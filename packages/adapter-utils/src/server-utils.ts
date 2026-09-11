@@ -13,6 +13,7 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
+import { collectKnownSecretEnvValues, redactKnownSecretEnvValues } from "./secret-env-redaction.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
@@ -4617,6 +4618,12 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // Known secret env values (DATABASE_URL, API keys, signing secrets,
+        // ...) must not land verbatim in Paperclip's captured run log just
+        // because a command like `printenv` or `env` echoed them. Collected
+        // once per spawn from the actual child env, not learned from any
+        // corpus of captured/leaked values.
+        const knownSecretEnvValues = collectKnownSecretEnvValues(childEnv);
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -4743,7 +4750,7 @@ export async function runChildProcess(
           const readable = child.stdout;
           if (!readable) return;
           readable.pause();
-          const text = String(chunk);
+          const text = redactKnownSecretEnvValues(String(chunk), knownSecretEnvValues);
           stdout = appendWithCap(stdout, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -4761,7 +4768,7 @@ export async function runChildProcess(
           const readable = child.stderr;
           if (!readable) return;
           readable.pause();
-          const text = String(chunk);
+          const text = redactKnownSecretEnvValues(String(chunk), knownSecretEnvValues);
           stderr = appendWithCap(stderr, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain

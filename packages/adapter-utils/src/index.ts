@@ -69,6 +69,12 @@ export {
   redactCommandText,
   redactDiagnosticText,
 } from "./command-redaction.js";
+export {
+  KNOWN_SECRET_ENV_VAR_NAMES,
+  REDACTED_SECRET_ENV_VALUE,
+  collectKnownSecretEnvValues,
+  redactKnownSecretEnvValues,
+} from "./secret-env-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
   buildAdapterEnvConfig,

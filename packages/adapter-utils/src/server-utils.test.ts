@@ -585,6 +585,51 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("redacts known secret env values out of captured stdout before it reaches onLog or the result", async () => {
+    const loggedChunks: string[] = [];
+    const secretValue = "sk-live-super-secret-value-123456";
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write('DATABASE_URL=' + process.env.DATABASE_URL + '\\n'); process.stdout.write('bare value: ' + process.env.DATABASE_URL + '\\n');",
+      ],
+      {
+        cwd: process.cwd(),
+        env: { DATABASE_URL: secretValue },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => {
+          loggedChunks.push(chunk);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain(secretValue);
+    expect(result.stdout).toContain("***REDACTED***");
+    expect(loggedChunks.join("")).not.toContain(secretValue);
+  });
+
+  it("does not redact short/common env values even if the name is denylisted", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdout.write('DATABASE_URL=' + process.env.DATABASE_URL);"],
+      {
+        cwd: process.cwd(),
+        env: { DATABASE_URL: "x" },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("DATABASE_URL=x");
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
