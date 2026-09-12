@@ -275,8 +275,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: TogetherWeOwn/paperclip-ops-tooling
-          # Replace with the reviewed remediation commit after the local ops
-          # squash is finalized and published through the separate release path.
+          # Pin the independently reviewed policy to its immutable published SHA.
           ref: b8a10e85ba303bd99c6e49053ca95a75c4d50ff3
           path: trusted-policy
           persist-credentials: false
