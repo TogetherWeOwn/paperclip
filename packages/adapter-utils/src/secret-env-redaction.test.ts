@@ -61,6 +61,12 @@ describe("redactKnownSecretEnvValues", () => {
     expect(out).toBe("***REDACTED***");
   });
 
+  it("redacts overlapping occurrences as one range", () => {
+    expect(redactKnownSecretEnvValues("BBBBB", ["BBBB"])).toBe(
+      "***REDACTED***",
+    );
+  });
+
   it("is a no-op when there is nothing to redact", () => {
     expect(redactKnownSecretEnvValues("hello world", [])).toBe("hello world");
     expect(redactKnownSecretEnvValues("", ["x-secret-value"])).toBe("");
@@ -111,6 +117,22 @@ describe("createSecretEnvRedactionStream", () => {
     const out = stream.push("AAABAAAA") + stream.push("AABAAA") + stream.flush();
     expect(out).not.toContain(secret);
     expect(out).toBe("***REDACTED******REDACTED***");
+  });
+
+  it("redacts periodic overlapping values across chunks", () => {
+    const secret = "ABABAB";
+    const stream = createSecretEnvRedactionStream([secret]);
+    const out = stream.push("ABABABAB") + stream.push("ABAB") + stream.flush();
+    expect(out).not.toContain(secret);
+    expect(out).toBe("***REDACTED***ABAB");
+  });
+
+  it("redacts repeated-character overlaps across chunks", () => {
+    const secret = "BBBBBB";
+    const stream = createSecretEnvRedactionStream([secret]);
+    const out = stream.push("BBBBBBB") + stream.push("BBBBB") + stream.flush();
+    expect(out).not.toContain(secret);
+    expect(out).toBe("***REDACTED***BBBBB");
   });
 
   it("passes chunks straight through when there are no secrets", () => {

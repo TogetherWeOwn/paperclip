@@ -84,14 +84,46 @@ export function redactKnownSecretEnvValues(
   redactedValue: string = REDACTED_SECRET_ENV_VALUE,
 ): string {
   if (!text || secretValues.length === 0) return text;
-  let result = text;
-  // Longest first so a secret value that is a substring of another denylisted
-  // value is not left partially exposed by an earlier, shorter replacement.
-  for (const value of [...secretValues].sort((a, b) => b.length - a.length)) {
-    if (!result.includes(value)) continue;
-    result = result.split(value).join(redactedValue);
+
+  const ranges: Array<{ from: number; to: number }> = [];
+  for (const value of new Set(secretValues)) {
+    if (!value) continue;
+    let current: { from: number; to: number } | null = null;
+    let from = text.indexOf(value);
+    while (from !== -1) {
+      const to = from + value.length;
+      // Merge overlapping occurrences of the same value. A non-overlapping
+      // replacement leaks on periodic values: replacing the first "BBBB" in
+      // "BBBBB" leaves a trailing "B" that can join the next chunk's "BBB".
+      if (current && from < current.to) current.to = Math.max(current.to, to);
+      else {
+        if (current) ranges.push(current);
+        current = { from, to };
+      }
+      from = text.indexOf(value, from + 1);
+    }
+    if (current) ranges.push(current);
   }
-  return result;
+  if (ranges.length === 0) return text;
+
+  ranges.sort((a, b) => a.from - b.from || b.to - a.to);
+  const merged: Array<{ from: number; to: number }> = [];
+  for (const range of ranges) {
+    const current = merged[merged.length - 1];
+    if (current && range.from < current.to) {
+      current.to = Math.max(current.to, range.to);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+
+  let result = "";
+  let plainFrom = 0;
+  for (const range of merged) {
+    result += text.slice(plainFrom, range.from) + redactedValue;
+    plainFrom = range.to;
+  }
+  return result + text.slice(plainFrom);
 }
 
 export type SecretEnvRedactionStream = {
