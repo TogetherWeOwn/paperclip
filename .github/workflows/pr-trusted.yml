@@ -298,7 +298,7 @@ jobs:
         with:
           repository: TogetherWeOwn/paperclip-ops-tooling
           # Immutable trusted checker revision; never use the pull request copy.
-          ref: 0e33e4fb70ccee64e015ec12ffc259d399758c86
+          ref: 8f711709a7fbb080f05a9bdeda2a3d5a6f240382
           path: trusted-policy
           token: ${{ secrets.TRUSTED_POLICY_TOKEN }}
           persist-credentials: false
@@ -311,7 +311,7 @@ jobs:
           TRUSTED_EVENT_ACTION: ${{ github.event.action }}
           TRUSTED_EVENT_SENDER_ID: ${{ github.event.sender.id }}
           TRUSTED_EVENT_REPOSITORY: ${{ github.repository }}
-          TRUSTED_POLICY_PIN: 0e33e4fb70ccee64e015ec12ffc259d399758c86
+          TRUSTED_POLICY_PIN: 8f711709a7fbb080f05a9bdeda2a3d5a6f240382
         run: |
           set -euo pipefail
           event_file="$RUNNER_TEMP/trusted-pull-request-event.json"
