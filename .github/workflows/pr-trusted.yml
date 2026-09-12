@@ -5,6 +5,10 @@ name: Trusted PR CI
 # drift from this file.
 on:
   workflow_call:
+    secrets:
+      TRUSTED_POLICY_TOKEN:
+        description: Read-only installation token scoped to TogetherWeOwn/paperclip-ops-tooling.
+        required: true
 
 permissions:
   actions: read
@@ -79,7 +83,7 @@ jobs:
           [[ "$EVENT_REPOSITORY_ID" == '1170821064' ]] || fail_closed 'unexpected repository ID'
           [[ "$EVENT_BASE_REPOSITORY_ID" == '1170821064' ]] || fail_closed 'unexpected base repository ID'
           [[ -n "$EVENT_BASE_REF" ]] || fail_closed 'missing base branch'
-          [[ "$EVENT_ACTION" =~ ^(opened|reopened|synchronize)$ ]] || fail_closed 'unsupported pull_request action'
+          [[ "$EVENT_ACTION" =~ ^(opened|reopened|synchronize|edited)$ ]] || fail_closed 'unsupported pull_request action'
 
           jq -e '
             type == "array" and
@@ -271,46 +275,48 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Validate trusted policy credential contract
+        working-directory: .
+        env:
+          TRUSTED_POLICY_TOKEN: ${{ secrets.TRUSTED_POLICY_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TRUSTED_POLICY_TOKEN" ]] || {
+            echo "::error::TRUSTED_POLICY_TOKEN is required"
+            exit 1
+          }
+          case "$TRUSTED_POLICY_TOKEN" in
+            github_pat_*|ghs_*) ;;
+            *)
+              echo "::error::TRUSTED_POLICY_TOKEN has an invalid installation-token shape"
+              exit 1
+              ;;
+          esac
+
       - name: Checkout trusted attribution policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: TogetherWeOwn/paperclip-ops-tooling
-          # Pin the independently reviewed policy to its immutable published SHA.
+          # Immutable trusted checker revision; never use the pull request copy.
           ref: b8a10e85ba303bd99c6e49053ca95a75c4d50ff3
           path: trusted-policy
+          token: ${{ secrets.TRUSTED_POLICY_TOKEN }}
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Enforce trusted pull request policy
+      - name: Enforce trusted pull request and commit policy
+        working-directory: .
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: node ../trusted-policy/github_policy_check.mjs pr
-
-      - name: Enforce trusted commit attribution
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRUSTED_EVENT_JSON: ${{ toJSON(github.event.pull_request) }}
+          TRUSTED_EVENT_ACTION: ${{ github.event.action }}
+          TRUSTED_EVENT_SENDER_ID: ${{ github.event.sender.id }}
+          TRUSTED_EVENT_REPOSITORY: ${{ github.repository }}
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRUSTED_POLICY_PIN: b8a10e85ba303bd99c6e49053ca95a75c4d50ff3
         run: |
           set -euo pipefail
-          git log --format='%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00' "$BASE_SHA..$HEAD_SHA" |
-            while IFS= read -r -d '' sha &&
-                  IFS= read -r -d '' author_name &&
-                  IFS= read -r -d '' author_email &&
-                  IFS= read -r -d '' committer_name &&
-                  IFS= read -r -d '' committer_email &&
-                  IFS= read -r -d '' message; do
-              GIT_AUTHOR_NAME="$author_name" \
-              GIT_AUTHOR_EMAIL="$author_email" \
-              GIT_COMMITTER_NAME="$committer_name" \
-              GIT_COMMITTER_EMAIL="$committer_email" \
-              COMMIT_MESSAGE="$message" \
-                node ../trusted-policy/github_policy_check.mjs commit || {
-                  echo "::error::commit $sha fails trusted attribution policy"
-                  exit 1
-                }
-            done
+          node trusted-policy/github_policy_workflow.mjs --repository pull-request
 
       - name: Block manual lockfile edits
         if: >-
