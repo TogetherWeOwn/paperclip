@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   ci:
-    # Replace with the published remediation commit after its local squash
-    # fixture, merge-tree, and focused tests pass. A reusable workflow cannot
-    # safely execute an unpublished revision from the pull request checkout.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@TRUSTED_WORKFLOW_REVISION
+    # Execute the reviewed reusable workflow from its immutable published SHA;
+    # never trust a workflow implementation from the pull request checkout.
+    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@5a6cd509269326cf77b43eaca4f058487c956a12
