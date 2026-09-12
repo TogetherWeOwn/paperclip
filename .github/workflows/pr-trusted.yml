@@ -5,6 +5,10 @@ name: Trusted PR CI
 # drift from this file.
 on:
   workflow_call:
+    secrets:
+      TRUSTED_POLICY_TOKEN:
+        description: Read-only installation token scoped to TogetherWeOwn/paperclip-ops-tooling.
+        required: true
 
 permissions:
   actions: read
@@ -79,7 +83,7 @@ jobs:
           [[ "$EVENT_REPOSITORY_ID" == '1170821064' ]] || fail_closed 'unexpected repository ID'
           [[ "$EVENT_BASE_REPOSITORY_ID" == '1170821064' ]] || fail_closed 'unexpected base repository ID'
           [[ -n "$EVENT_BASE_REF" ]] || fail_closed 'missing base branch'
-          [[ "$EVENT_ACTION" =~ ^(opened|reopened|synchronize)$ ]] || fail_closed 'unsupported pull_request action'
+          [[ "$EVENT_ACTION" =~ ^(opened|reopened|synchronize|edited)$ ]] || fail_closed 'unsupported pull_request action'
 
           jq -e '
             type == "array" and
@@ -271,46 +275,48 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Validate trusted policy credential contract
+        working-directory: .
+        env:
+          TRUSTED_POLICY_TOKEN: ${{ secrets.TRUSTED_POLICY_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TRUSTED_POLICY_TOKEN" ]] || {
+            echo "::error::TRUSTED_POLICY_TOKEN is required"
+            exit 1
+          }
+          case "$TRUSTED_POLICY_TOKEN" in
+            github_pat_*|ghs_*) ;;
+            *)
+              echo "::error::TRUSTED_POLICY_TOKEN has an invalid installation-token shape"
+              exit 1
+              ;;
+          esac
+
       - name: Checkout trusted attribution policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: TogetherWeOwn/paperclip-ops-tooling
-          # Pin the independently reviewed policy to its immutable published SHA.
+          # Immutable trusted checker revision; never use the pull request copy.
           ref: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e
           path: trusted-policy
+          token: ${{ secrets.TRUSTED_POLICY_TOKEN }}
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Enforce trusted pull request policy
+      - name: Enforce trusted pull request and commit policy
+        working-directory: .
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: node ../trusted-policy/github_policy_check.mjs pr
-
-      - name: Enforce trusted commit attribution
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRUSTED_EVENT_JSON: ${{ toJSON(github.event.pull_request) }}
+          TRUSTED_EVENT_ACTION: ${{ github.event.action }}
+          TRUSTED_EVENT_SENDER_ID: ${{ github.event.sender.id }}
+          TRUSTED_EVENT_REPOSITORY: ${{ github.repository }}
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRUSTED_POLICY_PIN: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e
         run: |
           set -euo pipefail
-          git log --format='%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00' "$BASE_SHA..$HEAD_SHA" |
-            while IFS= read -r -d '' sha &&
-                  IFS= read -r -d '' author_name &&
-                  IFS= read -r -d '' author_email &&
-                  IFS= read -r -d '' committer_name &&
-                  IFS= read -r -d '' committer_email &&
-                  IFS= read -r -d '' message; do
-              GIT_AUTHOR_NAME="$author_name" \
-              GIT_AUTHOR_EMAIL="$author_email" \
-              GIT_COMMITTER_NAME="$committer_name" \
-              GIT_COMMITTER_EMAIL="$committer_email" \
-              COMMIT_MESSAGE="$message" \
-                node ../trusted-policy/github_policy_check.mjs commit || {
-                  echo "::error::commit $sha fails trusted attribution policy"
-                  exit 1
-                }
-            done
+          node trusted-policy/github_policy_workflow.mjs --repository pull-request
 
       - name: Block manual lockfile edits
         if: >-
@@ -598,7 +604,7 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [gate, policy, typecheck_release_registry, general_tests, build, docker_context_integrity]
+    needs: [gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity]
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 5
 
@@ -609,6 +615,7 @@ jobs:
           POLICY_RESULT: ${{ needs.policy.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          RUNNER_VERIFICATION_RESULT: ${{ needs.verify_paperclip_runner.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           DOCKER_CONTEXT_INTEGRITY_RESULT: ${{ needs.docker_context_integrity.result }}
         run: |
@@ -617,12 +624,14 @@ jobs:
             true)
               test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
               test "$GENERAL_TESTS_RESULT" = "success"
+              test "$RUNNER_VERIFICATION_RESULT" = "success"
               test "$BUILD_RESULT" = "success"
               test "$DOCKER_CONTEXT_INTEGRITY_RESULT" = "success"
               ;;
             false)
               test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"
               test "$GENERAL_TESTS_RESULT" = "skipped"
+              test "$RUNNER_VERIFICATION_RESULT" = "skipped"
               test "$BUILD_RESULT" = "skipped"
               test "$DOCKER_CONTEXT_INTEGRITY_RESULT" = "skipped"
               ;;
@@ -632,8 +641,8 @@ jobs:
               ;;
           esac
 
-  build:
-    name: Build
+  verify_paperclip_runner:
+    name: Verify Paperclip Runner
     needs: [gate, policy]
     if: ${{ needs.gate.outputs.full_ci == 'true' }}
     runs-on: ${{ needs.gate.outputs.runner }}
@@ -677,6 +686,49 @@ jobs:
 
       - name: Verify Paperclip Runner
         run: pnpm --filter @paperclipai/paperclip-runner check:all
+
+  build:
+    name: Build
+    needs: [gate, policy]
+    if: ${{ needs.gate.outputs.full_ci == 'true' }}
+    runs-on: ${{ needs.gate.outputs.runner }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Build Runner Evalbook viewer
         run: pnpm --filter @paperclipai/paperclip-runner build:issue-thread
