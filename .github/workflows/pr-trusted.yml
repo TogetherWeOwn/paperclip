@@ -298,7 +298,7 @@ jobs:
         with:
           repository: TogetherWeOwn/paperclip-ops-tooling
           # Immutable trusted checker revision; never use the pull request copy.
-          ref: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e
+          ref: 8b7d4163cc1ae7e760ccd704742fef25d5644f64
           path: trusted-policy
           token: ${{ secrets.TRUSTED_POLICY_TOKEN }}
           persist-credentials: false
@@ -307,16 +307,17 @@ jobs:
       - name: Enforce trusted pull request and commit policy
         working-directory: .
         env:
-          TRUSTED_EVENT_JSON: ${{ toJSON(github.event.pull_request) }}
+          TRUSTED_EVENT_JSON: ${{ toJSON(github.event) }}
           TRUSTED_EVENT_ACTION: ${{ github.event.action }}
           TRUSTED_EVENT_SENDER_ID: ${{ github.event.sender.id }}
           TRUSTED_EVENT_REPOSITORY: ${{ github.repository }}
-          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          TRUSTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TRUSTED_POLICY_PIN: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e
+          TRUSTED_POLICY_PIN: 8b7d4163cc1ae7e760ccd704742fef25d5644f64
         run: |
           set -euo pipefail
-          node trusted-policy/github_policy_workflow.mjs --repository pull-request
+          event_file="$RUNNER_TEMP/trusted-pull-request-event.json"
+          printf '%s' "$TRUSTED_EVENT_JSON" > "$event_file"
+          node trusted-policy/github_policy_ci.mjs "$event_file" pull-request
+          rm -f "$event_file"
 
       - name: Block manual lockfile edits
         if: >-
