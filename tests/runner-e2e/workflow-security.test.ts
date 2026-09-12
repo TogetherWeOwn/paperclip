@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const ordinaryPrTrustedWorkflowRevision =
-  "a0a78ee60946a5f79f85b2bd0584fc766fae43bb";
+  "03609aa6ecc9a047ed53d6b6469d8be554fbc46d";
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -121,15 +121,18 @@ describe("public repository paid workflow security", () => {
 
   it("gates every provider-secret job with stable actor IDs", async () => {
     const workflows = await Promise.all(
-      ["runner-full-stack-e2e.yml", "runner-live-evals.yml", "e2e.yml"].map(
-        async (name) => ({
-          name,
-          contents: await readFile(
-            path.join(repositoryRoot, ".github/workflows", name),
-            "utf8",
-          ),
-        }),
-      ),
+      [
+        "runner-full-stack-e2e.yml",
+        "runner-live-evals.yml",
+        "runner-protocol-live-evals.yml",
+        "e2e.yml",
+      ].map(async (name) => ({
+        name,
+        contents: await readFile(
+          path.join(repositoryRoot, ".github/workflows", name),
+          "utf8",
+        ),
+      })),
     );
 
     for (const { name, contents } of workflows) {
@@ -482,6 +485,7 @@ describe("public repository paid workflow security", () => {
       "e2e.yml",
       "runner-full-stack-e2e.yml",
       "runner-live-evals.yml",
+      "runner-protocol-live-evals.yml",
     ]);
     const names = (await readdir(workflowDirectory)).filter((name) =>
       /\.ya?ml$/.test(name),
@@ -508,7 +512,11 @@ describe("public repository paid workflow security", () => {
 
   it("runs paid scheduled campaigns only on Sundays", async () => {
     const workflows = await Promise.all(
-      ["runner-full-stack-e2e.yml", "runner-live-evals.yml"].map((name) =>
+      [
+        "runner-full-stack-e2e.yml",
+        "runner-live-evals.yml",
+        "runner-protocol-live-evals.yml",
+      ].map((name) =>
         readFile(path.join(repositoryRoot, ".github/workflows", name), "utf8"),
       ),
     );
@@ -662,6 +670,12 @@ describe("public repository paid workflow security", () => {
     expect(report).toContain("tests/runner-e2e/select-rerun-artifacts.ts");
     expect(report).toContain(
       "PAPERCLIP_RUNNER_E2E_REPORT_ROOT: ${{ github.workspace }}/selected-runner-e2e",
+    );
+    expect(report).toContain(
+      "PAPERCLIP_RUNNER_E2E_HISTORY_PUBLIC_BASE_URL: ${{ vars.RUNNER_E2E_HISTORY_PUBLIC_BASE_URL }}",
+    );
+    expect(report).toContain(
+      "PAPERCLIP_RUNNER_E2E_HISTORY_PREFIX: ${{ vars.RUNNER_E2E_HISTORY_PREFIX || 'runner-e2e' }}",
     );
     expect(
       report.indexOf("Select latest workflow attempt per cell"),

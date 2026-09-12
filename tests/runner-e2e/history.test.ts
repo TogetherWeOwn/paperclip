@@ -195,8 +195,8 @@ describe("runner E2E campaign history", () => {
     expect(index).toContain("Runner E2E campaigns");
     expect(index).toContain("complete-green");
     expect(index).toContain("complete-red");
-    expect(index).toContain("66/66 passed");
-    expect(index).toContain("65/66 passed");
+    expect(index).toContain("68/68 passed");
+    expect(index).toContain("67/68 passed");
     expect(index).toContain("Open report&nbsp;→");
     expect(index).toContain(
       "campaigns/complete-red/public-images/campaign-summary.png",
@@ -631,6 +631,13 @@ describe("historical publication security", () => {
       validateHistoryDestination({
         bucket: "paperclip-runner-e2e-history",
         prefix: "../unsafe",
+        publicBaseUrl: "https://history.paperclip.ai/",
+      }),
+    ).toThrow("safe non-empty key prefix");
+    expect(() =>
+      validateHistoryDestination({
+        bucket: "paperclip-runner-e2e-history",
+        prefix: "runner-e2e?other",
         publicBaseUrl: "https://history.paperclip.ai/",
       }),
     ).toThrow("safe non-empty key prefix");

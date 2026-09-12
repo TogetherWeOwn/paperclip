@@ -6113,6 +6113,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
     expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-455\/\d{8}T\d{6}Z$/);
     const rescueCommitSha = await readGit(repoRoot, ["rev-parse", rescueBranch]);
+    await expect(readGit(repoRoot, ["show", "-s", "--format=%an|%ae|%cn|%ce", rescueCommitSha])).resolves.toBe(
+      "TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com|TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com",
+    );
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
     await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
@@ -7737,7 +7740,13 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const reservePort = async () => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        // macOS can allocate an entire ephemeral range above 55535. Pick a
+        // bounded candidate so the test's HMR companion remains a valid port.
+        await new Promise<void>((resolve) => {
+          probe.once("error", () => resolve());
+          probe.listen(20_000 + Math.floor(Math.random() * 20_000), "127.0.0.1", resolve);
+        });
+        if (!probe.listening) continue;
         const address = probe.address();
         const port = typeof address === "object" && address ? address.port : null;
         await new Promise<void>((resolve, reject) => {
@@ -8078,7 +8087,13 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const reservePort = async () => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        // macOS can allocate an entire ephemeral range above 55535. Pick a
+        // bounded candidate so the test's HMR companion remains a valid port.
+        await new Promise<void>((resolve) => {
+          probe.once("error", () => resolve());
+          probe.listen(20_000 + Math.floor(Math.random() * 20_000), "127.0.0.1", resolve);
+        });
+        if (!probe.listening) continue;
         const address = probe.address();
         const candidate = typeof address === "object" && address ? address.port : null;
         await new Promise<void>((resolve, reject) => {

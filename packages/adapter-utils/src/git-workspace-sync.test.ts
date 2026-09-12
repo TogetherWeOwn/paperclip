@@ -495,11 +495,13 @@ describe("git workspace sync", () => {
     const importedHead = await git(repo, ["rev-parse", "HEAD"]);
     await git(repo, ["checkout", "main"]);
 
-    // Ambient identity env vars would override the `-c` flags and make the
-    // assertion machine-dependent, so clear them for the call under test.
+    // Ambient identity must not override the explicit system attribution.
     const identityEnvKeys = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"];
     const savedEnv = new Map(identityEnvKeys.map((key) => [key, process.env[key]]));
-    for (const key of identityEnvKeys) delete process.env[key];
+    process.env.GIT_AUTHOR_NAME = "Claude";
+    process.env.GIT_AUTHOR_EMAIL = "noreply@anthropic.com";
+    process.env.GIT_COMMITTER_NAME = "Paperclip";
+    process.env.GIT_COMMITTER_EMAIL = "noreply@paperclip.ing";
     try {
       await integrateImportedGitHead({ localDir: repo, importedHead });
     } finally {
@@ -512,7 +514,7 @@ describe("git workspace sync", () => {
     const parents = (await git(repo, ["rev-list", "--parents", "-1", "HEAD"])).split(" ");
     expect(parents.slice(1)).toEqual([currentHead, importedHead]);
     expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
-      .toBe("Paperclip|noreply@paperclip.ing|Paperclip|noreply@paperclip.ing");
+      .toBe("TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com|TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com");
     expect(await git(repo, ["log", "-1", "--format=%s"]))
       .toBe(`Paperclip remote git sync merge ${importedHead.slice(0, 12)}`);
     const mergedTree = await git(repo, ["ls-tree", "--name-only", "HEAD"]);

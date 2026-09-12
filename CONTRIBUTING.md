@@ -48,7 +48,7 @@ PRs that follow this path are **much** more likely to be accepted, even when the
 
 ### Use the PR Template
 
-Every pull request **must** follow the PR template at [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). If you create a PR via the GitHub API or other tooling that bypasses the template, copy its contents into your PR description manually. The template includes required sections: Thinking Path, What Changed, Verification, Risks, Model Used, and a Checklist.
+Every pull request **must** follow the PR template at [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). If you create a PR via the GitHub API or other tooling that bypasses the template, copy its contents into your PR description manually. The required sections are Why, What, Validation, Risk and rollback, Automation provenance, and References. The PR title must use `<type>[optional scope][optional !]: <imperative outcome>`.
 
 ### Link Issues or Describe Them In-PR
 
@@ -94,9 +94,11 @@ git push -u origin <descriptive-name>
 git push origin --delete <old-name>
 ```
 
-### Model Used (Required)
+### Automation Provenance (Required)
 
-Every PR must include a **Model Used** section specifying which AI model produced or assisted with the change. Include the provider, exact model ID/version, context window size, and any relevant capability details (e.g., reasoning mode, tool use). If no AI was used, write "None — human-authored". This applies to all contributors — human and AI alike.
+Every PR must include an **Automation provenance** section. Record `Prepared by: TogetherWeOwn automation` and the actual full model name/version used. List each materially contributing model once. Do not include an email, URL, GitHub mention, secret, agent persona, configured fallback, or unnecessary capability detail. For human-only work, use `Prepared by: Human` and `Model(s): None`.
+
+Automation provenance belongs in the PR body only. Never add a model, provider, tool, Paperclip, or agent persona to Git authorship, co-author, sign-off, mentions, reviewers, assignees, or contributors merely because it assisted. Company commits use primary author `Rick7C2 <rick.dugger@gmail.com>` and exactly one `Co-Authored-By: TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>` trailer. Preserve upstream/dependency authorship and follow a real upstream DCO requirement when applicable.
 
 ### Tests Must Pass
 
@@ -161,31 +163,7 @@ Bugs, docs improvements, and small targeted improvements are still the easiest p
 
 Write all PR text in Simplified Technical English (ASD-STE100): use short sentences, one instruction per sentence, simple approved vocabulary, and the active voice.
 
-Your PR description must follow the [PR template](.github/PULL_REQUEST_TEMPLATE.md). All sections are required. The "thinking path" at the top explains from the top of the project down to what you fixed. E.g.:
-
-### Thinking Path Example 1:
-
-> - Paperclip is the open source app people use to manage AI agents for work
-> - There are many types of adapters for each LLM model provider
-> - But LLM's have a context limit and not all agents can automatically compact their context
-> - So we need to have an adapter-specific configuration for which adapters can and cannot automatically compact their context
-> - This pull request adds per-adapter configuration of compaction, either auto or paperclip managed
-> - That way we can get optimal performance from any adapter/provider in Paperclip
-
-### Thinking Path Example 2:
-
-> - Paperclip is the open source app people use to manage AI agents for work
-> - But humans want to watch the agents and oversee their work
-> - Human users also operate in teams and so they need their own logins, profiles, views etc.
-> - So we have a multi-user system for humans
-> - But humans want to be able to update their own profile picture and avatar
-> - But the avatar upload form wasn't saving the avatar to the file storage system
-> - So this PR fixes the avatar upload form to use the file storage service
-> - The benefit is we don't have a one-off file storage for just one aspect of the system, which would cause confusion and extra configuration
-
-Then have the rest of your normal PR message after the Thinking Path.
-
-This should include details about what you did, why you did it, why it matters & the benefits, how we can verify it works, and any risks.
+Your PR description must follow the [PR template](.github/PULL_REQUEST_TEMPLATE.md). All sections are required. Lead with the problem in **Why**, state the solution and material decisions in **What**, and give reproducible evidence in **Validation**. Record the exact undo path in **Risk and rollback**. Keep automation facts only in **Automation provenance**.
 
 Questions? Just ask in #dev — we're happy to help.
 

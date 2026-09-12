@@ -961,7 +961,12 @@ export function ConnectionSetupFlow({
     [entry, galleryQuery.data, linkUrl],
   );
 
-  const entryAutomaticOAuthMethod = automaticOAuthMethod(entry);
+  const selectedSetupMethod = entry ? getAvailableConnectionMethod(entry, connectionMethodKey || null) : null;
+  // Apps with an advanced PAT option still need OAuth progress and recovery
+  // screens when their selected method is managed sign-in.
+  const entryAutomaticOAuthMethod = selectedSetupMethod && connectionMethodSupportsAutomaticOAuth(selectedSetupMethod)
+    ? selectedSetupMethod
+    : automaticOAuthMethod(entry);
   const automaticOAuthEntry = credentialSource === "paperclip_vault" && entryAutomaticOAuthMethod ? entry : null;
   const directOAuthEntry = credentialSource === "paperclip_vault" && canUseAutomaticOAuthFastPath(entry) ? entry : null;
   const directOAuthLookupPending = Boolean(directOAuthSource) && (
@@ -1214,7 +1219,28 @@ export function ConnectionSetupFlow({
       reconnectConnection,
       applications: applicationsQuery.data?.applications ?? [],
     });
+    const requestedEntryAdvertisesManagedConnector = Boolean(
+      requestedEntry?.methods.some((candidate) =>
+        candidate.oauthStrategy === "paperclip_cloud_connector"
+        || candidate.oauthStrategy === "paperclip_id_connector"
+      ),
+    );
+    // The enrollment lookup decides whether a hidden managed method means
+    // "enroll this instance" or "that Cloud profile is unavailable here".
+    // Preserve managed sign-in intent in both cases; the setup screen explains
+    // unavailable profiles rather than downgrading to a credential form.
+    if (
+      requestedDefinitionUsesManagedConnector
+      && !requestedEntryAdvertisesManagedConnector
+      && connectorEnrollmentQuery.isLoading
+    ) return;
     const methods = connectionMethodsForCredentialSource(requestedEntry, credentialSource);
+    const initialMethod = (
+      requestedDefinitionUsesManagedConnector
+        && !requestedEntryAdvertisesManagedConnector
+        ? recommendedManagedConnectorMethod(fullRequestedDefinition)
+        : null
+    ) ?? recommendedSetupConnectionMethod(methods);
     const method = methods.length === 1 ? methods[0]! : null;
     const automaticOAuth = credentialSource === "paperclip_vault" && Boolean(automaticOAuthMethod(requestedEntry));
     const vercelUnavailable = isVercelConnectUnavailable({
@@ -1266,15 +1292,6 @@ export function ConnectionSetupFlow({
       setCuratedOAuthClientId("");
       setCuratedOAuthClientSecret("");
       setVercelConnector("");
-      const requestedEntryAdvertisesManagedConnector = requestedEntry.methods.some((candidate) =>
-        candidate.oauthStrategy === "paperclip_cloud_connector"
-        || candidate.oauthStrategy === "paperclip_id_connector"
-      );
-      const initialMethod = (
-        requestedDefinitionUsesManagedConnector && !requestedEntryAdvertisesManagedConnector
-          ? recommendedManagedConnectorMethod(fullRequestedDefinition)
-          : null
-      ) ?? recommendedSetupConnectionMethod(methods);
       setConnectionMethodKey(initialMethod?.key ?? "");
       setConfigValues(defaultMethodConfig(initialMethod));
       setGoogleSheetsLinks("");
@@ -1298,6 +1315,12 @@ export function ConnectionSetupFlow({
         hasPrefilledLink: Boolean(prefill.link),
         zapierSource,
       }));
+    } else if (entryAdvertisesManagedConnector !== requestedEntryAdvertisesManagedConnector) {
+      // A capability refresh must replace the stale gallery entry as well as
+      // its method, while preserving the chosen audience and wizard step.
+      setEntry(requestedEntry);
+      setConnectionMethodKey(initialMethod?.key ?? "");
+      setConfigValues(defaultMethodConfig(initialMethod));
     }
 
     if (automaticOAuth && (
@@ -1317,8 +1340,12 @@ export function ConnectionSetupFlow({
     applicationsQuery.data,
     connectionsQuery.isError,
     connectionsQuery.isFetchedAfterMount,
+    connectorEnrollmentQuery.data?.configured,
+    connectorEnrollmentQuery.isLoading,
+    connectionMethodKey,
     credentialSource,
     entry?.slug,
+    entryAdvertisesManagedConnector,
     galleryQuery.data,
     galleryQuery.isLoading,
     navigate,
@@ -1662,6 +1689,14 @@ export function ConnectionSetupFlow({
     && (directOAuthEntry || oauthPhase !== "entry"),
   );
 
+  const managedConnectorUnavailable = Boolean(
+    step === "key"
+    && entry
+    && requestedDefinitionUsesManagedConnector
+    && !entryAdvertisesManagedConnector
+    && connectorEnrollmentQuery.data?.configured === true
+  );
+
   const showConnectorEnrollmentStep = Boolean(
     step === "key"
     && entry
@@ -1841,14 +1876,12 @@ export function ConnectionSetupFlow({
       : linkAuthMode === "oauth"
         ? "oauth"
         : "api_key";
-  // The primary label names the next effect, so an OAuth handoff never arrives
-  // unannounced.
-  const accessMethodIsKnown = !entry
-    || Boolean(connectionMethodKey)
-    || credentialSourceMethods.length === 1;
-  const accessSubmitLabel = accessStepAuthKind === "oauth" && accessMethodIsKnown
+  // Name the actual next effect: multi-method apps and enrollment still have
+  // a local setup screen, even when OAuth is already the selected method.
+  const accessContinuesToProvider = Boolean(directOAuthEntry);
+  const accessSubmitLabel = accessContinuesToProvider
     ? `Continue to ${entry?.name ?? "sign-in"}`
-    : "Save and continue";
+    : accessStepAuthKind === "oauth" ? "Continue" : "Save and continue";
 
   const stepIndex = (zapierSource || entry) && step !== "gallery" && step !== "success"
     ? SELECTED_APP_STEP_INDEX[step]
@@ -1913,7 +1946,21 @@ export function ConnectionSetupFlow({
         />
       )}
 
-      {step === "key" && entry && showConnectorEnrollmentStep ? (
+      {managedConnectorUnavailable && entry ? (
+        <div className="mx-auto max-w-xl rounded-xl border border-border bg-card p-6">
+          <h2 className="text-lg font-semibold text-foreground">{entry.name} sign-in is unavailable</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            This instance is connected to Paperclip, but {entry.name} sign-in is not currently available. Try again shortly or contact your instance administrator.
+          </p>
+          <div className="mt-6 flex items-center justify-between gap-3">
+            <Button type="button" variant="ghost" onClick={() => setAppStep("access")}>Back</Button>
+            <Button type="button" disabled={galleryQuery.isFetching} onClick={() => void galleryQuery.refetch()}>
+              {galleryQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Try again
+            </Button>
+          </div>
+        </div>
+      ) : step === "key" && entry && showConnectorEnrollmentStep ? (
         <div className="mx-auto max-w-xl">
           <div className="rounded-xl border border-border bg-card p-6">
             <div className="flex items-start gap-3">
@@ -1946,9 +1993,9 @@ export function ConnectionSetupFlow({
                 onClick={() => {
                   setConnectorEnrollmentError(null);
                   preserveEnrollmentAccess();
-                  const verificationUrl = connectorEnrollmentQuery.data?.verificationUrl;
-                  if (verificationUrl) openConnectorEnrollment(verificationUrl);
-                  else startConnectorEnrollment.mutate();
+                  // Let the server reuse a live enrollment or replace an expired
+                  // one. A cached verification URL may expire while this page is open.
+                  startConnectorEnrollment.mutate();
                 }}
               >
                 {startConnectorEnrollment.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -2105,6 +2152,7 @@ export function ConnectionSetupFlow({
           capabilities={galleryQuery.data?.capabilities}
           githubIdentity={entry?.slug === "github"}
           submitLabel={accessSubmitLabel}
+          continuesToProvider={accessContinuesToProvider}
           identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
           preserveAgentAccess={Boolean(automaticOAuthEntry && (resumableOAuthConnection || reconnectConnection))}
           pending={connectMutation.isPending || oauthStartMutation.isPending}
@@ -3554,6 +3602,7 @@ export function AccessStep({
   capabilities,
   githubIdentity = false,
   submitLabel,
+  continuesToProvider = false,
   identityLoading = false,
   preserveAgentAccess = false,
   pending = false,
@@ -3578,6 +3627,8 @@ export function AccessStep({
   } | null;
   githubIdentity?: boolean;
   submitLabel: string;
+  /** Only show an external-handoff cue when this action starts provider OAuth. */
+  continuesToProvider?: boolean;
   /** Wait for a durable OAuth connection before showing a reconnect identity. */
   identityLoading?: boolean;
   /** Reconnect changes credentials only; existing install reach stays intact. */
@@ -3637,6 +3688,9 @@ export function AccessStep({
         <div className="divide-y divide-border">
           <section className="p-6">
             <h2 className="text-sm font-semibold text-foreground">{identityHeading}</h2>
+            {githubIdentity && grantKind === "agent" ? (
+              <p className="mt-2 text-sm text-muted-foreground">This agent uses this GitHub account for everyone’s work, instead of the person giving instructions.</p>
+            ) : null}
             {identityLoading ? (
               <div className="mt-4 grid gap-2 sm:grid-cols-2" aria-label="Loading connection identity">
                 <Skeleton className="h-20 w-full rounded-md" />
@@ -3815,7 +3869,7 @@ export function AccessStep({
         >
           {pending ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : null}
           {submitLabel}
-          {!pending && authKind === "oauth" ? <ArrowUpRight className="h-4 w-4" aria-hidden="true" /> : null}
+          {!pending && continuesToProvider ? <ArrowUpRight className="h-4 w-4" aria-hidden="true" /> : null}
         </Button>
       </div>
     </div>

@@ -503,7 +503,7 @@ Exact response fields are documented in `skills/paperclip/references/api-referen
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.
 - **Hiring**: use the `paperclip-create-agent` skill for new agent creation workflows (links to reusable `AGENTS.md` templates like `Coder` and `QA`).
-- **Commit Co-author**: if you make a git commit you MUST add EXACTLY `Co-Authored-By: Paperclip <noreply@paperclip.ing>` to the end of each commit message. Do not put in your agent name, put `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+- **Commit attribution**: follow the repository's durable authorship policy. Never add Paperclip, a model, provider, tool, or agent persona as an author or co-author merely because it assisted. For TogetherWeOwn company repositories, the final company commit uses primary author `Rick7C2 <rick.dugger@gmail.com>` and exactly one trailer: `Co-Authored-By: TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>`. Put the actual model name/version in the PR's Automation provenance section only. Upstream authorship and DCO rules take precedence when contributing outside the company.
 
 This is rule #1:
 
