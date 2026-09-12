@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+# Restrict default permissions for files created by the application and its child processes.
+umask 0077
+
 # Capture runtime UID/GID from environment variables, defaulting to 1000
 PUID=${USER_UID:-1000}
 PGID=${USER_GID:-1000}

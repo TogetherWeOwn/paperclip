@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,5 +179,26 @@ describe("docker-entrypoint.sh", () => {
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1000:1001; cannot remap to requested 1000:1000");
     expect(calls).toBe("");
+  });
+
+  it.each([
+    ["root", { uid: 0, gid: 0 }],
+    ["non-root", { uid: 1000, gid: 1000 }],
+  ])("creates files with owner-only default permissions on the %s path", async (_path, ids) => {
+    installStubs(ids);
+    const outputDir = join(stubDir, "tool-results");
+    const outputFile = join(outputDir, "result.txt");
+    const script = [
+      `mkdirSync(${JSON.stringify(outputDir)})`,
+      `writeFileSync(${JSON.stringify(outputFile)}, "sensitive output")`,
+    ].join(";");
+
+    await execFileAsync("sh", [ENTRYPOINT, process.execPath, "--input-type=module", "-e", `import { mkdirSync, writeFileSync } from "node:fs";${script}`], {
+      env: { PATH: `${stubDir}:${process.env.PATH}` },
+    });
+
+    const directoryMode = statSync(outputDir).mode & 0o777;
+    const fileMode = statSync(outputFile).mode & 0o777;
+    expect({ directoryMode, fileMode }).toEqual({ directoryMode: 0o700, fileMode: 0o600 });
   });
 });
