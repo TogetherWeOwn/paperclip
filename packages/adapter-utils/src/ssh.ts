@@ -9,6 +9,7 @@ import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  GIT_SYNC_COMMIT_IDENTITY_ENV,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -1021,6 +1022,7 @@ async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: { ...process.env, ...GIT_SYNC_COMMIT_IDENTITY_ENV },
       },
     );
     try {

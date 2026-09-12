@@ -6113,6 +6113,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
     expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-455\/\d{8}T\d{6}Z$/);
     const rescueCommitSha = await readGit(repoRoot, ["rev-parse", rescueBranch]);
+    await expect(readGit(repoRoot, ["show", "-s", "--format=%an|%ae|%cn|%ce", rescueCommitSha])).resolves.toBe(
+      "TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com|TogetherWeOwn|319968614+togetherweown[bot]@users.noreply.github.com",
+    );
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
     await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);

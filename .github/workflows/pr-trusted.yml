@@ -257,15 +257,61 @@ jobs:
     needs: [gate]
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pull-request
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: pull-request
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Checkout trusted attribution policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: TogetherWeOwn/paperclip-ops-tooling
+          # Replace with the reviewed remediation commit after the local ops
+          # squash is finalized and published through the separate release path.
+          ref: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e
+          path: trusted-policy
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Enforce trusted pull request policy
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node ../trusted-policy/github_policy_check.mjs pr
+
+      - name: Enforce trusted commit attribution
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git log --format='%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00' "$BASE_SHA..$HEAD_SHA" |
+            while IFS= read -r -d '' sha &&
+                  IFS= read -r -d '' author_name &&
+                  IFS= read -r -d '' author_email &&
+                  IFS= read -r -d '' committer_name &&
+                  IFS= read -r -d '' committer_email &&
+                  IFS= read -r -d '' message; do
+              GIT_AUTHOR_NAME="$author_name" \
+              GIT_AUTHOR_EMAIL="$author_email" \
+              GIT_COMMITTER_NAME="$committer_name" \
+              GIT_COMMITTER_EMAIL="$committer_email" \
+              COMMIT_MESSAGE="$message" \
+                node ../trusted-policy/github_policy_check.mjs commit || {
+                  echo "::error::commit $sha fails trusted attribution policy"
+                  exit 1
+                }
+            done
 
       - name: Block manual lockfile edits
         if: >-

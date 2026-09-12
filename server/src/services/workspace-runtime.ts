@@ -1786,9 +1786,14 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: [
+        "-c",
+        "user.name=TogetherWeOwn",
+        "-c",
+        "user.email=319968614+togetherweown[bot]@users.noreply.github.com",
         "commit",
+        "--author=TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>",
         "-m",
-        "Paperclip dirty workspace rescue",
+        "Rescue dirty workspace state",
         "-m",
         [
           `Source-Issue: ${input.evidence.sourceIdentifier ?? input.evidence.sourceIssueId ?? "unknown"}`,
@@ -2692,12 +2697,8 @@ async function detectDefaultBranch(
   repoRoot: string,
   resolveGitAuth?: GitRemoteAuthProvider | null,
 ): Promise<string | null> {
-  const originMasterRef = "origin/master";
-  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef, resolveGitAuth);
-  if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
-    return originMasterRef;
-  }
-
+  // Use the remote's declared default before conventional-name heuristics.
+  // A hard-coded master preference can silently choose the wrong PR base.
   // Try the explicit remote HEAD first (set by git clone or git remote set-head)
   try {
     const remoteHead = await runGit(

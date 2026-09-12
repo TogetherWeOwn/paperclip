@@ -126,7 +126,7 @@ async function main() {
   const prTitle = pr.title ?? '';
   const [templateResult, issueResult, dedupResult, testResult, lockfileResult, depsResult, bootstrapResult] =
     await Promise.all([
-      Promise.resolve(checkTemplate(prBody)),
+      Promise.resolve(checkTemplate(prBody, prTitle)),
       Promise.resolve(checkLinkedIssue(prBody, prTitle)),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
