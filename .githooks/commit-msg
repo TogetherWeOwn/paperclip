@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-$(git config user.name || true)} \
+GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-$(git config user.email || true)} \
+COMMIT_MESSAGE_FILE=$1 \
+node "$repo_root/.github/scripts/check-commit-attribution-local.mjs"

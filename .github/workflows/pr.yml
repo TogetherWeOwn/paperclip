@@ -10,5 +10,7 @@ permissions:
 
 jobs:
   ci:
-    # Pin: #13300 merge — restore-only dependency caches and parallel native verification.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@44dde2dec42a22746a2f36b595acacc9ccfa1df6
+    # Replace with the published remediation commit after its local squash
+    # fixture, merge-tree, and focused tests pass. A reusable workflow cannot
+    # safely execute an unpublished revision from the pull request checkout.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@TRUSTED_WORKFLOW_REVISION

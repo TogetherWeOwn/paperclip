@@ -66,20 +66,27 @@ export const GIT_ARCHIVE_EXCLUDES = [".git", ".git/*"] as const;
 
 /**
  * Identity flags for commits the sync machinery itself creates (the merge
- * commits that reconcile concurrent histories). Execution hosts are often
- * containers with no git config and no resolvable hostname, so git cannot
- * auto-detect an identity there and `commit-tree` hard-fails with "Author
- * identity unknown" — which fails the whole run at finalize. Passing the
- * identity per invocation keeps every deployment working without host
- * configuration; `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment variables
- * still take precedence over `-c` when an operator sets them.
+ * commits that reconcile concurrent histories). These are system-created
+ * commits, so use the approved TogetherWeOwn automation identity rather than a
+ * model, vendor, tool, or agent persona. Execution hosts are often containers
+ * with no git config and no resolvable hostname, so git cannot auto-detect an
+ * identity there and `commit-tree` hard-fails with "Author identity unknown".
+ * Explicit author and committer values also prevent ambient host or repository
+ * configuration from silently changing durable attribution.
  */
 export const GIT_SYNC_COMMIT_IDENTITY_ARGS = [
   "-c",
-  "user.name=Paperclip",
+  "user.name=TogetherWeOwn",
   "-c",
-  "user.email=noreply@paperclip.ing",
+  "user.email=319968614+togetherweown[bot]@users.noreply.github.com",
 ] as const;
+
+export const GIT_SYNC_COMMIT_IDENTITY_ENV = {
+  GIT_AUTHOR_NAME: "TogetherWeOwn",
+  GIT_AUTHOR_EMAIL: "319968614+togetherweown[bot]@users.noreply.github.com",
+  GIT_COMMITTER_NAME: "TogetherWeOwn",
+  GIT_COMMITTER_EMAIL: "319968614+togetherweown[bot]@users.noreply.github.com",
+} as const;
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
@@ -729,6 +736,7 @@ export async function createUnrelatedHistoryGraftCommit(input: {
     {
       timeout: 60_000,
       maxBuffer: 64 * 1024,
+      env: { ...process.env, ...GIT_SYNC_COMMIT_IDENTITY_ENV },
     },
   );
   return graftCommit.stdout.trim();
@@ -837,6 +845,7 @@ export async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: { ...process.env, ...GIT_SYNC_COMMIT_IDENTITY_ENV },
       },
     );
     try {

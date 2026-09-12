@@ -194,7 +194,9 @@ end of the entry in this format:
 Rules:
 
 - Only add a PR link when you can confidently trace the bullet to a specific merged PR.
-  Use merge commit messages (`Merge pull request #N from user/branch`) to map PRs.
+  Query GitHub PR metadata for commits in the release range. Squash merges do not
+  retain `Merge pull request #N` subjects, so commit-message parsing is only a
+  fallback for an older merge-commit release.
 - List the contributor(s) who authored the PR. Use GitHub usernames, not real names or emails.
 - If multiple PRs contributed to a single bullet, list them all: `([#10](url), [#12](url), @user1, @user2)`.
 - If you cannot determine the PR number or contributor with confidence, omit the attribution
@@ -245,9 +247,13 @@ The `Contributors` section should always be included. List every person who auth
 commits in the release range, @-mentioning them by their **GitHub username** (not their
 real name or email). To find GitHub usernames:
 
-1. Extract usernames from merge commit messages: `git log v{last}..{beta-src} --oneline --merges` — the branch prefix (e.g. `from username/branch`) gives the GitHub username.
-2. For noreply emails like `user@users.noreply.github.com`, the username is the part before `@`.
-3. For contributors whose username is ambiguous, check `gh api users/{guess}` or the PR page.
+1. For each commit in the release range, query associated pull requests with
+   `gh api repos/paperclipai/paperclip/commits/{sha}/pulls` and use the merged
+   PR author's GitHub login. This works for squash merges.
+2. Use `Merge pull request #N from username/branch` parsing only for an older
+   merge-commit release when the associated-PR API has no result.
+3. For noreply emails like `user@users.noreply.github.com`, use the username
+   only as a fallback and confirm it with the PR page or `gh api users/{guess}`.
 
 **Never expose contributor email addresses.** Use `@username` only.
 
