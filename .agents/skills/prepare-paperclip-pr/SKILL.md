@@ -26,13 +26,21 @@ each one).
 * Make **logical commits** of all uncommitted changes before anything else.
   Do not stash and forget; do not leave files behind. If commits are missing,
   make them.
-* Commit messages must end with exactly:
-  `Co-Authored-By: Paperclip <noreply@paperclip.ing>`
+* Follow the target repository's durable attribution policy. Never add
+  Paperclip, a model, provider, tool, or agent persona as an author/co-author
+  merely because it assisted. TogetherWeOwn company repositories use primary
+  author `Rick7C2 <rick.dugger@gmail.com>` and exactly one trailer:
+  `Co-Authored-By: TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>`.
+* Put the actual model name/version in the PR's `Automation provenance`
+  section only. Follow upstream authorship and DCO requirements when they
+  differ.
 
 ## 2. Get changes cleanly on top of master
 
-* Fetch the target remote and rebase (or otherwise replay) your branch on top
-  of the target master so the PR has no merge conflicts.
+* Fetch the target remote. Integrate the target branch without rewriting
+  already-shared history. Rebase/replay is allowed only for unpublished local
+  commits; otherwise merge or replace the branch through the repository's
+  documented exception path.
 * Re-verify after rebase: build/tests relevant to the change still pass at
   whatever depth the task warrants.
 
