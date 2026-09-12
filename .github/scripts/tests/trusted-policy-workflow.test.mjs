@@ -49,8 +49,14 @@ test('covers metadata edits and rejects checker substitution paths', () => {
   assert.doesNotMatch(policyEnforcement, /pull-request\/.*github_policy/);
 });
 
-test('pins the reusable workflow and trusted checker by immutable SHA', () => {
-  assert.match(workflow, /ref: [0-9a-f]{40}/);
-  assert.match(workflow, /TRUSTED_POLICY_PIN: [0-9a-f]{40}/);
+test('pins the reusable workflow and corrected trusted checker by immutable SHA', () => {
+  assert.match(
+    workflow,
+    /ref: 8c802c0e4af2243e7246913047031791f75fe694/,
+  );
+  assert.match(
+    workflow,
+    /TRUSTED_POLICY_PIN: 8c802c0e4af2243e7246913047031791f75fe694/,
+  );
   assert.match(caller, /TogetherWeOwn\/paperclip\/\.github\/workflows\/pr-trusted\.yml@[0-9a-f]{40}/);
 });
