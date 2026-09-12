@@ -33,12 +33,11 @@ test('checks out only immutable trusted checker code with the credential', () =>
 
 test('passes trusted event and commit facts to the trusted runner, not caller classifications', () => {
   assert.match(policyEnforcement, /working-directory: \./);
-  assert.match(policyEnforcement, /TRUSTED_EVENT_JSON: \$\{\{ toJSON\(github\.event\.pull_request\) \}\}/);
+  assert.match(policyEnforcement, /TRUSTED_EVENT_JSON: \$\{\{ toJSON\(github\.event\) \}\}/);
   assert.match(policyEnforcement, /TRUSTED_EVENT_ACTION: \$\{\{ github\.event\.action \}\}/);
   assert.match(policyEnforcement, /TRUSTED_EVENT_SENDER_ID: \$\{\{ github\.event\.sender\.id \}\}/);
-  assert.match(policyEnforcement, /TRUSTED_BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
-  assert.match(policyEnforcement, /TRUSTED_HEAD_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
-  assert.match(policyEnforcement, /node trusted-policy\/github_policy_workflow\.mjs --repository pull-request/);
+  assert.match(policyEnforcement, /printf '%s' "\$TRUSTED_EVENT_JSON" > "\$event_file"/);
+  assert.match(policyEnforcement, /node trusted-policy\/github_policy_ci\.mjs "\$event_file" pull-request/);
   assert.doesNotMatch(policyEnforcement, /ATTRIBUTION_EXCEPTION|DCO_REQUIRED|TOPOLOGY_EXCEPTION/);
   assert.doesNotMatch(policyEnforcement, /secrets\.|TRUSTED_POLICY_TOKEN/);
 });
