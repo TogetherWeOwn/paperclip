@@ -2,6 +2,7 @@ name: PR
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, edited]
 
 permissions:
   actions: read
@@ -12,4 +13,6 @@ jobs:
   ci:
     # Execute the reviewed reusable workflow from its immutable published SHA;
     # never trust a workflow implementation from the pull request checkout.
-    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@126fbcb3dd7875e309be8193c6fc22dae1def088
+    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@REPIN_CURRENT_MERGE_TREE
+    secrets:
+      TRUSTED_POLICY_TOKEN: ${{ secrets.TRUSTED_POLICY_TOKEN }}
