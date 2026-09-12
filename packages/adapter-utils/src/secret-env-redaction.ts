@@ -93,3 +93,106 @@ export function redactKnownSecretEnvValues(
   }
   return result;
 }
+
+export type SecretEnvRedactionStream = {
+  /** Redact a chunk, holding back a bounded tail that may start a secret. */
+  push(chunk: string): string;
+  /** Emit whatever is still held back once the stream has ended. */
+  flush(): string;
+};
+
+/**
+ * Redacting each chunk independently misses a secret that straddles a chunk
+ * boundary: a child writing more than one pipe buffer of output (`printenv` on
+ * a large env, say) can split a value across two `data` events, and neither
+ * half matches on its own, so the secret lands in the log verbatim.
+ *
+ * This keeps the trailing `longestSecret - 1` characters back until the next
+ * chunk arrives, so a straddling value is matched once its second half shows
+ * up. The held-back tail is bounded by the longest denylisted value and is
+ * released by `flush()` at stream end.
+ */
+export function createSecretEnvRedactionStream(
+  secretValues: readonly string[],
+  redactedValue: string = REDACTED_SECRET_ENV_VALUE,
+): SecretEnvRedactionStream {
+  const values = [...new Set(secretValues)].sort((a, b) => b.length - a.length);
+  if (values.length === 0) {
+    return { push: (chunk) => chunk, flush: () => "" };
+  }
+
+  const matchers = values.map((value) => {
+    const fallback = new Uint32Array(value.length);
+    for (let i = 1, matched = 0; i < value.length; i += 1) {
+      while (matched > 0 && value[i] !== value[matched]) {
+        matched = fallback[matched - 1] ?? 0;
+      }
+      if (value[i] === value[matched]) matched += 1;
+      fallback[i] = matched;
+    }
+    return { value, fallback };
+  });
+  const maxSecretLength = values[0]?.length ?? 0;
+  let carry = "";
+  return {
+    push(chunk: string): string {
+      if (!chunk) return "";
+      const combined = carry + chunk;
+      const scanStart = Math.max(0, combined.length - (maxSecretLength * 2 - 2));
+      const scanText = combined.slice(scanStart);
+      const unsafeBoundaryDiff = new Int32Array(scanText.length + 1);
+      const suffixMatches: Array<{ fallback: Uint32Array; length: number }> = [];
+
+      for (const { value, fallback } of matchers) {
+        let matched = 0;
+        for (let i = 0; i < scanText.length; i += 1) {
+          while (matched > 0 && scanText[i] !== value[matched]) {
+            matched = fallback[matched - 1] ?? 0;
+          }
+          if (scanText[i] === value[matched]) matched += 1;
+          if (matched !== value.length) continue;
+
+          // A carry boundary inside a complete match would emit its prefix
+          // unredacted. Mark those interior boundaries as unsafe, including
+          // overlapping matches, then continue from the match's longest border.
+          const matchStart = i - value.length + 1;
+          unsafeBoundaryDiff[matchStart + 1] += 1;
+          unsafeBoundaryDiff[i + 1] -= 1;
+          matched = fallback[matched - 1] ?? 0;
+        }
+        suffixMatches.push({ fallback, length: matched });
+      }
+
+      const unsafeBoundaries = new Int32Array(scanText.length + 1);
+      for (let i = 0, active = 0; i < unsafeBoundaryDiff.length; i += 1) {
+        active += unsafeBoundaryDiff[i] ?? 0;
+        unsafeBoundaries[i] = active;
+      }
+
+      let carryStart = combined.length;
+      for (const { fallback, length: longestSuffix } of suffixMatches) {
+        let length = longestSuffix;
+        while (length > 0) {
+          const start = combined.length - length;
+          if ((unsafeBoundaries[start - scanStart] ?? 0) === 0) {
+            carryStart = Math.min(carryStart, start);
+            break;
+          }
+          length = fallback[length - 1] ?? 0;
+        }
+      }
+
+      carry = combined.slice(carryStart);
+      return redactKnownSecretEnvValues(
+        combined.slice(0, carryStart),
+        values,
+        redactedValue,
+      );
+    },
+    flush(): string {
+      const remaining = redactKnownSecretEnvValues(carry, values, redactedValue);
+      carry = "";
+      return remaining;
+    },
+  };
+}

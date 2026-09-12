@@ -13,7 +13,10 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
-import { collectKnownSecretEnvValues, redactKnownSecretEnvValues } from "./secret-env-redaction.js";
+import {
+  collectKnownSecretEnvValues,
+  createSecretEnvRedactionStream,
+} from "./secret-env-redaction.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
@@ -4623,7 +4626,12 @@ export async function runChildProcess(
         // because a command like `printenv` or `env` echoed them. Collected
         // once per spawn from the actual child env, not learned from any
         // corpus of captured/leaked values.
+        // Streaming (not per-chunk) so a value split across a pipe-buffer
+        // boundary is still caught; stdout and stderr each need their own
+        // carry buffer.
         const knownSecretEnvValues = collectKnownSecretEnvValues(childEnv);
+        const stdoutRedaction = createSecretEnvRedactionStream(knownSecretEnvValues);
+        const stderrRedaction = createSecretEnvRedactionStream(knownSecretEnvValues);
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -4663,8 +4671,8 @@ export async function runChildProcess(
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
-        let terminalResultStdoutScanOffset = 0;
-        let terminalResultStderrScanOffset = 0;
+        let terminalResultStdoutScanBuffer = "";
+        let terminalResultStderrScanBuffer = "";
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -4673,34 +4681,32 @@ export async function runChildProcess(
           terminalCleanupKillTimer = null;
         };
 
-        const maybeArmTerminalResultCleanup = () => {
+        const maybeArmTerminalResultCleanup = (
+          stream?: "stdout" | "stderr",
+          text = "",
+        ) => {
           const terminalCleanup = opts.terminalResultCleanup;
           if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
           if (!terminalResultSeen) {
-            const stdoutStart = Math.max(
-              0,
-              terminalResultStdoutScanOffset -
-                TERMINAL_RESULT_SCAN_OVERLAP_CHARS,
-            );
-            const stderrStart = Math.max(
-              0,
-              terminalResultStderrScanOffset -
-                TERMINAL_RESULT_SCAN_OVERLAP_CHARS,
-            );
-            const scanOutput = {
-              stdout: stdout.slice(stdoutStart),
-              stderr: stderr.slice(stderrStart),
-            };
-            terminalResultStdoutScanOffset = stdout.length;
-            terminalResultStderrScanOffset = stderr.length;
+            if (stream === "stdout" && text) {
+              terminalResultStdoutScanBuffer = (
+                terminalResultStdoutScanBuffer + text
+              ).slice(-TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
+            } else if (stream === "stderr" && text) {
+              terminalResultStderrScanBuffer = (
+                terminalResultStderrScanBuffer + text
+              ).slice(-TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
+            }
             if (
-              scanOutput.stdout.length === 0 &&
-              scanOutput.stderr.length === 0
+              terminalResultStdoutScanBuffer.length === 0 &&
+              terminalResultStderrScanBuffer.length === 0
             )
               return;
             try {
-              terminalResultSeen =
-                terminalCleanup.hasTerminalResult(scanOutput);
+              terminalResultSeen = terminalCleanup.hasTerminalResult({
+                stdout: terminalResultStdoutScanBuffer,
+                stderr: terminalResultStderrScanBuffer,
+              });
             } catch (err) {
               onLogError(
                 err,
@@ -4750,11 +4756,11 @@ export async function runChildProcess(
           const readable = child.stdout;
           if (!readable) return;
           readable.pause();
-          const text = redactKnownSecretEnvValues(String(chunk), knownSecretEnvValues);
+          const text = stdoutRedaction.push(String(chunk));
           stdout = appendWithCap(stdout, text);
-          maybeArmTerminalResultCleanup();
+          maybeArmTerminalResultCleanup("stdout", text);
           logChain = logChain
-            .then(() => opts.onLog("stdout", text))
+            .then(() => (text ? opts.onLog("stdout", text) : undefined))
             .catch((err) =>
               onLogError(err, runId, "failed to append stdout log chunk"),
             )
@@ -4764,15 +4770,29 @@ export async function runChildProcess(
             });
         });
 
+        // Release the boundary-straddle carry buffer once the stream ends, so
+        // the tail of the output is not silently dropped.
+        child.stdout?.on("end", () => {
+          const text = stdoutRedaction.flush();
+          if (!text) return;
+          stdout = appendWithCap(stdout, text);
+          maybeArmTerminalResultCleanup("stdout", text);
+          logChain = logChain
+            .then(() => opts.onLog("stdout", text))
+            .catch((err) =>
+              onLogError(err, runId, "failed to append stdout log chunk"),
+            );
+        });
+
         child.stderr?.on("data", (chunk: unknown) => {
           const readable = child.stderr;
           if (!readable) return;
           readable.pause();
-          const text = redactKnownSecretEnvValues(String(chunk), knownSecretEnvValues);
+          const text = stderrRedaction.push(String(chunk));
           stderr = appendWithCap(stderr, text);
-          maybeArmTerminalResultCleanup();
+          maybeArmTerminalResultCleanup("stderr", text);
           logChain = logChain
-            .then(() => opts.onLog("stderr", text))
+            .then(() => (text ? opts.onLog("stderr", text) : undefined))
             .catch((err) =>
               onLogError(err, runId, "failed to append stderr log chunk"),
             )
@@ -4780,6 +4800,18 @@ export async function runChildProcess(
               maybeArmTerminalResultCleanup();
               resumeReadable(readable);
             });
+        });
+
+        child.stderr?.on("end", () => {
+          const text = stderrRedaction.flush();
+          if (!text) return;
+          stderr = appendWithCap(stderr, text);
+          maybeArmTerminalResultCleanup("stderr", text);
+          logChain = logChain
+            .then(() => opts.onLog("stderr", text))
+            .catch((err) =>
+              onLogError(err, runId, "failed to append stderr log chunk"),
+            );
         });
 
         const stdin = child.stdin;

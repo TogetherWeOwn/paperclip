@@ -630,6 +630,40 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("DATABASE_URL=x");
   });
 
+  it("redacts a secret that straddles a stdout chunk boundary", async () => {
+    const loggedChunks: string[] = [];
+    const secretValue = "postgres://user:p4ssw0rd@db.internal:5432/paperclip";
+    // Push the secret across a pipe-buffer boundary, so it arrives split over
+    // two "data" events and no single chunk contains it whole.
+    const fillerLength = 65536 - 20;
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        `process.stdout.write("A".repeat(${fillerLength}) + process.env.DATABASE_URL + "\\ntail\\n");`,
+      ],
+      {
+        cwd: process.cwd(),
+        env: { DATABASE_URL: secretValue },
+        timeoutSec: 15,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => {
+          loggedChunks.push(chunk);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain(secretValue);
+    expect(loggedChunks.join("")).not.toContain(secretValue);
+    // The surrounding output must survive intact: redaction must not silently
+    // truncate the tail that the carry buffer held back.
+    expect(result.stdout).toContain("***REDACTED***");
+    expect(result.stdout.endsWith("\ntail\n")).toBe(true);
+    expect(result.stdout).toBe("A".repeat(fillerLength) + "***REDACTED***\ntail\n");
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();

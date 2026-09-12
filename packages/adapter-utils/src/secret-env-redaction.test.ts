@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   collectKnownSecretEnvValues,
+  createSecretEnvRedactionStream,
   KNOWN_SECRET_ENV_VAR_NAMES,
   redactKnownSecretEnvValues,
 } from "./secret-env-redaction.js";
@@ -63,5 +64,64 @@ describe("redactKnownSecretEnvValues", () => {
   it("is a no-op when there is nothing to redact", () => {
     expect(redactKnownSecretEnvValues("hello world", [])).toBe("hello world");
     expect(redactKnownSecretEnvValues("", ["x-secret-value"])).toBe("");
+  });
+});
+
+describe("createSecretEnvRedactionStream", () => {
+  const SECRET = "postgres://user:p4ssw0rd@db.internal:5432/paperclip";
+
+  it("redacts a secret split across two chunks", () => {
+    const stream = createSecretEnvRedactionStream([SECRET]);
+    const split = 20;
+    const out =
+      stream.push("head " + SECRET.slice(0, split)) +
+      stream.push(SECRET.slice(split) + " tail") +
+      stream.flush();
+    expect(out).not.toContain(SECRET);
+    expect(out).toBe("head ***REDACTED*** tail");
+  });
+
+  it("redacts a secret split one character at a time", () => {
+    const stream = createSecretEnvRedactionStream([SECRET]);
+    let out = "";
+    for (const ch of "x" + SECRET + "y") out += stream.push(ch);
+    out += stream.flush();
+    expect(out).not.toContain(SECRET);
+    expect(out).toBe("x***REDACTED***y");
+  });
+
+  it("does not drop, duplicate or reorder output when nothing matches", () => {
+    const stream = createSecretEnvRedactionStream([SECRET]);
+    const chunks = ["alpha ", "beta ", "gamma ", "delta"];
+    let out = "";
+    for (const chunk of chunks) out += stream.push(chunk);
+    out += stream.flush();
+    expect(out).toBe(chunks.join(""));
+  });
+
+  it("does not split a complete match when its suffix is also a secret prefix", () => {
+    const stream = createSecretEnvRedactionStream(["abcabc"]);
+    const out = stream.push("abcabc") + stream.flush();
+    expect(out).toBe("***REDACTED***");
+  });
+
+  it("retains a shorter safe suffix when a longer candidate crosses a match", () => {
+    const secret = "AAABAAA";
+    const stream = createSecretEnvRedactionStream([secret]);
+    const out = stream.push("AAABAAAA") + stream.push("AABAAA") + stream.flush();
+    expect(out).not.toContain(secret);
+    expect(out).toBe("***REDACTED******REDACTED***");
+  });
+
+  it("passes chunks straight through when there are no secrets", () => {
+    const stream = createSecretEnvRedactionStream([]);
+    expect(stream.push("anything at all")).toBe("anything at all");
+    expect(stream.flush()).toBe("");
+  });
+
+  it("holds back no more than the longest secret", () => {
+    const stream = createSecretEnvRedactionStream([SECRET]);
+    const emitted = stream.push("z".repeat(10_000));
+    expect(10_000 - emitted.length).toBeLessThan(SECRET.length);
   });
 });
