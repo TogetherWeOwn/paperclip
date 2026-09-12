@@ -13,6 +13,6 @@ jobs:
   ci:
     # Execute the reviewed reusable workflow from its immutable published SHA;
     # never trust a workflow implementation from the pull request checkout.
-    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@a8e219e83323f7e634111e9862442f008a23dfc0
+    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@5cd12a3cec606b9a3f0316d0450392b98281a51a
     secrets:
       TRUSTED_POLICY_TOKEN: ${{ secrets.TRUSTED_POLICY_TOKEN }}
