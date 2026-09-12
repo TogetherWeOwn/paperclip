@@ -18,7 +18,7 @@ test('keeps every policy command in the pull request checkout', () => {
   assert.match(workflow, /defaults:\n\s+run:\n\s+working-directory: pull-request/);
 });
 
-test('pins the trusted policy and leaves the unpublished caller fail-closed', () => {
+test('pins both published trusted revisions by immutable SHA', () => {
   assert.match(workflow, /ref: 2585661e7c2a5be1d9d6cda26e12bc6eab8ea67e/);
-  assert.match(caller, /pr-trusted\.yml@TRUSTED_WORKFLOW_REVISION/);
+  assert.match(caller, /TogetherWeOwn\/paperclip\/.github\/workflows\/pr-trusted\.yml@3f1772f2cfe60baf37fc8665375ba7953cf277f7/);
 });
