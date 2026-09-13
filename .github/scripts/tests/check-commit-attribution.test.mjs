@@ -25,6 +25,11 @@ test('rejects unapproved author identity', () => {
   assert.equal(checkCommits([{ ...valid, author: { name: 'Other', email: 'other@example.com' } }]).passed, false);
 });
 
+test('rejects a forged committer on an otherwise canonical company commit', () => {
+  const forged = { ...valid, author: { name: 'Rick7C2', email: 'rick.dugger@gmail.com' }, committer: { name: 'Mallory', email: 'mallory@example.com' } };
+  assert.equal(checkCommits([forged]).passed, false);
+});
+
 test('rejects internal sign-off unless DCO is enabled', () => {
   const commit = { ...valid, message: `${valid.message}\nSigned-off-by: Rick7C2 <rick.dugger@gmail.com>` };
   assert.equal(checkCommits([commit]).passed, false);

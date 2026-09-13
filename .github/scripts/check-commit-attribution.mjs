@@ -2,6 +2,7 @@
 import { fileURLToPath } from 'node:url';
 
 export const COMPANY_AUTHOR = 'Rick7C2 <rick.dugger@gmail.com>';
+export const COMPANY_BOT_COMMITTER = 'TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>';
 export const COMPANY_COAUTHOR = 'Co-Authored-By: TogetherWeOwn <319968614+togetherweown[bot]@users.noreply.github.com>';
 const forbiddenIdentity = /(?:paperclip|claude|anthropic|openai|chatgpt|codex|gemini|copilot|cursor|gpt[- ]?\d|sonnet|opus|haiku|llama|mistral|deepseek)/i;
 
@@ -11,8 +12,12 @@ export function checkCommitAttribution(commit, options = {}) {
   const coauthors = String(commit.message ?? '').split(/\r?\n/).filter((line) => /^co-authored-by:/i.test(line.trim()));
   const dependencyException = options.allowPreservedAuthorship === true;
 
+  const committer = `${commit.committer?.name ?? ''} <${commit.committer?.email ?? ''}>`;
   if (!dependencyException && author !== COMPANY_AUTHOR) {
     failures.push(`${commit.sha}: author must be ${COMPANY_AUTHOR}.`);
+  }
+  if (!dependencyException && committer !== COMPANY_AUTHOR && committer !== COMPANY_BOT_COMMITTER) {
+    failures.push(`${commit.sha}: committer must be ${COMPANY_AUTHOR} or ${COMPANY_BOT_COMMITTER}.`);
   }
   if (!dependencyException && (coauthors.length !== 1 || coauthors[0] !== COMPANY_COAUTHOR)) {
     failures.push(`${commit.sha}: commit must contain exactly one trailer: ${COMPANY_COAUTHOR}`);
