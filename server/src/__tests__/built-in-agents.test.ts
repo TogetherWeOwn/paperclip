@@ -647,7 +647,11 @@ describeEmbeddedPostgres("built-in agents", () => {
       title: "Review recent agent trajectories for coaching proposals",
       status: "paused",
       assigneeAgentId: state.agentId,
+      // TOG-2397: must fall through to the company's real default responsible
+      // user, not the synthetic actor id used internally to create the routine.
+      responsibleUserId: "responsible-user",
     });
+    expect(routine!.responsibleUserId).not.toBe("built-in-bundles");
     const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
     expect(trigger).toMatchObject({
       kind: "schedule",

@@ -1284,7 +1284,13 @@ export function builtInAgentService(db: Db) {
 
   async function createOrResetRoutine(agent: Agent, definition: BuiltInAgentDefinition, existing: Routine | null, mode: "reconcile" | "reset") {
     const routine = definition.bundle!.routine;
-    const actor = { agentId: null, userId: "built-in-bundles" };
+    // `userId: null` (not a fabricated sentinel) so responsibleUserId resolution
+    // falls through to the company's real default responsible user. A synthetic
+    // id like "built-in-bundles" is not a row in `user`, so every authorization
+    // check that intersects with the responsible user (e.g. posting an issue
+    // comment) denies with RESPONSIBLE_USER_UNAVAILABLE for every run this
+    // routine ever spawns — see TOG-2397.
+    const actor = { agentId: null, userId: null };
     const nextRoutine = existing
       ? await routineSvc.update(existing.id, {
         title: routine.title,
