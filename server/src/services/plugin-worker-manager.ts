@@ -544,6 +544,15 @@ interface ActiveInvocation {
   // when no startup span is active. The span host handler reads it to mint the
   // parentage, so a worker never supplies the parent itself.
   traceparent?: string;
+  // True for an invocation minted by notify() for a fire-and-forget onEvent
+  // delivery. It exists only so a call the worker makes from inside that
+  // notification's handler can echo it back via paperclipInvocationId; unlike
+  // a call-path invocation it is never settled early and lives out its full
+  // TTL (MAX_RPC_TIMEOUT_MS). On a board with frequent subscribed events this
+  // Map is then rarely empty, so a soft entry must not itself justify denying
+  // an unrelated, later, genuinely proactive call (e.g. a scheduled job's
+  // companies.list()) via the activeInvocations.size fallback below.
+  soft?: boolean;
 }
 
 /**
@@ -1139,7 +1148,11 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    ttlMs?: number,
+    soft = false,
+  ): PluginInvocationContext {
     // Mint a W3C `traceparent` from the active startup span, so the worker's
     // provider span can parent to it. The host keeps the value on its own record
     // (below) and never trusts the worker to supply the parent. Outside a
@@ -1153,7 +1166,7 @@ export function createPluginWorkerHandle(
       scope,
       ...(traceparent ? { traceparent } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent };
+    const entry: ActiveInvocation = { scope, traceparent, soft };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -2682,7 +2695,16 @@ export function createPluginWorkerHandle(
       if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
         return { invocationScope: { companyId: proactiveCompanyId } };
       }
-      const hasActiveInvocation = activeInvocations.size > 0 ||
+      // Only a "hard" invocation — one registered for a host→worker call
+      // still awaiting its response — should make an unrelated proactive
+      // call look like it's happening inside someone else's invocation.
+      // A `soft` (notify-path) entry is fire-and-forget bookkeeping with a
+      // long TTL and no early-clear; on a board with frequent subscribed
+      // events (e.g. issue.updated) activeInvocations is then rarely empty,
+      // which used to deny an unrelated scheduled job's very first proactive
+      // call (companies.list()) purely because of stale onEvent bookkeeping
+      // on the same worker handle.
+      const hasActiveInvocation = Array.from(activeInvocations.values()).some((entry) => !entry.soft) ||
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
       return hasActiveInvocation ? { invalidInvocationScope: true } : {};
     }
@@ -3463,7 +3485,13 @@ export function createPluginWorkerHandle(
       // Notifications have no response to settle on, so the invocation scope
       // is GC'd by TTL. Call-path invocations are registered without a TTL and
       // cleared on settlement, so they survive arbitrarily long call timeouts.
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      // Marked `soft`: it must remain resolvable by id (so a call the worker
+      // makes from inside this notification's handler still echoes it back
+      // correctly), but must not itself count toward hasActiveInvocation's
+      // proactive-call gate — see the `soft` field on ActiveInvocation.
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS, true)
+        : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
