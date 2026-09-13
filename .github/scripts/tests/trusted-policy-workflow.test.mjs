@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const workflow = await readFile(new URL('../../workflows/pr-trusted.yml', import.meta.url), 'utf8');
 const caller = await readFile(new URL('../../workflows/pr.yml', import.meta.url), 'utf8');
 
@@ -59,4 +63,51 @@ test('pins the reusable workflow and corrected trusted checker by immutable SHA'
     /TRUSTED_POLICY_PIN: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/,
   );
   assert.match(caller, /TogetherWeOwn\/paperclip\/\.github\/workflows\/pr-trusted\.yml@[0-9a-f]{40}/);
+});
+
+test('the caller actually resolves to a commit whose checker pin is corrected', () => {
+  // TOG-2390: a caller SHA can be "some 40-hex string" while still pointing at
+  // the pre-fix pr-trusted.yml — the earlier version of this test only checked
+  // the shape of the pin, not what it resolves to. Fetch the exact blob the
+  // caller's immutable ref names and assert the checker ref/pin it contains
+  // are the corrected values, not the vulnerable ones.
+  const callerRef = caller.match(
+    /uses: TogetherWeOwn\/paperclip\/\.github\/workflows\/pr-trusted\.yml@([0-9a-f]{40})/,
+  )?.[1];
+  assert.ok(callerRef, 'caller must pin pr-trusted.yml to a 40-hex SHA');
+
+  const resolvedWorkflow = execFileSync(
+    'git',
+    ['-C', repoRoot, 'show', `${callerRef}:.github/workflows/pr-trusted.yml`],
+    { encoding: 'utf8' },
+  );
+
+  assert.match(
+    resolvedWorkflow,
+    /ref: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/,
+    `caller pin ${callerRef} must resolve to a pr-trusted.yml with the corrected checkout ref`,
+  );
+  assert.match(
+    resolvedWorkflow,
+    /TRUSTED_POLICY_PIN: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/,
+    `caller pin ${callerRef} must resolve to a pr-trusted.yml with the corrected TRUSTED_POLICY_PIN`,
+  );
+  assert.doesNotMatch(
+    resolvedWorkflow,
+    /3552145dbb3e57bd5d65e18025d9ab737019d550/,
+    `caller pin ${callerRef} must not resolve to a pr-trusted.yml still carrying the vulnerable checker pin`,
+  );
+});
+
+test('positive control: a stale caller pin is caught by the resolution check', () => {
+  // Proves the previous test is not vacuous: pinning the caller to the
+  // pre-fix commit (the actual TOG-2386 bypass) must fail resolution.
+  const stalePin = '43cd4ff932a884fcb672d96017070b3b25e42652';
+  const resolvedWorkflow = execFileSync(
+    'git',
+    ['-C', repoRoot, 'show', `${stalePin}:.github/workflows/pr-trusted.yml`],
+    { encoding: 'utf8' },
+  );
+  assert.match(resolvedWorkflow, /ref: 3552145dbb3e57bd5d65e18025d9ab737019d550/);
+  assert.doesNotMatch(resolvedWorkflow, /ref: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/);
 });
