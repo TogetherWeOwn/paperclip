@@ -52,11 +52,11 @@ test('covers metadata edits and rejects checker substitution paths', () => {
 test('pins the reusable workflow and corrected trusted checker by immutable SHA', () => {
   assert.match(
     workflow,
-    /ref: 3552145dbb3e57bd5d65e18025d9ab737019d550/,
+    /ref: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/,
   );
   assert.match(
     workflow,
-    /TRUSTED_POLICY_PIN: 3552145dbb3e57bd5d65e18025d9ab737019d550/,
+    /TRUSTED_POLICY_PIN: bbe53af536017fa3509f869dc7ff7feb76e8cb3f/,
   );
   assert.match(caller, /TogetherWeOwn\/paperclip\/\.github\/workflows\/pr-trusted\.yml@[0-9a-f]{40}/);
 });
