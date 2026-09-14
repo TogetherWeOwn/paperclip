@@ -12,6 +12,13 @@ permissions:
   checks: write
   contents: read
 
+# A rapid synchronize burst on one PR would otherwise queue redundant
+# bot-review runs; cancel the superseded one since the job re-evaluates
+# full PR state each time regardless.
+concurrency:
+  group: commitperclip-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
