@@ -19,6 +19,15 @@ permissions:
   packages: write
   id-token: write   # cosign keyless OIDC
 
+# Cancel a superseded push-triggered build (rapid pushes to the path-filtered
+# docker/agent-runtime/** tree would otherwise queue redundant 6-image
+# multi-arch cosign builds). Never cancel a workflow_dispatch run — each one
+# carries its own explicit version tag and is a deliberate, infrequent manual
+# build that should always complete.
+concurrency:
+  group: agent-runtime-images-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io/paperclipai
   VERSION: ${{ github.event.inputs.version || format('git-{0}', github.sha) }}
