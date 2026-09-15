@@ -82,6 +82,7 @@ import {
   type AcpRuntimeEvent,
   type AcpRuntimeHandle,
   type AcpRuntimeOptions,
+  type AcpSessionStore,
   type AcpRuntimeStatus,
   type AcpRuntimeTurn,
   type AcpRuntimeTurnResult,
@@ -4020,6 +4021,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         processIdentitySink.current = ctx.onSpawn;
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
+        const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
+        const withoutPersistedSessionEnv = <T extends Awaited<ReturnType<AcpSessionStore["load"]>>>(
+          record: T,
+        ): T => {
+          if (!record?.acpx?.session_options?.env) return record;
+          const sessionOptions = { ...record.acpx.session_options };
+          delete sessionOptions.env;
+          return {
+            ...record,
+            acpx: {
+              ...record.acpx,
+              session_options: sessionOptions,
+            },
+          };
+        };
+        const runtimeStore: AcpSessionStore = {
+          async load(id) {
+            return withoutPersistedSessionEnv(await persistedRuntimeStore.load(id));
+          },
+          save(record) {
+            return persistedRuntimeStore.save(withoutPersistedSessionEnv(record));
+          },
+        };
         const runtimeOptions: PaperclipAcpRuntimeOptions = {
           cwd: prepared.cwd,
           // Host-only spawn cwd for the relay proxy on the remote process-session
@@ -4028,7 +4052,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // fingerprint / compat key are unaffected — this redirects ONLY the host
           // `spawn()` `chdir`, not the in-sandbox data path.
           spawnCwd: prepared.hostSpawnCwd,
-          sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
+          sessionStore: runtimeStore,
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,
           nonInteractivePermissions: prepared.nonInteractivePermissions,
@@ -4038,6 +4062,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // and custom agents already emit their own per-tool output and don't
           // benefit from doubling the log volume.
           verbose: prepared.acpxAgent === "claude",
+          // ACPX snapshots this child-only overlay at runtime construction and
+          // reuses it for reconnects without writing it into session records.
+          // A rotated adapter secret changes the session fingerprint, so this
+          // runtime is recreated with a fresh snapshot before the next spawn.
+          agentProcessEnv: { ...prepared.env },
           // The engine passes a complete, sanitized launch environment. ACPX
           // must not merge the Paperclip server's ambient environment back in
           // when it spawns the provider child.
@@ -4163,7 +4192,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                       mode: prepared.mode,
                       cwd: prepared.cwd,
                       resumeSessionId,
-                      sessionOptions: { env: prepared.env },
                     }),
                   fence: handshakeFence,
                   isTransportLost: isHandshakeTransportLost,
@@ -4201,7 +4229,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                       agent: prepared.acpxAgent,
                       mode: prepared.mode,
                       cwd: prepared.cwd,
-                      sessionOptions: { env: prepared.env },
                     }),
                   fence: handshakeFence,
                   isTransportLost: isHandshakeTransportLost,

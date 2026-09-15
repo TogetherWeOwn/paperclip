@@ -20,7 +20,7 @@ patchedDependencies:
     hash: jb7mkuk6elgpjomlxcdukdpiyy
     path: patches/@agentclientprotocol__codex-acp@1.6.2.patch
   acpx@0.12.0:
-    hash: b2ggqg6aj4hdob4whk6vq6jmc4
+    hash: 2llvgm767rnmgi3b3h66zdu6ii
     path: patches/acpx@0.12.0.patch
   acpx@0.13.1:
     hash: lzpwjtiaybzoijy455dfycwavu
@@ -135,7 +135,7 @@ importers:
         version: link:../shared
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=b2ggqg6aj4hdob4whk6vq6jmc4)
+        version: 0.12.0(patch_hash=2llvgm767rnmgi3b3h66zdu6ii)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -12331,7 +12331,7 @@ snapshots:
 
   acorn@8.18.0: {}
 
-  acpx@0.12.0(patch_hash=b2ggqg6aj4hdob4whk6vq6jmc4):
+  acpx@0.12.0(patch_hash=2llvgm767rnmgi3b3h66zdu6ii):
     dependencies:
       '@agentclientprotocol/sdk': 1.2.1(zod@4.4.3)
       commander: 15.0.0

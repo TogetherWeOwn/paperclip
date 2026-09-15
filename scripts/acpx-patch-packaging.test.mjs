@@ -38,6 +38,10 @@ const dbPackage = JSON.parse(
 const releaseScript = await readFile(new URL("./release.sh", import.meta.url), "utf8");
 const releaseLib = await readFile(new URL("./release-lib.sh", import.meta.url), "utf8");
 const buildNpmScript = await readFile(new URL("./build-npm.sh", import.meta.url), "utf8");
+const acpxAdapterUtilsPatch = await readFile(
+  new URL("../patches/acpx@0.12.0.patch", import.meta.url),
+  "utf8",
+);
 const acpxRuntimePatch = await readFile(
   new URL("../patches/acpx@0.13.1.patch", import.meta.url),
   "utf8",
@@ -57,6 +61,13 @@ test("published packages preserve the patched ACPX runtime", () => {
     "patches/acpx@0.13.1.patch",
   );
   assert.equal(adapterUtilsPackage.dependencies.acpx, "0.12.0");
+  for (const marker of [
+    "agentProcessEnv",
+    "validateAgentProcessEnv",
+    "agentProcessEnv: { ...options.agentProcessEnv }",
+    "agentProcessEnv: this.options.agentProcessEnv",
+    "agentProcessEnv: options.agentProcessEnv",
+  ]) assert.match(acpxAdapterUtilsPatch, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.deepEqual(adapterUtilsPackage.bundleDependencies, ["acpx"]);
   assert.equal(serverPackage.dependencies.acpx, "0.13.1");
   assert.deepEqual(serverPackage.bundleDependencies, ["acpx"]);

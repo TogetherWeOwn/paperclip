@@ -2047,21 +2047,25 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.readFile(path.join(stateDir, "run-stderr", "run-warm-2.log"), "utf8")).resolves.toContain("current-run-stderr");
   });
 
-  it("passes Paperclip env through ACPX session options instead of process.env", async () => {
-    let observedSessionEnv: Record<string, string> | undefined;
+  it("passes Paperclip env through ACPX agentProcessEnv instead of process.env", async () => {
+    let observedRuntimeEnv: Record<string, string> | undefined;
+    let observedSessionOptions: unknown;
     const execute = createAcpxEngineExecutor({
-      createRuntime: () => ({
-        ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
-          observedSessionEnv = input.sessionOptions?.env;
-          return { backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" };
-        },
-        startTurn: () => ({
-          events: (async function* () { yield { type: "done", stopReason: "end_turn" }; })(),
-          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
-          cancel: async () => {},
-        }),
-        close: async () => {},
-      }) as never,
+      createRuntime: (options) => {
+        observedRuntimeEnv = options.agentProcessEnv;
+        return {
+          ensureSession: async (input: { sessionOptions?: unknown }) => {
+            observedSessionOptions = input.sessionOptions;
+            return { backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" };
+          },
+          startTurn: () => ({
+            events: (async function* () { yield { type: "done", stopReason: "end_turn" }; })(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {},
+        } as never;
+      },
     });
     const previousApiKey = process.env.PAPERCLIP_API_KEY;
     try {
@@ -2077,7 +2081,8 @@ describe("shared ACPX engine runtime behavior", () => {
         onMeta: async () => {},
       } as never);
       expect(result.exitCode).toBe(0);
-      expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedRuntimeEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedSessionOptions).toBeUndefined();
       expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
     } finally {
       if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
@@ -2239,6 +2244,71 @@ describe("shared ACPX engine runtime behavior", () => {
     );
 
     expect(await pathExists(path.join(cwd, ".claude", "settings.local.json"))).toBe(false);
+  });
+
+  it("strips legacy persisted session env on load and save while keeping the current overlay transient", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+    const execute = createAcpxEngineExecutor({
+      createRuntime: (options) => {
+        runtimeOptions = options;
+        return buildRuntime() as never;
+      },
+    });
+
+    const result = await execute({
+      runId: "run-secret-store",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        env: { CURRENT_SECRET: "current-secret-value" },
+      },
+      context: {},
+      authToken: "current-run-token",
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+    expect(result.exitCode).toBe(0);
+
+    const legacySecret = "legacy-secret-value";
+    const legacy = {
+      schema: "acpx.session.v1",
+      acpxRecordId: "legacy-record",
+      acpSessionId: "legacy-session",
+      agentCommand: "node ./fake-acp.js",
+      cwd: root,
+      name: "legacy-record",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      lastSeq: 0,
+      eventLog: { active_path: "unused", segment_count: 0, max_segment_bytes: 1, max_segments: 1 },
+      closed: false,
+      title: null,
+      messages: [],
+      updated_at: "2026-01-01T00:00:00.000Z",
+      cumulative_token_usage: {},
+      cumulative_cost: null,
+      request_token_usage: {},
+      acpx: { session_options: { env: { LEGACY_SECRET: legacySecret }, model: "kept-model" } },
+    } as never;
+    await runtimeOptions!.sessionStore.save(legacy);
+
+    const sessionPath = path.join(stateDir, "sessions", "legacy-record.json");
+    const savedText = await fs.readFile(sessionPath, "utf8");
+    expect(savedText).not.toContain(legacySecret);
+    expect(savedText).not.toContain("LEGACY_SECRET");
+    expect(savedText).toContain("kept-model");
+    const loaded = await runtimeOptions!.sessionStore.load("legacy-record");
+    expect(loaded?.acpx?.session_options?.env).toBeUndefined();
+    expect(runtimeOptions!.agentProcessEnv).toMatchObject({
+      CURRENT_SECRET: "current-secret-value",
+      PAPERCLIP_API_KEY: "current-run-token",
+    });
+    expect(JSON.stringify(runtimeOptions)).not.toContain(legacySecret);
   });
 
   it("changes the ACPX session fingerprint when the resolved secret manifest rotates", async () => {

@@ -1,16 +1,7 @@
 diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
-index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73ee2ad1626 100644
+index 243c9d1..4b4ea19 100644
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
-@@ -1532,7 +1532,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
- 	"RedactedThinking",
- 	"ToolUse"
- ]);
--const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results"]);
-+const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results", "acpx.session_options.env"]);
- const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
- 	"agent_capabilities",
- 	"messages.Agent.content.ToolUse.input",
 @@ -2557,7 +2557,7 @@ function readCommandLineChar(state) {
  		escaping: false,
  		hasPart: true
@@ -20,65 +11,63 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  		current: state.current,
  		quote: state.quote,
  		escaping: true,
-@@ -2914,15 +2914,15 @@
+@@ -2912,14 +2912,20 @@ function promotePrefixedAuthEnvironment(env) {
+ 	}
+ 	return protectedKeys;
  }
 -function buildAgentEnvironment(authCredentials, sessionEnv) {
 -	const env = { ...process.env };
--	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
--	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
--		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
--		assignAuthCredentialEnv(env, methodId, credential);
--	}
--	if (sessionEnv) for (const [key, value] of Object.entries(sessionEnv)) {
--		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
--		assignSessionEnv(env, key, value);
--	}
--	return env;
--}
-+function buildAgentEnvironment(authCredentials, sessionEnv, inheritProcessEnv = true) {
-+	const env = inheritProcessEnv ? { ...process.env } : {};
-+	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
-+	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
-+		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
-+		assignAuthCredentialEnv(env, methodId, credential);
++function validateAgentProcessEnv(agentProcessEnv) {
++	for (const [key, value] of Object.entries(agentProcessEnv ?? {})) {
++		if (typeof value !== "string" || key.includes("=") || key.includes("\0") || value.includes("\0")) throw new Error("Invalid agentProcessEnv: environment entries cannot contain NUL or names with '='");
 +	}
-+	if (sessionEnv) for (const [key, value] of Object.entries(sessionEnv)) {
-+		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
-+		assignSessionEnv(env, key, value);
-+	}
-+	return env;
 +}
- function assignSessionEnv(env, key, value) {
-@@ -2957,14 +2957,14 @@
++function buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv = true) {
++	validateAgentProcessEnv(agentProcessEnv);
++	const env = inheritProcessEnv ? { ...process.env } : {};
+ 	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
+ 	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
+ 		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
+ 		assignAuthCredentialEnv(env, methodId, credential);
+ 	}
+-	if (sessionEnv) for (const [key, value] of Object.entries(sessionEnv)) {
++	for (const overlay of [sessionEnv, agentProcessEnv]) for (const [key, value] of Object.entries(overlay ?? {})) {
+ 		if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) continue;
+ 		assignSessionEnv(env, key, value);
+ 	}
+@@ -2955,10 +2961,10 @@ function resolveConfiguredAuthCredential(methodId, authCredentials) {
+ 	const configCredentials = authCredentials ?? {};
+ 	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
  }
 -function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv) {
--	return {
--		cwd,
++function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv) {
+ 	return {
+ 		cwd,
 -		env: buildAgentEnvironment(authCredentials, sessionEnv),
--		stdio: [
--			"pipe",
--			"pipe",
--			"pipe"
--		],
--		windowsHide: true
--	};
--}
-+function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, inheritProcessEnv) {
-+	return {
-+		cwd,
-+		env: buildAgentEnvironment(authCredentials, sessionEnv, inheritProcessEnv),
-+		stdio: [
-+			"pipe",
-+			"pipe",
-+			"pipe"
-+		],
-+		windowsHide: true
++		env: buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv),
+ 		stdio: [
+ 			"pipe",
+ 			"pipe",
+@@ -3724,10 +3730,13 @@ function resolveClientCapabilities(params) {
+ 		},
+ 		terminal: params.terminal
+ 	};
+-	if (!params.devinAcp) return baseCapabilities;
++	const typedSessionFailureMeta = {
++		jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } }
 +	};
-+}
- //#endregion
-@@ -3959,7 +3959,24 @@ var AcpClient = class {
--		this.attachAgentLifecycleObservers(child);
-+		this.attachAgentLifecycleObservers(child);
++	if (!params.devinAcp) return { ...baseCapabilities, _meta: typedSessionFailureMeta };
+ 	return {
+ 		...baseCapabilities,
+-		_meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META
++		_meta: { ...typedSessionFailureMeta, ...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META }
+ 	};
+ }
+ function isDevinRequestDiagnosticsMethod(method) {
+@@ -3957,9 +3966,26 @@ var AcpClient = class {
+ 		this.lastAgentExit = void 0;
+ 		this.lastKnownPid = child.pid ?? void 0;
+ 		this.attachAgentLifecycleObservers(child);
 +		if (this.options.onAgentSpawn) {
 +			try {
 +				if (typeof child.pid !== "number" || child.pid <= 0) {
@@ -102,20 +91,67 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3994,7 +4011,7 @@ var AcpClient = class {
+@@ -3994,7 +4020,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
 -			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env)
-+			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.inheritProcessEnv)
++			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv, this.options.inheritProcessEnv)
  		};
  	}
  	logAgentLaunch(plan) {
+@@ -6070,6 +6096,27 @@ async function withConnectedSession(options) {
+ //#region src/runtime/engine/prompt-turn.ts
+ const SESSION_REPLY_IDLE_MS = 1e3;
+ const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
++const TYPED_SESSION_FAILURE_CATEGORIES = /* @__PURE__ */ new Set([
++	"connection",
++	"access",
++	"limit",
++	"service",
++	"request",
++	"unknown"
++]);
++function typedTerminalSessionFailureCategory(response) {
++	if (response === null || typeof response !== "object" || Array.isArray(response)) return null;
++	const meta = response._meta;
++	if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return null;
++	const jetbrains = meta.jetbrains;
++	if (jetbrains === null || typeof jetbrains !== "object" || Array.isArray(jetbrains)) return null;
++	const air = jetbrains.air;
++	if (air === null || typeof air !== "object" || Array.isArray(air)) return null;
++	if (!Number.isInteger(air.version) || air.version < 1) return null;
++	const failure = air.sessionFailure;
++	if (failure === null || typeof failure !== "object" || Array.isArray(failure) || failure.severity !== "error") return null;
++	return typeof failure.category === "string" && TYPED_SESSION_FAILURE_CATEGORIES.has(failure.category) ? failure.category : "unknown";
++}
+ async function runPromptTurn(params) {
+ 	try {
+ 		const promptPromise = params.client.prompt(params.sessionId, params.prompt);
+@@ -6079,6 +6126,9 @@ async function runPromptTurn(params) {
+ 			idleMs: SESSION_REPLY_IDLE_MS,
+ 			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
+ 		}).catch(() => {});
++		const terminalFailureCategory = typedTerminalSessionFailureCategory(response);
++		if (terminalFailureCategory !== null)
++			throw new Error(`ACP agent reported a terminal ${terminalFailureCategory} failure.`);
+ 		recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
+ 		return {
+ 			stopReason: response.stopReason,
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e43547ff2d 100644
+index ccdbe5b..93277c6 100644
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
-@@ -266,6 +266,10 @@ type AcpRuntimeOptions = {
+@@ -258,6 +258,8 @@ interface AcpAgentRegistry {
+ }
+ type AcpRuntimeOptions = {
+   cwd: string;
++  /** Trusted child-only environment, snapshotted at construction and never persisted. */
++  agentProcessEnv?: Record<string, string>;
+   sessionStore: AcpSessionStore;
+   agentRegistry: AcpAgentRegistry;
+   mcpServers?: McpServer$1[];
+@@ -266,6 +268,10 @@ type AcpRuntimeOptions = {
    timeoutMs?: number;
    probeAgent?: string;
    verbose?: boolean;
@@ -127,7 +163,7 @@ index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e4
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
 diff --git a/dist/runtime.js b/dist/runtime.js
-index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2ba5a9f05 100644
+index 6c9cc99..f0298fb 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
 @@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
@@ -135,16 +171,42 @@ index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2
  	}
  	createClient(options) {
 -		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
-+		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, inheritProcessEnv: this.options.inheritProcessEnv };
++		const clientOptions = { ...options, agentProcessEnv: this.options.agentProcessEnv, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, inheritProcessEnv: this.options.inheritProcessEnv };
 +		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
  	}
  	async readPendingPersistentClient(record, options) {
  		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
+@@ -1496,6 +1497,7 @@ function createProbeClient(options, agentCommand, deps) {
+ 	const clientOptions = {
+ 		agentCommand,
+ 		cwd: options.cwd,
++		agentProcessEnv: options.agentProcessEnv,
+ 		mcpServers: [...options.mcpServers ?? []],
+ 		permissionMode: options.permissionMode,
+ 		nonInteractivePermissions: options.nonInteractivePermissions,
+@@ -1528,7 +1530,7 @@ var AcpxRuntime = class {
+ 	manager = null;
+ 	managerPromise = null;
+ 	constructor(options, testOptions) {
+-		this.options = options;
++		this.options = options.agentProcessEnv ? { ...options, agentProcessEnv: { ...options.agentProcessEnv } } : options;
+ 		this.testOptions = testOptions;
+ 	}
+ 	isHealthy() {
 diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
-index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..680bc080fc5d6ffd266ed1b27d3d5056add9d980 100644
+index 9d37f37..3baa8c4 100644
 --- a/dist/session-options-jkYbBxGE.d.ts
 +++ b/dist/session-options-jkYbBxGE.d.ts
-@@ -84,6 +84,10 @@ type AcpClientOptions = {
+@@ -74,6 +74,8 @@ type SessionEventLog = {
+ };
+ type AcpClientOptions = {
+   agentCommand: string;
++  /** Trusted child-only environment overlay; never persisted as session options. */
++  agentProcessEnv?: Record<string, string>;
+   cwd: string;
+   mcpServers?: McpServer[];
+   permissionMode: PermissionMode;
+@@ -84,6 +86,10 @@ type AcpClientOptions = {
    terminal?: boolean;
    suppressSdkConsoleErrors?: boolean;
    verbose?: boolean;
