@@ -2010,7 +2010,8 @@ describe.sequential("agent permission routes", () => {
       expect(res.status).toBe(403);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+        scope: { targetAgentId: peerAgentId },
       }));
     });
 
@@ -2051,7 +2052,8 @@ describe.sequential("agent permission routes", () => {
       expect(res.status).toBe(200);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+        scope: { targetAgentId: peerAgentId },
       }));
     });
   });

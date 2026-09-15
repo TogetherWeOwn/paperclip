@@ -43,6 +43,7 @@ import {
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateMemberPermissionSchema,
   updateUserCompanyAccessSchema,
   PERMISSION_KEYS,
   isUuidLike,
@@ -4614,6 +4615,69 @@ export function accessRoutes(
         reassignedIssueCount: result.reassignedIssueCount,
       });
     }
+  );
+
+  router.patch(
+    "/companies/:companyId/members/:memberId/permissions/:permissionKey",
+    validate(updateMemberPermissionSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const memberId = req.params.memberId as string;
+      const permissionKey = req.params.permissionKey;
+      if (permissionKey !== "agents:suggest-changes") {
+        throw badRequest("Only agents:suggest-changes can be managed for agent memberships");
+      }
+      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      const memberToUpdate = await access.getMemberById(companyId, memberId);
+      if (!memberToUpdate) throw notFound("Member not found");
+      if (memberToUpdate.principalType !== "agent") {
+        throw badRequest("This route only manages existing agent memberships");
+      }
+      if (memberToUpdate.status === "archived") {
+        throw conflict("Archived agent memberships cannot receive permission changes");
+      }
+
+      const updated = await access.setMemberPermission(
+        companyId,
+        memberId,
+        permissionKey,
+        req.body.enabled,
+        req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+        req.body.scope ?? null,
+      );
+      if (!updated) throw notFound("Member not found");
+
+      const grants = await access.listPrincipalGrants(
+        companyId,
+        "agent",
+        updated.principalId,
+      );
+      const actor = req.actor.type === "agent"
+        ? { actorType: "agent" as const, actorId: req.actor.agentId ?? "unknown-agent" }
+        : { actorType: "user" as const, actorId: req.actor.userId ?? "board" };
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
+        runId: req.actor.type === "agent" ? (req.actor.runId ?? null) : null,
+        agentApiKeyId: req.actor.type === "agent" ? (req.actor.keyId ?? null) : null,
+        action: req.body.enabled ? "company_agent.permission_granted" : "company_agent.permission_revoked",
+        entityType: "company_membership",
+        entityId: memberId,
+        details: {
+          principalId: updated.principalId,
+          permissionKey,
+          scoped: Boolean(req.body.scope && Object.keys(req.body.scope).length > 0),
+        },
+      });
+
+      res.json({
+        ...updated,
+        principalType: "agent" as const,
+        grants,
+      });
+    },
   );
 
   router.patch(
