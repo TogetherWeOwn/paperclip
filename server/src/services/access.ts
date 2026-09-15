@@ -995,6 +995,7 @@ export function accessService(db: Db) {
     enabled: boolean,
     grantedByUserId: string | null,
     scope: Record<string, unknown> | null = null,
+    options: { ensureMembership?: boolean } = {},
   ) {
     if (!enabled) {
       await db
@@ -1010,43 +1011,60 @@ export function accessService(db: Db) {
       return;
     }
 
-    await ensureMembership(companyId, principalType, principalId, "member", "active");
-
-    const existing = await db
-      .select()
-      .from(principalPermissionGrants)
-      .where(
-        and(
-          eq(principalPermissionGrants.companyId, companyId),
-          eq(principalPermissionGrants.principalType, principalType),
-          eq(principalPermissionGrants.principalId, principalId),
-          eq(principalPermissionGrants.permissionKey, permissionKey),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-
-    if (existing) {
-      await db
-        .update(principalPermissionGrants)
-        .set({
-          scope,
-          grantedByUserId,
-          updatedAt: new Date(),
-        })
-        .where(eq(principalPermissionGrants.id, existing.id));
-      return;
+    if (options.ensureMembership !== false) {
+      await ensureMembership(companyId, principalType, principalId, "member", "active");
     }
 
-    await db.insert(principalPermissionGrants).values({
+    const now = new Date();
+    await db
+      .insert(principalPermissionGrants)
+      .values({
+        companyId,
+        principalType,
+        principalId,
+        permissionKey,
+        scope,
+        grantedByUserId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [
+          principalPermissionGrants.companyId,
+          principalPermissionGrants.principalType,
+          principalPermissionGrants.principalId,
+          principalPermissionGrants.permissionKey,
+        ],
+        set: {
+          scope,
+          grantedByUserId,
+          updatedAt: now,
+        },
+      });
+  }
+
+  async function setMemberPermission(
+    companyId: string,
+    memberId: string,
+    permissionKey: PermissionKey,
+    enabled: boolean,
+    grantedByUserId: string | null,
+    scope: Record<string, unknown> | null = null,
+  ) {
+    const member = await getMemberById(companyId, memberId);
+    if (!member) return null;
+
+    await setPrincipalPermission(
       companyId,
-      principalType,
-      principalId,
+      member.principalType as PrincipalType,
+      member.principalId,
       permissionKey,
-      scope,
+      enabled,
       grantedByUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+      scope,
+      { ensureMembership: false },
+    );
+    return member;
   }
 
   async function updateMember(
@@ -1147,6 +1165,7 @@ export function accessService(db: Db) {
     setPrincipalGrants,
     listPrincipalGrants,
     setPrincipalPermission,
+    setMemberPermission,
     updateMember,
   };
 }

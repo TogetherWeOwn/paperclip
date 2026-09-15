@@ -663,6 +663,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           actor: req.actor,
           action: "agent_config:update",
           resource: { type: "agent", companyId: connection.companyId, agentId: agent.id },
+          scope: { targetAgentId: agent.id },
         });
         if (decision.allowed) editableAgentIds.push(agent.id);
       }
@@ -1971,6 +1972,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
             actor: req.actor,
             action: "agent_config:update",
             resource: { type: "agent", companyId: connection.companyId, agentId: agent.id },
+            scope: { targetAgentId: agent.id },
           });
           if (!decision.allowed) {
             throw forbidden(`You cannot edit agent ${agent.id}, so you cannot change its connection installs`);
