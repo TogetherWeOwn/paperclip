@@ -762,6 +762,7 @@ export {
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateMemberPermissionSchema,
   searchAdminUsersQuerySchema,
   updateUserCompanyAccessSchema,
   type CreateCompanyInvite,
@@ -781,6 +782,7 @@ export {
   type UpdateCompanyMemberWithPermissions,
   type ArchiveCompanyMember,
   type UpdateMemberPermissions,
+  type UpdateMemberPermission,
   type SearchAdminUsersQuery,
   type UpdateUserCompanyAccess,
 } from "./access.js";

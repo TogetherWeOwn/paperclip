@@ -250,6 +250,66 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows manager-scoped configuration access for descendants and rejects unrelated agents", async () => {
+    const company = await createCompany(db, "AgentConfigSubtreeScope");
+    const managerAgent = await createAgent(db, company.id);
+    const childAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const grandchildAgent = await createAgent(db, company.id, { reportsTo: childAgent.id });
+    const outsideAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, managerAgent.id, "agents:suggest-changes", {
+      managedSubtreeAgentIds: [managerAgent.id],
+    });
+
+    const authz = authorizationService(db);
+    const actor = {
+      type: "agent" as const,
+      agentId: managerAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    for (const targetAgent of [childAgent, grandchildAgent]) {
+      await expect(authz.decide({
+        actor,
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+        scope: { targetAgentId: targetAgent.id },
+      })).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        grant: { permissionKey: "agents:suggest-changes" },
+      });
+
+      await expect(authz.decide({
+        actor,
+        action: "agent_config:update",
+        resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
+        scope: { requiresChangeGrant: true, consentedChange: true, targetAgentId: targetAgent.id },
+      })).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_consented_change",
+        grant: { permissionKey: "agents:suggest-changes" },
+      });
+    }
+
+    await expect(authz.decide({
+      actor,
+      action: "agent_config:read",
+      resource: { type: "agent", companyId: company.id, agentId: outsideAgent.id },
+      scope: { targetAgentId: outsideAgent.id },
+    })).resolves.toMatchObject({ allowed: false });
+
+    await expect(authz.decide({
+      actor,
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: outsideAgent.id },
+      scope: { requiresChangeGrant: true, consentedChange: true, targetAgentId: outsideAgent.id },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_scope",
+    });
+  });
+
   it("falls back to the direct config-read grant decision when a suggest read grant is scoped away", async () => {
     const company = await createCompany(db, "AgentReadScopedSuggestGrant");
     const actorAgent = await createAgent(db, company.id);

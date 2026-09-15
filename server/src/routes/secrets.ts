@@ -172,7 +172,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: req.params.companyId as string, agentId: proposal.targetId },
-      scope: { requiresChangeGrant: true },
+      scope: { requiresChangeGrant: true, targetAgentId: proposal.targetId },
     });
   }
 
