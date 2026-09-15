@@ -33,7 +33,7 @@ export async function assertCanResolveProposal(input: {
       companyId: input.companyId,
       agentId: input.proposal.targetId,
     },
-    scope: { requiresChangeGrant: true },
+    scope: { requiresChangeGrant: true, targetAgentId: input.proposal.targetId },
   });
   if (!decision.allowed) {
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));

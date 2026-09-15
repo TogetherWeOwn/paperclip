@@ -175,6 +175,78 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     });
   });
 
+  it("adds and removes one scoped agent grant without overwriting unrelated grants", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const agent = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Scoped grant target",
+      role: "manager",
+      adapterType: "process",
+      adapterConfig: {},
+    }).returning().then((rows) => rows[0]!);
+    const membership = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      status: "active",
+      membershipRole: "member",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      permissionKey: "tasks:assign",
+      scope: null,
+      grantedByUserId: owner.principalId,
+    });
+    const scope = { managedSubtreeAgentIds: [agent.id] };
+
+    const granted = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${membership.id}/permissions/agents:suggest-changes`)
+      .send({ enabled: true, scope });
+
+    expect(granted.status, JSON.stringify(granted.body)).toBe(200);
+    expect(granted.body).toMatchObject({
+      id: membership.id,
+      principalType: "agent",
+      principalId: agent.id,
+      status: "active",
+      grants: expect.arrayContaining([
+        expect.objectContaining({ permissionKey: "tasks:assign", scope: null }),
+        expect.objectContaining({ permissionKey: "agents:suggest-changes", scope }),
+      ]),
+    });
+
+    const revoked = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${membership.id}/permissions/agents:suggest-changes`)
+      .send({ enabled: false });
+
+    expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
+    expect(revoked.body.grants).toEqual([
+      expect.objectContaining({ permissionKey: "tasks:assign", scope: null }),
+    ]);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.id, membership.id)))
+      .toEqual([expect.objectContaining({ status: "active", membershipRole: "member" })]);
+  });
+
+  it("rejects the targeted grant route for human memberships", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const member = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `member-${randomUUID()}`,
+      status: "active",
+      membershipRole: "operator",
+    }).returning().then((rows) => rows[0]!);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${member.id}/permissions/agents:suggest-changes`)
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [randomUUID()] } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toContain("only manages existing agent memberships");
+  });
+
   it("sweeps personal connection access when the member route suspends a user", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({

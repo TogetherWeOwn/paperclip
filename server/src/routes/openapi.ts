@@ -167,6 +167,7 @@ import {
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateMemberPermissionSchema,
   updateUserCompanyAccessSchema,
   // Instance settings
   patchInstanceGeneralSettingsSchema,
@@ -4376,6 +4377,22 @@ registry.registerPath({
   request: {
     params: z.object({ companyId: z.string(), memberId: z.string() }),
     body: jsonBody(archiveCompanyMemberSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/members/{memberId}/permissions/{permissionKey}",
+  tags: ["access"],
+  summary: "Add, update, or remove one permission on an existing agent membership",
+  request: {
+    params: z.object({
+      companyId: z.string(),
+      memberId: z.string(),
+      permissionKey: z.literal("agents:suggest-changes"),
+    }),
+    body: jsonBody(updateMemberPermissionSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
