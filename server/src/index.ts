@@ -22,6 +22,7 @@ import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
 import { warnIfUnsupportedNodeVersion } from "@paperclipai/shared/node-version";
+import type { BackupRetentionPolicy } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
@@ -798,6 +799,7 @@ async function startServerWithDatabaseTeardown(
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
   const backupSettingsSvc = instanceSettingsService(db);
+  let startupDatabaseBackupRetention: BackupRetentionPolicy | null = null;
   const databaseBackupMaxAgeHours = Math.max(
     1,
     Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
@@ -829,10 +831,13 @@ async function startServerWithDatabaseTeardown(
     const startedAtMs = Date.now();
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
     try {
-      logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
       // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
+      logger.info(
+        { backupDir: config.databaseBackupDir, retention, retentionSource: "instance-settings-db", trigger },
+        `${label} database backup starting`,
+      );
 
       const result = await runDatabaseBackup({
         connectionString: activeDatabaseConnectionString,
@@ -1825,10 +1830,12 @@ async function startServerWithDatabaseTeardown(
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
+    startupDatabaseBackupRetention = (await backupSettingsSvc.getGeneral()).backupRetention;
 
     logger.info(
       {
         intervalMinutes: config.databaseBackupIntervalMinutes,
+        retention: startupDatabaseBackupRetention,
         retentionSource: "instance-settings-db",
         backupDir: config.databaseBackupDir,
       },
@@ -1891,7 +1898,7 @@ async function startServerWithDatabaseTeardown(
         heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
         databaseBackupEnabled: config.databaseBackupEnabled,
         databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
-        databaseBackupRetentionDays: config.databaseBackupRetentionDays,
+        databaseBackupRetention: startupDatabaseBackupRetention,
         databaseBackupDir: config.databaseBackupDir,
   });
   const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);

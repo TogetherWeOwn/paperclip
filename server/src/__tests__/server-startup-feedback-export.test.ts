@@ -161,6 +161,8 @@ const {
   };
 });
 
+const printStartupBannerMock = vi.hoisted(() => vi.fn());
+
 function buildTestConfig(overrides: Record<string, unknown> = {}) {
   return {
     deploymentMode: "authenticated",
@@ -179,7 +181,6 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     embeddedPostgresPort: 54329,
     databaseBackupEnabled: false,
     databaseBackupIntervalMinutes: 60,
-    databaseBackupRetentionDays: 30,
     databaseBackupDir: "/tmp/paperclip-test-backups",
     serveUi: false,
     uiDevMiddleware: false,
@@ -307,6 +308,7 @@ vi.mock("../services/index.js", () => ({
     })),
     getGeneral: vi.fn(async () => ({
       backupRetention: {
+        hourlyHours: 24,
         dailyDays: 7,
         weeklyWeeks: 4,
         monthlyMonths: 1,
@@ -393,7 +395,7 @@ vi.mock("../services/plugin-worker-manager.js", () => ({
 }));
 
 vi.mock("../startup-banner.js", () => ({
-  printStartupBanner: vi.fn(),
+  printStartupBanner: printStartupBannerMock,
 }));
 
 vi.mock("../board-claim.js", () => ({
@@ -582,6 +584,20 @@ describe("startServer feedback export wiring", () => {
     } finally {
       setIntervalSpy.mockRestore();
     }
+  });
+
+  it("reports the Instance Settings backup retention policy at startup", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ databaseBackupEnabled: true }));
+    await startServer();
+
+    expect(printStartupBannerMock).toHaveBeenCalledWith(expect.objectContaining({
+      databaseBackupRetention: {
+        hourlyHours: 24,
+        dailyDays: 7,
+        weeklyWeeks: 4,
+        monthlyMonths: 1,
+      },
+    }));
   });
 
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {

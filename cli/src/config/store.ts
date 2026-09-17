@@ -69,6 +69,13 @@ function migrateLegacyConfig(raw: unknown): unknown {
     }
   }
 
+  const backupRaw = database.backup;
+  if (typeof backupRaw === "object" && backupRaw !== null && !Array.isArray(backupRaw)) {
+    const backup = { ...(backupRaw as Record<string, unknown>) };
+    delete backup.retentionDays;
+    database.backup = backup;
+  }
+
   config.database = database;
   return config;
 }
