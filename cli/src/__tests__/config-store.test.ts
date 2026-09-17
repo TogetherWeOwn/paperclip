@@ -111,6 +111,29 @@ describe("config store", () => {
     expect(JSON.parse(fs.readFileSync(configPath, "utf8")).database.backup).not.toHaveProperty("retentionDays");
   });
 
+  it("rewrites the file to drop the retired retention scalar even when nothing else changes", () => {
+    const configPath = createConfigPath();
+    const source = defaultConfig();
+    fs.writeFileSync(configPath, JSON.stringify({
+      ...source,
+      database: {
+        ...source.database,
+        backup: {
+          ...source.database.backup,
+          retentionDays: 30,
+          backupExtension: "keep",
+        },
+      },
+    }, null, 2));
+
+    const migrated = readConfig(configPath)!;
+    expect(writeConfig(migrated, configPath)).toBe(true);
+
+    const onDisk = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    expect(onDisk.database.backup).not.toHaveProperty("retentionDays");
+    expect(onDisk.database.backup.backupExtension).toBe("keep");
+  });
+
   it("skips semantic no-op writes and keeps the config mtime stable", () => {
     const configPath = createConfigPath();
     const source = defaultConfig();
