@@ -71,9 +71,6 @@ import { traceparentFromContextToken } from "../instrumentation.js";
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default timeout for RPC calls in milliseconds. */
-const DEFAULT_RPC_TIMEOUT_MS = 30_000;
-
 /**
  * Upper bound for the *default* RPC timeout path (15 minutes). Explicit
  * caller-supplied timeouts are not subject to this cap: execute-class RPCs such
@@ -90,6 +87,31 @@ const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
  * setTimeout, otherwise a huge timeout can expire almost immediately.
  */
 const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Default timeout for RPC calls in milliseconds, used by every call site that
+ * does not pass an explicit `timeoutMs` (e.g. `handleApiRequest`,
+ * `executeTool`, `getData`, `performAction`). Overridable per-environment via
+ * `PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS` so a deployment can raise this floor for
+ * plugins whose RPCs routinely need longer than 30s, without a code change or
+ * a per-call `timeoutMs` plumbed through every route. Still clamped to
+ * `MAX_RPC_TIMEOUT_MS`, same as the built-in default. This does not change
+ * `resolveRpcCallTimeoutMs`'s handling of explicit per-call timeouts, which
+ * are clamped only to `MAX_NODE_TIMER_TIMEOUT_MS`.
+ */
+const DEFAULT_RPC_TIMEOUT_MS = resolveDefaultRpcTimeoutMsFromEnv();
+
+function resolveDefaultRpcTimeoutMsFromEnv(): number {
+  const raw = process.env.PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS;
+  if (raw === undefined) {
+    return 30_000;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 30_000;
+  }
+  return Math.min(Math.trunc(parsed), MAX_RPC_TIMEOUT_MS);
+}
 
 /** Timeout for the initialize RPC call. */
 const INITIALIZE_TIMEOUT_MS = 15_000;
