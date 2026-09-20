@@ -84,7 +84,7 @@ export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
-});
+}).strict();
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
 export const routineRevisionSnapshotRoutineV1Schema = z.object({
@@ -180,7 +180,7 @@ export const runRoutineSchema = z.object({
   executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
-});
+}).strict();
 
 export type RunRoutine = z.infer<typeof runRoutineSchema>;
 

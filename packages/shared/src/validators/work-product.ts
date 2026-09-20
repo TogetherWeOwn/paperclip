@@ -100,6 +100,6 @@ export type CreateIssueWorkProduct = z.infer<typeof createIssueWorkProductSchema
 
 export const updateIssueWorkProductSchema = objectWithoutDefaults(
   createIssueWorkProductSchema,
-).partial();
+).partial().strict();
 
 export type UpdateIssueWorkProduct = z.infer<typeof updateIssueWorkProductSchema>;

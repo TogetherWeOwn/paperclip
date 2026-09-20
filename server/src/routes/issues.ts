@@ -353,7 +353,7 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
-});
+}).strict();
 const queuedCommentSteeringTargetSchema =
   queuedCommentMutationTargetSchema.extend({
     targetRunId: z.string().min(1),
