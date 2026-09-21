@@ -1066,6 +1066,56 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it.each([
+    { streamOutputViaSession: false, exitCode: 0 },
+    { streamOutputViaSession: false, exitCode: 7 },
+    { streamOutputViaSession: true, exitCode: 0 },
+    { streamOutputViaSession: true, exitCode: 7 },
+    { streamOutputViaSession: false, exitCode: null },
+    { streamOutputViaSession: true, exitCode: null },
+  ])("exits with stdin open after remote exit (stream=$streamOutputViaSession, code=$exitCode)", async ({
+    streamOutputViaSession,
+    exitCode,
+  }) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-open-stdin-"));
+    cleanupDirs.push(rootDir);
+    // ACP keeps stdin open while it waits for a handshake. A remote child can
+    // exit before replying; that must close the proxy and fail the handshake.
+    const output = "final output\n".repeat(16_384);
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-open-stdin",
+      target: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "local-test",
+        remoteCwd: rootDir,
+        runner: createLocalSandboxRunner(),
+      },
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: exitCode === null ? path.join(rootDir, "missing-agent") : process.execPath,
+      args: ["-e", `process.stdout.write("final output\\n".repeat(16_384)); process.stderr.write("final diagnostic\\n"); process.exitCode = ${exitCode};`],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 10,
+      streamOutputViaSession,
+    });
+    expect(bridge).not.toBeNull();
+    try {
+      const result = await runProxyWithInput(bridge!.agentCommand, "initialize\n", true);
+      expect(result.code).toBe(exitCode ?? 1);
+      if (exitCode === null) {
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain("ENOENT");
+      } else {
+        expect(result.stdout).toBe(output);
+        expect(result.stderr).toBe("final diagnostic\n");
+      }
+    } finally {
+      await bridge?.stop();
+    }
+  }, 15_000);
+
   it("buffers sandbox process session output until the local proxy connects", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-buffer-"));
     cleanupDirs.push(rootDir);
