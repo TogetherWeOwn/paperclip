@@ -96,11 +96,43 @@ async function handleMcpGatewayProtocol(
       return;
     }
     if (body.method === "tools/list") {
-      const tools = await toolGateway.listToolsForNamedGateway({
+      const { tools, allowedActions } = await toolGateway.listToolsForNamedGateway({
         ...locator,
         bearerToken: token,
         callerHeaders: headers,
       });
+      // Only advertise a context wrapper the gateway token can actually
+      // perform. Heartbeat and narrowly scoped tokens carry only
+      // tools/list + tools/call, so unconditionally listing the context
+      // tools produces calls that the token check then denies with
+      // gateway_token_action_denied.
+      const allowedActionSet = new Set(allowedActions);
+      const contextTools = [
+        {
+          action: "resources/list" as const,
+          name: "paperclip_list_resources",
+          description: "List resources from fully assigned MCP connections.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+        {
+          action: "resources/read" as const,
+          name: "paperclip_read_resource",
+          description: "Read a resource URI returned by paperclip_list_resources.",
+          inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
+        },
+        {
+          action: "prompts/list" as const,
+          name: "paperclip_list_prompts",
+          description: "List prompts from fully assigned MCP connections.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+        {
+          action: "prompts/get" as const,
+          name: "paperclip_get_prompt",
+          description: "Get a prompt returned by paperclip_list_prompts.",
+          inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
+        },
+      ].filter((tool) => allowedActionSet.has(tool.action));
       res.json({
         jsonrpc: "2.0",
         id,
@@ -112,26 +144,7 @@ async function handleMcpGatewayProtocol(
             description: tool.description,
             inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
             })),
-            {
-              name: "paperclip_list_resources",
-              description: "List resources from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_read_resource",
-              description: "Read a resource URI returned by paperclip_list_resources.",
-              inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string" } }, additionalProperties: false },
-            },
-            {
-              name: "paperclip_list_prompts",
-              description: "List prompts from fully assigned MCP connections.",
-              inputSchema: { type: "object", properties: {}, additionalProperties: false },
-            },
-            {
-              name: "paperclip_get_prompt",
-              description: "Get a prompt returned by paperclip_list_prompts.",
-              inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, arguments: { type: "object" } }, additionalProperties: false },
-            },
+            ...contextTools.map(({ action: _action, ...tool }) => tool),
           ],
         },
       });
@@ -178,14 +191,25 @@ async function handleMcpGatewayProtocol(
       const contentText = typeof resultRecord?.content === "string"
         ? resultRecord.content
         : JSON.stringify(resultRecord?.data ?? result.result ?? null);
+      // MCP requires structuredContent to be absent or an object. Plugin
+      // tools that return only content have no data envelope, so emitting
+      // null here makes strict clients reject the whole result.
+      const data = resultRecord?.data;
+      const resultPayload: {
+        content: Array<{ type: string; text: string }>;
+        structuredContent?: Record<string, unknown>;
+        isError: boolean;
+      } = {
+        content: [{ type: "text", text: contentText }],
+        isError: false,
+      };
+      if (data && typeof data === "object" && !Array.isArray(data)) {
+        resultPayload.structuredContent = data as Record<string, unknown>;
+      }
       res.json({
         jsonrpc: "2.0",
         id,
-        result: {
-          content: [{ type: "text", text: contentText }],
-          structuredContent: resultRecord?.data ?? null,
-          isError: false,
-        },
+        result: resultPayload,
       });
       return;
     }
