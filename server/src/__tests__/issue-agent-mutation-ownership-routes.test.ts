@@ -2898,4 +2898,91 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
+
+  describe("issue PATCH redacted env restore", () => {
+    const REDACTED = "***REDACTED***";
+    const storedPathBinding = { type: "plain", value: "/usr/bin:/bin" };
+
+    it("restores a redacted PATH from the stored override on GET-then-PATCH round trip", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: { adapterConfig: { env: { PATH: storedPathBinding } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: REDACTED } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: storedPathBinding } },
+          },
+        }),
+      );
+    });
+
+    it("falls back to the assignee agent stored env when the override has no stored value", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: null,
+      }));
+      mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, {
+        adapterConfig: { env: { PATH: { type: "plain", value: "/agent/bin" } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: REDACTED } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/agent/bin" } } },
+          },
+        }),
+      );
+    });
+
+    it("passes genuine new env values through untouched", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: { adapterConfig: { env: { PATH: storedPathBinding } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/new/bin" } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/new/bin" } } },
+          },
+        }),
+      );
+      expect(mockAgentService.getById).not.toHaveBeenCalled();
+    });
+  });
 });

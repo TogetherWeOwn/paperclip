@@ -987,6 +987,44 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+/**
+ * Restore display-only `***REDACTED***` plain env bindings in a requested env
+ * map from previously stored env maps. Reads redact every plain env value, so
+ * a client that echoes a read payload back (GET then PATCH) would otherwise
+ * persist the placeholder as the real value. The first source that still holds
+ * the key wins, so callers pass the most specific store first (e.g. the
+ * stored issue override, then the assignee agent's stored env). Keys with no
+ * stored value, or requests that are not redacted placeholders, pass through
+ * untouched. Mirrors the agent-update restore in `routes/agents.ts`.
+ */
+export function restoreRedactedPlainEnvBindings(
+  requestedEnv: Record<string, unknown>,
+  sources: Array<Record<string, unknown> | null | undefined>,
+): Record<string, unknown> {
+  const restoredEnv = { ...requestedEnv };
+  for (const [key, value] of Object.entries(requestedEnv)) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      (value as Record<string, unknown>).type !== "plain" ||
+      (value as Record<string, unknown>).value !== REDACTED_EVENT_VALUE
+    ) {
+      continue;
+    }
+    for (const source of sources) {
+      if (
+        source &&
+        Object.prototype.hasOwnProperty.call(source, key)
+      ) {
+        restoredEnv[key] = source[key];
+        break;
+      }
+    }
+  }
+  return restoredEnv;
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
