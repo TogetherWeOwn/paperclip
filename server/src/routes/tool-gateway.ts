@@ -188,13 +188,24 @@ async function handleMcpGatewayProtocol(
       const resultRecord = result.result && typeof result.result === "object" && !Array.isArray(result.result)
         ? result.result as Record<string, unknown>
         : null;
-      const contentText = typeof resultRecord?.content === "string"
-        ? resultRecord.content
-        : JSON.stringify(resultRecord?.data ?? result.result ?? null);
+      // Plugin tools arrive wrapped one level deeper than every other
+      // provider: { pluginId, toolName, result: ToolResult }. MCP-remote,
+      // MCP-local and builtin tools arrive as { content, data } directly.
+      // Read content/data from the inner ToolResult when the wrapper shape
+      // is present, so the text is the plugin's content string (not JSON of
+      // the wrapper) and structuredContent is the plugin's data.
+      const inner = resultRecord?.result;
+      const toolResultRecord = (typeof resultRecord?.pluginId === "string"
+        && inner && typeof inner === "object" && !Array.isArray(inner))
+        ? inner as Record<string, unknown>
+        : resultRecord;
+      const contentText = typeof toolResultRecord?.content === "string"
+        ? toolResultRecord.content
+        : JSON.stringify(toolResultRecord?.data ?? result.result ?? null);
       // MCP requires structuredContent to be absent or an object. Plugin
       // tools that return only content have no data envelope, so emitting
       // null here makes strict clients reject the whole result.
-      const data = resultRecord?.data;
+      const data = toolResultRecord?.data;
       const resultPayload: {
         content: Array<{ type: string; text: string }>;
         structuredContent?: Record<string, unknown>;

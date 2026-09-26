@@ -133,6 +133,57 @@ describe("named gateway MCP protocol response shaping", () => {
     expect(names).toContain("paperclip_get_prompt");
   });
 
+  it("unwraps the plugin ToolExecutionResult: text is the inner content, not wrapper JSON", async () => {
+    // Real dispatcher/registry shape: { pluginId, toolName, result: ToolResult }.
+    const app = createProtocolApp({
+      listResult: { tools: [], allowedActions: FULL_CONTEXT_ACTIONS },
+      executeToolResult: {
+        pluginId: "hindsight",
+        toolName: "hindsight_recall",
+        result: { content: "recall body" },
+      },
+    });
+    const response = await request(app)
+      .post("/mcp/gateways/gw_test")
+      .set("authorization", "Bearer test-token")
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hindsight:hindsight_recall", arguments: {} } })
+      .expect(200);
+    expect(response.body.result.content).toEqual([{ type: "text", text: "recall body" }]);
+    expect("structuredContent" in response.body.result).toBe(false);
+  });
+
+  it("forwards the plugin inner data as structuredContent through the wrapper", async () => {
+    const app = createProtocolApp({
+      listResult: { tools: [], allowedActions: FULL_CONTEXT_ACTIONS },
+      executeToolResult: {
+        pluginId: "model-selection",
+        toolName: "model_selection_aa_drift_report",
+        result: { content: "drift summary", data: { drift: 0.12, window: "7d" } },
+      },
+    });
+    const response = await request(app)
+      .post("/mcp/gateways/gw_test")
+      .set("authorization", "Bearer test-token")
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "model-selection:model_selection_aa_drift_report", arguments: {} } })
+      .expect(200);
+    expect(response.body.result.content).toEqual([{ type: "text", text: "drift summary" }]);
+    expect(response.body.result.structuredContent).toEqual({ drift: 0.12, window: "7d" });
+  });
+
+  it("still reads content/data directly for non-plugin results", async () => {
+    const app = createProtocolApp({
+      listResult: { tools: [], allowedActions: FULL_CONTEXT_ACTIONS },
+      executeToolResult: { content: "11", data: { result: 11 } },
+    });
+    const response = await request(app)
+      .post("/mcp/gateways/gw_test")
+      .set("authorization", "Bearer test-token")
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "mcp-remote-fixture:add", arguments: {} } })
+      .expect(200);
+    expect(response.body.result.content).toEqual([{ type: "text", text: "11" }]);
+    expect(response.body.result.structuredContent).toEqual({ result: 11 });
+  });
+
   it("advertises only the context wrappers covered by a partial scope", async () => {
     const app = createProtocolApp({
       listResult: {
