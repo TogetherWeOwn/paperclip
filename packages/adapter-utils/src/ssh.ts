@@ -57,23 +57,21 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
-        .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-      const envPrefix = envEntries.length > 0
-        ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
-        : "";
-      const exportPrefix = envEntries.length > 0
-        ? envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join(" ") + " "
-        : "";
-      const commandScript = command === "sh" || command === "bash"
+      const envEntries = filterStringEnvEntries(commandInput.env);
+      assertValidShellEnvKeys(envEntries);
+      // Env rides the runSshCommand options channel (0600 temp file, sourced
+      // remotely) — never the command string — so secret values stay out of
+      // the local and remote process argv.
+      const innerScript = command === "sh" || command === "bash"
         ? (args[0] === "-c" || args[0] === "-lc") && typeof args[1] === "string"
-          ? `${exportPrefix}${args[1]}`
-          : `${envPrefix}exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`
-        : `${envPrefix}exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
-      const remoteCommand = `cd ${shellQuote(cwd)} && ${commandScript}`;
+          ? args[1]
+          : `exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`
+        : `exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
+      const remoteCommand = `cd ${shellQuote(cwd)} && ${innerScript}`;
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
+          env: Object.fromEntries(envEntries),
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
@@ -157,6 +155,87 @@ export function shellQuote(value: string) {
 
 function isValidShellEnvKey(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+function filterStringEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  return Object.entries(env ?? {})
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+}
+
+function assertValidShellEnvKeys(entries: Array<[string, string]>) {
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid SSH environment variable key: ${key}`);
+    }
+  }
+}
+
+// Env values must never ride the ssh argv: local `ps` and the remote host's
+// `ps`/audit trail would expose every resolved agent secret. Stage env as an
+// `export KEY='value'` fragment in a local 0600 temp file, copy it to a remote
+// 0600 path, source it inside the remote script (after the login profiles so
+// identity overrides keep winning), and remove it in the same remote shell
+// invocation that runs the payload. The removal is a chained `rm` after the
+// payload — not a `trap ... EXIT` before a terminal `exec`, which POSIX shells
+// skip across `exec` and would leave the secret-bearing file behind on success.
+function buildRemoteEnvFileContents(entries: Array<[string, string]>): string {
+  return entries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join("\n") + "\n";
+}
+
+// The remote env-file path is an absolute path with the HOME directory already
+// expanded (via `printf %s "$HOME"`), never a literal `$HOME/...` string: a
+// quoted `$HOME` neither expands for scp (which would create a literal `$HOME`
+// directory on SFTP-mode servers) nor inside the single-quoted `[ -f '...']`
+// / `. '...'` tests below.
+function remoteTempFilenameForEnvFile(): string {
+  const nonce = randomUUID().replace(/-/g, "");
+  return `.paperclip-ssh-env-${nonce}.sh`;
+}
+
+async function resolveRemoteHomeDir(
+  authArgs: string[],
+  config: SshConnectionConfig,
+): Promise<string> {
+  const result = await execFileText(
+    "ssh",
+    [...authArgs, "-p", String(config.port), `${config.username}@${config.host}`, "printf %s \"$HOME\""],
+    { timeout: 15_000, maxBuffer: 64 * 1024 },
+  );
+  const home = result.stdout.trim();
+  if (!home || home.includes("\n") || !home.startsWith("/")) {
+    throw new Error("Unable to resolve the remote HOME directory for SSH env staging.");
+  }
+  return home;
+}
+
+function quoteForRemoteRm(remotePath: string): string {
+  return `'${remotePath.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function copyEnvFileToRemote(
+  authArgs: string[],
+  config: SshConnectionConfig,
+  localPath: string,
+  remotePath: string,
+): Promise<void> {
+  const scpArgs = [...authArgs, "-P", String(config.port), localPath, `${config.username}@${config.host}:${remotePath}`];
+  await execFileText("scp", scpArgs, { timeout: 15_000, maxBuffer: 64 * 1024 });
+  await runSshCommand(config, `chmod 600 ${quoteForRemoteRm(remotePath)}`, {});
+}
+
+// Sources the staged env file, then runs the payload with a chained `rm -f`
+// of the env file so the secret-bearing file is removed on both success and
+// failure paths. `payloadScript` must be a `sh -c '<payload>'` fragment (no
+// terminal `exec`): a shell that `exec`s the payload never returns to run the
+// chained `rm`. `remotePath` must be a fully-expanded absolute path — never a
+// literal `$HOME/...` string — so the single-quoted tests below match the
+// file scp actually wrote.
+function envSourcingScriptLines(remotePath: string, payloadScript: string): string[] {
+  const quoted = quoteForRemoteRm(remotePath);
+  return [
+    `if [ -f ${quoted} ]; then . ${quoted}; fi`,
+    `${payloadScript}; rc=$?; rm -f ${quoted}; exit $rc`,
+  ];
 }
 
 export function parseSshRemoteExecutionSpec(value: unknown): SshRemoteExecutionSpec | null {
@@ -1204,16 +1283,31 @@ export async function runSshCommand(
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-    for (const [key] of envEntries) {
-      if (!isValidShellEnvKey(key)) {
-        throw new Error(`Invalid SSH environment variable key: ${key}`);
-      }
+    const envEntries = filterStringEnvEntries(options.env);
+    assertValidShellEnvKeys(envEntries);
+
+    // Stage env in a remote 0600 file (never argv) when present.
+    let envFileCleanup: () => Promise<void> = () => Promise.resolve();
+    let remoteEnvPath: string | null = null;
+    if (envEntries.length > 0) {
+      const localEnvFile = await withTempFile(
+        "paperclip-ssh-env-",
+        buildRemoteEnvFileContents(envEntries),
+        0o600,
+      );
+      envFileCleanup = localEnvFile.cleanup;
+      const previousCleanup = cleanup;
+      cleanup = async () => {
+        await previousCleanup();
+        await envFileCleanup();
+      };
+      const remoteHome = await resolveRemoteHomeDir(auth.args, config);
+      remoteEnvPath = `${remoteHome}/${remoteTempFilenameForEnvFile()}`;
+      await copyEnvFileToRemote(auth.args, config, localEnvFile.path, remoteEnvPath);
     }
 
-    // Mirror buildSshSpawnTarget: source the login profiles first, then run
-    // `env KEY=VAL cmd` so user-supplied identity overrides win over anything a
+    // Mirror buildSshSpawnTarget: source the login profiles first, then the
+    // staged env file, so user-supplied identity overrides win over anything a
     // profile re-exports. The SSH target is an operator-configured host, not a
     // Paperclip sandbox image, so it can expose `node` or an agent CLI only
     // through a login profile; a non-login SSH command would miss that PATH.
@@ -1223,16 +1317,23 @@ export async function runSshCommand(
     // .bash_profile typically sources .bashrc itself; only source .bashrc
     // directly when no .bash_profile exists, so a host that adds nvm in
     // .bashrc still resolves node without a double-run of the setup.
-    const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
-    const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-      envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
-    ].join(" && ");
+    // The payload runs as `sh -c` (no terminal `exec`) followed by a chained
+    // `rm -f` of the staged env file, so cleanup fires on success and failure.
+    const remoteScript = remoteEnvPath != null
+      ? [
+          'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+          ...envSourcingScriptLines(remoteEnvPath, `sh -c ${shellQuote(remoteCommand)}`),
+        ].join(" && ")
+      : [
+          'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+          'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+          `exec sh -c ${shellQuote(remoteCommand)}`,
+        ].join(" && ");
 
     sshArgs.push(
       "-p",
@@ -1256,6 +1357,61 @@ export async function runSshCommand(
   }
 }
 
+export function buildSshSpawnTargetScript(input: {
+  remoteCwd: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  // Fully-expanded remote HOME directory (no `$HOME` literal): the staging
+  // caller resolves it once via `printf %s "$HOME"` and passes it here, so
+  // the script path and the scp destination are the same absolute path.
+  remoteHomeDir: string;
+}): { remoteScript: string; remoteEnvPath: string | null; envFileContents: string | null } {
+  const envEntries = filterStringEnvEntries(input.env);
+  assertValidShellEnvKeys(envEntries);
+  if (!input.remoteHomeDir || input.remoteHomeDir.includes("\n") || !input.remoteHomeDir.startsWith("/")) {
+    throw new Error("A fully-expanded remote HOME directory is required to stage spawn-target env.");
+  }
+  // The spawn path has no stdin channel: the caller stages envFileContents at
+  // remoteEnvPath (0600) before spawning. The remote script sources it after
+  // the profiles, then runs the payload as `sh -c` (no terminal `exec`) with
+  // a chained `rm -f` so the secret-bearing file is removed on success and
+  // failure. Env values never enter argv.
+  const remoteEnvPath = envEntries.length > 0 ? `${input.remoteHomeDir}/${remoteTempFilenameForEnvFile()}` : null;
+  const envFileContents = envEntries.length > 0 ? buildRemoteEnvFileContents(envEntries) : null;
+  const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
+  const profileLines = [
+    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    `cd ${shellQuote(input.remoteCwd)}`,
+  ];
+  const remoteScript = remoteEnvPath != null
+    ? [...profileLines, ...envSourcingScriptLines(remoteEnvPath, `sh -c ${shellQuote(remoteCommandParts)}`)].join(" && ")
+    : [...profileLines, `exec ${remoteCommandParts}`].join(" && ");
+  return { remoteScript, remoteEnvPath, envFileContents };
+}
+
+export async function stageSshSpawnTargetEnvFile(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteEnvPath: string;
+  envFileContents: string;
+}): Promise<{ cleanup: () => Promise<void> }> {
+  const auth = await createSshAuthArgs(input.spec);
+  const localEnvFile = await withTempFile("paperclip-ssh-env-", input.envFileContents, 0o600);
+  try {
+    await copyEnvFileToRemote(auth.args, input.spec, localEnvFile.path, input.remoteEnvPath);
+  } finally {
+    await localEnvFile.cleanup();
+  }
+  return {
+    cleanup: async () => {
+      await auth.cleanup();
+    },
+  };
+}
+
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
   command: string;
@@ -1266,51 +1422,53 @@ export async function buildSshSpawnTarget(input: {
   args: string[];
   cleanup: () => Promise<void>;
 }> {
-  for (const key of Object.keys(input.env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid SSH environment variable key: ${key}`);
-    }
-  }
+  // Validate env keys before any network call: callers (and tests) must get
+  // the key error without an ssh round-trip to an unreachable host.
+  assertValidShellEnvKeys(filterStringEnvEntries(input.env));
   const auth = await createSshAuthArgs(input.spec);
-  const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
-  const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  // Source the login profiles first, then run `env KEY=VAL cmd` so
-  // user-supplied identity overrides win over anything a profile re-exports.
-  // The SSH target is an operator-configured host, not a Paperclip sandbox
-  // image, so it can expose `node` or an agent CLI only through a login
-  // profile; a non-login SSH command would miss that PATH. Source
-  // `/etc/profile` first so a host that exposes the PATH through
-  // `/etc/profile.d` scripts still resolves node and the agent CLI. The script
-  // no longer sources `nvm.sh`; a profile that adds nvm still runs.
-  // .bash_profile typically sources .bashrc itself; only source .bashrc
-  // directly when no .bash_profile exists, so a host that adds nvm in
-  // .bashrc still resolves node without a double-run of the setup.
-  const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-    `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
-  ].join(" && ");
+  try {
+    const sshArgs = [...auth.args];
+    const cleanups: Array<() => Promise<void>> = [auth.cleanup];
+    // The spawn target is built now but executed later by the caller, so stage
+    // the env file up front: resolve the remote HOME first (same absolute path
+    // lands in both the script and the scp destination), then the remote script
+    // sources it after the profiles (identity overrides win) and removes it via
+    // a chained `rm -f` after the payload runs.
+    const remoteHomeDir = await resolveRemoteHomeDir(auth.args, input.spec);
+    const { remoteScript, remoteEnvPath, envFileContents } = buildSshSpawnTargetScript({
+      remoteCwd: input.spec.remoteCwd,
+      command: input.command,
+      args: input.args,
+      env: input.env,
+      remoteHomeDir,
+    });
+    if (remoteEnvPath != null && envFileContents != null) {
+      const staged = await stageSshSpawnTargetEnvFile({
+        spec: input.spec,
+        remoteEnvPath,
+        envFileContents,
+      });
+      cleanups.push(staged.cleanup);
+    }
 
-  sshArgs.push(
-    "-p",
-    String(input.spec.port),
-    `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteScript)}`,
-  );
+    sshArgs.push(
+      "-p",
+      String(input.spec.port),
+      `${input.spec.username}@${input.spec.host}`,
+      `sh -c ${shellQuote(remoteScript)}`,
+    );
 
-  return {
-    command: "ssh",
-    args: sshArgs,
-    cleanup: auth.cleanup,
-  };
+    return {
+      command: "ssh",
+      args: sshArgs,
+      cleanup: async () => {
+        await Promise.all(cleanups.map((cleanup) => cleanup()));
+      },
+    };
+  } catch (error) {
+    await auth.cleanup();
+    throw error;
+  }
 }
 
 export async function syncDirectoryToSsh(input: {

@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   buildSshSpawnTarget,
+  buildSshSpawnTargetScript,
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
@@ -272,6 +273,35 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toBe("hello over ssh stdin\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("delivers env to the remote shell without exposing values in argv", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env file staging test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+
+    // Synthetic values only — never real secrets in fixtures.
+    const result = await runSshCommand(
+      config,
+      `printf '%s|%s' "$SSH_STAGED_ENV_A" "$SSH_STAGED_ENV_B"`,
+      {
+        env: { SSH_STAGED_ENV_A: "synth-alpha-value", SSH_STAGED_ENV_B: "synth-beta-value" },
+        timeoutMs: 30_000,
+        maxBuffer: 256 * 1024,
+      },
+    );
+
+    expect(result.stdout).toBe("synth-alpha-value|synth-beta-value");
+
+    // The staged env file removes itself on remote exit: no residue in $HOME.
+    const residue = await runSshCommand(config, `ls "$HOME"/.paperclip-ssh-env-*.sh 2>/dev/null || echo no-residue`, {
+      timeoutMs: 30_000,
+      maxBuffer: 256 * 1024,
+    });
+    expect(residue.stdout).toContain("no-residue");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("does not treat an unrelated reused pid as the running fixture", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
@@ -447,28 +477,20 @@ describe("ssh env-lab fixture", () => {
     await expect(stat(rootDir)).rejects.toThrow();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("builds a remote script that sources login profiles but no nvm", async () => {
-    const target = await buildSshSpawnTarget({
-      spec: {
-        host: "ssh.example.test",
-        port: 22,
-        username: "ssh-user",
-        remoteCwd: "/srv/paperclip/workspace",
-        remoteWorkspacePath: "/srv/paperclip/workspace",
-        privateKey: null,
-        knownHosts: null,
-        strictHostKeyChecking: true,
-      },
+  it("builds a remote script that sources login profiles but no nvm", () => {
+    // Pure script builder: no network, so this runs without the sshd fixture.
+    const { remoteScript, remoteEnvPath, envFileContents } = buildSshSpawnTargetScript({
+      remoteCwd: "/srv/paperclip/workspace",
       command: "node",
       args: ["--version"],
-      env: { FOO: "bar" },
+      // Synthetic value only — never a real secret in fixtures.
+      env: { FOO: "synth-fixture-value" },
+      remoteHomeDir: "/home/fixture",
     });
 
-    // The remote script rides the last ssh argument. The SSH target is an
-    // operator-configured host that can expose `node` only through a login
-    // profile, so the wrapper sources the profiles. It no longer sources
-    // `nvm.sh`; a profile that adds nvm still runs.
-    const remoteScript = String(target.args.at(-1) ?? "");
+    // The SSH target is an operator-configured host that can expose `node`
+    // only through a login profile, so the wrapper sources the profiles. It
+    // no longer sources `nvm.sh`; a profile that adds nvm still runs.
     expect(remoteScript).not.toContain("nvm.sh");
     expect(remoteScript).not.toContain("NVM_DIR");
     // Source /etc/profile so a host that exposes the PATH through
@@ -480,14 +502,103 @@ describe("ssh env-lab fixture", () => {
     // Fall back to .bashrc when no .bash_profile exists, so a host that adds
     // nvm in .bashrc still resolves node under a non-login SSH command.
     expect(remoteScript).toContain(".bashrc");
-    // The last ssh argument wraps the script as `sh -c '...'`, so the inner
-    // quotes are escaped. Assert the command still runs: cd, env, and the argv.
+    // Assert the command still runs: cd and the argv.
     expect(remoteScript).toContain("cd ");
     expect(remoteScript).toContain("/srv/paperclip/workspace");
-    expect(remoteScript).toContain("exec env ");
     expect(remoteScript).toContain("node");
     expect(remoteScript).toContain("--version");
-    await target.cleanup();
+    // Env must not ride the ssh argv: no `env KEY=VAL` prefix and no secret
+    // value in the remote script. The staged env file is sourced after the
+    // login profiles (identity overrides win); the payload runs as `sh -c`
+    // (no terminal `exec`, which would skip cleanup) followed by a chained
+    // `rm -f` of the staged file, so cleanup fires on success and failure.
+    // The staged path is fully expanded — no literal `$HOME` that scp and the
+    // single-quoted sourcing tests would fail to resolve.
+    expect(remoteScript).not.toContain("exec env ");
+    expect(remoteScript).not.toContain("synth-fixture-value");
+    expect(remoteEnvPath!.startsWith("/home/fixture/.paperclip-ssh-env-")).toBe(true);
+    expect(remoteEnvPath).toContain(".paperclip-ssh-env-");
+    expect(remoteEnvPath).not.toContain("$HOME");
+    expect(remoteScript).toContain(".paperclip-ssh-env-");
+    expect(remoteScript).not.toContain("$HOME/.paperclip-ssh-env-");
+    expect(remoteScript).not.toContain("trap 'rm -f ");
+    expect(remoteScript).toContain("rm -f ");
+    expect(remoteScript).toContain("; rc=$?; rm -f ");
+    expect(envFileContents).toContain("export FOO=");
+  });
+
+  it("keeps spawn-target env values out of the argv with multiple vars", () => {
+    const { remoteScript } = buildSshSpawnTargetScript({
+      remoteCwd: "/srv/paperclip/workspace",
+      command: "env",
+      args: [],
+      // Synthetic values only — never a real secret in fixtures.
+      env: { SSH_STAGED_ENV_ALPHA: "synth-fixture-alpha", SSH_STAGED_ENV_BETA: "synth-fixture-beta" },
+      remoteHomeDir: "/home/fixture",
+    });
+
+    for (const secret of ["synth-fixture-alpha", "synth-fixture-beta"]) {
+      expect(remoteScript).not.toContain(secret);
+    }
+    expect(remoteScript).not.toContain("exec env ");
+  });
+
+  it("rejects an unexpanded remote home dir when building spawn-target scripts", () => {
+    // Pure script builder: the staging caller must resolve the remote HOME
+    // once (via `printf %s "$HOME"`); a literal `$HOME/...` path would never
+    // resolve inside the single-quoted sourcing tests, and scp would write to
+    // a literal `$HOME` directory on SFTP-mode servers.
+    expect(() =>
+      buildSshSpawnTargetScript({
+        remoteCwd: "/srv/paperclip/workspace",
+        command: "env",
+        args: [],
+        env: { FOO: "synth-fixture-value" },
+        remoteHomeDir: "$HOME",
+      }),
+    ).toThrow("fully-expanded remote HOME");
+    expect(() =>
+      buildSshSpawnTargetScript({
+        remoteCwd: "/srv/paperclip/workspace",
+        command: "env",
+        args: [],
+        // Synthetic value only — never a real secret in fixtures.
+        env: { FOO: "synth-fixture-value" },
+        remoteHomeDir: "",
+      }),
+    ).toThrow("fully-expanded remote HOME");
+  });
+
+  it("runs the spawn-target payload as sh -c with chained env-file removal", () => {
+    // Regression for the two blocking findings on the first fix: a
+    // single-quoted `$HOME` staging path never resolves, and `trap ... EXIT`
+    // before a terminal `exec` never fires — the secret-bearing file would
+    // persist on the remote host after successful commands.
+    const { remoteScript } = buildSshSpawnTargetScript({
+      remoteCwd: "/srv/paperclip/workspace",
+      command: "node",
+      args: ["--version"],
+      // Synthetic value only — never a real secret in fixtures.
+      env: { FOO: "synth-fixture-value" },
+      remoteHomeDir: "/home/fixture",
+    });
+
+    expect(remoteScript).not.toContain("trap ");
+    expect(remoteScript).not.toContain("$HOME/.paperclip-ssh-env-");
+    // The env file is sourced after the login profiles, then the payload runs
+    // as `sh -c` (returning control to the shell) with removal chained after
+    // it on both success and failure paths.
+    const sourceIndex = remoteScript.indexOf(".paperclip-ssh-env-");
+    const payloadIndex = remoteScript.indexOf("sh -c ");
+    const rmIndex = remoteScript.indexOf("; rc=$?; rm -f ");
+    expect(sourceIndex).toBeGreaterThan(-1);
+    expect(payloadIndex).toBeGreaterThan(sourceIndex);
+    expect(rmIndex).toBeGreaterThan(payloadIndex);
+    // No terminal `exec` into the payload: the shell must survive it to run
+    // the chained removal. (`exec env ` / `exec sh -c ` prefixes are covered by
+    // the no-argv assertions above; this pins the bare-`exec` shape too.)
+    expect(remoteScript).not.toContain("exec node");
+    expect(remoteScript).not.toContain("exec sh -c ");
   });
 
   it("rejects invalid environment variable keys when constructing SSH spawn targets", async () => {
