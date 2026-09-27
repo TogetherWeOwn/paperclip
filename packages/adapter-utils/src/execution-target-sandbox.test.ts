@@ -211,7 +211,7 @@ describe("sandbox adapter execution targets", () => {
     elapsedMs: number;
   };
 
-  async function runProxyWithInput(command: string, input: string): Promise<ProxyRunResult> {
+  async function runProxyWithInput(command: string, input: string, keepStdinOpen = false): Promise<ProxyRunResult> {
     const startedAt = performance.now();
     const child = spawn(command, [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
@@ -224,7 +224,8 @@ describe("sandbox adapter execution targets", () => {
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    child.stdin.end(input);
+    if (keepStdinOpen) child.stdin.write(input);
+    else child.stdin.end(input);
     const code = await new Promise<number | null>((resolve, reject) => {
       const timeout = setTimeout(() => {
         child.kill("SIGKILL");
@@ -234,7 +235,7 @@ describe("sandbox adapter execution targets", () => {
         clearTimeout(timeout);
         reject(error);
       });
-      child.on("exit", (exitCode) => {
+      child.on("close", (exitCode) => {
         clearTimeout(timeout);
         resolve(exitCode);
       });
