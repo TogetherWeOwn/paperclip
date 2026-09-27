@@ -5,8 +5,10 @@ import {
   companySkillAuditResultSchema,
   companySkillInstallCatalogResultSchema,
   companySkillInstallCatalogSchema,
+  companySkillFileUpdateSchema,
   companySkillInstallUpdateSchema,
   companySkillResetSchema,
+  companySkillUpdateSchema,
   companySkillUpdateStatusSchema,
 } from "./company-skill.js";
 
@@ -179,5 +181,40 @@ describe("company skill catalog validators", () => {
     expect(companySkillInstallUpdateSchema.parse({ force: true })).toEqual({ force: true });
     expect(companySkillResetSchema.parse(undefined)).toEqual({});
     expect(companySkillResetSchema.parse({ force: true })).toEqual({ force: true });
+  });
+
+  it("rejects unknown keys on skill update and file update instead of stripping them", () => {
+    const update = companySkillUpdateSchema.safeParse({
+      description: "Review code",
+      skillName: "review",
+    });
+    expect(update.success).toBe(false);
+    expect(update.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["skillName"],
+      }),
+    ]);
+
+    const fileUpdate = companySkillFileUpdateSchema.safeParse({
+      path: "SKILL.md",
+      content: "# Skill",
+      executable: true,
+    });
+    expect(fileUpdate.success).toBe(false);
+    expect(fileUpdate.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["executable"],
+      }),
+    ]);
+
+    expect(companySkillUpdateSchema.parse(undefined)).toEqual({});
+    expect(
+      companySkillUpdateSchema.parse({ description: "Review code" }),
+    ).toMatchObject({ description: "Review code" });
+    expect(
+      companySkillFileUpdateSchema.parse({ path: "SKILL.md", content: "# Skill" }),
+    ).toMatchObject({ path: "SKILL.md" });
   });
 });

@@ -250,7 +250,9 @@ describe("issue validators", () => {
       createdByUserId: "spoofed-creator",
       responsibleUserId: "spoofed-responsible",
     });
-    const updated = updateIssueSchema.parse({
+    // A patch body has no attribution field. The strict schema refuses the
+    // whole request, so the update cannot carry a spoofed attribution value.
+    const updated = updateIssueSchema.safeParse({
       title: "Do not update attribution",
       createdByUserId: "spoofed-creator",
       responsibleUserId: "spoofed-responsible",
@@ -258,8 +260,32 @@ describe("issue validators", () => {
 
     expect(created.createdByUserId).toBe("spoofed-creator");
     expect(created.responsibleUserId).toBe("spoofed-responsible");
-    expect(updated).not.toHaveProperty("createdByUserId");
-    expect(updated).not.toHaveProperty("responsibleUserId");
+    expect(updated.success).toBe(false);
+    expect(updated.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["createdByUserId", "responsibleUserId"],
+      }),
+    ]);
+  });
+
+  it("rejects unknown keys on an issue update instead of stripping them", () => {
+    // Misspelled assignment field: the request must fail, not drop the field.
+    const misspelled = updateIssueSchema.safeParse({
+      title: "Fix the typo",
+      assigneeId: "spoofed-assignee",
+    });
+    expect(misspelled.success).toBe(false);
+    expect(misspelled.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["assigneeId"],
+      }),
+    ]);
+
+    expect(
+      updateIssueSchema.parse({ title: "Fix the typo", priority: "high" }),
+    ).toMatchObject({ title: "Fix the typo", priority: "high" });
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {

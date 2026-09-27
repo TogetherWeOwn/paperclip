@@ -191,6 +191,27 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return { companyId, agentId, issueId, runId, wakeId, commentIds };
   }
 
+  it("rejects an unknown key on a queue mutation body instead of stripping it", async () => {
+    const seeded = await seedQueue();
+    const initial = await request(app(seeded.companyId))
+      .get(`/api/issues/${seeded.issueId}/queued-comments`);
+    expect(initial.status, JSON.stringify(initial.body)).toBe(200);
+
+    // All required fields are present and correct; only one extra unknown key
+    // is added. Without the strict target schema this strips to a valid body
+    // and returns 200. With it, the request fails with a validation error.
+    const misspelled = await request(app(seeded.companyId))
+      .patch(`/api/issues/${seeded.issueId}/queued-comments/${seeded.commentIds[0]}`)
+      .send({
+        queueId: seeded.wakeId,
+        revision: initial.body.revision,
+        body: "typo",
+        commentId: seeded.commentIds[0],
+      });
+    expect(misspelled.status).toBe(400);
+    expect(JSON.stringify(misspelled.body)).toContain("commentId");
+  });
+
   it.each(["cancelled", "running"])("rejects a late Done from an interrupted %s task run at the write boundary", async status => {
     const seeded = await seedQueue();
     await db.update(heartbeatRuns).set({ status, resultJson: { executionCancellation: { state: "requested" } } })
