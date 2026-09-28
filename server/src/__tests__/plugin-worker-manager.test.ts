@@ -709,6 +709,84 @@ describe("plugin proactive company scope (LOOA-629)", () => {
       await handle.stop().catch(() => undefined);
     }
   });
+
+  it("admits a proactive companies.list() after a notify() onEvent delivery", async () => {
+    // A fire-and-forget event delivery registers a TTL-bound invocation entry.
+    // On a board with frequent events the map is never empty for that reason
+    // alone; that bookkeeping must not deny an unrelated proactive call.
+    const companiesList = vi.fn(async () => [{ id: "company-1", name: "Co" }]);
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: { list: companiesList },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+      handle.notify("onEvent", { event: { companyId: "company-1", name: "issue.updated" } });
+      const result = await handle.call("getData", {
+        params: { mode: "omit", hostMethod: "companies.list", requestedCompanyId: "company-1" },
+      } as unknown as HostToWorkerMethods["getData"][0]);
+      expect(result).toMatchObject([{ id: "company-1" }]);
+      expect(companiesList).toHaveBeenCalledTimes(1);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still denies a proactive call while a call-path invocation is in flight", async () => {
+    // performAction registers a hard (call-path) invocation; the fixture's
+    // id-less nested companies.list then runs on the proactive path while that
+    // invocation still awaits its response, so it must stay denied.
+    const companiesList = vi.fn(async () => [{ id: "company-1", name: "Co" }]);
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: { list: companiesList },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+      await expect(handle.call("performAction", {
+        key: "probe",
+        params: { mode: "omit", hostMethod: "companies.list", requestedCompanyId: "company-1" },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-1",
+        },
+        renderEnvironment: null,
+      })).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        message: expect.stringContaining("missing, expired, or unknown invocation scope"),
+      });
+      expect(companiesList).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
 });
 
 describe("plugin proactive events.subscribe: options-seeded scope + filter parity (LOOA-695)", () => {
