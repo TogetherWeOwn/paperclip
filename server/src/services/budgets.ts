@@ -165,6 +165,68 @@ async function computeObservedAmount(
   return Number(row?.total ?? 0);
 }
 
+/**
+ * Host-computed fraction of the run's budget envelope spent (TOG-7967, D1).
+ *
+ * Denominator = the most-specific active `billed_cents` budget-policy envelope
+ * covering the run (agent-scope → project → company, `calendar_month_utc`
+ * preferred); fraction = `observed / amount` with `observed` from the existing
+ * `computeObservedAmount` scope+window logic. No qualifying policy with
+ * `amount > 0` → `undefined` (plugin treats absent/non-finite as "host did not
+ * inject"). `runId` is accepted for call-site uniformity and reserved for a
+ * future per-run debit; the host currently owns no per-run budget envelope.
+ */
+export async function runBudgetSpentFraction(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string | null;
+    projectId: string | null;
+    runId: string;
+  },
+): Promise<number | undefined> {
+  void input.runId;
+  const rows = await db
+    .select()
+    .from(budgetPolicies)
+    .where(
+      and(
+        eq(budgetPolicies.companyId, input.companyId),
+        eq(budgetPolicies.isActive, true),
+        eq(budgetPolicies.metric, "billed_cents"),
+      ),
+    );
+
+  const candidates = rows.filter((row) => {
+    // Belt-and-braces with the query's isActive/metric predicates above.
+    if (!row.isActive || row.metric !== "billed_cents") return false;
+    if (row.amount <= 0) return false;
+    if (row.scopeType === "agent") return input.agentId !== null && row.scopeId === input.agentId;
+    if (row.scopeType === "project") return input.projectId !== null && row.scopeId === input.projectId;
+    if (row.scopeType === "company") return row.scopeId === input.companyId;
+    return false;
+  });
+
+  const scopeRank = (scopeType: string): number => {
+    if (scopeType === "agent") return 0;
+    if (scopeType === "project") return 1;
+    return 2;
+  };
+  candidates.sort((a, b) => {
+    const scopeDelta = scopeRank(a.scopeType) - scopeRank(b.scopeType);
+    if (scopeDelta !== 0) return scopeDelta;
+    const aMonthly = a.windowKind === "calendar_month_utc" ? 0 : 1;
+    const bMonthly = b.windowKind === "calendar_month_utc" ? 0 : 1;
+    return aMonthly - bMonthly;
+  });
+
+  const winner = candidates[0];
+  if (!winner) return undefined;
+  const observed = await computeObservedAmount(db, winner);
+  const fraction = observed / winner.amount;
+  return Number.isFinite(fraction) ? fraction : undefined;
+}
+
 function buildApprovalPayload(input: {
   policy: PolicyRow;
   scopeName: string;
