@@ -6,8 +6,8 @@ import { Transform } from "node:stream";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
+  streamSshToLocalFileForTest,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
 
@@ -168,7 +168,7 @@ async function createRemoteRepo(rootDir: string): Promise<{ remoteDir: string; h
 }
 
 describe("ssh bundle stream", () => {
-  it("drains the full bundle through a slow progress counter before resolving", async () => {
+  it("drains a slow ssh stream before resolving", async () => {
     const rootDir = await trackDir("paperclip-ssh-bundle-drain-");
     const { remoteDir, head } = await createRemoteRepo(rootDir);
     await git(remoteDir, ["update-ref", "refs/paperclip/ssh-sync/export", "HEAD"]);
@@ -249,8 +249,11 @@ describe("ssh bundle stream", () => {
     });
 
     expect(await git(localDir, ["rev-parse", "HEAD"])).toBe(head);
-    // The terminal completion line still lands after the retry succeeds.
-    expect(seen.join("")).toMatch(/100%|MB/);
+    // The truncated first attempt gets a terminal failure line, and the retry
+    // still ends on a completion line.
+    const exportLines = seen.filter((line) => line.includes("Exporting git history"));
+    expect(exportLines.some((line) => line.includes("failed after"))).toBe(true);
+    expect(exportLines.at(-1)).not.toMatch(/failed/);
   }, TEST_TIMEOUT_MS);
 
   it("fails instead of retrying forever when every stream is truncated", async () => {
@@ -278,38 +281,36 @@ describe("ssh bundle stream", () => {
     ).rejects.toThrow(/early EOF|index-pack/i);
   }, TEST_TIMEOUT_MS);
 
-  it("still round-trips prepare/restore through the fixture counter path", async () => {
-    const rootDir = await trackDir("paperclip-ssh-bundle-counter-");
-    const localRepo = path.join(rootDir, "local-workspace");
-    await execFile("git", ["init", "-b", "main", localRepo], { timeout: 30_000 });
-    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
-    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
-    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
-    await git(localRepo, ["add", "tracked.txt"]);
-    await git(localRepo, ["commit", "-m", "initial"]);
+  it("keeps every byte when the progress counter lags behind the ssh exit", async () => {
+    const rootDir = await trackDir("paperclip-ssh-bundle-lag-");
+    const payloadPath = path.join(rootDir, "payload.bin");
+    const payload = Buffer.alloc(1_500_000, "x");
+    await writeFile(payloadPath, payload);
+    // The fake ssh serves the payload at full speed and exits once stdout
+    // flushes, so the slow counter below still holds bytes when ssh closes.
+    await installFakeSshFlakyStream(payloadPath, payloadPath);
 
+    let transferred = 0;
     const slowCounter = new Transform({
       highWaterMark: 64,
       transform(chunk: Buffer, _encoding, callback) {
+        transferred += chunk.length;
         setTimeout(() => callback(null, chunk), 5);
       },
     });
+    const localFile = path.join(rootDir, "out.bundle");
+    await streamSshToLocalFileForTest({
+      spec: baseSpec(),
+      remoteScript: "git bundle create - refs/paperclip/ssh-sync/export",
+      localFile,
+      progress: {
+        counter: slowCounter,
+        transferred: () => transferred,
+        finish: async () => undefined,
+        fail: async () => undefined,
+      },
+    });
 
-    // The real `ssh` binary is untouched here; this only proves a slow
-    // counter Transform preserves every byte through pipeline semantics.
-    const { pipeline } = await import("node:stream/promises");
-    const { createWriteStream } = await import("node:fs");
-    const outPath = path.join(rootDir, "out.bin");
-    const payload = Buffer.alloc(300_000, "x");
-    const { Readable } = await import("node:stream");
-    await pipeline(Readable.from([payload]), slowCounter, createWriteStream(outPath));
-    expect((await stat(outPath)).size).toBe(payload.length);
-
-    await expect(
-      prepareWorkspaceForSshExecution({
-        spec: { ...baseSpec(), host: "invalid.invalid" },
-        localDir: localRepo,
-      }),
-    ).rejects.toThrow();
+    expect((await stat(localFile)).size).toBe(payload.length);
   }, TEST_TIMEOUT_MS);
 });

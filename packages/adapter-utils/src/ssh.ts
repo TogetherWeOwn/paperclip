@@ -789,6 +789,9 @@ async function streamSshToLocalFile(input: {
   }).finally(auth.cleanup);
 }
 
+/** Test-only. Drive the SSH download path with a caller-supplied progress counter. */
+export const streamSshToLocalFileForTest = streamSshToLocalFile;
+
 async function importGitWorkspaceToSsh(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -945,6 +948,8 @@ async function exportGitWorkspaceFromSsh(input: {
         } catch (error) {
           if (!retriedTruncatedFetch && isTruncatedBundleFetchError(error)) {
             retriedTruncatedFetch = true;
+            // Close out this attempt's progress line before the retry replaces it.
+            await progress?.fail();
             continue;
           }
           throw error;
