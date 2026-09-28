@@ -111,6 +111,86 @@ describe("runAdapterExecutionTargetShellCommand", () => {
     );
   });
 
+  it("redacts known secret env values from SSH output and results", async () => {
+    const secret = "sk-ant-abcdefghijklmnop";
+    vi.spyOn(ssh, "runSshCommand").mockResolvedValue({
+      stdout: `token=${secret}\n`,
+      stderr: "",
+    });
+    const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => {});
+
+    const result = await runAdapterExecutionTargetShellCommand(
+      "run-1c",
+      {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip/workspace",
+        spec: {
+          host: "ssh.example.test",
+          port: 22,
+          username: "ssh-user",
+          remoteCwd: "/srv/paperclip/workspace",
+          remoteWorkspacePath: "/srv/paperclip/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+      },
+      "printenv",
+      {
+        cwd: "/tmp/local",
+        env: { ANTHROPIC_API_KEY: secret },
+        onLog,
+      },
+    );
+
+    expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).toContain("***REDACTED***");
+    expect(onLog).toHaveBeenCalledWith("stdout", "token=***REDACTED***\n");
+    expect(
+      onLog.mock.calls.some(([, chunk]) => typeof chunk === "string" && chunk.includes(secret)),
+    ).toBe(false);
+  });
+
+  it("redacts known secret env values from SSH failure output", async () => {
+    const secret = "postgres://user:pass@host:5432/db";
+    vi.spyOn(ssh, "runSshCommand").mockRejectedValue(Object.assign(new Error("non-zero exit"), {
+      code: 1,
+      stdout: `url=${secret}\n`,
+      stderr: "",
+      signal: null,
+    }));
+    const onLog = vi.fn(async () => {});
+
+    const result = await runAdapterExecutionTargetShellCommand(
+      "run-1d",
+      {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip/workspace",
+        spec: {
+          host: "ssh.example.test",
+          port: 22,
+          username: "ssh-user",
+          remoteCwd: "/srv/paperclip/workspace",
+          remoteWorkspacePath: "/srv/paperclip/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+      },
+      "printenv",
+      {
+        cwd: "/tmp/local",
+        env: { DATABASE_URL: secret },
+        onLog,
+      },
+    );
+
+    expect(result.stdout).not.toContain(secret);
+    expect(onLog).toHaveBeenCalledWith("stdout", "url=***REDACTED***\n");
+  });
+
   it("returns a timedOut result when the SSH shell command times out", async () => {
     vi.spyOn(ssh, "runSshCommand").mockRejectedValue(Object.assign(new Error("timed out"), {
       code: "ETIMEDOUT",

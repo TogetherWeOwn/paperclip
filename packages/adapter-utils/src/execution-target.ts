@@ -80,6 +80,7 @@ import {
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { createRedactingOnLog } from "./secret-env-redaction.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import {
   runWithRuntimeParent,
@@ -865,6 +866,13 @@ export async function runAdapterExecutionTargetProcess(
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
     const env = sanitizeRemoteExecutionEnv(options.env);
+    // Known secret env values must not land verbatim in the run log when the
+    // remote command echoes them (`printenv`, `env`). Collected once from the
+    // sanitized env actually sent, mirroring the local `runChildProcess`
+    // choke point. The wrapper covers both the runner's incremental `onLog`
+    // chunks and the run-log tail stream (which re-emits the same remote
+    // bytes through the sink passed to `start`/`finish`).
+    const redacting = createRedactingOnLog(env, options.onLog);
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
       message: "Starting adapter in environment",
@@ -874,7 +882,7 @@ export async function runAdapterExecutionTargetProcess(
     let execArgs = args;
     if (runLogTail) {
       ({ command: execCommand, args: execArgs } = runLogTail.wrapCommand(command, args));
-      runLogTail.start(options.onLog);
+      runLogTail.start(redacting.onLog);
     }
     try {
       const result = await runner.execute({
@@ -886,7 +894,7 @@ export async function runAdapterExecutionTargetProcess(
         timeoutMs: options.timeoutSec > 0 ? options.timeoutSec * 1000 : target.timeoutMs ?? undefined,
         // The tail loop already streams incremental chunks; suppress the
         // runner's end-of-run batched onLog to avoid duplicate log bytes.
-        onLog: runLogTail ? undefined : options.onLog,
+        onLog: runLogTail ? undefined : redacting.onLog,
         onSpawn: options.onSpawn
           ? async (meta) => options.onSpawn?.({ ...meta, processGroupId: null })
           : undefined,
@@ -898,15 +906,27 @@ export async function runAdapterExecutionTargetProcess(
       // control channel that died before this clean completion still fails the
       // run closed.
       if (!result.timedOut && typeof result.exitCode === "number" && Number.isInteger(result.exitCode) && result.exitCode >= 0) options.onProcessStopped?.();
-      const settled = applyRunDispositionSeam(result, options.settleRunDisposition);
+      const settled = applyRunDispositionSeam(
+        {
+          ...result,
+          stdout: redacting.redactText(result.stdout),
+          stderr: redacting.redactText(result.stderr),
+        },
+        options.settleRunDisposition,
+      );
       if (runLogTail) {
         await runLogTail.finish({ stdout: result.stdout, stderr: result.stderr });
       }
+      // Release the redactors' held-back carry so the streamed log view ends
+      // with the same bytes the redacted result carries. Runs after `finish`
+      // so the flush lands after the tail's final batch.
+      await redacting.flush();
       return settled;
     } catch (error) {
       if (runLogTail) {
         await runLogTail.abort();
       }
+      await redacting.flush();
       throw error;
     }
   }
@@ -947,6 +967,11 @@ export async function runAdapterExecutionTargetShellCommand(
   if (target?.kind === "remote") {
     const startedAt = new Date().toISOString();
     const env = sanitizeRemoteExecutionEnv(options.env);
+    // Known secret env values must not land verbatim in the run log when the
+    // remote command echoes them (`printenv`, `env`). Collected once from the
+    // sanitized env actually sent, mirroring the local `runChildProcess`
+    // choke point.
+    const redacting = createRedactingOnLog(env, onLog);
     if (target.transport === "ssh") {
       try {
         // Pass the raw command — `runSshCommand` owns profile sourcing and
@@ -958,14 +983,17 @@ export async function runAdapterExecutionTargetShellCommand(
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
         });
-        if (result.stdout) await onLog("stdout", result.stdout);
-        if (result.stderr) await onLog("stderr", result.stderr);
+        const stdout = redacting.redactText(result.stdout);
+        const stderr = redacting.redactText(result.stderr);
+        if (stdout) await redacting.onLog("stdout", stdout);
+        if (stderr) await redacting.onLog("stderr", stderr);
+        await redacting.flush();
         return {
           exitCode: 0,
           signal: null,
           timedOut: false,
-          stdout: result.stdout,
-          stderr: result.stderr,
+          stdout,
+          stderr,
           pid: null,
           startedAt,
         };
@@ -975,11 +1003,12 @@ export async function runAdapterExecutionTargetShellCommand(
           stderr?: string;
           signal?: string | null;
         };
-        const stdout = timedOutError.stdout ?? "";
-        const stderr = timedOutError.stderr ?? "";
+        const stdout = redacting.redactText(timedOutError.stdout ?? "");
+        const stderr = redacting.redactText(timedOutError.stderr ?? "");
         if (typeof timedOutError.code === "number") {
-          if (stdout) await onLog("stdout", stdout);
-          if (stderr) await onLog("stderr", stderr);
+          if (stdout) await redacting.onLog("stdout", stdout);
+          if (stderr) await redacting.onLog("stderr", stderr);
+          await redacting.flush();
           return {
             exitCode: timedOutError.code,
             signal: timedOutError.signal ?? null,
@@ -993,8 +1022,9 @@ export async function runAdapterExecutionTargetShellCommand(
         if (timedOutError.code !== "ETIMEDOUT") {
           throw error;
         }
-        if (stdout) await onLog("stdout", stdout);
-        if (stderr) await onLog("stderr", stderr);
+        if (stdout) await redacting.onLog("stdout", stdout);
+        if (stderr) await redacting.onLog("stderr", stderr);
+        await redacting.flush();
         return {
           exitCode: null,
           signal: timedOutError.signal ?? null,
@@ -1008,14 +1038,22 @@ export async function runAdapterExecutionTargetShellCommand(
     }
 
     const shellCommand = preferredSandboxShell(target);
-    return await requireSandboxRunner(target).execute({
+    const result = await requireSandboxRunner(target).execute({
       command: shellCommand,
       args: shellCommandArgs(command),
       cwd: target.remoteCwd,
       env,
       timeoutMs: (options.timeoutSec ?? 15) * 1000,
-      onLog,
+      onLog: redacting.onLog,
     });
+    // Release the redactors' held-back carry so the streamed log view ends
+    // with the same bytes the redacted result carries.
+    await redacting.flush();
+    return {
+      ...result,
+      stdout: redacting.redactText(result.stdout),
+      stderr: redacting.redactText(result.stderr),
+    };
   }
 
   return await runAdapterExecutionTargetProcess(

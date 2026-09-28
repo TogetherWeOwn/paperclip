@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { createRedactingOnLog } from "./secret-env-redaction.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -57,6 +58,12 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
+      // Known secret env values must not land verbatim in the run log when a
+      // remote command echoes them (`printenv`, `env`). Collected once from
+      // the env actually sent, mirroring the local `runChildProcess` choke
+      // point; both the streamed `onLog` emissions and the returned result
+      // are redacted below.
+      const redacting = createRedactingOnLog(commandInput.env ?? {}, commandInput.onLog);
       const envEntries = Object.entries(commandInput.env ?? {})
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
       const envPrefix = envEntries.length > 0
@@ -78,14 +85,17 @@ export function createSshCommandManagedRuntimeRunner(input: {
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
         });
-        if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
-        if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
+        const stdout = redacting.redactText(result.stdout);
+        const stderr = redacting.redactText(result.stderr);
+        if (stdout) await redacting.onLog("stdout", stdout);
+        if (stderr) await redacting.onLog("stderr", stderr);
+        await redacting.flush();
         return {
           exitCode: 0,
           signal: null,
           timedOut: false,
-          stdout: result.stdout,
-          stderr: result.stderr,
+          stdout,
+          stderr,
           pid: null,
           startedAt,
         };
@@ -97,14 +107,15 @@ export function createSshCommandManagedRuntimeRunner(input: {
           signal?: unknown;
           killed?: unknown;
         };
-        const stdout = typeof failure.stdout === "string" ? failure.stdout : "";
-        const stderr = typeof failure.stderr === "string"
+        const stdout = redacting.redactText(typeof failure.stdout === "string" ? failure.stdout : "");
+        const stderr = redacting.redactText(typeof failure.stderr === "string"
           ? failure.stderr
           : error instanceof Error
             ? error.message
-            : String(error);
-        if (stdout) await commandInput.onLog?.("stdout", stdout);
-        if (stderr) await commandInput.onLog?.("stderr", stderr);
+            : String(error));
+        if (stdout) await redacting.onLog("stdout", stdout);
+        if (stderr) await redacting.onLog("stderr", stderr);
+        await redacting.flush();
         return {
           exitCode: typeof failure.code === "number" ? failure.code : null,
           signal: typeof failure.signal === "string" ? failure.signal : null,
