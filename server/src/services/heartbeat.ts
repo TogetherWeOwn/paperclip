@@ -4367,6 +4367,20 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
+
+export function heartbeatRunGatewayTokenTtlMs(): number {
+  const parsed = Number.parseInt(
+    readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS) ?? "",
+    10,
+  );
+  // The gateway rejects tokens whose run is no longer active, so a long TTL
+  // only keeps tools working for the lifetime of a still-running run.
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? parsed
+    : RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+}
+
 function parseNativeSessionGoalControl(
   value: unknown,
 ): NativeSessionGoalControl | null {
@@ -4741,7 +4755,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       clientLabel: `${input.agent.name} heartbeat run`,
       ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: new Date(Date.now() + heartbeatRunGatewayTokenTtlMs()),
     },
     actor: { agentId: input.agent.id },
   });
@@ -5038,7 +5052,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + heartbeatRunGatewayTokenTtlMs());
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({

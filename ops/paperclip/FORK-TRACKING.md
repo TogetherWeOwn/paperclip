@@ -4,6 +4,23 @@ Ledger of upstream refs vs fork state for the tog release line.
 "Gone when" = condition under which the row can be dropped
 (upstream merged the equivalent, or the fork rebased past it).
 
+## tog.3 ([TOG-8853](/TOG/issues/TOG-8853), parent [TOG-8760](/TOG/issues/TOG-8760))
+
+- Base: `tog/v2026.916.1-e2big-14092` @ `6aefa649f` (tog.2 release tip)
+- Work branch: `fix/run-gateway-token-ttl`
+- PR: TogetherWeOwn/paperclip#12 (`fix(tool-gateway): run-scoped token TTL covers run lifetime`)
+- Fix: both run-scoped gateway token mint sites in `server/src/services/heartbeat.ts`
+  (native run gateway token and managed gateways token) share one helper,
+  `heartbeatRunGatewayTokenTtlMs()`: env `PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS`,
+  default 24 h. The gateway still rejects tokens whose run is no longer active
+  (`ACTIVE_GATEWAY_RUN_STATUSES` / `gateway_token_run_inactive` in
+  `server/src/services/tool-gateway.ts`, untouched). Tests: TTL default/override
+  unit test, updated runtime-MCP expiry bounds, and a 61-minute-old token that
+  authenticates while its run is active and is rejected after the run finishes.
+- Operator step after deploy: remove the interim DB trigger
+  `two_run_gateway_token_ttl_ins` (it extended `heartbeat_run` tokens to 24 h
+  and is redundant once this fix is live).
+
 ## tog.2 ([TOG-7727](/TOG/issues/TOG-7727), parent [TOG-7607](/TOG/issues/TOG-7607))
 
 - Base: `tog/v2026.916.1-e2big-14092` @ `3c2da437`

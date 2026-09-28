@@ -4926,6 +4926,67 @@ rl.on("line", (line) => {
     expect(replay.body.error.data.reasonCode).toBe("gateway_token_run_inactive");
   });
 
+  it("authenticates a 61-minute-old run token while the run stays active, rejects it after the run finishes", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const profile = await allowToolsForAgent(db, company.id, agent.id, ["mcp-stdio-fixture:runtime_status"]);
+    const gateway = createTestToolGatewayService(db);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: {
+        name: `Stale-run gateway ${randomUUID()}`,
+        profileId: profile.id,
+        defaultProfileMode: "gateway_only",
+      },
+    });
+    const mintedAt = new Date(Date.now() - 61 * 60 * 1000);
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Stale runtime token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        clientLabel: "Heartbeat runtime",
+        ownerNote: "Simulates a token minted 61 minutes into a still-running run",
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(mintedAt.getTime() + 24 * 60 * 60 * 1000),
+      },
+      actor: { agentId: agent.id },
+    });
+    // Backdate the run and token rows to simulate a run aged past the old
+    // 60-minute TTL. Under the old TTL this token would verify as expired;
+    // with the run-lifetime TTL it must still authenticate while running.
+    await db
+      .update(toolMcpGatewayTokens)
+      .set({ createdAt: mintedAt, updatedAt: mintedAt })
+      .where(eq(toolMcpGatewayTokens.id, token.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: mintedAt, updatedAt: mintedAt })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const app = createGatewayRouteApp(db, gateway);
+    await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      .expect(200);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", completedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const finished = await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" })
+      .expect(401);
+    expect(finished.body.error.data.reasonCode).toBe("gateway_token_run_inactive");
+  });
+
   it("rejects expired, revoked, and tampered durable sessions without auditing token values", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
