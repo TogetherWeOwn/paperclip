@@ -8,7 +8,7 @@ Ledger of upstream refs vs fork state for the tog release line.
 
 - Base: `tog/v2026.916.1-e2big-14092` @ `6aefa649f` (tog.2 release tip)
 - Work branch: `fix/run-gateway-token-ttl`
-- PR: TogetherWeOwn/paperclip#7 (`fix(tool-gateway): run-scoped token TTL covers run lifetime`)
+- PR: TogetherWeOwn/paperclip#12 (`fix(tool-gateway): run-scoped token TTL covers run lifetime`)
 - Fix: both run-scoped gateway token mint sites in `server/src/services/heartbeat.ts`
   (native run gateway token and managed gateways token) share one helper,
   `heartbeatRunGatewayTokenTtlMs()`: env `PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS`,
