@@ -155,6 +155,102 @@ describe("worker performAction context", () => {
       workerToHost.destroy();
     }
   });
+
+  it("passes a host-stamped finite budgetSpentFraction through to the action handler (TOG-7967 H3)", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("inspect", async (_params, context) => ({
+          actor: context.actor,
+        }));
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      await expect(callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-worker-bsf",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Worker BSF Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })).resolves.toMatchObject({ ok: true });
+
+      await expect(callWorker("performAction", {
+        key: "inspect",
+        params: {},
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-1",
+          budgetSpentFraction: 0.25,
+        },
+      })).resolves.toEqual({
+        actor: expect.objectContaining({ budgetSpentFraction: 0.25 }),
+      });
+
+      for (const forged of [Number.NaN, Number.POSITIVE_INFINITY, "0.99"]) {
+        const result = await callWorker("performAction", {
+          key: "inspect",
+          params: {},
+          actorContext: {
+            type: "agent",
+            userId: null,
+            agentId: "agent-1",
+            runId: "run-1",
+            companyId: "company-1",
+            budgetSpentFraction: forged,
+          },
+        }) as { actor: { budgetSpentFraction?: unknown } };
+        expect(result.actor.budgetSpentFraction).toBeUndefined();
+      }
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
 });
 
 describe("worker invocation scope propagation", () => {

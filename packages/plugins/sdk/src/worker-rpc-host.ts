@@ -1934,6 +1934,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  function finiteNumberOrUndefined(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  }
+
   function actorTypeOrSystem(value: unknown): PluginPerformActionActorContext["type"] {
     return value === "user" || value === "agent" || value === "system" ? value : "system";
   }
@@ -1948,6 +1952,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       agentId: stringOrNull(rawActor?.agentId),
       runId: stringOrNull(rawActor?.runId),
       companyId: stringOrNull(rawActor?.companyId),
+      budgetSpentFraction: finiteNumberOrUndefined(rawActor?.budgetSpentFraction),
     });
     return Object.freeze({
       actor,

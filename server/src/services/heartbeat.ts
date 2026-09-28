@@ -641,6 +641,7 @@ import {
   type EffectiveRunConfigSecretManifestEntry,
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { pluginRegistryService } from "./plugin-registry.js";
 import { serverVersion } from "../version.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -26507,6 +26508,47 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // TOG-7967 H9 (receipt 2): run-end reap of router async invocations.
+          // Never throws: lookup and call failures are logged, orphans linger
+          // to TTL. Company scope is mandatory (worker throws without it).
+          try {
+            const manager = options.pluginWorkerManager;
+            if (manager && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+              const routerRow = await pluginRegistryService(db)
+                .getByKey("togetherweown.paperclip-model-router")
+                .catch(() => null);
+              if (routerRow) {
+                await manager
+                  .call(
+                    routerRow.id,
+                    "performAction",
+                    {
+                      key: "cancel-run-invocations",
+                      params: { runId: run.id },
+                      actorContext: {
+                        type: "system",
+                        userId: null,
+                        agentId: null,
+                        runId: run.id,
+                        companyId: run.companyId,
+                      },
+                    },
+                    10_000,
+                  )
+                  .catch((reapErr) => {
+                    logger.warn(
+                      { err: reapErr, runId: run.id },
+                      "router run-end reap failed; orphans linger to TTL",
+                    );
+                  });
+              }
+            }
+          } catch (reapLookupErr) {
+            logger.warn(
+              { err: reapLookupErr, runId: run.id },
+              "router run-end reap lookup failed; orphans linger to TTL",
+            );
+          }
         }
         if (
           runScratch &&

@@ -429,6 +429,8 @@ export interface PluginPerformActionActorContext {
   runId: string | null;
   /** Company id authorized by the host bridge for this action, when applicable. */
   companyId: string | null;
+  /** Host-computed fraction of the run's budget envelope spent (TOG-7967). Absent = not injected. */
+  budgetSpentFraction?: number;
 }
 
 export interface PluginPerformActionContext {

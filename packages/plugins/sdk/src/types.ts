@@ -270,6 +270,8 @@ export interface ToolRunContext {
   companyId: string;
   /** UUID of the project the run belongs to. */
   projectId: string;
+  /** Host-computed fraction of the run's budget envelope spent (TOG-7967). Absent = not injected. */
+  budgetSpentFraction?: number;
 }
 
 /**

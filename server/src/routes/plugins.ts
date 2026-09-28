@@ -54,6 +54,7 @@ import {
   REPO_ROOT,
 } from "../services/plugin-loader.js";
 import { logActivity } from "../services/activity-log.js";
+import { runBudgetSpentFraction } from "../services/budgets.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import type { PluginJobScheduler } from "../services/plugin-job-scheduler.js";
@@ -766,8 +767,20 @@ export function pluginRoutes(
     }
   }
 
-  function performActionActorContext(req: Request, companyId: string | undefined): PluginPerformActionActorContext {
+  async function performActionActorContext(req: Request, companyId: string | undefined): Promise<PluginPerformActionActorContext> {
     const scopedCompanyId = companyId ?? null;
+    // TOG-7967 H8: host-computed stamp. The action path carries no project;
+    // agent→company fallback still resolves a company/agent envelope.
+    // Undefined ≡ absent downstream (H3 shim drops non-finite regardless).
+    const bsf = (req.actor.agentId && req.actor.runId && scopedCompanyId)
+      ? await runBudgetSpentFraction(db, {
+          companyId: scopedCompanyId,
+          agentId: req.actor.agentId,
+          projectId: null,
+          runId: req.actor.runId,
+        }).catch(() => undefined)
+      : undefined;
+    const stamp = bsf === undefined ? {} : { budgetSpentFraction: bsf };
     if (req.actor.type === "agent") {
       return {
         type: "agent",
@@ -775,6 +788,7 @@ export function pluginRoutes(
         agentId: req.actor.agentId ?? null,
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
+        ...stamp,
       };
     }
     if (req.actor.type === "board") {
@@ -784,6 +798,7 @@ export function pluginRoutes(
         agentId: null,
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
+        ...stamp,
       };
     }
     return {
@@ -792,6 +807,7 @@ export function pluginRoutes(
       agentId: null,
       runId: req.actor.runId ?? null,
       companyId: scopedCompanyId,
+      ...stamp,
     };
   }
 
@@ -1087,10 +1103,21 @@ export function pluginRoutes(
     }
 
     try {
+      // TOG-7967 H6 (B3): direct-dispatch branch bypasses the tool-gateway
+      // overwrite. runContext is caller JSON — spread-overwrite with the
+      // host-computed value; undefined ≡ absent downstream.
       const result = await toolDeps.toolDispatcher.executeTool(
         tool,
         parameters ?? {},
-        runContext,
+        {
+          ...runContext,
+          budgetSpentFraction: await runBudgetSpentFraction(db, {
+            companyId: runContext.companyId,
+            agentId: runContext.agentId,
+            projectId: runContext.projectId ?? null,
+            runId: runContext.runId,
+          }).catch(() => undefined),
+        },
       );
       res.json(result);
     } catch (err) {
@@ -1536,7 +1563,7 @@ export function pluginRoutes(
         {
           key: body.key,
           params: actionParamsWithAuthorizedCompanyScope(body.params, companyId),
-          actorContext: performActionActorContext(req, companyId),
+          actorContext: await performActionActorContext(req, companyId),
           renderEnvironment: body.renderEnvironment ?? null,
         },
       );
@@ -1720,7 +1747,7 @@ export function pluginRoutes(
         {
           key,
           params: actionParamsWithAuthorizedCompanyScope(body?.params, companyId),
-          actorContext: performActionActorContext(req, companyId),
+          actorContext: await performActionActorContext(req, companyId),
           renderEnvironment: body?.renderEnvironment ?? null,
         },
       );
