@@ -110,6 +110,7 @@
     "acpx"
   ],
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@paperclipai/paperclip-runner": "workspace:*",
     "@types/express": "^5.0.0",
     "@types/express-serve-static-core": "^5.1.3",
