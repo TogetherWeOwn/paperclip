@@ -3449,6 +3449,12 @@ const SERVER_SECRET_ENV_EXACT_KEYS = new Set([
   "GEMINI_API_KEY",
   "GH_TOKEN",
   "GITHUB_TOKEN",
+  // Enterprise GitHub tokens (TOG-9729): live managed-credential keys, same
+  // family as heartbeat.ts MANAGED_GITHUB_TOKEN_KEYS, github-launcher.ts and
+  // execution-target.ts. Listed explicitly so the _TOKEN suffix rule below is
+  // defense-in-depth, not the only coverage.
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
   "GOOGLE_API_KEY",
   "GROK_API_KEY",
   "GROQ_API_KEY",
@@ -3460,6 +3466,18 @@ const SERVER_SECRET_ENV_EXACT_KEYS = new Set([
   "UNBOUND_API_KEY",
   "XAI_API_KEY",
   "ZAI_API_KEY",
+  // Credential-pointer vars (TOG-9729): file/socket pointers to credentials,
+  // not values. A child inheriting the path resolves the server's credential
+  // files on a shared host. Runs that need these receive explicit per-run env
+  // (merged after sanitize), never implicit inheritance.
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_CONFIG_FILE",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "SSH_AUTH_SOCK",
+  "GH_CONFIG_DIR",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GOOGLE_APPLICATION_CREDENTIALS",
 ]);
 
 // Server-secret families matched by prefix: container-composed Postgres vars
@@ -3468,10 +3486,11 @@ const SERVER_SECRET_ENV_EXACT_KEYS = new Set([
 // settings. Fail closed for future vars in these families.
 const SERVER_SECRET_ENV_PREFIXES = ["DATABASE_", "POSTGRES_", "PG"];
 
-// Fail closed for future provider keys: any *_API_KEY inherited from the
-// server env is a provider credential by naming convention and must arrive via
-// secret bindings instead.
-const SERVER_SECRET_ENV_SUFFIXES = ["_API_KEY"];
+// Fail closed for future provider keys (TOG-9729): any *_API_KEY or *_TOKEN
+// inherited from the server env is a credential by naming convention and must
+// arrive via secret bindings instead. The enterprise GitHub keys above are
+// listed explicitly so they stay covered even if this suffix rule changes.
+const SERVER_SECRET_ENV_SUFFIXES = ["_API_KEY", "_TOKEN"];
 
 function isServerSecretEnvKey(key: string): boolean {
   if (SERVER_SECRET_ENV_EXACT_KEYS.has(key)) return true;
