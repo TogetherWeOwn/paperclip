@@ -4,6 +4,14 @@ Ledger of upstream refs vs fork state for the tog release line.
 "Gone when" = condition under which the row can be dropped
 (upstream merged the equivalent, or the fork rebased past it).
 
+## tog.4 ([TOG-9419](/TOG/issues/TOG-9419), parent [TOG-9405](/TOG/issues/TOG-9405))
+
+- Base: `tog/v2026.916.1-e2big-14092` @ `0691be8d3` (post-#12 tip; #12 merged 2026-09-28, so tog.3 is taken and this port takes tog.4)
+- Work branch: `feat/port-h1h9-tog4`
+- PR: TogetherWeOwn/paperclip#15 (`feat(plugins): port H1-H9 host wiring onto tog line`)
+- Port: H1-H9 host wiring from origin/master `b2dad8daf` (reviewed head `c44939012`, [TOG-9323](/TOG/issues/TOG-9323) APPROVE, CI green exact head). Cherry-picked cleanly onto the tog base with zero conflicts; staged stat identical to PR #14 (12 files, 621+/6-). Tog anchors: types.ts:274, protocol.ts:433, worker-rpc-host.ts:1930/1948 (+finiteNumberOrUndefined), budgets.ts:179 (runBudgetSpentFraction), tool-gateway.ts:10264 (+import :87) and :10671, plugins.ts:1114 + :770/776/783 (+awaits :1566/:1750, +import :57), openapi.ts:8310, heartbeat.ts:25592-25633 (+import :609). Semantics identical: host-wins spread order, H3 NaN/Inf drop, H9 never-throws + company scope.
+- Tests (ported): worker-rpc-host.test.ts (+96), budgets-service.test.ts (+94), heartbeat-router-run-end-reap.test.ts (new, +45), plugin-budget-spent-fraction.test.ts (new, +223).
+
 ## tog.3 ([TOG-8853](/TOG/issues/TOG-8853), parent [TOG-8760](/TOG/issues/TOG-8760))
 
 - Base: `tog/v2026.916.1-e2big-14092` @ `6aefa649f` (tog.2 release tip)
