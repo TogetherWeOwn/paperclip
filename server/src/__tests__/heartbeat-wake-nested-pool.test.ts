@@ -1,8 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -10,6 +10,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   agents,
+  applyPendingMigrations,
   companies,
   companySkills,
   createDb,
@@ -21,10 +22,6 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
@@ -54,32 +51,54 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping embedded Postgres wake nested-pool tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
+// Use an exclusively owned, disposable database on agent-testdb or a CI service
+// container. Never fall back to DATABASE_URL or the application instance.
+const testDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
+if (testDatabaseUrl) {
+  const url = new URL(testDatabaseUrl);
+  const allowedHost = url.hostname === "agent-testdb" ||
+    (process.env.CI === "true" && ["localhost", "127.0.0.1", "postgres"].includes(url.hostname));
+  if (!allowedHost || !/^\/paperclip_nested_pool_[a-z0-9_]+$/.test(url.pathname)) {
+    throw new Error("Nested-pool tests require a dedicated paperclip_nested_pool_* database on agent-testdb or a CI PostgreSQL service");
+  }
 }
+const describeDatabase = testDatabaseUrl ? describe : describe.skip;
 
-describeEmbeddedPostgres("heartbeat wake nested-pool deadlock (TOG-9736)", () => {
-  // Small pool on purpose: with the pre-fix code each wake transaction holds
-  // its only connection while the inner task-session read waits for a second
-  // pooled connection, so N concurrent wakes deadlock a pool of size N.
+describeDatabase("heartbeat wake nested-pool deadlock", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let sessionCwd: string | null = null;
+  const transactionScope = new AsyncLocalStorage<{ active: boolean }>();
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-wake-nested-pool-");
-    // Pool of 2 with 4+ concurrent wakes is the regression shape: every wake
-    // holds one connection in its issue-lock transaction, so any nested
-    // pooled read deadlocks once all connections are held in-transaction.
-    db = createDb(tempDb.connectionString, { maxConnections: 2 });
+    await applyPendingMigrations(testDatabaseUrl!);
+    db = createDb(testDatabaseUrl!, { maxConnections: 2 });
+
+    // Fail fast on an outer-pool read instead of leaving a deadlocked pool
+    // alive through teardown. AsyncLocalStorage distinguishes concurrent wakes
+    // outside the transaction from reads made by the transaction itself.
+    const select = db.select.bind(db);
+    db.select = ((...args: Parameters<typeof db.select>) => {
+      if (transactionScope.getStore()?.active) {
+        throw new Error("Wake transaction attempted an outer-pool read instead of reusing tx");
+      }
+      return select(...args);
+    }) as typeof db.select;
+    const transaction = db.transaction.bind(db);
+    vi.spyOn(db, "transaction").mockImplementation((callback, config) =>
+      transaction(async (tx) => {
+        const scope = { active: true };
+        try {
+          return await transactionScope.run(scope, () => callback(tx));
+        } finally {
+          scope.active = false;
+        }
+      }, config),
+    );
+
     heartbeat = heartbeatService(db);
-    sessionCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-nested-pool-session-"));
+    sessionCwd = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-nested-pool-session-"));
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
   }, 60_000);
 
   afterEach(async () => {
@@ -111,18 +130,17 @@ describeEmbeddedPostgres("heartbeat wake nested-pool deadlock (TOG-9736)", () =>
   });
 
   afterAll(async () => {
-    await db?.$client.end({ timeout: 0 }).catch(() => undefined);
-    await tempDb?.cleanup();
+    await db?.$client.end({ timeout: 0 });
+    vi.restoreAllMocks();
     if (sessionCwd) await rm(sessionCwd, { recursive: true, force: true });
   }, 60_000);
 
-  async function seedIsolatedWorkspaceIssue(opts: { taskKey: string }) {
+  async function seedIsolatedWorkspaceIssue(taskKey: string) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
-    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -140,21 +158,18 @@ describeEmbeddedPostgres("heartbeat wake nested-pool deadlock (TOG-9736)", () =>
       adapterType: "process",
       adapterConfig: {},
       runtimeConfig: {
-        heartbeat: {
-          wakeOnDemand: true,
-          maxConcurrentRuns: 4,
-        },
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 4 },
       },
       permissions: {},
     });
-    // A task session with a resolvable cwd forces the wake's isolated-
-    // workspace preflight down the getTaskSession read inside the issue-lock
-    // transaction — the exact nested-pool path from the incident.
+    // A resolvable task session exercises getTaskSession inside the locked
+    // workspace preflight. Null issue attribution also exercises the nested
+    // responsible-user reads and company-default fallback.
     await db.insert(agentTaskSessions).values({
       companyId,
       agentId,
       adapterType: "process",
-      taskKey: opts.taskKey,
+      taskKey,
       sessionParamsJson: { cwd: sessionCwd },
       sessionDisplayId: "session-before",
     });
@@ -165,7 +180,6 @@ describeEmbeddedPostgres("heartbeat wake nested-pool deadlock (TOG-9736)", () =>
       status: "todo",
       priority: "medium",
       assigneeAgentId: agentId,
-      responsibleUserId: "responsible-user",
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       executionWorkspaceSettings: {
@@ -173,55 +187,48 @@ describeEmbeddedPostgres("heartbeat wake nested-pool deadlock (TOG-9736)", () =>
         workspaceStrategy: { type: "adapter_managed" },
       },
     });
-    return { companyId, agentId, issueId };
+    return { companyId, agentId, issueId, taskKey };
   }
 
-  it("completes concurrent isolated-workspace wakes on a pool of 2 without deadlock", async () => {
+  it("reuses tx reads and completes four isolated-workspace wakes on a pool of two", async () => {
     const wakeCount = 4;
     const seeded = await Promise.all(
       Array.from({ length: wakeCount }, (_, index) =>
-        seedIsolatedWorkspaceIssue({ taskKey: `nested-pool-issue-${index}` }),
+        seedIsolatedWorkspaceIssue(`nested-pool-issue-${index}`),
       ),
     );
 
-    const deadlineMs = 20_000;
-    const wakes = await Promise.race([
-      Promise.all(
-        seeded.map(({ agentId, issueId }) =>
-          heartbeat.wakeup(agentId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "issue_assigned",
-            payload: { issueId },
-            contextSnapshot: {
-              issueId,
-              taskId: issueId,
-              taskKey: `nested-pool-issue-${seeded.findIndex((s) => s.issueId === issueId)}`,
-              wakeReason: "issue_assigned",
-            },
-            requestedByActorType: "system",
-            requestedByActorId: "test",
-          }),
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const wakes = await Promise.race([
+        Promise.all(
+          seeded.map(({ agentId, issueId, taskKey }) =>
+            heartbeat.wakeup(agentId, {
+              source: "on_demand",
+              triggerDetail: "manual",
+              reason: "manual",
+              payload: { issueId },
+              // Assignment wakes reset sessions and skip the affected read.
+              contextSnapshot: { issueId, taskId: issueId, taskKey, wakeReason: "manual" },
+              requestedByActorType: "system",
+              requestedByActorId: "test",
+            }),
+          ),
         ),
-      ),
-      new Promise<never>((_, reject) => {
-        setTimeout(
-          () => reject(new Error(`concurrent wakes deadlocked with maxConnections=2 after ${deadlineMs}ms`)),
-          deadlineMs,
-        );
-      }),
-    ]);
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Concurrent wakes deadlocked with maxConnections=2")), 20_000);
+        }),
+      ]);
 
-    // Every wake queues a run: none stalled inside the issue-lock transaction
-    // waiting for a second pooled connection.
-    expect(wakes).toHaveLength(wakeCount);
-    for (const run of wakes) {
-      expect(run).not.toBeNull();
+      expect(wakes).toHaveLength(wakeCount);
+      expect(wakes.every((run) => run !== null)).toBe(true);
+      const runRows = await db
+        .select({ id: heartbeatRuns.id, responsibleUserId: heartbeatRuns.responsibleUserId })
+        .from(heartbeatRuns);
+      expect(runRows).toHaveLength(wakeCount);
+      expect(runRows.every((run) => run.responsibleUserId === "responsible-user")).toBe(true);
+    } finally {
+      clearTimeout(timer);
     }
-
-    const runRows = await db
-      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
-      .from(heartbeatRuns);
-    expect(runRows).toHaveLength(wakeCount);
   }, 60_000);
 });
