@@ -287,6 +287,7 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { collectCompletedReviewReceipt } from "../services/completed-review-receipt.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import {
@@ -13335,8 +13336,13 @@ export function issueRoutes(
       });
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
+      const completingTypedReview =
+        transition.decision?.outcome === "approved" &&
+        updateFields.status === "done" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "completed";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || completingTypedReview;
+      let completionCommentId: string | null = null;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -13605,6 +13611,9 @@ export function issueRoutes(
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
       ) => {
         if (!persistReviewActivityTransactionally) return;
+        const completedReviewEvidence = completingTypedReview
+          ? await collectCompletedReviewReceipt(tx as unknown as Db, updated, actor)
+          : null;
         const changes = updated.changes ?? {};
         const previous = Object.fromEntries(
           Object.entries(changes).map(([key, change]) => [key, change.from]),
@@ -13624,6 +13633,12 @@ export function issueRoutes(
             entityId: updated.id,
             details: {
               ...updateFields,
+              ...(completedReviewEvidence ? {
+                completedReviewEvidence,
+                completionCommentId,
+                status: updated.status,
+                executionState: updated.executionState,
+              } : {}),
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
@@ -13684,7 +13699,7 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || completingTypedReview
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13704,9 +13719,10 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || (completingTypedReview && commentBody)) {
               // Adapter settings, reassignment, comment and upload binding commit together.
-              // A failed comment or invalid receipt rolls back the issue update.
+              // A failed comment or invalid receipt rolls back the issue update. A final
+              // review approval comment is also bound into the completion receipt.
               transactionalComment = await svc.addComment(
                 id,
                 commentBody,
@@ -13726,6 +13742,7 @@ export function issueRoutes(
                 },
                 tx,
               );
+              if (completingTypedReview && transactionalComment) completionCommentId = transactionalComment.id;
             }
 
             if (decision && decisionId) {

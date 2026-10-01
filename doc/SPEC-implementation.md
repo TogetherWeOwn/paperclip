@@ -651,6 +651,20 @@ Every issue PATCH emits an `issue.updated` activity receipt containing the
 actor, responsible user, run, authorization reason, and field-level before/after
 changes so both agent and board edits are visible in the issue activity stream.
 
+Completed typed execution reviews are not invalidated by deferred comment wakes
+whose entire comment batch was already covered by the original completion.
+Explicit resumes and independent continuation remain intentional new work.
+A completed-review restoration action accepts persisted evidence locators only.
+It cannot accept an execution-state snapshot or create replacement decisions.
+It checks company and issue write access against the locked current issue, checks
+the original return assignment through ordinary assignment authorization, and
+preserves review policy, restricted-key containment, run ownership and holds.
+It requires unchanged policy and delivery fingerprints, original approvals and
+covered wake lineage. Missing, legacy, ambiguous, adverse or newer evidence
+refuses restoration. The projection and original-reference audit commit together
+under a bounded serializable transaction. The same evidence is idempotent only
+while the restored projection and assignment remain unchanged.
+
 ## 9.4 Permission Terminology and Default Visibility Rule
 
 Paperclip V1 keeps a company-scoped visibility model as the default because centralized authorization and scoped work-object controls are not yet a core V1 control surface.
