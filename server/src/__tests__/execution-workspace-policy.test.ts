@@ -13,6 +13,7 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   ManagedSandboxUnavailableError,
+  mergeIssueAdapterConfigOverrides,
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolvePinnedIssueWorkspaceStrategyType,
@@ -755,5 +756,50 @@ describe("operator default isolated execution workspaces", () => {
         resolvedStrategy: resolveEffectiveWorkspaceStrategyType(mode, config),
       }),
     ).toBe(false);
+  });
+
+  it("merges issue override env per key over the base agent env (TOG-11791)", () => {
+    const secretRef = { type: "secret_ref", secretId: "sec-1" };
+    const merged = mergeIssueAdapterConfigOverrides(
+      {
+        model: "base-model",
+        env: { KEEP_ME: secretRef, SHARED: "base" },
+      },
+      {
+        model: "override-model",
+        env: { ADDED: "new", SHARED: "override" },
+      },
+    );
+    // 1. override env adds a key
+    expect((merged.env as Record<string, unknown>).ADDED).toBe("new");
+    // 2. override env shadows a base key
+    expect((merged.env as Record<string, unknown>).SHARED).toBe("override");
+    // 3. a base secret_ref survives an override that omits it
+    expect((merged.env as Record<string, unknown>).KEEP_ME).toEqual(secretRef);
+    // other keys keep shallow replace semantics
+    expect(merged.model).toBe("override-model");
+  });
+
+  it("restoring the shallow merge drops base env (mutation guard, TOG-11791)", () => {
+    const secretRef = { type: "secret_ref", secretId: "sec-1" };
+    const base = { env: { KEEP_ME: secretRef } };
+    const override = { env: { ADDED: "new" } };
+    // This is the old behaviour: a whole-object spread replaces env.
+    const shallow = { ...base, ...override };
+    expect((shallow.env as Record<string, unknown>).KEEP_ME).toBeUndefined();
+    // The helper must not share that behaviour.
+    const merged = mergeIssueAdapterConfigOverrides(base, override);
+    expect((merged.env as Record<string, unknown>).KEEP_ME).toEqual(secretRef);
+  });
+
+  it("leaves env alone when the override carries none (TOG-11791)", () => {
+    const merged = mergeIssueAdapterConfigOverrides(
+      { model: "base", env: { A: "1" } },
+      { model: "override" },
+    );
+    expect(merged.env).toEqual({ A: "1" });
+    expect(mergeIssueAdapterConfigOverrides({ model: "base" }, null)).toEqual({
+      model: "base",
+    });
   });
 });
