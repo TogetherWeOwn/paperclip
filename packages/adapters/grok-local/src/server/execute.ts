@@ -47,7 +47,7 @@ import {
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { grokHomeHasUsableAuth, resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
-import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
+import { isGrokUnknownSessionError, parseGrokProcessOutput } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -625,7 +625,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
       });
       return {
         proc,
-        parsed: parseGrokJsonl(proc.stdout),
+        parsed: parseGrokProcessOutput(proc),
       };
     };
 
@@ -638,7 +638,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
           stdout: string;
           stderr: string;
         };
-        parsed: ReturnType<typeof parseGrokJsonl>;
+        parsed: ReturnType<typeof parseGrokProcessOutput>;
       },
       clearSessionOnMissingSession = false,
       isRetry = false,

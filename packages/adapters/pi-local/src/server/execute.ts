@@ -53,7 +53,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
-import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
+import { isPiUnknownSessionError, parsePiProcessOutput } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -755,7 +755,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return {
         proc,
         rawStderr: proc.stderr,
-        parsed: parsePiJsonl(proc.stdout),
+        parsed: parsePiProcessOutput(proc),
       };
     };
 
@@ -763,7 +763,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
-        parsed: ReturnType<typeof parsePiJsonl>;
+        parsed: ReturnType<typeof parsePiProcessOutput>;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {

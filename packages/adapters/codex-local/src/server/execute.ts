@@ -59,7 +59,7 @@ import {
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
-  parseCodexJsonl,
+  parseCodexProcessOutput,
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
@@ -1344,7 +1344,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stderr: cleanedStderr,
           },
           rawStderr: proc.stderr,
-          parsed: parseCodexJsonl(proc.stdout),
+          parsed: parseCodexProcessOutput(proc),
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1372,7 +1372,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
-        parsed: ReturnType<typeof parseCodexJsonl>;
+        parsed: ReturnType<typeof parseCodexProcessOutput>;
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
