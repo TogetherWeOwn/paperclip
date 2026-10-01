@@ -454,6 +454,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  mergeIssueAdapterConfigOverrides,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -21224,10 +21225,13 @@ export function heartbeatService(
         legacyUseProjectWorkspace:
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
-      const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
-      };
+      // TOG-11791: merge override `env` per key so a pin that sets one key
+      // keeps the base credentials it omits. All other keys keep shallow
+      // replace semantics.
+      const mergedConfig = mergeIssueAdapterConfigOverrides(
+        workspaceManagedConfig,
+        issueAssigneeOverrides?.adapterConfig ?? null,
+      );
       const configSnapshot = buildExecutionWorkspaceConfigSnapshot(
         mergedConfig,
         selectedEnvironmentId,

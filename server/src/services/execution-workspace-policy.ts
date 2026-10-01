@@ -439,3 +439,28 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
 
   return nextConfig;
 }
+
+/**
+ * Merge an issue's `assigneeAdapterOverrides.adapterConfig` over a base agent
+ * config. Every key keeps shallow replace semantics except `env`, which merges
+ * per key (`{ ...base.env, ...override.env }`).
+ *
+ * The shallow spread used to replace the whole `env` object, so a pin that set
+ * one model key silently dropped every agent credential. Pins then had to copy
+ * every env entry, secret_refs included, and those copied refs failed the
+ * run-agent binding check after a reassignment ("configuration incomplete",
+ * non-retryable). Per-key `env` merge keeps base credentials that the override
+ * omits; an override key still shadows the base key. TOG-11791.
+ */
+export function mergeIssueAdapterConfigOverrides(
+  base: Record<string, unknown>,
+  override: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const next = { ...base, ...(override ?? {}) };
+  if (override && "env" in override) {
+    const baseEnv = parseObject(base.env);
+    const overrideEnv = parseObject(override.env);
+    next.env = { ...baseEnv, ...overrideEnv };
+  }
+  return next;
+}
