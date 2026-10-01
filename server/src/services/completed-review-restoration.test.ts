@@ -92,7 +92,7 @@ function fixture(agent = false) {
     return { id: id(30) };
   });
   mocks.publish.mockImplementation(() => events.push("publish"));
-  const authorize = vi.fn(async () => {});
+  const authorize = { issue: vi.fn(async () => {}), assignment: vi.fn(async () => {}) };
   return { db, tx, transaction, issue, state, scope, completion, activities, commentActivity, reopen, comments, wake,
     promoted, caller, input, byTable, heartbeatResults, wakeResults, conditions, locks, events, authorize, policy, delivery, decisions };
 }
@@ -111,7 +111,9 @@ describe("completed review restoration transaction (mock DB only)", () => {
     expect(result).toMatchObject({ outcome: "restore", completionActivityId: f.completion.id,
       issue: { status: "done", executionState: f.state, assigneeAgentId: id(3), assigneeUserId: null } });
     expect(f.transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: "serializable" });
-    expect(f.authorize).toHaveBeenCalledWith(f.tx, f.issue);
+    expect(f.authorize.issue).toHaveBeenCalledWith(f.tx, f.issue);
+    expect(f.authorize.assignment).toHaveBeenCalledWith(f.tx, f.issue, f.state.returnAssignee);
+    expect(f.authorize.assignment.mock.invocationCallOrder[0]).toBeLessThan(mocks.update.mock.invocationCallOrder[0]!);
     expect(f.locks).toEqual([issues, agentWakeupRequests, heartbeatRuns]);
     expect(mocks.update).toHaveBeenCalledWith(f.scope.issueId, f.scope.companyId, expect.objectContaining({ status: "done" }),
       f.tx, expect.any(Array), expect.any(Array));
@@ -144,7 +146,7 @@ describe("completed review restoration transaction (mock DB only)", () => {
 
   it("propagates the locked authorization denial before any update or audit", async () => {
     const f = fixture();
-    f.authorize.mockRejectedValue(forbidden("Denied"));
+    f.authorize.issue.mockRejectedValue(forbidden("Denied"));
     await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).rejects.toMatchObject({ status: 403 });
     expect(mocks.context).not.toHaveBeenCalled();
     expect(mocks.update).not.toHaveBeenCalled();
@@ -156,6 +158,53 @@ describe("completed review restoration transaction (mock DB only)", () => {
     f.caller.contextSnapshot.issueId = id(99);
     await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).rejects.toMatchObject({ status: 403 });
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it.each(["caller", "promoted"] as const)("refuses a conflicting %s native issue binding", async (which) => {
+    const f = fixture(which === "caller");
+    Object.assign(which === "caller" ? f.caller : f.promoted, { nativeIssueId: id(99) });
+    await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).rejects.toMatchObject({ status: which === "caller" ? 403 : 409 });
+    expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it("checks original assignment authority before any projection write", async () => {
+    const f = fixture();
+    f.authorize.assignment.mockRejectedValue(forbidden("Protected assignment denied"));
+    await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).rejects.toMatchObject({ status: 403 });
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.log).not.toHaveBeenCalled();
+    expect(mocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("does not exclude an active run using a user's unvalidated audit run id", async () => {
+    const f = fixture();
+    f.input.actor.runId = id(99);
+    await completedReviewRestorationService(f.db).restore(f.input, f.authorize);
+    const condition = f.conditions.filter((entry) => entry.table === heartbeatRuns)[1].condition;
+    const { params } = new PgDialect().sqlToQuery(condition as Parameters<PgDialect["sqlToQuery"]>[0]);
+    expect(params).not.toContain(id(99));
+  });
+
+  it("allows only the current assignee's persisted issue run", async () => {
+    const f = fixture(true);
+    await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).resolves.toMatchObject({ outcome: "restore" });
+    expect(f.locks).toEqual([issues, heartbeatRuns, agentWakeupRequests, heartbeatRuns]);
+  });
+
+  it.each([
+    ["missing run", (f: ReturnType<typeof fixture>) => { f.input.actor.runId = null; }, 401],
+    ["absent persisted run", (f: ReturnType<typeof fixture>) => { f.heartbeatResults[0] = []; }, 403],
+    ["stopped run", (f: ReturnType<typeof fixture>) => { f.caller.status = "succeeded"; }, 403],
+    ["unrelated assignee", (f: ReturnType<typeof fixture>) => { f.issue.assigneeAgentId = id(99); }, 403],
+    ["conflicting checkout", (f: ReturnType<typeof fixture>) => { f.issue.checkoutRunId = id(99); }, 409],
+    ["conflicting execution", (f: ReturnType<typeof fixture>) => { f.issue.executionRunId = id(99); }, 409],
+    ["independent caller resume", (f: ReturnType<typeof fixture>) => { f.caller.contextSnapshot.resumeIntent = true; }, 409],
+  ] as const)("refuses agent %s before writing", async (_name, mutate, status) => {
+    const f = fixture(true);
+    mutate(f);
+    await expect(completedReviewRestorationService(f.db).restore(f.input, f.authorize)).rejects.toMatchObject({ status });
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.log).not.toHaveBeenCalled();
   });
 
   const refusals: Array<[string, (f: ReturnType<typeof fixture>) => void]> = [

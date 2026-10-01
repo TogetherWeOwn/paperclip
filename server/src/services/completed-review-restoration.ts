@@ -1,4 +1,5 @@
 import { and, asc, eq, gte, inArray, ne, or, sql } from "drizzle-orm";
+import type { IssueExecutionStagePrincipal } from "@paperclipai/shared";
 import {
   type Db,
   activityLog,
@@ -32,6 +33,11 @@ export type CompletedReviewRestorationInput = {
 
 type IssueRow = typeof issues.$inferSelect;
 
+export type CompletedReviewRestorationAuthorization = {
+  issue: (tx: Db, issue: IssueRow) => Promise<void>;
+  assignment: (tx: Db, issue: IssueRow, target: IssueExecutionStagePrincipal) => Promise<void>;
+};
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : {};
@@ -56,7 +62,7 @@ function refuse(reason: string): never {
 /** Locators select persisted evidence, not client state or replacement approvals. */
 export function completedReviewRestorationService(db: Db) {
   return {
-    async restore(input: CompletedReviewRestorationInput, authorize: (tx: Db, issue: IssueRow) => Promise<void>) {
+    async restore(input: CompletedReviewRestorationInput, authorize: CompletedReviewRestorationAuthorization) {
       const publications: ActivityPublication[] = [];
       const postCommitActions: IssuePostCommitAction[] = [];
       const result = await db.transaction(async (transaction) => {
@@ -69,7 +75,7 @@ export function completedReviewRestorationService(db: Db) {
           .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)))
           .for("update");
         if (!issue) throw notFound("Issue not found");
-        await authorize(tx, issue);
+        await authorize.issue(tx, issue);
         if (issue.hiddenAt || issue.conversationAgentId || issue.monitorNextCheckAt) refuse("unsupported_issue_state");
         if (await getExecutionBlocker(tx, input.companyId, input.issueId) ||
             await issueTreeControlService(tx).getActivePauseHoldGate(input.companyId, input.issueId)) refuse("execution_hold");
@@ -108,7 +114,10 @@ export function completedReviewRestorationService(db: Db) {
             eq(heartbeatRuns.agentId, input.actor.actorId),
           )).for("update");
           if (!callerRun || input.actor.agentId !== input.actor.actorId || callerRun.status !== "running" ||
-              !assertIssueContext(callerRun.contextSnapshot, input.issueId)) throw forbidden("Restoration requires this issue's active agent run");
+              !assertIssueContext(callerRun.contextSnapshot, input.issueId) ||
+              (callerRun.nativeIssueId != null && callerRun.nativeIssueId !== input.issueId)) {
+            throw forbidden("Restoration requires this issue's active agent run");
+          }
           if (refusesIndependentContinuation(callerRun.contextSnapshot)) refuse("independent_continuation");
           const replayByOriginalActor = restoration?.actorType === "agent" &&
             restoration.actorId === input.actor.actorId && restoration.runId === input.actor.runId;
@@ -132,7 +141,8 @@ export function completedReviewRestorationService(db: Db) {
           eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, wake.runId),
           eq(heartbeatRuns.wakeupRequestId, wake.id), eq(heartbeatRuns.agentId, wake.agentId),
         )).for("update");
-        if (!promotedRun || !assertIssueContext(promotedRun.contextSnapshot, input.issueId)) refuse("wake_lineage_mismatch");
+        if (!promotedRun || !assertIssueContext(promotedRun.contextSnapshot, input.issueId) ||
+            (promotedRun.nativeIssueId != null && promotedRun.nativeIssueId !== input.issueId)) refuse("wake_lineage_mismatch");
         const payload = record(wake.payload);
         const context = record(payload._paperclipWakeContext);
         const runContext = record(promotedRun.contextSnapshot);
@@ -185,7 +195,7 @@ export function completedReviewRestorationService(db: Db) {
             sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${input.issueId}`,
             sql`${heartbeatRuns.contextSnapshot} ->> 'taskKey' = ${input.issueId}`,
             eq(heartbeatRuns.nativeIssueId, input.issueId)),
-          ...(input.actor.runId ? [ne(heartbeatRuns.id, input.actor.runId)] : []),
+          ...(callerRun ? [ne(heartbeatRuns.id, callerRun.id)] : []),
         ));
         const newerWakes = await tx.select().from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, input.companyId), ne(agentWakeupRequests.id, wake.id),
@@ -214,6 +224,7 @@ export function completedReviewRestorationService(db: Db) {
               issue.assigneeUserId !== (plan.returnAssignee.type === "user" ? plan.returnAssignee.userId : null)) refuse("restoration_drifted");
           return { outcome: plan.outcome, issue, completionActivityId: plan.completionActivityId };
         }
+        await authorize.assignment(tx, issue, plan.returnAssignee);
         const updated = await issueService(tx).updateForCompany(issue.id, input.companyId, {
           status: "done", executionState: { ...plan.executionState },
           assigneeAgentId: plan.returnAssignee.type === "agent" ? plan.returnAssignee.agentId : null,
