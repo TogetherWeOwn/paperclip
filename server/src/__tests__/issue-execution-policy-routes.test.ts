@@ -307,13 +307,17 @@ describe("issue execution policy routes", () => {
     expect(mockCollectReceipt).toHaveBeenCalledWith(mockIssueService.update.mock.calls[0]?.[2],
       expect.objectContaining({ status: "done", executionState: expect.objectContaining({ status: "completed" }) }),
       expect.objectContaining({ actorType: "user", actorId: "local-board" }));
+    expect(mockIssueService.addComment.mock.calls[0]?.[4]).toBe(mockIssueService.update.mock.calls[0]?.[2]);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.addComment.mock.invocationCallOrder[0]).toBeLessThan(mockDecisionValues.mock.invocationCallOrder[0]!);
     expect(mockDecisionValues.mock.invocationCallOrder[0]).toBeLessThan(mockCollectReceipt.mock.invocationCallOrder[0]!);
     if (fail) expect(mockLogActivity).not.toHaveBeenCalled();
     else {
       expect(mockLogActivity.mock.calls.filter((call) => (call[1] as { action?: string })?.action === "issue.updated")).toHaveLength(1);
       expect(mockLogActivity).toHaveBeenCalledWith(mockIssueService.update.mock.calls[0]?.[2],
         expect.objectContaining({ action: "issue.updated", details: expect.objectContaining({
-          completedReviewEvidence: proof, status: "done", executionState: expect.objectContaining({ status: "completed" }),
+          completedReviewEvidence: proof, completionCommentId: "66666666-6666-4666-8666-666666666666",
+          status: "done", executionState: expect.objectContaining({ status: "completed" }),
         }) }), expect.any(Array));
     }
   }, 45_000);

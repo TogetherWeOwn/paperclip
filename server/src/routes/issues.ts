@@ -13412,6 +13412,7 @@ export function issueRoutes(
         parseIssueExecutionState(updateFields.executionState)?.status === "completed";
       const persistReviewActivityTransactionally =
         enteringReviewRequested || Boolean(reviewInteractionId) || completingTypedReview;
+      let completionCommentId: string | null = null;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -13656,6 +13657,7 @@ export function issueRoutes(
               ...updateFields,
               ...(completedReviewEvidence ? {
                 completedReviewEvidence,
+                completionCommentId,
                 status: updated.status,
                 executionState: updated.executionState,
               } : {}),
@@ -13716,7 +13718,7 @@ export function issueRoutes(
         transition.decision && decisionId ? transition.decision : null;
       let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
         null;
-      const attachmentCommentSourceTrust = commentAttachmentIds?.length
+      const attachmentCommentSourceTrust = commentAttachmentIds?.length || completingTypedReview
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13735,9 +13737,9 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length) {
+            if (commentAttachmentIds?.length || (completingTypedReview && commentBody)) {
+              // The final approval comment is bound into the completion receipt.
               // Reassignment, comment creation and upload binding commit together.
-              // An invalid or already-bound receipt rolls back the issue update.
               attachmentComment = await svc.addComment(
                 id,
                 commentBody,
@@ -13757,6 +13759,7 @@ export function issueRoutes(
                 },
                 tx,
               );
+              if (completingTypedReview) completionCommentId = attachmentComment.id;
             }
 
             if (decision && decisionId) {
