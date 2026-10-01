@@ -375,6 +375,117 @@ const support = await getEmbeddedPostgresTestSupport();
     return result;
   });
 
+  async function seedNeverStartedLegacy() {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null,
+      status: "queued", processPid: null, finishedAt: null }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    // Exercise the real cancel-before-launch writer, including its lifecycle event.
+    await heartbeatService(db).cancelRun(f.sourceRunId);
+    // Historical cancellations predate server-owned conversation adapter evidence.
+    await db.update(heartbeatRuns).set({ resultJson: null, finishedAt: new Date("2026-09-11T10:00:00Z") })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    return f;
+  }
+
+  it("admits a historical legacy cancellation before launch once without a native stop receipt", async () => {
+    const f = await seedNeverStartedLegacy();
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, lastOutputSeq: 0 });
+    expect(await hasNativeLocalProcessStop(db, f.companyId, f.sourceRunId)).toBe(false);
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await admit(f)).toBeNull();
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(after).toEqual(before);
+  });
+
+  it("delivers a new user message after cancel-before-launch through real wake admission", async () => {
+    const f = await seedNeverStartedLegacy();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const heartbeat = heartbeatService(db);
+    const wake = () => heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const first = await wake();
+    expect(first).toMatchObject({ status: "queued", contextSnapshot: {
+      forceFreshSession: true, previousRunId: f.sourceRunId,
+      explicitUserContinuation: { commentId: f.commentId },
+    } });
+    await wake();
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(successors).toHaveLength(1);
+  });
+
+  it.each(["start", "process_time", "output", "log", "controller", "stage", "session", "launch", "provider", "running_event", "unknown_event", "null_lifecycle", "cleanup", "remote"])(
+    "retains the never-started hold with contradictory evidence (%s)", async evidence => {
+      const f = await seedNeverStartedLegacy();
+      const metadata: Record<string, Partial<typeof heartbeatRuns.$inferInsert>> = {
+        start: { startedAt: new Date() }, process_time: { processStartedAt: new Date() },
+        output: { lastOutputSeq: 1 }, log: { logRef: "retained.log" },
+        controller: { controllerBootId: randomUUID() }, stage: { executionStage: "preparing" },
+        session: { sessionIdAfter: "provider-session" },
+      };
+      if (metadata[evidence]) await db.update(heartbeatRuns).set(metadata[evidence])
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+      if (["launch", "provider", "running_event", "unknown_event", "null_lifecycle"].includes(evidence)) {
+        await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.sourceRunId, agentId: f.agentId,
+          eventType: evidence === "launch" ? PROCESS_START_REQUESTED : evidence === "provider" ? "provider.event" : "lifecycle",
+          stream: "system", payload: evidence === "running_event" ? { status: "running" } : undefined,
+          message: evidence === "unknown_event" ? "preparing provider" : undefined });
+      }
+      if (evidence === "cleanup" || evidence === "remote") await db.insert(environmentLeases).values({
+        companyId: f.companyId, heartbeatRunId: f.sourceRunId, provider: evidence === "remote" ? "daytona" : "local",
+        status: "pending_cleanup", leasePolicy: "ephemeral", releasedAt: new Date(), cleanupStatus: "failed",
+      });
+      expect(await admit(f)).toBeNull();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
+    });
+
+  it.each(["accepted", "wrong_run", "wrong_owner", "active", "unverified", "missing_actor", "missing_time", "stale", "later_launch", "later_process", "live_process", "cleanup", "controller", "other_source"])(
+    "uses accepted reconciliation only for its exact stopped source (%s)", async evidence => {
+      const f = await seed();
+      await db.update(heartbeatRuns).set({ processPid: evidence === "live_process" ? process.pid : null,
+        startedAt: new Date("2026-09-11T09:00:00Z") }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.update(issueRecoveryActions).set({ status: evidence === "active" ? "active" : "resolved",
+        returnOwnerAgentId: evidence === "wrong_owner" ? null : f.agentId,
+        evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" },
+          executionReconciliation: { runId: evidence === "wrong_run" ? randomUUID() : f.sourceRunId,
+            providerStopped: evidence !== "unverified", actionOutcome: "not_performed",
+            outcomeEvidence: "Operator verified the provider stopped and the action was never submitted.",
+            ...(evidence === "missing_actor" ? {} : { actorId: "board" }),
+            ...(evidence === "missing_time" ? {} : { recordedAt: evidence === "stale" ? "2026-09-11T09:30:00Z" : "2026-09-11T10:30:00Z" }),
+          } } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      if (evidence === "later_launch") await appendHeartbeatRunEvent(db, { companyId: f.companyId,
+        runId: f.sourceRunId, agentId: f.agentId, eventType: PROCESS_START_REQUESTED, stream: "system" });
+      if (evidence === "later_process") await db.update(heartbeatRuns).set({ processStartedAt: new Date("2026-09-11T10:31:00Z") })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+      if (evidence === "controller") await db.update(nativeRunFinalizations).set({ leaseOwner: "still-active" })
+        .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      if (evidence === "cleanup") await db.insert(environmentLeases).values({ companyId: f.companyId,
+        heartbeatRunId: f.sourceRunId, provider: "local", status: "pending_cleanup", leasePolicy: "ephemeral", cleanupStatus: "failed" });
+      if (evidence === "other_source") {
+        const otherId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: otherId, companyId: f.companyId, agentId: f.agentId,
+          runtimeMode: "native", nativeIssueId: f.issueId, status: "failed", finishedAt: new Date("2026-09-11T10:00:00Z") });
+        await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+          kind: "active_run_watchdog", cause: "uncertain_external_action", fingerprint: otherId, status: "active",
+          nextAction: "Verify this independent source.", evidence: { runId: otherId } });
+      }
+      expect(Boolean(await admit(f))).toBe(evidence === "accepted");
+      const [action] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, f.issueId), eq(issueRecoveryActions.fingerprint, f.sourceRunId)));
+      expect(action.evidence.executionReconciliation).toMatchObject({ actionOutcome: "not_performed" });
+      if (evidence !== "accepted") expect(action.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
+    });
+
   it.each(["verified", "unproven", "changed", "dry_run", "retry", "duplicate"])(
     "requires exact local cleanup for a new turn after worker loss (%s)", async mode => {
       const f = await seed();

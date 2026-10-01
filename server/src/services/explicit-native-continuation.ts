@@ -1,14 +1,14 @@
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
-import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { isCancelledNativeStartup, isNeverStartedLegacyRun } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "./native-local-process-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
-import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
@@ -231,9 +231,28 @@ export async function admitExplicitNativeContinuation(input: {
       }))) return null;
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
-      if (!unusedAdmission && !cancelledStartup) {
-        // A missing process identity is not evidence that a provider exited.
-        if (!run.processPid && !run.processGroupId &&
+      const neverStarted = await isNeverStartedLegacyRun(db, run, coordinator);
+      // An accepted decision is stop evidence only for this action's exact source.
+      // It never waives current process ownership, controller or cleanup gates.
+      const reconciliation = z.object({
+        runId: z.literal(run.id), providerStopped: z.literal(true),
+        actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
+        outcomeEvidence: z.string().trim().min(20),
+        actorId: z.string().trim().min(1), recordedAt: z.string().datetime(),
+      }).safeParse(action.evidence.executionReconciliation);
+      const reconciledAt = reconciliation.success ? new Date(reconciliation.data.recordedAt) : null;
+      const [laterLaunch] = reconciledAt ? await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id),
+        gt(heartbeatRunEvents.createdAt, reconciledAt),
+        inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded",
+          "adapter.invoke", "harness.ready", "session.started", "session.resumed", "turn.started"]),
+      )).limit(1) : [];
+      const reconciled = action.status === "resolved" && action.kind === "active_run_watchdog" &&
+        action.returnOwnerAgentId === agentId && reconciledAt && reconciledAt >= run.finishedAt! &&
+        !laterLaunch && (!run.processStartedAt || run.processStartedAt <= reconciledAt);
+      if (!unusedAdmission && !cancelledStartup && !neverStarted) {
+        // A missing process identity alone is not evidence that a provider exited.
+        if (!run.processPid && !run.processGroupId && !reconciled &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
         if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
