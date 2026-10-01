@@ -93,6 +93,20 @@ describe("completed-review restoration HTTP authorization (mock service)", () =>
     expect(mocks.decide).not.toHaveBeenCalled();
   });
 
+  it("returns 404 rather than 403 when the locked row is cross-tenant", async () => {
+    // Defense in depth: the service re-reads under lock inside the same
+    // transaction it restores in. The locked row must pass the same
+    // existence-folded gate so a cross-tenant id never surfaces as 403.
+    lockedIssue = { ...lockedIssue, companyId: id(99) };
+    const response = await request(await app()).post(path).send(body);
+    expect(response.status, String(routeError)).toBe(404);
+    expect(response.body).toEqual({ error: "Issue not found" });
+    // Only the route-level authorization on the in-tenant row ran; the
+    // locked-row gate refused before a second write/review check.
+    expect(mocks.decide).toHaveBeenCalledTimes(1);
+    expect(mocks.review).toHaveBeenCalledTimes(1);
+  });
+
   it("denies viewer company membership", async () => {
     const actor = { ...user, memberships: [{ companyId: id(1), membershipRole: "viewer", status: "active" }] };
     expect((await request(await app(actor)).post(path).send(body)).status).toBe(403);

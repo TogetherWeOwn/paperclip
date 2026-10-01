@@ -2,7 +2,7 @@ import { Router } from "express";
 import type { Request } from "express";
 import type { Db, issues } from "@paperclipai/db";
 import { isUuidLike, restoreCompletedReviewSchema } from "@paperclipai/shared";
-import { forbidden, unauthorized } from "../errors.js";
+import { forbidden, notFound, unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService } from "../services/access.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -12,7 +12,7 @@ import {
 } from "../services/completed-review-restoration.js";
 import { assertIssueReviewVerdictActorAllowed } from "../services/issue-review-policy.js";
 import { issueService } from "../services/issues.js";
-import { assertAuthenticated, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertAuthenticated, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 
 type IssueRow = typeof issues.$inferSelect;
 
@@ -32,6 +32,10 @@ function issueResource(issue: IssueRow) {
 function restorationAuthorization(req: Request): CompletedReviewRestorationAuthorization {
   return {
     async issue(tx, issue) {
+      // Gate the locked row too: the service passes its own re-read row here,
+      // so fold existence into access (404 either way) before the write-path
+      // checks below instead of leaking cross-tenant existence as a 403.
+      if (!hasCompanyAccess(req, issue.companyId)) throw notFound("Issue not found");
       assertCompanyAccess(req, issue.companyId);
       // This repair is not part of skill-test or task-bridge capability scopes.
       // Never turn ordinary visibility into additional restoration authority.

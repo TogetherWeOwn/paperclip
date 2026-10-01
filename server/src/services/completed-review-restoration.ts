@@ -14,7 +14,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unauthorized } from "../errors.js";
-import { hasInteractionContinuationWakeContext } from "../modules/wake-queue/domain/context.js";
+import { hasInteractionContinuationWakeContext } from "../modules/wake-queue/index.js";
 import { logActivity, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import { planCompletedReviewRestoration } from "./completed-review-reconciliation-evidence.js";
 import { readCompletedReviewEvidenceContext } from "./completed-review-receipt.js";
