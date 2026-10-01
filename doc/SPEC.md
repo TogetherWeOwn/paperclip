@@ -277,6 +277,11 @@ All agent communication flows through the **task system**.
 
 There is no separate messaging or chat system. Tasks are the communication channel. This keeps all context attached to the work it relates to and creates a natural audit trail.
 
+A deferred comment already covered by a completed typed review must not erase
+that review. Intentional resumes remain new work. Any supported repair derives
+completion from authentic persisted evidence, preserves access and policy gates,
+and records original decision references. See [the implementation contract](SPEC-implementation.md#93-permission-matrix-v1) and [the restoration release gates](completed-review-restoration.md).
+
 Experimental Agent Chat presents one persistent task per person and agent as a simplified conversation. It retains the task composer, transcript, tools, attachments, documents, and existing Subtasks panel, with ordinary company visibility. New execution tasks are ordinary project tasks, not children of the conversation. Idle conversations wait for a message without entering execution-task work queues. Agents clarify goals here and create assigned tasks for substantial execution. `/new` resets provider context at an ordered session boundary within the same task while preserving visible history. `enableAgentChat` is disabled by default; the V1 lifecycle and rollout contract is specified in `SPEC-implementation.md`.
 
 ### Implications

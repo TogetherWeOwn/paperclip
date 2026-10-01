@@ -893,6 +893,13 @@ export const stalledReviewDecisionSchema = z
 
 export type StalledReviewDecision = z.infer<typeof stalledReviewDecisionSchema>;
 
+export const restoreCompletedReviewSchema = z.object({
+  completionActivityId: z.string().guid(),
+  wakeupRequestId: z.string().guid(),
+}).strict();
+
+export type RestoreCompletedReview = z.infer<typeof restoreCompletedReviewSchema>;
+
 export const checkoutIssueSchema = z.object({
   agentId: z.string().guid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
