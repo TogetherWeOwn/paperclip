@@ -74,6 +74,53 @@ export function buildCompletedReviewEvidence(input: Scope & {
   };
 }
 
+/** Seal only a just-persisted final approval; callers supply rows from the same transaction. */
+export function sealCompletedReviewEvidence(input: Scope & {
+  status: string;
+  executionState: unknown;
+  policy: unknown;
+  delivery: unknown;
+  decisions: Decision[];
+  actorType: string;
+  actorId: string;
+  runId: string | null;
+}): CompletedReviewEvidence | null {
+  const policy = issueExecutionPolicySchema.safeParse(object(input.policy)?.executionPolicy);
+  const state = issueExecutionStateSchema.safeParse(input.executionState);
+  if (input.status !== "done" || !policy.success || !state.success ||
+      state.data.status !== "completed" || state.data.lastDecisionOutcome !== "approved" ||
+      !state.data.lastDecisionId || !state.data.returnAssignee ||
+      state.data.currentStageId !== null || state.data.currentStageIndex !== null ||
+      state.data.currentStageType !== null || state.data.currentParticipant !== null ||
+      state.data.changesRequestedCount !== 0 || state.data.reviewRequest !== null ||
+      state.data.monitor != null || policy.data.stages.length === 0 ||
+      !["agent", "user"].includes(input.actorType) ||
+      input.decisions.some((row) => !sameScope(input, row))) return null;
+  const stageIds = policy.data.stages.map((stage) => stage.id);
+  if (new Set(stageIds).size !== stageIds.length ||
+      completedReviewEvidenceDigest(state.data.completedStageIds) !== completedReviewEvidenceDigest(stageIds)) return null;
+  const decisions: Decision[] = [];
+  for (const stage of policy.data.stages) {
+    const matching = input.decisions.filter((row) => row.stageId === stage.id)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const selected = matching[0];
+    if (!selected || selected.outcome !== "approved" || selected.stageType !== stage.type ||
+        !Number.isFinite(selected.createdAt.getTime()) ||
+        !Number.isFinite(selected.updatedAt.getTime()) ||
+        selected.updatedAt.getTime() !== selected.createdAt.getTime() ||
+        matching.some((row) => row !== selected && row.createdAt >= selected.createdAt) ||
+        !stage.participants.some((participant) => participant.type === "agent"
+          ? participant.agentId === selected.actorAgentId && selected.actorUserId === null
+          : participant.userId === selected.actorUserId && selected.actorAgentId === null)) return null;
+    decisions.push(selected);
+  }
+  const last = decisions.at(-1)!;
+  if (last.id !== state.data.lastDecisionId || last.createdByRunId !== input.runId ||
+      (input.actorType === "agent" ? last.actorAgentId : last.actorUserId) !== input.actorId ||
+      decisions.some((row, index) => index > 0 && row.createdAt <= decisions[index - 1].createdAt)) return null;
+  return buildCompletedReviewEvidence({ ...input, decisionIds: decisions.map((row) => row.id) });
+}
+
 export type CompletedReviewRestorationPlan =
   | { outcome: "refused"; reason: string }
   | {

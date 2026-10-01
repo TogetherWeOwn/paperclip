@@ -53,10 +53,13 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+const mockDecisionValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDecisionInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDecisionValues })));
+const mockCollectReceipt = vi.hoisted(() => vi.fn(async (..._args: unknown[]): Promise<Record<string, unknown> | null> => null));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
-  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
-    callback({ select: mockDbSelect })),
+  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect; insert: typeof mockDecisionInsert }) => Promise<unknown>) =>
+    callback({ select: mockDbSelect, insert: mockDecisionInsert })),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -74,6 +77,9 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/completed-review-receipt.js", () => ({
+    collectCompletedReviewReceipt: mockCollectReceipt,
+  }));
   vi.doMock("../services/queued-interaction-response.js", () => ({
     hasQueuedInteractionResponse: vi.fn(async () => false),
   }));
@@ -203,6 +209,7 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockCollectReceipt.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
@@ -264,6 +271,52 @@ describe("issue execution policy routes", () => {
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
   });
+
+  it.each([false, true])("persists final approval receipt in the decision transaction (failure=%s)", async (fail) => {
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1",
+      status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board",
+      createdByUserId: "local-board", identifier: "PAP-1002", title: "Typed review",
+      executionPolicy: {
+        mode: "normal", commentRequired: true,
+        stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
+          participants: [{ id: "22222222-2222-4222-8222-222222222222", type: "user", userId: "local-board", agentId: null }] }],
+      },
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board", agentId: null },
+        returnAssignee: { type: "user", userId: "executor", agentId: null },
+        completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        changesRequestedCount: 0, reviewRequest: null, monitor: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue, ...patch, changes: { status: { from: "in_review", to: "done" } }, updatedAt: new Date(),
+    }));
+    const proof = { version: 1, companyId: issue.companyId, issueId: issue.id,
+      policyDigest: "persisted-policy", deliveryDigest: "persisted-delivery", decisionIds: ["original-decision"] };
+    if (fail) mockCollectReceipt.mockRejectedValueOnce(new Error("receipt read failed"));
+    else mockCollectReceipt.mockResolvedValueOnce(proof);
+    mockIssueService.addComment.mockResolvedValue({ id: "66666666-6666-4666-8666-666666666666", companyId: issue.companyId, issueId: issue.id, body: "Approved the final stage." });
+    const res = await request(await createApp()).patch(`/api/issues/${issue.id}`)
+      .send({ status: "done", comment: "Approved the final stage." });
+    expect(res.status, JSON.stringify(res.body)).toBe(fail ? 500 : 200);
+    expect(mockDecisionValues).toHaveBeenCalledWith(expect.objectContaining({ outcome: "approved", stageId }));
+    expect(mockCollectReceipt).toHaveBeenCalledWith(mockIssueService.update.mock.calls[0]?.[2],
+      expect.objectContaining({ status: "done", executionState: expect.objectContaining({ status: "completed" }) }),
+      expect.objectContaining({ actorType: "user", actorId: "local-board" }));
+    expect(mockDecisionValues.mock.invocationCallOrder[0]).toBeLessThan(mockCollectReceipt.mock.invocationCallOrder[0]!);
+    if (fail) expect(mockLogActivity).not.toHaveBeenCalled();
+    else {
+      expect(mockLogActivity.mock.calls.filter((call) => (call[1] as { action?: string })?.action === "issue.updated")).toHaveLength(1);
+      expect(mockLogActivity).toHaveBeenCalledWith(mockIssueService.update.mock.calls[0]?.[2],
+        expect.objectContaining({ action: "issue.updated", details: expect.objectContaining({
+          completedReviewEvidence: proof, status: "done", executionState: expect.objectContaining({ status: "completed" }),
+        }) }), expect.any(Array));
+    }
+  }, 45_000);
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {
     const issue = {

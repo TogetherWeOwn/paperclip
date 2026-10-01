@@ -4,6 +4,7 @@ import {
   buildCompletedReviewEvidence,
   completedReviewEvidenceDigest,
   planCompletedReviewRestoration,
+  sealCompletedReviewEvidence,
 } from "./completed-review-reconciliation-evidence.js";
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -71,6 +72,45 @@ function fixture() {
     restoredCompletionActivityId: null as string | null,
   };
 }
+
+describe("completion receipt sealing (fixtures only)", () => {
+  function input() {
+    const f = fixture();
+    return { ...f, status: "done", executionState: structuredClone(completed),
+      actorType: f.completion.actorType, actorId: f.completion.actorId, runId: f.completion.runId };
+  }
+
+  it("derives references from persisted approvals, without mutating their rows", () => {
+    const f = input();
+    const before = structuredClone(f);
+    expect(sealCompletedReviewEvidence(f)).toEqual(f.completion.details.completedReviewEvidence);
+    expect(f).toEqual(before);
+  });
+
+  const cases: [string, (f: ReturnType<typeof input>) => void][] = [
+    ["incomplete issue", (f) => { f.status = "in_review"; }],
+    ["no native policy", (f) => { f.policy.executionPolicy.stages = []; }],
+    ["missing decision", (f) => { f.decisions.pop(); }],
+    ["newer rejection", (f) => { f.decisions.push({ ...f.decisions[1], id: id(99), outcome: "rejected", createdAt: at(36), updatedAt: at(36) }); }],
+    ["changed decision", (f) => { f.decisions[1].updatedAt = at(36); }],
+    ["equal-time ambiguous decisions", (f) => { f.decisions.push({ ...f.decisions[1], id: id(99) }); }],
+    ["other company", (f) => { f.decisions[0].companyId = id(99); }],
+    ["other issue", (f) => { f.decisions[0].issueId = id(99); }],
+    ["substituted reviewer", (f) => { f.decisions[1].actorAgentId = id(99); }],
+    ["unrelated actor", (f) => { f.actorId = id(99); }],
+    ["system actor", (f) => { f.actorType = "system"; }],
+    ["other run", (f) => { f.runId = id(99); }],
+    ["no return assignee", (f) => { f.executionState.returnAssignee = null; }],
+    ["pending review", (f) => { f.executionState.currentStageId = id(4); }],
+    ["missing completed stage", (f) => { f.executionState.completedStageIds.pop(); }],
+    ["forged last decision", (f) => { f.executionState.lastDecisionId = id(99); }],
+  ];
+  it.each(cases)("does not seal %s", (_name, mutate) => {
+    const f = input();
+    mutate(f);
+    expect(sealCompletedReviewEvidence(f)).toBeNull();
+  });
+});
 
 describe("completed review restoration evidence (fixtures only)", () => {
   it("derives the original state and references without replacing approvals", () => {

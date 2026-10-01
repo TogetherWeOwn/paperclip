@@ -279,6 +279,7 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { collectCompletedReviewReceipt } from "../services/completed-review-receipt.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -13405,8 +13406,12 @@ export function issueRoutes(
       });
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
+      const completingTypedReview =
+        transition.decision?.outcome === "approved" &&
+        updateFields.status === "done" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "completed";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || completingTypedReview;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -13627,6 +13632,9 @@ export function issueRoutes(
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
       ) => {
         if (!persistReviewActivityTransactionally) return;
+        const completedReviewEvidence = completingTypedReview
+          ? await collectCompletedReviewReceipt(tx as unknown as Db, updated, actor)
+          : null;
         const changes = updated.changes ?? {};
         const previous = Object.fromEntries(
           Object.entries(changes).map(([key, change]) => [key, change.from]),
@@ -13646,6 +13654,11 @@ export function issueRoutes(
             entityId: updated.id,
             details: {
               ...updateFields,
+              ...(completedReviewEvidence ? {
+                completedReviewEvidence,
+                status: updated.status,
+                executionState: updated.executionState,
+              } : {}),
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
