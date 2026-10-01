@@ -5,7 +5,7 @@ import { commentsCoveredByCompletedReview } from "./completed-review.js";
 const completedAt = new Date("2026-10-01T11:32:56.812Z");
 const state: IssueExecutionState = {
   status: "completed", currentStageId: null, currentStageIndex: null, currentStageType: null,
-  currentParticipant: null, returnAssignee: { agentId: "author", userId: null },
+  currentParticipant: null, returnAssignee: { type: "agent", agentId: "author", userId: null },
   completedStageIds: ["security", "code"], lastDecisionId: "original-decision",
   lastDecisionOutcome: "approved", monitor: null, reviewRequest: null,
 };
