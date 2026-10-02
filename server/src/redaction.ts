@@ -1,7 +1,14 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { isPublicExecutorToolSelector } from "@paperclipai/adapter-utils/command-redaction";
 
-const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
+// Bound the [A-Za-z0-9_-] affixes to {0,64} around the secret keyword core.
+// Unbounded `*` affixes cause quadratic backtracking on long alphanumeric
+// runs (e.g. thinking signatures) through SECRET_PAYLOAD_KEY_RE and the
+// derived CLI/JSON text regexes below. The pattern is unanchored, so genuine
+// field names (always short) still match; only the backtracking window is
+// capped. Port of the live v2026.916 operator overlay; preserves all PRP
+// v2 / public-executor-selector semantics below.
+const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]{0,64}`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
 // Authorization reasons are policy decision codes, not credentials. They must
