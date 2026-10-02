@@ -106,6 +106,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableOwnerInstanceAdmin: false,
     enableSandboxDuplexBridge: false,
     enableRunnerPreviewIngress: false,
+    requireRunModelDecision: false,
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,

@@ -1029,6 +1029,7 @@ export type {
   PluginManagedSkillDeclaration,
   PluginManagedSkillFileDeclaration,
   PluginLocalFolderDeclaration,
+  PluginModelRoutingDeclaration,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
   PluginManagedRoutineResolution,

@@ -130,6 +130,13 @@ export interface InstanceExperimentalSettings {
    */
   enableRunnerPreviewIngress: boolean;
   /**
+   * Issue runs ask the `run.model.resolve` plugin holder which model to use
+   * before the adapter config merge. On: no decision parks the run on a
+   * bounded retry and never falls back to the default. Off: advisory only,
+   * the run starts on the default and records `outcome: "timeout"`.
+   */
+  requireRunModelDecision: boolean;
+  /**
    * Worktree preview instances (`PAPERCLIP_IN_WORKTREE=true`) suppress the
    * heartbeat run engine by default so previews never self-execute tasks. When
    * this is enabled the worktree-instance scheduling suppression is lifted so
