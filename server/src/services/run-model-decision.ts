@@ -384,7 +384,12 @@ export interface RunModelDecisionHolder {
 export type RunModelDecisionHolderSelection =
   | { kind: "none" }
   | { kind: "single"; holder: RunModelDecisionHolder }
-  | { kind: "conflict"; pluginKeys: string[] };
+  | { kind: "conflict"; pluginKeys: string[] }
+  /**
+   * The host could not tell whether a holder exists (the plugin lookup
+   * failed). Treated as a holder that did not answer: never a skip.
+   */
+  | { kind: "unavailable"; reason: string };
 
 /**
  * Picks the `run.model.resolve` holder among ready plugins. More than one
@@ -537,6 +542,8 @@ export async function resolveRunModelDecision(
       outcome: "deferred",
       reason: `multiple ${RUN_MODEL_DECISION_CAPABILITY} holders: ${input.holder.pluginKeys.join(", ")}`,
     };
+  } else if (input.holder.kind === "unavailable") {
+    failure = { outcome: "timeout", reason: input.holder.reason };
   } else if (input.holder.kind === "single") {
     let raw: unknown;
     try {

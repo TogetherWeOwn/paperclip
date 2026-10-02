@@ -205,6 +205,42 @@ describe("run model decision hook (TOG-11792, design §9.2)", () => {
     });
   });
 
+  it("parks, never skips, when the host could not look up the holder", async () => {
+    const call = vi.fn();
+    const holder: RunModelDecisionHolderSelection = {
+      kind: "unavailable",
+      reason: "holder lookup failed: db down",
+    };
+    expect(await resolveRunModelDecision(input({ holder, call }))).toMatchObject({
+      action: "park",
+      retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
+      reason: "holder lookup failed: db down",
+      record: { outcome: "timeout", pluginKey: null },
+    });
+    expect(
+      await resolveRunModelDecision(input({ holder, call, requireDecision: false })),
+    ).toMatchObject({
+      action: "proceed",
+      answer: null,
+      record: { advisory: { outcome: "timeout", reason: "holder lookup failed: db down" } },
+    });
+    expect(
+      await resolveRunModelDecision(input({ holder, call, isUserRequestedWake: true })),
+    ).toMatchObject({ action: "proceed", record: { outcome: "exempt" } });
+    expect(
+      (
+        await resolveRunModelDecision(
+          input({
+            holder,
+            call,
+            skip: { issueId: "issue-1", assigneeIsHuman: false, issueOverrideModel: "pinned" },
+          }),
+        )
+      ).record.outcome,
+    ).toBe("skipped");
+    expect(call).not.toHaveBeenCalled();
+  });
+
   // 5. max attempts → surfaced, never default
   it("surfaces the issue once attempts are exhausted; it never returns the default", () => {
     expect(

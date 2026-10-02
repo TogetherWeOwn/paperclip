@@ -57,6 +57,11 @@ describe("execution truth projection", () => {
       scheduledRetryAttempt: 12, contextSnapshot: { failureRetriesBeforeAiConnectionWait: 0 } }), undefined, [], undefined, now))
       .toMatchObject({ label: "Waiting for AI subscription", phase: "retry_scheduled", attempt: 1, recoveryOwner: null });
   });
+  it("shows a model-decision wait as a resource wait", () => {
+    expect(projectExecution(run({ runtimeMode: "legacy", status: "scheduled_retry", scheduledRetryReason: "model_decision_pending",
+      scheduledRetryAttempt: 4 }), undefined, [], undefined, now))
+      .toMatchObject({ label: "Waiting for model router", phase: "retry_scheduled", recoveryOwner: null });
+  });
   it("shows a workspace wait without presenting its deferral count as failed attempts", () => {
     expect(projectExecution(run({ runtimeMode: "legacy", status: "scheduled_retry", scheduledRetryReason: "workspace_busy",
       scheduledRetryAttempt: 12, contextSnapshot: { failureRetriesBeforeWorkspaceWait: 1 } }), undefined, [], undefined, now))
