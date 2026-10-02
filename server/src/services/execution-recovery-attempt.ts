@@ -12,6 +12,9 @@ export interface ExecutionRetryAccounting {
   maxTurnContinuations: number;
 }
 
+/** Waits that precede provider execution; each counts its own attempts. */
+const RESOURCE_WAIT_REASONS: ReadonlySet<string> = new Set(["workspace_busy", "ai_connection_busy", "model_decision_pending"]);
+
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -42,7 +45,8 @@ function historicalFailureCount(run: RetryRun): number {
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy"].includes(run.scheduledRetryReason ?? "");
+  const reason = run.scheduledRetryReason ?? "";
+  const nonFailureLane = reason === "max_turns_continuation" || reason === "issue_disposition_repair" || RESOURCE_WAIT_REASONS.has(reason);
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -57,7 +61,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
-  if (reason === "workspace_busy" || reason === "ai_connection_busy") {
+  if (RESOURCE_WAIT_REASONS.has(reason)) {
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
@@ -67,6 +71,6 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy") accounting.failureRetries = attempt;
+  else if (!RESOURCE_WAIT_REASONS.has(reason)) accounting.failureRetries = attempt;
   return accounting;
 }

@@ -536,6 +536,55 @@ export interface ResolveExternalObjectParams {
   object: PluginExternalObjectRecordSnapshot;
 }
 
+// ---------------------------------------------------------------------------
+// Run model decision (TOG-11792)
+// ---------------------------------------------------------------------------
+
+/**
+ * Input to `onResolveRunModel`. The host asks the `run.model.resolve` holder
+ * which model an issue run uses, inside `executeRun`, before the adapter
+ * config merge. Requires the `run.model.resolve` capability.
+ */
+export interface ResolveRunModelParams {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  issueId: string | null;
+  adapterType: string;
+  invocationSource: string;
+  wakeReason: string | null;
+  /** Resolved agent `adapterConfig.model`. */
+  agentDefaultModel: string | null;
+  /** Last run on the same issue and agent, with its recorded decision. */
+  previous: { runId: string; model: string | null; decisionId: string | null } | null;
+  /** Human/operator override model, if any. */
+  issueOverrideModel: string | null;
+  /** Host deadline for this call; past it the run defers. */
+  deadlineMs: number;
+}
+
+/**
+ * Answer to `onResolveRunModel`.
+ * - `decide`: run on `model`. `env` carries plain strings only, and every key
+ *   must be declared in the manifest's `modelRouting.envKeys`.
+ * - `keep`: the agent default / existing override is correct.
+ * - `defer`: no decision yet; the host parks the run and retries later.
+ */
+export type ResolveRunModelResult =
+  | {
+      kind: "decide";
+      decisionId: string;
+      model: string;
+      effort?: string;
+      env?: Record<string, string>;
+      tier?: string;
+      source: string;
+      fallback?: boolean;
+      reason?: string;
+    }
+  | { kind: "keep" }
+  | { kind: "defer"; retryAfterMs: number; reason: string };
+
 export interface PluginExternalObjectResolvedSnapshot {
   displayKey?: string | null;
   iconKey?: string | null;
@@ -1357,6 +1406,10 @@ export interface HostToWorkerMethods {
     params: RefreshExternalObjectsParams,
     result: RefreshExternalObjectsResult,
   ];
+  resolveRunModel: [
+    params: ResolveRunModelParams,
+    result: ResolveRunModelResult,
+  ];
   environmentValidateConfig: [
     params: PluginEnvironmentValidateConfigParams,
     result: PluginEnvironmentValidationResult,
@@ -1475,6 +1528,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "detectExternalObjects",
   "resolveExternalObject",
   "refreshExternalObjects",
+  "resolveRunModel",
   "environmentValidateConfig",
   "environmentProbe",
   "environmentAcquireLease",
