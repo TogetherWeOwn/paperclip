@@ -4791,10 +4791,32 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // TOG-12050: the child may exit or close its stdin before the
+          // deferred onSpawn persist settles. The write below then hits a
+          // broken pipe, and Node emits the EPIPE asynchronously as an
+          // 'error' event on this stream. Without a listener that surfaces
+          // as an uncaught exception and kills the whole controller process
+          // -- every in-flight run, not just this one. The guards below do
+          // not cover it: child.killed and stdin.destroyed both still read
+          // false while a live child holds a readerless pipe. Swallow only
+          // the broken-pipe codes; any other stream failure is reported
+          // through onLogError so it stays visible.
+          stdin.on("error", (stdinErr: Error) => {
+            const code = (stdinErr as NodeJS.ErrnoException).code;
+            if (code === "EPIPE" || code === "ECONNRESET") return;
+            onLogError(stdinErr, runId, "child stdin stream error");
+          });
           void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            try {
+              if (child.killed || stdin.destroyed) return;
+              stdin.write(opts.stdin as string);
+              stdin.end();
+            } catch (err) {
+              // A synchronous write failure must not reject this chain:
+              // the derived promise has no rejection handler, and an
+              // unhandled rejection would take down the controller too.
+              onLogError(err, runId, "failed to write child stdin");
+            }
           });
         }
 

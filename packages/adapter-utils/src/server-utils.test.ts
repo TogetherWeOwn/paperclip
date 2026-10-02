@@ -912,6 +912,117 @@ describe("runChildProcess", () => {
   );
 });
 
+// Regression coverage for TOG-12050: the controller crashed twice on
+// 2026-10-02 when deferred stdin payloads hit a child pipe the child had
+// already closed. The write-side EPIPE surfaces asynchronously as an 'error'
+// event on the parent's stdin stream; with no listener it is an uncaught
+// exception and the whole controller process dies with it. These tests drive
+// the real runChildProcess spawn path -- including the slow onSpawn persist
+// that defers the write -- so a missing listener fails loudly here instead
+// of in production.
+describe("runChildProcess deferred stdin pipe failures", () => {
+  it("settles normally when the child reads its stdin and exits", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "let data='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>data+=chunk);process.stdin.on('end',()=>{process.stdout.write(data);process.exit(0);});",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "normal-input",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("normal-input");
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives the child exiting before a slow onSpawn persist settles", async () => {
+    // The child fails immediately, while the onSpawn persist below stays
+    // slow: the deferred write then lands on a pipe whose reader is gone.
+    // Before the fix this emitted an unhandled error on the stdin stream
+    // and crashed the host process; now the run settles with the child's
+    // real exit code and the failure is contained to this run.
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.exit(3);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "deferred payload nobody reads",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(3);
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives an asynchronous EPIPE from a live child that closed its stdin", async () => {
+    // The child destroys its own stdin read end and stays alive past the
+    // write. The pipe buffer fills, so the kernel delivers EPIPE as an
+    // async 'error' event on the parent's stdin stream -- neither the
+    // child.killed nor the stdin.destroyed guard filters this case. The
+    // host process must stay alive and the run must settle on child exit.
+    const payload = "x".repeat(1024 * 1024);
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdin.destroy();setTimeout(()=>process.exit(0),500);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: payload,
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives a slow onSpawn persist against a live child with closed stdin", async () => {
+    // The exact incident shape: a readerless child plus the deferred write
+    // racing the slow onSpawn persist, so the parent-side guards read clean
+    // at write time and the failure arrives async instead.
+    const payload = "x".repeat(1024 * 1024);
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdin.destroy();setTimeout(()=>process.exit(0),1500);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: payload,
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+  });
+});
+
 describe("renderPaperclipWakePrompt", () => {
   it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
     const payload = {
