@@ -36,6 +36,63 @@ const TOOL_GATEWAY_WINDOWS: Record<string, number | null> = {
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function toMcpCallResult(raw: unknown): { content: Array<{ type: string; text: string }>; structuredContent?: Record<string, unknown>; isError: boolean } {
+  const outer = isPlainRecord(raw) ? raw : {};
+  // Connected-MCP envelope from normalizeMcpToolResult: { content, data: { content, structuredContent?, isError, ... } }.
+  // Only unwrap when data carries the MCP content array so a built-in payload
+  // that happens to have a `data` key is never mistaken for an envelope.
+  const dataInner =
+    isPlainRecord(outer.data) && Array.isArray((outer.data as Record<string, unknown>).content)
+      ? (outer.data as Record<string, unknown>)
+      : null;
+  // Plugin dispatcher envelope: { pluginId, toolName, result: ToolResult }.
+  // Both keys are always present (plugin-tool-registry returns them together),
+  // so require both — a built-in payload that happens to have a `result` key
+  // must never be mistaken for an envelope.
+  const resultInner =
+    isPlainRecord(outer.result) && typeof outer.pluginId === "string" && typeof outer.toolName === "string"
+      ? (outer.result as Record<string, unknown>)
+      : null;
+  const shaped = dataInner ?? resultInner ?? outer;
+  const contentArray = Array.isArray(shaped.content) ? (shaped.content as Array<{ type: string; text: string }>) : null;
+  const content = contentArray ?? [
+    {
+      type: "text",
+      text:
+        typeof shaped.content === "string"
+          ? shaped.content
+          : JSON.stringify(
+              (shaped.data as unknown) ?? raw ?? null,
+            ),
+    },
+  ];
+  const outerData = isPlainRecord(outer.data) ? (outer.data as Record<string, unknown>) : null;
+  const structuredCandidate =
+    (shaped as Record<string, unknown>).structuredContent ??
+    (isPlainRecord((shaped as Record<string, unknown>).data) ? ((shaped as Record<string, unknown>).data as Record<string, unknown>) : undefined) ??
+    outerData?.structuredContent;
+  const shapedRecord = shaped as Record<string, unknown>;
+  const result: { content: Array<{ type: string; text: string }>; structuredContent?: Record<string, unknown>; isError: boolean } = {
+    content,
+    // `outer.isError` matters for replayed rows: storedInvocationResult stamps
+    // the flag on the outer record, and the unwrap below must not drop it.
+    isError:
+      shapedRecord.isError === true ||
+      outer.isError === true ||
+      (shapedRecord.error != null && shapedRecord.error !== false) ||
+      (outer.error != null && outer.error !== false),
+  };
+  // Strict MCP clients reject `structuredContent: null`; omit unless a record.
+  if (isPlainRecord(structuredCandidate)) {
+    result.structuredContent = structuredCandidate;
+  }
+  return result;
+}
+
 function gatewayToken(req: { header(name: string): string | undefined }) {
   return req.header("x-paperclip-tool-gateway-token")?.trim() || null;
 }
@@ -161,7 +218,13 @@ async function handleMcpGatewayProtocol(
             : {},
           callerHeaders: headers,
         });
-        res.json({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false } });
+        res.json({
+          jsonrpc: "2.0",
+          id,
+          result: isPlainRecord(result)
+            ? { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result, isError: false }
+            : { content: [{ type: "text", text: JSON.stringify(result ?? null) }], isError: false },
+        });
         return;
       }
       const result = await toolGateway.executeTool({
@@ -172,21 +235,7 @@ async function handleMcpGatewayProtocol(
         parameters: params.arguments ?? {},
         callerHeaders: req.headers,
       });
-      const resultRecord = result.result && typeof result.result === "object" && !Array.isArray(result.result)
-        ? result.result as Record<string, unknown>
-        : null;
-      const contentText = typeof resultRecord?.content === "string"
-        ? resultRecord.content
-        : JSON.stringify(resultRecord?.data ?? result.result ?? null);
-      res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [{ type: "text", text: contentText }],
-          structuredContent: resultRecord?.data ?? null,
-          isError: false,
-        },
-      });
+      res.json({ jsonrpc: "2.0", id, result: toMcpCallResult(result.result) });
       return;
     }
     if (["resources/list", "resources/read", "prompts/list", "prompts/get"].includes(body.method ?? "")) {

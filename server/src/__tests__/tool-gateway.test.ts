@@ -45,6 +45,7 @@ import {
 } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { toolAccessService } from "../services/tool-access.js";
 import {
   canonicalToolArguments,
@@ -5376,5 +5377,219 @@ rl.on("line", (line) => {
       },
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
+  });
+
+  it("shapes a plugin content-only result without structuredContent (TOG-7727)", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const dispatcher: PluginToolDispatcher = {
+      initialize: async () => {},
+      teardown: () => {},
+      listToolsForAgent: () => [
+        {
+          name: "hindsight:recall",
+          displayName: "Recall",
+          description: "Recall through a plugin tool.",
+          parametersSchema: { type: "object" },
+          pluginId: "hindsight",
+        },
+      ],
+      getTool: () => null,
+      executeTool: async () =>
+        ({
+          pluginId: "hindsight",
+          toolName: "recall",
+          result: { content: [{ type: "text", text: "x" }] },
+        }) as unknown as Awaited<ReturnType<PluginToolDispatcher["executeTool"]>>,
+      registerPluginTools: () => {},
+      unregisterPluginTools: () => {},
+      toolCount: () => 1,
+      getRegistry: () => {
+        throw new Error("not used");
+      },
+    };
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const profile = await allowToolsForAgent(db, company.id, agent.id, ["hindsight:recall"]);
+    const namedGateway = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: `Plugin gateway ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+    });
+    const token = await gateway.createNamedGatewayToken({
+      companyId: company.id,
+      gatewayId: namedGateway.id,
+      body: {
+        name: "Runtime token",
+        subjectType: "heartbeat_run",
+        subjectId: run.id,
+        clientLabel: "Shape regression",
+        ownerNote: "TOG-7727 result-shape regression",
+        allowedActions: ["tools/list", "tools/call"],
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      actor: { agentId: agent.id },
+    });
+    const app = createGatewayRouteApp(db, gateway);
+    const called = await request(app)
+      .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "hindsight:recall", arguments: {} } })
+      .expect(200);
+    expect(called.body.result.content).toEqual([{ type: "text", text: "x" }]);
+    expect(called.body.result.isError).toBe(false);
+    expect("structuredContent" in called.body.result).toBe(false);
+    expect(CallToolResultSchema.safeParse(called.body.result).success).toBe(true);
+  });
+
+  it("passes object structuredContent through and omits null/array (TOG-7727)", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => {
+      const name = (body?.params as { name?: unknown } | undefined)?.name;
+      if (name === "shaped_null") {
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "n" }], structuredContent: null } } };
+      }
+      if (name === "shaped_array") {
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "a" }], structuredContent: [1, 2] } } };
+      }
+      return { body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "o" }], structuredContent: { ok: true } } } };
+    });
+    try {
+      const gatewayNames: string[] = [];
+      for (const toolName of ["shaped_object", "shaped_null", "shaped_array"]) {
+        const made = await createRemoteMcpTool(db, company.id, {
+          url: remote.url,
+          applicationKey: "shape-app",
+          toolName,
+          riskLevel: "read",
+        });
+        gatewayNames.push(expectedConnectedToolName({
+          applicationKey: made.application.applicationKey,
+          connectionId: made.connection.id,
+          toolName: made.catalogEntry.toolName,
+        }));
+      }
+      const profile = await allowToolsForAgent(db, company.id, agent.id, gatewayNames);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: `Shape gateway ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Runtime token",
+          subjectType: "heartbeat_run",
+          subjectId: run.id,
+          clientLabel: "Shape regression",
+          ownerNote: "TOG-7727 result-shape regression",
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+        actor: { agentId: agent.id },
+      });
+      const app = createGatewayRouteApp(db, gateway);
+      const call = (name: string, id: number) =>
+        request(app)
+          .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: { key: "k", value: "v" } } })
+          .expect(200);
+
+      const objectResult = await call(gatewayNames[0]!, 1);
+      expect(objectResult.body.result.structuredContent).toEqual({ ok: true });
+      expect(objectResult.body.result.isError).toBe(false);
+      expect(CallToolResultSchema.safeParse(objectResult.body.result).success).toBe(true);
+
+      const nullResult = await call(gatewayNames[1]!, 2);
+      expect("structuredContent" in nullResult.body.result).toBe(false);
+      expect(nullResult.body.result.isError).toBe(false);
+      expect(CallToolResultSchema.safeParse(nullResult.body.result).success).toBe(true);
+
+      const arrayResult = await call(gatewayNames[2]!, 3);
+      expect("structuredContent" in arrayResult.body.result).toBe(false);
+      expect(arrayResult.body.result.isError).toBe(false);
+      expect(CallToolResultSchema.safeParse(arrayResult.body.result).success).toBe(true);
+    } finally {
+      await remote.close();
+    }
+  });
+
+  it("replays a failed invocation with isError:true and no structuredContent key (TOG-7727)", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => ({
+      body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "stored" }] } },
+    }));
+    try {
+      const made = await createRemoteMcpTool(db, company.id, {
+        url: remote.url,
+        applicationKey: "replay-app",
+        toolName: "kv_set",
+        riskLevel: "write",
+      });
+      const gatewayToolName = expectedConnectedToolName({
+        applicationKey: made.application.applicationKey,
+        connectionId: made.connection.id,
+        toolName: made.catalogEntry.toolName,
+      });
+      const profile = await allowToolsForAgent(db, company.id, agent.id, [gatewayToolName]);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: `Replay gateway ${randomUUID()}`, profileId: profile.id, defaultProfileMode: "gateway_only" },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Runtime token",
+          subjectType: "heartbeat_run",
+          subjectId: run.id,
+          clientLabel: "Replay regression",
+          ownerNote: "TOG-7727 replay-shape regression",
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+        actor: { agentId: agent.id },
+      });
+      const app = createGatewayRouteApp(db, gateway);
+      const call = (id: number) =>
+        request(app)
+          .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id, method: "tools/call", params: { name: gatewayToolName, arguments: { key: "k", value: "v" } } })
+          .expect(200);
+
+      const first = await call(1);
+      expect(first.body.result.isError).toBe(false);
+      expect("structuredContent" in first.body.result).toBe(false);
+      expect(remote.requests.filter((entry) => entry.body?.method === "tools/call")).toHaveLength(1);
+
+      const [stored] = await db.select().from(toolInvocations);
+      expect(stored).toBeTruthy();
+      await db
+        .update(toolInvocations)
+        .set({
+          status: "failed",
+          errorCode: "tool_execution_failed",
+          errorMessage: "boom",
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(toolInvocations.id, stored!.id));
+
+      const replayed = await call(2);
+      expect(replayed.body.result.isError).toBe(true);
+      expect("structuredContent" in replayed.body.result).toBe(false);
+      expect(CallToolResultSchema.safeParse(replayed.body.result).success).toBe(true);
+      // The replay must not re-dispatch upstream.
+      expect(remote.requests.filter((entry) => entry.body?.method === "tools/call")).toHaveLength(1);
+    } finally {
+      await remote.close();
+    }
   });
 });
