@@ -783,8 +783,11 @@ second-line\" status=401`,
     // Port-guard for the live v2026.916 operator overlay: the unbounded
     // [A-Za-z0-9_-]* affixes in SECRET_FIELD_NAME_PATTERN backtrack
     // quadratically on thinking-signature-like runs. Synthetic input only.
-    const adversarial = "a".repeat(20000);
-    const nearMiss = "ab12-_".repeat(2000); // 12k key-alphabet chars, no secret word
+    // The "." passes maybeContainsSecretText, so the JSON text regexes run;
+    // without it redactSensitiveText returns early and nothing is measured.
+    // Unbounded affixes take seconds here; the bound keeps it in tens of ms.
+    const adversarial = `sig.${"a".repeat(50000)}`;
+    const nearMiss = `sig.${"ab12-_".repeat(2000)}`; // 12k key-alphabet chars, no secret word
     const started = Date.now();
     const untouched = redactSensitiveText(adversarial);
     const nearMissOut = redactSensitiveText(nearMiss);
@@ -792,7 +795,7 @@ second-line\" status=401`,
     // No secret material: output is unchanged and fast (linear scan, not seconds).
     expect(untouched).toBe(adversarial);
     expect(nearMissOut).toBe(nearMiss);
-    expect(elapsedMs).toBeLessThan(2000);
+    expect(elapsedMs).toBeLessThan(1000);
   });
 
   it("still redacts real secret keys after the affix bound", () => {
