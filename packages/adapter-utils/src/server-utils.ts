@@ -3402,12 +3402,82 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Server-secret denylist for agent child env (TOG-9648): run b05bb87b
+// inherited DATABASE_URL from the server env, then `migrate:fresh` wiped the
+// production Paperclip schema as a superuser. Agent children must never
+// inherit server credentials. Runs receive provider keys and any DB access
+// only through explicit per-run env (secret bindings), which runChildProcess
+// merges AFTER sanitizeInheritedPaperclipEnv — so stripping here cannot starve
+// a bound run, it only removes the implicit inheritance path.
+const SERVER_SECRET_ENV_EXACT_KEYS = new Set([
+  // Database connection strings read by server/config and packages/db.
+  "DATABASE_URL",
+  "DATABASE_MIGRATION_URL",
+  // Session/auth signing secrets.
+  "BETTER_AUTH_SECRET",
+  // Provider API keys and auth tokens. Agents must receive these only via
+  // secret bindings (explicit per-run env), never via server inheritance.
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AZURE_OPENAI_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CODEX_API_KEY",
+  "COGNEE_API_KEY",
+  "CREATEOS_API_KEY",
+  "CURSOR_API_KEY",
+  "DAYTONA_API_KEY",
+  "E2B_API_KEY",
+  "GEMINI_API_KEY",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GOOGLE_API_KEY",
+  "GROK_API_KEY",
+  "GROQ_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_MODEL_API_KEY",
+  "NOVITA_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "UNBOUND_API_KEY",
+  "XAI_API_KEY",
+  "ZAI_API_KEY",
+]);
+
+// Server-secret families matched by prefix: container-composed Postgres vars
+// (POSTGRES_USER/PASSWORD/DB/HOST/...), the libpq PG* family
+// (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGSSLMODE/...), and DATABASE_* connection
+// settings. Fail closed for future vars in these families.
+const SERVER_SECRET_ENV_PREFIXES = ["DATABASE_", "POSTGRES_", "PG"];
+
+// Fail closed for future provider keys: any *_API_KEY inherited from the
+// server env is a provider credential by naming convention and must arrive via
+// secret bindings instead.
+const SERVER_SECRET_ENV_SUFFIXES = ["_API_KEY"];
+
+function isServerSecretEnvKey(key: string): boolean {
+  if (SERVER_SECRET_ENV_EXACT_KEYS.has(key)) return true;
+  for (const prefix of SERVER_SECRET_ENV_PREFIXES) {
+    if (key.startsWith(prefix)) return true;
+  }
+  for (const suffix of SERVER_SECRET_ENV_SUFFIXES) {
+    if (key.endsWith(suffix)) return true;
+  }
+  return false;
+}
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
+    if (isServerSecretEnvKey(key)) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
