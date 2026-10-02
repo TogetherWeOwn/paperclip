@@ -1,0 +1,387 @@
+/**
+ * Run-scoped model decision hook — pure decision logic (TOG-11792).
+ *
+ * Parent: TOG-11780. Contract: TOG-11780 document `design`, §4.1/§4.2.
+ * The host calls the `run.model.resolve` capability holder inside
+ * `executeRun` (after the override parse, before the adapter config merge)
+ * and feeds the validated answer through these helpers. All I/O (worker RPC,
+ * retry scheduling, run-row writes) stays at the heartbeat.ts call site; this
+ * module is pure so the §9.2 cases run as unit tests.
+ */
+
+/** Deadline for the host→worker `resolveRunModel` RPC call. */
+export const RUN_MODEL_DECISION_RPC_TIMEOUT_MS = 1500;
+
+/** `scheduleBoundedRetryForRun` reason used when no decision is available. */
+export const RUN_MODEL_DECISION_RETRY_REASON = "model_decision_pending";
+
+/** Capability key: exactly one holder per company may resolve run models. */
+export const RUN_MODEL_DECISION_CAPABILITY = "run.model.resolve";
+
+/** Default bounded-retry budget for a pending model decision. */
+export const RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS = 12;
+
+/** Default delay before the first `model_decision_pending` retry. */
+export const RUN_MODEL_DECISION_DEFAULT_DELAY_MS = 5_000;
+
+/** Max accepted length for a decided model id. */
+export const RUN_MODEL_DECISION_MAX_MODEL_LENGTH = 200;
+
+export interface RunModelDecisionPrevious {
+  runId: string;
+  model: string | null;
+  decisionId: string | null;
+}
+
+/** Input passed to the `onResolveRunModel` plugin hook (design §4.1). */
+export interface RunModelDecisionInput {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  issueId: string | null;
+  adapterType: string;
+  invocationSource: string;
+  wakeReason: string | null;
+  agentDefaultModel: string | null;
+  previous: RunModelDecisionPrevious | null;
+  issueOverrideModel: string | null;
+  deadlineMs: number;
+}
+
+export interface RunModelDecideAnswer {
+  kind: "decide";
+  decisionId: string;
+  model: string;
+  effort?: string;
+  env?: Record<string, string>;
+  tier?: string;
+  source: string;
+  fallback?: boolean;
+  reason?: string;
+}
+
+export interface RunModelKeepAnswer {
+  kind: "keep";
+}
+
+export interface RunModelDeferAnswer {
+  kind: "defer";
+  retryAfterMs: number;
+  reason: string;
+}
+
+export type RunModelDecisionAnswer =
+  | RunModelDecideAnswer
+  | RunModelKeepAnswer
+  | RunModelDeferAnswer;
+
+// ---------------------------------------------------------------------------
+// Skip rules (design §4.2 "Skips")
+// ---------------------------------------------------------------------------
+
+export type RunModelDecisionSkipReason =
+  | "non_issue_run"
+  | "human_assignee"
+  | "operator_override"
+  | "user_wake"
+  | "no_capability_holder";
+
+export interface RunModelDecisionSkipInput {
+  issueId: string | null;
+  /** True when the issue assignee is a human, not an agent. */
+  assigneeIsHuman: boolean;
+  /** Operator-set override model (human/operator pin), if any. */
+  issueOverrideModel: string | null;
+  /** True for user-requested wakes (may run on the default, recorded exempt). */
+  isUserRequestedWake: boolean;
+  /** True when a `run.model.resolve` capability holder is installed. */
+  hasCapabilityHolder: boolean;
+}
+
+export type RunModelDecisionSkip =
+  | { skip: true; reason: RunModelDecisionSkipReason }
+  | { skip: false; reason: null };
+
+export function evaluateRunModelDecisionSkip(
+  input: RunModelDecisionSkipInput,
+): RunModelDecisionSkip {
+  if (!input.issueId) return { skip: true, reason: "non_issue_run" };
+  if (input.assigneeIsHuman) return { skip: true, reason: "human_assignee" };
+  if (input.issueOverrideModel) return { skip: true, reason: "operator_override" };
+  if (input.isUserRequestedWake) return { skip: true, reason: "user_wake" };
+  if (!input.hasCapabilityHolder) return { skip: true, reason: "no_capability_holder" };
+  return { skip: false, reason: null };
+}
+
+// ---------------------------------------------------------------------------
+// Answer validation (design §4.2 "Validation")
+// ---------------------------------------------------------------------------
+
+export type RunModelDecisionValidationError =
+  | "not_an_object"
+  | "unknown_kind"
+  | "missing_decision_id"
+  | "invalid_model"
+  | "invalid_env"
+  | "env_key_not_allowlisted"
+  | "env_value_not_plain_string"
+  | "env_key_is_secret_ref";
+
+export type RunModelDecisionValidation =
+  | { valid: true; answer: RunModelDecisionAnswer; error: null }
+  | { valid: false; answer: null; error: RunModelDecisionValidationError };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * True when a base-config env value is a secret binding. Decision env may only
+ * carry plain plugin-owned keys, so a decision key landing on one of these is
+ * rejected (the TOG-11791 secret-copy class of bug, applied to decisions).
+ */
+export function isSecretEnvBinding(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return value.type === "secret_ref" || value.type === "user_secret_ref";
+}
+
+export interface ValidateRunModelDecisionOptions {
+  /** Manifest `modelRouting.envKeys` allowlist of the capability holder. */
+  allowlistedEnvKeys: readonly string[];
+  /** Base adapter-config `env` (pre-merge), used for the secret_ref check. */
+  baseEnv: Record<string, unknown> | null | undefined;
+}
+
+export function validateRunModelDecisionAnswer(
+  raw: unknown,
+  options: ValidateRunModelDecisionOptions,
+): RunModelDecisionValidation {
+  if (!isRecord(raw)) return { valid: false, answer: null, error: "not_an_object" };
+  const kind = raw.kind;
+  if (kind === "keep") {
+    return { valid: true, answer: { kind: "keep" }, error: null };
+  }
+  if (kind === "defer") {
+    const retryAfterMs =
+      typeof raw.retryAfterMs === "number" && Number.isFinite(raw.retryAfterMs) && raw.retryAfterMs >= 0
+        ? Math.floor(raw.retryAfterMs)
+        : RUN_MODEL_DECISION_DEFAULT_DELAY_MS;
+    const reason = readNonEmptyString(raw.reason) ?? "deferred by router";
+    return { valid: true, answer: { kind: "defer", retryAfterMs, reason }, error: null };
+  }
+  if (kind !== "decide") {
+    return { valid: false, answer: null, error: "unknown_kind" };
+  }
+  const decisionId = readNonEmptyString(raw.decisionId);
+  if (!decisionId) {
+    return { valid: false, answer: null, error: "missing_decision_id" };
+  }
+  const model = readNonEmptyString(raw.model);
+  if (!model || model.length > RUN_MODEL_DECISION_MAX_MODEL_LENGTH) {
+    return { valid: false, answer: null, error: "invalid_model" };
+  }
+  const source = readNonEmptyString(raw.source) ?? "unknown";
+  let env: Record<string, string> | undefined;
+  if (raw.env !== undefined) {
+    if (!isRecord(raw.env)) {
+      return { valid: false, answer: null, error: "invalid_env" };
+    }
+    const allowlist = new Set(options.allowlistedEnvKeys);
+    const next: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw.env)) {
+      if (!allowlist.has(key)) {
+        return { valid: false, answer: null, error: "env_key_not_allowlisted" };
+      }
+      if (typeof value !== "string") {
+        return { valid: false, answer: null, error: "env_value_not_plain_string" };
+      }
+      if (isSecretEnvBinding(options.baseEnv?.[key])) {
+        return { valid: false, answer: null, error: "env_key_is_secret_ref" };
+      }
+      next[key] = value;
+    }
+    env = next;
+  }
+  const effort = readNonEmptyString(raw.effort) ?? undefined;
+  const tier = readNonEmptyString(raw.tier) ?? undefined;
+  const reason = readNonEmptyString(raw.reason) ?? undefined;
+  const fallback = raw.fallback === true ? true : undefined;
+  return {
+    valid: true,
+    answer: {
+      kind: "decide",
+      decisionId,
+      model,
+      ...(effort !== undefined ? { effort } : {}),
+      ...(env !== undefined ? { env } : {}),
+      ...(tier !== undefined ? { tier } : {}),
+      source,
+      ...(fallback !== undefined ? { fallback } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    },
+    error: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Merge application
+// ---------------------------------------------------------------------------
+
+/**
+ * Applies a validated `decide` answer to a base adapter config. Env merges
+ * per key (TOG-11791 semantics); `keep` returns the base untouched.
+ */
+export function applyRunModelDecisionToAdapterConfig(
+  base: Record<string, unknown>,
+  answer: RunModelDecideAnswer | RunModelKeepAnswer,
+): Record<string, unknown> {
+  if (answer.kind === "keep") return base;
+  const baseEnv = isRecord(base.env) ? base.env : {};
+  return {
+    ...base,
+    model: answer.model,
+    ...(answer.effort !== undefined ? { effort: answer.effort } : {}),
+    env: { ...baseEnv, ...(answer.env ?? {}) },
+  };
+}
+
+/**
+ * True when the decided model differs from the model's previous session, i.e.
+ * the run must start a fresh session (the existing "configured model changed"
+ * reset sees the decided model, design §4.2 "Order").
+ */
+export function runModelDecisionChangesModel(
+  decidedModel: string | null,
+  previousSessionModel: string | null,
+): boolean {
+  if (!decidedModel) return false;
+  return decidedModel !== previousSessionModel;
+}
+
+// ---------------------------------------------------------------------------
+// Outcome recording (design §4.2 "Record")
+// ---------------------------------------------------------------------------
+
+export type RunModelDecisionOutcome =
+  | "decided"
+  | "kept"
+  | "deferred"
+  | "timeout"
+  | "exempt"
+  | "advisory"
+  | "skipped";
+
+export interface RunModelDecisionRecord {
+  decisionId: string | null;
+  pluginKey: string | null;
+  model: string | null;
+  effort?: string;
+  tier?: string;
+  source: string | null;
+  fallback?: boolean;
+  latencyMs: number;
+  outcome: RunModelDecisionOutcome;
+  /** Skip reason when outcome is `skipped`, defer reason when `deferred`. */
+  reason?: string;
+}
+
+export function buildModelDecisionRecord(input: {
+  answer: RunModelDecisionAnswer | null;
+  pluginKey: string | null;
+  latencyMs: number;
+  outcome: RunModelDecisionOutcome;
+  reason?: string;
+}): RunModelDecisionRecord {
+  const answer = input.answer;
+  return {
+    decisionId:
+      answer?.kind === "decide" ? answer.decisionId : null,
+    pluginKey: input.pluginKey,
+    model: answer?.kind === "decide" ? answer.model : null,
+    ...(answer?.kind === "decide" && answer.effort !== undefined
+      ? { effort: answer.effort }
+      : {}),
+    ...(answer?.kind === "decide" && answer.tier !== undefined
+      ? { tier: answer.tier }
+      : {}),
+    source: answer?.kind === "decide" ? answer.source : null,
+    ...(answer?.kind === "decide" && answer.fallback === true
+      ? { fallback: true as const }
+      : {}),
+    latencyMs: Math.max(0, Math.floor(input.latencyMs)),
+    outcome: input.outcome,
+    ...(input.reason !== undefined ? { reason: input.reason } : {}),
+  };
+}
+
+/** A timed-out RPC surfaces as `defer` so the run parks, never defaults. */
+export function deferRunModelDecisionOnTimeout(
+  reason = "resolveRunModel timed out",
+): RunModelDeferAnswer {
+  return {
+    kind: "defer",
+    retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
+    reason,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// No-decision path (design §4.2 "Failure")
+// ---------------------------------------------------------------------------
+
+export type RunModelDecisionNoDecision =
+  | { action: "retry"; retryAfterMs: number; reason: string }
+  | { action: "surface"; reason: string };
+
+/**
+ * After a timeout/defer/invalid answer the run parks via
+ * `scheduleBoundedRetryForRun` (`model_decision_pending`). Once attempts are
+ * exhausted the issue is surfaced — the run never falls back to the default.
+ */
+export function resolveRunModelDecisionNoDecision(input: {
+  consumedAttempts: number;
+  maxAttempts?: number;
+  retryAfterMs?: number;
+  reason: string;
+}): RunModelDecisionNoDecision {
+  const maxAttempts = Math.max(
+    0,
+    Math.floor(input.maxAttempts ?? RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS),
+  );
+  if (input.consumedAttempts >= maxAttempts) {
+    return { action: "surface", reason: input.reason };
+  }
+  return {
+    action: "retry",
+    retryAfterMs: Math.max(
+      0,
+      Math.floor(input.retryAfterMs ?? RUN_MODEL_DECISION_DEFAULT_DELAY_MS),
+    ),
+    reason: input.reason,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Flag-off advisory mode (design §4.2 "Flag")
+// ---------------------------------------------------------------------------
+
+/**
+ * When `experimental.requireRunModelDecision` is off the hook is advisory:
+ * the run proceeds on the default and records `outcome: "advisory"`.
+ */
+export function buildAdvisoryModelDecisionRecord(input: {
+  pluginKey: string | null;
+  latencyMs: number;
+}): RunModelDecisionRecord {
+  return buildModelDecisionRecord({
+    answer: null,
+    pluginKey: input.pluginKey,
+    latencyMs: input.latencyMs,
+    outcome: "advisory",
+    reason: "requireRunModelDecision disabled",
+  });
+}
