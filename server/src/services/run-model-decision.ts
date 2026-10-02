@@ -9,6 +9,11 @@
  * module is pure so the §9.2 cases run as unit tests.
  */
 
+import type {
+  ResolveRunModelParams,
+  ResolveRunModelResult,
+} from "@paperclipai/plugin-sdk";
+
 /** Deadline for the host→worker `resolveRunModel` RPC call. */
 export const RUN_MODEL_DECISION_RPC_TIMEOUT_MS = 1500;
 
@@ -27,53 +32,13 @@ export const RUN_MODEL_DECISION_DEFAULT_DELAY_MS = 5_000;
 /** Max accepted length for a decided model id. */
 export const RUN_MODEL_DECISION_MAX_MODEL_LENGTH = 200;
 
-export interface RunModelDecisionPrevious {
-  runId: string;
-  model: string | null;
-  decisionId: string | null;
-}
-
 /** Input passed to the `onResolveRunModel` plugin hook (design §4.1). */
-export interface RunModelDecisionInput {
-  runId: string;
-  companyId: string;
-  agentId: string;
-  issueId: string | null;
-  adapterType: string;
-  invocationSource: string;
-  wakeReason: string | null;
-  agentDefaultModel: string | null;
-  previous: RunModelDecisionPrevious | null;
-  issueOverrideModel: string | null;
-  deadlineMs: number;
-}
-
-export interface RunModelDecideAnswer {
-  kind: "decide";
-  decisionId: string;
-  model: string;
-  effort?: string;
-  env?: Record<string, string>;
-  tier?: string;
-  source: string;
-  fallback?: boolean;
-  reason?: string;
-}
-
-export interface RunModelKeepAnswer {
-  kind: "keep";
-}
-
-export interface RunModelDeferAnswer {
-  kind: "defer";
-  retryAfterMs: number;
-  reason: string;
-}
-
-export type RunModelDecisionAnswer =
-  | RunModelDecideAnswer
-  | RunModelKeepAnswer
-  | RunModelDeferAnswer;
+export type RunModelDecisionInput = ResolveRunModelParams;
+export type RunModelDecisionPrevious = NonNullable<ResolveRunModelParams["previous"]>;
+export type RunModelDecisionAnswer = ResolveRunModelResult;
+export type RunModelDecideAnswer = Extract<ResolveRunModelResult, { kind: "decide" }>;
+export type RunModelKeepAnswer = Extract<ResolveRunModelResult, { kind: "keep" }>;
+export type RunModelDeferAnswer = Extract<ResolveRunModelResult, { kind: "defer" }>;
 
 // ---------------------------------------------------------------------------
 // Skip rules (design §4.2 "Skips")
@@ -83,17 +48,18 @@ export type RunModelDecisionSkipReason =
   | "non_issue_run"
   | "human_assignee"
   | "operator_override"
-  | "user_wake"
   | "no_capability_holder";
 
 export interface RunModelDecisionSkipInput {
   issueId: string | null;
   /** True when the issue assignee is a human, not an agent. */
   assigneeIsHuman: boolean;
-  /** Operator-set override model (human/operator pin), if any. */
+  /**
+   * Issue-level override model, if any. The host cannot tell an operator pin
+   * from a legacy plugin pin, so any override wins and the hook is skipped;
+   * the plugin retires its own pins once the flag is on (design §4.3).
+   */
   issueOverrideModel: string | null;
-  /** True for user-requested wakes (may run on the default, recorded exempt). */
-  isUserRequestedWake: boolean;
   /** True when a `run.model.resolve` capability holder is installed. */
   hasCapabilityHolder: boolean;
 }
@@ -108,7 +74,6 @@ export function evaluateRunModelDecisionSkip(
   if (!input.issueId) return { skip: true, reason: "non_issue_run" };
   if (input.assigneeIsHuman) return { skip: true, reason: "human_assignee" };
   if (input.issueOverrideModel) return { skip: true, reason: "operator_override" };
-  if (input.isUserRequestedWake) return { skip: true, reason: "user_wake" };
   if (!input.hasCapabilityHolder) return { skip: true, reason: "no_capability_holder" };
   return { skip: false, reason: null };
 }
@@ -272,8 +237,21 @@ export type RunModelDecisionOutcome =
   | "deferred"
   | "timeout"
   | "exempt"
-  | "advisory"
   | "skipped";
+
+/**
+ * What the holder answered while the flag was off. The run used the default,
+ * so the top-level record says `timeout`; this keeps the advice measurable.
+ */
+export interface RunModelDecisionAdvice {
+  outcome: "decided" | "kept" | "deferred" | "timeout";
+  decisionId: string | null;
+  model: string | null;
+  tier?: string;
+  source: string | null;
+  fallback?: boolean;
+  reason?: string;
+}
 
 export interface RunModelDecisionRecord {
   decisionId: string | null;
@@ -285,8 +263,10 @@ export interface RunModelDecisionRecord {
   fallback?: boolean;
   latencyMs: number;
   outcome: RunModelDecisionOutcome;
-  /** Skip reason when outcome is `skipped`, defer reason when `deferred`. */
+  /** Skip reason when `skipped`; why no decision when `deferred`/`timeout`/`exempt`. */
   reason?: string;
+  /** Present only when `requireRunModelDecision` is off (advisory mode). */
+  advisory?: RunModelDecisionAdvice;
 }
 
 export function buildModelDecisionRecord(input: {
@@ -315,17 +295,6 @@ export function buildModelDecisionRecord(input: {
     latencyMs: Math.max(0, Math.floor(input.latencyMs)),
     outcome: input.outcome,
     ...(input.reason !== undefined ? { reason: input.reason } : {}),
-  };
-}
-
-/** A timed-out RPC surfaces as `defer` so the run parks, never defaults. */
-export function deferRunModelDecisionOnTimeout(
-  reason = "resolveRunModel timed out",
-): RunModelDeferAnswer {
-  return {
-    kind: "defer",
-    retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
-    reason,
   };
 }
 
@@ -365,23 +334,322 @@ export function resolveRunModelDecisionNoDecision(input: {
   };
 }
 
+
 // ---------------------------------------------------------------------------
 // Flag-off advisory mode (design §4.2 "Flag")
 // ---------------------------------------------------------------------------
 
 /**
  * When `experimental.requireRunModelDecision` is off the hook is advisory:
- * the run proceeds on the default and records `outcome: "advisory"`.
+ * the run proceeds on the default and records `outcome: "timeout"`. What the
+ * holder said, if anything, goes under `advisory` for before/after measurement.
  */
 export function buildAdvisoryModelDecisionRecord(input: {
   pluginKey: string | null;
   latencyMs: number;
+  advice: RunModelDecisionAdvice;
 }): RunModelDecisionRecord {
-  return buildModelDecisionRecord({
-    answer: null,
-    pluginKey: input.pluginKey,
-    latencyMs: input.latencyMs,
-    outcome: "advisory",
-    reason: "requireRunModelDecision disabled",
+  return {
+    ...buildModelDecisionRecord({
+      answer: null,
+      pluginKey: input.pluginKey,
+      latencyMs: input.latencyMs,
+      outcome: "timeout",
+      reason: "requireRunModelDecision disabled",
+    }),
+    advisory: input.advice,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Capability holder (design §4.1: one holder per company)
+// ---------------------------------------------------------------------------
+
+export interface RunModelDecisionHolderCandidate {
+  id: string;
+  pluginKey: string;
+  manifestJson: {
+    capabilities?: readonly string[];
+    modelRouting?: { envKeys?: readonly string[] };
+  } | null;
+}
+
+export interface RunModelDecisionHolder {
+  pluginId: string;
+  pluginKey: string;
+  /** Manifest `modelRouting.envKeys`: the only env keys a decision may set. */
+  envKeys: string[];
+}
+
+export type RunModelDecisionHolderSelection =
+  | { kind: "none" }
+  | { kind: "single"; holder: RunModelDecisionHolder }
+  | { kind: "conflict"; pluginKeys: string[] };
+
+/**
+ * Picks the `run.model.resolve` holder among ready plugins. More than one
+ * holder is a conflict: the host asks nobody, and with the flag on the run
+ * defers rather than guessing which router is authoritative.
+ */
+export function selectRunModelDecisionHolder(
+  candidates: readonly RunModelDecisionHolderCandidate[],
+): RunModelDecisionHolderSelection {
+  const holders = candidates.filter((candidate) =>
+    candidate.manifestJson?.capabilities?.includes(RUN_MODEL_DECISION_CAPABILITY),
+  );
+  if (holders.length === 0) return { kind: "none" };
+  if (holders.length > 1) {
+    return {
+      kind: "conflict",
+      pluginKeys: holders.map((holder) => holder.pluginKey).sort(),
+    };
+  }
+  const holder = holders[0]!;
+  return {
+    kind: "single",
+    holder: {
+      pluginId: holder.id,
+      pluginKey: holder.pluginKey,
+      envKeys: [...(holder.manifestJson?.modelRouting?.envKeys ?? [])],
+    },
+  };
+}
+
+/** Reads `previous` from the last run on the same issue and agent. */
+export function readPreviousRunModelDecision(
+  row: { id: string; contextSnapshot: unknown } | null | undefined,
+): RunModelDecisionPrevious | null {
+  if (!row) return null;
+  const snapshot = isRecord(row.contextSnapshot) ? row.contextSnapshot : {};
+  const record = isRecord(snapshot.modelDecision) ? snapshot.modelDecision : {};
+  return {
+    runId: row.id,
+    model: readNonEmptyString(record.model),
+    decisionId: readNonEmptyString(record.decisionId),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration (design §4.2): one call per run, I/O injected
+// ---------------------------------------------------------------------------
+
+/** Thrown inside `executeRun` so the run parks as `model_decision_pending`. */
+export class RunModelDecisionDeferral extends Error {
+  readonly code = RUN_MODEL_DECISION_RETRY_REASON;
+  readonly retryAfterMs: number;
+  readonly reason: string;
+  readonly record: RunModelDecisionRecord;
+
+  constructor(input: {
+    retryAfterMs: number;
+    reason: string;
+    record: RunModelDecisionRecord;
+  }) {
+    super(`Model router has not decided this run's model: ${input.reason}`);
+    this.name = "RunModelDecisionDeferral";
+    this.retryAfterMs = input.retryAfterMs;
+    this.reason = input.reason;
+    this.record = input.record;
+  }
+}
+
+export function isRunModelDecisionDeferral(
+  error: unknown,
+): error is RunModelDecisionDeferral {
+  return error instanceof RunModelDecisionDeferral;
+}
+
+export type RunModelDecisionResolution =
+  | {
+      action: "proceed";
+      /** `null` runs on the agent default / existing override. */
+      answer: RunModelDecideAnswer | RunModelKeepAnswer | null;
+      record: RunModelDecisionRecord;
+    }
+  | {
+      action: "park";
+      retryAfterMs: number;
+      reason: string;
+      record: RunModelDecisionRecord;
+    };
+
+export interface ResolveRunModelDecisionInput {
+  /** `experimental.requireRunModelDecision`. */
+  requireDecision: boolean;
+  skip: Omit<RunModelDecisionSkipInput, "hasCapabilityHolder">;
+  /** User-requested wakes may run on the default when no decision comes. */
+  isUserRequestedWake: boolean;
+  holder: RunModelDecisionHolderSelection;
+  params: Omit<RunModelDecisionInput, "deadlineMs">;
+  /** Base adapter-config `env`, for the secret_ref check. */
+  baseEnv: Record<string, unknown> | null | undefined;
+  /** Host→worker RPC; must reject once `timeoutMs` passes. */
+  call: (
+    pluginId: string,
+    params: RunModelDecisionInput,
+    timeoutMs: number,
+  ) => Promise<unknown>;
+  now?: () => number;
+  timeoutMs?: number;
+}
+
+const MAX_RECORDED_REASON_LENGTH = 200;
+
+function describeCallFailure(error: unknown): string {
+  const message =
+    error instanceof Error && error.message.trim().length > 0
+      ? error.message.trim()
+      : "resolveRunModel call failed";
+  return message.slice(0, MAX_RECORDED_REASON_LENGTH);
+}
+
+export async function resolveRunModelDecision(
+  input: ResolveRunModelDecisionInput,
+): Promise<RunModelDecisionResolution> {
+  const skip = evaluateRunModelDecisionSkip({
+    ...input.skip,
+    hasCapabilityHolder: input.holder.kind !== "none",
   });
+  if (skip.skip) {
+    return {
+      action: "proceed",
+      answer: null,
+      record: buildModelDecisionRecord({
+        answer: null,
+        pluginKey: null,
+        latencyMs: 0,
+        outcome: "skipped",
+        reason: skip.reason,
+      }),
+    };
+  }
+
+  const now = input.now ?? Date.now;
+  const timeoutMs = input.timeoutMs ?? RUN_MODEL_DECISION_RPC_TIMEOUT_MS;
+  const pluginKey =
+    input.holder.kind === "single" ? input.holder.holder.pluginKey : null;
+  const startedAt = now();
+
+  let answer: RunModelDecisionAnswer | null = null;
+  let failure: { outcome: "deferred" | "timeout"; reason: string } | null = null;
+  if (input.holder.kind === "conflict") {
+    failure = {
+      outcome: "deferred",
+      reason: `multiple ${RUN_MODEL_DECISION_CAPABILITY} holders: ${input.holder.pluginKeys.join(", ")}`,
+    };
+  } else if (input.holder.kind === "single") {
+    let raw: unknown;
+    try {
+      raw = await input.call(
+        input.holder.holder.pluginId,
+        { ...input.params, deadlineMs: timeoutMs },
+        timeoutMs,
+      );
+    } catch (error) {
+      failure = { outcome: "timeout", reason: describeCallFailure(error) };
+    }
+    if (!failure) {
+      const validation = validateRunModelDecisionAnswer(raw, {
+        allowlistedEnvKeys: input.holder.holder.envKeys,
+        baseEnv: input.baseEnv,
+      });
+      if (!validation.valid) {
+        failure = { outcome: "deferred", reason: `invalid answer: ${validation.error}` };
+      } else {
+        answer = validation.answer;
+      }
+    }
+  }
+  const latencyMs = now() - startedAt;
+
+  if (!input.requireDecision) {
+    return {
+      action: "proceed",
+      answer: null,
+      record: buildAdvisoryModelDecisionRecord({
+        pluginKey,
+        latencyMs,
+        advice: failure
+          ? {
+              outcome: failure.outcome,
+              decisionId: null,
+              model: null,
+              source: null,
+              reason: failure.reason,
+            }
+          : toAdvice(answer!),
+      }),
+    };
+  }
+
+  if (answer && answer.kind !== "defer") {
+    return {
+      action: "proceed",
+      answer,
+      record: buildModelDecisionRecord({
+        answer,
+        pluginKey,
+        latencyMs,
+        outcome: answer.kind === "decide" ? "decided" : "kept",
+        ...(answer.kind === "decide" && answer.reason !== undefined
+          ? { reason: answer.reason }
+          : {}),
+      }),
+    };
+  }
+
+  const reason = failure?.reason ?? (answer?.kind === "defer" ? answer.reason : "no decision");
+  const outcome = failure?.outcome ?? "deferred";
+  if (input.isUserRequestedWake) {
+    return {
+      action: "proceed",
+      answer: null,
+      record: buildModelDecisionRecord({
+        answer: null,
+        pluginKey,
+        latencyMs,
+        outcome: "exempt",
+        reason,
+      }),
+    };
+  }
+  return {
+    action: "park",
+    retryAfterMs:
+      answer?.kind === "defer"
+        ? answer.retryAfterMs
+        : RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
+    reason,
+    record: buildModelDecisionRecord({
+      answer: null,
+      pluginKey,
+      latencyMs,
+      outcome,
+      reason,
+    }),
+  };
+}
+
+function toAdvice(answer: RunModelDecisionAnswer): RunModelDecisionAdvice {
+  if (answer.kind === "keep") {
+    return { outcome: "kept", decisionId: null, model: null, source: null };
+  }
+  if (answer.kind === "defer") {
+    return {
+      outcome: "deferred",
+      decisionId: null,
+      model: null,
+      source: null,
+      reason: answer.reason,
+    };
+  }
+  return {
+    outcome: "decided",
+    decisionId: answer.decisionId,
+    model: answer.model,
+    ...(answer.tier !== undefined ? { tier: answer.tier } : {}),
+    source: answer.source,
+    ...(answer.fallback === true ? { fallback: true } : {}),
+    ...(answer.reason !== undefined ? { reason: answer.reason } : {}),
+  };
 }

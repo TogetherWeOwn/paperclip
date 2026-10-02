@@ -1,322 +1,438 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   RUN_MODEL_DECISION_CAPABILITY,
   RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
   RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
   RUN_MODEL_DECISION_RETRY_REASON,
   RUN_MODEL_DECISION_RPC_TIMEOUT_MS,
+  RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
-  buildAdvisoryModelDecisionRecord,
-  buildModelDecisionRecord,
-  deferRunModelDecisionOnTimeout,
   evaluateRunModelDecisionSkip,
+  isRunModelDecisionDeferral,
   isSecretEnvBinding,
+  readPreviousRunModelDecision,
+  resolveRunModelDecision,
   resolveRunModelDecisionNoDecision,
   runModelDecisionChangesModel,
+  selectRunModelDecisionHolder,
   validateRunModelDecisionAnswer,
+  type ResolveRunModelDecisionInput,
+  type RunModelDecisionHolderSelection,
 } from "../services/run-model-decision.ts";
+import { shouldResetTaskSessionForModelChange } from "../services/heartbeat.ts";
 
-const ALLOWLIST = ["PAPERCLIP_ASSIGNED_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"] as const;
+const ALLOWLIST = ["PAPERCLIP_ASSIGNED_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"];
+
+const HOLDER: RunModelDecisionHolderSelection = {
+  kind: "single",
+  holder: { pluginId: "plugin-1", pluginKey: "model-router", envKeys: ALLOWLIST },
+};
+
+function decide(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: "decide",
+    decisionId: "dec-1",
+    model: "claude-opus-5-5",
+    source: "router",
+    ...overrides,
+  };
+}
+
+/** A clock that advances 7 ms per read, so latency is deterministic. */
+function steppingClock() {
+  let t = 1_000;
+  return () => {
+    t += 7;
+    return t;
+  };
+}
+
+function input(
+  overrides: Partial<ResolveRunModelDecisionInput> = {},
+): ResolveRunModelDecisionInput {
+  return {
+    requireDecision: true,
+    skip: { issueId: "issue-1", assigneeIsHuman: false, issueOverrideModel: null },
+    isUserRequestedWake: false,
+    holder: HOLDER,
+    params: {
+      runId: "run-1",
+      companyId: "co-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      adapterType: "claude_local",
+      invocationSource: "assignment",
+      wakeReason: "issue_assigned",
+      agentDefaultModel: "agent-default-model",
+      previous: null,
+      issueOverrideModel: null,
+    },
+    baseEnv: {},
+    call: async () => decide(),
+    now: steppingClock(),
+    ...overrides,
+  };
+}
 
 describe("run model decision hook (TOG-11792, design §9.2)", () => {
   // 1. decision applied
-  it("applies a decide answer: model, effort and allowlisted env merge per key", () => {
-    const validated = validateRunModelDecisionAnswer(
-      {
-        kind: "decide",
-        decisionId: "dec-1",
-        model: "claude-opus-5-5",
+  it("applies a decide answer to the run config and records it", async () => {
+    const call = vi.fn(async () =>
+      decide({
         effort: "xhigh",
+        tier: "frontier",
         env: { PAPERCLIP_ASSIGNED_MODEL: "claude-opus-5-5" },
-        source: "router",
-      },
-      { allowlistedEnvKeys: ALLOWLIST, baseEnv: {} },
+      }),
     );
-    expect(validated.valid).toBe(true);
-    if (!validated.valid) throw new Error("expected valid");
+    const resolution = await resolveRunModelDecision(input({ call }));
+
+    expect(call).toHaveBeenCalledWith(
+      "plugin-1",
+      expect.objectContaining({ runId: "run-1", deadlineMs: RUN_MODEL_DECISION_RPC_TIMEOUT_MS }),
+      RUN_MODEL_DECISION_RPC_TIMEOUT_MS,
+    );
+    expect(resolution.action).toBe("proceed");
+    if (resolution.action !== "proceed" || !resolution.answer) throw new Error("expected answer");
+    expect(resolution.record).toEqual({
+      decisionId: "dec-1",
+      pluginKey: "model-router",
+      model: "claude-opus-5-5",
+      effort: "xhigh",
+      tier: "frontier",
+      source: "router",
+      latencyMs: 7,
+      outcome: "decided",
+    });
+
     const merged = applyRunModelDecisionToAdapterConfig(
-      { model: "base-model", env: { KEEP: "1" } },
-      validated.answer,
+      { model: "agent-default-model", env: { KEEP: "1", PAPERCLIP_ASSIGNED_MODEL: "old" } },
+      resolution.answer,
     );
-    expect(merged.model).toBe("claude-opus-5-5");
-    expect(merged.effort).toBe("xhigh");
-    expect(merged.env).toEqual({
-      KEEP: "1",
-      PAPERCLIP_ASSIGNED_MODEL: "claude-opus-5-5",
+    expect(merged).toEqual({
+      model: "claude-opus-5-5",
+      effort: "xhigh",
+      env: { KEEP: "1", PAPERCLIP_ASSIGNED_MODEL: "claude-opus-5-5" },
     });
   });
 
   // 2. env allowlist enforced
-  it("rejects a decision env key outside the manifest allowlist", () => {
-    const validated = validateRunModelDecisionAnswer(
-      {
-        kind: "decide",
-        decisionId: "dec-2",
-        model: "m",
-        env: { NOT_ALLOWLISTED: "x" },
-        source: "router",
-      },
-      { allowlistedEnvKeys: ALLOWLIST, baseEnv: {} },
+  it("parks the run when decision env names a key outside the manifest allowlist", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({ call: async () => decide({ env: { OPENAI_API_KEY: "x" } }) }),
     );
-    expect(validated.valid).toBe(false);
-    if (validated.valid) throw new Error("expected invalid");
-    expect(validated.error).toBe("env_key_not_allowlisted");
+    expect(resolution).toMatchObject({
+      action: "park",
+      reason: "invalid answer: env_key_not_allowlisted",
+      record: { outcome: "deferred", model: null, decisionId: null },
+    });
   });
 
-  it("rejects a non-string decision env value", () => {
+  it("rejects non-string decision env values", () => {
     const validated = validateRunModelDecisionAnswer(
-      {
-        kind: "decide",
-        decisionId: "dec-2b",
-        model: "m",
-        env: { PAPERCLIP_ASSIGNED_MODEL: 42 },
-        source: "router",
-      },
+      decide({ env: { PAPERCLIP_ASSIGNED_MODEL: { type: "plain", value: "m" } } }),
       { allowlistedEnvKeys: ALLOWLIST, baseEnv: {} },
     );
-    expect(validated.valid).toBe(false);
-    if (validated.valid) throw new Error("expected invalid");
-    expect(validated.error).toBe("env_value_not_plain_string");
+    expect(validated).toMatchObject({ valid: false, error: "env_value_not_plain_string" });
   });
 
   // 3. secret_ref key rejected
-  it("rejects a decision env key that is a secret_ref in the base config", () => {
-    const validated = validateRunModelDecisionAnswer(
-      {
-        kind: "decide",
-        decisionId: "dec-3",
-        model: "m",
-        env: { PAPERCLIP_ASSIGNED_MODEL: "plain" },
-        source: "router",
-      },
-      {
-        allowlistedEnvKeys: ALLOWLIST,
-        baseEnv: {
-          PAPERCLIP_ASSIGNED_MODEL: { type: "secret_ref", secretId: "sec-1" },
-        },
-      },
-    );
-    expect(validated.valid).toBe(false);
-    if (validated.valid) throw new Error("expected invalid");
-    expect(validated.error).toBe("env_key_is_secret_ref");
-  });
-
-  it("rejects a decision env key that is a user_secret_ref in the base config", () => {
-    const validated = validateRunModelDecisionAnswer(
-      {
-        kind: "decide",
-        decisionId: "dec-3b",
-        model: "m",
-        env: { PAPERCLIP_ASSIGNED_MODEL: "plain" },
-        source: "router",
-      },
-      {
-        allowlistedEnvKeys: ALLOWLIST,
-        baseEnv: {
-          PAPERCLIP_ASSIGNED_MODEL: { type: "user_secret_ref", key: "k" },
-        },
-      },
-    );
-    expect(validated.valid).toBe(false);
-    if (validated.valid) throw new Error("expected invalid");
-    expect(validated.error).toBe("env_key_is_secret_ref");
-  });
-
-  it("detects secret bindings and ignores plain values", () => {
-    expect(isSecretEnvBinding({ type: "secret_ref", secretId: "s" })).toBe(true);
-    expect(isSecretEnvBinding({ type: "user_secret_ref", key: "k" })).toBe(true);
+  it("parks the run when an allowlisted env key is a secret binding in the base config", async () => {
+    for (const binding of [
+      { type: "secret_ref", secretId: "sec-1" },
+      { type: "user_secret_ref", key: "anthropic" },
+    ]) {
+      const resolution = await resolveRunModelDecision(
+        input({
+          baseEnv: { PAPERCLIP_ASSIGNED_MODEL: binding },
+          call: async () => decide({ env: { PAPERCLIP_ASSIGNED_MODEL: "plain" } }),
+        }),
+      );
+      expect(resolution).toMatchObject({
+        action: "park",
+        reason: "invalid answer: env_key_is_secret_ref",
+      });
+    }
     expect(isSecretEnvBinding({ type: "plain", value: "x" })).toBe(false);
     expect(isSecretEnvBinding("plain-string")).toBe(false);
-    expect(isSecretEnvBinding(null)).toBe(false);
   });
 
-  // 4. timeout → defer (parks via model_decision_pending, never defaults)
-  it("maps an RPC timeout to a defer that parks the run", () => {
-    const deferred = deferRunModelDecisionOnTimeout();
-    expect(deferred.kind).toBe("defer");
-    expect(deferred.retryAfterMs).toBe(RUN_MODEL_DECISION_DEFAULT_DELAY_MS);
-    const next = resolveRunModelDecisionNoDecision({
-      consumedAttempts: 0,
-      reason: deferred.reason,
-    });
-    expect(next).toEqual({
-      action: "retry",
+  // 4. timeout → defer
+  it("parks the run when the RPC times out instead of running on the default", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({
+        call: async () => {
+          throw new Error("Worker call resolveRunModel timed out after 1500ms");
+        },
+      }),
+    );
+    expect(resolution).toEqual({
+      action: "park",
       retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
-      reason: deferred.reason,
+      reason: "Worker call resolveRunModel timed out after 1500ms",
+      record: expect.objectContaining({
+        outcome: "timeout",
+        model: null,
+        pluginKey: "model-router",
+      }),
     });
-    expect(RUN_MODEL_DECISION_RETRY_REASON).toBe("model_decision_pending");
-    expect(RUN_MODEL_DECISION_RPC_TIMEOUT_MS).toBe(1500);
+    expect(
+      resolveRunModelDecisionNoDecision({ consumedAttempts: 0, reason: "timed out" }),
+    ).toEqual({ action: "retry", retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS, reason: "timed out" });
+  });
+
+  it("honours the router's retryAfterMs on an explicit defer", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({ call: async () => ({ kind: "defer", retryAfterMs: 30_000, reason: "pacer closed" }) }),
+    );
+    expect(resolution).toMatchObject({
+      action: "park",
+      retryAfterMs: 30_000,
+      reason: "pacer closed",
+      record: { outcome: "deferred", reason: "pacer closed" },
+    });
+  });
+
+  it("parks the run when more than one plugin holds run.model.resolve", async () => {
+    const call = vi.fn();
+    const resolution = await resolveRunModelDecision(
+      input({ holder: { kind: "conflict", pluginKeys: ["a", "b"] }, call }),
+    );
+    expect(call).not.toHaveBeenCalled();
+    expect(resolution).toMatchObject({
+      action: "park",
+      reason: "multiple run.model.resolve holders: a, b",
+      record: { outcome: "deferred", pluginKey: null },
+    });
   });
 
   // 5. max attempts → surfaced, never default
-  it("surfaces the issue after max attempts instead of running on the default", () => {
-    const next = resolveRunModelDecisionNoDecision({
-      consumedAttempts: RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
-      reason: "router has not decided",
-    });
-    expect(next).toEqual({
-      action: "surface",
-      reason: "router has not decided",
-    });
+  it("surfaces the issue once attempts are exhausted; it never returns the default", () => {
+    expect(
+      resolveRunModelDecisionNoDecision({
+        consumedAttempts: RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS - 1,
+        reason: "pacer closed",
+      }),
+    ).toMatchObject({ action: "retry" });
+    expect(
+      resolveRunModelDecisionNoDecision({
+        consumedAttempts: RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
+        reason: "pacer closed",
+      }),
+    ).toEqual({ action: "surface", reason: "pacer closed" });
+    expect(RUN_MODEL_DECISION_RETRY_REASON).toBe("model_decision_pending");
   });
 
   // 6. user wake exempt
-  it("skips the hook for user-requested wakes (recorded exempt)", () => {
-    const skip = evaluateRunModelDecisionSkip({
-      issueId: "issue-1",
-      assigneeIsHuman: false,
-      issueOverrideModel: null,
-      isUserRequestedWake: true,
-      hasCapabilityHolder: true,
-    });
-    expect(skip).toEqual({ skip: true, reason: "user_wake" });
-    const record = buildModelDecisionRecord({
+  it("lets a user-requested wake run on the default when no decision comes, recorded exempt", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({
+        isUserRequestedWake: true,
+        call: async () => ({ kind: "defer", retryAfterMs: 5_000, reason: "pacer closed" }),
+      }),
+    );
+    expect(resolution).toMatchObject({
+      action: "proceed",
       answer: null,
-      pluginKey: null,
-      latencyMs: 3,
-      outcome: "exempt",
-      reason: "user-requested wake",
+      record: { outcome: "exempt", reason: "pacer closed", model: null },
     });
-    expect(record.outcome).toBe("exempt");
-    expect(record.model).toBeNull();
   });
 
-  // 7. operator override skips the hook
-  it("skips the hook when an operator override model is set", () => {
-    const skip = evaluateRunModelDecisionSkip({
-      issueId: "issue-1",
-      assigneeIsHuman: false,
-      issueOverrideModel: "operator-pinned-model",
-      isUserRequestedWake: false,
-      hasCapabilityHolder: true,
-    });
-    expect(skip).toEqual({ skip: true, reason: "operator_override" });
+  it("still applies a decision on a user-requested wake", async () => {
+    const resolution = await resolveRunModelDecision(input({ isUserRequestedWake: true }));
+    expect(resolution).toMatchObject({ action: "proceed", record: { outcome: "decided" } });
   });
 
-  it("skips non-issue runs, human assignees and missing holders", () => {
-    const base = {
-      issueId: "issue-1",
-      assigneeIsHuman: false,
-      issueOverrideModel: null,
-      isUserRequestedWake: false,
-      hasCapabilityHolder: true,
-    };
-    expect(
-      evaluateRunModelDecisionSkip({ ...base, issueId: null }),
-    ).toEqual({ skip: true, reason: "non_issue_run" });
-    expect(
-      evaluateRunModelDecisionSkip({ ...base, assigneeIsHuman: true }),
-    ).toEqual({ skip: true, reason: "human_assignee" });
-    expect(
-      evaluateRunModelDecisionSkip({ ...base, hasCapabilityHolder: false }),
-    ).toEqual({ skip: true, reason: "no_capability_holder" });
-    expect(evaluateRunModelDecisionSkip(base)).toEqual({
-      skip: false,
-      reason: null,
+  // 7. operator override skips
+  it("skips the hook when the issue carries an override model", async () => {
+    const call = vi.fn();
+    const resolution = await resolveRunModelDecision(
+      input({
+        skip: { issueId: "issue-1", assigneeIsHuman: false, issueOverrideModel: "operator-pin" },
+        call,
+      }),
+    );
+    expect(call).not.toHaveBeenCalled();
+    expect(resolution).toEqual({
+      action: "proceed",
+      answer: null,
+      record: expect.objectContaining({
+        outcome: "skipped",
+        reason: "operator_override",
+        pluginKey: null,
+        latencyMs: 0,
+      }),
     });
   });
 
   // 8. flag off → advisory only
-  it("records advisory outcome when the flag is off and runs on the default", () => {
-    const record = buildAdvisoryModelDecisionRecord({
-      pluginKey: "router",
-      latencyMs: 0,
+  it("asks the holder but never applies its answer when the flag is off", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({ requireDecision: false, call: async () => decide({ tier: "frontier" }) }),
+    );
+    expect(resolution).toEqual({
+      action: "proceed",
+      answer: null,
+      record: {
+        decisionId: null,
+        pluginKey: "model-router",
+        model: null,
+        source: null,
+        latencyMs: 7,
+        outcome: "timeout",
+        reason: "requireRunModelDecision disabled",
+        advisory: {
+          outcome: "decided",
+          decisionId: "dec-1",
+          model: "claude-opus-5-5",
+          tier: "frontier",
+          source: "router",
+        },
+      },
     });
-    expect(record.outcome).toBe("advisory");
-    expect(record.model).toBeNull();
-    expect(record.pluginKey).toBe("router");
+  });
+
+  it("never parks when the flag is off, even if the holder fails", async () => {
+    const resolution = await resolveRunModelDecision(
+      input({
+        requireDecision: false,
+        call: async () => {
+          throw new Error("worker not running");
+        },
+      }),
+    );
+    expect(resolution).toMatchObject({
+      action: "proceed",
+      answer: null,
+      record: {
+        outcome: "timeout",
+        advisory: { outcome: "timeout", reason: "worker not running" },
+      },
+    });
   });
 
   // 9. model change resets session
-  it("starts a fresh session when the decided model differs", () => {
-    expect(runModelDecisionChangesModel("new-model", "old-model")).toBe(true);
-    expect(runModelDecisionChangesModel("same-model", "same-model")).toBe(false);
-    expect(runModelDecisionChangesModel(null, "old-model")).toBe(false);
-  });
-
-  // 10. non-issue run skips the hook
-  it("skips the hook for runs without an issue", () => {
-    const skip = evaluateRunModelDecisionSkip({
-      issueId: null,
-      assigneeIsHuman: false,
-      issueOverrideModel: null,
-      isUserRequestedWake: false,
-      hasCapabilityHolder: true,
-    });
-    expect(skip.skip).toBe(true);
-    expect(skip.reason).toBe("non_issue_run");
-  });
-
-  it("accepts keep answers and leaves the base config untouched", () => {
-    const validated = validateRunModelDecisionAnswer(
-      { kind: "keep" },
-      { allowlistedEnvKeys: ALLOWLIST, baseEnv: {} },
+  it("resets the task session when the decided model differs from the session's model", async () => {
+    const resolution = await resolveRunModelDecision(input());
+    if (resolution.action !== "proceed" || !resolution.answer) throw new Error("expected answer");
+    const runConfig = applyRunModelDecisionToAdapterConfig(
+      { model: "agent-default-model" },
+      resolution.answer,
     );
-    expect(validated.valid).toBe(true);
-    if (!validated.valid) throw new Error("expected valid");
-    const base = { model: "base-model", env: { A: "1" } };
-    expect(applyRunModelDecisionToAdapterConfig(base, validated.answer)).toBe(
-      base,
-    );
-    const record = buildModelDecisionRecord({
-      answer: validated.answer,
-      pluginKey: "router",
-      latencyMs: 7,
-      outcome: "kept",
-    });
-    expect(record).toMatchObject({
-      outcome: "kept",
-      decisionId: null,
-      model: null,
-      latencyMs: 7,
-    });
+    const sessionParams = { __paperclipConfiguredModel: "agent-default-model" };
+    expect(
+      shouldResetTaskSessionForModelChange({
+        configuredModel: runConfig.model as string,
+        taskSessionParams: sessionParams,
+      }),
+    ).toBe(true);
+    expect(runModelDecisionChangesModel("claude-opus-5-5", "agent-default-model")).toBe(true);
+
+    const keep = applyRunModelDecisionToAdapterConfig({ model: "agent-default-model" }, { kind: "keep" });
+    expect(
+      shouldResetTaskSessionForModelChange({
+        configuredModel: keep.model as string,
+        taskSessionParams: sessionParams,
+      }),
+    ).toBe(false);
   });
 
-  it("rejects malformed answers as defer-equivalent (never default)", () => {
+  // 10. non-issue run skips
+  it("skips non-issue runs, human assignees and companies without a holder", async () => {
+    const call = vi.fn();
+    const skipped = async (overrides: Partial<ResolveRunModelDecisionInput>) =>
+      (await resolveRunModelDecision(input({ call, ...overrides }))).record.reason;
+
+    expect(
+      await skipped({ skip: { issueId: null, assigneeIsHuman: false, issueOverrideModel: null } }),
+    ).toBe("non_issue_run");
+    expect(
+      await skipped({ skip: { issueId: "issue-1", assigneeIsHuman: true, issueOverrideModel: null } }),
+    ).toBe("human_assignee");
+    expect(await skipped({ holder: { kind: "none" } })).toBe("no_capability_holder");
+    expect(call).not.toHaveBeenCalled();
+    expect(
+      evaluateRunModelDecisionSkip({
+        issueId: "issue-1",
+        assigneeIsHuman: false,
+        issueOverrideModel: null,
+        hasCapabilityHolder: true,
+      }),
+    ).toEqual({ skip: false, reason: null });
+  });
+});
+
+describe("run model decision helpers", () => {
+  it("rejects malformed answers so the run parks", () => {
     for (const raw of [
       null,
       "decide",
       { kind: "nope" },
-      { kind: "decide", decisionId: "", model: "m", source: "r" },
-      { kind: "decide", decisionId: "d", model: "", source: "r" },
-      { kind: "decide", decisionId: "d", model: "m", env: "nope", source: "r" },
-      {
-        kind: "decide",
-        decisionId: "d",
-        model: "x".repeat(201),
-        source: "r",
-      },
+      decide({ decisionId: "" }),
+      decide({ model: "" }),
+      decide({ model: "x".repeat(201) }),
+      decide({ env: "nope" }),
     ]) {
-      const validated = validateRunModelDecisionAnswer(raw, {
-        allowlistedEnvKeys: ALLOWLIST,
-        baseEnv: {},
-      });
-      expect(validated.valid).toBe(false);
+      expect(
+        validateRunModelDecisionAnswer(raw, { allowlistedEnvKeys: ALLOWLIST, baseEnv: {} }).valid,
+      ).toBe(false);
     }
   });
 
-  it("weakening validation to accept any env key fails the allowlist (mutation guard)", () => {
-    // The old shape: decision env spread onto base env without checks.
-    const raw = {
-      kind: "decide",
-      decisionId: "d",
-      model: "m",
-      env: { NOT_ALLOWLISTED: "x" },
-      source: "r",
-    } as const;
-    const unguarded = {
-      ...(raw.env as Record<string, string>),
+  it("selects exactly one run.model.resolve holder and its env allowlist", () => {
+    const router = {
+      id: "p-router",
+      pluginKey: "model-router",
+      manifestJson: {
+        capabilities: [RUN_MODEL_DECISION_CAPABILITY, "events.subscribe"],
+        modelRouting: { envKeys: ["PAPERCLIP_ASSIGNED_MODEL"] },
+      },
     };
-    expect(unguarded.NOT_ALLOWLISTED).toBe("x");
-    // The validator must not share that behaviour.
-    const validated = validateRunModelDecisionAnswer(raw, {
-      allowlistedEnvKeys: ALLOWLIST,
-      baseEnv: {},
+    const other = { id: "p-other", pluginKey: "other", manifestJson: { capabilities: ["events.subscribe"] } };
+
+    expect(selectRunModelDecisionHolder([])).toEqual({ kind: "none" });
+    expect(selectRunModelDecisionHolder([other, { id: "x", pluginKey: "x", manifestJson: null }])).toEqual({
+      kind: "none",
     });
-    expect(validated.valid).toBe(false);
+    expect(selectRunModelDecisionHolder([other, router])).toEqual({
+      kind: "single",
+      holder: { pluginId: "p-router", pluginKey: "model-router", envKeys: ["PAPERCLIP_ASSIGNED_MODEL"] },
+    });
+    expect(
+      selectRunModelDecisionHolder([
+        { ...router, id: "p-z", pluginKey: "z-router" },
+        router,
+      ]),
+    ).toEqual({ kind: "conflict", pluginKeys: ["model-router", "z-router"] });
   });
 
-  it("uses the run.model.resolve capability key", () => {
-    expect(RUN_MODEL_DECISION_CAPABILITY).toBe("run.model.resolve");
+  it("reads the previous run's recorded decision", () => {
+    expect(readPreviousRunModelDecision(null)).toBeNull();
+    expect(
+      readPreviousRunModelDecision({
+        id: "run-0",
+        contextSnapshot: { modelDecision: { model: "m", decisionId: "d", outcome: "decided" } },
+      }),
+    ).toEqual({ runId: "run-0", model: "m", decisionId: "d" });
+    expect(readPreviousRunModelDecision({ id: "run-0", contextSnapshot: null })).toEqual({
+      runId: "run-0",
+      model: null,
+      decisionId: null,
+    });
+  });
+
+  it("carries the park details on a typed deferral error", () => {
+    const record = {
+      decisionId: null,
+      pluginKey: "model-router",
+      model: null,
+      source: null,
+      latencyMs: 3,
+      outcome: "deferred" as const,
+      reason: "pacer closed",
+    };
+    const deferral = new RunModelDecisionDeferral({ retryAfterMs: 30_000, reason: "pacer closed", record });
+    expect(isRunModelDecisionDeferral(deferral)).toBe(true);
+    expect(isRunModelDecisionDeferral(new Error("x"))).toBe(false);
+    expect(deferral).toMatchObject({ code: "model_decision_pending", retryAfterMs: 30_000, record });
   });
 });
