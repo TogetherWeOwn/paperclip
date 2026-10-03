@@ -59,8 +59,8 @@ test("smoke script keeps its load-bearing assertions", () => {
 });
 
 test("source-smoke workflow checks out the selected source and runs the release suite", () => {
-  assert.match(sourceWorkflow, /ref: \$\{\{ inputs\.source_sha \}\}/);
-  assert.match(sourceWorkflow, /test "\$\(git rev-parse HEAD\)" = "\$\{\{ inputs\.source_sha \}\}"/);
+  assert.match(sourceWorkflow, /ref: \$\{\{ inputs\.source_sha \|\| github\.sha \}\}/);
+  assert.match(sourceWorkflow, /expected="\$\{\{ inputs\.source_sha \|\| github\.sha \}\}"/);
   assert.match(sourceWorkflow, /persist-credentials: false/);
   // No pnpm cache: the checkout is a caller-supplied SHA, and a cache keyed
   // on the lockfile could restore dependencies the selected source never had.
@@ -85,23 +85,41 @@ test("source-smoke workflow checks out the selected source and runs the release 
   assert.match(sourceWorkflow, /source-smoke\.env/);
   assert.match(sourceWorkflow, /if-no-files-found: error/);
   assert.match(sourceWorkflow, /tests\/release-smoke\/playwright-report\//);
+  // The lane is exercisable before it gates anything: a manual dispatch
+  // with an optional SHA, so its first run is never the production gate.
+  assert.match(sourceWorkflow, /workflow_dispatch:/);
+  assert.match(sourceWorkflow, /source_sha:\n\s+description: Full commit SHA/);
+  // The redact step actually receives the credential: it sources the same
+  // step-scoped file the suite step does.
+  const redact = sourceWorkflow.split("Redact the credential")[1] ?? "";
+  assert.match(redact.split("- name:")[0], /source-smoke\.pw/);
 });
 
-test("nightly promotion is gated on both the published and the source smokes", () => {
+test("nightly promotion is gated on the source smoke; the stale published lane is informational", () => {
   assert.match(releaseWorkflow, /smoke_nightly_published:\n\s+needs: select_nightly/);
+  // Informational, never blocking: the inherited stale canary fails nightly
+  // while fork canary publication is absent, so its result is ignored.
+  const published = releaseWorkflow.split("smoke_nightly_published:\n")[1].split("smoke_nightly_source:")[0];
+  assert.match(published, /continue-on-error: true/);
   assert.match(releaseWorkflow, /smoke_nightly_source:\n\s+needs: select_nightly/);
+  // Reusable-workflow calls carry the caller's least privilege explicitly.
+  const sourceCaller = releaseWorkflow.split("smoke_nightly_source:\n")[1].split("publish_nightly:")[0];
+  assert.match(sourceCaller, /permissions:\n\s+contents: read/);
   assert.match(
     releaseWorkflow,
     /source_sha: \$\{\{ needs\.select_nightly\.outputs\.sha \}\}/,
   );
   assert.match(
     releaseWorkflow,
-    /needs: \[select_nightly, smoke_nightly_published, smoke_nightly_source\]/,
+    /needs: \[select_nightly, smoke_nightly_source\]/,
   );
   assert.match(
     releaseWorkflow,
-    /needs\.smoke_nightly_published\.result == 'success' && needs\.smoke_nightly_source\.result == 'success'/,
+    /needs\.smoke_nightly_source\.result == 'success'/,
   );
+  // The published lane's result gates nothing: a stale-canary failure must
+  // never veto a source-verified candidate.
+  assert.doesNotMatch(releaseWorkflow, /needs\.smoke_nightly_published\.result/);
   // The old single-gate references must be gone: one stale `smoke_nightly`
   // would silently gate on a job that no longer exists.
   assert.doesNotMatch(releaseWorkflow, /needs\.smoke_nightly\.result/);

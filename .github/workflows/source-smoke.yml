@@ -11,6 +11,23 @@ name: Source Smoke
 # upstream published-package promotion lane is untouched.
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA to boot and smoke-test (defaults to the branch head)
+        required: false
+        default: ""
+        type: string
+      host_port:
+        description: Host port for the source smoke server
+        required: false
+        default: "3232"
+        type: string
+      artifact_name:
+        description: Artifact name for uploaded diagnostics
+        required: false
+        default: manual-source-smoke
+        type: string
   workflow_call:
     inputs:
       source_sha:
@@ -48,14 +65,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          # Manual dispatches default to the branch head; the nightly call
+          # always passes an explicit SHA.
+          ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify the checkout matches the selected source
+        # Manual dispatches record the resolved head for the diagnostics;
+        # the harness itself derives the candidate from the checkout, so
+        # the two can never disagree about what was tested.
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
+          expected="${{ inputs.source_sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$expected"
+          echo "SELECTED_SOURCE_SHA=$expected" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
@@ -119,7 +143,10 @@ jobs:
       - name: Redact the credential from the log before upload
         if: always()
         run: |
-          sed -i "s/$SMOKE_ADMIN_PASSWORD/***/g" "${{ runner.temp }}/source-onboard-smoke.log" 2>/dev/null || true
+          set -a
+          source "${{ runner.temp }}/source-smoke.pw"
+          set +a
+          sed -i "s/$SMOKE_ADMIN_PASSWORD/***/g" "${{ runner.temp }}/source-onboard-smoke.log"
 
       - name: Upload diagnostics
         if: always()
