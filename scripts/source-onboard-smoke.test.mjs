@@ -48,6 +48,12 @@ test("smoke script keeps its load-bearing assertions", () => {
   // the one hostname through /etc/hosts, and only that boot runs elevated.
   assert.match(script, /server\.listen\(443, "127\.0\.0\.1"/);
   assert.match(script, />>\/etc\/hosts/);
+  // The throwaway password never reaches the log line or the uploaded env:
+  // it travels in curl bodies (never echoed, no xtrace) and a step-scoped
+  // file the upload does not include.
+  assert.doesNotMatch(script, /Smoke admin credentials:.*SMOKE_ADMIN_PASSWORD/);
+  assert.match(sourceWorkflow, /source-smoke\.pw/);
+  assert.doesNotMatch(sourceWorkflow, /source-smoke\.env\n/);
   // Reports the server pid so the workflow can stop it after the suite.
   assert.match(script, /SMOKE_SERVER_PID/);
 });

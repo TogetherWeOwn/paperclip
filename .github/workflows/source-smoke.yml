@@ -96,19 +96,30 @@ jobs:
           {
             echo "SMOKE_BASE_URL=$SMOKE_BASE_URL"
             echo "SMOKE_ADMIN_EMAIL=$SMOKE_ADMIN_EMAIL"
-            echo "SMOKE_ADMIN_PASSWORD=$SMOKE_ADMIN_PASSWORD"
             echo "SMOKE_DATA_DIR=$SMOKE_DATA_DIR"
             echo "SMOKE_SERVER_PID=$SMOKE_SERVER_PID"
             echo "SMOKE_SOURCE_SHA=$SMOKE_SOURCE_SHA"
           } >> "$GITHUB_ENV"
+          # The password reaches the Playwright step through the step-scoped
+          # env file only — never $GITHUB_ENV, which the runner prints into
+          # the job log on every write.
+          echo "SMOKE_ADMIN_PASSWORD=$SMOKE_ADMIN_PASSWORD" >> "${{ runner.temp }}/source-smoke.pw"
 
       - name: Run release smoke Playwright suite
         env:
           PAPERCLIP_RELEASE_SMOKE_BASE_URL: ${{ env.SMOKE_BASE_URL }}
           PAPERCLIP_RELEASE_SMOKE_EMAIL: ${{ env.SMOKE_ADMIN_EMAIL }}
-          PAPERCLIP_RELEASE_SMOKE_PASSWORD: ${{ env.SMOKE_ADMIN_PASSWORD }}
           PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
-        run: pnpm run test:release-smoke
+        run: |
+          set -a
+          source "${{ runner.temp }}/source-smoke.pw"
+          set +a
+          PAPERCLIP_RELEASE_SMOKE_PASSWORD="$SMOKE_ADMIN_PASSWORD" pnpm run test:release-smoke
+
+      - name: Redact the credential from the log before upload
+        if: always()
+        run: |
+          sed -i "s/$SMOKE_ADMIN_PASSWORD/***/g" "${{ runner.temp }}/source-onboard-smoke.log" 2>/dev/null || true
 
       - name: Upload diagnostics
         if: always()
@@ -117,7 +128,6 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: |
             ${{ runner.temp }}/source-onboard-smoke.log
-            ${{ runner.temp }}/source-smoke.env
             tests/release-smoke/playwright-report/
             tests/release-smoke/test-results/
           # The harness truncates the log file at startup, so an empty upload

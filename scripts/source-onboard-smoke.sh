@@ -334,7 +334,7 @@ write_metadata_file
 
 echo "==> Smoke server ready for automation"
 echo "    Smoke base URL: $PAPERCLIP_PUBLIC_URL"
-echo "    Smoke admin credentials: $SMOKE_ADMIN_EMAIL / $SMOKE_ADMIN_PASSWORD"
+echo "    Smoke admin: $SMOKE_ADMIN_EMAIL (password in step-scoped env file only)"
 echo "    Smoke source SHA: $SOURCE_SHA"
 if [[ -n "$SMOKE_METADATA_FILE" ]]; then
   echo "    Smoke metadata file: $SMOKE_METADATA_FILE"
