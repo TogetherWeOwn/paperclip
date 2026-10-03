@@ -102,9 +102,12 @@ test("nightly promotion is gated on the source smoke; the stale published lane i
   const published = releaseWorkflow.split("smoke_nightly_published:\n")[1].split("smoke_nightly_source:")[0];
   assert.match(published, /continue-on-error: true/);
   assert.match(releaseWorkflow, /smoke_nightly_source:\n\s+needs: select_nightly/);
-  // Reusable-workflow calls carry the caller's least privilege explicitly.
+  // No permissions on reusable-workflow caller jobs: GitHub rejects
+  // `permissions` alongside `uses` in a caller job, and the sibling
+  // reusable calls in this file (release-verify, release-smoke) carry
+  // none — least privilege lives inside the called workflow instead.
   const sourceCaller = releaseWorkflow.split("smoke_nightly_source:\n")[1].split("publish_nightly:")[0];
-  assert.match(sourceCaller, /permissions:\n\s+contents: read/);
+  assert.doesNotMatch(sourceCaller, /permissions:/);
   assert.match(
     releaseWorkflow,
     /source_sha: \$\{\{ needs\.select_nightly\.outputs\.sha \}\}/,
