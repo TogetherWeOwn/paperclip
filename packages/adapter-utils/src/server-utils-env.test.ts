@@ -46,12 +46,35 @@ describe("sanitizeInheritedPaperclipEnv", () => {
       GEMINI_API_KEY_EXTRA: "nope",
       GH_TOKEN: "test",
       GITHUB_TOKEN: "test",
+      GH_ENTERPRISE_TOKEN: "test",
+      GITHUB_ENTERPRISE_TOKEN: "test",
       AWS_ACCESS_KEY_ID: "test",
       AWS_SECRET_ACCESS_KEY: "test",
       AWS_SESSION_TOKEN: "test",
       CLAUDE_CODE_OAUTH_TOKEN: "test",
       PATH: "/usr/bin",
     })).toEqual({ PATH: "/usr/bin", GEMINI_API_KEY_EXTRA: "nope" });
+  });
+
+  it("strips credential-pointer vars (TOG-9729)", () => {
+    expect(sanitizeInheritedPaperclipEnv({
+      AWS_SHARED_CREDENTIALS_FILE: "/root/.aws/credentials",
+      AWS_CONFIG_FILE: "/root/.aws/config",
+      AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/secrets/token",
+      SSH_AUTH_SOCK: "/run/agent.sock",
+      GH_CONFIG_DIR: "/root/.config/gh",
+      GIT_CONFIG_GLOBAL: "/root/.gitconfig",
+      GIT_CONFIG_SYSTEM: "/etc/gitconfig",
+      GOOGLE_APPLICATION_CREDENTIALS: "/root/sa.json",
+      PATH: "/usr/bin",
+    })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("fails closed on future *_TOKEN vars (TOG-9729)", () => {
+    expect(sanitizeInheritedPaperclipEnv({
+      SOME_FUTURE_PROVIDER_TOKEN: "test",
+      PATH: "/usr/bin",
+    })).toEqual({ PATH: "/usr/bin" });
   });
 
   it("fails closed on future *_API_KEY and DATABASE_*/POSTGRES_*/PG* vars", () => {

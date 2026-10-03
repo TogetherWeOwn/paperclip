@@ -235,14 +235,23 @@ export function projectExecution(
     projection.nextAction = "Waiting for the AI subscription's current execution to finish; the scheduled check will revalidate access.";
     return set("retry_scheduled", "Waiting for AI subscription");
   }
+  if (run.status === "scheduled_retry" && run.scheduledRetryReason === "model_decision_pending") {
+    projection.nextAction = "Waiting for the model router to decide this run's model; the run never starts on the default.";
+    return set("retry_scheduled", "Waiting for model router");
+  }
   if (run.status === "scheduled_retry" && run.scheduledRetryReason === "workspace_busy") {
     projection.nextAction = "Waiting for the live workspace holder to finish; the scheduled check will revalidate ownership.";
     return set("retry_scheduled", "Waiting for workspace");
   }
-  if (
+  // Cleanup can fail before a finalization coordinator exists. The missing
+  // row must not turn a quarantined native session into an ordinary Retry.
+  const cleanupQuarantined = run.runtimeMode === "native" &&
+    ["failed", "timed_out"].includes(run.status) &&
+    run.errorCode === "native_session_cleanup_quarantined";
+  if (!cleanupQuarantined && (
     coordinator?.phase === "retryable_failure" ||
     run.status === "scheduled_retry"
-  ) {
+  )) {
     projection.recoveryOwner = "agent";
     return set(
       projection.retryAt && new Date(projection.retryAt) > now
@@ -253,8 +262,9 @@ export function projectExecution(
         : "Reconnecting",
     );
   }
-  if (coordinator?.phase === "terminal_failure" || recoveryAction) {
+  if (coordinator?.phase === "terminal_failure" || recoveryAction || cleanupQuarantined) {
     if (
+      !cleanupQuarantined &&
       coordinator?.failureCode === "native_provider_terminal_failed" &&
       !detail.replacementDenied &&
       run.finishedAt &&
@@ -271,6 +281,9 @@ export function projectExecution(
       text(detail.replacementDenied) ??
       projection.cause;
     projection.nextAction = recoveryAction?.nextAction ?? projection.nextAction;
+    if (cleanupQuarantined && !projection.nextAction) {
+      projection.nextAction = "Verify the stopped session and its saved work before starting a new attempt.";
+    }
     projection.permittedActions.push("inspect_recovery");
     return set("recovery_needed", "Recovery needed");
   }

@@ -30,6 +30,7 @@ export type InstanceExecutionMode = "kubernetes" | "any";
 
 export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
+  /** @deprecated Legacy instance value. Use /auth/preferences for personal shortcuts. */
   keyboardShortcuts: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
@@ -71,8 +72,10 @@ export interface InstanceExperimentalSettings {
   enableApps: boolean;
   /** Exposes chat connector setup and Board surfaces; existing delivery continues when hidden. */
   enableChatConnectors: boolean;
-  /** Exposes MCP aggregator setup; existing connections keep running when hidden. */
+  /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
   enableMcpAggregators: boolean;
+  /** Show experimental memory connection setup. Existing connections remain usable. */
+  enableMemoryConnectors: boolean;
   enablePipelines: boolean;
   enableCases: boolean;
   enableAgentChat: boolean;
@@ -128,6 +131,13 @@ export interface InstanceExperimentalSettings {
    * enableNativeRunner and this value has no runtime effect.
    */
   enableRunnerPreviewIngress: boolean;
+  /**
+   * Issue runs ask the `run.model.resolve` plugin holder which model to use
+   * before the adapter config merge. On: no decision parks the run on a
+   * bounded retry and never falls back to the default. Off: advisory only,
+   * the run starts on the default and records `outcome: "timeout"`.
+   */
+  requireRunModelDecision: boolean;
   /**
    * Worktree preview instances (`PAPERCLIP_IN_WORKTREE=true`) suppress the
    * heartbeat run engine by default so previews never self-execute tasks. When

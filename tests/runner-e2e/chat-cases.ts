@@ -47,11 +47,22 @@ function buildChatTasks(definitions: readonly (readonly [string, string, number]
 }
 export const chatTasks = buildChatTasks(CHAT_CASES);
 export const chatHardeningTasks = buildChatTasks(HARDENING_CASES);
+export const chatStoryTasks = buildChatTasks([
+  ["enable-disable-resume", "Enable Agent Chat, pause access, and resume preserved history", 2],
+  ["followup-while-running", "Deliver a follow-up while a provider turn is running", 2],
+  ["revise-while-running", "Change instructions during active work and save the updated plan", 2],
+]).map(task => ({ ...task, ...(task.id === "enable-disable-resume" ? {} : { minimumExpectedRunCount: 1 }) }));
 
 export function chatNeedsApiTools(suiteId: string, caseId: string): boolean {
-  return suiteId === "agent-chat-hardening" && ["hire-delegate-reuse", "blocked-status-review"].includes(caseId);
+  return (suiteId === "agent-chat-qualification" && caseId === "grounded-answer-quality") || suiteId === "agent-chat-hardening" && ["hire-delegate-reuse", "blocked-status-review"].includes(caseId);
 }
 export function isManagedHiringCase(suiteId: string, caseId: string): boolean {
   return (suiteId === "everyday-workflows" && caseId === "hire-reuse") ||
     (suiteId === "agent-chat-hardening" && caseId === "hire-delegate-reuse");
 }
+
+export const chatQualificationTasks = buildChatTasks([
+  ["active-reassignment", "Reassign an executing task and preserve its saved work", 3],
+  ["worker-crash-retry", "Recover from worker process loss through visible Retry", 2],
+  ["grounded-answer-quality", "Ground status, correct stale claims, and acknowledge uncertainty", 2],
+]);

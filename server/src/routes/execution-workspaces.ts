@@ -3,6 +3,7 @@ import { accessSync, constants as fsConstants, existsSync, readFileSync } from "
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
@@ -697,7 +698,12 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             ], {
               cwd: baseWorkspaceCwd,
               env: {
-                ...process.env,
+                // TOG-9729: repair is agent-reachable (runtime:manage allows
+                // same-company agents), so strip inherited server secrets from
+                // the base. The CLI reads DB/secret material from the source
+                // config + .env entries, plus PAPERCLIP_SEED_* guardrails set
+                // explicitly below — never from the inherited server env.
+                ...sanitizeInheritedPaperclipEnv(process.env),
                 PAPERCLIP_SEED_EXPECTED_COMPANY_ID: existing.companyId,
                 PAPERCLIP_WORKSPACE_BASE_CWD: baseWorkspaceCwd,
                 PAPERCLIP_PROJECT_WORKSPACE_ID: existing.projectWorkspaceId ?? "",

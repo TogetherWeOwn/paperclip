@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 import { agentSessionGoalActions, agentTaskSessions } from "@paperclipai/db";
 
@@ -396,7 +397,12 @@ export async function executeNativeCodexRunner(input: {
     cwd: input.cwd,
     detached: process.platform !== "win32",
     env: {
-      ...process.env,
+      // TOG-9729: agent-reachable spawn — strip inherited server secrets
+      // (DATABASE_URL, provider keys, credential pointers) from the base.
+      // input.environment (allowlisted host keys + agent config) and the
+      // run-scoped bootstrap ticket merge after, so explicit per-run values
+      // still apply.
+      ...sanitizeInheritedPaperclipEnv(process.env),
       ...input.environment,
       PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
     },

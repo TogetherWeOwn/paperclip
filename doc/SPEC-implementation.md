@@ -255,6 +255,7 @@ See `doc/project-repositories.md` for the API and UI contract.
   - `standard`: normal autonomous execution. Agents may investigate, edit files, create artifacts, and complete the task.
   - `ask`: answer-only execution. Agents may use tools for investigation or temporary scratch work, but the deliverable is an issue-thread answer; they must not write implementation code or produce an implementation plan.
   - `planning`: plan-only execution. Agents create or revise the plan without implementation work. Accepting a fresh confirmation for the issue's current `plan` revision atomically changes this mode to `standard`, so the continuation may implement the approved plan on the source issue.
+- Work mode is explicit persisted state. Titles, descriptions, and requested deliverables never select or change it. A `standard` task may deliver a requested plan, including a canonical `plan` document, and complete without entering `planning` mode. Existing explicit approval requirements still apply.
 - `billing_code` text null
 - `assignee_adapter_overrides` jsonb null
 - `execution_policy` jsonb null
@@ -526,6 +527,7 @@ V1 non-terminal liveness rule:
 - heartbeat finalization evaluates liveness from persisted Paperclip state; an issue cannot remain healthy `in_progress` solely because the exiting heartbeat started a local/background watcher
 - a continuation cancelled as `issue_continuation_waiting_on_review` first converts a current typed wait target into a first-class wait; without a current target it is classified as `deliberate_wait_without_target` and gives the invokable original owner five normal-model disposition-repair attempts (immediate, then after 60, 120, 240, and 480 seconds, with up to 10 percent jitter)
 - disposition repair revalidates blockers, children, interactions, approvals, monitors, execution stages, queued wakes, active runs, work products, owner invokability, budgets, and governance before every attempt; the attempt bound is keyed by durable source state, so comments or equivalent parked prose do not reset it while durable source-state changes may establish a new fingerprint
+- exhausted disposition repair appears in both task threads as “Agent needs attention,” with recorded attempt details and an explicit retry action; display uses structured recovery evidence, and the server rechecks the exact action, current task state, original owner, pause/approval/dependency/budget gates before restoring the task to todo
 - backwards-compatible upgrades count consecutive historical `issue_continuation_waiting_on_review` cancellations for the unchanged accepted-interaction source state against the same five-attempt disposition-repair ceiling; missing pre-upgrade recovery-action rows do not reset the budget
 - the source fingerprint, source-attempt count, next due time, source owner, and return owner persist in the recovery action; startup and periodic reconciliation resume that exact lineage without duplicate wakes, fold it when a current typed wait appears, and reschedule or escalate an expired action that has no live scheduled run
 - source-attempt exhaustion opens one board-owned source-scoped recovery action without changing the source assignee and without waking a substitute agent; the board explicitly chooses whether to repair, retry the original owner, reassign, or resolve
@@ -626,6 +628,20 @@ records the write-policy reason, and spoof attempts fail with an audited 422.
 Every issue PATCH emits an `issue.updated` activity receipt containing the
 actor, responsible user, run, authorization reason, and field-level before/after
 changes so both agent and board edits are visible in the issue activity stream.
+
+Completed typed execution reviews are not invalidated by deferred comment wakes
+whose entire comment batch was already covered by the original completion.
+Explicit resumes and independent continuation remain intentional new work.
+A completed-review restoration action accepts persisted evidence locators only.
+It cannot accept an execution-state snapshot or create replacement decisions.
+It checks company and issue write access against the locked current issue, checks
+the original return assignment through ordinary assignment authorization, and
+preserves review policy, restricted-key containment, run ownership and holds.
+It requires unchanged policy and delivery fingerprints, original approvals and
+covered wake lineage. Missing, legacy, ambiguous, adverse or newer evidence
+refuses restoration. The projection and original-reference audit commit together
+under a bounded serializable transaction. The same evidence is idempotent only
+while the restored projection and assignment remain unchanged.
 
 ## 9.4 Permission Terminology and Default Visibility Rule
 
@@ -993,7 +1009,16 @@ On a Paperclip Cloud-managed instance, `POST /companies` returns `403` with
 code `cloud_managed`; the trusted-header provisioning path and company import
 routes remain the only company-creation paths there.
 
-## 10.1.1 Cloud Stack Portfolio
+## 10.1.1 Organization navigation and Cloud invitations
+
+Core's built-in organization switcher lists this instance's companies. An
+installed plugin can replace it through the generic `organizationSwitcher`
+slot. The built-in menu remains available when no unique usable contribution
+exists. Core does not fetch or render Cloud portfolios in its switcher. Managed
+hosts do not expose local company creation in that built-in menu; their extension
+owns the creation action.
+
+The Cloud Members-page invitation action still uses the following route:
 
 - `GET /cloud/stacks`
 
@@ -1002,6 +1027,13 @@ The route exists only on a Cloud-managed instance, requires a trusted
 stack id to the Cloud tenant portfolio endpoint. Client-supplied user ids are
 never forwarded. Successful responses are cached briefly per user; self-hosted
 instances return `404`.
+
+On Cloud-managed instances, the Members page offers **Invite people** to the
+current stack's owner/admin. It opens that stack's Cloud People settings with a
+full-page navigation. The destination uses the configured Cloud origin and the
+current stack from the authenticated portfolio. The action stays hidden until
+that role is known, or when the portfolio request fails. Hiding the tenant-local
+Invites tab does not hide this Cloud action.
 
 ## 10.2 Goals
 
@@ -1684,3 +1716,19 @@ instance-level registry retains validated publication IDs, allowing offline
 dismissal retries after withdrawal while rejecting caller-invented IDs. It
 stores no announcement content, account data or interaction events.
 See [Announcements](ANNOUNCEMENTS.md) for API and publishing details.
+
+### Personal keyboard shortcut preference
+
+Keyboard shortcuts are off by default and are enabled in Settings → Profile.
+The preference is stored on the signed-in user, applies across companies and
+devices, and does not require instance administrator access. The local trusted
+board user has the same preference. `GET /api/auth/preferences` returns only the
+current board user's preference. `PATCH /api/auth/preferences` updates only that
+user and requires an accessible `companyId` for the activity log, including viewer
+memberships. The preference and audit record commit in one transaction. Both
+requests require `expectedUserId` (GET query parameter or PATCH body) matching
+the authenticated actor, so a cookie change cannot mix accounts in the cache.
+Agents cannot
+read or change these preferences. The legacy instance general setting is retained
+for API compatibility but no longer controls shortcut behavior in the app;
+users opt in individually after the upgrade.

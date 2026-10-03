@@ -121,6 +121,10 @@ vi.mock("../telemetry.js", () => ({
   getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
 }));
 
+vi.mock("../services/completed-review-receipt.js", () => ({
+  collectCompletedReviewReceipt: vi.fn(async () => null),
+}));
+
 vi.mock("../services/queued-interaction-response.js", () => ({
   hasQueuedInteractionResponse: vi.fn(async () => false),
 }));
@@ -1425,6 +1429,8 @@ describe.sequential("issue comment reopen routes", () => {
         attachmentIds: undefined,
         authorType: "user",
         authorizationReason: "allow_board_actor",
+        clientRequestId: undefined,
+        mirrorToSlack: true,
         presentation: {
           kind: "system_notice",
           tone: "warning",

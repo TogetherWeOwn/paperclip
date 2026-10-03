@@ -28,6 +28,7 @@ import type {
   SmokeRunStep,
   UpdateSmokeRun,
 } from "@paperclipai/shared";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -985,7 +986,18 @@ export function smokeLabService(db: Db, options: {
     const fixturePath = smokeLabFixturePath("http-fixture.mjs");
     const port = await allocateFetchAllowedLoopbackPort();
     const child = spawn(process.execPath, [fixturePath], {
-      env: { ...process.env, HOST: "127.0.0.1", PORT: String(port) },
+      env: {
+        // TOG-9729: the fixture passes process.env through as tool-call
+        // `secrets`, and smoke-run results are agent-readable — so strip
+        // inherited server secrets from the base. Fixture fake secrets
+        // (FAKE_OAUTH_TOKEN, MISSING_FIXTURE_SECRET) are forwarded
+        // explicitly; nothing else secret-shaped crosses this boundary.
+        ...sanitizeInheritedPaperclipEnv(process.env),
+        ...(process.env.FAKE_OAUTH_TOKEN ? { FAKE_OAUTH_TOKEN: process.env.FAKE_OAUTH_TOKEN } : {}),
+        ...(process.env.MISSING_FIXTURE_SECRET ? { MISSING_FIXTURE_SECRET: process.env.MISSING_FIXTURE_SECRET } : {}),
+        HOST: "127.0.0.1",
+        PORT: String(port),
+      },
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });

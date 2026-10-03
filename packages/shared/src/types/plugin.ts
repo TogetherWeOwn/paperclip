@@ -206,6 +206,13 @@ export interface PluginEnvironmentDriverDeclaration {
   /** Optional description for operator-facing docs or UI affordances. */
   description?: string;
   /**
+   * Default provider budget for a fresh lease acquisition, in milliseconds.
+   * The host adds RPC overhead. A valid explicit config.timeoutMs overrides
+   * this default; bridgeRequestTimeoutMs can extend the resulting budget.
+   * Omit to retain the worker's normal RPC timeout. This is not lease lifetime.
+   */
+  defaultAcquireTimeoutMs?: number;
+  /**
    * Sandbox providers must opt in before the host retains and resumes provider
    * leases across runs. Providers without this flag keep per-run acquire/release
    * behavior even if their config schema exposes a reuse-like setting.
@@ -650,6 +657,15 @@ export interface PluginObjectReferenceProviderDeclaration {
 // ---------------------------------------------------------------------------
 
 /**
+ * Declares the env keys a `run.model.resolve` holder may set on a run's
+ * adapter config. The host rejects any decision env key outside this list.
+ */
+export interface PluginModelRoutingDeclaration {
+  /** Plain env keys the decision may set (never secret bindings). */
+  envKeys: string[];
+}
+
+/**
  * The manifest shape every plugin package must export.
  * See PLUGIN_SPEC.md §10.1 for the normative definition.
  */
@@ -713,6 +729,8 @@ export interface PaperclipPluginManifestV1 {
   localFolders?: PluginLocalFolderDeclaration[];
   /** External object reference providers this plugin contributes. */
   objectReferences?: PluginObjectReferenceProviderDeclaration[];
+  /** Run-scoped model decisions. Requires `run.model.resolve` capability. */
+  modelRouting?: PluginModelRoutingDeclaration;
   /**
    * Legacy top-level launcher declarations.
    * Prefer `ui.launchers` for new manifests.

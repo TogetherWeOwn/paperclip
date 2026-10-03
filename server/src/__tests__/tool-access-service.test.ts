@@ -85,6 +85,7 @@ import {
 } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import * as sentry from "../sentry.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
 import { invalidatePaperclipCloudConnectorCapabilities, type PaperclipCloudConnector } from "../services/paperclip-cloud-connector.js";
 
@@ -810,14 +811,14 @@ describeEmbeddedPostgres("tool access service", () => {
       process.env.PAPERCLIP_TOOL_ACCESS_TEST_DATABASE_URL?.trim();
     if (externalDatabaseUrl) {
       db = createDb(externalDatabaseUrl);
-      await instanceSettingsService(db).updateExperimental({ enableMcpAggregators: true });
+      await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: true });
       return;
     }
     tempDb = await startEmbeddedPostgresTestDatabase(
       "paperclip-tool-access-service-",
     );
     db = createDb(tempDb.connectionString);
-    await instanceSettingsService(db).updateExperimental({ enableMcpAggregators: true });
+    await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: true });
   }, 20_000);
 
   afterEach(async () => {
@@ -2407,6 +2408,36 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+  });
+
+  it.each(["read", "write"])("requests only reduced Chat scopes for customer-owned %s OAuth, including reconnect", async (capability) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const actor = { actorType: "user" as const, actorId: "board" };
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "google-chat",
+      connectionMethodKey: `customer-${capability}-oauth`,
+      name: "Chat scope fixture",
+      grantKind: "user",
+      oauthClient: { clientId: "google-chat-client", clientSecret: "google-chat-secret" },
+    }, actor);
+    const scopes = ["chat.spaces.readonly", "chat.messages.readonly", ...(capability === "write" ? ["chat.messages.create"] : [])]
+      .map((scope) => `https://www.googleapis.com/auth/${scope}`);
+    const removed = ["chat.memberships.readonly", "chat.users.readstate.readonly"]
+      .map((scope) => `https://www.googleapis.com/auth/${scope}`);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    // A saved broad scope hint must not leak back into the next consent URL.
+    await db.update(toolConnections).set({ config: {
+      ...connection.config,
+      oauth: { ...(connection.config.oauth as Record<string, unknown>), scopes: [...scopes, ...removed] },
+    } }).where(eq(toolConnections.id, connection.id));
+    const input = { redirectUri: "https://paperclip.example.test/api/tools/oauth/callback", actor };
+    const started = await service.startOAuth(company.id, connection.id, input);
+    expect(new URL(started.authorizationUrl).searchParams.get("scope")?.split(" ")).toEqual(scopes);
+    for (const removedScope of removed) {
+      await expect(service.startOAuth(company.id, connection.id, { ...input, scopes: [...scopes, removedScope] }))
+        .rejects.toMatchObject({ status: 400, details: { code: "oauth_scope_widening_rejected", scopes: [removedScope] } });
+    }
   });
 
   it("keeps tools outside a Google Workspace capability profile disabled", async () => {
@@ -5061,7 +5092,7 @@ describeEmbeddedPostgres("tool access service", () => {
         "youcom",
       ]),
     );
-    expect(res.body.apps).toHaveLength(51);
+    expect(res.body.apps).toHaveLength(56);
     expect(
       res.body.apps.find((app: { slug: string }) => app.slug === "gmail")
         .ownershipAvailability,
@@ -11558,6 +11589,149 @@ describeEmbeddedPostgres("tool access service", () => {
     );
   });
 
+  it.each(["mem0", "zep", "supermemory", "cognee", "honcho"])("rejects %s setup before creating credentials when memory connectors are disabled", async (provider) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: false });
+    try {
+      const response = await request(createRouteApp(db)).get(`/api/companies/${company.id}/tools/gallery`).expect(200);
+      expect(response.body.apps.some((app: { slug: string }) => app.slug === provider)).toBe(false);
+      await expect(service.connectGalleryApp(company.id, { galleryKey: provider })).rejects.toMatchObject({ status: 403, details: { code: "memory_connectors_disabled" } });
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id))).toHaveLength(0);
+      expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toHaveLength(0);
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: true });
+    }
+  });
+
+  it("rotates an existing Mem0 key while new memory setup is disabled", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "mem0", credentialValues: { "credentials.authorization": "old-key" },
+    });
+    await db.update(toolConnections).set({ status: "active" }).where(eq(toolConnections.id, connected.connectionId));
+    await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: false });
+    try {
+      const result = await service.reconnectGalleryApp(connected.connectionId, company.id,
+        { credentialValues: { "credentials.authorization": "new-key" } });
+      expect(result.connection.id).toBe(connected.connectionId);
+      expect(result.connection.healthStatus).toBe("ok");
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableMemoryConnectors: true });
+    }
+  });
+
+  it("keeps active Cognee tools available during a transient Cloud probe outage", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("[]", { status: 200 }));
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "cognee", credentialValues: { "env.COGNEE_BASE_URL": "https://fixture.aws.cognee.ai", "env.COGNEE_API_KEY": "key" },
+    });
+    await db.update(toolConnections).set({ status: "active" }).where(eq(toolConnections.id, connected.connectionId));
+    fetchMock.mockReset().mockRejectedValue(new Error("temporary timeout"));
+    const result = await service.checkHealth(connected.connectionId);
+    expect(result.connection.healthStatus).toBe("ok");
+    expect(fetchMock).not.toHaveBeenCalled();
+    const catalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
+    expect(catalog).toHaveLength(3);
+  });
+
+  it("creates a user-owned value when reconnect restores a missing personal credential field", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "search_memories", annotations: { readOnlyHint: true } }]);
+    const actor = { actorType: "user" as const, actorId: "personal-reconnect-owner" };
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "mem0", grantKind: "user", credentialValues: { "credentials.authorization": "old-key" },
+    }, actor);
+    const { grants } = await service.listConnectionGrants(connected.connectionId, company.id);
+    await db.update(connectionGrants).set({ credentialSecretRefs: [] }).where(eq(connectionGrants.id, grants[0]!.id));
+    await service.reconnectGalleryApp(connected.connectionId, company.id,
+      { credentialValues: { "credentials.authorization": "restored-key" } }, actor);
+    const after = await service.listConnectionGrants(connected.connectionId, company.id);
+    const ref = after.grants[0]!.credentialSecretRefs[0]!;
+    const [secret] = await db.select().from(companySecrets).where(eq(companySecrets.id, ref.secretId));
+    expect(secret).toMatchObject({ scope: "user", ownerUserId: actor.actorId });
+    const resolved = await secretService(db).resolveUserSecretValue(company.id, {
+      definitionId: secret.userSecretDefinitionId!, responsibleUserId: actor.actorId,
+    }, { consumerType: "tool_connection", consumerId: connected.connectionId, configPath: ref.configPath,
+      actorType: "system", actorId: null, responsibleUserId: actor.actorId });
+    expect(resolved?.value).toBe("restored-key");
+    expect((await service.getConnection(connected.connectionId, company.id)).credentialSecretRefs).toEqual([]);
+  });
+
+  it("keeps rejected Mem0 API keys on the key-entry path rather than switching to OAuth", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } }));
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "mem0", credentialValues: { "credentials.authorization": "invalid-key" },
+    })).rejects.toMatchObject({ status: 422, details: { code: "memory_api_key_rejected" } });
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toHaveLength(0);
+  });
+
+  it("vaults Cognee environment credentials and verifies Cloud access before exposing its reviewed tools", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("[]", { status: 200 }));
+    const key = "cognee-private-fixture-key";
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "cognee",
+      credentialValues: { "env.COGNEE_BASE_URL": "https://fixture.aws.cognee.ai", "env.COGNEE_API_KEY": key },
+    });
+    expect(fetchMock).toHaveBeenCalledWith("https://fixture.aws.cognee.ai/api/v1/datasets/", expect.objectContaining({
+      method: "GET", headers: { "X-Api-Key": key }, redirect: "manual",
+    }));
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection.config).toMatchObject({ templateId: "paperclip.cognee-cloud" });
+    expect(connection.credentialSecretRefs.map(ref => ref.configPath).sort()).toEqual(["env.COGNEE_API_KEY", "env.COGNEE_BASE_URL"]);
+    expect(JSON.stringify(connected)).not.toContain(key);
+    expect(JSON.stringify(connection)).not.toContain(key);
+    const catalog = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
+    expect(catalog.map(entry => [entry.toolName, entry.riskLevel]).sort()).toEqual([["forget", "destructive"], ["recall", "read"], ["remember", "write"]]);
+  });
+
+  it("resolves personal Cognee credentials through their owner and durable declarations", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("[]", { status: 200 }));
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "cognee", grantKind: "user",
+      credentialValues: { "env.COGNEE_BASE_URL": "https://fixture.aws.cognee.ai", "env.COGNEE_API_KEY": "personal-cognee-key" },
+    }, { actorType: "user", actorId: "carol" });
+    const { grants } = await service.listConnectionGrants(connected.connectionId, company.id);
+    expect(grants).toHaveLength(1);
+    expect(connected.connection.credentialSecretRefs).toEqual([]);
+    const vault = secretService(db);
+    for (const ref of grants[0]!.credentialSecretRefs) {
+      const [secret] = await db.select().from(companySecrets).where(eq(companySecrets.id, ref.secretId));
+      expect(secret).toMatchObject({ scope: "user", ownerUserId: "carol" });
+      const resolved = await vault.resolveUserSecretValue(company.id, {
+        definitionId: secret.userSecretDefinitionId, responsibleUserId: "carol",
+      }, { consumerType: "tool_connection", consumerId: connected.connectionId, configPath: ref.configPath,
+        actorType: "system", actorId: null, responsibleUserId: "carol" });
+      expect(resolved?.value).toBe(ref.configPath === "env.COGNEE_API_KEY" ? "personal-cognee-key" : "https://fixture.aws.cognee.ai");
+      await expect(vault.resolveUserSecretValue(company.id, {
+        definitionId: secret.userSecretDefinitionId, responsibleUserId: "another-user",
+      })).rejects.toMatchObject({ status: 422, details: { code: "user_secret_missing" } });
+    }
+  });
+
+  it.each(["organization", "user"] as const)("cleans up a rejected %s Cognee connection and its vault records", async (grantKind) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("unauthorized", { status: 401 }));
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "cognee", grantKind, credentialValues: { "env.COGNEE_BASE_URL": "https://fixture.aws.cognee.ai", "env.COGNEE_API_KEY": "invalid-key" },
+    }, { actorType: "user", actorId: "carol" })).rejects.toMatchObject({ status: 422, details: { code: "cognee_access_unverified" } });
+    expect(await db.select().from(userSecretDefinitions).where(eq(userSecretDefinitions.companyId, company.id))).toHaveLength(0);
+    expect(await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.companyId, company.id))).toHaveLength(0);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, company.id))).toHaveLength(0);
+  });
+
   it("retains an encrypted API key when the same draft method resumes", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -11972,6 +12146,7 @@ describeEmbeddedPostgres("tool access service", () => {
           details: expect.objectContaining({
             code: "oauth_reauthorization_required",
           }),
+          status: 422,
         },
       );
     }
@@ -12244,7 +12419,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(updated.config)).not.toContain("m2m-access-token");
   });
 
-  it("fails expired OAuth credentials without a refresh token and returns reconnect links", async () => {
+  it.each(["catalog", "catalog/refresh", "health-check"])("returns reconnect instructions on %s for expired OAuth without a refresh token", async (path) => {
     vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
     vi.stubEnv(
       "PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET",
@@ -12327,7 +12502,7 @@ describeEmbeddedPostgres("tool access service", () => {
         actorId: "board",
       }),
     ).rejects.toMatchObject({
-      status: 502,
+      status: 422,
       details: expect.objectContaining({
         code: "oauth_refresh_missing",
         setupUrl: `/apps/${connect.connectionId}/permissions`,
@@ -12335,6 +12510,18 @@ describeEmbeddedPostgres("tool access service", () => {
         connection: expect.objectContaining({ healthStatus: "failed" }),
       }),
     });
+    await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connect.connectionId));
+    const capture = vi.spyOn(sentry, "captureException").mockImplementation(() => {});
+    const app = createRouteApp(db, boardSessionActor(company.id, "owner", "board"));
+    const url = `/api/tool-connections/${connect.connectionId}/${path}`;
+    const response = await (path === "catalog" ? request(app).get(url) : request(app).post(url));
+    expect(response.status).toBe(422);
+    expect(response.body).toMatchObject({
+      code: "oauth_refresh_missing",
+      error: "OAuth credentials have expired and need to be reconnected.",
+      details: { setupUrl: `/apps/${connect.connectionId}/permissions`, reconnectUrl: `/apps/${connect.connectionId}/permissions` },
+    });
+    expect(capture).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     const auditRows = await db
       .select()
@@ -13758,7 +13945,7 @@ describeEmbeddedPostgres("tool access service", () => {
         name: "Sign-in app",
       });
 
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(422);
     expect(res.body).toMatchObject({
       error: "This app needs you to sign in.",
       details: expect.objectContaining({ code: "oauth_challenge" }),
@@ -13766,6 +13953,126 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
     await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
   });
+
+  it.each(["catalog", "catalog/refresh", "health-check"])(
+    "explains disabled Slack MCP access on %s without reporting a server error",
+    async (path) => {
+      const company = await createCompany(db);
+      const [application] = await db.insert(toolApplications).values({
+        companyId: company.id,
+        applicationKey: `slack-setup-${randomUUID()}`,
+        name: "Slack setup fixture",
+        type: "mcp_http",
+        status: "active",
+      }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: application!.id,
+        name: "Slack setup fixture",
+        uid: `test/${randomUUID()}`,
+        transport: "mcp_remote",
+        status: "draft",
+        enabled: false,
+        config: { url: "https://mcp.slack.com/mcp" },
+        transportConfig: { url: "https://mcp.slack.com/mcp" },
+      }).returning();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: null, error: {
+          code: -32600,
+          message: "App is not enabled for Slack MCP server access. Please enable it here: https://api.slack.com/apps/fixture/mcp",
+        } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ));
+      const capture = vi.spyOn(sentry, "captureException").mockImplementation(() => {});
+      const app = createRouteApp(db);
+      const url = `/api/tool-connections/${connection!.id}/${path}`;
+      const response = await (path === "catalog" ? request(app).get(url) : request(app).post(url));
+      expect(response.status).toBe(422);
+      expect(response.body).toMatchObject({
+        code: "slack_mcp_access_disabled",
+        error: "Slack MCP access is disabled for this app. Ask the Slack app owner to enable MCP access, then refresh this connection.",
+        details: { code: "slack_mcp_access_disabled", setupUrl: expect.any(String) },
+      });
+      expect(JSON.stringify(response.body)).not.toContain("api.slack.com/apps/fixture");
+      expect(capture).not.toHaveBeenCalled();
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id));
+      expect(updated?.healthStatus).toBe("error");
+      expect(updated?.healthMessage).toBe(response.body.error);
+      await expect(db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection!.id)))
+        .resolves.toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["catalog", 401, 'Bearer realm="app"', 422, false],
+    ["catalog/refresh", 401, 'Bearer realm="app"', 422, false],
+    ["catalog", 400, null, 502, true],
+    ["catalog/refresh", 400, null, 502, true],
+    ["catalog", 503, null, 502, true],
+    ["catalog/refresh", 503, null, 502, true],
+  ] as const)(
+    "classifies %s upstream HTTP %i without hiding provider failures",
+    async (path, upstreamStatus, challenge, expectedStatus, reportable) => {
+      const company = await createCompany(db);
+      const [application] = await db
+        .insert(toolApplications)
+        .values({
+          companyId: company.id,
+          applicationKey: `catalog-status-${randomUUID()}`,
+          name: "Catalog status fixture",
+          type: "mcp_http",
+          status: "active",
+        })
+        .returning();
+      const [connection] = await db
+        .insert(toolConnections)
+        .values({
+          companyId: company.id,
+          applicationId: application!.id,
+          name: "Catalog status fixture",
+          uid: `test/${randomUUID()}`,
+          transport: "mcp_remote",
+          status: "draft",
+          enabled: false,
+          config: { url: "https://catalog-status.example.test/mcp" },
+          transportConfig: { url: "https://catalog-status.example.test/mcp" },
+          credentialSecretRefs: [],
+        })
+        .returning();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+        new Response(JSON.stringify({ error: "upstream request rejected" }), {
+          status: upstreamStatus,
+          headers: challenge ? { "www-authenticate": challenge } : {},
+        }),
+      );
+      const capture = vi
+        .spyOn(sentry, "captureException")
+        .mockImplementation(() => {});
+      const app = createRouteApp(db);
+      const url = `/api/tool-connections/${connection!.id}/${path}`;
+      const res = await (path === "catalog"
+        ? request(app).get(url)
+        : request(app).post(url));
+
+      expect(res.status).toBe(expectedStatus);
+      if (challenge) {
+        expect(res.body).toMatchObject({
+          error: "This app needs you to sign in.",
+          code: "oauth_challenge",
+          details: {
+            code: "oauth_challenge",
+            setupUrl: expect.any(String),
+            reconnectUrl: expect.any(String),
+          },
+        });
+      }
+      expect(capture).toHaveBeenCalledTimes(reportable ? 1 : 0);
+      await expect(
+        db.select().from(toolCatalogEntries)
+          .where(eq(toolCatalogEntries.connectionId, connection!.id)),
+      ).resolves.toHaveLength(0);
+    },
+  );
 
   it.each([
     [
@@ -13833,7 +14140,7 @@ describeEmbeddedPostgres("tool access service", () => {
         .post(`/api/companies/${company.id}/tools/apps/connect`)
         .send({ link: "https://8.8.8.8/mcp", name: "Redirect OAuth MCP" });
 
-      expect(res.status).toBe(502);
+      expect(res.status).toBe(422);
       expect(fetchMock).toHaveBeenCalledWith(
         "https://8.8.8.8/.well-known/oauth-protected-resource",
         expect.objectContaining({ redirect: "manual" }),
@@ -17671,6 +17978,14 @@ describeEmbeddedPostgres("tool access service", () => {
 });
 
 describe("classifyRisk", () => {
+  it("classifies Fireflies reads and mutations without changing action defaults", () => {
+    for (const name of ["fireflies_get_transcripts", "fireflies_get_transcript", "fireflies_get_summary"])
+      expect(classifyRisk({ name }, "fireflies")).toBe("read");
+    for (const name of ["fireflies_share_meeting", "fireflies_revoke_meeting_access", "fireflies_move_meeting", "fireflies_create_soundbite", "fireflies_update_meeting_title"])
+      expect(classifyRisk({ name, annotations: { readOnlyHint: true } }, "fireflies")).toBe("write");
+    expect(classifyRisk({ name: "fireflies_share_meeting", annotations: { destructiveHint: true } }, "fireflies")).toBe("destructive");
+  });
+
   const risk = (name: string, annotations?: Record<string, unknown>) =>
     classifyRisk({ name, annotations });
 

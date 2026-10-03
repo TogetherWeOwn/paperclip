@@ -279,9 +279,14 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { collectCompletedReviewReceipt } from "../services/completed-review-receipt.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { redactSensitiveText } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactSensitiveText,
+  restoreRedactedPlainEnvBindings,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
   deliverNativeQuestionResponse,
@@ -676,6 +681,12 @@ function readObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function readEnvRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function hasOwn(record: Record<string, unknown>, key: string) {
@@ -2977,6 +2988,7 @@ class AutoApprovalIssueMissingError extends Error {
 
 function toCompactIssue(issue: any): CompactIssue {
   return {
+    externalConversationState: issue.externalConversationState ?? null,
     id: issue.id,
     companyId: issue.companyId,
     projectId: issue.projectId,
@@ -9256,6 +9268,65 @@ export function issueRoutes(
           { source: "recovery_action_resolution" },
         );
 
+        // Retrying an exhausted disposition repair is an explicit retry of the
+        // recorded owner, never permission to reopen a stopped/completed task or
+        // silently retry a new assignee from an old notice. All admission gates
+        // below still apply, even for a board operator.
+        if (
+          outcome === "restored" &&
+          sourceIssueStatus === "todo" &&
+          activeRecoveryAction.kind === "deliberate_wait_without_target"
+        ) {
+          if (
+            lockedIssue.status !== "blocked" ||
+            activeRecoveryAction.ownerType !== "board" ||
+            activeRecoveryAction.wakePolicy?.type !== "board_escalation" ||
+            !activeRecoveryAction.returnOwnerAgentId ||
+            lockedIssue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId
+          ) {
+            throw conflict(
+              "This recovery notice no longer matches the task. Refresh the task before choosing its next step.",
+              { code: "disposition_recovery_retry_stale" },
+            );
+          }
+          const sourceOwner = lockedIssue.assigneeAgentId
+            ? await agentsSvc.getById(lockedIssue.assigneeAgentId)
+            : null;
+          if (
+            !sourceOwner ||
+            sourceOwner.companyId !== lockedIssue.companyId ||
+            sourceOwner.status === "paused" ||
+            sourceOwner.status === "terminated"
+          ) {
+            throw conflict(
+              "The assigned agent is unavailable. Resume or review the agent before retrying.",
+              { code: "disposition_recovery_owner_unavailable" },
+            );
+          }
+          const readiness = await svc.getDependencyReadiness(lockedIssue.id, tx);
+          if (readiness.unresolvedBlockerCount > 0) {
+            throw conflict("Resolve the task’s blockers before retrying.", { code: "disposition_recovery_retry_blocked" });
+          }
+          // Interaction creation also locks the source issue. Check the durable
+          // wait inside this transaction so retry cannot bypass a newer question
+          // or confirmation after the notice was rendered.
+          const [pendingInteraction] = await tx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(and(
+              eq(issueThreadInteractions.companyId, lockedIssue.companyId),
+              eq(issueThreadInteractions.issueId, lockedIssue.id),
+              eq(issueThreadInteractions.status, "pending"),
+            ))
+            .limit(1);
+          if (pendingInteraction) {
+            throw conflict(
+              "Respond to the pending question or confirmation before retrying.",
+              { code: "disposition_recovery_interaction_pending" },
+            );
+          }
+        }
+
         if (
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
@@ -13345,8 +13416,13 @@ export function issueRoutes(
       });
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
+      const completingTypedReview =
+        transition.decision?.outcome === "approved" &&
+        updateFields.status === "done" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "completed";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || completingTypedReview;
+      let completionCommentId: string | null = null;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -13356,6 +13432,49 @@ export function issueRoutes(
         updateFields.assigneeUserId === undefined
           ? existing.assigneeUserId
           : (updateFields.assigneeUserId as string | null);
+      // Agent reads redact every plain env value, so a client that copies a
+      // redacted agent env into an issue pin would otherwise persist
+      // "***REDACTED***" as the real value (the response is redacted too, so
+      // the corruption is invisible on read-back). Restore display-only
+      // placeholders from the stored override first, then the assignee
+      // agent's stored env — the same way agent updates restore redacted env.
+      if (
+        updateFields.assigneeAdapterOverrides !== undefined &&
+        updateFields.assigneeAdapterOverrides !== null
+      ) {
+        const requestedOverrides = readObject(updateFields.assigneeAdapterOverrides);
+        const requestedOverrideEnv = readEnvRecord(
+          readObject(requestedOverrides.adapterConfig).env,
+        );
+        const hasRedactedPlaceholder = requestedOverrideEnv !== null &&
+          Object.values(requestedOverrideEnv).some(
+            (binding) =>
+              readEnvRecord(binding)?.type === "plain" &&
+              readEnvRecord(binding)?.value === REDACTED_EVENT_VALUE,
+          );
+        if (requestedOverrideEnv !== null && hasRedactedPlaceholder) {
+          const storedEnvRecord = readEnvRecord(
+            readObject(readObject(existing.assigneeAdapterOverrides).adapterConfig).env,
+          );
+          let agentEnvRecord: Record<string, unknown> | null = null;
+          if (typeof nextAssigneeAgentId === "string" && nextAssigneeAgentId) {
+            const assigneeAgent = await agentsSvc.getById(nextAssigneeAgentId);
+            agentEnvRecord = assigneeAgent?.companyId === existing.companyId
+              ? readEnvRecord(readObject(assigneeAgent.adapterConfig).env)
+              : null;
+          }
+          updateFields.assigneeAdapterOverrides = {
+            ...requestedOverrides,
+            adapterConfig: {
+              ...readObject(requestedOverrides.adapterConfig),
+              env: restoreRedactedPlainEnvBindings(
+                requestedOverrideEnv,
+                [storedEnvRecord, agentEnvRecord],
+              ),
+            },
+          };
+        }
+      }
       const assigneeWillChange =
         nextAssigneeAgentId !== existing.assigneeAgentId ||
         nextAssigneeUserId !== existing.assigneeUserId;
@@ -13567,6 +13686,9 @@ export function issueRoutes(
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
       ) => {
         if (!persistReviewActivityTransactionally) return;
+        const completedReviewEvidence = completingTypedReview
+          ? await collectCompletedReviewReceipt(tx as unknown as Db, updated, actor)
+          : null;
         const changes = updated.changes ?? {};
         const previous = Object.fromEntries(
           Object.entries(changes).map(([key, change]) => [key, change.from]),
@@ -13586,6 +13708,12 @@ export function issueRoutes(
             entityId: updated.id,
             details: {
               ...updateFields,
+              ...(completedReviewEvidence ? {
+                completedReviewEvidence,
+                completionCommentId,
+                status: updated.status,
+                executionState: updated.executionState,
+              } : {}),
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
@@ -13643,7 +13771,7 @@ export function issueRoutes(
         transition.decision && decisionId ? transition.decision : null;
       let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
         null;
-      const attachmentCommentSourceTrust = commentAttachmentIds?.length
+      const attachmentCommentSourceTrust = commentAttachmentIds?.length || completingTypedReview
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13662,9 +13790,9 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length) {
+            if (commentAttachmentIds?.length || (completingTypedReview && commentBody)) {
+              // The final approval comment is bound into the completion receipt.
               // Reassignment, comment creation and upload binding commit together.
-              // An invalid or already-bound receipt rolls back the issue update.
               attachmentComment = await svc.addComment(
                 id,
                 commentBody,
@@ -13678,11 +13806,13 @@ export function issueRoutes(
                 {
                   attachmentIds: commentAttachmentIds,
                   clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                  mirrorToSlack: actor.actorType === "user",
                   authorizationReason: issueMutationAuthorizationReason,
                   sourceTrust: attachmentCommentSourceTrust,
                 },
                 tx,
               );
+              if (completingTypedReview) completionCommentId = attachmentComment.id;
             }
 
             if (decision && decisionId) {
@@ -14283,6 +14413,7 @@ export function issueRoutes(
           {
             authorizationReason: issueMutationAuthorizationReason,
             clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+            mirrorToSlack: actor.actorType === "user",
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
@@ -14290,6 +14421,7 @@ export function issueRoutes(
         await externalObjectsSvc.syncCommentSafely(comment.id);
         if (
           issue.assigneeAgentId &&
+          !issue.externalConversationState &&
           !(
             actor.actorType === "agent" &&
             actor.actorId === issue.assigneeAgentId
@@ -14490,6 +14622,11 @@ export function issueRoutes(
             typeof wakeup.payload.issueId === "string"
               ? wakeup.payload.issueId
               : issue.id;
+          // Provider turns use the task identifier as their session key. Board
+          // messages must resume that same session instead of creating a UUID-keyed fork.
+          if (wakeIssueId === issue.id && issue.externalConversationState && issue.identifier) {
+            wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: issue.identifier };
+          }
           wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
         };
         const addDependencyResolvedWakeup = async (input: {
@@ -17634,6 +17771,7 @@ export function issueRoutes(
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          mirrorToSlack: actor.actorType === "user",
           sourceTrust,
         };
         let txResult: {
@@ -17746,6 +17884,7 @@ export function issueRoutes(
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          mirrorToSlack: actor.actorType === "user",
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };
@@ -17771,6 +17910,9 @@ export function issueRoutes(
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         currentIssue.assigneeAgentId &&
+        // Slack-linked messages need the normal attributed wake boundary so
+        // the accepted requester and return-thread receipt travel with the run.
+        !currentIssue.externalConversationState &&
         !(
           actor.actorType === "agent" &&
           actor.actorId === currentIssue.assigneeAgentId
@@ -17954,6 +18096,9 @@ export function issueRoutes(
               : currentIssue.id;
           const key = `${agentId}:${wakeIssueId}`;
           if (wakeups.has(key)) return;
+          if (wakeIssueId === currentIssue.id && issue.externalConversationState && currentIssue.identifier) {
+            wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: currentIssue.identifier };
+          }
           wakeups.set(key, { agentId, wakeup });
         };
         const addDependencyResolvedWakeup = async (input: {

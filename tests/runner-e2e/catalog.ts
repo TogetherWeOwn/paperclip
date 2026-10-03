@@ -1,8 +1,10 @@
+import { accountingTasks } from "./accounting-cases.js";
 import { continuationTasks } from "./continuation-cases.js";
+import { lifecycleLiveTasks, lifecycleLiveDefinitionDigest } from "./lifecycle-live-cases.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
-import { chatTasks, chatHardeningTasks } from "./chat-cases.js";
+import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
 import { createEnvironmentSchema } from "../../packages/shared/src/validators/environment.js";
@@ -910,6 +912,26 @@ const everydayProfiles = [
 
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
   {
+    id: "continuation-accounting", label: "Continuation accounting baseline", manualOnly: true,
+    description: "Structured productive steps, bounded repair, restart and late gates; comments cannot buy more attempts.",
+    groups: ["local"], environments: [localEnvironment], profiles: codexContinuityProfiles.map(productionStoryProfile),
+    tasks: accountingTasks, expectedMatrixSize: 8,
+    excludedExecutionIds: accountingTasks.filter(t => !t.id.includes("productive")).map(t => `continuation-accounting.runner-codex.local.${t.id}`),
+    definitionMetadata: { version: 4, grading: "accounting-v4-cancellation-evidence", scheduling: "explicit-only", providerTurns: "five productive, three repair, two executed plus one cancelled for Stop" },
+  },
+  {
+    id: "lifecycle-baseline", label: "Lifecycle authority baseline", manualOnly: true,
+    description: "Paired narrative probes plus real stop/resume and governed-action controls; live browser/server/database/provider execution.",
+    groups: ["local"], environments: [localEnvironment],
+    profiles: codexContinuityProfiles.map(productionStoryProfile),
+    tasks: [...lifecycleLiveTasks,
+      ...chatTasks.filter(task => ["clarify-reuse", "stop-new-resume"].includes(task.id)),
+      ...connectionReviewSuite.tasks],
+    expectedMatrixSize: 46,
+    excludedExecutionIds: ["neutral", "challenge"].map(variant => `lifecycle-baseline.runner-codex.local.lifecycle-repair-${variant}`),
+    definitionMetadata: { version: 1, narrativeDigest: lifecycleLiveDefinitionDigest, grading: "durable-state-and-attributed-narrative", scheduling: "explicit-only" },
+  },
+  {
     id: "continuation", label: "Task continuation",
     description: "Human direction, approval boundaries, untrusted evidence, and completed actions across turns.",
     groups: ["local"], environments: [localEnvironment],
@@ -919,13 +941,13 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       ...["legacy-codex", "legacy-claude"].map(profile => `continuation.${profile}.local.question-tool-documentation`),
       ...["legacy-codex", "legacy-claude", "runner-codex"].map(profile => `continuation.${profile}.local.provider-question-bridge`),
     ],
-    definitionMetadata: { version: 3, grading: "durable-state-and-approval-boundaries", instructions: "production" },
+    definitionMetadata: { version: 4, grading: "durable-state-and-approval-boundaries", instructions: "production" },
   },
   {
     id: "everyday-workflows", label: "Everyday Paperclip Work", manualOnly: true,
     description: "Real user requests, useful downloaded work, and durable continuation using production instructions.",
     groups: ["native"], profiles: everydayProfiles, environments: [localEnvironment, daytonaWarmEnvironment],
-    tasks: everydayTasks, expectedMatrixSize: 38,
+    tasks: everydayTasks, expectedMatrixSize: 47,
     excludedExecutionIds: [...everydayProfiles.flatMap(profile => everydayTasks
       .filter(task => !["build-revise", "delegate-feedback", "recover-controller", "create-skill-studio"].includes(task.id))
       .map(task => `everyday-workflows.${profile.id}.daytona.${task.id}`))],
@@ -958,6 +980,24 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
       ["stop-startup-new-resume", "hire-delegate-reuse", "blocked-status-review"].map(task => `agent-chat-hardening.${profile}.daytona.${task}`)),
     definitionMetadata: { version: 5, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations", hiringReference: "neutral-document-reference-line" },
+  },
+  {
+    id: "agent-chat-stories", label: "Agent Chat Setup and Interruptions", manualOnly: true,
+    description: "Experimental settings lifecycle and user follow-ups during active native work.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatStoryTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 3, setup: "configured-native-agent", permissions: "production-defaults", interruptionBoundary: "provider-file-wait-in-agent-workspace", grading: "persisted-comments-and-plan-run-attributed", scheduling: "explicit-only" },
+  },
+  {
+    id: "agent-chat-qualification", label: "Agent Chat Remaining Qualification", manualOnly: true,
+    description: "Active ownership transfer, user recovery after worker loss, and grounded answer quality.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatQualificationTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 9, permissions: "production-defaults", instructions: "production", crashBoundary: "verified-native-worker-pid-at-file-wait", recovery: "new-user-message-after-verified-cleanup", answerGrading: "exact-grounded-propositions-plus-separate-semantic-review", scheduling: "explicit-only" },
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
@@ -1033,6 +1073,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: task.id,
           flow: task.flow,
           expectedRunCount: task.expectedRunCount,
+          ...(task.minimumExpectedRunCount === undefined ? {} : { minimumExpectedRunCount: task.minimumExpectedRunCount }),
           restartServerBeforeQuestionAnswer:
             task.restartServerBeforeQuestionAnswer ?? false,
         })),
@@ -1120,6 +1161,8 @@ function assertNoRawSecretValues(value: unknown, label: string) {
 export function validateRunnerCatalog(): MatrixExecution[] {
   const allProfiles = [...runnerProfiles, ...openRouterBreadthProfiles, ...everydayProfiles.filter(p => !runnerProfiles.some(existing => existing.id === p.id))];
   const allTasks = [
+    ...accountingTasks,
+    ...lifecycleLiveTasks,
     ...continuationTasks,
     ...everydayTasks,
     ...runnerTasks,

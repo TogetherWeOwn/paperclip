@@ -123,6 +123,11 @@ Paid tests never silently skip a missing credential or unsupported artifact.
 
 ## New Paperclip object fixtures
 
+The explicit-only `lifecycle-baseline` suite reuses this registry and existing
+continuation, chat and governed-action flows. Its narrative pairs require actual
+agent/run-attributed comments or exact visible responses. See
+[the live baseline contract](LIFECYCLE-BASELINE.md) for selectors and proof boundaries.
+
 Register new objects in `live-fixtures.ts` with explicit dependencies in
 `FixtureRegistry`. Setup must use a public API. Teardown runs in reverse order
 and is invoked after partial setup failures. Direct database writes and private
@@ -195,3 +200,28 @@ The lost-acknowledgement probe may interrupt only the fixture browser's own
 comment request after the real server has committed it. Retain its request ID
 and replay that same request through the public API after restarting the server.
 Never fabricate tool results or repair task state after a failed assertion.
+
+`chat-stories.ts` seeds an ordinary file wait in the isolated agent's actual
+home workspace; native Codex intentionally cannot see arbitrary host temp files.
+The observed run workspace must match the fixture location. This is a deterministic interruption
+boundary. The real provider command writes the readiness file and waits at most
+two minutes. The harness must persist the next browser message while the same
+run is active before supplying the brief. Always release the wait in `finally`.
+Save boundary observations independently of the final outcome. The final answer
+must recover a brief reference absent from both prompts; the revision oracle
+also reads the actual conversation plan. Fixture setup never enables native API
+tools for this suite. Do not describe its prepared-agent settings case as a
+production onboarding qualification.
+
+The `agent-chat-qualification` local fixtures use public APIs to seed two workers
+and a task with a saved plan, or read-only tasks with contradictory historical
+comments. Ordinary Node file waits in the isolated agent workspace establish
+observable active execution; no provider output or database outcome is fabricated.
+A worker-crash case sends SIGKILL only to a positively identified running native
+worker PID, then uses the production Retry button. Each gate is released in a
+finally block. Source facts and boundary state are retained with the attempt.
+The lifecycle suite also includes two legacy disposition-repair probes. Their
+first provider turn intentionally omits task disposition, and their second turn
+must be an automatic, causally bound repair that records completion. They use
+public task comments/status APIs and run-detail evidence; no private runtime
+hooks or database mutations are used by the fixture.

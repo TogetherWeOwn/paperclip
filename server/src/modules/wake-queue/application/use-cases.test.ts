@@ -115,6 +115,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
     isCompletedDelegationMention: vi.fn(async () => false),
+    isCommentWakeCoveredByCompletedReview: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
@@ -509,6 +510,45 @@ describe("releaseIssueExecution", () => {
     expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
     expect(result.outcome.kind).toBe("released");
   });
+
+  it.each(["stale_agent", "stale_human", "new_human", "explicit_resume", "interaction"])(
+    "preserves completed native review without suppressing intentional follow-up (%s)", async (scenario) => {
+      const commentIds = ["review-closing-comment"];
+      const queue = [wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: scenario === "stale_agent" || scenario === "explicit_resume" ? "agent" : "user",
+        wakeReason: "issue_reopened_via_comment",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+        deferredContextSeed: scenario === "explicit_resume" ? { resumeIntent: true } : {},
+        preservesIndependentContinuation: scenario === "interaction" || scenario === "explicit_resume",
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: commentIds, containedSelfAuthoredComment: false })),
+        isCommentWakeCoveredByCompletedReview: vi.fn(async () => scenario !== "new_human"),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status: "done" }),
+        recovery: createFakeRecovery(),
+      });
+      const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+      if (scenario.startsWith("stale_")) {
+        expect(transaction.cancelDeferredWake).toHaveBeenCalledWith(expect.objectContaining({
+          reason: "Deferred comment already covered by completed native review",
+        }));
+        expect(transaction.reopenIssue).not.toHaveBeenCalled();
+        expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalled();
+        expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+        expect(result.outcome.kind).toBe("released");
+      } else {
+        expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+        expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+        expect(result.outcome.kind).toBe("promoted");
+      }
+    },
+  );
 
   it("reopens a completed task before promoting its assignee's human follow-up", async () => {
     const queue = [wakeCandidate({

@@ -108,6 +108,25 @@ and review run. The server reads these records from saved review state; it does
 not depend on the parent session remembering a separate review session. These
 records are evidence and do not grant permission to resolve another review.
 
+### Answered Slack conversations
+
+A successful Slack turn with a published final reply and no remaining execution
+or decision path settles to `chat_conversations.state = waiting` and issue
+`in_review`. This is a server-owned passive conversation state, displayed as
+**Idle**, not a request for review. It is excluded from execution counts, work
+queues, and generic review attention, while remaining accessible through
+Conversations, search, recent history, and unread activity.
+
+An admitted Slack or board message clears waiting and returns the issue to
+`todo` in the message transaction; normal wake admission and checkout resume
+execution. Settlement rechecks the
+latest run, message cursor, publication receipt, and outstanding work under the
+task lock. Failed delivery, a newer message, queued work, monitors, dependencies,
+and pending decisions prevent settlement. Reconciliation applies the same rule
+to existing answered threads without another model invocation. Slack identity,
+permissions, and the ability to execute work in the same thread are unchanged.
+Other providers keep their existing lifecycle.
+
 ### `done`
 
 The work is complete and terminal.
@@ -334,6 +353,12 @@ The valid action-path primitives are:
 - a first-class blocker chain whose unresolved leaf issues are themselves healthy
 - an open explicit recovery action that names the owner and action needed to restore liveness
 
+A bounded review-path recovery for a task from a supported external-chat
+provider retains the source run's admitted message IDs. It does not inherit checkout or authorization
+markers. Before dispatch, Paperclip verifies the recovery run's task ownership
+and current conversation, endpoint, and principal access for every message.
+Missing message references or revoked access still prevent execution.
+
 ### Durable external waits and heartbeat finalization
 
 An external wait counts as a live or waiting path only when the next move survives the current heartbeat and is represented in Paperclip's durable control-plane state. Valid external-wait shapes are:
@@ -375,6 +400,10 @@ Document-scoped activity may still route work when it is converted into an expli
 - intentional board routing that assigns or reassigns the issue, opens a first-class blocker, creates delegated follow-up work, or queues a typed wake
 
 Freeform document approval text is not auto-acceptance. Plan approval, implementation approval, or review acceptance must flow through the explicit interaction, approval, execution-policy, assignment, or blocker primitives that define who owns the next move.
+
+An interaction can be created by a run on another task in the same company, or by a run with no task. That run records the interaction's origin; its comments and results do not become context for the target task. Explicit resume and retry history takes precedence and must belong to the target task.
+
+New interactions exclude known comments from other tasks when recording their origins. At dispatch, older interactions may discard a copied origin only when both the producer's saved context and a comment on that producer's other task prove where it came from. Missing records, cross-company references, explicit wake comments, and unrelated origins still fail closed.
 
 ### Comment interrupts and ownership handoffs
 

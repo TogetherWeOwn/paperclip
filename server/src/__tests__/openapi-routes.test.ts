@@ -29,12 +29,14 @@ const apiPrefixes: Record<string, string> = {
   "board-chat.ts": "/api",
   "built-in-agents.ts": "/api",
   "chat-channels.ts": "/api",
+  "slack-tools.ts": "/api",
   "email.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
   "company-skill-policy.ts": "/api",
   "connection-intents.ts": "/api",
+  "completed-review-restoration.ts": "/api",
   "costs.ts": "/api",
   "dashboard.ts": "/api",
   "decision-queues.ts": "/api",
@@ -225,6 +227,22 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents locator-only completed review restoration and refusal responses", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/completed-review/restore"].post;
+    const schema = operation.requestBody.content["application/json"].schema;
+    expect(schema).toMatchObject({ additionalProperties: false, required: ["completionActivityId", "wakeupRequestId"] });
+    expect(Object.keys(schema.properties)).toEqual(["completionActivityId", "wakeupRequestId"]);
+    for (const property of Object.values(schema.properties)) {
+      expect(property).toMatchObject({ type: "string", format: "uuid" });
+    }
+    for (const status of [200, 400, 401, 403, 404, 409, 422]) {
+      expect(operation.responses[String(status)]).toBeDefined();
+    }
+    expect(operation.description).toContain("persisted active exact-issue run");
+    expect(operation.description).toContain("never client state or replacement approvals");
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
@@ -954,4 +972,11 @@ describe("heartbeat run ID OpenAPI contract", () => {
     }
     expect(checked).toBe(12);
   });
+});
+
+it("documents the account binding required for preference reads", () => {
+  const operation = buildOpenApiSpec().paths["/api/auth/preferences"]?.get;
+  expect(operation?.parameters).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "expectedUserId", in: "query", required: true }),
+  ]));
 });
