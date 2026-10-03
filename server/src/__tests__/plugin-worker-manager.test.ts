@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   createHostClientHandlers,
@@ -32,6 +32,7 @@ import {
   createDuplexRouteSlotController,
   createPluginWorkerHandle,
   formatWorkerFailureMessage,
+  resolveDefaultRpcTimeoutMsFromEnv,
   resolveRpcCallTimeoutMs,
 } from "../services/plugin-worker-manager.js";
 
@@ -103,6 +104,41 @@ describe("resolveRpcCallTimeoutMs", () => {
       expect(resolveRpcCallTimeoutMs(bad, DEFAULT_RPC_TIMEOUT_MS)).toBe(DEFAULT_RPC_TIMEOUT_MS);
     }
     expect(resolveRpcCallTimeoutMs(Number.NaN, 24 * 60 * 60 * 1_000)).toBe(MAX_RPC_TIMEOUT_MS);
+  });
+});
+
+describe("resolveDefaultRpcTimeoutMsFromEnv", () => {
+  const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("returns the 30s default when the variable is unset", () => {
+    delete process.env.PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS;
+    expect(resolveDefaultRpcTimeoutMsFromEnv()).toBe(30_000);
+  });
+
+  it("honors a valid override below the ceiling", () => {
+    vi.stubEnv("PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS", "120000");
+    expect(resolveDefaultRpcTimeoutMsFromEnv()).toBe(120_000);
+  });
+
+  it("clamps an override above the 15-minute ceiling", () => {
+    vi.stubEnv("PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS", String(60 * 60 * 1_000));
+    expect(resolveDefaultRpcTimeoutMsFromEnv()).toBe(MAX_RPC_TIMEOUT_MS);
+  });
+
+  it("truncates a fractional override", () => {
+    vi.stubEnv("PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS", "1000.9");
+    expect(resolveDefaultRpcTimeoutMsFromEnv()).toBe(1_000);
+  });
+
+  it("falls back to 30s for unusable overrides", () => {
+    for (const bad of ["", "garbage", "-5", "0", "NaN", "Infinity"]) {
+      vi.stubEnv("PAPERCLIP_PLUGIN_RPC_TIMEOUT_MS", bad);
+      expect(resolveDefaultRpcTimeoutMsFromEnv()).toBe(30_000);
+    }
   });
 });
 
