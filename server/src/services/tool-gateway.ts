@@ -5761,11 +5761,14 @@ export function createToolGatewayService(
     const content = googleWorkspacePermissionDenied
       ? "Google rejected this call. Google Workspace MCP is a Developer Preview: enroll the signed-in Workspace account and this OAuth client's Google Cloud project in Google's Developer Preview Program, wait for Google's registration confirmation, then reconnect and try again."
       : providerContent;
+    const structuredContent = record.structuredContent;
     return {
       content,
       data: {
         content: record.content,
-        structuredContent: record.structuredContent ?? null,
+        ...(typeof structuredContent === "object" && structuredContent !== null && !Array.isArray(structuredContent)
+          ? { structuredContent: structuredContent as Record<string, unknown> }
+          : {}),
         isError: record.isError === true,
         transport,
         spawnedLocalProcess,
@@ -7417,13 +7420,36 @@ export function createToolGatewayService(
   function storedInvocationResult(
     invocation: typeof toolInvocations.$inferSelect,
   ): unknown {
+    const failed =
+      invocation.status !== "succeeded" || invocation.errorMessage != null;
     const summary = invocation.resultSummary?.summary;
-    if (typeof summary !== "string") return null;
-    try {
-      return JSON.parse(summary);
-    } catch {
-      return summary;
+    let parsed: unknown = null;
+    if (typeof summary === "string") {
+      try {
+        parsed = JSON.parse(summary);
+      } catch {
+        parsed = summary;
+      }
     }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      if (failed && record.isError !== true) {
+        return { ...record, isError: true };
+      }
+      return record;
+    }
+    if (failed) {
+      const message = invocation.errorMessage ?? "Tool call failed";
+      if (typeof parsed === "string" && parsed.length > 0) {
+        return { content: parsed, isError: true, error: message };
+      }
+      return {
+        content: [{ type: "text", text: message }],
+        isError: true,
+        error: message,
+      };
+    }
+    return parsed;
   }
 
   async function actionRequestResolution(
@@ -10299,7 +10325,7 @@ export function createToolGatewayService(
             invocationId,
             status: "replayed" as const,
             tool: tool.name,
-            result: recorded.invocation.resultSummary ?? null,
+            result: storedInvocationResult(recorded.invocation),
           };
         }
         if (accessDecision.decision === "require_approval") {
@@ -10766,7 +10792,7 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
-        return recorded.invocation.resultSummary;
+        return storedInvocationResult(recorded.invocation);
       }
 
       if (accessDecision.decision === "require_approval") {
