@@ -335,6 +335,115 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(freshPrompt).toContain("Read my Notion launch notes.");
       expect(freshPrompt).not.toContain('"resumeDelta"');
     });
+    it("caps an oversized newest human message without mutating history on a fresh turn", async () => {
+      const freshIssueId = randomUUID(), freshRunId = randomUUID();
+      const smallId = randomUUID(), bigId = randomUUID(), answerId = randomUUID();
+      const bigBody = `Human direction with a very large payload. ${"x".repeat(100 * 1024)}`;
+      await db.insert(issues).values({
+        id: freshIssueId, companyId, title: "Cap fresh", status: "in_progress",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: freshRunId, companyId, agentId, status: "failed",
+        contextSnapshot: { issueId: freshIssueId },
+      });
+      await db.insert(issueComments).values([
+        { id: smallId, companyId, issueId: freshIssueId, authorType: "user",
+          authorUserId: "local-board", body: "Start with the small request.",
+          createdAt: new Date("2026-09-08T10:00:00Z") },
+        { id: bigId, companyId, issueId: freshIssueId, authorType: "user",
+          authorUserId: "local-board", body: bigBody,
+          createdAt: new Date("2026-09-08T10:01:00Z") },
+      ]);
+      await db.insert(issueThreadInteractions).values({ id: answerId, companyId, issueId: freshIssueId,
+        kind: "ask_user_questions", status: "answered", resolvedByUserId: "local-board", resolvedAt: new Date(),
+        payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single", options: [{ id: "answer", label: "Answer", freeText: true }] }] },
+        result: { version: 1, answers: [{ questionId: "scope", optionIds: [], otherText: "Plan Amber instead." }] },
+      });
+      try {
+        const envelope = await buildExecutionContinuation({ db, companyId,
+          issueId: freshIssueId, agentId, context: {}, summary: null, exposeLowTrustRaw: false });
+        expect(envelope.truncated).toBe(true);
+        expect(envelope.fallbackFetchNeeded).toBe(true);
+        const newest = envelope.messages.at(-1);
+        expect(newest?.id).toBe(bigId);
+        expect(newest?.bodyTruncated).toBe(true);
+        expect(newest?.body.endsWith("[truncated; fetch the source comment for the full body]")).toBe(true);
+        expect(Buffer.byteLength(newest!.body, "utf8")).toBeLessThanOrEqual(96 * 1024);
+        // The cap copies the newest message instead of mutating shared history.
+        const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, bigId));
+        expect(stored.body).toBe(bigBody);
+        // The objective is selected from the full history and bounded on its own budget.
+        expect(envelope.objective.endsWith("[objective truncated; fetch the source message for the full request]")).toBe(true);
+        expect(envelope.objective).not.toContain("[truncated; fetch the source comment for the full body]");
+        expect(envelope.humanResponses).toEqual([expect.objectContaining({ id: answerId, resolvedByUserId: "local-board" })]);
+        expect(envelope.resumeDelta).toBeUndefined();
+      } finally {
+        await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, answerId));
+        await db.delete(issueComments).where(eq(issueComments.issueId, freshIssueId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, freshRunId));
+        await db.delete(issues).where(eq(issues.id, freshIssueId));
+      }
+    });
+    it("caps an oversized newest human message without mutating history on a resumed turn", async () => {
+      const resumedIssueId = randomUUID(), resumedRunId = randomUUID();
+      const smallId = randomUUID(), bigId = randomUUID(), answerId = randomUUID();
+      const bigBody = `Follow-up human direction with a very large payload. ${"y".repeat(100 * 1024)}`;
+      await db.insert(issues).values({
+        id: resumedIssueId, companyId, title: "Cap resumed", status: "in_progress",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: resumedRunId, companyId, agentId, status: "failed",
+        contextSnapshot: { issueId: resumedIssueId },
+      });
+      await db.insert(issueComments).values([
+        { id: smallId, companyId, issueId: resumedIssueId, authorType: "user",
+          authorUserId: "local-board", body: "Start with the small request.",
+          createdAt: new Date("2026-09-08T10:00:00Z") },
+      ]);
+      await db.insert(issueThreadInteractions).values({ id: answerId, companyId, issueId: resumedIssueId,
+        kind: "ask_user_questions", status: "answered", resolvedByUserId: "local-board", resolvedAt: new Date(),
+        payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single", options: [{ id: "answer", label: "Answer", freeText: true }] }] },
+        result: { version: 1, answers: [{ questionId: "scope", optionIds: [], otherText: "Plan Amber instead." }] },
+      });
+      try {
+        const first = await buildExecutionContinuation({ db, companyId,
+          issueId: resumedIssueId, agentId, context: {}, summary: null, exposeLowTrustRaw: false });
+        expect(first.truncated).toBeUndefined();
+        await db.update(heartbeatRuns)
+          .set({ contextSnapshot: { issueId: resumedIssueId, executionContinuation: first } })
+          .where(eq(heartbeatRuns.id, resumedRunId));
+        await db.insert(issueComments).values([
+          { id: bigId, companyId, issueId: resumedIssueId, authorType: "user",
+            authorUserId: "local-board", body: bigBody,
+            createdAt: new Date("2026-09-08T10:01:00Z") },
+        ]);
+        const resumed = await buildExecutionContinuation({ db, companyId,
+          issueId: resumedIssueId, agentId, previousContextRunId: resumedRunId,
+          context: {}, summary: null, exposeLowTrustRaw: false });
+        // Delta is computed from the full history, so the burst is not dropped.
+        expect(resumed.resumeDelta?.messages.map((row) => row.id)).toContain(bigId);
+        const deltaNewest = resumed.resumeDelta?.messages.at(-1);
+        expect(deltaNewest?.id).toBe(bigId);
+        expect(deltaNewest?.bodyTruncated).toBe(true);
+        const newest = resumed.messages.at(-1);
+        expect(newest?.id).toBe(bigId);
+        expect(newest?.bodyTruncated).toBe(true);
+        expect(resumed.truncated).toBe(true);
+        expect(resumed.fallbackFetchNeeded).toBe(true);
+        const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, bigId));
+        expect(stored.body).toBe(bigBody);
+        expect(resumed.objective.endsWith("[objective truncated; fetch the source message for the full request]")).toBe(true);
+        expect(resumed.objective).not.toContain("[truncated; fetch the source comment for the full body]");
+        expect(resumed.humanResponses).toEqual([expect.objectContaining({ id: answerId, resolvedByUserId: "local-board" })]);
+      } finally {
+        await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, answerId));
+        await db.delete(issueComments).where(eq(issueComments.issueId, resumedIssueId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, resumedRunId));
+        await db.delete(issues).where(eq(issues.id, resumedIssueId));
+      }
+    });
     it("fails closed when required originating context is missing", async () => {
       await expect(
         buildExecutionContinuation({
