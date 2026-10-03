@@ -23,9 +23,10 @@ set -euo pipefail
 # provider endpoint (see validateAiApiKey). Like docker-onboard-smoke.sh's
 # provider mock, this harness answers api.anthropic.com from a local mock so
 # the gate never depends on a real paid credential or provider uptime: the
-# product is not touched — the mock binds loopback 443 and the server process
-# resolves that one hostname to it through a hosts entry the harness manages,
-# and the mock's self-signed certificate is trusted via NODE_EXTRA_CA_CERTS.
+# product is not touched — the workflow runs the boot step through sudo, so
+# the mock binds loopback 443 and the server resolves that one hostname to
+# it through a hosts entry the harness manages, and the mock's self-signed
+# certificate is trusted via NODE_EXTRA_CA_CERTS.
 # What the gate proves is that this source can finish onboarding when the
 # provider accepts the credential — the provider's actual verdict is not this
 # source's code.
@@ -58,7 +59,6 @@ SOURCE_SMOKE_SERVER_LOG_NAME="${SOURCE_SMOKE_SERVER_LOG_NAME:-source-onboard-ser
 SERVER_PID=""
 MOCK_PID=""
 TMP_DIR=""
-HOSTS_FILE="${SOURCE_SMOKE_HOSTS_FILE:-}"
 HOSTS_TOUCHED="false"
 
 mkdir -p "$DATA_DIR"
@@ -74,12 +74,11 @@ cleanup() {
   if [[ -n "$MOCK_PID" ]]; then
     kill "$MOCK_PID" >/dev/null 2>&1 || true
   fi
-  # The provider mock resolves through a hosts file the harness manages
-  # (the container image's /etc/hosts in CI, a temp copy pointed at by
-  # SOURCE_SMOKE_HOSTS_FILE elsewhere). Remove only the entry this script
-  # added, never anything else in the file.
-  if [[ "$HOSTS_TOUCHED" == "true" && -n "$HOSTS_FILE" ]]; then
-    sed -i '/# paperclip-source-smoke-provider-mock$/d' "$HOSTS_FILE" 2>/dev/null || true
+  # The provider mock resolves through /etc/hosts, written by the sudo
+  # step below. Remove only the entry this script added, never anything
+  # else in the file.
+  if [[ "$HOSTS_TOUCHED" == "true" ]]; then
+    sed -i '/# paperclip-source-smoke-provider-mock$/d' /etc/hosts 2>/dev/null || true
   fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf "$TMP_DIR"
@@ -195,25 +194,18 @@ const server = createServer(
     res.end(JSON.stringify({ error: { type: "not_found_error", message: "provider mock: unexpected endpoint" } }));
   },
 );
+// Port 443 is what the product dials by name. Binding it needs privilege;
+// the workflow runs this step through sudo exactly for the two privileged
+// operations below (hosts entry + 443 bind), and nothing else in the
+// harness needs it.
 server.listen(443, "127.0.0.1", () => console.log("[provider-mock] listening on 127.0.0.1:443"));
 MOCK_EOF
 
-  # The mock must answer the provider's public hostname. It binds the
-  # loopback 443 the product dials by name; only the one hostname resolves
-  # there, and only for this run — removed in cleanup. The file defaults to
-  # the container image's /etc/hosts (writable for root on GitHub runners);
-  # local runs without that access point SOURCE_SMOKE_HOSTS_FILE at a temp
-  # copy and run the server with a matching resolver override.
-  if [[ -z "$HOSTS_FILE" ]]; then
-    if [[ -w /etc/hosts ]]; then
-      HOSTS_FILE=/etc/hosts
-    else
-      echo "Source smoke failed: /etc/hosts is not writable; set SOURCE_SMOKE_HOSTS_FILE to a writable hosts file" >&2
-      return 1
-    fi
-  fi
-  if ! grep -q "api.anthropic.com # paperclip-source-smoke-provider-mock$" "$HOSTS_FILE" 2>/dev/null; then
-    echo "127.0.0.1 api.anthropic.com # paperclip-source-smoke-provider-mock" >>"$HOSTS_FILE"
+  # The mock must answer the provider's public hostname. Only that one name
+  # resolves to loopback, and only for this run — removed in cleanup. The
+  # workflow runs this step through sudo, so /etc/hosts is writable here.
+  if ! grep -q "api.anthropic.com # paperclip-source-smoke-provider-mock$" /etc/hosts 2>/dev/null; then
+    echo "127.0.0.1 api.anthropic.com # paperclip-source-smoke-provider-mock" >>/etc/hosts
     HOSTS_TOUCHED="true"
   fi
 
@@ -222,10 +214,7 @@ MOCK_EOF
   MOCK_PID=$!
 
   for ((i = 1; i <= 30; i += 1)); do
-    # Probe by IP with the hostname for TLS verification: the CI runner
-    # resolves the name through the managed hosts file, but a local run with
-    # SOURCE_SMOKE_HOSTS_FILE may not — the mock answers either way.
-    if curl -fkss --resolve api.anthropic.com:443:127.0.0.1 https://api.anthropic.com/v1/models >/dev/null 2>&1; then
+    if curl -fkss https://api.anthropic.com/v1/models >/dev/null 2>&1; then
       echo "    Provider mock: api.anthropic.com -> 127.0.0.1 (mock pid $MOCK_PID)"
       return 0
     fi

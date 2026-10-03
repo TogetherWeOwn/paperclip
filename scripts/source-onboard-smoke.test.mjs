@@ -44,6 +44,10 @@ test("smoke script keeps its load-bearing assertions", () => {
   assert.match(script, /api\.anthropic\.com/);
   assert.match(script, /provider mock: unexpected endpoint/);
   assert.match(script, /NODE_EXTRA_CA_CERTS/);
+  // Privilege is explicit and minimal: the mock binds loopback 443 and maps
+  // the one hostname through /etc/hosts, and only that boot runs elevated.
+  assert.match(script, /server\.listen\(443, "127\.0\.0\.1"/);
+  assert.match(script, />>\/etc\/hosts/);
   // Reports the server pid so the workflow can stop it after the suite.
   assert.match(script, /SMOKE_SERVER_PID/);
 });
@@ -51,10 +55,25 @@ test("smoke script keeps its load-bearing assertions", () => {
 test("source-smoke workflow checks out the selected source and runs the release suite", () => {
   assert.match(sourceWorkflow, /ref: \$\{\{ inputs\.source_sha \}\}/);
   assert.match(sourceWorkflow, /test "\$\(git rev-parse HEAD\)" = "\$\{\{ inputs\.source_sha \}\}"/);
+  assert.match(sourceWorkflow, /persist-credentials: false/);
+  // No pnpm cache: the checkout is a caller-supplied SHA, and a cache keyed
+  // on the lockfile could restore dependencies the selected source never had.
+  assert.doesNotMatch(sourceWorkflow, /cache: pnpm/);
   assert.match(sourceWorkflow, /scripts\/source-onboard-smoke\.sh/);
+  // Privilege is explicit and scoped: only the mock/server boot runs
+  // elevated (443 bind + hosts entry); install, suite, and upload do not.
+  assert.match(sourceWorkflow, /sudo -E env/);
+  assert.equal(
+    (sourceWorkflow.match(/sudo -E env/g) ?? []).length,
+    1,
+    "exactly one sudo step: the mock/server boot",
+  );
   assert.match(sourceWorkflow, /pnpm run test:release-smoke/);
   assert.match(sourceWorkflow, /PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"/);
   assert.match(sourceWorkflow, /google-chrome --version/);
+  // Least privilege: the workflow declares no write beyond checkout.
+  assert.match(sourceWorkflow, /permissions: \{\}/);
+  assert.match(sourceWorkflow, /contents: read/);
   // Diagnostics must survive the run with the source identity attached.
   assert.match(sourceWorkflow, /source-onboard-smoke\.log/);
   assert.match(sourceWorkflow, /source-smoke\.env/);
