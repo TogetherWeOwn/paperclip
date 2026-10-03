@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   routineRevisionSnapshotV1Schema,
   routineVariableSchema,
+  runRoutineSchema,
   updateRoutineSchema,
 } from "./routine.js";
 
@@ -85,6 +86,39 @@ describe("routine validators", () => {
       title: "Daily triage",
       baseRevisionId,
     }).baseRevisionId).toBe(baseRevisionId);
+  });
+
+  it("rejects unknown keys on routine update and run bodies instead of stripping them", () => {
+    const update = updateRoutineSchema.safeParse({
+      title: "Daily triage",
+      cronExpression: "0 9 * * *",
+    });
+    expect(update.success).toBe(false);
+    expect(update.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["cronExpression"],
+      }),
+    ]);
+
+    const run = runRoutineSchema.safeParse({
+      source: "manual",
+      routineId,
+    });
+    expect(run.success).toBe(false);
+    expect(run.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["routineId"],
+      }),
+    ]);
+
+    expect(
+      updateRoutineSchema.parse({ title: "Daily triage", baseRevisionId }),
+    ).toMatchObject({ title: "Daily triage" });
+    expect(runRoutineSchema.parse({ source: "manual" })).toMatchObject({
+      source: "manual",
+    });
   });
 
   it("validates routine activity gate values", () => {

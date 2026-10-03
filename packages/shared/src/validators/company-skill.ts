@@ -222,7 +222,7 @@ export const companySkillUpdateSchema = z.object({
   homepageUrl: z.string().nullable().optional(),
   categories: z.array(z.string().min(1)).optional(),
   sharingScope: companySkillSharingScopeSchema.optional(),
-}).default({});
+}).strict().default({});
 
 export const companySkillUpdateStatusSchema = z.object({
   supported: z.boolean(),
@@ -389,7 +389,7 @@ export const companySkillFileDetailSchema = z.object({
 export const companySkillFileUpdateSchema = z.object({
   path: z.string().min(1),
   content: z.string(),
-});
+}).strict();
 
 export const companySkillFileDeleteSchema = z.object({
   path: z.string().min(1),

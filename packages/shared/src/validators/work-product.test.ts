@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { attachmentArtifactWorkProductMetadataSchema } from "./work-product.js";
+import {
+  attachmentArtifactWorkProductMetadataSchema,
+  updateIssueWorkProductSchema,
+} from "./work-product.js";
 
 describe("attachmentArtifactWorkProductMetadataSchema", () => {
   it("accepts the attachment-backed artifact metadata contract", () => {
@@ -37,5 +40,23 @@ describe("attachmentArtifactWorkProductMetadataSchema", () => {
       "openPath",
       "downloadPath",
     ]);
+  });
+
+  it("rejects unknown keys on a work-product update instead of stripping them", () => {
+    const rejected = updateIssueWorkProductSchema.safeParse({
+      title: "Ship the preview",
+      externalUrl: "https://example.com/preview",
+    });
+    expect(rejected.success).toBe(false);
+    expect(rejected.error?.issues).toEqual([
+      expect.objectContaining({
+        code: "unrecognized_keys",
+        keys: ["externalUrl"],
+      }),
+    ]);
+
+    expect(
+      updateIssueWorkProductSchema.parse({ title: "Ship the preview" }),
+    ).toMatchObject({ title: "Ship the preview" });
   });
 });
