@@ -1,0 +1,121 @@
+name: Source Smoke
+
+# Exact-source onboarding smoke for the fork nightly lane.
+#
+# The fork's nightly selector (release.yml:select_nightly) promotes a
+# published canary by tag, but the fork has published no canary since
+# September 5 — so smoke_nightly tests a 400-commit-old artifact against
+# this week's contracts and fails every night. This workflow instead boots
+# the exact source under test and runs the unchanged release onboarding
+# suite against it. Called only from release.yml's fork-nightly job; the
+# upstream published-package promotion lane is untouched.
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Full commit SHA to boot and smoke-test
+        required: true
+        type: string
+      host_port:
+        description: Host port for the source smoke server
+        required: false
+        default: "3232"
+        type: string
+      artifact_name:
+        description: Artifact name for uploaded diagnostics
+        required: false
+        default: nightly-source-smoke
+        type: string
+
+jobs:
+  smoke_source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # Fixed here rather than read back out of the harness, so the `always()`
+    # diagnostics steps below still know the log path when the boot step is
+    # the thing that failed. Reading it back was why a failing smoke once
+    # uploaded no logs at all.
+    env:
+      SMOKE_LOG_FILE: ${{ runner.temp }}/source-onboard-smoke.log
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Verify the checkout matches the selected source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify runner Chrome
+        # Release smoke runs headless on GitHub's Ubuntu image, so use the
+        # runner's preinstalled Chrome instead of a Playwright browser download.
+        run: google-chrome --version
+
+      - name: Boot exact source and bootstrap smoke instance
+        run: |
+          SOURCE_SMOKE_PORT="${{ inputs.host_port }}" \
+          DATA_DIR="$RUNNER_TEMP/source-smoke-data" \
+          SMOKE_READY_TIMEOUT_SECONDS=420 \
+          SMOKE_DETACH=true \
+          SOURCE_SMOKE_METADATA_FILE="${{ runner.temp }}/source-smoke.env" \
+          SMOKE_LOG_FILE="${{ runner.temp }}/source-onboard-smoke.log" \
+          ./scripts/source-onboard-smoke.sh
+          set -a
+          source "${{ runner.temp }}/source-smoke.env"
+          set +a
+          {
+            echo "SMOKE_BASE_URL=$SMOKE_BASE_URL"
+            echo "SMOKE_ADMIN_EMAIL=$SMOKE_ADMIN_EMAIL"
+            echo "SMOKE_ADMIN_PASSWORD=$SMOKE_ADMIN_PASSWORD"
+            echo "SMOKE_DATA_DIR=$SMOKE_DATA_DIR"
+            echo "SMOKE_SERVER_PID=$SMOKE_SERVER_PID"
+            echo "SMOKE_SOURCE_SHA=$SMOKE_SOURCE_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Run release smoke Playwright suite
+        env:
+          PAPERCLIP_RELEASE_SMOKE_BASE_URL: ${{ env.SMOKE_BASE_URL }}
+          PAPERCLIP_RELEASE_SMOKE_EMAIL: ${{ env.SMOKE_ADMIN_EMAIL }}
+          PAPERCLIP_RELEASE_SMOKE_PASSWORD: ${{ env.SMOKE_ADMIN_PASSWORD }}
+          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
+        run: pnpm run test:release-smoke
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/source-onboard-smoke.log
+            ${{ runner.temp }}/source-smoke.env
+            tests/release-smoke/playwright-report/
+            tests/release-smoke/test-results/
+          # The harness truncates the log file at startup, so an empty upload
+          # means the diagnostics wiring itself broke — which is worth failing
+          # over rather than burying in a warning nobody reads.
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop source smoke server
+        if: always()
+        run: kill "${{ env.SMOKE_SERVER_PID }}" >/dev/null 2>&1 || true
