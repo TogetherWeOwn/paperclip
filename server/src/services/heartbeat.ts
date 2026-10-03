@@ -303,6 +303,7 @@ import {
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { isTerminalResultCleanupSuccess } from "./terminal-cleanup-outcome.js";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -25187,6 +25188,17 @@ export function heartbeatService(
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
+        // The terminal-result cleanup SIGTERMs a lingering background task
+        // after the adapter already produced its terminal result; the CLI
+        // then exits 143. That cleanup-induced end of process is not a run
+        // failure when the adapter itself reports success.
+        const terminalCleanupSuccess = isTerminalResultCleanupSuccess({
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          errorMessage: adapterResult.errorMessage,
+          errorCode: adapterResult.errorCode,
+          resultJson: parseObject(adapterResult.resultJson),
+        });
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
@@ -25205,9 +25217,9 @@ export function heartbeatService(
         } else if (adapterResult.timedOut) {
           outcome = "timed_out";
         } else if (
-          (adapterResult.exitCode ?? 0) === 0 &&
+          ((adapterResult.exitCode ?? 0) === 0 || terminalCleanupSuccess) &&
           !adapterResult.errorMessage &&
-          !adapterResult.signal &&
+          (!adapterResult.signal || terminalCleanupSuccess) &&
           !processCancellation?.failed
         ) {
           outcome = "succeeded";
