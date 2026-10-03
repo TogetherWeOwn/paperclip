@@ -88,6 +88,7 @@ import type {
   PluginToolDispatcher,
 } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { runBudgetSpentFraction } from "./budgets.js";
 import { secretService } from "./secrets.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
@@ -10361,6 +10362,13 @@ export function createToolGatewayService(
                     runId: session.runId!,
                     companyId: session.companyId,
                     projectId: session.projectId ?? "",
+                    // TOG-7967 H5: host-authored stamp; undefined ≡ absent downstream.
+                    budgetSpentFraction: await runBudgetSpentFraction(db, {
+                      companyId: session.companyId,
+                      agentId: session.agentId!,
+                      projectId: session.projectId ?? null,
+                      runId: session.runId!,
+                    }).catch(() => undefined),
                   },
                 ),
                 executionTimeoutMs,
@@ -10755,10 +10763,20 @@ export function createToolGatewayService(
 
       const startedAt = Date.now();
       try {
+        // TOG-7967 H6 (B2): input.runContext is caller JSON — forgeable.
+        // Spread-overwrite with the host-computed value; undefined ≡ absent.
         const result = await pluginToolDispatcher.executeTool(
           input.tool,
           requestedParameters,
-          input.runContext,
+          {
+            ...input.runContext,
+            budgetSpentFraction: await runBudgetSpentFraction(db, {
+              companyId: input.runContext.companyId,
+              agentId: input.runContext.agentId,
+              projectId: input.runContext.projectId ?? null,
+              runId: input.runContext.runId,
+            }).catch(() => undefined),
+          },
         );
         const resultValidation = validateToolContent({
           value: result,

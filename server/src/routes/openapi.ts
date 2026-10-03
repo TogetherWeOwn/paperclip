@@ -8498,6 +8498,7 @@ registry.registerPath({
           runId: z.string(),
           companyId: z.string(),
           projectId: z.string(),
+          budgetSpentFraction: z.number().optional(),
         }),
       }),
     ),
