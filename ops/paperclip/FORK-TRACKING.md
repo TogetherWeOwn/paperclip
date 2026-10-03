@@ -8,7 +8,7 @@ Ledger of upstream refs vs fork state for the 1001 release line.
 
 - Base: `release/v2026.1001.0` @ `14f66a7cf`
 - Work branch: `fix/run-gateway-token-ttl-1001`
-- PR: TogetherWeOwn/paperclip#12 (`fix(tool-gateway): run-scoped token TTL covers run lifetime`) ported onto 1001; new fork PR number recorded after opening.
+- PR: TogetherWeOwn/paperclip#12 (`fix(tool-gateway): run-scoped token TTL covers run lifetime`) ported onto 1001; fork PR TogetherWeOwn/paperclip#32.
 - Fix: both run-scoped gateway token mint sites in `server/src/services/heartbeat.ts`
   share one helper, `heartbeatRunGatewayTokenTtlMs()`: env `PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS`,
   default 24 h. The gateway still rejects tokens whose run is no longer active
