@@ -704,7 +704,9 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 
 Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Correctness-sensitive runtime guards bypass the result cache.
 
-Workspace snapshots list ignored paths with `git ls-files --others --ignored --exclude-standard --directory -z` so ignored directory contents do not require a full status walk. Snapshot failures retain their typed cause instead of becoming a non-Git-folder result. During pre-provider setup, scan timeouts and queue saturation use the existing two automatic failure retries with a 30-second delay. Cancellation, output limits, and other Git errors stop with specific recovery guidance. See `doc/execution-semantics.md` for the ownership and retry-budget contract.
+Workspace snapshots list ignored paths with `git ls-files --others --ignored --exclude-standard --directory -z` so ignored directory contents do not require a full status walk. The untracked-file snapshot has a 32 MiB output bound so generated trees with thousands of long filenames can be staged. It still records explicit file paths; files created after the scan do not enter that overlay. Other scan bounds stay unchanged. Snapshot failures retain their typed cause instead of becoming a non-Git-folder result. During pre-provider setup, scan timeouts and queue saturation use the existing two automatic failure retries with a 30-second delay. Cancellation, output limits, and other Git errors stop with specific recovery guidance. See `doc/execution-semantics.md` for the ownership and retry-budget contract.
+
+Workspace preparation resolves an existing root symlink before reading the snapshot and uses that resolved directory for the rest of the operation. Overlay staging checks the captured root identity and each selected path's ancestors before and after copying. A replaced root or a symlink in an ancestor directory stops staging before upload. A missing source file can be skipped; other source inspection errors stop staging. Selected symlink entries remain symlinks.
 
 The cache intentionally trades up to a few seconds of changed-file freshness for stable server latency. The file browser retains an explicit refresh action, does not start its query while the panel or browser tab is hidden, and presents overloads as retryable failures rather than an empty workspace. A full queue returns `503` with code `workspace_git_scan_saturated`; a scan exceeding its wall-clock limit returns `504` with code `workspace_git_scan_timeout`. Both responses include `Retry-After: 1`.
 
@@ -1298,7 +1300,8 @@ schemas. Defaults:
 
 - enabled
 - every 60 minutes
-- retain 30 days
+- keep the newest backup per hour for 24 hours
+- then keep the newest backup per day for 7 days, per week for 4 weeks, and per month for 1 month
 - backup dir: `~/.paperclip/instances/default/data/backups`
 
 Automatic backups are disabled for isolated worktree instances created with
@@ -1306,13 +1309,16 @@ Automatic backups are disabled for isolated worktree instances created with
 configs are migrated to the disabled setting when their server next starts. The
 main/default instance keeps the normal enabled-by-default behavior.
 
-Configure these in:
+Configure the backup schedule and directory with:
 
 ```sh
 pnpm paperclipai configure --section database
 ```
 
-Run a one-off backup manually:
+Configure automatic retention tiers in **Instance Settings → General → Backup retention**.
+Changes take effect on the next backup without a server restart.
+
+Run a one-off backup manually. One-off backups use the default `24 hourly / 7 daily / 4 weekly / 1 monthly` policy and print the effective policy before pruning:
 
 ```sh
 pnpm paperclipai db:backup
@@ -1324,7 +1330,6 @@ Environment overrides:
 
 - `PAPERCLIP_DB_BACKUP_ENABLED=true|false`
 - `PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=<minutes>`
-- `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=<days>`
 - `PAPERCLIP_DB_BACKUP_DIR=/absolute/or/~/path`
 - `PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS=<hours>` controls the `/api/health`
   stale-backup warning threshold
