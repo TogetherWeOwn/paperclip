@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { claimedAdapterType } from "./conversation-continuation.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
@@ -6,6 +6,26 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
+
+/** Historical queued legacy cancellations have no process to stop. Require
+ * untouched launch metadata and lifecycle-only events under the run lock.
+ * Lease cleanup and current execution controls remain the caller's gates. */
+export async function isNeverStartedLegacyRun(db: Db, run: Run, coordinator: Coordinator | undefined) {
+  if (run.runtimeMode !== "legacy" || run.status !== "cancelled" || !run.finishedAt || coordinator ||
+      run.startedAt || run.processPid || run.processGroupId || run.processStartedAt ||
+      run.controllerBootId || run.controllerLeaseExpiresAt || run.executionStage ||
+      run.nativeSessionId || run.runnerInstanceId || run.sessionIdAfter ||
+      run.lastOutputSeq !== 0 || run.lastOutputAt || run.lastOutputBytes ||
+      run.logStore || run.logRef || run.logBytes) return false;
+  const [execution] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    or(isNotNull(heartbeatRunEvents.sourceEventId), ne(heartbeatRunEvents.eventType, "lifecycle"),
+      sql`coalesce(${heartbeatRunEvents.stream}, '') <> 'system'`,
+      sql`not (coalesce(${heartbeatRunEvents.payload}->>'status', '') in ('queued', 'scheduled_retry', 'cancelled')
+        or (coalesce(${heartbeatRunEvents.message}, '') = 'run cancelled' and ${heartbeatRunEvents.payload} is null))`),
+  )).limit(1);
+  return !execution;
+}
 
 /** Caller holds the coordinator and run locks when using this proof to admit
  * work. Attempt zero is a durable never-claimed receipt: every native executor

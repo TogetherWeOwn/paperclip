@@ -1731,6 +1731,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     };
   }
 
+  it("TOG-11377: delivers accepted reconciliation for a never-started cancellation without native stop evidence", async () => {
+    const { companyId, coderId, sourceIssueId, previousRunId, action, heartbeat } = await seedReconciledDelivery();
+    await db.update(heartbeatRuns).set({ status: "cancelled", startedAt: null,
+      finishedAt: new Date("2026-05-13T18:01:00Z") }).where(eq(heartbeatRuns.id, previousRunId));
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "blocked",
+      cause: "legacy_execution_requires_reconciliation", evidence: { runId: previousRunId,
+        automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).where(eq(issueRecoveryActions.id, action.id));
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId: previousRunId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Verified queued cancellation: no provider was launched and no action was submitted." },
+    }).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(
+      agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ status: "queued" });
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wakes[0].runId!));
+    expect(successor).toMatchObject({ companyId, agentId: coderId, status: "queued", retryOfRunId: previousRunId,
+      contextSnapshot: { forceFreshSession: true, previousRunId, recoveryActionId: action.id } });
+    expect(successor.contextSnapshot).not.toHaveProperty("explicitUserContinuation");
+    const [receipt] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(receipt.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: successor.id });
+  });
+
+  it.each(["other_action", "same_source_action", "pending_cleanup", "failed_cleanup"])(
+    "accepted reconciliation does not waive an independent execution hold (%s)", async hold => {
+      const { companyId, coderId, sourceIssueId, previousRunId, action, heartbeat } = await seedReconciledDelivery();
+      await db.update(heartbeatRuns).set({ status: "cancelled", startedAt: null,
+        finishedAt: new Date(), runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).where(eq(heartbeatRuns.id, previousRunId));
+      if (hold.endsWith("cleanup")) await db.insert(environmentLeases).values({ companyId,
+        heartbeatRunId: previousRunId, provider: "local", leasePolicy: "ephemeral", releasedAt: new Date(),
+        status: hold === "pending_cleanup" ? "pending_cleanup" : "released",
+        cleanupStatus: hold === "failed_cleanup" ? "failed" : "success",
+      });
+      else {
+        const otherId = hold === "same_source_action" ? previousRunId : randomUUID();
+        if (otherId !== previousRunId) await seedHeartbeatRun({ companyId, agentId: coderId,
+          issueId: sourceIssueId, runId: otherId, status: "failed" });
+        await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId,
+          kind: "active_run_watchdog", status: "active", cause: "uncertain_external_action",
+          fingerprint: `independent:${otherId}`, nextAction: "Verify this independent execution hold.",
+          evidence: { runId: otherId } });
+      }
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      const successors = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")));
+      expect(successors).toHaveLength(0);
+      const [receipt] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(receipt.evidence.continuationDelivery).toBe("pending");
+    });
+
   it("delivers a reconciled execution once across concurrent sweeps without a deferred duplicate", async () => {
     const { action, heartbeat } = await seedReconciledDelivery();
     let entered = 0;
