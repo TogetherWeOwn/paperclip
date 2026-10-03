@@ -10650,8 +10650,15 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(
+    companyId: string,
+    issueId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
@@ -10762,6 +10769,10 @@ export function heartbeatService(
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (
       !issueContext ||
@@ -10772,7 +10783,7 @@ export function heartbeatService(
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await queryDb
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -10789,7 +10800,7 @@ export function heartbeatService(
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await queryDb
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -10818,7 +10829,7 @@ export function heartbeatService(
       }
     }
 
-    const routine = await db
+    const routine = await queryDb
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -10839,8 +10850,14 @@ export function heartbeatService(
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(
+    companyId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    const company = await queryDb
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -10850,7 +10867,7 @@ export function heartbeatService(
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10866,7 +10883,7 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10885,9 +10902,13 @@ export function heartbeatService(
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await queryDb
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -10923,7 +10944,12 @@ export function heartbeatService(
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the reads
+    // reuse the transaction's connection instead of acquiring a second pooled
+    // connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
+    const queryDb = input.queryDb ?? db;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -10943,7 +10969,7 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await queryDb
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -10968,7 +10994,7 @@ export function heartbeatService(
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await queryDb
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -10990,11 +11016,12 @@ export function heartbeatService(
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      queryDb,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, queryDb);
   }
 
   async function resolveResponsibleUserIdForRun(input: {
@@ -11055,8 +11082,14 @@ export function heartbeatService(
     });
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(
+    agentId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -11093,8 +11126,12 @@ export function heartbeatService(
     agentId: string,
     adapterType: string,
     taskKey: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
-    return db
+    return queryDb
       .select()
       .from(agentTaskSessions)
       .where(
@@ -12147,6 +12184,9 @@ export function heartbeatService(
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` for the same
+    // nested-pool reason as getTaskSession.
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -12155,6 +12195,7 @@ export function heartbeatService(
         agent.id,
         agent.adapterType,
         taskKey,
+        queryDb,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -12166,7 +12207,7 @@ export function heartbeatService(
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, queryDb);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -12188,6 +12229,10 @@ export function heartbeatService(
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the session
+    // read reuses the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -12204,6 +12249,7 @@ export function heartbeatService(
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.queryDb,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,
@@ -12216,11 +12262,15 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the resume
+    // reads reuse the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
 
-    const resumeRun = await db
+    const resumeRun = await queryDb
       .select({
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -12247,6 +12297,7 @@ export function heartbeatService(
           agent.id,
           agent.adapterType,
           resumeTaskKey,
+          queryDb,
         )
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
@@ -26856,7 +26907,12 @@ export function heartbeatService(
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // session read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    const resolveHasResolvablePriorSessionWorkspace = async (
+      queryDb?: Pick<Db, "select">,
+    ) => {
       if (hasResolvablePriorSessionWorkspace !== null)
         return hasResolvablePriorSessionWorkspace;
       hasResolvablePriorSessionWorkspace = issueId
@@ -26865,6 +26921,7 @@ export function heartbeatService(
             contextSnapshot: enrichedContextSnapshot,
             taskKey: effectiveTaskKey,
             explicitResumeSession,
+            queryDb,
           })
         : false;
       return hasResolvablePriorSessionWorkspace;
@@ -26933,15 +26990,20 @@ export function heartbeatService(
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // responsible-user reads reuse the transaction's connection instead of
+    // acquiring a second pooled connection (pool deadlock at saturation). The
+    // pre-lock call sites pass nothing and keep the pooled `db` behavior.
+    const resolveQueuedResponsibleUserId = (queryDb?: Pick<Db, "select">) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, queryDb)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          queryDb,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
@@ -26953,6 +27015,7 @@ export function heartbeatService(
             requestedByActorId: opts.requestedByActorId ?? null,
             source,
             triggerDetail,
+            queryDb,
           });
         if (!queuedResponsibleUserId) {
           throw new HttpError(
@@ -27977,8 +28040,10 @@ export function heartbeatService(
                 issue.executionWorkspacePreference,
               existingExecutionWorkspaceStatus,
             });
+            // TOG-9736: pass tx so the inner task-session read reuses the
+            // transaction's connection (nested-pool deadlock at saturation).
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await resolveHasResolvablePriorSessionWorkspace(tx);
 
             if (
               isUnrunnableWorktreeCombo({
@@ -28414,7 +28479,9 @@ export function heartbeatService(
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              // TOG-9736: pass tx so the responsible-user reads reuse the
+              // transaction's connection (nested-pool deadlock at saturation).
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -28686,7 +28753,9 @@ export function heartbeatService(
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          // TOG-9736: pass tx so the responsible-user reads reuse the
+          // transaction's connection (nested-pool deadlock at saturation).
+          responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
