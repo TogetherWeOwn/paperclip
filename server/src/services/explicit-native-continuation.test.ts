@@ -446,6 +446,67 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(after).toEqual(before);
     });
 
+  it("TOG-11303: delivers one reviewer-CHANGES turn after never-started waiting_on_review park", async () => {
+    const f = await seedNeverStartedLegacy(1);
+    await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
+      error: "Continuation parked: issue is waiting on review/approval" })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, processGroupId: null,
+      logRef: null, runnerInstanceId: null, nativeSessionId: null, lastOutputSeq: 0,
+      errorCode: "issue_continuation_waiting_on_review" });
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(hold).toMatchObject({ status: "resolved", cause: "legacy_execution_requires_reconciliation",
+      evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const heartbeat = heartbeatService(db);
+    const wake = () => heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const first = await wake();
+    expect(first).toMatchObject({ status: "queued", contextSnapshot: {
+      forceFreshSession: true, previousRunId: f.sourceRunId,
+      explicitUserContinuation: { commentId: f.commentId },
+    } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(settled.evidence).toMatchObject({ runId: f.sourceRunId,
+      automaticRecovery: { replay: "explicit_user_continuation", actionOutcome: "unknown" },
+      explicitUserContinuation: { runId: first!.id, previousRunId: f.sourceRunId, commentId: f.commentId },
+    });
+    await wake();
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(successors).toHaveLength(1);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(after).toEqual(before);
+  });
+
+  it("TOG-11303: an active pause hold still defers the never-started waiting_on_review turn", async () => {
+    const f = await seedNeverStartedLegacy(1);
+    await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
+      error: "Continuation parked: issue is waiting on review/approval" })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const holdId = randomUUID();
+    await db.insert(issueTreeHolds).values({ id: holdId, companyId: f.companyId, rootIssueId: f.issueId, mode: "pause", status: "active" });
+    await db.insert(issueTreeHoldMembers).values({ companyId: f.companyId, holdId, issueId: f.issueId, depth: 0, issueTitle: "Deploy", issueStatus: "in_progress" });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [f.commentId] } },
+    });
+    await heartbeatService(db).wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+  });
+
   it("TOG-10968: five repeated holds do not waive another source's missing stop evidence", async () => {
     const f = await seedNeverStartedLegacy(5), otherId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: otherId, companyId: f.companyId, agentId: f.agentId,
