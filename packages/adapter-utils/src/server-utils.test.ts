@@ -837,6 +837,49 @@ describe("runChildProcess", () => {
   );
 
   it.skipIf(process.platform === "win32")(
+    "reports exit 143 with terminal-result evidence when the child exits 143 on cleanup SIGTERM",
+    async () => {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
+            "process.on('SIGTERM', () => process.exit(143));",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async () => {},
+          terminalResultCleanup: {
+            graceMs: 100,
+            hasTerminalResult: ({ stdout }) =>
+              stdout.includes('"type":"result"'),
+          },
+        },
+      );
+
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(143);
+      expect(result.terminalResultCleanup).toMatchObject({
+        kind: "terminal_result_cleanup",
+        stopped: true,
+        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+        terminalResultSeen: true,
+        signal: "SIGTERM",
+        forceKilled: false,
+      });
+      expect(result.stdout).toContain('"type":"result"');
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "does not clean up noisy runs that have no terminal output",
     async () => {
       const runId = randomUUID();
