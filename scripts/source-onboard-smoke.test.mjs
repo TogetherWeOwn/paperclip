@@ -90,9 +90,11 @@ test("source-smoke workflow checks out the selected source and runs the release 
   assert.match(sourceWorkflow, /workflow_dispatch:/);
   assert.match(sourceWorkflow, /source_sha:\n\s+description: Full commit SHA/);
   // The redact step actually receives the credential: it sources the same
-  // step-scoped file the suite step does.
+  // step-scoped file the suite step does — and it tolerates the boot step
+  // having failed before writing that file, when there is nothing to redact.
   const redact = sourceWorkflow.split("Redact the credential")[1] ?? "";
   assert.match(redact.split("- name:")[0], /source-smoke\.pw/);
+  assert.match(redact.split("- name:")[0], /if \[\[ ! -f .*source-smoke\.pw/);
 });
 
 test("nightly promotion is gated on the source smoke; the stale published lane is informational", () => {
@@ -102,12 +104,15 @@ test("nightly promotion is gated on the source smoke; the stale published lane i
   const published = releaseWorkflow.split("smoke_nightly_published:\n")[1].split("smoke_nightly_source:")[0];
   assert.match(published, /continue-on-error: true/);
   assert.match(releaseWorkflow, /smoke_nightly_source:\n\s+needs: select_nightly/);
-  // No permissions on reusable-workflow caller jobs: GitHub rejects
-  // `permissions` alongside `uses` in a caller job, and the sibling
-  // reusable calls in this file (release-verify, release-smoke) carry
-  // none — least privilege lives inside the called workflow instead.
-  const sourceCaller = releaseWorkflow.split("smoke_nightly_source:\n")[1].split("publish_nightly:")[0];
-  assert.doesNotMatch(sourceCaller, /permissions:/);
+  // Both nightly caller jobs carry the caller's least privilege explicitly:
+  // `permissions` is a valid caller-job key beside `uses`, and the called
+  // workflow's own blocks are the second layer, not the only one.
+  const nightlyCallers = releaseWorkflow.split("smoke_nightly_published:\n")[1].split("publish_nightly:")[0];
+  assert.equal(
+    (nightlyCallers.match(/permissions:\n\s+contents: read/g) ?? []).length,
+    2,
+    "both smoke_nightly_* caller jobs declare contents: read",
+  );
   assert.match(
     releaseWorkflow,
     /source_sha: \$\{\{ needs\.select_nightly\.outputs\.sha \}\}/,

@@ -143,6 +143,11 @@ jobs:
       - name: Redact the credential from the log before upload
         if: always()
         run: |
+          # The boot step may have failed before writing the credential
+          # file; without it there is nothing to redact, which is success.
+          if [[ ! -f "${{ runner.temp }}/source-smoke.pw" ]]; then
+            exit 0
+          fi
           set -a
           source "${{ runner.temp }}/source-smoke.pw"
           set +a

@@ -592,6 +592,8 @@ jobs:
     needs: select_nightly
     if: needs.select_nightly.outputs.proceed == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
     continue-on-error: true
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-smoke.yml
     with:
       paperclip_version: ${{ needs.select_nightly.outputs.canary_version }}
@@ -600,6 +602,8 @@ jobs:
   smoke_nightly_source:
     needs: select_nightly
     if: needs.select_nightly.outputs.proceed == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    permissions:
+      contents: read
     uses: ./.github/workflows/source-smoke.yml
     with:
       source_sha: ${{ needs.select_nightly.outputs.sha }}
