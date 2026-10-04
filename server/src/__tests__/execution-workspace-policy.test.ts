@@ -13,6 +13,7 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   ManagedSandboxUnavailableError,
+  mergeIssueAdapterConfigOverrides,
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolvePinnedIssueWorkspaceStrategyType,
@@ -755,5 +756,216 @@ describe("operator default isolated execution workspaces", () => {
         resolvedStrategy: resolveEffectiveWorkspaceStrategyType(mode, config),
       }),
     ).toBe(false);
+  });
+
+  it("merges issue override env per key over the base agent env", () => {
+    const secretRef = { type: "secret_ref", secretId: "sec-1" };
+    const merged = mergeIssueAdapterConfigOverrides(
+      {
+        model: "base-model",
+        env: { KEEP_ME: secretRef, SHARED: "base" },
+      },
+      {
+        model: "override-model",
+        env: { ADDED: "new", SHARED: "override" },
+      },
+    );
+    // 1. override env adds a key
+    expect((merged.env as Record<string, unknown>).ADDED).toBe("new");
+    // 2. override env shadows a base key
+    expect((merged.env as Record<string, unknown>).SHARED).toBe("override");
+    // 3. a base secret_ref survives an override that omits it
+    expect((merged.env as Record<string, unknown>).KEEP_ME).toEqual(secretRef);
+    // other keys keep shallow replace semantics
+    expect(merged.model).toBe("override-model");
+  });
+
+  it("does not mutate the base or override config", () => {
+    const base = { env: { A: "1" } };
+    const override = { env: { B: "2" } };
+    const merged = mergeIssueAdapterConfigOverrides(base, override);
+    expect(merged.env).toEqual({ A: "1", B: "2" });
+    expect(base.env).toEqual({ A: "1" });
+    expect(override.env).toEqual({ B: "2" });
+  });
+
+  it("leaves env alone when the override carries none", () => {
+    const merged = mergeIssueAdapterConfigOverrides(
+      { model: "base", env: { A: "1" } },
+      { model: "override" },
+    );
+    expect(merged.env).toEqual({ A: "1" });
+    expect(mergeIssueAdapterConfigOverrides({ model: "base" }, null)).toEqual({
+      model: "base",
+    });
+  });
+
+  it("preserves an explicit null env as a clearing operation", () => {
+    const merged = mergeIssueAdapterConfigOverrides(
+      {
+        model: "base",
+        env: { API_TOKEN: { type: "secret_ref", secretId: "sec-1" } },
+      },
+      { model: "override", env: null },
+    );
+    // The clearing value survives the merge instead of gaining every base key
+    // back. Downstream resolution maps a non-object env to `{}` with zero
+    // inherited bindings, matching the previous spread behavior.
+    expect("env" in merged).toBe(true);
+    expect(merged.env).toBeNull();
+    expect(merged.model).toBe("override");
+  });
+
+  it("preserves a non-object env instead of merging the base back over it", () => {
+    expect(
+      mergeIssueAdapterConfigOverrides({ env: { A: "1" } }, { env: "not-an-object" }).env,
+    ).toBe("not-an-object");
+    expect(
+      mergeIssueAdapterConfigOverrides({ env: { A: "1" } }, { env: ["A"] }).env,
+    ).toEqual(["A"]);
+  });
+
+  it("rejects an override key that differs only by case from a base key", () => {
+    expect(() =>
+      mergeIssueAdapterConfigOverrides(
+        { env: { API_TOKEN: { type: "secret_ref", secretId: "old" } } },
+        { env: { api_token: "replacement" } },
+      ),
+    ).toThrow(/conflicts with agent env key "API_TOKEN"/);
+  });
+
+  it("keeps exact-match shadowing and unrelated keys case-sensitive", () => {
+    const merged = mergeIssueAdapterConfigOverrides(
+      { env: { API_TOKEN: "base", OTHER: "x" } },
+      { env: { API_TOKEN: "override", UNRELATED: "y" } },
+    );
+    expect(merged.env).toEqual({
+      API_TOKEN: "override",
+      OTHER: "x",
+      UNRELATED: "y",
+    });
+  });
+
+  it("fails a case-variant alias at the merge boundary before secret resolution", () => {
+    // Mirrors the secret resolver: every merged entry is validated and an
+    // unavailable secret_ref fails the run. The launch layer would fold the
+    // alias pair on case-insensitive targets (Windows), so the shadowed
+    // binding must never reach resolution.
+    const resolveEnvForTest = (env: unknown): Record<string, string> => {
+      const record =
+        typeof env === "object" && env !== null && !Array.isArray(env)
+          ? (env as Record<string, unknown>)
+          : null;
+      if (!record) return {};
+      const out: Record<string, string> = {};
+      for (const [key, binding] of Object.entries(record)) {
+        if (typeof binding === "object" && binding !== null && "secretId" in binding) {
+          throw new Error(`unavailable secret for ${key}`);
+        }
+        out[key] = String(binding);
+      }
+      return out;
+    };
+    const base = {
+      env: { API_TOKEN: { type: "secret_ref", secretId: "unavailable" } },
+    };
+    const override = { env: { api_token: "replacement" } };
+    // The merge rejects the ambiguous alias before any binding is resolved.
+    expect(() => mergeIssueAdapterConfigOverrides(base, override)).toThrow(
+      /conflicts with agent env key "API_TOKEN"/,
+    );
+    // Without the guard, the shadowed binding would reach resolution and fail
+    // the run there with an unavailable-secret error instead of the alias error.
+    const unguarded = { ...(base.env as Record<string, unknown>), ...(override.env as Record<string, unknown>) };
+    expect(() => resolveEnvForTest(unguarded)).toThrow(
+      /unavailable secret for API_TOKEN/,
+    );
+  });
+
+  it("rejects an override when the base carries several spellings, in either base order", () => {
+    const override = { env: { API_TOKEN: "replacement" } };
+    const firstOrder = {
+      env: {
+        API_TOKEN: "base",
+        api_token: { type: "secret_ref", secretId: "old" },
+      },
+    };
+    const secondOrder = {
+      env: {
+        api_token: { type: "secret_ref", secretId: "old" },
+        API_TOKEN: "base",
+      },
+    };
+    // The first spelling matches exactly, but the second inherited alias
+    // would survive the merge and shadow the replacement. Both base orders
+    // reject with the same deterministic error.
+    for (const base of [firstOrder, secondOrder]) {
+      expect(() => mergeIssueAdapterConfigOverrides(base, override)).toThrow(
+        /conflicts with agent env keys "API_TOKEN", "api_token"/,
+      );
+    }
+  });
+
+  it("rejects an exact override when the base carries another spelling", () => {
+    const base = { env: { API_TOKEN: "one", api_token: "two" } };
+    // Overriding the second spelling exactly still leaves the first alias
+    // behind, so the contract rejects instead of replacing half the group.
+    expect(() => mergeIssueAdapterConfigOverrides(base, { env: { api_token: "x" } })).toThrow(
+      /conflicts with agent env keys "API_TOKEN", "api_token"/,
+    );
+  });
+
+  it("rejects before resolution when another spelling holds an unavailable reference", () => {
+    const resolveEnvForTest = (env: unknown): Record<string, string> => {
+      const record =
+        typeof env === "object" && env !== null && !Array.isArray(env)
+          ? (env as Record<string, unknown>)
+          : null;
+      if (!record) return {};
+      const out: Record<string, string> = {};
+      for (const [key, binding] of Object.entries(record)) {
+        if (typeof binding === "object" && binding !== null && "secretId" in binding) {
+          throw new Error(`unavailable secret for ${key}`);
+        }
+        out[key] = String(binding);
+      }
+      return out;
+    };
+    const base = {
+      env: {
+        API_TOKEN: "base",
+        api_token: { type: "secret_ref", secretId: "unavailable" },
+      },
+    };
+    const override = { env: { API_TOKEN: "replacement" } };
+    // The merge rejects the ambiguous group before any binding is resolved.
+    expect(() => mergeIssueAdapterConfigOverrides(base, override)).toThrow(
+      /conflicts with agent env keys "API_TOKEN", "api_token"/,
+    );
+    // Without the guard, the retained lowercase reference reaches resolution
+    // and fails the run there instead of at the merge boundary.
+    const unguarded = { ...(base.env as Record<string, unknown>), ...(override.env as Record<string, unknown>) };
+    expect(() => resolveEnvForTest(unguarded)).toThrow(
+      /unavailable secret for api_token/,
+    );
+  });
+
+  it("never lets an inherited alias win the Windows fold over a replacement", () => {
+    // Test-local mirror of case-insensitive targets: later entries win the
+    // fold, so an inherited lowercase alias overwrites the replacement.
+    const foldForWindowsForTest = (env: Record<string, unknown>): Record<string, unknown> => {
+      const out: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(env)) out[key.toUpperCase()] = value;
+      return out;
+    };
+    const base = { env: { API_TOKEN: "base", api_token: "shadow" } };
+    const override = { env: { API_TOKEN: "replacement" } };
+    const unguarded = { ...(base.env as Record<string, unknown>), ...(override.env as Record<string, unknown>) };
+    expect(foldForWindowsForTest(unguarded)).toEqual({ API_TOKEN: "shadow" });
+    // The guard rejects the ambiguous group, so the losing fold is
+    // unreachable through the merge.
+    expect(() => mergeIssueAdapterConfigOverrides(base, override)).toThrow(
+      /conflicts with agent env keys "API_TOKEN", "api_token"/,
+    );
   });
 });

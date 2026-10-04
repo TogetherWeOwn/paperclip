@@ -485,6 +485,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  mergeIssueAdapterConfigOverrides,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -21615,8 +21616,10 @@ export function heartbeatService(
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
       const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...mergeIssueAdapterConfigOverrides(
+          workspaceManagedConfig,
+          issueAssigneeOverrides?.adapterConfig ?? null,
+        ),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),

@@ -446,3 +446,98 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
 
   return nextConfig;
 }
+
+/**
+ * Merge an issue's `assigneeAdapterOverrides.adapterConfig` over a base agent
+ * config. Every key keeps shallow replace semantics except `env`, which merges
+ * per key (`{ ...base.env, ...override.env }`) when the override carries an
+ * env object.
+ *
+ * A shallow spread replaces the whole `env` object, so an override that sets
+ * one env key drops every other key of the agent config, secret references
+ * included. Merging `env` per key keeps the base keys that the override omits.
+ * An override key still shadows the base key.
+ *
+ * Two edge cases keep the previous replace behavior instead of merging:
+ *
+ * - An explicit non-object `env` (including `null`) clears the agent env,
+ *   exactly as the previous spread did. Downstream resolution maps a
+ *   non-object env to `{}`, so `env: null` removes every agent environment
+ *   key. There is no per-key removal: an `env` entry set to `null` is not a
+ *   valid binding and is rejected at secret resolution.
+ * - An override env key that shares a case-insensitive name with any base
+ *   env key is rejected unless the base carries exactly that one spelling.
+ *   Environment names are case-sensitive on Linux but case-insensitive on
+ *   Windows targets, so `api_token` over `API_TOKEN` would keep a shadowed
+ *   secret binding that secret resolution must resolve before the launch
+ *   layer folds the names. Rename the override key to the exact base
+ *   spelling to replace it, or pick a non-conflicting name. When the base
+ *   already carries several spellings of one name (for example both
+ *   `API_TOKEN` and `api_token`), every override of that name is rejected:
+ *   no single spelling can replace them all, and letting another inherited
+ *   alias survive would shadow the replacement through resolution (or
+ *   through Windows folding afterwards). This rejection runs on every
+ *   target, so a conflicting override also fails on Linux even though the
+ *   process variables would be distinct there.
+ */
+export function mergeIssueAdapterConfigOverrides(
+  base: Record<string, unknown>,
+  override: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const next = { ...base, ...(override ?? {}) };
+  if (override && "env" in override) {
+    const overrideEnv = override.env;
+    if (!isEnvRecord(overrideEnv)) {
+      // Preserve an explicit clearing value (`null`, an array, a primitive)
+      // instead of merging the base env back over it.
+      next.env = overrideEnv;
+    } else {
+      rejectCaseVariantEnvAliases(parseObject(base.env), overrideEnv);
+      next.env = { ...parseObject(base.env), ...overrideEnv };
+    }
+  }
+  return next;
+}
+
+function isEnvRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectCaseVariantEnvAliases(
+  baseEnv: Record<string, unknown>,
+  overrideEnv: Record<string, unknown>,
+): void {
+  const baseKeys = Object.keys(baseEnv);
+  if (baseKeys.length === 0) return;
+  // Every inherited spelling of each case-insensitive name. A base env may
+  // already carry several spellings of one name; remembering only the first
+  // one lets another inherited alias survive the merge and shadow the
+  // replacement through secret resolution (or through Windows folding).
+  // Sets keep this independent of base input order.
+  const baseSpellings = new Map<string, Set<string>>();
+  for (const key of baseKeys) {
+    const canonical = key.toUpperCase();
+    let spellings = baseSpellings.get(canonical);
+    if (!spellings) {
+      spellings = new Set<string>();
+      baseSpellings.set(canonical, spellings);
+    }
+    spellings.add(key);
+  }
+  for (const key of Object.keys(overrideEnv)) {
+    const spellings = baseSpellings.get(key.toUpperCase());
+    if (!spellings || (spellings.size === 1 && spellings.has(key))) continue;
+    // Deterministic message: sort the inherited spellings so base input
+    // order never changes the error.
+    const inherited = [...spellings].sort();
+    const quoted = inherited.map((spelling) => `"${spelling}"`).join(", ");
+    throw new Error(
+      `Issue override env key "${key}" conflicts with agent env key${inherited.length === 1 ? "" : "s"} ${quoted}: ` +
+        `environment names are case-insensitive on some targets (Windows). ` +
+        (inherited.length === 1
+          ? `Use the exact key ${quoted} to replace it, or choose a non-conflicting name.`
+          : `The agent env already carries several spellings of this name, so no single spelling can replace them all; ` +
+            `remove the inherited aliases instead of overriding this name.`),
+    );
+  }
+}
