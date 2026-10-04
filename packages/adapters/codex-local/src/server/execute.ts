@@ -748,6 +748,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  // Ends this run's hold on the managed MCP block in config.toml (see
+  // writeManagedCodexMcpConfig). Called from the outer `finally`, so the run
+  // JWT and gateway bearers it carries never outlive the run on disk.
+  let releaseManagedMcpConfig: (() => Promise<void>) | null = null;
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
@@ -766,7 +770,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
+      // A user-supplied CODEX_HOME is not ours to clean up.
+      scrubOnRelease: isManagedCodexHomePath(process.env, agent.companyId, effectiveCodexHome),
     });
+    releaseManagedMcpConfig = managedMcp.release;
     if (managedMcpGateways.length > 0) {
       await onLog(
         "stdout",
@@ -1627,6 +1634,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
-    await preparedRuntimeConfig.cleanup();
+    try {
+      await preparedRuntimeConfig.cleanup();
+    } finally {
+      // After the provider-config restore above, which rewrites config.toml from
+      // its pre-run copy, so a stale MCP block cannot be restored behind us.
+      if (releaseManagedMcpConfig) {
+        await releaseManagedMcpConfig().catch(async (error) => {
+          await onLog(
+            "stderr",
+            `[paperclip] Failed to remove the managed MCP block from the Codex config: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+          );
+        });
+      }
+    }
   }
 }

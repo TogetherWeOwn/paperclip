@@ -4,6 +4,7 @@ import type { AddressInfo, Server as NetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
+import { afterAll } from "vitest";
 
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
@@ -24,10 +25,44 @@ type SupertestTestConstructor = {
 const require = createRequire(import.meta.url);
 const SupertestTest = require("supertest/lib/test.js") as SupertestTestConstructor;
 
+// Route and service suites that reach the codex adapter resolve its managed
+// home and auth cache under the Paperclip instance root. Left to the
+// environment that is the developer's (or the live server's) own instance, and
+// each run would leave `companies/<id>/codex-home` and `codex-auth-cache`
+// directories in it. Use a throwaway root per test file; suites that need a
+// specific home set their own and restore this one.
+//
+// The runtime-context and skill-cache snapshots under that root are made
+// read-only (0o555) on purpose, and a read-only directory cannot have its
+// entries unlinked, so make the tree writable before removing it.
+function removeTestDirectory(directory: string) {
+  const makeWritable = (current: string) => {
+    fs.chmodSync(current, 0o700);
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) makeWritable(path.join(current, entry.name));
+    }
+  };
+  try {
+    makeWritable(directory);
+  } catch {
+    // Already gone or unreadable; rmSync below reports anything that matters.
+  }
+  fs.rmSync(directory, { recursive: true, force: true });
+}
+
+const testPaperclipHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-home-"));
+process.env.PAPERCLIP_HOME = testPaperclipHome;
+afterAll(() => {
+  removeTestDirectory(testPaperclipHome);
+});
+
 if (!process.env.CODEX_HOME) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-codex-home-"));
   fs.writeFileSync(path.join(codexHome, "auth.json"), '{"OPENAI_API_KEY":"sk-vitest"}\n', { mode: 0o600 });
   process.env.CODEX_HOME = codexHome;
+  afterAll(() => {
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
 }
 
 // The automatic Tailscale HTTPS default (PAP-17158) probes for a real host
