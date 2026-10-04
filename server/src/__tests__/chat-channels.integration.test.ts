@@ -2909,6 +2909,189 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(writes)).not.toContain("current-vanity.example");
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
     });
+    async function formalReviewPublicationFixture() {
+      const f = await reviewBotFixture();
+      const config = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: config.revision,
+        configuration: {
+          ...config.configuration,
+          defaults: { ...config.configuration.defaults, allowApprove: true, allowRequestChanges: true },
+        },
+      }, "owner-user");
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:91",
+        name: "Formal review",
+      }).thread;
+      await deliverMessage({
+        callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention",
+        message: makeMessage({ id: "formal-request", text: "Review this PR", userId: "42", userName: "octocat", mentioned: true }),
+      });
+      const [link] = await db.select().from(chatMessageLinks).where(and(
+        eq(chatMessageLinks.endpointId, f.endpoint.id),
+        eq(chatMessageLinks.direction, "inbound"),
+      ));
+      const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.id, link.conversationId));
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId, agentId: f.assignedAgentId, invocationSource: "assignment", status: "running",
+        contextSnapshot: { issueId: conversation.issueId, wakeCommentId: link.commentId },
+      }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run.id };
+      const reviewedCommit = "b".repeat(40);
+      let head = reviewedCommit;
+      let historyHook: ((page: number) => Promise<void>) | undefined;
+      let loseResponse = false;
+      let paginateHistory = false;
+      const requests: Array<{ method: string; url: string }> = [];
+      const posts: Array<Record<string, unknown>> = [];
+      const reviews: Array<{ id: number; body: string; html_url: string; user: { login: string | null } }> = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
+        const method = init?.method ?? "GET";
+        requests.push({ method, url });
+        if (method === "GET" && url.endsWith("/pulls/91")) return Response.json({
+          number: 91, title: "Fixture PR", body: "", state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        });
+        if (method === "GET" && url.includes("/pulls/91/reviews?")) {
+          const page = Number(new URL(url).searchParams.get("page"));
+          await historyHook?.(page);
+          return Response.json(paginateHistory && page === 1
+            ? Array.from({ length: 100 }, (_, index) => ({ id: index, body: "Unrelated review", user: { login: "other-person" } }))
+            : reviews);
+        }
+        if (method === "POST" && url.endsWith("/pulls/91/reviews")) {
+          const body = JSON.parse(String(init?.body));
+          posts.push(body);
+          const review = {
+            id: posts.length + 100, body: String(body.body),
+            html_url: `https://github.com/test/reviews/${posts.length}`,
+            user: { login: f.endpoint.botUsername },
+          };
+          reviews.push(review);
+          if (loseResponse) throw new Error("Fixture lost the provider response after publication");
+          return Response.json(review);
+        }
+        throw new Error(`Unexpected formal-review fixture request: ${method} ${url}`);
+      });
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "begin_review", { reviewedCommit });
+      // Seed the completed assessment to isolate the formal effect path. All
+      // scope, permission, outbox, lease and provider-request code remains real.
+      await db.update(chatGitHubReviews).set({
+        state: "completed",
+        assessment: {
+          reviewedCommit, complete: true, score: 5, summary: "Fixture assessment", rationale: "All fixture paths reviewed",
+          coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [],
+        },
+      }).where(and(eq(chatGitHubReviews.runId, run.id), eq(chatGitHubReviews.headSha, reviewedCommit)));
+      // This fixture does not publish assessment checks. Retire its queued check
+      // so another case's bounded outbox scan cannot consume this fixture.
+      await db.update(chatActions).set({ status: "cancelled" }).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_check"),
+      ));
+      return {
+        ...f, service, session, run, thread, reviewedCommit, requests, posts,
+        setHead: (value: string) => { head = value; },
+        setHistoryHook: (hook: (page: number) => Promise<void>) => { historyHook = hook; },
+        loseResponse: (value: boolean) => { loseResponse = value; },
+        paginateHistory: () => { paginateHistory = true; },
+        request: (event: "APPROVE" | "REQUEST_CHANGES") => service.execute(session, "formal_review", {
+          event, reviewedCommit, body: "Explicit formal review", idempotencyKey: "formal-preflight",
+        }),
+      };
+    }
+
+    it.each(["APPROVE", "REQUEST_CHANGES"] as const)("revalidates the %s head after paginated review history", async (event) => {
+      const f = await formalReviewPublicationFixture();
+      f.paginateHistory();
+      f.setHistoryHook(async (page) => { if (page === 2) f.setHead("c".repeat(40)); });
+      expect(await f.request(event)).toMatchObject({ status: "cancelled", receipt: { code: "stale_head", retryable: false } });
+      expect(f.posts).toHaveLength(0);
+      expect(f.requests.some((r) => r.url.endsWith("page=2"))).toBe(true);
+    });
+
+    it.each(["formal permission", "initiating person", "tool connection", "assigned agent", "task run", "request delivery", "pull binding", "conversation kind"])("refuses formal publication when %s changes during history retrieval", async (change) => {
+      const f = await formalReviewPublicationFixture();
+      f.setHistoryHook(async () => {
+        if (change === "formal permission") {
+          const config = await f.management.configuration(f.endpoint.id, "owner-user");
+          await f.management.saveConfiguration(f.endpoint.id, {
+            expectedRevision: config.revision,
+            configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, allowApprove: false } },
+          }, "owner-user");
+        } else if (change === "initiating person") {
+          await db.update(chatIdentityLinks).set({ status: "revoked" }).where(eq(chatIdentityLinks.principalId, f.principal.id));
+        } else if (change === "tool connection") {
+          await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, f.endpoint.connectionId!));
+        } else if (change === "pull binding" || change === "conversation kind") {
+          await db.update(chatConversations).set({
+            externalThreadId: change === "pull binding" ? "github:paperclipai/paperclip:92" : "github:paperclipai/paperclip:issue:91",
+          }).where(eq(chatConversations.issueId, f.session.issueId!));
+        } else if (change === "assigned agent") {
+          await db.update(issues).set({ assigneeAgentId: f.replacementAgentId }).where(eq(issues.id, f.session.issueId!));
+        } else if (change === "task run") {
+          await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id));
+        } else {
+          await deliverMessage({
+            callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread: f.thread,
+            trigger: "mention",
+            message: makeMessage({ id: "different-formal-request", text: "A different request", userId: "42", userName: "octocat", mentioned: true }),
+          });
+          const [link] = await db.select().from(chatMessageLinks).where(and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id), eq(chatMessageLinks.providerMessageId, "different-formal-request"),
+          ));
+          await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.run.contextSnapshot, wakeCommentId: link.commentId } }).where(eq(heartbeatRuns.id, f.run.id));
+        }
+      });
+      expect(await f.request("APPROVE")).toMatchObject({ status: "cancelled", receipt: { code: "authorization_changed", retryable: false } });
+      expect(f.posts).toHaveLength(0);
+    });
+
+    it.each(["APPROVE", "REQUEST_CHANGES"] as const)("posts exactly one eligible %s after a final head check", async (event) => {
+      const f = await formalReviewPublicationFixture();
+      expect(await f.request(event)).toMatchObject({ status: "processed" });
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toMatchObject({ event, commit_id: f.reviewedCommit });
+      const publication = f.requests.findIndex((r) => r.method === "POST");
+      expect(f.requests[publication - 1]).toEqual({ method: "GET", url: "https://api.github.com/repos/paperclipai/paperclip/pulls/91" });
+      expect(await f.request(event)).toMatchObject({ status: "processed" });
+      expect(f.posts).toHaveLength(1);
+    });
+
+    it("recovers an already-published formal review without another POST after head drift in history", async () => {
+      const f = await formalReviewPublicationFixture();
+      f.loseResponse(true);
+      expect(await f.request("APPROVE")).toMatchObject({ status: "failed" });
+      expect(f.posts).toHaveLength(1);
+      f.loseResponse(false);
+      f.setHistoryHook(async () => { f.setHead("c".repeat(40)); });
+      expect(await f.request("APPROVE")).toMatchObject({ status: "processed", receipt: { id: "101" } });
+      expect(f.posts).toHaveLength(1);
+    });
+
+    it.each(["missing assessment", "incomplete assessment", "disabled permission"])("preserves initial refusal for %s", async (denial) => {
+      const f = await formalReviewPublicationFixture();
+      if (denial === "missing assessment") {
+        await db.delete(chatGitHubReviews).where(eq(chatGitHubReviews.runId, f.run.id));
+      } else if (denial === "incomplete assessment") {
+        await db.update(chatGitHubReviews).set({ state: "incomplete" }).where(eq(chatGitHubReviews.runId, f.run.id));
+      } else {
+        const config = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, {
+          expectedRevision: config.revision,
+          configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, allowApprove: false } },
+        }, "owner-user");
+      }
+      await expect(f.request("APPROVE")).rejects.toThrow(denial === "disabled permission" ? "disabled" : "complete assessment");
+      expect(f.posts).toHaveLength(0);
+      expect(f.requests.some((r) => r.url.includes("/reviews?"))).toBe(false);
+    });
+
     it("uses task-bound bot tools and deterministic checks, then denies revoked people", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
