@@ -1065,7 +1065,17 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         if (!session || session.companyId !== action.companyId)
           throw forbidden("Invalid GitHub publication binding");
         try {
-          const source = await scope(session, true);
+          const publicationScope = async () => {
+            const source = await scope(session, true);
+            if (
+              source.endpoint.id !== action.endpointId ||
+              source.conversation.id !== action.conversationId ||
+              source.delivery.id !== action.deliveryId
+            )
+              throw forbidden("GitHub publication context changed");
+            return source;
+          };
+          const source = await publicationScope();
           const egressScope = await githubEgressReferenceScope(
             db,
             source.endpoint.companyId,
@@ -1076,12 +1086,6 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               projectSafeChatPublicationText(text),
               egressScope,
             );
-          if (
-            source.endpoint.id !== action.endpointId ||
-            source.conversation.id !== action.conversationId ||
-            source.delivery.id !== action.deliveryId
-          )
-            throw forbidden("GitHub publication context changed");
           await assertPublicationAuthority(source, action);
           const api = await client(source, lease.fetch);
           const publicationMarker = marker(
@@ -1111,7 +1115,17 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             );
           };
           const currentHead = async (expected: string) => {
-            const currentSource = await scope(session, true);
+            const currentSource = await publicationScope();
+            if (
+              currentSource.endpoint.connectionId !== source.endpoint.connectionId ||
+              currentSource.resource.id !== source.resource.id ||
+              currentSource.repositoryId !== source.repositoryId ||
+              currentSource.repository !== source.repository ||
+              currentSource.number !== source.number ||
+              currentSource.isIssue !== source.isIssue ||
+              currentSource.replyId !== source.replyId
+            )
+              throw forbidden("GitHub publication context changed");
             await assertPublicationAuthority(currentSource, action);
             if (action.payload.operation === "formal_review")
               assertFormalPermission(
@@ -1172,6 +1186,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               `/pulls/${source.number}/reviews`,
               publicationMarker,
             );
+            // Recover an existing effect without duplicating it. A new POST
+            // needs fresh authority and head checks after the history lookup;
+            // this preflight still is not an atomic transaction with GitHub.
+            if (!prior) await currentHead(parsed.reviewedCommit);
             const posted =
               prior ??
               (await api.request<{ id: number; html_url: string }>(
