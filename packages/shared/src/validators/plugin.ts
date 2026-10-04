@@ -799,6 +799,9 @@ export const pluginManifestV1Schema = z.object({
   skills: z.array(pluginManagedSkillDeclarationSchema).optional(),
   localFolders: z.array(pluginLocalFolderDeclarationSchema).optional(),
   objectReferences: z.array(pluginObjectReferenceProviderDeclarationSchema).optional(),
+  modelRouting: z.object({
+    envKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "envKeys must be env var names")).max(32),
+  }).optional(),
   launchers: z.array(pluginLauncherDeclarationSchema).optional(),
   ui: z.object({
     slots: z.array(pluginUiSlotDeclarationSchema).min(1).optional(),
@@ -895,6 +898,14 @@ export const pluginManifestV1Schema = z.object({
         path: ["capabilities"],
       });
     }
+  }
+
+  if (manifest.modelRouting && !manifest.capabilities.includes("run.model.resolve")) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Capability 'run.model.resolve' is required when modelRouting is declared",
+      path: ["capabilities"],
+    });
   }
 
   if (manifest.localFolders && manifest.localFolders.length > 0) {

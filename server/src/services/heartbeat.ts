@@ -118,6 +118,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
+  pluginCompanySettings,
   approvals,
   assets,
   chatActions,
@@ -281,6 +282,7 @@ import {
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { isTerminalResultCleanupSuccess } from "./terminal-cleanup-outcome.js";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -454,6 +456,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  mergeIssueAdapterConfigOverrides,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -617,6 +620,20 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import {
+  RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
+  RUN_MODEL_DECISION_RETRY_REASON,
+  RunModelDecisionDeferral,
+  applyRunModelDecisionToAdapterConfig,
+  isRunModelDecisionDeferral,
+  readPreviousRunModelDecision,
+  resolveRunModelDecision,
+  resolveRunModelDecisionNoDecision,
+  selectRunModelDecisionHolder,
+  type RunModelDecideAnswer,
+  type RunModelDecisionHolderSelection,
+  type RunModelDecisionPrevious,
+} from "./run-model-decision.js";
 import { serverVersion } from "../version.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -7983,6 +8000,12 @@ export async function buildPaperclipWakePayload(input: {
     issueDescriptionTruncated ||
     planReviewContext?.truncated === true ||
     documentReviewContext?.truncated === true;
+  const continuationEnvelope = parseObject(
+    input.contextSnapshot.executionContinuation,
+  );
+  const continuationTruncated =
+    continuationEnvelope.truncated === true ||
+    continuationEnvelope.fallbackFetchNeeded === true;
   const recoveryActionId = readNonEmptyString(
     input.contextSnapshot.recoveryActionId,
   );
@@ -8206,8 +8229,11 @@ export async function buildPaperclipWakePayload(input: {
       includedCount: comments.length,
       missingCount: missingCommentCount,
     },
-    truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    truncated: payloadTruncated || continuationTruncated,
+    fallbackFetchNeeded:
+      payloadTruncated ||
+      continuationTruncated ||
+      missingCommentCount > 0,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -10656,6 +10682,7 @@ export function heartbeatService(
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
@@ -13037,6 +13064,7 @@ export function heartbeatService(
       issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
+      modelDecision: parseObject(run.contextSnapshot).modelDecision ?? null,
     });
   }
 
@@ -13052,6 +13080,11 @@ export function heartbeatService(
     issueId: string | null;
     startedAt: Date | null;
     finishedAt: Date | null;
+    /**
+     * TOG-11792 `contextSnapshot.modelDecision`. `agent.run.started` fires at
+     * claim, before the hook runs, so only later lifecycle events carry it.
+     */
+    modelDecision?: unknown;
   }) {
     const eventType =
       run.status === "running"
@@ -13086,6 +13119,7 @@ export function heartbeatService(
         finishedAt: run.finishedAt
           ? new Date(run.finishedAt).toISOString()
           : null,
+        ...(run.modelDecision ? { modelDecision: run.modelDecision } : {}),
       },
     });
   }
@@ -16364,6 +16398,272 @@ export function heartbeatService(
     await finalizeAgentStatus(run.agentId, "cancelled", null, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     }).catch(() => undefined);
+  }
+
+  /**
+   * TOG-11792: gather the rows the run model decision needs and ask the
+   * company's single `run.model.resolve` holder. The decision rules live in
+   * run-model-decision.ts; this function only loads data and makes the call.
+   */
+  async function resolveModelDecisionForRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    context: Record<string, unknown>;
+    issueId: string | null;
+    issueContext: { assigneeAgentId: string | null; assigneeUserId: string | null } | null;
+    issueOverrideModel: string | null;
+    requireDecision: boolean;
+  }) {
+    const { run, agent, context, issueId } = input;
+    const manager = options.pluginWorkerManager;
+    let holder: RunModelDecisionHolderSelection = { kind: "none" };
+    let previous: RunModelDecisionPrevious | null = null;
+    let isUserRequestedWake = false;
+    if (manager && issueId) {
+      try {
+        // No settings row means enabled; an explicit `enabled = false` row is a
+        // company opting out, and its runs must not wait on that plugin.
+        const disabledPluginIds = new Set(
+          (
+            await db
+              .select({ pluginId: pluginCompanySettings.pluginId })
+              .from(pluginCompanySettings)
+              .where(
+                and(
+                  eq(pluginCompanySettings.companyId, run.companyId),
+                  eq(pluginCompanySettings.enabled, false),
+                ),
+              )
+          ).map((row) => row.pluginId),
+        );
+        const readyPlugins = await pluginRegistryService(db).listByStatus("ready");
+        holder = selectRunModelDecisionHolder(
+          readyPlugins.filter((row) => !disabledPluginIds.has(row.id)),
+        );
+      } catch (err) {
+        // Not knowing whether a holder exists is not "no holder": the
+        // orchestrator parks (flag on) or records advisory (flag off).
+        logger.warn({ err, runId: run.id }, "run model decision holder lookup failed");
+        holder = {
+          kind: "unavailable",
+          reason: `holder lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+    if (manager && issueId && holder.kind !== "none") {
+      // Both lookups below only refine the call; a failure falls back to a
+      // non-exempt wake with no previous decision.
+      try {
+        const [request] = run.wakeupRequestId
+          ? await db
+              .select({ requestedByActorType: agentWakeupRequests.requestedByActorType })
+              .from(agentWakeupRequests)
+              .where(
+                and(
+                  eq(agentWakeupRequests.id, run.wakeupRequestId),
+                  eq(agentWakeupRequests.companyId, run.companyId),
+                ),
+              )
+          : [];
+        isUserRequestedWake = isManualUserRun({
+          contextSnapshot: context,
+          requestedByActorType:
+            (request?.requestedByActorType as "user" | "agent" | "system" | null | undefined) ?? null,
+          source: run.invocationSource as WakeupOptions["source"],
+          triggerDetail: run.triggerDetail as WakeupOptions["triggerDetail"],
+        });
+        const previousRun = await db
+          .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              ne(heartbeatRuns.id, run.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              sql`${heartbeatRuns.contextSnapshot} -> 'modelDecision' is not null`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        previous = readPreviousRunModelDecision(previousRun);
+      } catch (err) {
+        logger.warn({ err, runId: run.id }, "run model decision context lookup failed");
+      }
+    }
+    const agentConfig = parseObject(agent.adapterConfig);
+    return resolveRunModelDecision({
+      requireDecision: input.requireDecision,
+      skip: {
+        issueId,
+        assigneeIsHuman:
+          Boolean(input.issueContext?.assigneeUserId) &&
+          !input.issueContext?.assigneeAgentId,
+        issueOverrideModel: input.issueOverrideModel,
+      },
+      isUserRequestedWake,
+      holder,
+      params: {
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: agent.id,
+        issueId,
+        adapterType: agent.adapterType,
+        invocationSource: run.invocationSource,
+        wakeReason: readNonEmptyString(context.wakeReason),
+        agentDefaultModel: readNonEmptyString(agentConfig.model),
+        previous,
+        issueOverrideModel: input.issueOverrideModel,
+      },
+      baseEnv: parseObject(agentConfig.env),
+      call: (pluginId, params, timeoutMs) =>
+        manager
+          ? manager.call(pluginId, "resolveRunModel", params, timeoutMs)
+          : Promise.reject(new Error("plugin worker manager unavailable")),
+    });
+  }
+
+  /**
+   * TOG-11792: the router gave no decision. Cancel before any provider work,
+   * schedule a bounded `model_decision_pending` retry, and once the attempts
+   * run out surface the issue. Never fall back to the default model.
+   */
+  async function finalizeRunModelDecisionDeferral(
+    run: typeof heartbeatRuns.$inferSelect,
+    deferral: RunModelDecisionDeferral,
+  ) {
+    const now = new Date();
+    const cancelWrite = await setRunStatusIfRunning(run.id, "cancelled", {
+      error: deferral.message,
+      errorCode: RUN_MODEL_DECISION_RETRY_REASON,
+      finishedAt: now,
+      resultJson: {
+        executionRecovery: {
+          kind: RUN_MODEL_DECISION_RETRY_REASON,
+          providerWorkStarted: false,
+        },
+      },
+      contextSnapshot: {
+        ...parseObject(run.contextSnapshot),
+        modelDecision: deferral.record,
+      },
+    });
+    if (!cancelWrite.updated) {
+      logger.info(
+        { runId: run.id, currentStatus: cancelWrite.run?.status ?? null },
+        "skipping model-decision deferral finalization because the run already left running state",
+      );
+      return;
+    }
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: deferral.message,
+    }).catch(() => undefined);
+
+    const cancelledRun =
+      cancelWrite.run ?? (await getRun(run.id).catch(() => null));
+    const agentRow = await getAgent(run.agentId).catch(() => null);
+    const consumedAttempts = cancelledRun
+      ? executionRetryAttemptCount(cancelledRun, RUN_MODEL_DECISION_RETRY_REASON)
+      : 0;
+    const next = resolveRunModelDecisionNoDecision({
+      consumedAttempts,
+      retryAfterMs: deferral.retryAfterMs,
+      reason: deferral.reason,
+    });
+    let scheduleOutcome: string | null = null;
+    if (cancelledRun && agentRow && next.action === "retry") {
+      const scheduleResult = await scheduleBoundedRetryForRun(
+        cancelledRun,
+        agentRow,
+        {
+          now,
+          retryReason: RUN_MODEL_DECISION_RETRY_REASON,
+          wakeReason: `${RUN_MODEL_DECISION_RETRY_REASON}_retry`,
+          maxAttempts: RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
+          delayMs: next.retryAfterMs,
+        },
+      ).catch((scheduleErr) => {
+        logger.error(
+          { err: scheduleErr, runId: run.id },
+          "failed to schedule model-decision retry after deferral",
+        );
+        return null;
+      });
+      scheduleOutcome = scheduleResult?.outcome ?? null;
+    }
+    const retryScheduled = scheduleOutcome === "scheduled";
+
+    if (cancelledRun) {
+      await appendRunEvent(cancelledRun, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: retryScheduled ? "info" : "warn",
+        message: retryScheduled
+          ? `Deferred: ${deferral.message}. Retry ${consumedAttempts + 1} of ${RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS} scheduled; the run does not start on the default model.`
+          : `Deferred: ${deferral.message}. No retry remains; the issue needs attention and the run does not start on the default model.`,
+        payload: {
+          modelDecision: deferral.record,
+          consumedAttempts,
+          maxAttempts: RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
+          retryScheduled,
+        },
+      }).catch(() => undefined);
+    }
+
+    if (cancelledRun && !retryScheduled) {
+      await releaseIssueExecutionAndPromote(cancelledRun).catch(
+        (releaseErr) => {
+          logger.error(
+            { err: releaseErr, runId: run.id },
+            "failed to release issue execution after model-decision deferral",
+          );
+        },
+      );
+      await surfaceRunModelDecisionExhaustion(cancelledRun, {
+        attempts: consumedAttempts,
+        reason: deferral.reason,
+      }).catch((surfaceErr) => {
+        logger.error(
+          { err: surfaceErr, runId: run.id },
+          "failed to surface exhausted model-decision deferral",
+        );
+      });
+    }
+
+    await finalizeAgentStatus(run.agentId, "cancelled", null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    }).catch(() => undefined);
+  }
+
+  async function surfaceRunModelDecisionExhaustion(
+    run: typeof heartbeatRuns.$inferSelect,
+    input: { attempts: number; reason: string },
+  ) {
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return null;
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+    if (
+      !issue ||
+      (issue.status !== "todo" &&
+        issue.status !== "in_progress" &&
+        issue.status !== "in_review")
+    )
+      return null;
+    return recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: issue.status,
+      latestRun: run,
+      comment: [
+        `The model router has not decided a model for this issue after ${input.attempts} scheduled attempts (last reason: ${input.reason}).`,
+        "The run was not started on the default model. Check the model router plugin, then move the issue back to `todo`.",
+      ].join("\n\n"),
+    });
   }
 
   async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
@@ -20487,6 +20787,36 @@ export function heartbeatService(
           : null;
       const experimentalInstanceSettings =
         await instanceSettings.getExperimental();
+      // TOG-11792: the model router decides this run's model before the
+      // adapter config merge and before any workspace or provider work. With
+      // `requireRunModelDecision` off the answer is only recorded (advisory).
+      const modelDecision = await resolveModelDecisionForRun({
+        run,
+        agent,
+        context,
+        issueId,
+        issueContext,
+        issueOverrideModel: readNonEmptyString(
+          issueAssigneeOverrides?.adapterConfig?.model,
+        ),
+        requireDecision: experimentalInstanceSettings.requireRunModelDecision,
+      });
+      context.modelDecision = modelDecision.record;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ modelDecision: modelDecision.record })}::jsonb`,
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+      if (modelDecision.action === "park") {
+        throw new RunModelDecisionDeferral({
+          retryAfterMs: modelDecision.retryAfterMs,
+          reason: modelDecision.reason,
+          record: modelDecision.record,
+        });
+      }
+      const decidedModel: RunModelDecideAnswer | null =
+        modelDecision.answer?.kind === "decide" ? modelDecision.answer : null;
       const isolatedWorkspacesEnabled =
         experimentalInstanceSettings.enableIsolatedWorkspaces;
       // Inert on its own: the operator default only reaches the resolver when
@@ -21275,10 +21605,19 @@ export function heartbeatService(
         legacyUseProjectWorkspace:
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
-      const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
-      };
+      // TOG-11791: merge override `env` per key so a pin that sets one key
+      // keeps the base credentials it omits. All other keys keep shallow
+      // replace semantics.
+      const overrideMergedConfig = mergeIssueAdapterConfigOverrides(
+        workspaceManagedConfig,
+        issueAssigneeOverrides?.adapterConfig ?? null,
+      );
+      // TOG-11792: the router's decision is run-scoped and lands before secret
+      // resolution; its env keys were validated against the manifest
+      // allowlist and the base config's secret bindings.
+      const mergedConfig = decidedModel
+        ? applyRunModelDecisionToAdapterConfig(overrideMergedConfig, decidedModel)
+        : overrideMergedConfig;
       const configSnapshot = buildExecutionWorkspaceConfigSnapshot(
         mergedConfig,
         selectedEnvironmentId,
@@ -23608,7 +23947,12 @@ export function heartbeatService(
                         : null,
                     ...resolvePaperclipRunnerNativeProviderInput({
                       backend: nativeRuntimeResolution.profile.backend,
-                      adapterConfig: agent.adapterConfig,
+                      adapterConfig: decidedModel
+                        ? applyRunModelDecisionToAdapterConfig(
+                            parseObject(agent.adapterConfig),
+                            decidedModel,
+                          )
+                        : agent.adapterConfig,
                       managedProfile,
                       agentCoreProfile,
                     }),
@@ -24766,6 +25110,17 @@ export function heartbeatService(
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
+        // The terminal-result cleanup SIGTERMs a lingering background task
+        // after the adapter already produced its terminal result; the CLI
+        // then exits 143. That cleanup-induced end of process is not a run
+        // failure when the adapter itself reports success.
+        const terminalCleanupSuccess = isTerminalResultCleanupSuccess({
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          errorMessage: adapterResult.errorMessage,
+          errorCode: adapterResult.errorCode,
+          resultJson: parseObject(adapterResult.resultJson),
+        });
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
@@ -24784,9 +25139,9 @@ export function heartbeatService(
         } else if (adapterResult.timedOut) {
           outcome = "timed_out";
         } else if (
-          (adapterResult.exitCode ?? 0) === 0 &&
+          ((adapterResult.exitCode ?? 0) === 0 || terminalCleanupSuccess) &&
           !adapterResult.errorMessage &&
-          !adapterResult.signal &&
+          (!adapterResult.signal || terminalCleanupSuccess) &&
           !processCancellation?.failed
         ) {
           outcome = "succeeded";
@@ -25741,6 +26096,17 @@ export function heartbeatService(
             logger.error(
               { err: deferralErr, runId },
               "failed to finalize workspace-busy deferral",
+            );
+          },
+        );
+      } else if (isRunModelDecisionDeferral(outerErr)) {
+        // TOG-11792: no model decision yet. The run never starts on the
+        // default; park it as a bounded `model_decision_pending` retry.
+        await finalizeRunModelDecisionDeferral(run, outerErr).catch(
+          (deferralErr) => {
+            logger.error(
+              { err: deferralErr, runId },
+              "failed to finalize model-decision deferral",
             );
           },
         );

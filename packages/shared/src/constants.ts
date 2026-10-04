@@ -1408,6 +1408,9 @@ export const PLUGIN_CAPABILITIES = [
   "secrets.read-ref",
   "environment.drivers.register",
   "local.folders",
+  // Decide the model for each issue run before it starts (TOG-11792). One
+  // holder per company; called synchronously from executeRun with a deadline.
+  "run.model.resolve",
   // Agent Tools
   "agent.tools.register",
   // UI

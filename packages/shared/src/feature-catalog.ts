@@ -317,6 +317,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  requireRunModelDecision: {
+    title: "Require Run Model Decision",
+    description:
+      "Issue runs wait for the model routing plugin to decide their model and never start on the agent default. Off keeps the decision advisory.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableWorktreeRunExecution: {
     title: "Worktree Run Execution",
     description:

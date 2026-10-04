@@ -1,7 +1,17 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { isPublicExecutorToolSelector } from "@paperclipai/adapter-utils/command-redaction";
 
-const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
+// Bound the [A-Za-z0-9_-] affixes to {0,64} around the secret keyword core.
+// Unbounded `*` affixes cause quadratic backtracking on long alphanumeric
+// runs (e.g. thinking signatures) through the unanchored JSON and escaped-JSON
+// text regexes below. SECRET_PAYLOAD_KEY_RE is unanchored, so object keys of
+// any length still match on the keyword core. CLI_SECRET_FLAG_RE (`^...$`)
+// only matches flags with at most 64 affix chars on each side, and the JSON
+// text regexes only match names with at most 64 chars after the keyword
+// (the closing quote/colon must follow); longer names are not masked there.
+// Port of the live v2026.916 operator overlay (same limits); preserves all
+// PRP v2 / public-executor-selector semantics below.
+const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]{0,64}`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
 // Authorization reasons are policy decision codes, not credentials. They must
@@ -987,6 +997,44 @@ export function redactAgentAdapterConfig(
   );
 
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
+}
+
+/**
+ * Restore display-only `***REDACTED***` plain env bindings in a requested env
+ * map from previously stored env maps. Reads redact every plain env value, so
+ * a client that echoes a read payload back (GET then PATCH) would otherwise
+ * persist the placeholder as the real value. The first source that still holds
+ * the key wins, so callers pass the most specific store first (e.g. the
+ * stored issue override, then the assignee agent's stored env). Keys with no
+ * stored value, or requests that are not redacted placeholders, pass through
+ * untouched. Mirrors the agent-update restore in `routes/agents.ts`.
+ */
+export function restoreRedactedPlainEnvBindings(
+  requestedEnv: Record<string, unknown>,
+  sources: Array<Record<string, unknown> | null | undefined>,
+): Record<string, unknown> {
+  const restoredEnv = { ...requestedEnv };
+  for (const [key, value] of Object.entries(requestedEnv)) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      (value as Record<string, unknown>).type !== "plain" ||
+      (value as Record<string, unknown>).value !== REDACTED_EVENT_VALUE
+    ) {
+      continue;
+    }
+    for (const source of sources) {
+      if (
+        source &&
+        Object.prototype.hasOwnProperty.call(source, key)
+      ) {
+        restoredEnv[key] = source[key];
+        break;
+      }
+    }
+  }
+  return restoredEnv;
 }
 
 export function redactSensitiveText(input: string): string {

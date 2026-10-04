@@ -85,6 +85,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   // Deprecated compatibility key. Runner ingress follows enableNativeRunner;
   // this remains accepted so older stored rows and managed configs keep loading.
   enableRunnerPreviewIngress: z.boolean().default(false),
+  // TOG-11792: issue runs wait for the run.model.resolve holder's decision and
+  // never start on the default. Off = advisory (run on the default).
+  requireRunModelDecision: z.boolean().default(false),
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),

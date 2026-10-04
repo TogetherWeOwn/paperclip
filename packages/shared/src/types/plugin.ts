@@ -657,6 +657,15 @@ export interface PluginObjectReferenceProviderDeclaration {
 // ---------------------------------------------------------------------------
 
 /**
+ * Declares the env keys a `run.model.resolve` holder may set on a run's
+ * adapter config. The host rejects any decision env key outside this list.
+ */
+export interface PluginModelRoutingDeclaration {
+  /** Plain env keys the decision may set (never secret bindings). */
+  envKeys: string[];
+}
+
+/**
  * The manifest shape every plugin package must export.
  * See PLUGIN_SPEC.md §10.1 for the normative definition.
  */
@@ -720,6 +729,8 @@ export interface PaperclipPluginManifestV1 {
   localFolders?: PluginLocalFolderDeclaration[];
   /** External object reference providers this plugin contributes. */
   objectReferences?: PluginObjectReferenceProviderDeclaration[];
+  /** Run-scoped model decisions. Requires `run.model.resolve` capability. */
+  modelRouting?: PluginModelRoutingDeclaration;
   /**
    * Legacy top-level launcher declarations.
    * Prefer `ui.launchers` for new manifests.

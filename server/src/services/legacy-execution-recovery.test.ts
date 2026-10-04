@@ -86,3 +86,16 @@ it("retains conversation retry eligibility for a transient restore lock timeout"
     workspaceRestoreFailure: "restore_lock_timeout", conversationContinuation: "continue_conversation_v1",
   } })).toBe(false);
 });
+
+it("permits model-decision waits only with explicit evidence that provider work never started", () => {
+  const waiting = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "model_decision_pending", scheduledRetryAttempt: 3,
+    resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+  };
+  expect(legacyExecutionNeedsReconciliation(waiting)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {
+    executionRecovery: { kind: "model_decision_pending", providerWorkStarted: true },
+  } })).toBe(true);
+});
