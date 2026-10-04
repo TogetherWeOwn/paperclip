@@ -31,10 +31,29 @@ const SupertestTest = require("supertest/lib/test.js") as SupertestTestConstruct
 // each run would leave `companies/<id>/codex-home` and `codex-auth-cache`
 // directories in it. Use a throwaway root per test file; suites that need a
 // specific home set their own and restore this one.
+//
+// The runtime-context and skill-cache snapshots under that root are made
+// read-only (0o555) on purpose, and a read-only directory cannot have its
+// entries unlinked, so make the tree writable before removing it.
+function removeTestDirectory(directory: string) {
+  const makeWritable = (current: string) => {
+    fs.chmodSync(current, 0o700);
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) makeWritable(path.join(current, entry.name));
+    }
+  };
+  try {
+    makeWritable(directory);
+  } catch {
+    // Already gone or unreadable; rmSync below reports anything that matters.
+  }
+  fs.rmSync(directory, { recursive: true, force: true });
+}
+
 const testPaperclipHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-home-"));
 process.env.PAPERCLIP_HOME = testPaperclipHome;
 afterAll(() => {
-  fs.rmSync(testPaperclipHome, { recursive: true, force: true });
+  removeTestDirectory(testPaperclipHome);
 });
 
 if (!process.env.CODEX_HOME) {
