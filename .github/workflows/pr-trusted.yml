@@ -293,11 +293,21 @@ jobs:
           set -euo pipefail
           # Diff against the merge base so recent base commits do not appear
           # as changes made by the PR itself.
-          changed="$(git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA")"
-          if ! printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
+          changed_paths="$(mktemp "$RUNNER_TEMP/pr-changed-paths.XXXXXX")"
+          trap 'rm -f "$changed_paths"' EXIT
+          git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$changed_paths"
+          lockfile_changed=false
+          manifest_changed=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              pnpm-lock.yaml) lockfile_changed=true ;;
+              package.json|*/package.json) manifest_changed=true ;;
+            esac
+          done < "$changed_paths"
+          if [[ "$lockfile_changed" != true ]]; then
             exit 0
           fi
-          if ! printf '%s\n' "$changed" | grep -Eq '(^|/)package\.json$'; then
+          if [[ "$manifest_changed" != true ]]; then
             echo "Do not commit pnpm-lock.yaml without a package.json change in the same PR."
             echo "The lockfile is regenerated automatically by the refresh bot on a schedule."
             exit 1
@@ -306,9 +316,9 @@ jobs:
           # result is admitted; restore the PR tree even if resolution fails.
           saved_lockfile="$(mktemp "$RUNNER_TEMP/pr-pnpm-lock.XXXXXX")"
           cp pnpm-lock.yaml "$saved_lockfile"
-          trap 'cp "$saved_lockfile" pnpm-lock.yaml; rm -f "$saved_lockfile"' EXIT
+          trap 'cp "$saved_lockfile" pnpm-lock.yaml; rm -f "$saved_lockfile" "$changed_paths"' EXIT
           git show "$BASE_SHA:pnpm-lock.yaml" > pnpm-lock.yaml
-          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          pnpm install --resolution-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile
           if ! cmp -s pnpm-lock.yaml "$saved_lockfile"; then
             echo "The committed pnpm-lock.yaml does not match what 'pnpm install' regenerates"
             echo "from this PR's package.json manifests. Commit the regenerated lockfile instead"
