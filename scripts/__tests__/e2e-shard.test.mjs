@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,27 +53,36 @@ function readWorkflowJobs(workflow) {
   return jobs;
 }
 
-function runStackScope(stack, prBaseRef) {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
-  const match = workflow.match(
-    /      - name: Select stacked PR CI scope[\s\S]*?        run: \|\n([\s\S]*?)\n\n  policy:/,
-  );
-  assert.ok(match, "trusted workflow must define the stacked PR scope script");
-  const script = match[1]
-    .split("\n")
-    .map((line) => line.replace(/^ {10}/, ""))
-    .join("\n");
-  const scratch = mkdtempSync(path.join(tmpdir(), "paperclip-stack-scope-"));
+function runAffectedScope(files, event = "pull_request") {
+  const scratch = mkdtempSync(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "paperclip-affected-scope-"));
   const output = path.join(scratch, "github-output");
 
   try {
-    const result = spawnSync("bash", ["-c", script], {
+    const git = (...args) => {
+      const result = spawnSync("git", args, { cwd: scratch, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git("init", "-q");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-qm", "base");
+    const base = git("rev-parse", "HEAD");
+    for (const file of files) {
+      const target = path.join(scratch, file);
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, "fixture\n");
+    }
+    git("add", ".");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "head");
+    const result = spawnSync(process.execPath, [path.join(repoRoot, "scripts/ci-affected-work.mjs")], {
+      cwd: scratch,
       encoding: "utf8",
       env: {
-        ...process.env,
+        PATH: process.env.PATH,
         GITHUB_OUTPUT: output,
-        PR_BASE_REF: prBaseRef,
-        STACK_JSON: JSON.stringify(stack),
+        CI_EVENT: event,
+        CI_SCOPE: "pr",
+        CI_BASE_SHA: base,
+        CI_HEAD_SHA: git("rev-parse", "HEAD"),
       },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -174,8 +183,8 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
   assert.match(aggregate, /^ {4}if: \$\{\{ always\(\) \}\}$/m, "the aggregate must run even when a shard fails");
   assert.match(
     aggregate,
-    /^ {4}needs: \[gate, (?:policy, )?e2e_shards\]$/m,
-    "the aggregate must depend on the runner gate, optional policy gate, and shard matrix",
+    /^ {4}needs: \[gate, changes, policy, e2e_shards\]$/m,
+    "the aggregate must depend on runner selection, change classification, policy, and the shard matrix",
   );
   assert.match(
     aggregate,
@@ -207,15 +216,13 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
   }
 });
 
-test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
+test("the trusted PR workflow gates heavy CI on affected work", () => {
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   const jobs = readWorkflowJobs(workflow);
-  const gate = jobs.get("gate");
+  const changes = jobs.get("changes");
 
-  assert.match(gate, /^ {6}full_ci: \$\{\{ steps\.scope\.outputs\.full_ci \}\}$/m);
-  assert.match(gate, /STACK_JSON: \$\{\{ toJSON\(github\.event\.pull_request\.stack\) \}\}/);
-  assert.match(gate, /stack_position == stack_size/);
-  assert.match(gate, /"\$stack_base_ref" == "\$PR_BASE_REF"/);
+  assert.match(changes, /uses: \.\/\.github\/workflows\/ci-changes\.yml/);
+  assert.match(changes, /^ {6}scope: pr$/m);
 
   for (const jobId of [
     "typecheck_release_registry",
@@ -228,23 +235,25 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   ]) {
     assert.match(
       jobs.get(jobId),
-      /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' \}\}$/m,
-      `${jobId} must run only when the gate selects full CI`,
+      /^ {4}if: \$\{\{ needs\.changes\.outputs\.affected == 'true' \}\}$/m,
+      `${jobId} must run only when changes select affected work`,
     );
   }
 
   assert.doesNotMatch(
     jobs.get("policy"),
-    /needs\.gate\.outputs\.full_ci/,
+    /needs\.changes\.outputs\.affected/,
     "the policy job must run on every PR layer",
   );
 
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity\]$/m,
+    /^ {4}needs: \[gate, changes, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity\]$/m,
   );
   assert.match(verify, /POLICY_RESULT: \$\{\{ needs\.policy\.result \}\}/);
+  assert.match(verify, /CHANGES_RESULT: \$\{\{ needs\.changes\.result \}\}/);
+  assert.match(verify, /test "\$CHANGES_RESULT" = "success"/);
   assert.match(verify, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"/);
   assert.match(verify, /test "\$GENERAL_TESTS_RESULT" = "skipped"/);
   // Runner verification must participate in the legacy aggregate required
@@ -261,29 +270,20 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(verify, /test "\$DOCKER_CONTEXT_INTEGRITY_RESULT" = "skipped"/);
 
   const e2e = jobs.get("e2e");
-  assert.match(e2e, /^ {4}needs: \[gate, policy, e2e_shards\]$/m);
+  assert.match(e2e, /^ {4}needs: \[gate, changes, policy, e2e_shards\]$/m);
   assert.match(e2e, /POLICY_RESULT: \$\{\{ needs\.policy\.result \}\}/);
+  assert.match(e2e, /CHANGES_RESULT: \$\{\{ needs\.changes\.result \}\}/);
+  assert.match(e2e, /test "\$CHANGES_RESULT" = "success"/);
   assert.match(e2e, /false\) test "\$E2E_SHARDS_RESULT" = "skipped"/);
 });
 
-test("the stacked PR scope selector runs full CI only where intended", () => {
-  assert.equal(runStackScope(null, "master").full_ci, "true");
-  assert.equal(
-    runStackScope({ position: 11, size: 11, base: { ref: "master" } }, "stack-10").full_ci,
-    "true",
-  );
-  assert.equal(
-    runStackScope({ position: 1, size: 11, base: { ref: "master" } }, "master").full_ci,
-    "true",
-  );
-  assert.equal(
-    runStackScope({ position: 6, size: 11, base: { ref: "master" } }, "stack-5").full_ci,
-    "false",
-  );
-  assert.equal(
-    runStackScope({ position: "invalid", size: 11, base: { ref: "master" } }, "stack-5").full_ci,
-    "true",
-  );
+test("the affected PR scope selector consumes Git paths and keeps main/nightly full", () => {
+  assert.equal(runAffectedScope(["doc/proposed.md"]).affected, "false");
+  assert.equal(runAffectedScope(["tests/e2e/proposed.spec.ts"]).affected, "true");
+  assert.equal(runAffectedScope(["workspace\nwith-unicode-λ/package.json"]).affected, "true");
+  assert.equal(runAffectedScope([".github/workflows/proposed.yml"]).affected, "true");
+  assert.equal(runAffectedScope(["doc/proposed.md"], "push").affected, "true");
+  assert.equal(runAffectedScope(["doc/proposed.md"], "schedule").affected, "true");
 });
 
 test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
