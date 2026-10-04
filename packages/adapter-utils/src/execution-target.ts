@@ -303,6 +303,8 @@ export interface AdapterExecutionTargetProcessOptions {
    */
   settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
+  /** Local target only. False starts the child from an empty env; see `runChildProcess`. */
+  inheritServerEnv?: boolean;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -927,6 +929,7 @@ export async function runAdapterExecutionTargetProcess(
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+    inheritServerEnv: options.inheritServerEnv,
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote
   // provider exited. SSH status 255 is transport failure, never a stop receipt.

@@ -3738,6 +3738,55 @@ describe("shapePaperclipWorkspaceEnvForExecution", () => {
   });
 });
 
+describe("runChildProcess inheritServerEnv", () => {
+  const PRINT_KEYS = "process.stdout.write(JSON.stringify(Object.keys(process.env).sort()))";
+
+  async function childEnvKeys(input: { env: Record<string, string>; inheritServerEnv?: boolean }) {
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", PRINT_KEYS], {
+      cwd: process.cwd(),
+      env: input.env,
+      timeoutSec: 0,
+      graceSec: 1,
+      onLog: async () => {},
+      ...(input.inheritServerEnv === undefined ? {} : { inheritServerEnv: input.inheritServerEnv }),
+    });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as string[];
+  }
+
+  it("inherits the server env by default", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "visible";
+    try {
+      const keys = await childEnvKeys({ env: { EXPLICIT_ONE: "1" } });
+      expect(keys).toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
+  });
+
+  it("starts from an empty env when inheritServerEnv is false", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "hidden";
+    try {
+      const keys = await childEnvKeys({
+        env: { EXPLICIT_ONE: "1", PATH: process.env.PATH ?? "" },
+        inheritServerEnv: false,
+      });
+      expect(keys).not.toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+      // Nothing from the server survives by name: only what was passed (the
+      // runtime may add a few of its own, such as locale or cwd hints).
+      expect(keys.filter((key) => !["EXPLICIT_ONE", "PATH", "PWD", "SHLVL", "_", "LC_CTYPE", "OLDPWD"].includes(key))).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
+  });
+});
+
 describe("rewriteWorkspaceCwdEnvVarsForExecution", () => {
   it("rewrites custom *_WORKSPACE_CWD env vars for remote execution", () => {
     const env = rewriteWorkspaceCwdEnvVarsForExecution({

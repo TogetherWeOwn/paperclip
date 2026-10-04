@@ -23915,6 +23915,15 @@ export function heartbeatService(
             }
           }
         }
+        // isolateRuntime is applied by the legacy codex adapter. The native runner
+        // would run the agent without it, so refuse rather than silently widen.
+        if (
+          nativeRuntimeResolution.kind === "native" &&
+          agent.adapterType === "codex_local" &&
+          parseObject(agent.adapterConfig).isolateRuntime === true
+        ) {
+          throw new Error("isolate_runtime_unsupported_on_native_runtime");
+        }
         let nativeExecution: NativeExecutionInput | null = null;
         let nativeRunnerInstanceId: string | null = null;
         if (nativeRuntimeResolution.kind === "native") {
@@ -25179,13 +25188,20 @@ export function heartbeatService(
                   }
                 : {}),
             };
-            const runtimeTools = createAdapterRuntimeToolAccess({
-              agentId: agent.id,
-              companyId: agent.companyId,
-              runId: run.id,
-              responsibleUserId: run.responsibleUserId,
-            });
-            if (!runtimeTools) {
+            // An isolated codex run (adapterConfig.isolateRuntime) is handed no MCP
+            // gateway and no run token, so none is minted for it.
+            const isolatedRuntime =
+              agent.adapterType === "codex_local" &&
+              parseObject(runtimeConfig).isolateRuntime === true;
+            const runtimeTools = isolatedRuntime
+              ? undefined
+              : createAdapterRuntimeToolAccess({
+                  agentId: agent.id,
+                  companyId: agent.companyId,
+                  runId: run.id,
+                  responsibleUserId: run.responsibleUserId,
+                });
+            if (!runtimeTools && !isolatedRuntime) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25195,11 +25211,13 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
-              db,
-              agent,
-              runId: run.id,
-            });
+            const runtimeMcpServers = isolatedRuntime
+              ? []
+              : await buildPaperclipRuntimeMcpServers({
+                  db,
+                  agent,
+                  runId: run.id,
+                });
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
             if (runtimeTools && runtimeToolDelivery === "native_mcp") {
@@ -25210,7 +25228,7 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+            if (!isolatedRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
               runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
                 token: authToken, connectionId: "paperclip-project-tools" });
             }
@@ -25218,14 +25236,16 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = await createManagedMcpRunConfig({
-              db,
-              agent,
-              runId: run.id,
-              config: runtimeConfig,
-              projectId: issueRef?.projectId ?? null,
-              issueId: issueRef?.id ?? null,
-            });
+            const managedMcpConfig = isolatedRuntime
+              ? null
+              : await createManagedMcpRunConfig({
+                  db,
+                  agent,
+                  runId: run.id,
+                  config: runtimeConfig,
+                  projectId: issueRef?.projectId ?? null,
+                  issueId: issueRef?.id ?? null,
+                });
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
@@ -25306,7 +25326,7 @@ export function heartbeatService(
                         startedAt: meta.startedAt,
                       });
                     },
-                    authToken: authToken ?? undefined,
+                    authToken: isolatedRuntime ? undefined : authToken ?? undefined,
                   });
                 },
               );
