@@ -299,6 +299,8 @@ export interface AdapterExecutionTargetProcessOptions {
    */
   settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
+  /** Local target only. False starts the child from an empty env; see `runChildProcess`. */
+  inheritServerEnv?: boolean;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -922,6 +924,7 @@ export async function runAdapterExecutionTargetProcess(
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+    inheritServerEnv: options.inheritServerEnv,
   });
 }
 

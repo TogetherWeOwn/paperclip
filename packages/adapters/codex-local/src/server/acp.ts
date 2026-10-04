@@ -39,6 +39,7 @@ import {
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { normalizeCodexModel } from "../index.js";
 import { classifyCodexAuthRefreshFailure } from "./parse.js";
+import { isIsolatedRuntime } from "./isolated-runtime.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import {
@@ -98,6 +99,9 @@ export async function resolveCodexExecutionEngineForRun(
   });
   if (target?.workspaceRealization?.mode === "in_place") {
     return unavailable("In-place workspace realization requires the Codex CLI engine; ACP archive staging is not supported.");
+  }
+  if (isIsolatedRuntime(input.config)) {
+    return unavailable("isolateRuntime requires the Codex CLI engine; the ACP engine does not apply it.");
   }
   const filesystemScope = parseLocalProcessFilesystemScope(input.config.filesystemScope);
   const networkScope = parseLocalProcessNetworkScope(input.config.networkScope);
