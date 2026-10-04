@@ -35,6 +35,7 @@ import {
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
+  recordGitOperation,
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
   UnresolvedWorkspaceBaseRefError,
@@ -476,6 +477,100 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+});
+
+describe("recordGitOperation bounded mutation diagnostics", () => {
+  it.each([false, true])("accepts a successful rescue commit with oversized stdout (recorder: %s)", async (withRecorder) => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const activeRecorder = withRecorder ? recorder : null;
+    try {
+      const originalHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      await runGit(repoRoot, ["checkout", "-b", "paperclip/rescue/test"]);
+      await fs.mkdir(path.join(repoRoot, "bulk"));
+      for (let start = 0; start < 2000; start += 200) {
+        await Promise.all(Array.from({ length: 200 }, (_, offset) => fs.writeFile(
+          path.join(repoRoot, "bulk", `${String(start + offset).padStart(6, "0")}${"x".repeat(130)}`),
+          "rescued work\n",
+        )));
+      }
+      await runGit(repoRoot, ["add", "-A"]);
+
+      const stdout = await recordGitOperation(activeRecorder, {
+        phase: "worktree_prepare",
+        args: ["commit", "-m", "Paperclip dirty workspace rescue"],
+        cwd: repoRoot,
+        failureLabel: "git commit dirty workspace rescue",
+      });
+
+      expect(stdout).toContain("[output truncated to last");
+      const totalBytes = Number(stdout.match(/total (\d+) bytes/)?.[1]);
+      expect(totalBytes).toBeGreaterThan(DEFAULT_CHILD_OUTPUT_CAP_BYTES);
+      expect(Buffer.byteLength(stdout, "utf8")).toBeLessThan(DEFAULT_CHILD_OUTPUT_CAP_BYTES + 100);
+      const rescueCommitSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      expect(rescueCommitSha).not.toBe(originalHead);
+      await expect(readGit(repoRoot, ["log", "-1", "--format=%s"])).resolves.toBe("Paperclip dirty workspace rescue");
+      await expect(readGit(repoRoot, ["rev-list", "--count", "main..HEAD"])).resolves.toBe("1");
+      await expect(readGit(repoRoot, ["show", `HEAD:bulk/${"000000"}${"x".repeat(130)}`])).resolves.toBe("rescued work");
+      if (withRecorder) {
+        expect(operations[0]?.result).toMatchObject({
+          status: "succeeded",
+          exitCode: 0,
+          metadata: { stdoutTruncated: true, stderrTruncated: false, stdoutBytes: totalBytes },
+        });
+        expect(operations[0]?.result.stdout?.trim()).toBe(stdout);
+      }
+
+      await recordGitOperation(activeRecorder, {
+        phase: "worktree_prepare",
+        args: ["checkout", "main"],
+        cwd: repoRoot,
+      });
+      await expect(readGit(repoRoot, ["branch", "--show-current"])).resolves.toBe("main");
+      await expect(readGit(repoRoot, ["rev-parse", "HEAD"])).resolves.toBe(originalHead);
+      await expect(readGit(repoRoot, ["status", "--porcelain"])).resolves.toBe("");
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each([false, true])("rejects a failed rescue commit with oversized diagnostics (recorder: %s)", async (withRecorder) => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    try {
+      const originalHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      await fs.appendFile(path.join(repoRoot, "README.md"), "dirty work\n");
+      await runGit(repoRoot, ["add", "-A"]);
+      await fs.writeFile(
+        path.join(repoRoot, ".git", "hooks", "pre-commit"),
+        '#!/bin/sh\nnode -e \'process.stdout.write("x".repeat(300000)); process.stderr.write("y".repeat(300000) + "\\nrescue commit blocked\\n"); process.exitCode = 1;\'\n',
+        { mode: 0o755 },
+      );
+
+      const error = await recordGitOperation(withRecorder ? recorder : null, {
+        phase: "worktree_prepare",
+        args: ["commit", "-m", "Paperclip dirty workspace rescue"],
+        cwd: repoRoot,
+        failureLabel: "git commit dirty workspace rescue",
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      if (!(error instanceof Error)) throw new Error("Expected the commit to fail");
+      expect(error.message).toContain("rescue commit blocked");
+      expect(error.message).toContain("[output truncated to last");
+      expect(Buffer.byteLength(error.message, "utf8")).toBeLessThan(2 * DEFAULT_CHILD_OUTPUT_CAP_BYTES + 300);
+      await expect(readGit(repoRoot, ["rev-parse", "HEAD"])).resolves.toBe(originalHead);
+      if (withRecorder) {
+        expect(operations[0]?.result).toMatchObject({
+          status: "failed",
+          exitCode: 1,
+          metadata: { stdoutTruncated: false, stderrTruncated: true },
+        });
+      }
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {

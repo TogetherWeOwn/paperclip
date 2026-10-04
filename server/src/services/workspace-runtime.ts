@@ -1018,13 +1018,18 @@ export async function refreshRemoteTrackingBaseRef(
 
   const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
   try {
-    await runGit([
-      ...(auth?.configArgs ?? []),
-      "fetch",
-      "--prune",
-      remoteTracking.remote,
-      `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
+    await recordGitOperation(null, {
+      phase: "worktree_prepare",
+      args: [
+        ...(auth?.configArgs ?? []),
+        "fetch",
+        "--prune",
+        remoteTracking.remote,
+        `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
+      ],
+      cwd: repoRoot,
+      env: auth ? { ...process.env, ...auth.env } : undefined,
+    });
     return [];
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
@@ -1954,7 +1959,11 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     };
   } catch (error) {
     if (rescueBranchCreated && !expectedBranchRestored) {
-      await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
+      await recordGitOperation(null, {
+        phase: input.phase ?? "worktree_prepare",
+        args: ["checkout", input.expectedBranchName],
+        cwd: input.worktreePath,
+      }).catch(() => null);
     }
     if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
     input.evidence.safeRepair.succeeded = false;
@@ -3052,56 +3061,61 @@ async function runWorkspaceCommand(input: {
   );
 }
 
-async function recordGitOperation(
+export async function recordGitOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
     phase: WorkspaceOperationPhase;
     args: string[];
     cwd: string;
+    env?: NodeJS.ProcessEnv;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     failureLabel?: string | null;
   },
 ): Promise<string> {
-  if (!recorder) {
-    return runGit(input.args, input.cwd);
-  }
-
   let stdout = "";
   let stderr = "";
   let code: number | null = null;
-  await recorder.recordOperation({
-    phase: input.phase,
-    command: formatCommandForDisplay("git", input.args),
-    cwd: input.cwd,
-    metadata: input.metadata ?? null,
-    run: async () => {
-      const result = await executeProcess({
-        command: "git",
-        args: input.args,
-        cwd: input.cwd,
-      });
-      stdout = result.stdout;
-      stderr = result.stderr;
-      code = result.code;
-      return {
-        status: result.code === 0 ? "succeeded" : "failed",
-        exitCode: result.code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        system: result.code === 0 ? input.successMessage ?? null : null,
-        metadata:
-          result.stdoutTruncated || result.stderrTruncated
-            ? {
-                stdoutTruncated: result.stdoutTruncated,
-                stderrTruncated: result.stderrTruncated,
-                stdoutBytes: result.stdoutBytes,
-                stderrBytes: result.stderrBytes,
-              }
-            : null,
-      };
-    },
-  });
+  // Mutation stdout is bounded diagnostic text, not a machine-readable result.
+  // Recording must not change whether an already-completed mutation succeeded.
+  const run = async () => {
+    const result = await executeProcess({
+      command: "git",
+      args: input.args,
+      cwd: input.cwd,
+      env: input.env,
+    });
+    stdout = result.stdout;
+    stderr = result.stderr;
+    code = result.code;
+    return {
+      status: result.code === 0 ? "succeeded" as const : "failed" as const,
+      exitCode: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      system: result.code === 0 ? input.successMessage ?? null : null,
+      metadata:
+        result.stdoutTruncated || result.stderrTruncated
+          ? {
+              stdoutTruncated: result.stdoutTruncated,
+              stderrTruncated: result.stderrTruncated,
+              stdoutBytes: result.stdoutBytes,
+              stderrBytes: result.stderrBytes,
+            }
+          : null,
+    };
+  };
+  if (recorder) {
+    await recorder.recordOperation({
+      phase: input.phase,
+      command: formatCommandForDisplay("git", input.args),
+      cwd: input.cwd,
+      metadata: input.metadata ?? null,
+      run,
+    });
+  } else {
+    await run();
+  }
 
   if (code !== 0) {
     const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
@@ -3893,7 +3907,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  await recordGitOperation(null, {
+    phase: "worktree_prepare",
+    args: ["worktree", "prune"],
+    cwd: repoRoot,
+  }).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef
     ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)
