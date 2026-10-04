@@ -182,15 +182,19 @@ Create an empty, exclusively owned database named `paperclip_nested_pool_*` on
 `agent-testdb`, then run:
 
 ```sh
-PAPERCLIP_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/paperclip_nested_pool_regression \
+PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/paperclip_nested_pool_regression \
   pnpm --filter @paperclipai/server exec vitest run src/__tests__/heartbeat-wake-nested-pool.test.ts
 ```
 
 The test applies migrations and deletes its test rows during cleanup. Never
 point it at a shared application database. It accepts `agent-testdb`, or a
 PostgreSQL CI service at `localhost`, `127.0.0.1`, or `postgres` when `CI=true`.
-Without `PAPERCLIP_TEST_DATABASE_URL`, the suite reports a skip. It does not
-fall back to `DATABASE_URL` or start embedded PostgreSQL.
+The suite reads only `PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL`, not the shared
+`PAPERCLIP_TEST_DATABASE_URL` that other integration suites use. Without it,
+including when only the shared URL is set, the suite reports a skip. If it is
+set to anything other than a `paperclip_nested_pool_*` database on an allowed
+host, collection fails. The suite does not fall back to `DATABASE_URL` or start
+embedded PostgreSQL.
 
 ## Switching between modes
 

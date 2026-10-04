@@ -52,8 +52,10 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 // Use an exclusively owned, disposable database on agent-testdb or a CI service
-// container. Never fall back to DATABASE_URL or the application instance.
-const testDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
+// container. This reads a dedicated variable, never the shared
+// PAPERCLIP_TEST_DATABASE_URL, DATABASE_URL or the application instance, so an
+// ordinary shared test URL skips this suite instead of failing collection.
+const testDatabaseUrl = process.env.PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL?.trim();
 if (testDatabaseUrl) {
   const url = new URL(testDatabaseUrl);
   const allowedHost = url.hostname === "agent-testdb" ||
