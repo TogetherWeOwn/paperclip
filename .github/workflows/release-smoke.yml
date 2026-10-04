@@ -36,8 +36,21 @@ on:
         required: false
         default: release-smoke
         type: string
+      informational:
+        description: Report failures without blocking the caller (nightly diagnostics only)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+    with:
+      scope: smoke
+
   # The Docker smoke below can never exercise the background-service leg of
   # onboarding: containers have no service manager, so v2026.824.0 shipped a
   # service install that crash-looped on a missing shim while every
@@ -45,6 +58,9 @@ jobs:
   # on the runner VM's systemd and require the installed service to end up
   # serving.
   smoke_service:
+    needs: changes
+    if: needs.changes.outputs.affected == 'true'
+    continue-on-error: ${{ inputs.informational || false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -97,7 +113,21 @@ jobs:
           path: ${{ runner.temp }}/paperclipai-service.log
           retention-days: 14
 
+      - name: Report published smoke outcome
+        if: always()
+        env:
+          OUTCOME: ${{ job.status }}
+          INFORMATIONAL: ${{ inputs.informational || false }}
+        run: |
+          echo "Published service smoke: $OUTCOME (informational=$INFORMATIONAL)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != success ]; then
+            echo "::warning::Published service smoke failed; inspect the service diagnostics."
+          fi
+
   smoke:
+    needs: changes
+    if: needs.changes.outputs.affected == 'true'
+    continue-on-error: ${{ inputs.informational || false }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -198,3 +228,14 @@ jobs:
       - name: Stop Docker smoke container
         if: always()
         run: docker rm -f "$SMOKE_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Report published smoke outcome
+        if: always()
+        env:
+          OUTCOME: ${{ job.status }}
+          INFORMATIONAL: ${{ inputs.informational || false }}
+        run: |
+          echo "Published container smoke: $OUTCOME (informational=$INFORMATIONAL)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != success ]; then
+            echo "::warning::Published container smoke failed; inspect the Docker and Playwright diagnostics."
+          fi
