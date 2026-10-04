@@ -155,12 +155,15 @@ test('real pnpm hooks cannot forge a regenerable lockfile', () => {
     assert.equal(pnpm('--version'), '9.15.4');
     const install = ['install', '--resolution-only', '--ignore-scripts', '--no-frozen-lockfile'];
     pnpm(...install);
-    const cleanLockfile = readFileSync(join(directory, 'pnpm-lock.yaml'), 'utf8');
     git(directory, 'init', '-q');
     git(directory, 'add', 'package.json', 'pnpm-lock.yaml');
     git(directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'base');
     const base = git(directory, 'rev-parse', 'HEAD');
-    writeFileSync(join(directory, 'package.json'), `${JSON.stringify({ ...manifest, version: '2.0.0' })}\n`);
+    mkdirSync(join(directory, 'local-package'));
+    writeFileSync(join(directory, 'local-package/package.json'), '{"name":"hook-local","version":"1.0.0"}\n');
+    writeFileSync(join(directory, 'package.json'), `${JSON.stringify({ ...manifest, version: '2.0.0', dependencies: { 'hook-local': 'link:./local-package' } })}\n`);
+    pnpm(...install);
+    const cleanLockfile = readFileSync(join(directory, 'pnpm-lock.yaml'), 'utf8');
     writeFileSync(join(directory, '.pnpmfile.cjs'), `module.exports = {
   hooks: {
     afterAllResolved(lockfile) {
@@ -175,12 +178,12 @@ test('real pnpm hooks cannot forge a regenerable lockfile', () => {
     const forgedLockfile = readFileSync(join(directory, 'pnpm-lock.yaml'), 'utf8');
     assert.match(forgedLockfile, /hookProof: forged/);
     assert.equal(existsSync(join(directory, 'hook-called')), true, '--ignore-scripts alone executes pnpm hooks');
-    git(directory, 'add', 'package.json', 'pnpm-lock.yaml', '.pnpmfile.cjs');
+    git(directory, 'add', 'package.json', 'pnpm-lock.yaml', '.pnpmfile.cjs', 'local-package/package.json');
     git(directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'head');
     const head = git(directory, 'rev-parse', 'HEAD');
-    const run = (script) => spawnSync('bash', ['-c', script], {
+    const run = (script, headSha = head) => spawnSync('bash', ['-c', script], {
       cwd: directory,
-      env: { ...env, BASE_SHA: base, HEAD_SHA: head, RUNNER_TEMP: temporary },
+      env: { ...env, BASE_SHA: base, HEAD_SHA: headSha, RUNNER_TEMP: temporary },
       encoding: 'utf8',
       timeout: 60_000,
     });
@@ -199,7 +202,9 @@ test('real pnpm hooks cannot forge a regenerable lockfile', () => {
 
     // An unused pnpmfile does not forbid an otherwise reproducible lockfile.
     writeFileSync(join(directory, 'pnpm-lock.yaml'), cleanLockfile);
-    const honest = run(gate);
+    git(directory, 'add', 'pnpm-lock.yaml');
+    git(directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'honest head');
+    const honest = run(gate, git(directory, 'rev-parse', 'HEAD'));
     assert.equal(honest.status, 0, honest.stderr);
     assert.match(honest.stdout, /Lockfile hunk verified/);
     assert.equal(existsSync(join(directory, 'hook-called')), false);
