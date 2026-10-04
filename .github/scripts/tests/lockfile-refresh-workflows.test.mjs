@@ -23,3 +23,17 @@ test('lockfile repair workflows resolve dependencies instead of updating metadat
     }
   }
 });
+
+test('policy gate admits regenerable lockfile hunks and still blocks hand-edits', async () => {
+  const contents = await readFile('.github/workflows/pr-trusted.yml', 'utf8');
+  // The old blanket ban must be gone.
+  assert.doesNotMatch(contents, /Block manual lockfile edits/);
+  assert.doesNotMatch(contents, /Do not commit pnpm-lock\.yaml in pull requests/);
+  // The amended gate must exist and enforce regen-identity.
+  assert.match(contents, /Block unregenerable lockfile edits/);
+  assert.match(contents, /package\\.json\$/);
+  assert.match(contents, /--resolution-only/);
+  assert.match(contents, /cmp -s pnpm-lock\.yaml/);
+  assert.ok(contents.indexOf('      - name: Setup pnpm\n') < contents.indexOf('      - name: Block unregenerable lockfile edits\n'));
+  assert.match(contents, /trap .* EXIT/);
+});
