@@ -55,7 +55,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
-import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./parse.js";
+import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser, parsePiProcessOutput } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -765,7 +765,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       // Display output is capped by the process transport. Keep accounting
       // from the full stream, including when no checkpoint callback is installed.
-      const parsed = parsePiJsonl(proc.stdout);
+      // Parse the redaction-aware control output when present.
+      const parsed = parsePiProcessOutput(proc);
       if (hasAccounting) {
         const retained = consumeAccounting("");
         parsed.usage = retained.usage;
@@ -778,7 +779,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
-        parsed: ReturnType<typeof parsePiJsonl>;
+        parsed: ReturnType<typeof parsePiProcessOutput>;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {

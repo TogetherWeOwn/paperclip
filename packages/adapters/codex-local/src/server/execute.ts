@@ -65,6 +65,7 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   parseCodexJsonl, createCodexJsonlParser,
+  parseCodexProcessOutput,
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
@@ -1397,7 +1398,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stderr: cleanedStderr,
           },
           rawStderr: proc.stderr,
-          parsed: parseCodexJsonl(proc.stdout),
+          parsed: parseCodexProcessOutput(proc),
           pricingContext,
           monitor: monitorFired
             ? {
@@ -1426,7 +1427,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
-        parsed: ReturnType<typeof parseCodexJsonl>;
+        parsed: ReturnType<typeof parseCodexProcessOutput>;
         pricingContext?: AdapterExecutionResult["pricingContext"];
         monitor?:
           | { fired: false }
