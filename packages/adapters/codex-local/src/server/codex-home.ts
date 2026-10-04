@@ -276,6 +276,49 @@ function stripManagedMcpBlock(config: string): string {
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
 }
 
+/**
+ * Removes every Paperclip-managed MCP block (and the bearer tokens inside it)
+ * from `<codexHome>/config.toml`, leaving user-authored content intact. A block
+ * with no end marker (a write that died midway) is cut through end of file, so
+ * a truncated block cannot keep a token alive. Returns true when the file
+ * changed; a missing file is a no-op.
+ */
+export async function removeManagedCodexMcpBlock(codexHome: string): Promise<boolean> {
+  const configPath = path.join(codexHome, "config.toml");
+  const existing = await fs.readFile(configPath, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (existing === null || !existing.includes(MANAGED_MCP_BLOCK_START)) return false;
+  let stripped = existing;
+  while (stripped.includes(MANAGED_MCP_BLOCK_START)) stripped = stripManagedMcpBlock(stripped);
+  await fs.writeFile(configPath, stripped ? `${stripped}\n` : "", { mode: 0o600 });
+  await fs.chmod(configPath, 0o600);
+  return true;
+}
+
+// A managed CODEX_HOME is shared by concurrent runs (the company home is used by
+// every keyless codex_local agent), and each run rewrites the same delimited
+// block. The block carries run-scoped bearer tokens, so the last run to leave
+// the home must remove it; an earlier finisher must not, or it would strip the
+// block out from under a run that is still live. Runs execute inside the one
+// server process, so an in-process holder set per home plus a per-home queue
+// that serialises write/scrub is sufficient. A crash skips the scrub; the next
+// run's write replaces the stale block, exactly as before.
+const managedMcpHolders = new Map<string, Set<symbol>>();
+const managedMcpQueues = new Map<string, Promise<void>>();
+
+function serializeOnCodexHome<T>(homeKey: string, task: () => Promise<T>): Promise<T> {
+  const previous = managedMcpQueues.get(homeKey) ?? Promise.resolve();
+  const result = previous.then(task, task);
+  const tail = result.then(() => undefined, () => undefined);
+  managedMcpQueues.set(homeKey, tail);
+  void tail.then(() => {
+    if (managedMcpQueues.get(homeKey) === tail) managedMcpQueues.delete(homeKey);
+  });
+  return result;
+}
+
 function readCodexMcpServerNames(config: string): Set<string> {
   const names = new Set<string>();
   for (const match of config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([^\]\s#]+))\s*\]/gm)) {
@@ -323,29 +366,72 @@ function buildManagedMcpBlock(input: {
   return { block: lines.join("\n"), warnings };
 }
 
+export type ManagedCodexMcpConfigResult = {
+  configPath: string;
+  warnings: string[];
+  /**
+   * Ends this run's hold on the home. The last holder removes the managed block,
+   * and the bearer tokens in it, from `config.toml`. Idempotent. A no-op unless
+   * the write was made with `scrubOnRelease`.
+   */
+  release: () => Promise<void>;
+};
+
 export async function writeManagedCodexMcpConfig(input: {
   codexHome: string;
   apiBaseUrl: string;
   gateways: ManagedCodexMcpGateway[];
-}): Promise<{ configPath: string; warnings: string[] }> {
+  /**
+   * Set for Paperclip-managed homes (`isManagedCodexHomePath`) so the block is
+   * removed when the run ends. Leave unset for a user-supplied CODEX_HOME, which
+   * Paperclip does not clean up.
+   */
+  scrubOnRelease?: boolean;
+}): Promise<ManagedCodexMcpConfigResult> {
   const configPath = path.join(input.codexHome, "config.toml");
-  await fs.mkdir(input.codexHome, { recursive: true });
-  const existing = await fs.readFile(configPath, "utf8").catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+  const homeKey = path.resolve(input.codexHome);
+  const hold = Symbol("codex-managed-mcp-hold");
+  const holdsBlock = input.scrubOnRelease === true && input.gateways.length > 0;
+
+  const drop = (): Promise<void> =>
+    serializeOnCodexHome(homeKey, async () => {
+      const holders = managedMcpHolders.get(homeKey);
+      if (!holders?.delete(hold)) return;
+      if (holders.size > 0) return;
+      managedMcpHolders.delete(homeKey);
+      await removeManagedCodexMcpBlock(input.codexHome);
+    });
+
+  const written = await serializeOnCodexHome(homeKey, async () => {
+    if (holdsBlock) {
+      const holders = managedMcpHolders.get(homeKey) ?? new Set<symbol>();
+      holders.add(hold);
+      managedMcpHolders.set(homeKey, holders);
+    }
+    await fs.mkdir(input.codexHome, { recursive: true });
+    const existing = await fs.readFile(configPath, "utf8").catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+      throw error;
+    });
+    const unmanagedConfig = stripManagedMcpBlock(existing);
+    const { block, warnings } = buildManagedMcpBlock({
+      gateways: input.gateways,
+      apiBaseUrl: input.apiBaseUrl,
+      existingNames: readCodexMcpServerNames(unmanagedConfig),
+    });
+    const next = input.gateways.length > 0
+      ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
+      : `${unmanagedConfig}${unmanagedConfig ? "\n" : ""}`;
+    await fs.writeFile(configPath, next, { mode: 0o600 });
+    await fs.chmod(configPath, 0o600);
+    return warnings;
+  }).catch(async (error) => {
+    // A failed write may have left a partial block; do not keep the hold on it.
+    await drop().catch(() => undefined);
     throw error;
   });
-  const unmanagedConfig = stripManagedMcpBlock(existing);
-  const { block, warnings } = buildManagedMcpBlock({
-    gateways: input.gateways,
-    apiBaseUrl: input.apiBaseUrl,
-    existingNames: readCodexMcpServerNames(unmanagedConfig),
-  });
-  const next = input.gateways.length > 0
-    ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
-    : `${unmanagedConfig}${unmanagedConfig ? "\n" : ""}`;
-  await fs.writeFile(configPath, next, { mode: 0o600 });
-  await fs.chmod(configPath, 0o600);
-  return { configPath, warnings };
+
+  return { configPath, warnings: written, release: drop };
 }
 
 /**

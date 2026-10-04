@@ -4,6 +4,7 @@ import type { AddressInfo, Server as NetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
+import { afterAll } from "vitest";
 
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
@@ -24,10 +25,25 @@ type SupertestTestConstructor = {
 const require = createRequire(import.meta.url);
 const SupertestTest = require("supertest/lib/test.js") as SupertestTestConstructor;
 
+// Route and service suites that reach the codex adapter resolve its managed
+// home and auth cache under the Paperclip instance root. Left to the
+// environment that is the developer's (or the live server's) own instance, and
+// each run would leave `companies/<id>/codex-home` and `codex-auth-cache`
+// directories in it. Use a throwaway root per test file; suites that need a
+// specific home set their own and restore this one.
+const testPaperclipHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-home-"));
+process.env.PAPERCLIP_HOME = testPaperclipHome;
+afterAll(() => {
+  fs.rmSync(testPaperclipHome, { recursive: true, force: true });
+});
+
 if (!process.env.CODEX_HOME) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-codex-home-"));
   fs.writeFileSync(path.join(codexHome, "auth.json"), '{"OPENAI_API_KEY":"sk-vitest"}\n', { mode: 0o600 });
   process.env.CODEX_HOME = codexHome;
+  afterAll(() => {
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  });
 }
 
 // The automatic Tailscale HTTPS default (PAP-17158) probes for a real host
