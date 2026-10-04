@@ -15,13 +15,20 @@ node --test scripts/__tests__/release-verify-workflow.test.mjs
 `ACTIONLINT` selects an existing validator; otherwise the tests use `actionlint`
 from PATH. A missing validator fails the tests. These checks disable optional
 ShellCheck/Pyflakes integrations, not actionlint's GitHub-aware semantic checks.
-Negative cases must reject caller-level `continue-on-error` on reusable jobs and
-`runner.temp` in job-level env. Other cases exercise mixed-case image paths,
-fork publication guards, source-smoke failures, and the `ci-ok` result gate.
+Positive validation uses real workflow filenames so actionlint resolves local
+reusable-call contracts. In-memory mutations use `-stdin-filename` with the real
+workflow path; anonymous stdin would omit those contract checks. Negative cases
+must reject unknown callee inputs, caller-level `continue-on-error` on reusable
+jobs, and `runner.temp` in job-level env. Other cases exercise mixed-case image
+paths, fork publication guards, source-smoke failures, and the `ci-ok` result gate.
 
 Workflow Health runs on PRs without a workflow-level path filter. Its read-only
-`changes` job selects affected work. Dependency, lockfile, patch, and `.github`
-changes run all scoped checks. Master pushes and nightly schedules always run
+`changes` job selects affected work. Its Git path list disables rename detection
+to include both removed and added paths; moving an in-scope harness into docs
+cannot skip its validation. Real Git rename fixtures cover harness and dependency
+moves, reverse moves, and unrelated docs-only moves across all scopes.
+Dependency, lockfile, patch, and `.github` changes run all scoped checks.
+Master pushes and nightly schedules always run
 all scoped checks. Its single `ci-ok` job rejects scope errors, failed validation,
 and unexpected skips. Existing repository-required checks remain unchanged.
 The other repaired workflows use the same scoped changes job; their explicit

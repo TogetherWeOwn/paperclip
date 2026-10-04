@@ -22,7 +22,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (event === "pull_request") {
     const { CI_BASE_SHA: base, CI_HEAD_SHA: head } = process.env;
     if (![base, head].every((sha) => /^[a-f0-9]{40}$/.test(sha || ""))) throw new Error("PR scope requires immutable base/head SHAs");
-    files = execFileSync("git", ["diff", "--name-only", "-z", `${base}...${head}`], { encoding: "utf8" }).split("\0").filter(Boolean);
+    files = execFileSync("git", ["diff", "--no-renames", "--name-only", "-z", `${base}...${head}`], { encoding: "utf8" }).split("\0").filter(Boolean);
   }
   const affected = affectedWork(event, process.env.CI_SCOPE, files);
   appendFileSync(process.env.GITHUB_OUTPUT, `affected=${affected}\n`);
