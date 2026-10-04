@@ -30,10 +30,12 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  inspectManagedGitWorktreeBranch,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
+  recordGitOperation,
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
   UnresolvedWorkspaceBaseRefError,
@@ -168,6 +170,32 @@ async function createTempRepo(defaultBranch = "main") {
   await runGit(repoRoot, ["commit", "-m", "Initial commit"]);
   await runGit(repoRoot, ["checkout", "-B", defaultBranch]);
   return repoRoot;
+}
+
+// The default capture bound for a child process's stdout in workspace-runtime.
+const DEFAULT_CHILD_OUTPUT_CAP_BYTES = 256 * 1024;
+
+/**
+ * Grows `git worktree list --porcelain` past the default capture cap without
+ * checking anything out: git lists every `.git/worktrees/<name>` admin entry,
+ * ordered by name, so fillers named `zz-*` come after the real worktrees.
+ */
+async function registerFillerWorktrees(repoRoot: string, count: number) {
+  const adminRoot = path.join(repoRoot, ".git", "worktrees");
+  const fillerRoot = path.join(repoRoot, ".paperclip", "worktrees");
+  const padding = "x".repeat(100);
+  for (let start = 0; start < count; start += 200) {
+    await Promise.all(
+      Array.from({ length: Math.min(200, count - start) }, async (_, offset) => {
+        const name = `zz-filler-${String(start + offset).padStart(5, "0")}-${padding}`;
+        const adminDir = path.join(adminRoot, name);
+        await fs.mkdir(adminDir, { recursive: true });
+        await fs.writeFile(path.join(adminDir, "gitdir"), `${path.join(fillerRoot, name, ".git")}\n`, "utf8");
+        await fs.writeFile(path.join(adminDir, "HEAD"), `ref: refs/heads/filler-${start + offset}\n`, "utf8");
+        await fs.writeFile(path.join(adminDir, "commondir"), "../..\n", "utf8");
+      }),
+    );
+  }
 }
 
 async function expectPersistedBranchMismatchRejected(input: {
@@ -449,6 +477,100 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+});
+
+describe("recordGitOperation bounded mutation diagnostics", () => {
+  it.each([false, true])("accepts a successful rescue commit with oversized stdout (recorder: %s)", async (withRecorder) => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const activeRecorder = withRecorder ? recorder : null;
+    try {
+      const originalHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      await runGit(repoRoot, ["checkout", "-b", "paperclip/rescue/test"]);
+      await fs.mkdir(path.join(repoRoot, "bulk"));
+      for (let start = 0; start < 2000; start += 200) {
+        await Promise.all(Array.from({ length: 200 }, (_, offset) => fs.writeFile(
+          path.join(repoRoot, "bulk", `${String(start + offset).padStart(6, "0")}${"x".repeat(130)}`),
+          "rescued work\n",
+        )));
+      }
+      await runGit(repoRoot, ["add", "-A"]);
+
+      const stdout = await recordGitOperation(activeRecorder, {
+        phase: "worktree_prepare",
+        args: ["commit", "-m", "Paperclip dirty workspace rescue"],
+        cwd: repoRoot,
+        failureLabel: "git commit dirty workspace rescue",
+      });
+
+      expect(stdout).toContain("[output truncated to last");
+      const totalBytes = Number(stdout.match(/total (\d+) bytes/)?.[1]);
+      expect(totalBytes).toBeGreaterThan(DEFAULT_CHILD_OUTPUT_CAP_BYTES);
+      expect(Buffer.byteLength(stdout, "utf8")).toBeLessThan(DEFAULT_CHILD_OUTPUT_CAP_BYTES + 100);
+      const rescueCommitSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      expect(rescueCommitSha).not.toBe(originalHead);
+      await expect(readGit(repoRoot, ["log", "-1", "--format=%s"])).resolves.toBe("Paperclip dirty workspace rescue");
+      await expect(readGit(repoRoot, ["rev-list", "--count", "main..HEAD"])).resolves.toBe("1");
+      await expect(readGit(repoRoot, ["show", `HEAD:bulk/${"000000"}${"x".repeat(130)}`])).resolves.toBe("rescued work");
+      if (withRecorder) {
+        expect(operations[0]?.result).toMatchObject({
+          status: "succeeded",
+          exitCode: 0,
+          metadata: { stdoutTruncated: true, stderrTruncated: false, stdoutBytes: totalBytes },
+        });
+        expect(operations[0]?.result.stdout?.trim()).toBe(stdout);
+      }
+
+      await recordGitOperation(activeRecorder, {
+        phase: "worktree_prepare",
+        args: ["checkout", "main"],
+        cwd: repoRoot,
+      });
+      await expect(readGit(repoRoot, ["branch", "--show-current"])).resolves.toBe("main");
+      await expect(readGit(repoRoot, ["rev-parse", "HEAD"])).resolves.toBe(originalHead);
+      await expect(readGit(repoRoot, ["status", "--porcelain"])).resolves.toBe("");
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each([false, true])("rejects a failed rescue commit with oversized diagnostics (recorder: %s)", async (withRecorder) => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    try {
+      const originalHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      await fs.appendFile(path.join(repoRoot, "README.md"), "dirty work\n");
+      await runGit(repoRoot, ["add", "-A"]);
+      await fs.writeFile(
+        path.join(repoRoot, ".git", "hooks", "pre-commit"),
+        '#!/bin/sh\nnode -e \'process.stdout.write("x".repeat(300000)); process.stderr.write("y".repeat(300000) + "\\nrescue commit blocked\\n"); process.exitCode = 1;\'\n',
+        { mode: 0o755 },
+      );
+
+      const error = await recordGitOperation(withRecorder ? recorder : null, {
+        phase: "worktree_prepare",
+        args: ["commit", "-m", "Paperclip dirty workspace rescue"],
+        cwd: repoRoot,
+        failureLabel: "git commit dirty workspace rescue",
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      if (!(error instanceof Error)) throw new Error("Expected the commit to fail");
+      expect(error.message).toContain("rescue commit blocked");
+      expect(error.message).toContain("[output truncated to last");
+      expect(Buffer.byteLength(error.message, "utf8")).toBeLessThan(2 * DEFAULT_CHILD_OUTPUT_CAP_BYTES + 300);
+      await expect(readGit(repoRoot, ["rev-parse", "HEAD"])).resolves.toBe(originalHead);
+      if (withRecorder) {
+        expect(operations[0]?.result).toMatchObject({
+          status: "failed",
+          exitCode: 1,
+          metadata: { stdoutTruncated: false, stderrTruncated: true },
+        });
+      }
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -2975,6 +3097,121 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
   }, 15_000);
+
+  describe("when `git worktree list --porcelain` outgrows the default capture cap", () => {
+    const branchName = "PAP-1401-large-worktree-list";
+    const issue = { id: "issue-large-list", identifier: "PAP-1401", title: "Large worktree list" };
+    const agent = { id: "agent-1", name: "Codex Coder", companyId: "company-1" };
+
+    async function createRepoWithEarlyWorktreeAndFillers() {
+      const repoRoot = await createTempRepo();
+      const initial = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue,
+        agent,
+      });
+      expect(initial.branchName).toBe(branchName);
+      const worktreePath = await fs.realpath(initial.cwd);
+
+      await registerFillerWorktrees(repoRoot, 2_000);
+
+      // Pin the precondition that makes this a regression test: the listing is
+      // over the cap, and the real worktree sits in the head that a keep-the-
+      // last-N-bytes capture would discard.
+      const listing = Buffer.from(await readGit(repoRoot, ["worktree", "list", "--porcelain"]), "utf8");
+      expect(listing.byteLength).toBeGreaterThan(2 * DEFAULT_CHILD_OUTPUT_CAP_BYTES);
+      const worktreeOffset = listing.indexOf(`worktree ${worktreePath}\n`);
+      expect(worktreeOffset).toBeGreaterThanOrEqual(0);
+      expect(worktreeOffset).toBeLessThan(listing.byteLength - DEFAULT_CHILD_OUTPUT_CAP_BYTES);
+
+      return { repoRoot, worktreePath };
+    }
+
+    it("keeps an early registered worktree valid", async () => {
+      const { repoRoot, worktreePath } = await createRepoWithEarlyWorktreeAndFillers();
+      try {
+        await expect(
+          inspectManagedGitWorktreeBranch({ repoRoot, worktreePath, expectedBranchName: branchName }),
+        ).resolves.toMatchObject({ valid: true, reasonCode: null, actualBranchName: branchName });
+
+        const restored = await ensurePersistedExecutionWorkspaceAvailable({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          workspace: {
+            id: "execution-workspace-large-list",
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            cwd: worktreePath,
+            providerRef: worktreePath,
+            projectId: "project-1",
+            projectWorkspaceId: "workspace-1",
+            repoUrl: null,
+            baseRef: "HEAD",
+            branchName,
+          },
+          issue,
+          agent,
+        });
+        expect(restored?.cwd).toBe(worktreePath);
+      } finally {
+        await fs.rm(repoRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    it("still reports a genuinely unregistered path as not_registered", async () => {
+      const { repoRoot } = await createRepoWithEarlyWorktreeAndFillers();
+      try {
+        const detachedWorktreePath = path.join(repoRoot, ".paperclip", "worktrees", "PAP-1401-detached-clone");
+        await execFileAsync("git", ["clone", repoRoot, detachedWorktreePath]);
+        await runGit(detachedWorktreePath, ["checkout", "-B", "PAP-1401-detached-clone"]);
+
+        await expect(
+          inspectManagedGitWorktreeBranch({
+            repoRoot,
+            worktreePath: detachedWorktreePath,
+            expectedBranchName: "PAP-1401-detached-clone",
+          }),
+        ).resolves.toMatchObject({ valid: false, reasonCode: "not_registered" });
+      } finally {
+        await fs.rm(repoRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    it("fails closed instead of reporting not_registered when the list does not fit the bound", async () => {
+      const { repoRoot, worktreePath } = await createRepoWithEarlyWorktreeAndFillers();
+      try {
+        const inspection = await inspectManagedGitWorktreeBranch({
+          repoRoot,
+          worktreePath,
+          expectedBranchName: branchName,
+          worktreeListMaxBytes: DEFAULT_CHILD_OUTPUT_CAP_BYTES,
+        });
+        expect(inspection).toMatchObject({ valid: false, reasonCode: "worktree_list_unavailable" });
+        expect(inspection.reason).toContain("refusing to use a truncated result");
+      } finally {
+        await fs.rm(repoRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+  });
 
   it("adopts an existing persisted git worktree when the checked-out branch is forward of the recorded branch", async () => {
     const repoRoot = await createTempRepo();
