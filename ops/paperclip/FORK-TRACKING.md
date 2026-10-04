@@ -19,6 +19,19 @@ Ledger of upstream refs vs fork state for the 1001 release line.
   place until this change rides a drained release and is verified live. Do not
   deploy from this branch.
 
+## codex_local managed MCP block scrub
+
+- Base: `release/v2026.1001.0`; work branch `fix/codex-local-scrub-mcp-bearer-on-run-end`; ported to `master` as a clean cherry-pick.
+- Fix: `writeManagedCodexMcpConfig` (`packages/adapters/codex-local/src/server/codex-home.ts`) now returns a `release()`.
+  `execute.ts` calls it in the outer `finally`, after the provider-config restore, so the run JWT and gateway
+  bearers in the `# BEGIN PAPERCLIP MANAGED MCP` block no longer outlive the run on disk. An in-process
+  holder set per home makes the last run to leave a shared home do the scrub. Managed homes only
+  (`isManagedCodexHomePath`); a user-supplied `CODEX_HOME` is left alone.
+- Also: the codex-local and server vitest setups point `PAPERCLIP_HOME` at a throwaway directory, so suites stop
+  writing `companies/<id>/codex-home` and `codex-auth-cache` into the live instance root.
+- Not in this slice: rejecting the run's agent JWT (48 h TTL) on `/api/mcp/project-tools` once the run has finished.
+- Gone when: upstream removes the managed block from `config.toml` at run end, or moves the bearers out of the file.
+
 ## Upstream refs
 
 | Upstream | Taken? | Notes | Gone when |
