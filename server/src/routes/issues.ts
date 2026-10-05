@@ -279,9 +279,14 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { collectCompletedReviewReceipt } from "../services/completed-review-receipt.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { redactSensitiveText } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactSensitiveText,
+  restoreRedactedPlainEnvBindings,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
   deliverNativeQuestionResponse,
@@ -676,6 +681,12 @@ function readObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function readEnvRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function hasOwn(record: Record<string, unknown>, key: string) {
@@ -13405,8 +13416,13 @@ export function issueRoutes(
       });
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
+      const completingTypedReview =
+        transition.decision?.outcome === "approved" &&
+        updateFields.status === "done" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "completed";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || completingTypedReview;
+      let completionCommentId: string | null = null;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -13416,6 +13432,49 @@ export function issueRoutes(
         updateFields.assigneeUserId === undefined
           ? existing.assigneeUserId
           : (updateFields.assigneeUserId as string | null);
+      // Agent reads redact every plain env value, so a client that copies a
+      // redacted agent env into an issue pin would otherwise persist
+      // "***REDACTED***" as the real value (the response is redacted too, so
+      // the corruption is invisible on read-back). Restore display-only
+      // placeholders from the stored override first, then the assignee
+      // agent's stored env — the same way agent updates restore redacted env.
+      if (
+        updateFields.assigneeAdapterOverrides !== undefined &&
+        updateFields.assigneeAdapterOverrides !== null
+      ) {
+        const requestedOverrides = readObject(updateFields.assigneeAdapterOverrides);
+        const requestedOverrideEnv = readEnvRecord(
+          readObject(requestedOverrides.adapterConfig).env,
+        );
+        const hasRedactedPlaceholder = requestedOverrideEnv !== null &&
+          Object.values(requestedOverrideEnv).some(
+            (binding) =>
+              readEnvRecord(binding)?.type === "plain" &&
+              readEnvRecord(binding)?.value === REDACTED_EVENT_VALUE,
+          );
+        if (requestedOverrideEnv !== null && hasRedactedPlaceholder) {
+          const storedEnvRecord = readEnvRecord(
+            readObject(readObject(existing.assigneeAdapterOverrides).adapterConfig).env,
+          );
+          let agentEnvRecord: Record<string, unknown> | null = null;
+          if (typeof nextAssigneeAgentId === "string" && nextAssigneeAgentId) {
+            const assigneeAgent = await agentsSvc.getById(nextAssigneeAgentId);
+            agentEnvRecord = assigneeAgent?.companyId === existing.companyId
+              ? readEnvRecord(readObject(assigneeAgent.adapterConfig).env)
+              : null;
+          }
+          updateFields.assigneeAdapterOverrides = {
+            ...requestedOverrides,
+            adapterConfig: {
+              ...readObject(requestedOverrides.adapterConfig),
+              env: restoreRedactedPlainEnvBindings(
+                requestedOverrideEnv,
+                [storedEnvRecord, agentEnvRecord],
+              ),
+            },
+          };
+        }
+      }
       const assigneeWillChange =
         nextAssigneeAgentId !== existing.assigneeAgentId ||
         nextAssigneeUserId !== existing.assigneeUserId;
@@ -13627,6 +13686,9 @@ export function issueRoutes(
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
       ) => {
         if (!persistReviewActivityTransactionally) return;
+        const completedReviewEvidence = completingTypedReview
+          ? await collectCompletedReviewReceipt(tx as unknown as Db, updated, actor)
+          : null;
         const changes = updated.changes ?? {};
         const previous = Object.fromEntries(
           Object.entries(changes).map(([key, change]) => [key, change.from]),
@@ -13646,6 +13708,12 @@ export function issueRoutes(
             entityId: updated.id,
             details: {
               ...updateFields,
+              ...(completedReviewEvidence ? {
+                completedReviewEvidence,
+                completionCommentId,
+                status: updated.status,
+                executionState: updated.executionState,
+              } : {}),
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
@@ -13703,7 +13771,7 @@ export function issueRoutes(
         transition.decision && decisionId ? transition.decision : null;
       let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
         null;
-      const attachmentCommentSourceTrust = commentAttachmentIds?.length
+      const attachmentCommentSourceTrust = commentAttachmentIds?.length || completingTypedReview
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13722,9 +13790,9 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length) {
+            if (commentAttachmentIds?.length || (completingTypedReview && commentBody)) {
+              // The final approval comment is bound into the completion receipt.
               // Reassignment, comment creation and upload binding commit together.
-              // An invalid or already-bound receipt rolls back the issue update.
               attachmentComment = await svc.addComment(
                 id,
                 commentBody,
@@ -13744,6 +13812,7 @@ export function issueRoutes(
                 },
                 tx,
               );
+              if (completingTypedReview) completionCommentId = attachmentComment.id;
             }
 
             if (decision && decisionId) {
