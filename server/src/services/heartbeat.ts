@@ -17682,6 +17682,45 @@ export function heartbeatService(
                 return { kind: "stale" as const, run: null };
               }
 
+              // An `interaction_pending` wake that adopts deferred comments
+              // carries `wakeCommentIds` and claims through this
+              // queued-comment path instead of the ordinary claim below. It
+              // must pass the same locked addressee verification: re-read
+              // the stored interaction under a `FOR UPDATE` row lock so a
+              // concurrent resolution blocks instead of landing between this
+              // read and the run-status writes below. Lock order stays
+              // issues-before-interaction, matching the resolution path, so
+              // this adds serialization without a lock-order inversion. A
+              // wake that no longer verifies stays queued; the next claim
+              // attempt cancels it through the ordinary staleness gate.
+              if (
+                issueId &&
+                readNonEmptyString(context.wakeReason) === "interaction_pending" &&
+                !issueClaim.ownsIssue
+              ) {
+                const stillAddressed = await verifyAddresseeInteractionWake(
+                  tx as unknown as Db,
+                  {
+                    companyId: run.companyId,
+                    issueId,
+                    agentId: run.agentId,
+                    contextSnapshot: context,
+                    lockInteraction: true,
+                  },
+                );
+                if (!stillAddressed) {
+                  logger.info(
+                    { runId: run.id, issueId, agentId: run.agentId },
+                    "claimQueuedRun: addressee interaction is no longer actionable; leaving run queued for the staleness gate",
+                  );
+                  return { kind: "stale" as const, run: null };
+                }
+                logger.info(
+                  { runId: run.id, issueId, agentId: run.agentId },
+                  "claimQueuedRun: addressee interaction verified for queued-comment claim",
+                );
+              }
+
               if (lockedRun.invocationSource === "automation") {
                 const admission = readChatControlRecoveryAdmission(lockedRun);
                 if (admission === "invalid")
@@ -17995,6 +18034,10 @@ export function heartbeatService(
                 );
                 return null;
               }
+              logger.info(
+                { runId: run.id, issueId, agentId: run.agentId },
+                "claimQueuedRun: addressee interaction verified for claim",
+              );
             }
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),

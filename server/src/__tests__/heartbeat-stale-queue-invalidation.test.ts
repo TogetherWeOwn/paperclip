@@ -806,6 +806,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     async function seedAddressedInteractionFixture(input: {
       interactionStatus?: string;
       wakeInteractionId?: string;
+      withQueuedComments?: boolean;
     } = {}) {
       const { companyId, agentId: assigneeAgentId } = await seedCompanyAndAgent();
       const addresseeAgentId = randomUUID();
@@ -848,6 +849,20 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           ? {}
           : { resolvedAt: new Date(), result: { version: 1, outcome: interactionStatus } }),
       });
+      // With adopted deferred comments the wake carries `wakeCommentIds` and
+      // claims through the separate queued-comment claim path. The wake
+      // payload carries the authoritative queued-message envelope so the
+      // claim exercises the envelope branch, not the legacy direct path.
+      const queuedCommentId = input.withQueuedComments ? randomUUID() : null;
+      if (queuedCommentId) {
+        await db.insert(issueComments).values({
+          id: queuedCommentId,
+          companyId,
+          issueId,
+          authorUserId: "local-board",
+          body: "Please also confirm the rollout plan.",
+        });
+      }
       const { runId, wakeupRequestId } = await seedQueuedRun({
         companyId,
         agentId: addresseeAgentId,
@@ -860,8 +875,18 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           interactionKind: "request_confirmation",
           mutation: "interaction",
           source: "issue.interaction.created",
+          ...(queuedCommentId ? { wakeCommentIds: [queuedCommentId] } : {}),
         },
       });
+      if (queuedCommentId) {
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            payload: withQueuedCommentIdsInWakePayload({ issueId }, [queuedCommentId]),
+            updatedAt: new Date(),
+          })
+          .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      }
       return { companyId, assigneeAgentId, addresseeAgentId, issueId, interactionId, runId, wakeupRequestId };
     }
 
@@ -975,6 +1000,86 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
       expect(wakeup).toMatchObject({ status: "skipped", error: expect.stringContaining("assignee changed") });
       expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    it("does not start the addressee on the queued-comment claim path when the interaction resolves before the claim", async () => {
+      const { runId, wakeupRequestId, interactionId } = await seedAddressedInteractionFixture({
+        withQueuedComments: true,
+      });
+      let resolvedAtClaim = false;
+      beforeClaimCheck = async ({ runId: guardedRunId, stage }) => {
+        if (stage !== "claim" || guardedRunId !== runId || resolvedAtClaim) return;
+        resolvedAtClaim = true;
+        await db
+          .update(issueThreadInteractions)
+          .set({ status: "accepted", resolvedAt: new Date(), updatedAt: new Date() })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      };
+
+      await heartbeat.resumeQueuedRuns();
+      // First pass: the gate admitted the run, the queued-comment claim
+      // re-read the resolved interaction under a row lock and left the run
+      // queued. Second pass: the gate cancels it.
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "cancelled";
+      }, 10_000)).toBe(true);
+
+      const [run, wakeup] = await Promise.all([
+        db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null),
+        db.select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId))
+          .then((rows) => rows[0] ?? null),
+      ]);
+      expect(resolvedAtClaim).toBe(true);
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(wakeup).toMatchObject({ status: "skipped" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    it("runs the named addressee on the queued-comment claim path while the interaction is still pending", async () => {
+      const { runId, wakeupRequestId, issueId, assigneeAgentId } = await seedAddressedInteractionFixture({
+        withQueuedComments: true,
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "succeeded";
+      }, 10_000)).toBe(true);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      const [run, wakeup, issue] = await Promise.all([
+        db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null),
+        db.select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId))
+          .then((rows) => rows[0] ?? null),
+        db.select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null),
+      ]);
+      expect(run).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(wakeup).toMatchObject({ status: "completed" });
+      expect(issue?.assigneeAgentId).toBe(assigneeAgentId);
+      expect(countExecuteCallsForRun(runId)).toBe(1);
     });
   });
 
