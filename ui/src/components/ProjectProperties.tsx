@@ -15,7 +15,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { AlertCircle, Archive, ArchiveRestore, Check, ExternalLink, Loader2, Trash2 } from "lucide-react";
+import { AlertCircle, Archive, ArchiveRestore, Check, ExternalLink, Loader2, Pause, Play, Trash2 } from "lucide-react";
 import { ChoosePathButton } from "./PathInstructionsModal";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { DraftInput } from "./agent-config-primitives";
@@ -196,6 +196,107 @@ function ArchiveDangerZone({
           ) : (
             <><ArchiveRestore className="h-3 w-3 mr-1" />{action} project</>
           )}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function PauseControl({
+  project,
+  onChanged,
+}: {
+  project: Project;
+  onChanged: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const paused = Boolean(project.pausedAt);
+
+  const pauseMutation = useMutation({
+    mutationFn: () => projectsApi.pause(project.id),
+    onSuccess: () => {
+      setConfirming(false);
+      setError(null);
+      onChanged();
+    },
+    onError: (err) => {
+      setError(err instanceof Error ? err.message : "Pause failed");
+    },
+  });
+  const resumeMutation = useMutation({
+    mutationFn: () => projectsApi.resume(project.id),
+    onSuccess: () => {
+      setError(null);
+      onChanged();
+    },
+    onError: (err) => {
+      setError(err instanceof Error ? err.message : "Resume failed");
+    },
+  });
+  const pending = pauseMutation.isPending || resumeMutation.isPending;
+
+  return (
+    <div className="space-y-3 rounded-md border border-border px-4 py-4">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium">Project pause</span>
+        {paused ? (
+          <Badge variant="secondary">
+            Paused{project.pauseReason ? ` · ${project.pauseReason}` : ""}
+          </Badge>
+        ) : null}
+      </div>
+      <p className="text-sm text-muted-foreground">
+        {paused
+          ? "Routines skip this project and new runs cannot start while it is paused."
+          : "Pause this project to park it: routines skip it and new runs cannot start until it resumes."}
+      </p>
+      {error ? (
+        <p className="text-sm text-destructive">{error}</p>
+      ) : null}
+      {pending ? (
+        <Button size="sm" variant="outline" disabled>
+          <Loader2 className="h-3 w-3 animate-spin mr-1" />
+          {paused ? "Resuming..." : "Pausing..."}
+        </Button>
+      ) : paused ? (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => resumeMutation.mutate()}
+        >
+          <Play className="h-3 w-3 mr-1" />Resume project
+        </Button>
+      ) : confirming ? (
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium">
+            Pause &ldquo;{project.name}&rdquo;?
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setConfirming(false);
+              pauseMutation.mutate();
+            }}
+          >
+            Confirm
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setConfirming(false)}
+          >
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => setConfirming(true)}
+        >
+          <Pause className="h-3 w-3 mr-1" />Pause project
         </Button>
       )}
     </div>
@@ -994,6 +1095,9 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
         ) : null}
 
       </div>
+
+      <Separator className="my-4" />
+      <PauseControl project={project} onChanged={invalidateProject} />
 
       {onArchive && (
         <>

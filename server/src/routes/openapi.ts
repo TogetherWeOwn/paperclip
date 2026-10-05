@@ -4536,6 +4536,29 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/projects/{id}/pause",
+  tags: ["projects"],
+  summary: "Pause a project with a manual pause reason",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({ reason: z.string().trim().min(1).max(500).optional() }).default({}),
+    ),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/projects/{id}/resume",
+  tags: ["projects"],
+  summary: "Resume a manually paused project",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/projects/{id}/workspaces",
   tags: ["projects"],

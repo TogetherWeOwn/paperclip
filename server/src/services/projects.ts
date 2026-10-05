@@ -28,7 +28,7 @@ import {
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { conflict, unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -910,6 +910,52 @@ export function projectService(db: Db) {
         await syncGoalLinks(db, id, row.companyId, ids);
       }
 
+      const [withGoals] = await attachGoals(db, [row]);
+      const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
+      return enriched ?? null;
+    },
+
+    pause: async (id: string): Promise<ProjectWithGoals | null> => {
+      const existing = await getProjectById(id);
+      if (!existing) return null;
+      // Never overwrite another pause reason (budget, system, import, company_archived):
+      // clearing or replacing it here would lose the owner's original intent and
+      // could resume a budget hard-stop without raising the budget.
+      if (existing.pausedAt) throw conflict("Project is already paused");
+      const now = new Date();
+      const row = await db
+        .update(projects)
+        .set({ pauseReason: "manual", pausedAt: now, updatedAt: now })
+        .where(eq(projects.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+      const [withGoals] = await attachGoals(db, [row]);
+      const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
+      return enriched ?? null;
+    },
+
+    resume: async (id: string): Promise<ProjectWithGoals | null> => {
+      const existing = await getProjectById(id);
+      if (!existing) return null;
+      if (!existing.pausedAt) return existing;
+      // Only the manual switch resumes here. Budget pauses resume through a budget
+      // raise; platform pauses (system, import, company_archived) resume through
+      // their own flows. Clearing them here would bypass those gates.
+      if (existing.pauseReason === "budget") {
+        throw conflict("Project is paused by a budget hard-stop. Raise the budget to resume it.");
+      }
+      if (existing.pauseReason !== "manual") {
+        throw conflict(`Project was paused by ${existing.pauseReason}. Resume it through that flow.`);
+      }
+      const now = new Date();
+      const row = await db
+        .update(projects)
+        .set({ pauseReason: null, pausedAt: null, updatedAt: now })
+        .where(eq(projects.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
       const [withGoals] = await attachGoals(db, [row]);
       const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
       return enriched ?? null;

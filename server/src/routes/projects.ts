@@ -377,6 +377,65 @@ export function projectRoutes(db: Db) {
     res.json(project);
   });
 
+  router.post(
+    "/projects/:id/pause",
+    validate(
+      z
+        .object({ reason: z.string().trim().min(1).max(500).optional() })
+        .default({}),
+    ),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+      if (!existing) return;
+      const project = await svc.pause(id);
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: project.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "project.paused",
+        entityType: "project",
+        entityId: project.id,
+        details: {
+          pauseReason: "manual",
+          ...(typeof req.body?.reason === "string" ? { reason: req.body.reason } : {}),
+        },
+      });
+      res.json(project);
+    },
+  );
+
+  router.post("/projects/:id/resume", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
+    const project = await svc.resume(id);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    if (existing.pausedAt) {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: project.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "project.resumed",
+        entityType: "project",
+        entityId: project.id,
+        details: { pauseReason: "manual" },
+      });
+    }
+    res.json(project);
+  });
+
   router.get("/projects/:id/workspaces", async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");

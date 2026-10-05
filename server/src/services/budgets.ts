@@ -841,12 +841,15 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         }
       }
 
-      if (agent.status === "paused" && agent.pauseReason === "budget") {
+      if (agent.status === "paused") {
         return {
           scopeType: "agent" as const,
           scopeId: agentId,
           scopeName: agent.name,
-          reason: "Agent is paused because its budget hard-stop was reached.",
+          reason:
+            agent.pauseReason === "budget"
+              ? "Agent is paused because its budget hard-stop was reached."
+              : "Agent is paused and cannot start new work.",
         };
       }
 
@@ -916,12 +919,18 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         }
       }
 
-      if (!project.pausedAt || project.pauseReason !== "budget") return null;
+      // Any paused project blocks invocation before a run starts, so a parked
+      // project never gets a run started that later fails at checkout. The
+      // message names the budget path when that gate owns the pause.
+      if (!project.pausedAt) return null;
       return {
         scopeType: "project" as const,
         scopeId: project.id,
         scopeName: project.name,
-        reason: "Project is paused because its budget hard-stop was reached.",
+        reason:
+          project.pauseReason === "budget"
+            ? "Project is paused because its budget hard-stop was reached."
+            : "Project is paused and cannot start new work. Resume the project to start new work.",
       };
     },
 
