@@ -550,7 +550,8 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
-  it("executes commands over SSH with cwd, env, and stdin", async () => {
+  it("executes commands over SSH with cwd, env, and stdin (env off argv)", async () => {
+    queueSpawnResult({ code: 0, stdout: "", stderr: "" });
     queueSpawnResult({ code: 0, stdout: "hello\n", stderr: "" });
 
     const result = await plugin.definition.onEnvironmentExecute?.({
@@ -577,15 +578,34 @@ describe("exe.dev sandbox provider plugin", () => {
       timeoutMs: 1000,
     });
 
-    expect(spawnMock).toHaveBeenCalledTimes(1);
+    // One ssh for env staging, one for the payload.
+    expect(spawnMock).toHaveBeenCalledTimes(2);
     expect(spawnMock.mock.calls[0]?.[0]).toBe("ssh");
-    const remoteScript = String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "");
+    expect(spawnMock.mock.calls[1]?.[0]).toBe("ssh");
+
+    // The staging command travels over argv but carries no secret values;
+    // the values ride the encrypted ssh stdin pipe into the 0600 env file.
+    const stageScript = String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "");
+    expect(stageScript).toContain("umask 077");
+    expect(stageScript).toContain("chmod 600");
+    expect(stageScript).toContain(".paperclip-exe-dev-env-");
+    expect(stageScript).not.toContain("bar");
+    const stageChild = spawnMock.mock.results[0]?.value as MockChildProcess;
+    expect(stageChild.stdin.written).toBe("export FOO='bar';\n");
+    expect(stageChild.stdin.ended).toBe(true);
+
+    // The payload script sources the staged file (after the login profiles),
+    // removes it on both success and failure, and never embeds values in argv.
+    const remoteScript = String(spawnMock.mock.calls[1]?.[1]?.at(-1) ?? "");
     expect(remoteScript).toContain("/workspace");
-    expect(remoteScript).toContain("FOO='");
+    expect(remoteScript).toContain(".paperclip-exe-dev-env-");
+    expect(remoteScript).toContain("rm -f");
+    expect(remoteScript).not.toContain("FOO='bar'");
+    expect(remoteScript).not.toContain("exec env");
     // The wrapper sources no `nvm.sh`; the sandbox image supplies node on PATH.
     expect(remoteScript).not.toContain("nvm.sh");
     expect(remoteScript).not.toContain("NVM_DIR");
-    const child = spawnMock.mock.results[0]?.value as MockChildProcess;
+    const child = spawnMock.mock.results[1]?.value as MockChildProcess;
     expect(child.stdin.written).toBe("input-body");
     expect(child.stdin.ended).toBe(true);
     expect(result).toMatchObject({
@@ -598,6 +618,98 @@ describe("exe.dev sandbox provider plugin", () => {
         vmName: "vm-1",
       },
     });
+  });
+
+  it("executes commands over SSH without env in a single spawn and no staging", async () => {
+    queueSpawnResult({ code: 0, stdout: "ok\n", stderr: "" });
+
+    const result = await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+      lease: {
+        providerLeaseId: "vm-1",
+        metadata: {
+          sshDest: "vm-1.exe.xyz",
+        },
+      },
+      command: "node",
+      args: ["-v"],
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const remoteScript = String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "");
+    // The payload runs through the outer `sh -c` quoting layer, so assert on
+    // the exec shape loosely: staged-env sourcing is absent, plain exec stays.
+    expect(remoteScript).toContain("exec ");
+    expect(remoteScript).toContain("node");
+    expect(remoteScript).not.toContain(".paperclip-exe-dev-env-");
+    expect(remoteScript).not.toContain("rm -f");
+    expect(result).toMatchObject({
+      exitCode: 0,
+      timedOut: false,
+      stdout: "ok\n",
+    });
+  });
+
+  it("fails execution when env staging fails, without running the payload", async () => {
+    queueSpawnResult({ code: 1, stdout: "", stderr: "permission denied" });
+
+    const result = await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+      lease: {
+        providerLeaseId: "vm-1",
+        metadata: {
+          sshDest: "vm-1.exe.xyz",
+        },
+      },
+      command: "node",
+      args: ["-v"],
+      cwd: "/workspace",
+      env: {
+        FOO: "bar",
+      },
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(result?.exitCode).toBe(1);
+    expect(String(result?.stderr ?? "")).toContain("permission denied");
+    expect(result?.stdout).toBe("");
+  });
+
+  it("rejects invalid env keys before any SSH call", async () => {
+    await expect(plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        apiKey: "api-key",
+        timeoutMs: 300000,
+      },
+      lease: {
+        providerLeaseId: "vm-1",
+        metadata: {
+          sshDest: "vm-1.exe.xyz",
+        },
+      },
+      command: "node",
+      args: ["-v"],
+      env: {
+        "BAD-KEY": "value",
+      },
+    })).rejects.toThrow("Invalid exe.dev environment variable key: BAD-KEY");
+
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("returns exe.dev SSH onboarding guidance for command execution failures", async () => {
