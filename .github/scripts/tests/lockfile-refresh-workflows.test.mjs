@@ -5,7 +5,6 @@ import assert from 'node:assert/strict';
 const workflows = [
   '.github/workflows/refresh-lockfile.yml',
   '.github/workflows/pr-trusted.yml',
-  '.github/workflows/docker.yml',
   '.github/workflows/docker-cloud.yml',
 ];
 
@@ -23,4 +22,17 @@ test('lockfile repair workflows resolve dependencies instead of updating metadat
       assert.doesNotMatch(command, /--lockfile-only/);
     }
   }
+});
+
+test('immutable Docker builds preserve committed dependency inputs', async () => {
+  const workflow = await readFile('.github/workflows/docker.yml', 'utf8');
+  const dockerfile = await readFile('Dockerfile', 'utf8');
+  const controls = await readFile('scripts/ci/immutable-docker.py', 'utf8');
+
+  assert.doesNotMatch(workflow, /pnpm install|--no-frozen-lockfile|--resolution-only/);
+  assert.match(dockerfile, /RUN pnpm install --frozen-lockfile/);
+  assert.match(workflow, /immutable-docker\.py prepare/);
+  assert.match(workflow, /immutable-docker\.py record/);
+  assert.match(controls, /"policy": "frozen-no-refresh"/);
+  assert.match(controls, /"status", "--porcelain", "--untracked-files=all"/);
 });
