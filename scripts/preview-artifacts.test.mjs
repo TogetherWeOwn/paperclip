@@ -235,10 +235,16 @@ test("cloud builds start per commit and preserve tag promotion dependencies", ()
   assert.match(cloud, /cancel-in-progress: false/);
   assert.doesNotMatch(cloud, /uses: .*@v\d\b/);
   assert.match(cloud, /cache-to: type=registry,ref=ghcr.io\/\$\{\{ github.repository \}\}:buildcache-cloud-\$\{\{ github.sha \}\},mode=max/);
-  const caller = docker.split("  build-and-push-cloud:")[1].split("  promote_canary_channel:")[0];
-  assert.match(caller, /if: github.event_name != 'push' \|\| github.ref != 'refs\/heads\/master'/);
-  assert.match(caller, /uses: .\/.github\/workflows\/docker-cloud.yml/);
-  assert.match(docker.split("  promote_canary_channel:")[1], /needs: \[merge-and-push, build-and-push-cloud\]/);
+  // Release line (build-only docker.yml) has no cloud caller by design.
+  if (!docker.includes("  build-and-push-cloud:")) {
+    assert.match(docker, /build-only/);
+    assert.doesNotMatch(docker, /docker-cloud\.yml/);
+  } else {
+    const caller = docker.split("  build-and-push-cloud:")[1].split("  promote_canary_channel:")[0];
+    assert.match(caller, /if: github.event_name != 'push' \|\| github.ref != 'refs\/heads\/master'/);
+    assert.match(caller, /uses: .\/.github\/workflows\/docker-cloud.yml/);
+    assert.match(docker.split("  promote_canary_channel:")[1], /needs: \[merge-and-push, build-and-push-cloud\]/);
+  }
   const reaping = cloud.indexOf("      - name: Verify cloud PID 1 reaps orphaned processes");
   assert.ok(reaping > cloud.indexOf("      - name: Verify the pushed image resolves the declared Sentry version"));
   assert.ok(reaping < cloud.indexOf("      - name: Publish verified full-SHA cloud tag"));
