@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import { instanceSettingsService, issueService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
@@ -251,7 +252,12 @@ export function boardChatRoutes(
       stdio: ["pipe", "pipe", "pipe"],
       cwd: "/tmp",
       env: {
-        ...process.env,
+        // TOG-9729: this route is agent-reachable (assertCompanyAccess allows
+        // same-company agent keys), so strip inherited server secrets from the
+        // base. The board skill needs no server credentials: local_trusted
+        // auto-grants board access on loopback, and the operator's claude
+        // subscription resolves from HOME, which sanitize preserves.
+        ...sanitizeInheritedPaperclipEnv(process.env),
         PAPERCLIP_API_URL: apiUrl,
         PAPERCLIP_COMPANY_ID: companyId,
       },

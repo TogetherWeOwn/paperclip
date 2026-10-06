@@ -166,6 +166,12 @@ export interface WakeQueueTransaction {
     wakeAgentId: string;
     commentIds: string[];
   }): Promise<boolean>;
+  /** Proves every comment predates the locked issue's persisted native review completion. */
+  isCommentWakeCoveredByCompletedReview(input: {
+    companyId: string;
+    issueId: string;
+    commentIds: string[];
+  }): Promise<boolean>;
   reopenIssue(input: { companyId: string; issueId: string; runId: string }): Promise<IssueSnapshot | null>;
   /** Verifies a Done onboarding parent's completion wake against its own completed children. */
   isCompletedOnboardingHandoffWake(input: { companyId: string; issueId: string; agentId: string;

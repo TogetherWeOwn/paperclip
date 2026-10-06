@@ -259,6 +259,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableOwnerInstanceAdmin: parsed.data.enableOwnerInstanceAdmin ?? false,
       enableSandboxDuplexBridge: parsed.data.enableSandboxDuplexBridge ?? false,
       enableRunnerPreviewIngress: parsed.data.enableRunnerPreviewIngress ?? false,
+      requireRunModelDecision: parsed.data.requireRunModelDecision ?? false,
       enableWorktreeRunExecution: parsed.data.enableWorktreeRunExecution ?? false,
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
@@ -302,6 +303,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableOwnerInstanceAdmin: false,
     enableSandboxDuplexBridge: false,
     enableRunnerPreviewIngress: false,
+    requireRunModelDecision: false,
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,

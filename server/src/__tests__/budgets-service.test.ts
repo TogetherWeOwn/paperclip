@@ -10,7 +10,7 @@ import {
   createDb,
   projects,
 } from "@paperclipai/db";
-import { budgetService } from "../services/budgets.ts";
+import { budgetService, runBudgetSpentFraction } from "../services/budgets.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -322,6 +322,98 @@ describe("budgetService", () => {
         updatedAt: expect.any(Date),
       }),
     );
+  });
+});
+
+describe("runBudgetSpentFraction (TOG-7967 D1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function policy(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "policy-1",
+      companyId: "company-1",
+      scopeType: "agent",
+      scopeId: "agent-1",
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+      ...overrides,
+    };
+  }
+
+  it("returns observed/amount for the most-specific active envelope", async () => {
+    const dbStub = createDbStub([
+      [
+        policy({ scopeType: "company", scopeId: "company-1", amount: 1000 }),
+        policy({ scopeType: "agent", scopeId: "agent-1", amount: 100 }),
+      ],
+      [{ total: 25 }],
+    ]);
+
+    const fraction = await runBudgetSpentFraction(dbStub.db as any, {
+      companyId: "company-1",
+      agentId: "agent-1",
+      projectId: null,
+      runId: "run-1",
+    });
+
+    expect(fraction).toBe(0.25);
+  });
+
+  it("prefers calendar_month_utc within the same scope", async () => {
+    const dbStub = createDbStub([
+      [
+        policy({ scopeType: "company", scopeId: "company-1", windowKind: "lifetime", amount: 1000 }),
+        policy({ scopeType: "company", scopeId: "company-1", windowKind: "calendar_month_utc", amount: 200 }),
+      ],
+      [{ total: 100 }],
+    ]);
+
+    const fraction = await runBudgetSpentFraction(dbStub.db as any, {
+      companyId: "company-1",
+      agentId: null,
+      projectId: null,
+      runId: "run-1",
+    });
+
+    expect(fraction).toBe(0.5);
+  });
+
+  it("returns undefined when no qualifying policy exists", async () => {
+    const dbStub = createDbStub([[]]);
+
+    const fraction = await runBudgetSpentFraction(dbStub.db as any, {
+      companyId: "company-1",
+      agentId: "agent-1",
+      projectId: null,
+      runId: "run-1",
+    });
+
+    expect(fraction).toBeUndefined();
+  });
+
+  it("ignores zero-amount and inactive policies", async () => {
+    const dbStub = createDbStub([
+      [
+        policy({ scopeType: "agent", scopeId: "agent-1", amount: 0 }),
+        policy({ scopeType: "company", scopeId: "company-1", amount: 100, isActive: false }),
+      ],
+    ]);
+
+    const fraction = await runBudgetSpentFraction(dbStub.db as any, {
+      companyId: "company-1",
+      agentId: "agent-1",
+      projectId: null,
+      runId: "run-1",
+    });
+
+    expect(fraction).toBeUndefined();
   });
 });
 

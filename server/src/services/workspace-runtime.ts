@@ -269,6 +269,14 @@ const exposurePortPairClaims = new ExposurePortPairClaims();
  */
 const OPEN_EXECUTION_WORKSPACE_LEASE_STATUSES = ["active", "idle", "in_review"] as const;
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+/**
+ * `git worktree list --porcelain` grows with every registered linked worktree
+ * (about 380 bytes each), so a repository with many execution worktrees
+ * outgrows the diagnostic capture cap. This bound is still finite, but sized
+ * for tens of thousands of entries; output past it is an error, not a
+ * silently shortened list.
+ */
+const GIT_WORKTREE_LIST_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
 export const WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS = 32;
 const ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES = ["provisioning", "starting", "running"] as const;
 const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.sock";
@@ -825,21 +833,27 @@ function trimToLastBytes(value: string, limit: number) {
 function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator {
   const limit = Math.max(1, Math.trunc(maxBytes));
   let text = "";
+  let textBytes = 0;
   let truncated = false;
   let totalBytes = 0;
 
   return {
     append(chunk: string) {
       if (!chunk) return;
-      totalBytes += Buffer.byteLength(chunk, "utf8");
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      totalBytes += chunkBytes;
 
-      const combined = text + chunk;
-      if (Buffer.byteLength(combined, "utf8") <= limit) {
-        text = combined;
+      // Track the retained size incrementally so a large, still-under-limit
+      // capture is not re-measured (and its concatenation re-flattened) on
+      // every chunk.
+      if (textBytes + chunkBytes <= limit) {
+        text += chunk;
+        textBytes += chunkBytes;
         return;
       }
 
-      text = trimToLastBytes(combined, limit);
+      text = trimToLastBytes(text + chunk, limit);
+      textBytes = Buffer.byteLength(text, "utf8");
       truncated = true;
     },
     finish(): ProcessOutputCapture {
@@ -909,15 +923,43 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+/**
+ * A git command succeeded but its stdout did not fit the capture bound, so the
+ * retained text is a partial tail. Callers parse stdout as data, and a partial
+ * list reads as a complete one, so this is an error rather than a result.
+ */
+class GitOutputTruncatedError extends Error {
+  readonly limitBytes: number;
+  readonly totalBytes: number;
+
+  constructor(input: { limitBytes: number; totalBytes: number }) {
+    super(
+      `git output exceeded the ${input.limitBytes}-byte capture limit (${input.totalBytes} bytes total); refusing to use a truncated result`,
+    );
+    this.name = "GitOutputTruncatedError";
+    this.limitBytes = input.limitBytes;
+    this.totalBytes = input.totalBytes;
+  }
+}
+
+async function runGit(
+  args: string[],
+  cwd: string,
+  opts?: { env?: NodeJS.ProcessEnv; maxStdoutBytes?: number },
+): Promise<string> {
+  const limitBytes = opts?.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES;
   const proc = await executeProcess({
     command: "git",
     args,
     cwd,
     env: opts?.env,
+    maxStdoutBytes: limitBytes,
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  if (proc.stdoutTruncated) {
+    throw new GitOutputTruncatedError({ limitBytes, totalBytes: proc.stdoutBytes });
   }
   return proc.stdout.trim();
 }
@@ -976,13 +1018,18 @@ export async function refreshRemoteTrackingBaseRef(
 
   const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
   try {
-    await runGit([
-      ...(auth?.configArgs ?? []),
-      "fetch",
-      "--prune",
-      remoteTracking.remote,
-      `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
+    await recordGitOperation(null, {
+      phase: "worktree_prepare",
+      args: [
+        ...(auth?.configArgs ?? []),
+        "fetch",
+        "--prune",
+        remoteTracking.remote,
+        `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
+      ],
+      cwd: repoRoot,
+      env: auth ? { ...process.env, ...auth.env } : undefined,
+    });
     return [];
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
@@ -1912,7 +1959,11 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     };
   } catch (error) {
     if (rescueBranchCreated && !expectedBranchRestored) {
-      await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
+      await recordGitOperation(null, {
+        phase: input.phase ?? "worktree_prepare",
+        args: ["checkout", input.expectedBranchName],
+        cwd: input.worktreePath,
+      }).catch(() => null);
     }
     if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
     input.evidence.safeRepair.succeeded = false;
@@ -2610,6 +2661,7 @@ export type ManagedGitWorktreeBranchInspection = {
     | "missing_worktree"
     | "not_a_git_checkout"
     | "not_registered"
+    | "worktree_list_unavailable"
     | "wrong_repository_root"
     | "branch_mismatch"
     | null;
@@ -2658,12 +2710,33 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   return path.dirname(path.resolve(checkoutRoot, commonDir));
 }
 
+/**
+ * Every registered worktree, or a throw. A list that did not fit
+ * `maxStdoutBytes` raises `GitOutputTruncatedError` instead of returning the
+ * entries that survived, so "not in the list" is never a statement about a
+ * partial list.
+ */
+async function readGitWorktreeList(
+  repoRoot: string,
+  opts?: { maxStdoutBytes?: number },
+): Promise<GitWorktreeListEntry[]> {
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    maxStdoutBytes: opts?.maxStdoutBytes ?? GIT_WORKTREE_LIST_MAX_STDOUT_BYTES,
+  });
+  return parseGitWorktreeListPorcelain(raw);
+}
+
 async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+  const entries = await readGitWorktreeList(repoRoot).catch((error) => {
+    // An unreadable list is "no match" as before, but a truncated one must not
+    // read as "no worktree holds this branch".
+    if (error instanceof GitOutputTruncatedError) throw error;
+    return null;
+  });
+  if (!entries) return null;
 
   const expectedBranchRef = `refs/heads/${branchName}`;
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (entry.branch !== expectedBranchRef) continue;
     return path.resolve(entry.worktree);
   }
@@ -2672,11 +2745,13 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
 }
 
 async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+  // Diagnostic evidence only: a null here (including an unusable truncated
+  // list) makes the safe-repair path ineligible, which is the conservative side.
+  const entries = await readGitWorktreeList(repoRoot).catch(() => null);
+  if (!entries) return null;
 
   const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (await resolvePathForWorktreeComparison(entry.worktree) === expectedPath) {
       return entry;
     }
@@ -2735,12 +2810,13 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
 }
 
-async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+async function listLinkedGitWorktreePaths(
+  repoRoot: string,
+  opts?: { maxStdoutBytes?: number },
+): Promise<Set<string>> {
   const paths = new Set<string>();
-  for (const line of output.split("\n")) {
-    if (!line.startsWith("worktree ")) continue;
-    const worktree = line.slice("worktree ".length).trim();
+  for (const entry of await readGitWorktreeList(repoRoot, opts)) {
+    const worktree = entry.worktree.trim();
     if (!worktree) continue;
     paths.add(await resolvePathForWorktreeComparison(worktree));
   }
@@ -2751,6 +2827,8 @@ export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
   repoRoot?: string | null;
+  /** Bound on the `git worktree list --porcelain` capture. Defaults to GIT_WORKTREE_LIST_MAX_STDOUT_BYTES. */
+  worktreeListMaxBytes?: number;
 }): Promise<ManagedGitWorktreeBranchInspection> {
   const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   const expectedBranchName = asString(input.expectedBranchName, "").trim() || null;
@@ -2783,8 +2861,22 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  let listedWorktrees: Set<string>;
+  try {
+    listedWorktrees = await listLinkedGitWorktreePaths(repoRoot, { maxStdoutBytes: input.worktreeListMaxBytes });
+  } catch (error) {
+    // Fail closed, but do not call the path unregistered: a list that could not
+    // be read in full says nothing about whether this path is in it.
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ...base,
+      valid: false,
+      reason: `could not enumerate \`git worktree list\` to verify registration (${detail})`,
+      reasonCode: "worktree_list_unavailable",
+      repoRoot,
+    };
+  }
+  if (!listedWorktrees.has(worktreePath)) {
     return {
       ...base,
       valid: false,
@@ -2969,56 +3061,61 @@ async function runWorkspaceCommand(input: {
   );
 }
 
-async function recordGitOperation(
+export async function recordGitOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
     phase: WorkspaceOperationPhase;
     args: string[];
     cwd: string;
+    env?: NodeJS.ProcessEnv;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     failureLabel?: string | null;
   },
 ): Promise<string> {
-  if (!recorder) {
-    return runGit(input.args, input.cwd);
-  }
-
   let stdout = "";
   let stderr = "";
   let code: number | null = null;
-  await recorder.recordOperation({
-    phase: input.phase,
-    command: formatCommandForDisplay("git", input.args),
-    cwd: input.cwd,
-    metadata: input.metadata ?? null,
-    run: async () => {
-      const result = await executeProcess({
-        command: "git",
-        args: input.args,
-        cwd: input.cwd,
-      });
-      stdout = result.stdout;
-      stderr = result.stderr;
-      code = result.code;
-      return {
-        status: result.code === 0 ? "succeeded" : "failed",
-        exitCode: result.code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        system: result.code === 0 ? input.successMessage ?? null : null,
-        metadata:
-          result.stdoutTruncated || result.stderrTruncated
-            ? {
-                stdoutTruncated: result.stdoutTruncated,
-                stderrTruncated: result.stderrTruncated,
-                stdoutBytes: result.stdoutBytes,
-                stderrBytes: result.stderrBytes,
-              }
-            : null,
-      };
-    },
-  });
+  // Mutation stdout is bounded diagnostic text, not a machine-readable result.
+  // Recording must not change whether an already-completed mutation succeeded.
+  const run = async () => {
+    const result = await executeProcess({
+      command: "git",
+      args: input.args,
+      cwd: input.cwd,
+      env: input.env,
+    });
+    stdout = result.stdout;
+    stderr = result.stderr;
+    code = result.code;
+    return {
+      status: result.code === 0 ? "succeeded" as const : "failed" as const,
+      exitCode: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      system: result.code === 0 ? input.successMessage ?? null : null,
+      metadata:
+        result.stdoutTruncated || result.stderrTruncated
+          ? {
+              stdoutTruncated: result.stdoutTruncated,
+              stderrTruncated: result.stderrTruncated,
+              stdoutBytes: result.stdoutBytes,
+              stderrBytes: result.stderrBytes,
+            }
+          : null,
+    };
+  };
+  if (recorder) {
+    await recorder.recordOperation({
+      phase: input.phase,
+      command: formatCommandForDisplay("git", input.args),
+      cwd: input.cwd,
+      metadata: input.metadata ?? null,
+      run,
+    });
+  } else {
+    await run();
+  }
 
   if (code !== 0) {
     const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
@@ -3810,7 +3907,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  await recordGitOperation(null, {
+    phase: "worktree_prepare",
+    args: ["worktree", "prune"],
+    cwd: repoRoot,
+  }).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef
     ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)

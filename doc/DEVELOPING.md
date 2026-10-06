@@ -747,6 +747,14 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 
 ## Workspace Git Scan Protection
 
+Worktree registration checks require a complete `git worktree list --porcelain`
+result. That list has a dedicated 16 MiB capture bound; other parsed Git output
+keeps the default 256 KiB bound. Truncated parsed output fails closed. An
+unreadable worktree list reports `worktree_list_unavailable`, not
+`not_registered`. Git mutations keep bounded diagnostic tails and use the exit
+status to determine success, with or without an operation recorder. A truncated
+commit summary does not turn an already-successful rescue commit into a failure.
+
 Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical buffered scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Streaming snapshot scans have caller-owned sinks, so they use separate jobs in the same queue and are never cached or coalesced. Correctness-sensitive runtime guards bypass the result cache.
 
 The shared scan subprocess sets `GIT_OPTIONAL_LOCKS=0`, including when a caller supplies an environment. This prevents background `git status` from rewriting the index's stat cache and competing with workspace writers. Git still computes current tracked and untracked changes. Required write locks remain enforced; existing lock files are never removed or treated as stale by a scan. This avoids optional index refresh work but may make later scans repeat stat checks. See Git's [background refresh guidance](https://git-scm.com/docs/git-status#_background_refresh).

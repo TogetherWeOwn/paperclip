@@ -186,6 +186,37 @@ blocks concurrent task or run updates. It allows audit inserts to retain their
 foreign-key `KEY SHARE` locks without waiting on identity acquisition. The audit
 foreign keys and their deletion behavior remain enforced.
 
+## Wake transactions and connection-pool regression
+
+A wake transaction must pass its `tx` handle to every database read it calls.
+Using the outer `db` can exhaust the pool: each transaction holds a connection
+while waiting for a second one. Session-workspace and responsible-user helpers
+accept a read handle so that the wake transaction can reuse its connection.
+Calls outside a transaction continue to use the normal pool.
+
+The nested-pool regression runs four concurrent isolated-workspace wakes with
+two connections. It also rejects outer-pool reads inside a transaction, so a
+regression fails promptly instead of hanging teardown. It uses a manual wake:
+an assignment wake resets the prior session and skips the affected session read.
+
+Create an empty, exclusively owned database named `paperclip_nested_pool_*` on
+`agent-testdb`, then run:
+
+```sh
+PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/paperclip_nested_pool_regression \
+  pnpm --filter @paperclipai/server exec vitest run src/__tests__/heartbeat-wake-nested-pool.test.ts
+```
+
+The test applies migrations and deletes its test rows during cleanup. Never
+point it at a shared application database. It accepts `agent-testdb`, or a
+PostgreSQL CI service at `localhost`, `127.0.0.1`, or `postgres` when `CI=true`.
+The suite reads only `PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL`, not the shared
+`PAPERCLIP_TEST_DATABASE_URL` that other integration suites use. Without it,
+including when only the shared URL is set, the suite reports a skip. If it is
+set to anything other than a `paperclip_nested_pool_*` database on an allowed
+host, collection fails. The suite does not fall back to `DATABASE_URL` or start
+embedded PostgreSQL.
+
 ## Switching between modes
 
 The database mode is controlled by `DATABASE_URL`:

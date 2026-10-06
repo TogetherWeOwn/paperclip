@@ -56,6 +56,7 @@ export type {
   QueuedCommentQueueSnapshot,
 } from "./application/queued-comment-ports.js";
 export type { QueuedCommentQueuePostgresAdapterDeps } from "./adapters/queued-comment-postgres.js";
+export { hasInteractionContinuationWakeContext } from "./domain/context.js";
 
 export type WakeQueueDeps = {
   /** Stays in `heartbeat.ts`; resolves the responsible user for a promoted or recovery run seed. */

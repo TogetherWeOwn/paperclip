@@ -11,6 +11,87 @@ import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-a
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
 function githubPolicyRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+
+// Secret-bearing model-provider credential env keys whose agent-scoped secret
+// bindings a low-trust GitHub review may use. A low-trust review runs the
+// assigned review agent with no Paperclip user principal, so the heartbeat
+// refuses every agent secret binding by default — including the reviewer's
+// own model credential, which means the reviewer can never start. Allowing
+// exactly these bindings lets the reviewer start while every other secret
+// (GitHub tokens, unrelated env, other agents' bindings) stays refused.
+// Paths and base URLs stay out: they are configuration, not credentials.
+export const LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "CODEX_API_KEY",
+  "OPENROUTER_API_KEY",
+  "XAI_API_KEY",
+  "GROK_API_KEY",
+] as const;
+
+export function lowTrustModelCredentialConfigPaths(): string[] {
+  return LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS.map((key) => `env.${key}`);
+}
+
+type LowTrustSecretBindingRow = {
+  id: string;
+  targetType: string;
+  targetId: string;
+  configPath: string;
+};
+
+export function filterLowTrustModelBindingIds(
+  bindings: readonly LowTrustSecretBindingRow[],
+  agentId: string,
+): string[] {
+  if (!agentId) return [];
+  const allowedPaths = new Set(lowTrustModelCredentialConfigPaths());
+  const ids = new Set<string>();
+  for (const binding of bindings) {
+    if (binding.targetType !== "agent") continue;
+    if (binding.targetId !== agentId) continue;
+    if (!allowedPaths.has(binding.configPath)) continue;
+    if (!binding.id) continue;
+    ids.add(binding.id);
+  }
+  return [...ids].sort();
+}
+
+async function resolveLowTrustModelBindingIds(
+  tx: DbOrTransaction,
+  input: { companyId: string; agentId: string },
+): Promise<string[]> {
+  if (!input.agentId) return [];
+  const rows = await tx
+    .select({
+      id: companySecretBindings.id,
+      targetType: companySecretBindings.targetType,
+      targetId: companySecretBindings.targetId,
+      configPath: companySecretBindings.configPath,
+    })
+    .from(companySecretBindings)
+    .where(
+      and(
+        eq(companySecretBindings.companyId, input.companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, input.agentId),
+        inArray(
+          companySecretBindings.configPath,
+          lowTrustModelCredentialConfigPaths(),
+        ),
+      ),
+    );
+  return filterLowTrustModelBindingIds(rows, input.agentId);
+}
+
+function readLowTrustAllowedBindingIds(value: unknown): string[] {
+  const record = githubPolicyRecord(value);
+  const ids = (record as { allowedSecretBindingIds?: unknown }).allowedSecretBindingIds;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment } from "./chat-github-events.js";
@@ -16100,6 +16181,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!issue) throw notFound("Bound task not found");
           const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
         if (!taskUserId || (githubAutomatic && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
+            // Low-trust reviews run with no user principal, so the heartbeat
+            // refuses every agent secret binding by default. Allow exactly
+            // the assigned review agent's own model-provider credential
+            // binding(s) so the reviewer can start; every other secret stays
+            // refused. The lookup is scoped to this endpoint's assigned
+            // agent by construction, and any operator-set allowlist entries
+            // already on the issue boundary are preserved.
+            const lowTrustReviewAgentId =
+              taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId;
+            const lowTrustModelBindingIds = await resolveLowTrustModelBindingIds(
+              taskTx,
+              {
+                companyId: endpoint.companyId,
+                agentId: lowTrustReviewAgentId,
+              },
+            );
+            const lowTrustAllowedSecretBindingIds = [
+              ...new Set([
+                ...readLowTrustAllowedBindingIds(
+                  githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary,
+                ),
+                ...lowTrustModelBindingIds,
+              ]),
+            ].sort();
             const reviewPreset = {
               id: LOW_TRUST_REVIEW_PRESET,
               version: LOW_TRUST_REVIEW_PRESET_VERSION,
@@ -16135,6 +16240,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                         "tests.local",
                       ],
                       ...githubPolicyRecord(githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary),
+                      allowedSecretBindingIds: lowTrustAllowedSecretBindingIds,
                     },
                   },
                 },

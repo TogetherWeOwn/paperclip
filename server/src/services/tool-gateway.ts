@@ -99,6 +99,8 @@ import type {
   PluginToolDispatcher,
 } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { runBudgetSpentFraction } from "./budgets.js";
+import { toBoundedBudgetFractionReceipt } from "./budget-receipt.js";
 import { secretService } from "./secrets.js";
 import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
@@ -5760,11 +5762,14 @@ export function createToolGatewayService(
     const content = googleWorkspacePermissionDenied
       ? "Google rejected this call. Google Workspace MCP is a Developer Preview: enroll the signed-in Workspace account and this OAuth client's Google Cloud project in Google's Developer Preview Program, wait for Google's registration confirmation, then reconnect and try again."
       : providerContent;
+    const structuredContent = record.structuredContent;
     return {
       content,
       data: {
         content: record.content,
-        structuredContent: record.structuredContent ?? null,
+        ...(typeof structuredContent === "object" && structuredContent !== null && !Array.isArray(structuredContent)
+          ? { structuredContent: structuredContent as Record<string, unknown> }
+          : {}),
         isError: record.isError === true,
         transport,
         spawnedLocalProcess,
@@ -7416,13 +7421,36 @@ export function createToolGatewayService(
   function storedInvocationResult(
     invocation: typeof toolInvocations.$inferSelect,
   ): unknown {
+    const failed =
+      invocation.status !== "succeeded" || invocation.errorMessage != null;
     const summary = invocation.resultSummary?.summary;
-    if (typeof summary !== "string") return null;
-    try {
-      return JSON.parse(summary);
-    } catch {
-      return summary;
+    let parsed: unknown = null;
+    if (typeof summary === "string") {
+      try {
+        parsed = JSON.parse(summary);
+      } catch {
+        parsed = summary;
+      }
     }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      if (failed && record.isError !== true) {
+        return { ...record, isError: true };
+      }
+      return record;
+    }
+    if (failed) {
+      const message = invocation.errorMessage ?? "Tool call failed";
+      if (typeof parsed === "string" && parsed.length > 0) {
+        return { content: parsed, isError: true, error: message };
+      }
+      return {
+        content: [{ type: "text", text: message }],
+        isError: true,
+        error: message,
+      };
+    }
+    return parsed;
   }
 
   async function actionRequestResolution(
@@ -10298,7 +10326,7 @@ export function createToolGatewayService(
             invocationId,
             status: "replayed" as const,
             tool: tool.name,
-            result: recorded.invocation.resultSummary ?? null,
+            result: storedInvocationResult(recorded.invocation),
           };
         }
         if (accessDecision.decision === "require_approval") {
@@ -10412,6 +10440,45 @@ export function createToolGatewayService(
                   input.timeoutMs === undefined,
                 )
               : null;
+        // Host budget-fraction receipt (H5): bounded numeric injection or
+        // observable degradation. Safe IDs only; no prompts, args, or headers.
+        let h5Fraction: number | undefined;
+        if (tool.providerType === "paperclip_plugin" && !connectedMcpExecution) {
+          try {
+            const h5Raw = await runBudgetSpentFraction(db, {
+              companyId: session.companyId,
+              agentId: session.agentId!,
+              projectId: session.projectId ?? null,
+              runId: session.runId!,
+            });
+            const h5Receipt = toBoundedBudgetFractionReceipt(h5Raw);
+            // Stamp raw: rounding is log-only; the router gates on this value.
+            h5Fraction = h5Receipt.injected ? h5Raw : undefined;
+            if (h5Receipt.injected) {
+              logger.info(
+                {
+                  runId: session.runId!,
+                  invocationId,
+                  tool: tool.name,
+                  budgetSpentFraction: h5Receipt.budgetSpentFraction,
+                  injected: true,
+                },
+                "budget fraction injected",
+              );
+            } else {
+              logger.info(
+                { runId: session.runId!, invocationId, tool: tool.name, injected: false, reason: "no-policy" },
+                "budget fraction absent; omitted from stamp",
+              );
+            }
+          } catch (h5Err) {
+            h5Fraction = undefined;
+            logger.warn(
+              { err: h5Err, runId: session.runId!, invocationId, tool: tool.name, injected: false },
+              "budget fraction lookup failed; omitted from stamp",
+            );
+          }
+        }
         const result = connectedMcpExecution
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
@@ -10424,6 +10491,8 @@ export function createToolGatewayService(
                     runId: session.runId!,
                     companyId: session.companyId,
                     projectId: session.projectId ?? "",
+                    // Host-authored stamp; undefined ≡ absent downstream.
+                    budgetSpentFraction: h5Fraction,
                   },
                 ),
                 executionTimeoutMs,
@@ -10758,7 +10827,7 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
-        return recorded.invocation.resultSummary;
+        return storedInvocationResult(recorded.invocation);
       }
 
       if (accessDecision.decision === "require_approval") {
@@ -10837,10 +10906,51 @@ export function createToolGatewayService(
 
       const startedAt = Date.now();
       try {
+        // Host budget-fraction receipt (H6 B2): input.runContext is caller
+        // JSON — forgeable. Spread-overwrite with the host-computed value;
+        // undefined ≡ absent. Safe IDs only; no prompts, args, or headers.
+        let b2Fraction: number | undefined;
+        try {
+          const b2Raw = await runBudgetSpentFraction(db, {
+            companyId: input.runContext.companyId,
+            agentId: input.runContext.agentId,
+            projectId: input.runContext.projectId ?? null,
+            runId: input.runContext.runId,
+          });
+          const b2Receipt = toBoundedBudgetFractionReceipt(b2Raw);
+          // Stamp raw: rounding is log-only; the router gates on this value.
+          b2Fraction = b2Receipt.injected ? b2Raw : undefined;
+          if (b2Receipt.injected) {
+            logger.info(
+              {
+                runId: input.runContext.runId,
+                invocationId,
+                tool: input.tool,
+                budgetSpentFraction: b2Receipt.budgetSpentFraction,
+                injected: true,
+              },
+              "budget fraction injected",
+            );
+          } else {
+            logger.info(
+              { runId: input.runContext.runId, invocationId, tool: input.tool, injected: false, reason: "no-policy" },
+              "budget fraction absent; omitted from stamp",
+            );
+          }
+        } catch (b2Err) {
+          b2Fraction = undefined;
+          logger.warn(
+            { err: b2Err, runId: input.runContext.runId, invocationId, tool: input.tool, injected: false },
+            "budget fraction lookup failed; omitted from stamp",
+          );
+        }
         const result = await pluginToolDispatcher.executeTool(
           input.tool,
           requestedParameters,
-          input.runContext,
+          {
+            ...input.runContext,
+            budgetSpentFraction: b2Fraction,
+          },
         );
         const resultValidation = validateToolContent({
           value: result,

@@ -86,6 +86,7 @@ import type {
   DetectExternalObjectsParams,
   ResolveExternalObjectParams,
   RefreshExternalObjectsParams,
+  ResolveRunModelParams,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
@@ -1624,6 +1625,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         return handleResolveExternalObject(params as ResolveExternalObjectParams);
       case "refreshExternalObjects":
         return handleRefreshExternalObjects(params as RefreshExternalObjectsParams);
+      case "resolveRunModel":
+        return handleResolveRunModel(params as ResolveRunModelParams);
 
       case "environmentValidateConfig":
         return handleEnvironmentValidateConfig(params as PluginEnvironmentValidateConfigParams);
@@ -1738,6 +1741,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onDetectExternalObjects) supportedMethods.push("detectExternalObjects");
     if (plugin.definition.onResolveExternalObject) supportedMethods.push("resolveExternalObject");
     if (plugin.definition.onRefreshExternalObjects) supportedMethods.push("refreshExternalObjects");
+    if (plugin.definition.onResolveRunModel) supportedMethods.push("resolveRunModel");
     if (plugin.definition.onEnvironmentValidateConfig) supportedMethods.push("environmentValidateConfig");
     if (plugin.definition.onEnvironmentProbe) supportedMethods.push("environmentProbe");
     if (plugin.definition.onEnvironmentAcquireLease) supportedMethods.push("environmentAcquireLease");
@@ -1934,6 +1938,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  function finiteNumberOrUndefined(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  }
+
   function actorTypeOrSystem(value: unknown): PluginPerformActionActorContext["type"] {
     return value === "user" || value === "agent" || value === "system" ? value : "system";
   }
@@ -1948,6 +1956,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       agentId: stringOrNull(rawActor?.agentId),
       runId: stringOrNull(rawActor?.runId),
       companyId: stringOrNull(rawActor?.companyId),
+      budgetSpentFraction: finiteNumberOrUndefined(rawActor?.budgetSpentFraction),
     });
     return Object.freeze({
       actor,
@@ -1990,6 +1999,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       throw methodNotImplemented("resolveExternalObject");
     }
     return plugin.definition.onResolveExternalObject(params);
+  }
+
+  async function handleResolveRunModel(params: ResolveRunModelParams) {
+    if (!plugin.definition.onResolveRunModel) {
+      throw methodNotImplemented("resolveRunModel");
+    }
+    return plugin.definition.onResolveRunModel(params);
   }
 
   async function handleRefreshExternalObjects(params: RefreshExternalObjectsParams) {

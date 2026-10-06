@@ -52,6 +52,7 @@ import {
   setIssueTitleSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
+  restoreCompletedReviewSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
@@ -3953,6 +3954,28 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/completed-review/restore",
+  tags: ["issues"],
+  summary: "Restore an evidenced completed typed review",
+  description:
+    "Accepts persisted completion and promoted-wake locators only, never client state or replacement approvals. Rechecks issue writes, current review policy and original-target assignment in the locked transaction. Agents require the current assignee's persisted active exact-issue run; skill-test and task-bridge keys cannot use this repair. Missing legacy receipts, conflicting runs, holds, changed policy or delivery, newer work, intentional resumes and ambiguous evidence refuse restoration. Same-evidence unchanged replay is idempotent.",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(restoreCompletedReviewSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
     422: r.unprocessable,
   },
 });
@@ -8654,6 +8677,7 @@ registry.registerPath({
           runId: z.string(),
           companyId: z.string(),
           projectId: z.string(),
+          budgetSpentFraction: z.number().optional(),
         }),
       }),
     ),

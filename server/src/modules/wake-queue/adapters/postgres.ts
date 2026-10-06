@@ -13,6 +13,7 @@ import {
   chatActions,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -42,6 +43,7 @@ import {
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
+import { commentsCoveredByCompletedReview } from "../domain/completed-review.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
@@ -416,6 +418,26 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     async isCompletedOnboardingHandoffWake(input) {
       return isCompletedOnboardingHandoffWake(tx, input);
+    },
+    async isCommentWakeCoveredByCompletedReview({ companyId, issueId, commentIds }) {
+      const ids = [...new Set(commentIds)];
+      if (ids.length === 0) return false;
+      const issue = await tx.select({ status: issues.status, completedAt: issues.completedAt, executionState: issues.executionState })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).then((rows) => rows[0]);
+      const state = parseIssueExecutionState(issue?.executionState);
+      if (!issue || issue.status !== "done" || state?.status !== "completed" || !state.lastDecisionId) return false;
+      const decision = await tx.select({ id: issueExecutionDecisions.id, outcome: issueExecutionDecisions.outcome,
+        createdAt: issueExecutionDecisions.createdAt })
+        .from(issueExecutionDecisions).where(and(
+          eq(issueExecutionDecisions.companyId, companyId), eq(issueExecutionDecisions.issueId, issueId),
+          eq(issueExecutionDecisions.id, state.lastDecisionId),
+        )).then((rows) => rows[0] ?? null);
+      const comments = await tx.select({ id: issueComments.id, createdAt: issueComments.createdAt })
+        .from(issueComments).where(and(
+          eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+          inArray(issueComments.id, ids), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
+        ));
+      return commentsCoveredByCompletedReview({ ...issue, state, decision, commentIds: ids, comments });
     },
 
     async reopenIssue({ companyId, issueId }) {

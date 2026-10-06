@@ -799,4 +799,42 @@ second-line\" status=401`,
       apiKey: REDACTED_EVENT_VALUE,
     });
   });
+
+  it("stays linear on long non-secret alphanumeric runs (bounded field-name affixes)", () => {
+    // Port-guard for the live v2026.916 operator overlay: the unbounded
+    // [A-Za-z0-9_-]* affixes in SECRET_FIELD_NAME_PATTERN backtrack
+    // quadratically on thinking-signature-like runs. Synthetic input only.
+    // The "." passes maybeContainsSecretText, so the JSON text regexes run;
+    // without it redactSensitiveText returns early and nothing is measured.
+    // Unbounded affixes take seconds here; the bound keeps it in tens of ms.
+    const adversarial = `sig.${"a".repeat(50000)}`;
+    const nearMiss = `sig.${"ab12-_".repeat(2000)}`; // 12k key-alphabet chars, no secret word
+    const started = Date.now();
+    const untouched = redactSensitiveText(adversarial);
+    const nearMissOut = redactSensitiveText(nearMiss);
+    const elapsedMs = Date.now() - started;
+    // No secret material: output is unchanged and fast (linear scan, not seconds).
+    expect(untouched).toBe(adversarial);
+    expect(nearMissOut).toBe(nearMiss);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it("still redacts real secret keys after the affix bound", () => {
+    // Real field names are short; the {0,64} bound must not weaken masking,
+    // including keyword cores with long (but bounded) affixes.
+    expect(sanitizeRecord({ apiKey: "s3cr3t" }).apiKey).toBe(REDACTED_EVENT_VALUE);
+    expect(sanitizeRecord({ "my-api-key-123": "s3cr3t" })["my-api-key-123"]).toBe(
+      REDACTED_EVENT_VALUE,
+    );
+    expect(
+      sanitizeRecord({ [`${"a".repeat(64)}token${"b".repeat(64)}`]: "s3cr3t" })[
+        `${"a".repeat(64)}token${"b".repeat(64)}`
+      ],
+    ).toBe(REDACTED_EVENT_VALUE);
+    const withSecret = redactSensitiveText(
+      `config {"apiKey":"json-secret-value"} trailing ${"x".repeat(5000)}`,
+    );
+    expect(withSecret).not.toContain("json-secret-value");
+    expect(withSecret).toContain(REDACTED_EVENT_VALUE);
+  });
 });

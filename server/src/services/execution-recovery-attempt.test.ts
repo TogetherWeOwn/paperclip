@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { accountingForScheduledRetry, executionFailureRetryCount, executionRetryAttemptCount } from "./execution-recovery-attempt.js";
 
 describe("failure attempts across resource waits", () => {
   it("preserves prior failures through subscription waits without trusting unrelated context", () => {
@@ -27,7 +27,7 @@ describe("failure attempts across resource waits", () => {
 });
 
 describe("persisted independent accounting", () => {
-  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
+  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "model_decision_pending"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
     expect(executionFailureRetryCount({ scheduledRetryReason, scheduledRetryAttempt: 20,
       contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 1 } },
     })).toBe(2);
@@ -41,5 +41,19 @@ describe("persisted independent accounting", () => {
     ]) expect(executionFailureRetryCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2,
       contextSnapshot: { executionRetryAccounting },
     })).toBe(2);
+  });
+});
+
+describe("model decision waits", () => {
+  const ledger = { executionRetryAccounting: { version: 1, failureRetries: 1, maxTurnContinuations: 0 } };
+  it("count their own attempts and never spend the failure budget", () => {
+    const parked = { scheduledRetryReason: "model_decision_pending", scheduledRetryAttempt: 7, contextSnapshot: ledger };
+    expect(executionRetryAttemptCount(parked, "model_decision_pending")).toBe(7);
+    expect(executionFailureRetryCount(parked)).toBe(1);
+    expect(accountingForScheduledRetry(parked, "model_decision_pending", 8).failureRetries).toBe(1);
+  });
+  it("start from zero after a different retry lane", () => {
+    expect(executionRetryAttemptCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 3,
+      contextSnapshot: ledger }, "model_decision_pending")).toBe(0);
   });
 });
