@@ -2,7 +2,6 @@ import type {
   RunPresentationDecision,
   RunPresentationSource,
 } from "@paperclipai/shared";
-import { THROTTLED_ISSUE_REWAKE_REASONS } from "./issue-rewake-throttle.js";
 
 export const HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS = 500;
 export const HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS = 4_096;
@@ -121,13 +120,18 @@ const NARRATION_OPENERS =
 export const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
 
-// Wakes that carry no new event for the issue. The throttle set covers
-// assignment, continuation, recovery and liveness re-wakes; monitor and timer
-// wakes are the same shape (a due check, not a new event), so they join the
-// set here. A null/undefined reason is a reason-less on-demand invoke, also
-// event-free.
+// Wakes that carry no new event for the issue. Monitor and timer wakes are
+// due checks, not new events; continuation, assignment-recovery and liveness
+// re-wakes re-assert state rather than deliver anything new. Fresh
+// `issue_assigned` is deliberately excluded: an assignment is a new event for
+// the agent, and the missing-comment policy requires assigned runs to leave a
+// comment (suppressing them starves disposition repair of its trigger and
+// breaks the no-comment retry contract). A null/undefined reason is a
+// reason-less on-demand invoke, also event-free.
 export const NO_PROGRESS_NO_EVENT_WAKE_REASONS: ReadonlySet<string> = new Set([
-  ...THROTTLED_ISSUE_REWAKE_REASONS,
+  "issue_continuation_needed",
+  "issue_assignment_recovery",
+  "issue_graph_liveness_backstop",
   "issue_monitor_due",
   "issue_monitor_recovery",
   "issue_monitor_recovery_issue",

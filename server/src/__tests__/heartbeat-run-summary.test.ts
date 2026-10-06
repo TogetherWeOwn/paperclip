@@ -903,7 +903,6 @@ describe("resolveHeartbeatRunResponse no-progress no-event wakes", () => {
     for (const wakeReason of [
       "issue_monitor_due",
       "issue_continuation_needed",
-      "issue_assigned",
       "issue_assignment_recovery",
       "issue_graph_liveness_backstop",
       "heartbeat_timer",
@@ -935,6 +934,22 @@ describe("resolveHeartbeatRunResponse no-progress no-event wakes", () => {
       }),
     ).toMatchObject({
       text: "Changed status this run",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("still publishes on a fresh assignment wake without run progress", () => {
+    // An assignment is a new event for the agent, and the missing-comment
+    // policy requires assigned runs to leave a comment. Suppressing them
+    // would starve disposition repair of its trigger.
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "First run notes" },
+        wakeReason: "issue_assigned",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "First run notes",
       decision: { commentAction: "create" },
     });
   });
