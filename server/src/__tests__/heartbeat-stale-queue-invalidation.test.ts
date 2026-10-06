@@ -31,7 +31,10 @@ import {
 } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
-import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+import {
+  queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInWakePayload,
+} from "../services/issue-queued-comment-queue.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -958,7 +961,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
       await heartbeat.resumeQueuedRuns();
       // First pass: the gate admitted the run, the claim re-read the resolved
-      // interaction and left the run queued. Second pass: the gate cancels it.
+      // interaction under a row lock and cancelled it deterministically.
       await heartbeat.resumeQueuedRuns();
       expect(await waitForCondition(async () => {
         const run = await db
@@ -1028,6 +1031,59 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(countExecuteCallsForRun(runId)).toBe(0);
     });
 
+    it("requeues adopted comments for the assignee when the queued-comment claim cancels a stale addressee wake", async () => {
+      const { runId, wakeupRequestId, issueId, assigneeAgentId, interactionId } =
+        await seedAddressedInteractionFixture({ withQueuedComments: true });
+      let resolvedAtClaim = false;
+      beforeClaimCheck = async ({ runId: guardedRunId, stage }) => {
+        if (stage !== "claim" || guardedRunId !== runId || resolvedAtClaim) return;
+        resolvedAtClaim = true;
+        await db
+          .update(issueThreadInteractions)
+          .set({ status: "accepted", resolvedAt: new Date(), updatedAt: new Date() })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      };
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "cancelled";
+      }, 10_000)).toBe(true);
+
+      const [run, wakeup, deferred] = await Promise.all([
+        db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null),
+        db.select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId))
+          .then((rows) => rows[0] ?? null),
+        db.select({
+          agentId: agentWakeupRequests.agentId,
+          payload: agentWakeupRequests.payload,
+        })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.status, "deferred_issue_execution")),
+      ]);
+      expect(resolvedAtClaim).toBe(true);
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(wakeup).toMatchObject({ status: "skipped" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+      // The adopted user comment must survive the cancel on the current
+      // owner's deferred queue instead of being dropped with the stale run.
+      expect(issueId).toBeTruthy();
+      expect(deferred).toHaveLength(1);
+      expect(deferred[0]?.agentId).toBe(assigneeAgentId);
+      expect(
+        queuedCommentIdsFromWakePayload(deferred[0]?.payload ?? {}),
+      ).toHaveLength(1);
+    });
+
     it.each([
       { label: "an interaction that no longer exists", missing: true, interactionStatus: "pending" },
       { label: "an already-resolved interaction", missing: false, interactionStatus: "accepted" },
@@ -1078,8 +1134,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
       await heartbeat.resumeQueuedRuns();
       // First pass: the gate admitted the run, the queued-comment claim
-      // re-read the resolved interaction under a row lock and left the run
-      // queued. Second pass: the gate cancels it.
+      // re-read the resolved interaction under a row lock and cancelled it
+      // deterministically.
       await heartbeat.resumeQueuedRuns();
       expect(await waitForCondition(async () => {
         const run = await db
