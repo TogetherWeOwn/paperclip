@@ -55,6 +55,8 @@ import {
 } from "../services/plugin-loader.js";
 import { logActivity } from "../services/activity-log.js";
 import { runBudgetSpentFraction } from "../services/budgets.js";
+import { toBoundedBudgetFractionReceipt } from "../services/budget-receipt.js";
+import { logger } from "../middleware/logger.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import type { PluginJobScheduler } from "../services/plugin-job-scheduler.js";
@@ -769,17 +771,45 @@ export function pluginRoutes(
 
   async function performActionActorContext(req: Request, companyId: string | undefined): Promise<PluginPerformActionActorContext> {
     const scopedCompanyId = companyId ?? null;
-    // TOG-7967 H8: host-computed stamp. The action path carries no project;
+    // Host-computed stamp. The action path carries no project;
     // agent→company fallback still resolves a company/agent envelope.
-    // Undefined ≡ absent downstream (H3 shim drops non-finite regardless).
-    const bsf = (req.actor.agentId && req.actor.runId && scopedCompanyId)
-      ? await runBudgetSpentFraction(db, {
+    // Undefined ≡ absent downstream (shim drops non-finite regardless).
+    // Receipt: bounded numeric injection or observable degradation with
+    // safe run ID only; no prompts, args, or actor-context passthrough.
+    let bsf: number | undefined;
+    if (req.actor.agentId && req.actor.runId && scopedCompanyId) {
+      try {
+        const raw = await runBudgetSpentFraction(db, {
           companyId: scopedCompanyId,
           agentId: req.actor.agentId,
           projectId: null,
           runId: req.actor.runId,
-        }).catch(() => undefined)
-      : undefined;
+        });
+        const receipt = toBoundedBudgetFractionReceipt(raw);
+        bsf = receipt.injected ? receipt.budgetSpentFraction : undefined;
+        if (receipt.injected) {
+          logger.info(
+            {
+              runId: req.actor.runId,
+              budgetSpentFraction: receipt.budgetSpentFraction,
+              injected: true,
+            },
+            "budget fraction injected",
+          );
+        } else {
+          logger.info(
+            { runId: req.actor.runId, injected: false, reason: "no-policy" },
+            "budget fraction absent; omitted from stamp",
+          );
+        }
+      } catch (err) {
+        bsf = undefined;
+        logger.warn(
+          { err, runId: req.actor.runId, injected: false },
+          "budget fraction lookup failed; omitted from stamp",
+        );
+      }
+    }
     const stamp = bsf === undefined ? {} : { budgetSpentFraction: bsf };
     if (req.actor.type === "agent") {
       return {
@@ -1103,20 +1133,49 @@ export function pluginRoutes(
     }
 
     try {
-      // TOG-7967 H6 (B3): direct-dispatch branch bypasses the tool-gateway
-      // overwrite. runContext is caller JSON — spread-overwrite with the
-      // host-computed value; undefined ≡ absent downstream.
+      // Direct-dispatch branch bypasses the tool-gateway overwrite.
+      // runContext is caller JSON — spread-overwrite with the host-computed
+      // value; undefined ≡ absent downstream. Receipt uses safe run/tool IDs
+      // only; no prompts, args, or headers.
+      let b3Fraction: number | undefined;
+      try {
+        const b3Raw = await runBudgetSpentFraction(db, {
+          companyId: runContext.companyId,
+          agentId: runContext.agentId,
+          projectId: runContext.projectId ?? null,
+          runId: runContext.runId,
+        });
+        const b3Receipt = toBoundedBudgetFractionReceipt(b3Raw);
+        b3Fraction = b3Receipt.injected ? b3Receipt.budgetSpentFraction : undefined;
+        if (b3Receipt.injected) {
+          logger.info(
+            {
+              runId: runContext.runId,
+              tool,
+              budgetSpentFraction: b3Receipt.budgetSpentFraction,
+              injected: true,
+            },
+            "budget fraction injected",
+          );
+        } else {
+          logger.info(
+            { runId: runContext.runId, tool, injected: false, reason: "no-policy" },
+            "budget fraction absent; omitted from stamp",
+          );
+        }
+      } catch (b3Err) {
+        b3Fraction = undefined;
+        logger.warn(
+          { err: b3Err, runId: runContext.runId, tool, injected: false },
+          "budget fraction lookup failed; omitted from stamp",
+        );
+      }
       const result = await toolDeps.toolDispatcher.executeTool(
         tool,
         parameters ?? {},
         {
           ...runContext,
-          budgetSpentFraction: await runBudgetSpentFraction(db, {
-            companyId: runContext.companyId,
-            agentId: runContext.agentId,
-            projectId: runContext.projectId ?? null,
-            runId: runContext.runId,
-          }).catch(() => undefined),
+          budgetSpentFraction: b3Fraction,
         },
       );
       res.json(result);
