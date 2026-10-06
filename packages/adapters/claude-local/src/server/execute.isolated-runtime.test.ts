@@ -71,12 +71,16 @@ type SpawnOpts = {
   inheritServerEnv?: boolean;
 };
 
-function spawnOpts(): SpawnOpts {
+function spawnCall(): [string, unknown, string, string[], SpawnOpts] {
   const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
     | [string, unknown, string, string[], SpawnOpts]
     | undefined;
   if (!call) throw new Error("expected runAdapterExecutionTargetProcess to have been called");
-  return call[4];
+  return call;
+}
+
+function spawnOpts(): SpawnOpts {
+  return spawnCall()[4];
 }
 
 function buildContext(input: { isolate?: boolean; engine?: string; executionTarget?: unknown }) {
@@ -157,6 +161,47 @@ describe("claude execute — isolateRuntime", () => {
     expect(Object.keys(meta.env)).toEqual(
       expect.arrayContaining(["ANTHROPIC_API_KEY", "PAPERCLIP_RUN_ID", "PAPERCLIP_RESOLVED_COMMAND"]),
     );
+  });
+
+  it("decides model and billing from the narrowed env, not server-held keys", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-server-only");
+    vi.stubEnv("ANTHROPIC_MODEL", "server-model");
+    const onMeta = vi.fn(async (_meta: unknown) => {});
+    const ctx = {
+      runId: "run-iso",
+      agent: {
+        id: "agent-iso",
+        companyId: "company-1",
+        name: "Review Bot",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "claude",
+        engine: "cli",
+        isolateRuntime: true,
+        env: {},
+      },
+      context: {
+        taskId: "task-1",
+        wakeReason: "issue_assigned",
+      },
+      authToken: "run-jwt",
+      onMeta,
+      onLog: vi.fn(async () => {}),
+    };
+
+    const result = await execute(ctx as never);
+
+    // The server-held key must not bill `api` for a child that never gets it.
+    expect(result.billingType).toBe("subscription");
+    // The server-held model must not reach `--model`; the default does.
+    const args = spawnCall()[3];
+    const modelFlag = args.indexOf("--model");
+    expect(modelFlag).toBeGreaterThanOrEqual(0);
+    expect(args[modelFlag + 1]).not.toBe("server-model");
+    expect(JSON.stringify(args)).not.toContain("server-model");
   });
 
   it("refuses the ACP engine, which would not apply it", async () => {

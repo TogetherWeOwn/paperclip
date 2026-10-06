@@ -74,7 +74,7 @@ Core fields:
 - filesystemExtraPaths (array, optional): additional absolute host paths exposed inside the workspace sandbox. String entries are read-only; object entries use { path: "/absolute/path", access: "ro" | "rw" }.
 - filesystemSandboxCommand (string, optional): Bubblewrap executable name or absolute path; defaults to "bwrap". Linux only.
 - networkScope (string, optional): "deny" blocks all network egress; "allowlist" permits only networkAllowlist targets through Paperclip's HTTP(S) proxy. Off by default.
-- isolateRuntime (boolean, optional): for an agent that reads untrusted input. The Claude child starts from an empty environment and receives only the agent's model/auth bindings, PATH/HOME/temp/locale basics, the run's Paperclip identity keys and the harness-minted run token; it inherits nothing from the server and nothing is written to disk. Off by default. Requires engine="cli" and a local execution target; ACP and remote targets are refused.
+- isolateRuntime (boolean, optional): for an agent that reads untrusted input. The Claude child starts from an empty environment and receives only the agent's model/auth bindings, PATH/HOME/temp/locale basics, the run's Paperclip identity keys and the harness-minted run token; it inherits nothing from the server. The run token stays in process env only; the pre-existing per-run MCP config file behavior is unchanged. Off by default. Requires engine="cli" and a local execution target; ACP and remote targets are refused.
 - networkAllowlist (string[], optional): exact hostnames, hostname:port entries, or origin URLs. Include the configured Claude provider origin, such as "api.anthropic.com", Bedrock/Vertex endpoints, or a custom gateway.
 
 ACP fields (only when engine="acp"):

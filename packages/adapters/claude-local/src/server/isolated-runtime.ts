@@ -6,7 +6,8 @@ import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
  * receives only {@link isolatedRuntimeEnv}: the agent's explicit model/auth
  * bindings, PATH/HOME/temp/locale basics, the run's Paperclip identity keys,
  * and the harness-minted run token exactly as today. It inherits nothing from
- * the server process. Nothing is persisted to disk.
+ * the server process. The run token itself is never written to disk by this
+ * change; the pre-existing per-run MCP config file behavior is unchanged.
  *
  * Off by default, so no other agent changes behavior. Older builds ignore the
  * unknown flag and run as before; this build refuses the ACP engine and
@@ -43,9 +44,15 @@ const FROM_ADAPTER_ENV = [
   "AWS_DEFAULT_REGION",
   // Vertex inference. Taken only from explicit agent bindings, never probed.
   "CLAUDE_CODE_USE_VERTEX",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "CLOUD_ML_REGION",
   "GOOGLE_CLOUD_PROJECT",
   "GOOGLE_CLOUD_REGION",
   "GOOGLE_APPLICATION_CREDENTIALS",
+  // Model pins the CLI reads per class.
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 ] as const;
 
 // Taken from the adapter env when present, else from the server process (a
