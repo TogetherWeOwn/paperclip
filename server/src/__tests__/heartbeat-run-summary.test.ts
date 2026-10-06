@@ -903,7 +903,6 @@ describe("resolveHeartbeatRunResponse no-progress no-event wakes", () => {
     for (const wakeReason of [
       "issue_monitor_due",
       "issue_continuation_needed",
-      "issue_assignment_recovery",
       "issue_graph_liveness_backstop",
       "heartbeat_timer",
       null,
@@ -950,6 +949,22 @@ describe("resolveHeartbeatRunResponse no-progress no-event wakes", () => {
       }),
     ).toMatchObject({
       text: "First run notes",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("still publishes on an assignment-recovery wake without run progress", () => {
+    // A recovery re-wake is the agent's chance to report back after an
+    // assignment loss. Suppressing its prose-only answer would stall the
+    // issue silently in `todo` with nothing visible on the thread.
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Recovery notes" },
+        wakeReason: "issue_assignment_recovery",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "Recovery notes",
       decision: { commentAction: "create" },
     });
   });

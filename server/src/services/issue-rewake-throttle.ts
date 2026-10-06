@@ -67,6 +67,7 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
   "issue.assigned",
   "issue.released",
   "issue.blockers_updated",
+  "issue.document_created",
   "issue.document_upserted",
   "issue.document_updated",
   "issue.document_deleted",

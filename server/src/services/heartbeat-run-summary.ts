@@ -121,16 +121,15 @@ export const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
 
 // Wakes that carry no new event for the issue. Monitor and timer wakes are
-// due checks, not new events; continuation, assignment-recovery and liveness
-// re-wakes re-assert state rather than deliver anything new. Fresh
-// `issue_assigned` is deliberately excluded: an assignment is a new event for
-// the agent, and the missing-comment policy requires assigned runs to leave a
-// comment (suppressing them starves disposition repair of its trigger and
-// breaks the no-comment retry contract). A null/undefined reason is a
+// due checks, not new events; continuation and liveness re-wakes re-assert
+// state rather than deliver anything new. Fresh `issue_assigned` and
+// `issue_assignment_recovery` are deliberately excluded: both are new events
+// for the agent, and the missing-comment policy requires such runs to leave
+// a comment — a prose-only recovery answer suppressed here would stall the
+// issue silently in `todo` with nothing visible. A null/undefined reason is a
 // reason-less on-demand invoke, also event-free.
 export const NO_PROGRESS_NO_EVENT_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_continuation_needed",
-  "issue_assignment_recovery",
   "issue_graph_liveness_backstop",
   "issue_monitor_due",
   "issue_monitor_recovery",
