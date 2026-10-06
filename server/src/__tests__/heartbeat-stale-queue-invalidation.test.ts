@@ -807,6 +807,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       interactionStatus?: string;
       wakeInteractionId?: string;
       withQueuedComments?: boolean;
+      asReviewParticipant?: boolean;
     } = {}) {
       const { companyId, agentId: assigneeAgentId } = await seedCompanyAndAgent();
       const addresseeAgentId = randomUUID();
@@ -826,9 +827,25 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         id: issueId,
         companyId,
         title: "Addressed confirmation on another agent's issue",
-        status: "in_progress",
+        status: input.asReviewParticipant ? "in_review" : "in_progress",
         priority: "medium",
         assigneeAgentId,
+        ...(input.asReviewParticipant
+          ? {
+              executionState: {
+                status: "pending",
+                currentStageId: randomUUID(),
+                currentStageIndex: 0,
+                currentStageType: "review",
+                currentParticipant: { type: "agent", agentId: addresseeAgentId, userId: null },
+                returnAssignee: { type: "agent", agentId: assigneeAgentId, userId: null },
+                reviewRequest: null,
+                completedStageIds: [],
+                lastDecisionId: null,
+                lastDecisionOutcome: null,
+              },
+            }
+          : {}),
       });
       const interactionId = randomUUID();
       const interactionStatus = input.interactionStatus ?? "pending";
@@ -942,6 +959,49 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       await heartbeat.resumeQueuedRuns();
       // First pass: the gate admitted the run, the claim re-read the resolved
       // interaction and left the run queued. Second pass: the gate cancels it.
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "cancelled";
+      }, 10_000)).toBe(true);
+
+      const [run, wakeup] = await Promise.all([
+        db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null),
+        db.select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId))
+          .then((rows) => rows[0] ?? null),
+      ]);
+      expect(resolvedAtClaim).toBe(true);
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(wakeup).toMatchObject({ status: "skipped" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    it("cancels in a single pass when the addressee is also the current review participant and the interaction resolves before the claim", async () => {
+      const { runId, wakeupRequestId, interactionId } = await seedAddressedInteractionFixture({
+        asReviewParticipant: true,
+      });
+      let resolvedAtClaim = false;
+      beforeClaimCheck = async ({ runId: guardedRunId, stage }) => {
+        if (stage !== "claim" || guardedRunId !== runId || resolvedAtClaim) return;
+        resolvedAtClaim = true;
+        await db
+          .update(issueThreadInteractions)
+          .set({ status: "accepted", resolvedAt: new Date(), updatedAt: new Date() })
+          .where(eq(issueThreadInteractions.id, interactionId));
+      };
+
+      // A single scheduler pass must cancel: the review-participant bypass keeps
+      // the ordinary staleness gate passing after the interaction resolves, so
+      // leaving the run queued would strand it until an unrelated coalescing wake.
       await heartbeat.resumeQueuedRuns();
       expect(await waitForCondition(async () => {
         const run = await db

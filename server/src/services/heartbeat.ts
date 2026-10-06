@@ -17691,8 +17691,11 @@ export function heartbeatService(
               // read and the run-status writes below. Lock order stays
               // issues-before-interaction, matching the resolution path, so
               // this adds serialization without a lock-order inversion. A
-              // wake that no longer verifies stays queued; the next claim
-              // attempt cancels it through the ordinary staleness gate.
+              // wake that no longer verifies is cancelled here: other
+              // ownership bypasses (review participant, workspace/AI-connection
+              // busy retry) can keep the ordinary staleness gate passing after
+              // the interaction resolves, which would otherwise strand the run
+              // queued forever.
               if (
                 issueId &&
                 readNonEmptyString(context.wakeReason) === "interaction_pending" &&
@@ -17709,11 +17712,62 @@ export function heartbeatService(
                   },
                 );
                 if (!stillAddressed) {
+                  const reason =
+                    "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead";
                   logger.info(
                     { runId: run.id, issueId, agentId: run.agentId },
-                    "claimQueuedRun: addressee interaction is no longer actionable; leaving run queued for the staleness gate",
+                    "claimQueuedRun: addressee interaction is no longer actionable; cancelling stale queued run",
                   );
-                  return { kind: "stale" as const, run: null };
+                  const [cancelled] = await tx
+                    .update(heartbeatRuns)
+                    .set({
+                      status: "cancelled",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      errorCode: "issue_assignee_changed",
+                      resultJson: {
+                        ...parseObject(lockedRun.resultJson),
+                        stopReason: "issue_assignee_changed",
+                        effectiveTimeoutSec: 0,
+                        timeoutConfigured: false,
+                        timeoutSource: "stale_queued_run_gate",
+                        timeoutFired: false,
+                      },
+                      updatedAt: claimedAt,
+                    })
+                    .where(
+                      and(
+                        eq(heartbeatRuns.id, lockedRun.id),
+                        eq(heartbeatRuns.status, "queued"),
+                      ),
+                    )
+                    .returning();
+                  if (!cancelled) return { kind: "stale" as const, run: null };
+                  await tx
+                    .update(agentWakeupRequests)
+                    .set({
+                      status: "skipped",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      updatedAt: claimedAt,
+                    })
+                    .where(eq(agentWakeupRequests.id, wake.id));
+                  await tx
+                    .update(issues)
+                    .set({
+                      executionRunId: null,
+                      executionAgentNameKey: null,
+                      executionLockedAt: null,
+                      updatedAt: claimedAt,
+                    })
+                    .where(
+                      and(
+                        eq(issues.id, issueId),
+                        eq(issues.companyId, run.companyId),
+                        eq(issues.executionRunId, run.id),
+                      ),
+                    );
+                  return { kind: "cancelled" as const, run: cancelled };
                 }
                 logger.info(
                   { runId: run.id, issueId, agentId: run.agentId },
@@ -17982,6 +18036,7 @@ export function heartbeatService(
       void emitAgentTaskRun(db, queuedCommentClaim.run);
       return null;
     }
+    let addresseeStaleCancellation: typeof heartbeatRuns.$inferSelect | null = null;
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
@@ -18010,8 +18065,10 @@ export function heartbeatService(
             // race on paperclipai/paperclip#13211). Lock order
             // stays issues-before-interaction, matching the resolution path, so
             // this adds serialization without a lock-order inversion. A wake
-            // that no longer verifies stays queued; the next claim attempt
-            // cancels it through the ordinary staleness gate.
+            // that no longer verifies is cancelled here: other ownership
+            // bypasses (review participant, workspace/AI-connection busy retry)
+            // can keep the ordinary staleness gate passing after the interaction
+            // resolves, which would otherwise strand the run queued forever.
             if (
               issueId &&
               readNonEmptyString(context.wakeReason) === "interaction_pending" &&
@@ -18028,10 +18085,69 @@ export function heartbeatService(
                 },
               );
               if (!stillAddressed) {
+                const reason =
+                  "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead";
                 logger.info(
                   { runId: run.id, issueId, agentId: run.agentId },
-                  "claimQueuedRun: addressee interaction is no longer actionable; leaving run queued for the staleness gate",
+                  "claimQueuedRun: addressee interaction is no longer actionable; cancelling stale queued run",
                 );
+                const [cancelled] = await claimTx
+                  .update(heartbeatRuns)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: claimedAt,
+                    error: reason,
+                    errorCode: "issue_assignee_changed",
+                    resultJson: {
+                      ...parseObject(run.resultJson),
+                      stopReason: "issue_assignee_changed",
+                      effectiveTimeoutSec: 0,
+                      timeoutConfigured: false,
+                      timeoutSource: "stale_queued_run_gate",
+                      timeoutFired: false,
+                    },
+                    updatedAt: claimedAt,
+                  })
+                  .where(
+                    and(
+                      eq(heartbeatRuns.id, run.id),
+                      eq(heartbeatRuns.status, "queued"),
+                    ),
+                  )
+                  .returning();
+                if (!cancelled) return null;
+                if (run.wakeupRequestId) {
+                  await claimTx
+                    .update(agentWakeupRequests)
+                    .set({
+                      status: "skipped",
+                      finishedAt: claimedAt,
+                      error: reason,
+                      updatedAt: claimedAt,
+                    })
+                    .where(
+                      and(
+                        eq(agentWakeupRequests.id, run.wakeupRequestId),
+                        eq(agentWakeupRequests.companyId, run.companyId),
+                      ),
+                    );
+                }
+                await claimTx
+                  .update(issues)
+                  .set({
+                    executionRunId: null,
+                    executionAgentNameKey: null,
+                    executionLockedAt: null,
+                    updatedAt: claimedAt,
+                  })
+                  .where(
+                    and(
+                      eq(issues.id, issueId),
+                      eq(issues.companyId, run.companyId),
+                      eq(issues.executionRunId, run.id),
+                    ),
+                  );
+                addresseeStaleCancellation = cancelled;
                 return null;
               }
               logger.info(
@@ -18046,6 +18162,38 @@ export function heartbeatService(
             return claimedRun;
           });
         });
+    if (addresseeStaleCancellation) {
+      await appendRunEvent(addresseeStaleCancellation, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          addresseeStaleCancellation.error ??
+          "Cancelled because issue assignee changed before the queued run could start",
+      });
+      publishLiveEvent({
+        companyId: addresseeStaleCancellation.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: addresseeStaleCancellation.id,
+          agentId: addresseeStaleCancellation.agentId,
+          status: addresseeStaleCancellation.status,
+          invocationSource: addresseeStaleCancellation.invocationSource,
+          triggerDetail: addresseeStaleCancellation.triggerDetail,
+          error: addresseeStaleCancellation.error ?? null,
+          errorCode: addresseeStaleCancellation.errorCode ?? null,
+          startedAt: addresseeStaleCancellation.startedAt
+            ? new Date(addresseeStaleCancellation.startedAt).toISOString()
+            : null,
+          finishedAt: addresseeStaleCancellation.finishedAt
+            ? new Date(addresseeStaleCancellation.finishedAt).toISOString()
+            : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(addresseeStaleCancellation);
+      void emitAgentTaskRun(db, addresseeStaleCancellation);
+      return null;
+    }
     if (!claimed) return null;
 
     publishLiveEvent({
