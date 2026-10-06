@@ -10261,7 +10261,8 @@ export function createToolGatewayService(
               runId: session.runId!,
             });
             const h5Receipt = toBoundedBudgetFractionReceipt(h5Raw);
-            h5Fraction = h5Receipt.injected ? h5Receipt.budgetSpentFraction : undefined;
+            // Stamp raw: rounding is log-only; the router gates on this value.
+            h5Fraction = h5Receipt.injected ? h5Raw : undefined;
             if (h5Receipt.injected) {
               logger.info(
                 {
@@ -10707,7 +10708,8 @@ export function createToolGatewayService(
             runId: input.runContext.runId,
           });
           const b2Receipt = toBoundedBudgetFractionReceipt(b2Raw);
-          b2Fraction = b2Receipt.injected ? b2Receipt.budgetSpentFraction : undefined;
+          // Stamp raw: rounding is log-only; the router gates on this value.
+          b2Fraction = b2Receipt.injected ? b2Raw : undefined;
           if (b2Receipt.injected) {
             logger.info(
               {

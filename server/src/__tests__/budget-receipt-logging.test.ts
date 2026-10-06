@@ -173,13 +173,46 @@ describe("budget fraction receipts (success/fallback without behavior change)", 
     });
 
     expect(res.status).toBe(200);
-    // Behavior preserved: forged 0.99 is overwritten with the bounded host value.
-    expect(executeTool.mock.calls[0][2]).toMatchObject({ budgetSpentFraction: 0.1235 });
+    // Behavior preserved: forged 0.99 is overwritten with the raw host value;
+    // rounding is log-only, the stamp stays unrounded for router gating.
+    expect(executeTool.mock.calls[0][2]).toMatchObject({ budgetSpentFraction: 0.123456 });
     expect(executeTool.mock.calls[0][2].budgetSpentFraction).not.toBe(0.99);
 
     const infos = loggedPayloads(mockLogger.info);
     const receipt = infos.find((p) => p.runId === runA && p.injected === true);
     expect(receipt).toMatchObject({ runId: runA, injected: true, budgetSpentFraction: 0.1235 });
+    assertSafeReceipt(receipt!);
+  });
+
+  it("stamps the raw value at a router gate boundary (rounding stays log-only)", async () => {
+    mockRunBudgetSpentFraction.mockResolvedValue(0.94996);
+    const executeTool = vi.fn(async () => ({ ok: true }));
+    const app = await createApp(agentActor(), {
+      db: validationDb(),
+      toolDeps: {
+        toolDispatcher: { getTool: () => ({}), executeTool },
+      },
+    });
+
+    const res = await request(app).post("/api/plugins/tools/execute").send({
+      tool: "acme.test:probe",
+      parameters: {},
+      runContext: {
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+        projectId: projectA,
+      },
+    });
+
+    expect(res.status).toBe(200);
+    // 0.94996 rounds to 0.95 in the log but stamps raw, so the router's
+    // >=0.95 halt gate does not flip on a rounded value.
+    expect(executeTool.mock.calls[0][2]).toMatchObject({ budgetSpentFraction: 0.94996 });
+
+    const infos = loggedPayloads(mockLogger.info);
+    const receipt = infos.find((p) => p.runId === runA && p.injected === true);
+    expect(receipt).toMatchObject({ runId: runA, injected: true, budgetSpentFraction: 0.95 });
     assertSafeReceipt(receipt!);
   });
 

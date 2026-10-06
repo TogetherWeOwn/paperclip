@@ -786,7 +786,8 @@ export function pluginRoutes(
           runId: req.actor.runId,
         });
         const receipt = toBoundedBudgetFractionReceipt(raw);
-        bsf = receipt.injected ? receipt.budgetSpentFraction : undefined;
+        // Stamp raw: rounding is log-only; the router gates on this value.
+        bsf = receipt.injected ? raw : undefined;
         if (receipt.injected) {
           logger.info(
             {
@@ -1146,7 +1147,8 @@ export function pluginRoutes(
           runId: runContext.runId,
         });
         const b3Receipt = toBoundedBudgetFractionReceipt(b3Raw);
-        b3Fraction = b3Receipt.injected ? b3Receipt.budgetSpentFraction : undefined;
+        // Stamp raw: rounding is log-only; the router gates on this value.
+        b3Fraction = b3Receipt.injected ? b3Raw : undefined;
         if (b3Receipt.injected) {
           logger.info(
             {

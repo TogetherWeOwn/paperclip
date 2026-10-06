@@ -38,6 +38,17 @@ describe("toBoundedReapReceipt", () => {
     ).toEqual({ cancelled: 2, alreadyTerminal: 1, failed: 0, unshaped: false });
   });
 
+  it("counts the router's real array-of-IDs result shape", () => {
+    expect(
+      toBoundedReapReceipt({
+        runId: "worker-run-9",
+        cancelled: ["req-1", "req-2"],
+        alreadyTerminal: ["req-3"],
+        failed: [],
+      }),
+    ).toEqual({ cancelled: 2, alreadyTerminal: 1, failed: 0, unshaped: false });
+  });
+
   it("accepts boolean counts as 0/1", () => {
     expect(
       toBoundedReapReceipt({ cancelled: true, alreadyTerminal: false, failed: 0 }),

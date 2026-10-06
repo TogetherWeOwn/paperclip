@@ -37,4 +37,11 @@ describe("tool-gateway budget receipts", () => {
     expect(gatewaySrc).toContain("budgetSpentFraction: h5Fraction");
     expect(gatewaySrc).toContain("budgetSpentFraction: b2Fraction");
   });
+
+  it("stamps the raw fraction (rounding is log-only for router gating)", () => {
+    // The router gates on the stamped value with >= thresholds, so the stamp
+    // must stay unrounded; only the logged number is rounded to 4dp.
+    expect(gatewaySrc).toContain("h5Fraction = h5Receipt.injected ? h5Raw : undefined");
+    expect(gatewaySrc).toContain("b2Fraction = b2Receipt.injected ? b2Raw : undefined");
+  });
 });

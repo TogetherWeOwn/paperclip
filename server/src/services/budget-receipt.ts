@@ -14,6 +14,11 @@
  * Finite numbers round to 4 decimals (overspend >1 is preserved, not
  * clamped, so degradation stays visible). Anything non-finite, including
  * `undefined` (no qualifying policy envelope), is an absent stamp.
+ *
+ * The rounded value is for the log line only. Call sites must stamp the raw
+ * value: the router gates on the stamped value with `>=` warn/downshift/halt
+ * thresholds, so rounding the stamp itself would flip gate outcomes at the
+ * boundary (e.g. 0.94996 stamped as 0.95).
  */
 export function toBoundedBudgetFractionReceipt(
   fraction: number | undefined,
@@ -32,6 +37,11 @@ function toBoundedCount(value: unknown): number | null {
   if (typeof value === "boolean") {
     return value ? 1 : 0;
   }
+  if (Array.isArray(value)) {
+    // Router cancel result shape: arrays of request IDs. Count the IDs;
+    // never log them.
+    return value.length > 1000000 ? null : value.length;
+  }
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return null;
   }
@@ -45,10 +55,12 @@ function toBoundedCount(value: unknown): number | null {
 /**
  * Bound a router cancel-run-invocations result to observable counts.
  *
- * The worker returns `{ cancelled, alreadyTerminal, failed }` counts. Only
- * those three bounded integers are extracted; any other shape (including
- * null/undefined) is still a bounded receipt with `unshaped: true` and
- * zeroed counts. The host run ID is correlated by the caller, never taken
+ * The worker returns `{ runId, cancelled, alreadyTerminal, failed }` where
+ * each of the three outcome fields is an array of request IDs. Only the
+ * three bounded lengths are extracted — IDs are counted, never logged. Plain
+ * numbers/booleans are also accepted for tolerance. Any other shape
+ * (including null/undefined) is still a bounded receipt with `unshaped: true`
+ * and zeroed counts. The host run ID is correlated by the caller, never taken
  * from the worker payload.
  */
 export function toBoundedReapReceipt(result: unknown): {
