@@ -328,6 +328,7 @@ import {
   hasAcceptedSemanticResult,
   isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
+  NO_PROGRESS_NO_EVENT_WAKE_REASON_CODE,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
@@ -14287,12 +14288,18 @@ export function heartbeatService(
 
     // A settled run may legitimately have no user-facing prose. The response
     // resolver owns that decision; do not wake the agent again merely to force
-    // an artificial comment into the issue thread.
+    // an artificial comment into the issue thread. A suppressed no-progress
+    // no-event wake is the same shape: the missing-comment retry must not
+    // claim the run, or disposition repair would see an owned lifecycle and
+    // never schedule the corrective wake.
     if (
       presentationDecision?.chosenSource === "none" &&
       (hasAcceptedSemanticResult(parseObject(run.resultJson)) ||
         presentationDecision.reasonCodes.includes(
           "legacy_adapter_summary_ambiguous",
+        ) ||
+        presentationDecision.reasonCodes.includes(
+          NO_PROGRESS_NO_EVENT_WAKE_REASON_CODE,
         ))
     ) {
       await patchRunIssueCommentStatus(run.id, {
