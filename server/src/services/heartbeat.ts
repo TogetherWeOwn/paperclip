@@ -337,6 +337,7 @@ import { reportRunFailure } from "./run-failure-report.js";
 import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import { toBoundedReapReceipt } from "./budget-receipt.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
@@ -27169,9 +27170,10 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
-          // TOG-7967 H9 (receipt 2): run-end reap of router async invocations.
-          // Never throws: lookup and call failures are logged, orphans linger
-          // to TTL. Company scope is mandatory (worker throws without it).
+          // Run-end reap of router async invocations. Never throws: lookup
+          // and call failures are logged, orphans linger to TTL. Company
+          // scope is mandatory (worker throws without it). Success emits a
+          // bounded receipt (counts only); no result payload passthrough.
           try {
             const manager = options.pluginWorkerManager;
             if (manager && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -27196,6 +27198,19 @@ export function heartbeatService(
                     },
                     10_000,
                   )
+                  .then((reapResult) => {
+                    const receipt = toBoundedReapReceipt(reapResult);
+                    logger.info(
+                      {
+                        runId: run.id,
+                        cancelled: receipt.cancelled,
+                        alreadyTerminal: receipt.alreadyTerminal,
+                        failed: receipt.failed,
+                        unshaped: receipt.unshaped,
+                      },
+                      "router run-end reap completed",
+                    );
+                  })
                   .catch((reapErr) => {
                     logger.warn(
                       { err: reapErr, runId: run.id },

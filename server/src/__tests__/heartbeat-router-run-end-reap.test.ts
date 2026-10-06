@@ -42,4 +42,17 @@ describe("heartbeat router run-end reap (TOG-7967 H9)", () => {
       'import { pluginRegistryService } from "./plugin-registry.js";',
     );
   });
+
+  it("emits a bounded success receipt (counts only, no payload passthrough)", () => {
+    const block = reapBlock();
+    expect(block).toContain("router run-end reap completed");
+    expect(block).toContain("toBoundedReapReceipt");
+    expect(block).toContain("cancelled");
+    expect(block).toContain("alreadyTerminal");
+    expect(block).toContain("failed");
+    // Only safe run ID plus bounded counts; no prompts, args, or headers.
+    expect(block).not.toContain("effectiveParameters");
+    expect(block).not.toContain("requestedParameters");
+    expect(block).not.toContain("callerHeaders");
+  });
 });
