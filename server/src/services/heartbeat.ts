@@ -9423,6 +9423,64 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export interface PresentationWakeProvenance {
+  wakeReason: string | null;
+  wakeCommentId: string | null;
+}
+
+/**
+ * Derive the wake provenance the no-progress/no-event suppression reads.
+ * Pure snapshot read: the wake reason plus the wake comment id (including
+ * batched/coalesced comment ids). Extracted from run finalization so the
+ * suppression contract is covered by tests, not just by inspection.
+ */
+export function derivePresentationWakeProvenance(
+  contextSnapshot: unknown,
+): PresentationWakeProvenance {
+  const snapshot = parseObject(contextSnapshot);
+  return {
+    wakeReason: readNonEmptyString(snapshot.wakeReason),
+    wakeCommentId: deriveCommentId(snapshot, null),
+  };
+}
+
+export interface PresentationProgressInput {
+  companyId: string;
+  runId: string;
+  issueId: string | null;
+  hasExistingRunComment: boolean;
+}
+
+/**
+ * Resolve whether a run left issue-visible progress for presentation
+ * purposes. An explicit run comment counts as progress (it keeps reuse
+ * precedence inside the resolver); otherwise progress is any
+ * ISSUE_PROGRESS_ACTIVITY_ACTIONS row attributed to this run on this issue.
+ * Returns undefined when there is no issue, preserving legacy behavior for
+ * callers without an issue context.
+ */
+export async function readPresentationRunMadeIssueProgress(
+  db: Db,
+  input: PresentationProgressInput,
+): Promise<boolean | undefined> {
+  if (!input.issueId) return undefined;
+  if (input.hasExistingRunComment) return true;
+  const progressRows = await db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.runId, input.runId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        inArray(activityLog.action, ISSUE_PROGRESS_ACTIVITY_ACTIONS),
+      ),
+    )
+    .limit(1);
+  return progressRows.length > 0;
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -25484,40 +25542,18 @@ export function heartbeatService(
             // run log. Progress is any ISSUE_PROGRESS_ACTIVITY_ACTIONS row
             // attributed to this run, or an explicit run comment (which keeps
             // reuse precedence inside the resolver).
-            const presentationWakeSnapshot = parseObject(
+            const presentationWake = derivePresentationWakeProvenance(
               livenessRun.contextSnapshot,
             );
-            const presentationWakeReason = readNonEmptyString(
-              presentationWakeSnapshot.wakeReason,
-            );
-            const presentationWakeCommentId = deriveCommentId(
-              presentationWakeSnapshot,
-              null,
-            );
-            let presentationRunMadeIssueProgress: boolean | undefined;
-            if (issueId) {
-              if (existingRunComment) {
-                presentationRunMadeIssueProgress = true;
-              } else {
-                const progressRows = await db
-                  .select({ id: activityLog.id })
-                  .from(activityLog)
-                  .where(
-                    and(
-                      eq(activityLog.companyId, livenessRun.companyId),
-                      eq(activityLog.runId, livenessRun.id),
-                      eq(activityLog.entityType, "issue"),
-                      eq(activityLog.entityId, issueId),
-                      inArray(
-                        activityLog.action,
-                        ISSUE_PROGRESS_ACTIVITY_ACTIONS,
-                      ),
-                    ),
-                  )
-                  .limit(1);
-                presentationRunMadeIssueProgress = progressRows.length > 0;
-              }
-            }
+            const presentationWakeReason = presentationWake.wakeReason;
+            const presentationWakeCommentId = presentationWake.wakeCommentId;
+            const presentationRunMadeIssueProgress =
+              await readPresentationRunMadeIssueProgress(db, {
+                companyId: livenessRun.companyId,
+                runId: livenessRun.id,
+                issueId,
+                hasExistingRunComment: Boolean(existingRunComment),
+              });
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
               conversationTurnFinished: isConversation(issueContext) &&
