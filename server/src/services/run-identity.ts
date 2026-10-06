@@ -10,6 +10,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
+import { withDeadlockRetry } from "../db-errors.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
@@ -170,7 +171,8 @@ export async function initializeRunIdentity(
     cause: string;
   },
 ) {
-  return db.transaction(async (tx) => {
+  return withDeadlockRetry(() =>
+    db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
       .select()
@@ -269,7 +271,8 @@ export async function initializeRunIdentity(
       });
     }
     return current;
-  });
+    }),
+  );
 }
 
 /** Caller holds the task and run row locks, in that order. Reserve before delivery so acquisitions cannot guess. */
@@ -334,7 +337,8 @@ export async function reserveSteeredIdentity(
   db: Db,
   input: Parameters<typeof prepareSteeredIdentity>[1],
 ) {
-  return db.transaction(async (tx) => {
+  return withDeadlockRetry(() =>
+    db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
       .select()
@@ -386,7 +390,8 @@ export async function reserveSteeredIdentity(
       return { ...context, status: "pending" };
     }
     return context;
-  });
+    }),
+  );
 }
 
 export async function rejectSteeredIdentity(
@@ -427,7 +432,11 @@ export async function captureRunIdentity(
   input: { companyId: string; runId: string; agentId: string },
 ) {
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
-  return db.transaction(async (tx) => {
+  // The issues-then-run lock order races the secret-access audit insert's FK
+  // checks in the opposite order; a lost race aborts with 40P01, so retry the
+  // whole transaction instead of surfacing a 500 to the runtime caller.
+  return withDeadlockRetry(() =>
+    db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
       .select()
@@ -476,7 +485,8 @@ export async function captureRunIdentity(
           )
       : [];
     return { run, context: context ?? null };
-  });
+    }),
+  );
 }
 
 export async function listRunIdentityContexts(
@@ -501,7 +511,8 @@ export async function reconcileSteeredIdentity(
   db: Db,
   context: RunIdentityContext,
 ) {
-  await db.transaction(async (tx) => {
+  await withDeadlockRetry(() =>
+    db.transaction(async (tx) => {
     await lockIdentityTask(tx, context.companyId, context.runId);
     const [run] = await tx
       .select()
@@ -515,7 +526,8 @@ export async function reconcileSteeredIdentity(
       .for("update");
     if (!run) return;
     await acceptSteeredIdentity(tx, context);
-  });
+    }),
+  );
 }
 
 /** Only events validated and persisted by the native control-plane transport count. */
