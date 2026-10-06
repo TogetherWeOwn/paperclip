@@ -2584,7 +2584,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   anchorRepoUrl: string | null;
   workspaces: Array<Pick<typeof projectWorkspaces.$inferSelect, "id" | "repoUrl" | "repoRef"> & { cwd?: string | null }>;
   resolveGitAuth?: GitRemoteAuthProvider | null;
-}): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null }>> {
+}): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }>> {
   const identity = (url: string) => url.trim().replace(/\.git\/?$/, "").replace(/\/$/, "");
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
   const selected = input.workspaces.filter((workspace) => {
@@ -2605,7 +2605,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     await fs.mkdir(path.dirname(excludePath), { recursive: true });
     await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
   }
-  const results = [];
+  const results: Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }> = [];
   for (const workspace of selected) {
     const repoUrl = workspace.repoUrl!;
     const name = (deriveRepoNameFromRepoUrl(repoUrl) ?? "repo").replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -2616,9 +2616,22 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     const localSource = workspace.cwd && workspace.cwd !== REPO_ONLY_CWD_SENTINEL
       && await fs.stat(workspace.cwd).then((entry) => entry.isDirectory()).catch(() => false)
       ? workspace.cwd : null;
-    const result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
-    if (result.warning) throw new Error(result.warning);
-    results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
+    let result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
+    let warnings: string[] = [];
+    if (result.warning) {
+      // A previous run can leave files without `.git` here: sync excludes
+      // match `.git` at every depth, so a nested checkout reconstituted from
+      // sync data keeps its files but loses its history. Preserve the snapshot
+      // for forensics (never delete it here) and re-provision a clean checkout
+      // so this run — and every continuation inheriting this workspace — works.
+      const quarantine = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
+      await fs.mkdir(path.dirname(quarantine), { recursive: true });
+      await fs.rename(cwd, quarantine);
+      warnings = [`Managed workspace path "${cwd}" already exists but is not a git checkout. Preserved the snapshot at "${quarantine}" and re-provisioned a clean checkout.`];
+      result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
+      if (result.warning) throw new Error(result.warning);
+    }
+    results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef, ...(warnings.length > 0 ? { warnings } : {}) });
   }
   // Retain detached checkout work outside the synchronized repository set.
   const active = new Set(results.map((repo) => path.basename(repo.cwd)));
@@ -22693,6 +22706,9 @@ export function heartbeatService(
         });
         const paths = new Map(repositories.map((repo) => [repo.workspaceId, repo.cwd]));
         projectRepositoryPaths.push(...repositories.map((repo) => path.relative(executionWorkspace.cwd, repo.cwd)));
+        for (const repo of repositories) {
+          if (repo.warnings?.length) resolvedWorkspace.warnings.push(...repo.warnings);
+        }
         if (resolvedWorkspace.workspaceId) paths.set(resolvedWorkspace.workspaceId, executionWorkspace.cwd);
         resolvedWorkspace.workspaceHints = resolvedWorkspace.workspaceHints.map((hint) => ({
           ...hint, cwd: paths.get(hint.workspaceId) ?? hint.cwd,

@@ -17,6 +17,12 @@ export interface GitWorkspaceSnapshot {
   ignoredPaths: string[];
   /** Managed, editable repositories inside the task workspace. */
   repositories?: Array<{ path: string; snapshot: GitWorkspaceSnapshot }>;
+  /**
+   * Nested project repositories that could not be snapshotted (for example, a
+   * checkout whose `.git` was stripped in transit while its files survived).
+   * Skipped, never fatal; run setup re-provisions the checkout.
+   */
+  repositoryWarnings?: string[];
 }
 
 export const PROJECT_REPOSITORIES_DIR = ".paperclip-repositories";
@@ -142,6 +148,7 @@ async function runExpensiveWorkspaceGit(
 
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true): Promise<GitWorkspaceSnapshot | null> {
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
+  const repositoryWarnings: string[] = [];
   if (includeRepositories) {
     const root = path.join(localDir, PROJECT_REPOSITORIES_DIR);
     const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
@@ -154,7 +161,13 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
         if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) throw new Error("Invalid project repository directory");
         const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}`;
         const snapshot = await readGitWorkspaceSnapshot(path.join(localDir, relative), false);
-        if (!snapshot) throw new Error(`Project repository is not a Git checkout: ${relative}`);
+        if (!snapshot) {
+          // A nested checkout can lose its `.git` in transit (sync excludes
+          // match at every depth) while its files survive. Skipping keeps the
+          // enclosing workspace usable; run setup re-provisions the checkout.
+          repositoryWarnings.push(`Project repository is not a Git checkout: ${relative}`);
+          continue;
+        }
         repositories.push({ path: relative, snapshot });
       }
     }
@@ -243,6 +256,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
       ...repositories.flatMap((repo) => repo.snapshot.ignoredPaths.map((entry) => `${repo.path}/${entry}`))]
       .sort((left, right) => left.localeCompare(right)),
     ...(repositories.length > 0 ? { repositories } : {}),
+    ...(repositoryWarnings.length > 0 ? { repositoryWarnings } : {}),
   };
 }
 

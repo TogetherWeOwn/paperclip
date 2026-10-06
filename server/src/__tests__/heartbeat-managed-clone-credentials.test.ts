@@ -81,6 +81,40 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
     }
   });
 
+  it("re-provisions a nested checkout that lost its .git instead of failing setup", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-reprovision", projectId: "two", repoUrl: first });
+    try {
+      const input = {
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      };
+      const [repo] = await prepareProjectRepositoryWorkspaces(input);
+      const nestedCwd = repo!.cwd;
+      expect(path.relative(anchor.cwd, nestedCwd)).toMatch(/^\.paperclip-repositories\//);
+      // Simulate sync-stripped state: files survive, `.git` does not.
+      await fs.rm(path.join(nestedCwd, ".git"), { recursive: true, force: true });
+      await fs.writeFile(path.join(nestedCwd, "survivor.txt"), "kept\n", "utf8");
+
+      const [recovered] = await prepareProjectRepositoryWorkspaces(input);
+      expect(recovered!.cwd).toBe(nestedCwd);
+      // Clean checkout re-provisioned at the same path: history is back and the
+      // stripped files are gone from the live path.
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: nestedCwd })).stdout.trim()).toBe("true");
+      await expect(fs.stat(path.join(nestedCwd, "survivor.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(recovered!.warnings).toHaveLength(1);
+      expect(recovered!.warnings![0]).toMatch(/not a git checkout.*re-provisioned a clean checkout/);
+      // The stripped snapshot is preserved for forensics, never deleted.
+      const detached = path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories");
+      const retained = await fs.readdir(detached);
+      expect(retained).toHaveLength(1);
+      expect(await fs.readFile(path.join(detached, retained[0]!, "survivor.txt"), "utf8")).toBe("kept\n");
+    } finally {
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
   it("seeds a configured second local checkout with its uncommitted work and ignores", async () => {
     const first = await createLocalSourceRepo();
     const second = await createLocalSourceRepo();

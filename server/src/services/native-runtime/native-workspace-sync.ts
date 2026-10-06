@@ -362,6 +362,18 @@ function parseGitSnapshot(
       repositories.push({ path: repo.path, snapshot });
     }
   }
+  // Nested checkouts that lost `.git` in transit ride as warnings, never as
+  // fatal descriptor errors. Bounded like every other parsed field.
+  let repositoryWarnings: string[] | undefined;
+  if (candidate.repositoryWarnings !== undefined) {
+    if (!Array.isArray(candidate.repositoryWarnings) || candidate.repositoryWarnings.length > 32) return undefined;
+    const cleaned: string[] = [];
+    for (const warning of candidate.repositoryWarnings) {
+      if (typeof warning !== "string" || warning.length === 0 || warning.length > 1000) return undefined;
+      cleaned.push(warning);
+    }
+    repositoryWarnings = cleaned;
+  }
   return {
     headCommit: candidate.headCommit,
     branchName: candidate.branchName as string | null,
@@ -369,6 +381,7 @@ function parseGitSnapshot(
     deletedPaths: [...(candidate.deletedPaths as string[])],
     ignoredPaths: [...(candidate.ignoredPaths as string[])],
     ...(repositories.length ? { repositories } : {}),
+    ...(repositoryWarnings?.length ? { repositoryWarnings } : {}),
   };
 }
 

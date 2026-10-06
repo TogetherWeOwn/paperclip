@@ -223,6 +223,41 @@ describe("git workspace sync", () => {
     expect(await git(nested, ["status", "--porcelain"])).toBe("");
   });
 
+  it("warns instead of failing when a nested checkout lost its .git", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-nested-stripped-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    // A nested checkout reconstituted from sync data: files survive, `.git` does not.
+    const stripped = path.join(repo, ".paperclip-repositories", "toolkit-abc123");
+    await mkdir(stripped, { recursive: true });
+    await writeFile(path.join(stripped, "runbook.md"), "surviving files\n", "utf8");
+    // A healthy sibling keeps snapshotting normally.
+    const healthy = path.join(repo, ".paperclip-repositories", "healthy-def456");
+    await mkdir(healthy, { recursive: true });
+    await git(healthy, ["init"]);
+    await git(healthy, ["config", "user.name", "Paperclip Test"]);
+    await git(healthy, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(healthy, "ok.txt"), "ok\n", "utf8");
+    await git(healthy, ["add", "ok.txt"]);
+    await git(healthy, ["commit", "-m", "ok"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    expect(snapshot?.headCommit).toBe(await git(repo, ["rev-parse", "HEAD"]));
+    expect(snapshot?.repositories?.map((entry) => entry.path)).toEqual([
+      ".paperclip-repositories/healthy-def456",
+    ]);
+    expect(snapshot?.repositoryWarnings).toEqual([
+      "Project repository is not a Git checkout: .paperclip-repositories/toolkit-abc123",
+    ]);
+
+    // The warning-carrying snapshot still restores: healthy history lands, the
+    // stripped entry is simply absent until setup re-provisions it.
+    await withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async (cloneDir) => {
+      expect(await readFile(path.join(cloneDir, "tracked.txt"), "utf8")).toBe("base\n");
+      expect((await lstat(path.join(cloneDir, ".paperclip-repositories", "healthy-def456", ".git"))).isDirectory()).toBe(true);
+    });
+  });
+
   it("copies the workspace origin remote into the shallow clone", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-origin-"));
     cleanupDirs.push(rootDir);
