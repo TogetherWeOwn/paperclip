@@ -2431,6 +2431,58 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
         "owner-user",
       );
+      // Low-trust model credential boundary: the assigned review agent holds
+      // one model binding plus one non-model binding, and a second agent holds
+      // its own model binding. Only the assigned agent's model binding may
+      // land on the persisted boundary.
+      const [modelSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-model-${randomUUID()}`,
+          name: `Low trust model ${randomUUID()}`,
+        })
+        .returning();
+      const [ghSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-gh-${randomUUID()}`,
+          name: `Low trust gh ${randomUUID()}`,
+        })
+        .returning();
+      const [otherModelSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-other-model-${randomUUID()}`,
+          name: `Low trust other model ${randomUUID()}`,
+        })
+        .returning();
+      const [modelBinding] = await db
+        .insert(companySecretBindings)
+        .values({
+          companyId: f.companyId,
+          secretId: modelSecret.id,
+          targetType: "agent",
+          targetId: f.assignedAgentId,
+          configPath: "env.ANTHROPIC_AUTH_TOKEN",
+        })
+        .returning();
+      await db.insert(companySecretBindings).values({
+        companyId: f.companyId,
+        secretId: ghSecret.id,
+        targetType: "agent",
+        targetId: f.assignedAgentId,
+        configPath: "env.GH_TOKEN",
+      });
+      await db.insert(companySecretBindings).values({
+        companyId: f.companyId,
+        secretId: otherModelSecret.id,
+        targetType: "agent",
+        targetId: f.replacementAgentId,
+        configPath: "env.ANTHROPIC_AUTH_TOKEN",
+      });
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
         id: "github:paperclipai/paperclip:94",
@@ -2476,6 +2528,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           allowedAgentIds: [f.assignedAgentId],
         },
       });
+      // The persisted boundary carries exactly the assigned review agent's
+      // model binding: the same-agent GH_TOKEN and the other agent's model
+      // binding stay refused.
+      const boundaryIds = (
+        task.executionPolicy as unknown as {
+          authorizationPolicy?: {
+            trustBoundary?: { allowedSecretBindingIds?: unknown };
+          };
+        }
+      )?.authorizationPolicy?.trustBoundary?.allowedSecretBindingIds;
+      expect(boundaryIds).toEqual([modelBinding.id]);
       const [run] = await db
         .insert(heartbeatRuns)
         .values({
