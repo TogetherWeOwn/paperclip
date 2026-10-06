@@ -137,6 +137,13 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  buildParentChildBlocksCycleNotice,
+  findParentChildBlocksCycle,
+  parentChildBlocksCycleMarker,
+  type ParentChildBlocksCycle,
+  type ParentChildBlocksRelation,
+} from "./parent-child-blocks-cycle.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -2872,6 +2879,124 @@ export function recoveryService(
       );
   }
 
+  async function blocksRelationsForCompany(
+    companyId: string,
+  ): Promise<ParentChildBlocksRelation[]> {
+    return db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+  }
+
+  function isBlocksCycleError(error: unknown): boolean {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "";
+    return message.includes("Blocking relations cannot contain cycles");
+  }
+
+  /**
+   * Detect whether materializing any of `childIds` as blockers of `issue`
+   * (the parent implicitly waiting on its open children) would close a
+   * parent/child + blocks loop. Returns the first cycle found, or null.
+   */
+  async function findOpenChildBlocksCycle(
+    issue: typeof issues.$inferSelect,
+    childIds: string[],
+  ): Promise<ParentChildBlocksCycle | null> {
+    const candidates = [...new Set(childIds)].filter(
+      (childId) => childId && childId !== issue.id,
+    );
+    if (candidates.length === 0) return null;
+    const relations = await blocksRelationsForCompany(issue.companyId);
+    for (const childId of candidates) {
+      const cycle = findParentChildBlocksCycle(relations, issue.id, childId);
+      if (cycle) return cycle;
+    }
+    return null;
+  }
+
+  /**
+   * Park a parent/child + blocks cycle: post one idempotent notice naming
+   * the cycle members and edges, and take no further automatic action. The
+   * marker keeps repeated startup/periodic sweeps from posting (or
+   * re-arming) again — no retry storm.
+   */
+  async function parkParentChildBlocksCycle(
+    issue: typeof issues.$inferSelect,
+    cycle: ParentChildBlocksCycle,
+  ): Promise<void> {
+    const marker = parentChildBlocksCycleMarker(cycle);
+    const pathIssues =
+      cycle.explicitPath.length > 0
+        ? await db
+            .select({
+              id: issues.id,
+              identifier: issues.identifier,
+              parentId: issues.parentId,
+            })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, issue.companyId),
+                inArray(issues.id, [...new Set(cycle.explicitPath)]),
+              ),
+            )
+        : [];
+    const notice = buildParentChildBlocksCycleNotice(
+      cycle,
+      pathIssues.map((row) => ({
+        id: row.id,
+        identifier: row.identifier,
+        parentId: row.parentId,
+      })),
+    );
+    const alreadyParked = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(50)
+      .then((rows) => rows.some((row) => (row.body ?? "").includes(marker)));
+    if (!alreadyParked) {
+      await issuesSvc.addComment(
+        issue.id,
+        notice,
+        {},
+        {
+          authorType: "system",
+          presentation: compactRecoveryPresentation(
+            "Recovery: parent/child blocks cycle — parked",
+          ),
+        },
+      );
+    }
+    logger.warn(
+      {
+        parentIssueId: cycle.parentId,
+        childIssueId: cycle.childId,
+        explicitPath: cycle.explicitPath,
+      },
+      "recovery parked a parent/child blocks cycle instead of materializing the dependency edge",
+    );
+  }
+
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
     if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
@@ -2916,10 +3041,38 @@ export function recoveryService(
     ];
     if (blockedByIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, {
-      status: "blocked",
-      blockedByIssueIds,
-    });
+    // A parent implicitly waits on its open children. When a child is
+    // already (transitively) blocked by the parent, materializing that wait
+    // as an explicit edge would close a dependency loop and the update
+    // below would throw ("Blocking relations cannot contain cycles"). At
+    // startup that throw crashes the boot and the supervisor retries the
+    // same input: a crash-loop. Park the cycle instead and report it as
+    // handled so callers do not requeue behind it.
+    const openChildCycle = await findOpenChildBlocksCycle(
+      issue,
+      openChildren.map((row) => row.id),
+    );
+    if (openChildCycle) {
+      await parkParentChildBlocksCycle(issue, openChildCycle);
+      return issue;
+    }
+
+    let updated: typeof issue | null;
+    try {
+      updated = await issuesSvc.update(issue.id, {
+        status: "blocked",
+        blockedByIssueIds,
+      });
+    } catch (error) {
+      if (!isBlocksCycleError(error)) throw error;
+      const racedCycle = await findOpenChildBlocksCycle(
+        issue,
+        openChildren.map((row) => row.id),
+      );
+      if (!racedCycle) throw error;
+      await parkParentChildBlocksCycle(issue, racedCycle);
+      return issue;
+    }
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment([
@@ -3454,19 +3607,71 @@ export function recoveryService(
         hasNewSourcePath
       ) {
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+          // Same parent/child + blocks hazard as resolveContinuationWaitingOnReview:
+          // materializing a healthy child that is already transitively blocked
+          // by this parent would throw a cycle error and crash startup
+          // recovery. Park the cycle, close the recovery action as blocked,
+          // and take no further automatic action on it.
+          const healthyChildCycle = await findOpenChildBlocksCycle(
+            issue,
+            healthyChildren.map((child) => child.id),
+          );
+          if (healthyChildCycle) {
+            await parkParentChildBlocksCycle(issue, healthyChildCycle);
+            const parked = await recoveryActionsSvc.resolveActiveForIssue({
+              companyId: action.companyId,
+              sourceIssueId: action.sourceIssueId,
+              actionId: action.id,
+              status: "resolved",
+              outcome: "blocked",
+              resolutionNote: "parent_child_blocks_cycle",
+            });
+            if (parked) {
+              result.resolved += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
           const blockerIds = await existingUnresolvedBlockerIssueIds(
             issue.companyId,
             issue.id,
           );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
+          try {
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([
+                  ...blockerIds,
+                  ...healthyChildren.map((child) => child.id),
+                ]),
+              ],
+            });
+          } catch (error) {
+            if (!isBlocksCycleError(error)) throw error;
+            const racedCycle = await findOpenChildBlocksCycle(
+              issue,
+              healthyChildren.map((child) => child.id),
+            );
+            if (!racedCycle) throw error;
+            await parkParentChildBlocksCycle(issue, racedCycle);
+            const parked = await recoveryActionsSvc.resolveActiveForIssue({
+              companyId: action.companyId,
+              sourceIssueId: action.sourceIssueId,
+              actionId: action.id,
+              status: "resolved",
+              outcome: "blocked",
+              resolutionNote: "parent_child_blocks_cycle",
+            });
+            if (parked) {
+              result.resolved += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
