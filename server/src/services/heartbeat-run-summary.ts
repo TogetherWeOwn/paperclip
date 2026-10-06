@@ -2,6 +2,7 @@ import type {
   RunPresentationDecision,
   RunPresentationSource,
 } from "@paperclipai/shared";
+import { THROTTLED_ISSUE_REWAKE_REASONS } from "./issue-rewake-throttle.js";
 
 export const HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS = 500;
 export const HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS = 4_096;
@@ -119,6 +120,29 @@ const NARRATION_OPENERS =
 
 export const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
+
+// Wakes that carry no new event for the issue. The throttle set covers
+// assignment, continuation, recovery and liveness re-wakes; monitor and timer
+// wakes are the same shape (a due check, not a new event), so they join the
+// set here. A null/undefined reason is a reason-less on-demand invoke, also
+// event-free.
+export const NO_PROGRESS_NO_EVENT_WAKE_REASONS: ReadonlySet<string> = new Set([
+  ...THROTTLED_ISSUE_REWAKE_REASONS,
+  "issue_monitor_due",
+  "issue_monitor_recovery",
+  "issue_monitor_recovery_issue",
+  "heartbeat_timer",
+]);
+
+export const NO_PROGRESS_NO_EVENT_WAKE_REASON_CODE =
+  "no_progress_no_event_wake";
+
+export function isNoEventWakeReason(
+  reason: string | null | undefined,
+): boolean {
+  if (reason == null) return true;
+  return NO_PROGRESS_NO_EVENT_WAKE_REASONS.has(reason);
+}
 
 export const RUN_PRESENTATION_RESOLVER_VERSION = "1";
 export const CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON =
@@ -381,6 +405,15 @@ export function resolveHeartbeatRunResponse(input: {
     channel: "final" | "unknown";
     reasonCode?: string;
   } | null;
+  /**
+   * Wake provenance for no-progress suppression. When the wake carried no new
+   * event and the run left no issue-visible progress, the run's final message
+   * stays in the run log and no issue comment is published. Omit
+   * `runMadeIssueProgress` (or pass true) to preserve the legacy behavior.
+   */
+  wakeReason?: string | null;
+  wakeCommentId?: string | null;
+  runMadeIssueProgress?: boolean;
 }): ResolvedHeartbeatRunResponse {
   const resultJson = record(input.resultJson);
   const finalAgentText = readCommentText(input.finalAgentMessage?.text);
@@ -536,6 +569,25 @@ export function resolveHeartbeatRunResponse(input: {
       decision: decision("none", {
         commentAction: "none",
         reasonCodes: ["yielded_control_plane_wait"],
+      }),
+    };
+  }
+
+  // A wake that carried no new event and a run that left no issue-visible
+  // progress must not publish the run's final message as an issue comment.
+  // The text stays in the run log; the thread stays clean. An explicit
+  // run comment already returned above with reuse precedence, and external
+  // chat precedence returned earlier, so neither is suppressed here.
+  if (
+    input.runMadeIssueProgress === false &&
+    isNoEventWakeReason(input.wakeReason ?? null) &&
+    !readCommentText(input.wakeCommentId)
+  ) {
+    return {
+      text: null,
+      decision: decision("none", {
+        commentAction: "none",
+        reasonCodes: [NO_PROGRESS_NO_EVENT_WAKE_REASON_CODE],
       }),
     };
   }

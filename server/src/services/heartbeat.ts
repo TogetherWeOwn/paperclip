@@ -25478,6 +25478,46 @@ export function heartbeatService(
               livenessRun.contextSnapshot,
               externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
             );
+            // No-progress, no-event suppression: a wake that carried no new
+            // event plus a run that left no issue-visible progress must not
+            // publish its final message as a comment. The text stays in the
+            // run log. Progress is any ISSUE_PROGRESS_ACTIVITY_ACTIONS row
+            // attributed to this run, or an explicit run comment (which keeps
+            // reuse precedence inside the resolver).
+            const presentationWakeSnapshot = parseObject(
+              livenessRun.contextSnapshot,
+            );
+            const presentationWakeReason = readNonEmptyString(
+              presentationWakeSnapshot.wakeReason,
+            );
+            const presentationWakeCommentId = deriveCommentId(
+              presentationWakeSnapshot,
+              null,
+            );
+            let presentationRunMadeIssueProgress: boolean | undefined;
+            if (issueId) {
+              if (existingRunComment) {
+                presentationRunMadeIssueProgress = true;
+              } else {
+                const progressRows = await db
+                  .select({ id: activityLog.id })
+                  .from(activityLog)
+                  .where(
+                    and(
+                      eq(activityLog.companyId, livenessRun.companyId),
+                      eq(activityLog.runId, livenessRun.id),
+                      eq(activityLog.entityType, "issue"),
+                      eq(activityLog.entityId, issueId),
+                      inArray(
+                        activityLog.action,
+                        ISSUE_PROGRESS_ACTIVITY_ACTIONS,
+                      ),
+                    ),
+                  )
+                  .limit(1);
+                presentationRunMadeIssueProgress = progressRows.length > 0;
+              }
+            }
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
               conversationTurnFinished: isConversation(issueContext) &&
@@ -25495,6 +25535,9 @@ export function heartbeatService(
                 Boolean(adapterResult.nativeFinalization) &&
                 externalChatPresentationAuthorization ===
                   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+              wakeReason: presentationWakeReason,
+              wakeCommentId: presentationWakeCommentId,
+              runMadeIssueProgress: presentationRunMadeIssueProgress,
             });
             let presentationDecision: RunPresentationDecision =
               resolved.decision;
