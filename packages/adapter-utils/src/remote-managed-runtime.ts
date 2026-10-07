@@ -7,6 +7,7 @@ import {
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
 } from "./ssh.js";
+import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES } from "./ssh-workspace-excludes.js";
 import {
   mergeExcludes,
   referencedSourceIgnoreExcludeEntries,
@@ -147,9 +148,16 @@ export async function prepareRemoteManagedRuntime(input: {
     : null;
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
+        // The SSH transfer never carries the agent-local scratch, so keep it
+        // out of the baseline: the restore merge then leaves the local copies
+        // alone and skips walking and hashing huge dependency trees.
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
-          : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES]
+          : [
+              ".paperclip-runtime",
+              ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+              ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
+            ],
       })
     : null;
 
