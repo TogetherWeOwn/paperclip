@@ -1730,6 +1730,29 @@ function nonDirectDestinationAllowed(
   return resource.enabled;
 }
 
+/**
+ * The authority a chat-bound task executes under. Admitting a sponsored guest
+ * stamps the task as quarantined and attaches the low-trust policy; chat
+ * ingress never clears that stamp, so the lane is a property of the task and
+ * not of whoever spoke last.
+ */
+type ChatTrustLane = "guest" | "verified";
+
+function chatTrustLaneOfIssue(
+  issue: Pick<typeof issues.$inferSelect, "sourceTrust">,
+): ChatTrustLane {
+  return issue.sourceTrust?.preset === LOW_TRUST_REVIEW_PRESET &&
+    issue.sourceTrust.disposition === "quarantined"
+    ? "guest"
+    : "verified";
+}
+
+/** Bound on how many other participants one trusted-lane admission will vet. */
+const TRUST_LANE_AUDIENCE_MAX_PRINCIPALS = 25;
+
+const TRUST_LANE_AUDIENCE_NOTICE =
+  "I can't run this request in this thread because it includes participants who aren't linked to a Paperclip account, and my replies would be visible to them. Start a new thread or send a direct message to continue.";
+
 function linearControlCommand(text: string): "new" | "close" | "status" | null {
   const match = /^\/(new|close|status)(?:@[\w.-]+)?\s*$/i.exec(text.trim());
   return (
@@ -10438,6 +10461,109 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     };
   }
 
+  /**
+   * Choose the task an inbound native-thread message may join. A thread can
+   * hold one task per trust lane, bound to the same provider thread: the guest
+   * task keeps its quarantine, sandbox policy and secret allowlist exactly as
+   * admitted, while an authorized linked user's turn runs in a separate task
+   * with no inherited comments, policy, session or workspace. Selection keys
+   * off the authority this transaction just locked, per message, so link or
+   * membership changes and interleaved senders land on the correct boundary.
+   */
+  async function selectChatTrustLane(
+    tx: DbOrTransaction,
+    input: {
+      anchor: ConversationRow;
+      endpoint: EndpointRow;
+      principalId: string;
+      verifiedUserId: string | null;
+    },
+  ): Promise<
+    | { kind: "default" }
+    | { kind: "reuse"; conversation: ConversationRow }
+    | { kind: "create"; sessionGeneration: number }
+    | { kind: "refused" }
+  > {
+    const lane: ChatTrustLane = input.verifiedUserId ? "verified" : "guest";
+    const rows = await tx
+      .select({ conversation: chatConversations, issue: issues })
+      .from(chatConversations)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, chatConversations.companyId),
+          eq(issues.id, chatConversations.issueId),
+        ),
+      )
+      .where(
+        and(
+          eq(chatConversations.companyId, input.endpoint.companyId),
+          eq(chatConversations.endpointId, input.endpoint.id),
+          eq(
+            chatConversations.externalConversationId,
+            input.anchor.externalConversationId,
+          ),
+          eq(chatConversations.externalThreadId, input.anchor.externalThreadId),
+        ),
+      )
+      .orderBy(desc(chatConversations.sessionGeneration));
+    // A verified author does not authorize other readers of this thread to
+    // receive the trusted agent's replies. Once an unlinked guest has taken
+    // part, run a verified turn only if every other participant Paperclip has
+    // accepted here is itself a currently authorized linked user.
+    if (
+      lane === "verified" &&
+      rows.some((row) => chatTrustLaneOfIssue(row.issue) === "guest")
+    ) {
+      const others = await tx
+        .selectDistinct({ principalId: chatDeliveries.principalId })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.companyId, input.endpoint.companyId),
+            eq(chatDeliveries.endpointId, input.endpoint.id),
+            inArray(
+              chatDeliveries.conversationId,
+              rows.map((row) => row.conversation.id),
+            ),
+            isNotNull(chatDeliveries.principalId),
+            ne(chatDeliveries.principalId, input.principalId),
+          ),
+        )
+        .orderBy(asc(chatDeliveries.principalId))
+        .limit(TRUST_LANE_AUDIENCE_MAX_PRINCIPALS + 1);
+      if (others.length > TRUST_LANE_AUDIENCE_MAX_PRINCIPALS) {
+        return { kind: "refused" };
+      }
+      for (const other of others) {
+        const authorization = await lockCurrentPrincipalAuthorization(
+          tx,
+          input.endpoint,
+          other.principalId!,
+        );
+        if (!authorization.allowed || authorization.userId === null) {
+          return { kind: "refused" };
+        }
+      }
+    }
+    const anchorRow =
+      rows.find((row) => row.conversation.id === input.anchor.id) ?? rows[0];
+    if (!anchorRow || chatTrustLaneOfIssue(anchorRow.issue) === lane) {
+      return { kind: "default" };
+    }
+    const sameLane = rows.find(
+      (row) => chatTrustLaneOfIssue(row.issue) === lane,
+    );
+    if (sameLane) {
+      return { kind: "reuse", conversation: sameLane.conversation };
+    }
+    return {
+      kind: "create",
+      sessionGeneration:
+        Math.max(...rows.map((row) => row.conversation.sessionGeneration)) + 1,
+    };
+  }
+
   async function requireCurrentExternalActionAuthorization(
     tx: DbTransaction,
     input: {
@@ -16018,16 +16144,40 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
 
       const inboundActivityPublications: ActivityPublication[] = [];
+      // GitHub keeps its own per-repository authority model; linear surfaces
+      // end a task with /new or /close. Native threads stay bound to one task
+      // for life, so each trust lane needs its own task in that thread.
+      const trustLanesIsolated =
+        surfaceKind === "native_thread" && endpoint.provider !== "github";
+      let trustLaneRefused = false;
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
         taskEndpoint: EndpointRow,
         taskUserId: string | null,
       ) => {
         let conversation = existingConversation;
+        let laneSessionGeneration: number | null = null;
+        if (trustLanesIsolated && existingConversation) {
+          const lane = await selectChatTrustLane(taskTx, {
+            anchor: existingConversation,
+            endpoint: taskEndpoint,
+            principalId: principalResolution.principal.id,
+            verifiedUserId: taskUserId,
+          });
+          if (lane.kind === "refused") {
+            trustLaneRefused = true;
+            return null;
+          }
+          if (lane.kind === "reuse") conversation = lane.conversation;
+          else if (lane.kind === "create") {
+            conversation = null;
+            laneSessionGeneration = lane.sessionGeneration;
+          }
+        }
         if (!conversation) {
-          const sessionGeneration = isLinear
-            ? (latestConversation?.sessionGeneration ?? 0) + 1
-            : 1;
+          const sessionGeneration =
+            laneSessionGeneration ??
+            (isLinear ? (latestConversation?.sessionGeneration ?? 0) + 1 : 1);
           const issue = await issuesSvc.create(
             endpoint.companyId,
             {
@@ -16083,6 +16233,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ),
             )
             .then((rows) => rows[0] ?? null);
+          // A lane's task must be bound only to the conversation created for
+          // it; never join whichever lane won a generation race.
+          if (laneSessionGeneration !== null && conversation?.issueId !== issue.id)
+            conversation = null;
         }
         if (!conversation)
           throw conflict(
@@ -16475,7 +16629,41 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           currentPrincipalAuthorization.userId,
         );
       });
-      if (!taskMutation) return;
+      if (!taskMutation) {
+        if (trustLaneRefused) {
+          // The verified author is authorized, but this thread has readers
+          // Paperclip cannot clear for the trusted agent's replies. Say so
+          // instead of dropping the message silently or running it elsewhere.
+          const effectContext =
+            runtimeContext ??
+            runtimeContextForRecord(
+              (await endpointRecord(endpoint.id)) ??
+                (() => {
+                  throw new Error("Chat endpoint is unavailable");
+                })(),
+            );
+          const effect = await db.transaction((tx) =>
+            stageProviderEffect(tx, {
+              endpoint,
+              deliveryId: activeDelivery.id,
+              principalId: principalResolution.principal.id,
+              providerActionId: `provider_effect:delivery:${activeDelivery.id}`,
+              payload: {
+                version: 1,
+                effect: "thread_message",
+                threadId: thread.id,
+                text: TRUST_LANE_AUDIENCE_NOTICE,
+                settleDelivery: true,
+                resourceId: resource.id,
+              },
+              runtimeContext: effectContext,
+            }),
+          );
+          if (!effect) throw new Error("Provider effect was not persisted");
+          await processProviderEffect(effect.id, thread);
+        }
+        return;
+      }
       // The open task can fetch the comment immediately, before attachments
       // finish preparing or the agent starts. Never publish an uncommitted row.
       for (const publication of inboundActivityPublications) {
