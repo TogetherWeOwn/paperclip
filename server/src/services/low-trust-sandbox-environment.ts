@@ -65,9 +65,8 @@ type LowTrustReadinessEnvironmentReader = LowTrustSandboxEnvironmentReader & {
  * Pick the environment a `low_trust_review` run for this agent would land on,
  * for setup-time readiness checks. Run placement and these checks must agree:
  * a check that ignores the instance's low-trust designation reports "not ready"
- * for an agent whose runs would in fact use the designated sandbox. Setup paths
- * (email inbox, GitHub review bot) call this instead of re-composing the
- * selection inputs.
+ * for an agent whose runs would in fact use the designated sandbox. The email
+ * inbox setup path calls this instead of re-composing the selection inputs.
  */
 export async function selectLowTrustReviewEnvironment(input: {
   companyId: string;
