@@ -656,7 +656,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return { usage: parsed.usageReported ? parsed.usage : undefined, costUsd: parsed.costUsd,
           costStatus: parsed.usageComplete || parsed.costUsd != null ? undefined : "unpriced",
           usageBasis: "per_run", provider, biller: resolveOpenCodeBiller(runtimeEnv, provider), billingType: "unknown", model, complete: false };
-      });
+      }, event => event.type === "step_finish");
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         onProcessStopped: providerStop.beginInvocation(),
         cwd,
