@@ -116,6 +116,7 @@ import type {
 } from "../services/chat-sdk-runtime.js";
 import { createChatSdkEndpointRuntime } from "../services/chat-sdk-runtime.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
+import { buildPromotedSourceTrust } from "../services/source-trust.js";
 import type { TelegramDraftControl } from "../services/chat-telegram-draft-stop.js";
 
 // Opt-in private physical candidate; normal CI uses the staged pinned package.
@@ -72628,6 +72629,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
     );
 
+    it("keeps a promoted guest issue separate from its linked user's task", async () => {
+      const f = await laneFixture("promoted-guest");
+      await f.send(OWNER, "@maya inspect this output", { trigger: "mention" });
+      const [guestBefore] = await f.lanes();
+      const promotedSourceTrust = buildPromotedSourceTrust({
+        sourceIssueId: guestBefore!.issue.id,
+        sourceArtifactKind: "issue",
+        sourceArtifactId: guestBefore!.issue.id,
+        promotedByActorType: "user",
+        promotedByActorId: "owner-user",
+      });
+      await db
+        .update(issues)
+        .set({ sourceTrust: promotedSourceTrust })
+        .where(eq(issues.id, guestBefore!.issue.id));
+
+      await f.link(OWNER);
+      await f.send(OWNER, "verified follow-up");
+
+      const [guest, trusted] = await f.lanes();
+      expect(trusted!.issue.id).not.toBe(guest!.issue.id);
+      expect(guest!.issue.sourceTrust).toMatchObject({
+        preset: "low_trust_review",
+        disposition: "promoted",
+      });
+      expect(
+        (await f.commentsOf(guest!.issue.id)).map((comment) => comment.body),
+      ).toEqual(["@maya inspect this output"]);
+      expect(trusted!.issue).toMatchObject({
+        sourceTrust: null,
+        executionPolicy: null,
+      });
+      expect(
+        (await f.commentsOf(trusted!.issue.id)).map((comment) => comment.body),
+      ).toEqual(["verified follow-up"]);
+    });
+
     it("resolves role-scoped secrets only in the trusted task while the guest allowlist stays closed", async () => {
       const { secretService } = await import("../services/secrets.js");
       const f = await laneFixture("secrets");
@@ -73194,7 +73232,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).not.toContainEqual(expect.stringContaining("after revocation"));
     });
 
-    it.each(["both lanes busy", "only the guest lane busy"] as const)(
+    it.each([
+      "both lanes busy",
+      "only the guest lane busy",
+      "only the guest lane queued",
+    ] as const)(
       "aims a linked user's Slack Stop at the right lane when %s",
       async (busy) => {
       // Slack validates Stop events against its real id shapes.
@@ -73255,10 +73297,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
       const verifiedRun =
         busy === "both lanes busy" ? await seedRun(verified!.issue.id) : null;
-      const guestRun = await seedRun(guest!.issue.id);
+      const guestRun =
+        busy === "only the guest lane queued"
+          ? null
+          : await seedRun(guest!.issue.id);
       const expectedRun = verifiedRun ?? guestRun;
       const expectedIssue =
         verifiedRun === null ? guest!.issue.id : verified!.issue.id;
+      let queuedWakeId: string | null = null;
+      // Inbound setup messages leave queued wakeups; isolate each Stop case to
+      // the run or wakeup seeded below.
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, f.fixture.companyId),
+            eq(agentWakeupRequests.agentId, f.fixture.assignedAgentId),
+            inArray(agentWakeupRequests.status, [
+              "queued",
+              "deferred_issue_execution",
+            ]),
+          ),
+        );
+      if (busy === "only the guest lane queued") {
+        const [queuedWake] = await db
+          .insert(agentWakeupRequests)
+          .values({
+            companyId: f.fixture.companyId,
+            agentId: f.fixture.assignedAgentId,
+            source: "assignment",
+            status: "queued",
+            payload: { issueId: guest!.issue.id },
+            requestedAt: new Date((stopSecond - 1) * 1_000),
+          })
+          .returning({ id: agentWakeupRequests.id });
+        queuedWakeId = queuedWake!.id;
+      }
       const workspaceId = (await f.service.get(f.endpoint.id)).providerAccountId;
       const body = JSON.stringify({
         type: "event_callback",
@@ -73285,8 +73360,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
       ).resolves.toMatchObject({ status: 202 });
 
-      expect(f.cancelRun).toHaveBeenCalledTimes(1);
-      expect(f.cancelRun.mock.calls[0]![0]).toBe(expectedRun);
+      if (expectedRun) {
+        expect(f.cancelRun).toHaveBeenCalledTimes(1);
+        expect(f.cancelRun.mock.calls[0]![0]).toBe(expectedRun);
+      } else {
+        expect(f.cancelRun).not.toHaveBeenCalled();
+      }
       const [stop] = await db
         .select()
         .from(chatActions)
@@ -73298,8 +73377,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         );
       expect(stop!.payload).toMatchObject({
         issueId: expectedIssue,
-        target: { id: expectedRun, kind: "run" },
+        target: expectedRun
+          ? { id: expectedRun, kind: "run" }
+          : { id: queuedWakeId, kind: "wakeup" },
       });
+      if (queuedWakeId) {
+        await expect(
+          db
+            .select({ status: agentWakeupRequests.status })
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, queuedWakeId)),
+        ).resolves.toEqual([{ status: "cancelled" }]);
+      }
     },
     );
   });

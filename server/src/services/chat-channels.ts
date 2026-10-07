@@ -26305,7 +26305,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       );
       if (!currentEndpoint || currentEndpoint.provider !== "slack") return null;
 
-      const conversation = await tx
+      const conversations = await tx
         .select({ conversation: chatConversations, issue: issues })
         .from(chatConversations)
         .innerJoin(
@@ -26324,19 +26324,61 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ),
         )
         .orderBy(desc(chatConversations.sessionGeneration))
-        .for("update", { of: chatConversations })
-        .then((rows) => {
-          if (rows[0]?.conversation.isDirectMessage)
-            return rows[0].conversation;
-          // A thread can hold one task per trust lane. Only a linked user may
-          // Stop (a guest's Stop is denied when it executes), so prefer the
-          // verified lane, among the tasks that have a run in flight.
-          const busy = rows.filter((row) => row.issue.executionRunId !== null);
-          return (
-            invokerLaneRow(busy.length > 0 ? busy : rows, true)?.conversation ??
-            null
+        .for("update", { of: chatConversations });
+      const conversation = await (async () => {
+        if (conversations[0]?.conversation.isDirectMessage)
+          return conversations[0].conversation;
+        if (conversations.length === 0) return null;
+
+        const issueIds = conversations.map((row) => row.issue.id);
+        // An issue with a current run is represented by that run, not stale queued wakes.
+        const queuedWakeIssues = await tx
+          .select({ issueId: issues.id })
+          .from(agentWakeupRequests)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.companyId, agentWakeupRequests.companyId),
+              inArray(issues.id, issueIds),
+              isNull(issues.executionRunId),
+              or(
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issues.id}::text`,
+                sql`${agentWakeupRequests.payload}->>'taskId' = ${issues.id}::text`,
+                sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId' = ${issues.id}::text`,
+                sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId' = ${issues.id}::text`,
+              ),
+            ),
+          )
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, currentEndpoint.companyId),
+              eq(agentWakeupRequests.agentId, currentEndpoint.assignedAgentId),
+              inArray(agentWakeupRequests.status, [
+                "queued",
+                "deferred_issue_execution",
+              ]),
+              isNull(agentWakeupRequests.runId),
+              lte(agentWakeupRequests.requestedAt, event.occurredAt),
+            ),
           );
-        });
+        const queuedIssueIds = new Set(
+          queuedWakeIssues.map((row) => row.issueId),
+        );
+        // A thread can hold one task per trust lane. Only a linked user may
+        // Stop (a guest's Stop is denied when it executes), so prefer the
+        // verified lane among tasks with a run or queued wake in flight.
+        const withWork = conversations.filter(
+          (row) =>
+            row.issue.executionRunId !== null ||
+            queuedIssueIds.has(row.issue.id),
+        );
+        return (
+          invokerLaneRow(
+            withWork.length > 0 ? withWork : conversations,
+            true,
+          )?.conversation ?? null
+        );
+      })();
       const principal = await tx
         .select()
         .from(chatExternalPrincipals)

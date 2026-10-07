@@ -15,14 +15,14 @@ const row = (name: string, issue: typeof guest | typeof verified) => ({
 });
 
 describe("chat trust lanes", () => {
-  it("treats only a quarantined low-trust stamp as the guest lane", () => {
+  it("keeps a promoted low-trust task in the guest lane", () => {
     expect(chatTrustLaneOfIssue(guest)).toBe("guest");
     expect(chatTrustLaneOfIssue(verified)).toBe("verified");
     expect(
       chatTrustLaneOfIssue({
         sourceTrust: { ...guest.sourceTrust, disposition: "promoted" },
       }),
-    ).toBe("verified");
+    ).toBe("guest");
   });
 
   describe("invokerLaneRow", () => {

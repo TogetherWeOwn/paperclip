@@ -3,17 +3,16 @@ import type { issues } from "@paperclipai/db";
 
 /**
  * The authority a chat-bound task executes under. Admitting a sponsored guest
- * stamps the task as quarantined and attaches the low-trust policy; chat
- * ingress never clears that stamp, so the lane is a property of the task and
- * not of whoever spoke last.
+ * stamps the task with the low-trust preset. Promoting that task's output
+ * changes its disposition, not its execution lane, so the lane is a property
+ * of the task and not of whoever spoke last.
  */
 export type ChatTrustLane = "guest" | "verified";
 
 export function chatTrustLaneOfIssue(
   issue: Pick<typeof issues.$inferSelect, "sourceTrust">,
 ): ChatTrustLane {
-  return issue.sourceTrust?.preset === LOW_TRUST_REVIEW_PRESET &&
-    issue.sourceTrust.disposition === "quarantined"
+  return issue.sourceTrust?.preset === LOW_TRUST_REVIEW_PRESET
     ? "guest"
     : "verified";
 }
