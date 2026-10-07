@@ -35,6 +35,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const originalApiUrl = process.env.PAPERCLIP_API_URL;
+  const originalGatewayTokenTtl = process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-runtime-mcp-");
@@ -44,6 +45,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   afterEach(async () => {
     if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = originalApiUrl;
+    if (originalGatewayTokenTtl === undefined) delete process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS;
+    else process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS = originalGatewayTokenTtl;
     await db.delete(toolMcpGatewayTokens);
     await db.delete(activityLog);
     await db.delete(toolAccessAuditEvents);
@@ -160,8 +163,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     for (const token of tokens) {
       expect(token.subjectType).toBe("heartbeat_run");
       expect(token.subjectId).toMatch(/^[0-9a-f-]{36}$/);
-      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 59 * 60 * 1000);
-      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 61 * 60 * 1000);
+      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 23 * 60 * 60 * 1000);
+      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 25 * 60 * 60 * 1000);
     }
     expect(JSON.stringify(tokens)).not.toContain(first[0]!.token);
 
@@ -555,10 +558,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       targetId: agent!.id,
     });
 
+    const runId = randomUUID();
+    const before = Date.now();
     const config = await createManagedMcpRunConfig({
       db,
       agent: agent!,
-      runId: randomUUID(),
+      runId,
       config: {},
       projectId: null,
       issueId: null,
@@ -571,5 +576,12 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       endpointPath: `/mcp/gateways/${gateways[0]!.gatewayPublicId}`,
     });
     expect(config?.gateways.some((gateway) => gateway.id === gateways[1]!.id)).toBe(false);
+
+    const managedTokens = await db.select().from(toolMcpGatewayTokens)
+      .where(eq(toolMcpGatewayTokens.subjectId, runId));
+    expect(managedTokens).toHaveLength(1);
+    expect(managedTokens[0]!.subjectType).toBe("heartbeat_run");
+    expect(managedTokens[0]!.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 23 * 60 * 60 * 1000);
+    expect(managedTokens[0]!.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 25 * 60 * 60 * 1000);
   });
 });
