@@ -119,6 +119,82 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     expect(mapped.errorMeta).toEqual({ category: "auth", errorName: "Error" });
   });
 
+  it.each([
+    [
+      "the planner's literal stream disconnect",
+      "API Error: stream error: stream disconnected before completion: stream closed before response.completed",
+      "acpx_turn_failed",
+    ],
+    [
+      "an OAuth-prefixed stream disconnect",
+      "OAuth stream error: stream disconnected before completion",
+      "acpx_turn_failed",
+    ],
+    [
+      "an equivalent stream closure",
+      "Stream closed before response.completed",
+      "acpx_turn_failed",
+    ],
+    [
+      "an explicit authentication failure",
+      "API Error: 401 Invalid bearer token. Authentication failed.",
+      "claude_auth_required",
+    ],
+    [
+      "an ambiguous provider failure",
+      "Provider request ended without a terminal response",
+      "acpx_turn_failed",
+    ],
+  ] as const)(
+    "classifies %s without inventing an authentication failure",
+    (_case, errorMessage, expectedCode) => {
+      const result: AdapterExecutionResult = {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage,
+        errorCode: "acpx_auth_required",
+        errorMeta: { category: "auth", errorName: "Error", phase: "turn" },
+      };
+
+      const mapped = mapClaudeAcpAuthErrorCode(result);
+
+      expect(mapped.errorCode).toBe(expectedCode);
+      expect(mapped.errorMeta?.category).toBe(
+        expectedCode === "claude_auth_required" ? "auth" : "runtime",
+      );
+    },
+  );
+
+  it("keeps an explicit authentication error class despite a stream message", () => {
+    const result: AdapterExecutionResult = {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "stream disconnected before completion",
+      errorCode: "acpx_auth_required",
+      errorMeta: { category: "auth", errorName: "AuthenticationError", phase: "turn" },
+    };
+
+    expect(mapClaudeAcpAuthErrorCode(result).errorCode).toBe("claude_auth_required");
+  });
+
+  it("keeps the typed ACP access failure on the auth gate with its generic message", () => {
+    const result: AdapterExecutionResult = {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "ACP agent reported a terminal access failure.",
+      errorCode: "acpx_auth_required",
+      resultJson: { terminalSessionFailure: { category: "access" } },
+    };
+
+    const mapped = mapClaudeAcpAuthErrorCode(result);
+
+    expect(mapped.errorCode).toBe("claude_auth_required");
+    expect(mapped.errorMessage).toBe("Claude sign-in failed. Sign in again and try again.");
+  });
+
   it("leaves a different error code unchanged", () => {
     const engineResult: AdapterExecutionResult = {
       exitCode: 1,

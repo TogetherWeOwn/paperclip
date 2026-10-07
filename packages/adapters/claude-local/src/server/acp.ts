@@ -353,9 +353,10 @@ function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExe
 }
 
 /**
- * The generic error code the shared acpx engine emits when a run fails because
- * the agent has no ready authentication. The shared engine stays vendor-neutral,
- * so it keeps this generic code. See `adapter-utils/acpx-engine/execute.ts`.
+ * The generic error code the shared acpx engine emits for auth-like failures.
+ * The shared engine stays vendor-neutral; the Claude boundary validates explicit
+ * authentication evidence before translating this code. See
+ * `adapter-utils/acpx-engine/execute.ts`.
  */
 const ACPX_AUTH_REQUIRED_ERROR_CODE = "acpx_auth_required";
 
@@ -366,25 +367,78 @@ const ACPX_AUTH_REQUIRED_ERROR_CODE = "acpx_auth_required";
  */
 const CLAUDE_AUTH_REQUIRED_ERROR_CODE = "claude_auth_required";
 
+const CLAUDE_ACP_AUTH_FAILURE_PATTERNS = [
+  /\b(?:401|403)\b|\b(?:unauthorized|forbidden|access\s+denied|not\s+authorized|not\s+authenticated)\b/i,
+  /\b(?:authentication|authorization|auth)\b[\s_-]*(?:required|failed|failure|error|invalid|expired|revoked|missing|denied|rejected)\b/i,
+  /\b(?:failed|unable|could\s+not|cannot)\s+to?\s+authenticate\b/i,
+  /\b(?:missing|required|invalid|expired|revoked|rejected)\b[\s\S]{0,40}\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b/i,
+  /\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b[\s\S]{0,40}\b(?:missing|required|invalid|expired|revoked|rejected)\b/i,
+  /\b(?:permission|entitlement)\b.{0,40}\b(?:denied|missing|required|insufficient)\b/i,
+  /\binsufficient\b.{0,40}\b(?:permissions?|entitlements?)\b/i,
+  /\b(?:please\s+)?(?:log\s+in|login)\b.{0,40}\b(?:required|first|needed|to\s+authenticate)\b/i,
+  /\b(?:requires?|needs?|must)\s+(?:you\s+to\s+)?(?:log\s+in|login|authenticate)\b/i,
+];
+
+function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
+  const terminalFailure = result.resultJson?.terminalSessionFailure;
+  const terminalFailureCategory =
+    terminalFailure && typeof terminalFailure === "object"
+      ? asString((terminalFailure as Record<string, unknown>).category, "")
+      : "";
+  if (terminalFailureCategory === "access") return true;
+
+  const errorMeta = result.errorMeta ?? {};
+  const message = [
+    result.errorMessage ?? "",
+    asString(errorMeta.causeMessage, ""),
+  ].filter(Boolean).join("\n");
+  const authName = asString(errorMeta.errorName, "");
+
+  if (CLAUDE_ACP_AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(message))) return true;
+  const normalizedAuthName = authName.replace(/[^a-z]/gi, "").toLowerCase();
+  if (/^(?:auth|authentication|authorization|credential|credentials)(?:error|exception)$/.test(normalizedAuthName)) {
+    return true;
+  }
+
+  return detectClaudeLoginRequired({
+    parsed: { is_error: true, result: message },
+    stdout: "",
+    stderr: "",
+  }).requiresLogin;
+}
+
+function acpxNonAuthFailureCode(result: AdapterExecutionResult): string {
+  const phase = asString(result.errorMeta?.phase, "");
+  if (phase === "ensure_session") return "acpx_session_init_failed";
+  if (phase === "configure_session") return "acpx_session_config_failed";
+  if (phase === "turn") return "acpx_turn_failed";
+  return "acpx_runtime_error";
+}
+
 /**
  * Translate the generic acpx auth-required code into the Claude-specific code at
- * the claude-local boundary. The shared acpx engine reports the generic
- * `acpx_auth_required` code for every adapter. The user interface run gate reads
- * the Claude-specific `claude_auth_required` code, the same code the Claude CLI
- * lane emits. Without this translation the default ACP run never shows the login
- * prompt. Provider diagnostics stay intact; the generic terminal-access
- * fallback instead explains that Claude needs sign-in.
+ * the claude-local boundary only when the error includes explicit authentication
+ * evidence. The shared engine's generic code can be derived from message text;
+ * an incidental auth-related word must not make a stream or unknown failure open
+ * the Claude login gate. Non-auth failures retain their phase-specific ACP code.
  */
 export function mapClaudeAcpAuthErrorCode(
   result: AdapterExecutionResult,
 ): AdapterExecutionResult {
   if (result.errorCode !== ACPX_AUTH_REQUIRED_ERROR_CODE) return result;
+  if (hasClaudeAcpAuthEvidence(result)) {
+    return {
+      ...result,
+      errorCode: CLAUDE_AUTH_REQUIRED_ERROR_CODE,
+      ...(result.errorMessage === "ACP agent reported a terminal access failure."
+        ? { errorMessage: "Claude sign-in failed. Sign in again and try again." }
+        : {}),
+    };
+  }
   return {
     ...result,
-    errorCode: CLAUDE_AUTH_REQUIRED_ERROR_CODE,
-    ...(result.errorMessage === "ACP agent reported a terminal access failure."
-      ? { errorMessage: "Claude sign-in failed. Sign in again and try again." }
-      : {}),
+    errorCode: acpxNonAuthFailureCode(result),
+    errorMeta: { ...(result.errorMeta ?? {}), category: "runtime" },
   };
 }
 
