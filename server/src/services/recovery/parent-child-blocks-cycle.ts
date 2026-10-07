@@ -48,21 +48,56 @@ export interface ParentChildBlocksCycle {
   explicitPath: string[];
 }
 
-/** Hard bound so a degenerate graph cannot turn detection into a storm. */
-export const PARENT_CHILD_BLOCKS_CYCLE_SEARCH_LIMIT = 500;
-
 function buildBlockerAdjacency(
   relations: ParentChildBlocksRelation[],
-): Map<string, string[]> {
-  const adjacency = new Map<string, string[]>();
+): Map<string, Set<string>> {
+  const adjacency = new Map<string, Set<string>>();
   for (const relation of relations) {
     if (!relation.blockerIssueId || !relation.blockedIssueId) continue;
     if (relation.blockerIssueId === relation.blockedIssueId) continue;
-    const list = adjacency.get(relation.blockerIssueId) ?? [];
-    if (!list.includes(relation.blockedIssueId)) list.push(relation.blockedIssueId);
-    adjacency.set(relation.blockerIssueId, list);
+    const targets = adjacency.get(relation.blockerIssueId) ?? new Set<string>();
+    targets.add(relation.blockedIssueId);
+    adjacency.set(relation.blockerIssueId, targets);
   }
   return adjacency;
+}
+
+/**
+ * Breadth-first explicit `blocks` path from `fromId` to any target, inclusive
+ * of both ends. Returns null when none of the targets is reachable.
+ */
+export function findExplicitBlocksPathToAny(
+  relations: ParentChildBlocksRelation[],
+  fromId: string,
+  targetIds: string[],
+): { targetId: string; path: string[] } | null {
+  const targets = new Set(
+    targetIds.filter((targetId) => targetId && targetId !== fromId),
+  );
+  if (!fromId || targets.size === 0) return null;
+
+  const adjacency = buildBlockerAdjacency(relations);
+  const previous = new Map<string, string | null>([[fromId, null]]);
+  const queue = [fromId];
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index]!;
+    if (targets.has(current)) {
+      const path = [current];
+      let node: string | null | undefined = previous.get(current);
+      while (node) {
+        path.unshift(node);
+        node = previous.get(node);
+      }
+      return { targetId: current, path };
+    }
+    for (const next of adjacency.get(current) ?? []) {
+      if (!previous.has(next)) {
+        previous.set(next, current);
+        queue.push(next);
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -75,32 +110,7 @@ export function findExplicitBlocksPath(
   fromId: string,
   toId: string,
 ): string[] | null {
-  if (!fromId || !toId || fromId === toId) return null;
-  const adjacency = buildBlockerAdjacency(relations);
-  const previous = new Map<string, string | null>([[fromId, null]]);
-  const queue = [fromId];
-  let visited = 0;
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    visited += 1;
-    if (visited > PARENT_CHILD_BLOCKS_CYCLE_SEARCH_LIMIT) return null;
-    if (current === toId) {
-      const path = [current];
-      let node: string | null | undefined = previous.get(current);
-      while (node) {
-        path.unshift(node);
-        node = previous.get(node);
-      }
-      return path;
-    }
-    for (const next of adjacency.get(current) ?? []) {
-      if (!previous.has(next)) {
-        previous.set(next, current);
-        queue.push(next);
-      }
-    }
-  }
-  return null;
+  return findExplicitBlocksPathToAny(relations, fromId, [toId])?.path ?? null;
 }
 
 /**

@@ -6200,6 +6200,161 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("parks a cyclic parent/child continuation once and resolves its recovery action", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const childId = randomUUID();
+    const actionId = randomUUID();
+
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      parentId: issueId,
+      title: "Cyclic child",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: childId,
+      type: "blocks",
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target",
+      fingerprint: `cycle-test:${issueId}`,
+      evidence: {},
+      nextAction: "Record a durable disposition.",
+      wakePolicy: {
+        type: "bounded_owner_disposition_repair",
+        attempt: 1,
+        maxAttempts: 5,
+      },
+      attemptCount: 1,
+      maxAttempts: 5,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const firstSweep = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(firstSweep.waitingOnReviewResolved).toBe(1);
+    expect(firstSweep.issueIds).toContain(issueId);
+    const parkedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parkedIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0] ?? null);
+    expect(action).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+      resolutionNote: "parent_child_blocks_cycle",
+    });
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain(`${issuePrefix}-1 --blocks--> ${issuePrefix}-2`);
+    expect(comments[0]?.body).toContain(`${issuePrefix}-1 -> ${issuePrefix}-2 -> ${issuePrefix}-1`);
+    expect(comments[0]?.body).toContain("No further automatic action");
+    expect(comments[0]?.body).toContain("parent_child_blocks_cycle:");
+
+    const secondSweep = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondSweep.waitingOnReviewResolved).toBe(0);
+    expect(secondSweep.continuationRequeued).toBe(0);
+    expect(secondSweep.escalated).toBe(0);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId)),
+    ).resolves.toMatchObject([
+      expect.objectContaining({ status: "resolved", outcome: "blocked" }),
+    ]);
+  });
+
+  it("parks cycle errors from existing requested blockers without rethrowing", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const blockerId = randomUUID();
+
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Existing blocker in malformed cycle",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values([
+      { companyId, issueId, relatedIssueId: blockerId, type: "blocks" },
+      { companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" },
+    ]);
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(1);
+    const parkedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parkedIssue?.status).toBe("blocked");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain(
+      `${issuePrefix}-1 -> ${issuePrefix}-2 -> ${issuePrefix}-1`,
+    );
+    expect(comments[0]?.body).toContain("requested dependency wait would create a blocker cycle");
+    expect(comments[0]?.body).toContain(`recovery_blocks_cycle:${issueId}`);
+
+    const secondSweep = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(secondSweep.waitingOnReviewResolved).toBe(0);
+    expect(secondSweep.continuationRequeued).toBe(0);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+    ).resolves.toHaveLength(1);
+  });
+
   it("converts a continuation parked for review into a dependency wait on its existing blockers", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

@@ -4,6 +4,7 @@ import {
   buildParentChildBlocksCycleNotice,
   findAllParentChildBlocksCycles,
   findExplicitBlocksPath,
+  findExplicitBlocksPathToAny,
   findParentChildBlocksCycle,
   parentChildBlocksCycleMarker,
 } from "./parent-child-blocks-cycle.js";
@@ -45,6 +46,27 @@ describe("parent/child + blocks cycle detection", () => {
       "x-id",
       "c-id",
     ]);
+    expect(
+      findExplicitBlocksPathToAny(relations, "p-id", ["missing-id", "c-id"]),
+    ).toEqual({ targetId: "c-id", path: ["p-id", "x-id", "c-id"] });
+  });
+
+  it("finds cycles beyond the former bounded search depth", () => {
+    const pathLength = 600;
+    const relations = Array.from({ length: pathLength }, (_, index) => ({
+      blockerIssueId: `issue-${index}`,
+      blockedIssueId: `issue-${index + 1}`,
+    }));
+
+    const path = findExplicitBlocksPath(
+      relations,
+      "issue-0",
+      `issue-${pathLength}`,
+    );
+
+    expect(path).toHaveLength(pathLength + 1);
+    expect(path?.[0]).toBe("issue-0");
+    expect(path?.at(-1)).toBe(`issue-${pathLength}`);
   });
 
   it("reports no cycle when the child is not blocked by the parent", () => {

@@ -138,7 +138,7 @@ import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   buildParentChildBlocksCycleNotice,
-  findParentChildBlocksCycle,
+  findExplicitBlocksPathToAny,
   parentChildBlocksCycleMarker,
   type ParentChildBlocksCycle,
   type ParentChildBlocksRelation,
@@ -2920,48 +2920,114 @@ export function recoveryService(
     );
     if (candidates.length === 0) return null;
     const relations = await blocksRelationsForCompany(issue.companyId);
-    for (const childId of candidates) {
-      const cycle = findParentChildBlocksCycle(relations, issue.id, childId);
-      if (cycle) return cycle;
-    }
-    return null;
+    const match = findExplicitBlocksPathToAny(
+      relations,
+      issue.id,
+      candidates,
+    );
+    return match
+      ? {
+          parentId: issue.id,
+          childId: match.targetId,
+          explicitPath: match.path,
+        }
+      : null;
+  }
+
+  async function findBlockingCycleForRequestedBlockers(
+    issue: typeof issues.$inferSelect,
+    blockerIssueIds: string[],
+    childIds: string[],
+  ): Promise<{
+    cycle: ParentChildBlocksCycle | null;
+    explicitPath: string[] | null;
+  }> {
+    const candidates = [...new Set(blockerIssueIds)].filter(
+      (blockerIssueId) => blockerIssueId && blockerIssueId !== issue.id,
+    );
+    if (candidates.length === 0) return { cycle: null, explicitPath: null };
+
+    const relations = await blocksRelationsForCompany(issue.companyId);
+    const match = findExplicitBlocksPathToAny(
+      relations,
+      issue.id,
+      candidates,
+    );
+    if (!match) return { cycle: null, explicitPath: null };
+
+    const cycle = childIds.includes(match.targetId)
+      ? {
+          parentId: issue.id,
+          childId: match.targetId,
+          explicitPath: match.path,
+        }
+      : null;
+    return { cycle, explicitPath: match.path };
   }
 
   /**
-   * Park a parent/child + blocks cycle: post one idempotent notice naming
-   * the cycle members and edges, and take no further automatic action. The
-   * marker keeps repeated startup/periodic sweeps from posting (or
-   * re-arming) again — no retry storm.
+   * Park a cycle rejected by blocker validation. The issue is moved to
+   * `blocked` without adding an edge, any active recovery action is resolved
+   * as blocked, and one marker-tagged notice records the manual repair path.
    */
-  async function parkParentChildBlocksCycle(
+  async function parkBlockingCycle(
     issue: typeof issues.$inferSelect,
-    cycle: ParentChildBlocksCycle,
-  ): Promise<void> {
-    const marker = parentChildBlocksCycleMarker(cycle);
-    const pathIssues =
-      cycle.explicitPath.length > 0
-        ? await db
-            .select({
-              id: issues.id,
-              identifier: issues.identifier,
-              parentId: issues.parentId,
-            })
-            .from(issues)
-            .where(
-              and(
-                eq(issues.companyId, issue.companyId),
-                inArray(issues.id, [...new Set(cycle.explicitPath)]),
-              ),
-            )
-        : [];
-    const notice = buildParentChildBlocksCycleNotice(
-      cycle,
-      pathIssues.map((row) => ({
-        id: row.id,
-        identifier: row.identifier,
-        parentId: row.parentId,
-      })),
+    options: {
+      cycle?: ParentChildBlocksCycle | null;
+      explicitPath?: string[] | null;
+    },
+  ): Promise<{
+    parkedIssue: typeof issues.$inferSelect | null;
+    recoveryActionResolved: boolean;
+  }> {
+    const [current] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)),
+      )
+      .limit(1);
+    if (!current || current.status === "done" || current.status === "cancelled") {
+      return { parkedIssue: null, recoveryActionResolved: false };
+    }
+
+    const cycle = options.cycle ?? null;
+    const explicitPath = cycle?.explicitPath ?? options.explicitPath ?? null;
+    const marker = cycle
+      ? parentChildBlocksCycleMarker(cycle)
+      : `recovery_blocks_cycle:${issue.id}`;
+    const pathIssues = explicitPath?.length
+      ? await db
+          .select({ id: issues.id, identifier: issues.identifier })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              inArray(issues.id, [...new Set(explicitPath)]),
+            ),
+          )
+      : [];
+    const labels = new Map(
+      pathIssues.map((row) => [row.id, row.identifier ?? row.id]),
     );
+    const issueLabel = issue.identifier ?? issue.id;
+    const notice = cycle
+      ? buildParentChildBlocksCycleNotice(
+          cycle,
+          pathIssues.map((row) => ({
+            id: row.id,
+            identifier: row.identifier,
+            parentId: null,
+          })),
+        )
+      : `Paperclip parked automatic recovery here because the requested dependency wait would create a blocker cycle. ` +
+        `No dependency edge was added.\n\n${
+          explicitPath?.length
+            ? `Existing blocks path: ${explicitPath.map((id) => labels.get(id) ?? id).join(" -> ")} -> ${issueLabel}.`
+            : "The blocker graph changed during recovery, so its exact cycle path is no longer available."
+        }\n\n` +
+        "No further automatic action will be taken on this issue. To unblock manually: repair the blocker relations, then move the issue back to todo.\n\n" +
+        `(${marker})`;
     const alreadyParked = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -2974,6 +3040,9 @@ export function recoveryService(
       .orderBy(desc(issueComments.createdAt))
       .limit(50)
       .then((rows) => rows.some((row) => (row.body ?? "").includes(marker)));
+
+    const parkedIssue = await issuesSvc.update(issue.id, { status: "blocked" });
+    if (!parkedIssue) return { parkedIssue: null, recoveryActionResolved: false };
     if (!alreadyParked) {
       await issuesSvc.addComment(
         issue.id,
@@ -2982,19 +3051,59 @@ export function recoveryService(
         {
           authorType: "system",
           presentation: compactRecoveryPresentation(
-            "Recovery: parent/child blocks cycle — parked",
+            "Recovery: blocker cycle — parked",
           ),
         },
       );
     }
+    if (current.status !== "blocked") {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: "blocked",
+          previousStatus: current.status,
+          source: "recovery.park_blocking_cycle",
+        },
+      });
+    }
+
+    const activeAction = await recoveryActionsSvc.getActiveForIssue(
+      issue.companyId,
+      issue.id,
+    );
+    const recoveryActionResolved = activeAction
+      ? Boolean(
+          await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: issue.companyId,
+            sourceIssueId: issue.id,
+            actionId: activeAction.id,
+            status: "resolved",
+            outcome: "blocked",
+            resolutionNote: cycle
+              ? "parent_child_blocks_cycle"
+              : "blocking_cycle",
+          }),
+        )
+      : false;
+
     logger.warn(
       {
-        parentIssueId: cycle.parentId,
-        childIssueId: cycle.childId,
-        explicitPath: cycle.explicitPath,
+        issueId: issue.id,
+        parentIssueId: cycle?.parentId,
+        childIssueId: cycle?.childId,
+        explicitPath,
       },
-      "recovery parked a parent/child blocks cycle instead of materializing the dependency edge",
+      "recovery parked a blocker cycle instead of materializing the dependency edge",
     );
+    return { parkedIssue, recoveryActionResolved };
   }
 
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
@@ -3053,8 +3162,13 @@ export function recoveryService(
       openChildren.map((row) => row.id),
     );
     if (openChildCycle) {
-      await parkParentChildBlocksCycle(issue, openChildCycle);
-      return issue;
+      const parked = await parkBlockingCycle(issue, { cycle: openChildCycle });
+      return parked.parkedIssue
+        ? {
+            issue: parked.parkedIssue,
+            cycleParked: "parent_child_blocks_cycle" as const,
+          }
+        : null;
     }
 
     let updated: typeof issue | null;
@@ -3065,13 +3179,20 @@ export function recoveryService(
       });
     } catch (error) {
       if (!isBlocksCycleError(error)) throw error;
-      const racedCycle = await findOpenChildBlocksCycle(
+      const racedCycle = await findBlockingCycleForRequestedBlockers(
         issue,
+        blockedByIssueIds,
         openChildren.map((row) => row.id),
       );
-      if (!racedCycle) throw error;
-      await parkParentChildBlocksCycle(issue, racedCycle);
-      return issue;
+      const parked = await parkBlockingCycle(issue, racedCycle);
+      return parked.parkedIssue
+        ? {
+            issue: parked.parkedIssue,
+            cycleParked: racedCycle.cycle
+              ? ("parent_child_blocks_cycle" as const)
+              : ("blocking_cycle" as const),
+          }
+        : null;
     }
     if (!updated) return null;
 
@@ -3135,7 +3256,7 @@ export function recoveryService(
         blockedByIssueIds,
       },
     });
-    return updated;
+    return { issue: updated, cycleParked: null };
   }
 
   function readDispositionRepairAttempt(latestRun: LatestIssueRun) {
@@ -3169,7 +3290,10 @@ export function recoveryService(
       sourceIssueId: issue.id,
       actionId: active.id,
       status: "resolved",
-      outcome: "restored",
+      outcome:
+        reason === "parent_child_blocks_cycle" || reason === "blocking_cycle"
+          ? "blocked"
+          : "restored",
       resolutionNote: reason,
     });
     await logActivity(db, {
@@ -3617,16 +3741,10 @@ export function recoveryService(
             healthyChildren.map((child) => child.id),
           );
           if (healthyChildCycle) {
-            await parkParentChildBlocksCycle(issue, healthyChildCycle);
-            const parked = await recoveryActionsSvc.resolveActiveForIssue({
-              companyId: action.companyId,
-              sourceIssueId: action.sourceIssueId,
-              actionId: action.id,
-              status: "resolved",
-              outcome: "blocked",
-              resolutionNote: "parent_child_blocks_cycle",
+            const parked = await parkBlockingCycle(issue, {
+              cycle: healthyChildCycle,
             });
-            if (parked) {
+            if (parked.recoveryActionResolved) {
               result.resolved += 1;
               result.issueIds.push(issue.id);
             } else {
@@ -3638,33 +3756,26 @@ export function recoveryService(
             issue.companyId,
             issue.id,
           );
+          const requestedBlockerIds = [
+            ...new Set([
+              ...blockerIds,
+              ...healthyChildren.map((child) => child.id),
+            ]),
+          ];
           try {
             await issuesSvc.update(issue.id, {
               status: "blocked",
-              blockedByIssueIds: [
-                ...new Set([
-                  ...blockerIds,
-                  ...healthyChildren.map((child) => child.id),
-                ]),
-              ],
+              blockedByIssueIds: requestedBlockerIds,
             });
           } catch (error) {
             if (!isBlocksCycleError(error)) throw error;
-            const racedCycle = await findOpenChildBlocksCycle(
+            const racedCycle = await findBlockingCycleForRequestedBlockers(
               issue,
+              requestedBlockerIds,
               healthyChildren.map((child) => child.id),
             );
-            if (!racedCycle) throw error;
-            await parkParentChildBlocksCycle(issue, racedCycle);
-            const parked = await recoveryActionsSvc.resolveActiveForIssue({
-              companyId: action.companyId,
-              sourceIssueId: action.sourceIssueId,
-              actionId: action.id,
-              status: "resolved",
-              outcome: "blocked",
-              resolutionNote: "parent_child_blocks_cycle",
-            });
-            if (parked) {
+            const parked = await parkBlockingCycle(issue, racedCycle);
+            if (parked.recoveryActionResolved) {
               result.resolved += 1;
               result.issueIds.push(issue.id);
             } else {
@@ -3985,7 +4096,7 @@ export function recoveryService(
     if (dependencyWait) {
       await resolveDispositionRepairActionAsCovered(
         current,
-        "dependency_wait_created",
+        dependencyWait.cycleParked ?? "dependency_wait_created",
       );
       return "covered";
     }
