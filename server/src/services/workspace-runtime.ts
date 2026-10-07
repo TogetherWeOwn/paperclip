@@ -32,7 +32,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
@@ -1327,6 +1327,87 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
+function worktreePathVariants(worktreePath: string) {
+  const variants = new Set([worktreePath, path.resolve(worktreePath)]);
+  try {
+    variants.add(realpathSync(worktreePath));
+  } catch {
+    // A path that cannot be resolved is matched as written.
+  }
+  return [...variants];
+}
+
+function escapeLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * Refuses while a runtime service could see the worktree's files change. It
+ * does not rely on a known execution workspace id: a fresh realization has no
+ * row yet, and a path can be shared by several rows. A service counts when it
+ * belongs to any open workspace row at the path (including the caller's own
+ * id), or when its own working directory is the path or inside it.
+ */
+async function assertNoRuntimeServiceInWorktree(input: {
+  db: Db;
+  companyId: string;
+  worktreePath: string;
+  executionWorkspaceId: string | null;
+  evidence: GitWorktreeBranchIncoherenceEvidence;
+  repairLabel: string;
+}) {
+  const variants = worktreePathVariants(input.worktreePath);
+  const pathMatches = variants.flatMap((value) => [
+    eq(executionWorkspaces.providerRef, value),
+    eq(executionWorkspaces.cwd, value),
+  ]);
+  const workspaceRows = await input.db
+    .select()
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.companyId, input.companyId),
+      isNull(executionWorkspaces.closedAt),
+      ne(executionWorkspaces.status, "archived"),
+      or(
+        ...pathMatches,
+        ...(input.executionWorkspaceId ? [eq(executionWorkspaces.id, input.executionWorkspaceId)] : []),
+      ),
+    ));
+
+  let activeService: { id: string; serviceName: string; status: string } | null = null;
+  for (const workspace of workspaceRows) {
+    activeService = await findActiveRuntimeServiceBlockingDirtyQuarantine({ db: input.db, workspace });
+    if (activeService) break;
+  }
+  if (!activeService) {
+    const cwdMatches = variants.flatMap((value) => [
+      eq(workspaceRuntimeServices.cwd, value),
+      like(workspaceRuntimeServices.cwd, `${escapeLikePattern(value.replace(/\/+$/, ""))}/%`),
+    ]);
+    const [service] = await input.db
+      .select({
+        id: workspaceRuntimeServices.id,
+        serviceName: workspaceRuntimeServices.serviceName,
+        status: workspaceRuntimeServices.status,
+      })
+      .from(workspaceRuntimeServices)
+      .where(and(
+        eq(workspaceRuntimeServices.companyId, input.companyId),
+        ne(workspaceRuntimeServices.status, "stopped"),
+        or(...cwdMatches),
+      ))
+      .orderBy(desc(workspaceRuntimeServices.updatedAt), desc(workspaceRuntimeServices.createdAt))
+      .limit(1);
+    activeService = service ?? null;
+  }
+  if (!activeService) return;
+
+  input.evidence.safeRepair.eligible = false;
+  input.evidence.safeRepair.reason =
+    `${input.repairLabel} requires runtime service "${activeService.serviceName}" (${activeService.id}) to be stopped; current status is ${activeService.status}`;
+  throw branchIncoherenceValidationFailure(input.evidence);
+}
+
 async function assertGitIndexIsUnlocked(worktreePath: string) {
   const indexLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
     .catch(() => null);
@@ -2054,15 +2135,16 @@ async function restoreCleanWorktreeToRecordedBranch(input: {
     const issueText = busyRun.issueIdentifier ? ` on ${busyRun.issueIdentifier}` : "";
     return refuse(`clean branch restore refused because run ${busyRun.id}${issueText} is running in this worktree`);
   }
-  if (evidence.executionWorkspaceId) {
-    // A runtime service started from this worktree would see its files change.
-    await assertDirtyQuarantineRuntimeServicesStopped({
-      db: input.db,
-      executionWorkspaceId: evidence.executionWorkspaceId,
-      evidence,
-      repairLabel: "clean branch restore",
-    });
-  }
+  // A runtime service started from this worktree would see its files change.
+  // Fresh realization has no workspace id yet, so the check goes by path.
+  await assertNoRuntimeServiceInWorktree({
+    db: input.db,
+    companyId,
+    worktreePath: input.worktreePath,
+    executionWorkspaceId: evidence.executionWorkspaceId,
+    evidence,
+    repairLabel: "clean branch restore",
+  });
 
   // Inspection ran before the checks above. Pin and switch only the HEAD that
   // exists now, so a commit made in that window is not left unreferenced.

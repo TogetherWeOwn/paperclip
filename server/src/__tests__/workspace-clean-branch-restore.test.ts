@@ -599,6 +599,113 @@ describeEmbeddedPostgres("clean worktree branch restore", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe("");
   }, 20_000);
 
+  describe("fresh realization, which has no execution workspace id yet", () => {
+    async function realizeFresh(ids: Awaited<ReturnType<typeof seed>>, input: {
+      repoRoot: string;
+      worktreePath: string;
+      expectedBranch: string;
+    }) {
+      return ensureGitWorktreeBranchCoherent({
+        db,
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        expectedBranchName: input.expectedBranch,
+        sourceIssue: { id: ids.sourceIssueId, identifier: ids.identifier, title: "Restore the recorded branch" },
+        executionWorkspaceId: null,
+        heartbeatRunId: ids.runId,
+        enableWorkspaceDirtyQuarantineRepair: true,
+      });
+    }
+
+    async function seedService(
+      ids: Awaited<ReturnType<typeof seed>>,
+      input: { cwd: string; executionWorkspaceId: string | null; status?: string },
+    ) {
+      await db.insert(workspaceRuntimeServices).values({
+        id: randomUUID(),
+        companyId: ids.companyId,
+        projectId: ids.projectId,
+        projectWorkspaceId: null,
+        executionWorkspaceId: input.executionWorkspaceId,
+        scopeType: input.executionWorkspaceId ? "execution_workspace" : "run",
+        scopeId: input.executionWorkspaceId,
+        serviceName: "dev-server",
+        status: input.status ?? "running",
+        lifecycle: "shared",
+        reuseKey: `dev-server-${randomUUID()}`,
+        command: "node server.js",
+        cwd: input.cwd,
+        provider: "local_process",
+        startedAt: new Date(),
+      });
+    }
+
+    async function closeWorkspaceRow(workspaceId: string) {
+      await db
+        .update(executionWorkspaces)
+        .set({ status: "archived", closedAt: new Date() })
+        .where(eq(executionWorkspaces.id, workspaceId));
+    }
+
+    it("refuses while a service of an open workspace row at the path is running", async () => {
+      const expectedBranch = "PAP-470-fresh-row-service";
+      const { repoRoot, worktreePath } = await createWorktreeOnRecordedBranch(expectedBranch);
+      await runGit(worktreePath, ["checkout", "--detach", "main"]);
+      const ids = await seed({ repoRoot, worktreePath, expectedBranch });
+      await seedService(ids, { cwd: worktreePath, executionWorkspaceId: ids.workspaceId });
+
+      const reason = await expectRefused(realizeFresh(ids, { repoRoot, worktreePath, expectedBranch }));
+
+      expect(reason).toContain('clean branch restore requires runtime service "dev-server"');
+      await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe("");
+    }, 20_000);
+
+    it("refuses while a service runs in the worktree and no workspace row points at it", async () => {
+      const expectedBranch = "PAP-470-fresh-cwd-service";
+      const { repoRoot, worktreePath } = await createWorktreeOnRecordedBranch(expectedBranch);
+      await runGit(worktreePath, ["checkout", "--detach", "main"]);
+      const ids = await seed({ repoRoot, worktreePath, expectedBranch });
+      await closeWorkspaceRow(ids.workspaceId);
+      await seedService(ids, { cwd: worktreePath, executionWorkspaceId: null });
+
+      const reason = await expectRefused(realizeFresh(ids, { repoRoot, worktreePath, expectedBranch }));
+
+      expect(reason).toContain('clean branch restore requires runtime service "dev-server"');
+      await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe("");
+    }, 20_000);
+
+    it("refuses while a service runs in a subdirectory of the worktree", async () => {
+      const expectedBranch = "PAP-470-fresh-subdir-service";
+      const { repoRoot, worktreePath } = await createWorktreeOnRecordedBranch(expectedBranch);
+      await runGit(worktreePath, ["checkout", "--detach", "main"]);
+      const ids = await seed({ repoRoot, worktreePath, expectedBranch });
+      await closeWorkspaceRow(ids.workspaceId);
+      await seedService(ids, { cwd: path.join(worktreePath, "packages", "web"), executionWorkspaceId: null });
+
+      const reason = await expectRefused(realizeFresh(ids, { repoRoot, worktreePath, expectedBranch }));
+
+      expect(reason).toContain('clean branch restore requires runtime service "dev-server"');
+    }, 20_000);
+
+    it("restores when the only services are stopped, elsewhere, or in a sibling directory", async () => {
+      const expectedBranch = "PAP-470-fresh-no-service";
+      const { repoRoot, worktreePath, expectedHead } = await createWorktreeOnRecordedBranch(expectedBranch);
+      await runGit(worktreePath, ["checkout", "--detach", "main"]);
+      const ids = await seed({ repoRoot, worktreePath, expectedBranch });
+      await closeWorkspaceRow(ids.workspaceId);
+      await seedService(ids, { cwd: worktreePath, executionWorkspaceId: null, status: "stopped" });
+      await seedService(ids, { cwd: path.join(path.dirname(worktreePath), "unrelated"), executionWorkspaceId: null });
+      // A name that only shares the worktree path as a prefix is another directory.
+      await seedService(ids, { cwd: `${worktreePath}-other`, executionWorkspaceId: null });
+
+      const result = await realizeFresh(ids, { repoRoot, worktreePath, expectedBranch });
+
+      expect(result.branchName).toBe(expectedBranch);
+      await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+      await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(expectedHead);
+    }, 20_000);
+  });
+
   it("does not repair a dirty operator-owned worktree", async () => {
     const expectedBranch = "PAP-470-operator-dirty";
     const { repoRoot, worktreePath } = await createWorktreeOnRecordedBranch(expectedBranch);
