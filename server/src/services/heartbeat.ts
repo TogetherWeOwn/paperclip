@@ -24509,8 +24509,10 @@ export function heartbeatService(
                   ) {
                     repairedExpectedBranchName = coherence.branchName;
                     executionWorkspace.branchName = coherence.branchName;
-                    executionWorkspace.warnings.push(...coherence.warnings);
                   }
+                  // A repair that keeps the recorded branch (a restore) still
+                  // changed the worktree, and its warning names any rescue branch.
+                  executionWorkspace.warnings.push(...coherence.warnings);
                 } catch (repairErr) {
                   const workspaceValidationFailure =
                     isWorkspaceValidationFailure(repairErr) ? repairErr : null;
