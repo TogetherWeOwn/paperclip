@@ -149,6 +149,7 @@ async function runExpensiveWorkspaceGit(
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true): Promise<GitWorkspaceSnapshot | null> {
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
   const repositoryWarnings: string[] = [];
+  const skippedRepositoryPaths: string[] = [];
   if (includeRepositories) {
     const root = path.join(localDir, PROJECT_REPOSITORIES_DIR);
     const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
@@ -165,7 +166,11 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
           // A nested checkout can lose its `.git` in transit (sync excludes
           // match at every depth) while its files survive. Skipping keeps the
           // enclosing workspace usable; run setup re-provisions the checkout.
+          // The skipped directory stays host-local via `ignoredPaths`: it is
+          // neither staged nor snapshotted, so restore must not read its
+          // absence in the sandbox as a deletion on the host.
           repositoryWarnings.push(`Project repository is not a Git checkout: ${relative}`);
+          skippedRepositoryPaths.push(relative);
           continue;
         }
         repositories.push({ path: relative, snapshot });
@@ -250,10 +255,11 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     deletedPaths: [...new Set([...splitNul(deletedResult.stdout),
       ...repositories.flatMap((repo) => repo.snapshot.deletedPaths.map((entry) => `${repo.path}/${entry}`))])]
       .sort((left, right) => left.localeCompare(right)),
-    ignoredPaths: [...splitNul(ignoredResult.stdout)
+    ignoredPaths: [...new Set([...splitNul(ignoredResult.stdout)
       .map((entry) => entry.replace(/\/+$/, ""))
       .filter((entry) => Boolean(entry) && !(repositories.length > 0 && entry === PROJECT_REPOSITORIES_DIR)),
-      ...repositories.flatMap((repo) => repo.snapshot.ignoredPaths.map((entry) => `${repo.path}/${entry}`))]
+      ...skippedRepositoryPaths,
+      ...repositories.flatMap((repo) => repo.snapshot.ignoredPaths.map((entry) => `${repo.path}/${entry}`))])]
       .sort((left, right) => left.localeCompare(right)),
     ...(repositories.length > 0 ? { repositories } : {}),
     ...(repositoryWarnings.length > 0 ? { repositoryWarnings } : {}),

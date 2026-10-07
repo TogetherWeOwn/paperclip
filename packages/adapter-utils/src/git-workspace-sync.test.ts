@@ -249,6 +249,9 @@ describe("git workspace sync", () => {
     expect(snapshot?.repositoryWarnings).toEqual([
       "Project repository is not a Git checkout: .paperclip-repositories/toolkit-abc123",
     ]);
+    // The skipped directory must stay host-local: restore treats anything
+    // missing from the sandbox and not ignored as a deletion.
+    expect(snapshot?.ignoredPaths).toContain(".paperclip-repositories/toolkit-abc123");
 
     // The warning-carrying snapshot still restores: healthy history lands, the
     // stripped entry is simply absent until setup re-provisions it.
