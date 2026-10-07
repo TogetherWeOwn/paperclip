@@ -25,6 +25,14 @@ helpers in [`src/ssh.ts`](./src/ssh.ts):
   syncs the remote cwd back into `localDir` after the run, including any new
   commits the agent created. Also runs with no `git remote` configured.
 
+For a Git-backed workspace with extra project repositories under
+`.paperclip-repositories/`, SSH sync transfers their working files but not their
+Git metadata. Direct restore preserves each local nested `.git` directory or
+gitfile while applying remote file changes and deletions. It does not transfer
+nested Git history or import nested commits. If the remote replaces a preserved
+metadata entry's ancestor with a file or symlink, restore rejects that conflict
+before clearing local working files. Plain-directory restore is unchanged.
+
 `prepareRemoteManagedRuntime` in
 [`src/remote-managed-runtime.ts`](./src/remote-managed-runtime.ts) wraps both
 calls for adapters that want a per-run remote workspace and an automatic

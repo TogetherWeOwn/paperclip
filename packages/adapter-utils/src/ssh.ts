@@ -10,6 +10,7 @@ import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remot
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  PROJECT_REPOSITORIES_DIR,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -583,18 +584,74 @@ async function runSshScript(
   );
 }
 
+// Preserve paths relative to localDir, including nested entries. Empty their
+// ancestors instead of removing them, so only the named entries survive.
 async function clearLocalDirectory(
   localDir: string,
-  preserveEntries: string[] = [],
+  preserveEntries: readonly string[] = [],
 ): Promise<void> {
   await fs.mkdir(localDir, { recursive: true });
-  const preserve = new Set(preserveEntries);
-  const entries = await fs.readdir(localDir);
-  await Promise.all(
-    entries
-      .filter((entry) => !preserve.has(entry))
-      .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
-  );
+  const preserve = preserveEntries.map((entry) => entry.replace(/^\.\//, "").replace(/\/+$/, ""));
+  const clear = async (relative: string): Promise<void> => {
+    const entries = await fs.readdir(relative ? path.join(localDir, relative) : localDir);
+    await Promise.all(
+      entries.map(async (entry) => {
+        const entryRelative = relative ? `${relative}/${entry}` : entry;
+        if (preserve.includes(entryRelative)) return;
+        const keepsDescendant = preserve.some((kept) => kept.startsWith(`${entryRelative}/`));
+        const entryPath = path.join(localDir, entryRelative);
+        if (keepsDescendant && (await fs.lstat(entryPath)).isDirectory()) {
+          await clear(entryRelative);
+          return;
+        }
+        await fs.rm(entryPath, { recursive: true, force: true });
+      }),
+    );
+  };
+  await clear("");
+}
+
+async function assertCompatiblePreservedAncestors(
+  stagingDir: string,
+  preserveEntries: readonly string[] = [],
+): Promise<void> {
+  for (const entry of preserveEntries) {
+    const parts = entry.replace(/^\.\//, "").replace(/\/+$/, "").split("/");
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      const relative = parts.slice(0, depth).join("/");
+      let metadata;
+      try {
+        metadata = await fs.lstat(path.join(stagingDir, relative));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+      if (!metadata.isDirectory()) {
+        throw new Error(`SSH sync-back cannot replace "${relative}" with a non-directory: it contains preserved local entries.`);
+      }
+    }
+  }
+}
+
+async function readNestedProjectGitEntries(localDir: string): Promise<string[]> {
+  const repositoriesDir = path.join(localDir, PROJECT_REPOSITORIES_DIR);
+  const lstatIfPresent = async (entryPath: string) => {
+    try {
+      return await fs.lstat(entryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  };
+  // Do not follow a symlink out of the local workspace.
+  if (!(await lstatIfPresent(repositoriesDir))?.isDirectory()) return [];
+  const entries = await fs.readdir(repositoriesDir, { withFileTypes: true });
+  const paths = await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
+    const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}/.git`;
+    const metadata = await lstatIfPresent(path.join(localDir, relative));
+    return metadata?.isDirectory() || metadata?.isFile() ? [relative] : [];
+  }));
+  return paths.flat();
 }
 
 async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
@@ -1490,6 +1547,7 @@ export async function syncDirectoryFromSsh(input: {
   localDir: string;
   exclude?: string[];
   preserveLocalEntries?: string[];
+  beforeApply?: () => Promise<void>;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -1590,6 +1648,10 @@ export async function syncDirectoryFromSsh(input: {
     });
     await progress?.finish();
 
+    // A remote file or symlink cannot replace an ancestor of kept metadata.
+    // Reject that conflict before clearing any local working files.
+    await assertCompatiblePreservedAncestors(stagingDir, input.preserveLocalEntries);
+    await input.beforeApply?.();
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
@@ -1712,18 +1774,23 @@ export async function restoreWorkspaceFromSshExecution(input: {
   const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
-    await exportGitWorkspaceFromSsh({
-      spec: input.spec,
-      remoteDir,
-      localDir: input.localDir,
-      onProgress: input.onProgress,
-    });
     await syncDirectoryFromSsh({
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
       exclude: [".git", ".paperclip-runtime"],
-      preserveLocalEntries: [".git"],
+      // Nested Git metadata was excluded from upload and download. Keep it
+      // locally, but replace the working files so remote deletions still apply.
+      preserveLocalEntries: [".git", ...await readNestedProjectGitEntries(input.localDir)],
+      // Import can reset local files, so defer it until staged paths are checked.
+      beforeApply: async () => {
+        await exportGitWorkspaceFromSsh({
+          spec: input.spec,
+          remoteDir,
+          localDir: input.localDir,
+          onProgress: input.onProgress,
+        });
+      },
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
