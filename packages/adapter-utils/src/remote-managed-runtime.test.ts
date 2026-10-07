@@ -95,6 +95,53 @@ describe("remote managed runtime", () => {
     expect(restoredAuth).toBe('{"token":"remote"}\n');
   });
 
+  it.each([
+    { gitBacked: false, label: "plain" },
+    { gitBacked: true, label: "git-backed" },
+  ])("captures the $label workspace baseline without the SSH agent-local scratch", async ({ gitBacked }) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-baseline-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(path.join(workspaceDir, ".claude", "worktrees", "wt"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "target", "debug"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "src", "commands", "target"), { recursive: true });
+    await writeFile(path.join(workspaceDir, ".claude", "worktrees", "wt", "work.txt"), "uncommitted\n");
+    await writeFile(path.join(workspaceDir, "node_modules", "dep", "index.js"), "module.exports = {};\n");
+    await writeFile(path.join(workspaceDir, "target", "debug", "binary"), "built\n");
+    await writeFile(path.join(workspaceDir, "src", "commands", "target", "index.ts"), "export {};\n");
+    await writeFile(path.join(workspaceDir, "keep.txt"), "keep\n");
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote",
+        remoteCwd: "/remote",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "KNOWN HOSTS",
+        strictHostKeyChecking: true,
+      },
+      runId: "run-baseline",
+      adapterKey: "codex",
+      workspaceLocalDir: workspaceDir,
+    });
+    await prepared.restoreWorkspace();
+
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
+      baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> };
+    };
+    const { exclude, entries } = restoreInput.baselineSnapshot;
+    expect(exclude).toEqual(expect.arrayContaining([".paperclip-runtime", ".claude/worktrees", "node_modules", "target"]));
+    // Root scratch is out of the baseline; nested source named like it stays in.
+    expect([...entries.keys()].filter((key) => /^(\.claude\/worktrees|node_modules|target)(\/|$)/.test(key))).toEqual([]);
+    expect(entries.has("src/commands/target/index.ts")).toBe(true);
+    expect(entries.has("keep.txt")).toBe(true);
+  });
+
   it("stages each additional project into its own isolated SSH dir, isolating one failure", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-additional-"));
     cleanupDirs.push(rootDir);
