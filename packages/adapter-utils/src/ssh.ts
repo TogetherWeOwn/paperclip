@@ -13,6 +13,12 @@ import {
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { shouldExcludePath } from "./exclude-patterns.js";
+import {
+  SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+  SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
+  toSshTarExcludes,
+} from "./ssh-workspace-excludes.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -422,19 +428,26 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
   };
 }
 
-// Agent-local scratch directories that are never workspace deliverables. They
-// are excluded from SSH workspace export and sync-back in both directions:
-// nested agent worktrees are full checkouts that can each hold their own build
-// outputs, and syncing them once cost a production host its root disk (a
-// sync-back staging copy grew until ENOSPC broke every agent on the host).
-// Rebuildable outputs stay out for the same reason; the remote run reinstalls
-// or rebuilds them instead of receiving them over the wire.
-export const SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES = [
-  ".paperclip-runtime",
-  ".claude/worktrees",
-  "node_modules",
-  "target",
-] as const;
+export { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES };
+
+/**
+ * Return `baseline` with the SSH agent-local scratch treated as out of scope
+ * for the restore merge. The sync-back no longer carries these paths, so a
+ * baseline that still lists them would make the merge read them as remote
+ * deletions and remove the local copies (including uncommitted work in nested
+ * agent worktrees). Dropping the entries and adding the excludes makes the
+ * merge ignore these paths on both sides, however the baseline was captured.
+ */
+export function withSshAgentLocalExcludes(baseline: DirectorySnapshot): DirectorySnapshot {
+  return {
+    exclude: [...new Set([...baseline.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],
+    entries: new Map(
+      [...baseline.entries].filter(
+        ([relative]) => !shouldExcludePath(relative, SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES),
+      ),
+    ),
+  };
+}
 
 /** Default bound on an SSH workspace sync-back payload, before any transfer. */
 export const SSH_SYNC_BACK_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
@@ -715,18 +728,32 @@ async function runSshScript(
   );
 }
 
+// Clear `localDir` ahead of a sync-back copy, keeping the listed entries. An
+// entry is a path relative to `localDir` and may be nested (`.claude/worktrees`):
+// its ancestors are emptied rather than removed so the preserved path survives.
 async function clearLocalDirectory(
   localDir: string,
-  preserveEntries: string[] = [],
+  preserveEntries: readonly string[] = [],
 ): Promise<void> {
   await fs.mkdir(localDir, { recursive: true });
-  const preserve = new Set(preserveEntries);
-  const entries = await fs.readdir(localDir);
-  await Promise.all(
-    entries
-      .filter((entry) => !preserve.has(entry))
-      .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
-  );
+  const preserve = preserveEntries.map((entry) => entry.replace(/^\.\//, "").replace(/\/+$/, ""));
+  const clear = async (relative: string): Promise<void> => {
+    const entries = await fs.readdir(relative ? path.join(localDir, relative) : localDir);
+    await Promise.all(
+      entries.map(async (entry) => {
+        const entryRelative = relative ? `${relative}/${entry}` : entry;
+        if (preserve.includes(entryRelative)) return;
+        const keepsDescendant = preserve.some((kept) => kept.startsWith(`${entryRelative}/`));
+        const entryPath = path.join(localDir, entryRelative);
+        if (keepsDescendant && (await fs.lstat(entryPath)).isDirectory()) {
+          await clear(entryRelative);
+          return;
+        }
+        await fs.rm(entryPath, { recursive: true, force: true });
+      }),
+    );
+  };
+  await clear("");
 }
 
 async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
@@ -1621,7 +1648,7 @@ export async function syncDirectoryFromSsh(input: {
   remoteDir: string;
   localDir: string;
   exclude?: string[];
-  preserveLocalEntries?: string[];
+  preserveLocalEntries?: readonly string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -1769,7 +1796,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1790,7 +1817,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1807,6 +1834,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   if (input.baselineSnapshot) {
+    // The sync-back never carries the agent-local scratch, so the merge must
+    // not read its absence as a remote deletion of the local copies.
+    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -1826,16 +1856,17 @@ export async function restoreWorkspaceFromSshExecution(input: {
         spec: input.spec,
         remoteDir,
         localDir: stagingDir,
-        // The baseline exclude comes from the generic snapshot path and does
-        // not know about SSH agent-local scratch; merge it in so this inner
-        // transfer (staging directory into staging directory) cannot carry
-        // nested worktrees or build outputs either.
-        exclude: [...new Set([...input.baselineSnapshot.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],
+        // The baseline exclude is merge grammar and may predate the SSH
+        // agent-local scratch; `baseline` has it merged in, and tar needs the
+        // scratch anchored to the root so this inner transfer (staging
+        // directory into staging directory) carries neither nested worktrees
+        // nor build outputs, yet keeps nested source named like them.
+        exclude: toSshTarExcludes(baseline.exclude),
         onProgress: input.onProgress,
         progressLabel: "workspace",
       });
       await mergeDirectoryWithBaseline({
-        baseline: input.baselineSnapshot,
+        baseline,
         sourceDir: stagingDir,
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
@@ -1873,8 +1904,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
-      preserveLocalEntries: [".git"],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      // Excluded from the download, so nothing replaces them: keep the local copies.
+      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1885,7 +1917,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

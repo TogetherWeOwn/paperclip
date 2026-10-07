@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readdir, readFile, rm, lstat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   assertSshSyncBackSizeWithinCap,
@@ -10,11 +12,13 @@ import {
   restoreWorkspaceFromSshExecution,
   SSH_SYNC_BACK_DEFAULT_MAX_BYTES,
   SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+  SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
   SshSyncBackSizeLimitExceededError,
   syncDirectoryFromSsh,
   syncDirectoryToSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
+import { toSshTarExcludes } from "./ssh-workspace-excludes.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 // A nested agent worktree plus build outputs once filled a production host's
@@ -36,6 +40,10 @@ eval "sh -c $rewritten"
 `;
 
 const TEST_TIMEOUT_MS = 30_000;
+// A git-backed round trip runs a dozen git processes locally and "remotely";
+// that is a few seconds on a developer machine and far slower on a loaded CI
+// host or a sandboxed filesystem.
+const GIT_ROUND_TRIP_TIMEOUT_MS = 180_000;
 const originalPath = process.env.PATH ?? "";
 const fixtureRoots: string[] = [];
 
@@ -145,7 +153,7 @@ describe("SSH workspace agent-local excludes", () => {
       spec,
       localDir,
       remoteDir: FAKE_REMOTE_ROOT,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     });
 
     await expect(readFile(path.join(fixtureDir, "keep.txt"))).resolves.toEqual(keep);
@@ -166,7 +174,7 @@ describe("SSH workspace agent-local excludes", () => {
       spec,
       remoteDir: FAKE_REMOTE_ROOT,
       localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     });
 
     await expect(readFile(path.join(localDir, "keep.txt"))).resolves.toEqual(Buffer.alloc(2048, 0x41));
@@ -239,6 +247,196 @@ describe("SSH workspace entry points", () => {
   }, TEST_TIMEOUT_MS);
 });
 
+const execFileAsync = promisify(execFile);
+const GIT_IDENTITY = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid"];
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", [...GIT_IDENTITY, ...args], { cwd });
+  return stdout;
+}
+
+async function writeTree(root: string, files: Record<string, string>): Promise<void> {
+  for (const [relative, content] of Object.entries(files)) {
+    const target = path.join(root, relative);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+}
+
+// Tracked source whose directory names collide with scratch names at depth.
+// Only the workspace-root `target/`, `node_modules/` and `.claude/worktrees/`
+// are scratch; none of these may ever be dropped or deleted.
+const NESTED_SOURCE_FILES: Record<string, string> = {
+  "keep.txt": "keep\n",
+  "src/commands/target/index.ts": "export const target = 1;\n",
+  "docs/target": "a plain file named target\n",
+  "packages/app/node_modules/vendored.js": "module.exports = 1;\n",
+  "packages/app/.claude/worktrees/notes.md": "tracked notes\n",
+};
+
+// Uncommitted agent work and rebuildable outputs at the workspace root. The
+// sync never carries these, so the restore must leave them exactly as they are.
+const ROOT_SCRATCH_FILES: Record<string, string> = {
+  ".claude/worktrees/wt/uncommitted.txt": "uncommitted agent work\n",
+  "node_modules/dep/index.js": "module.exports = {};\n",
+  "target/debug/binary": "built\n",
+};
+
+describe("SSH workspace excludes are anchored to the workspace root", () => {
+  it("exports a root-anchored tar grammar next to the merge grammar", () => {
+    expect([...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES]).toEqual(
+      SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((entry) => `./${entry}`),
+    );
+  });
+
+  it("anchors only the scratch names when translating a snapshot exclude list for tar", () => {
+    expect(toSshTarExcludes([".git", ".git/*", ".paperclip-runtime", "node_modules", "target", "dist"])).toEqual([
+      ".git",
+      ".git/*",
+      "./.paperclip-runtime",
+      "./node_modules",
+      "./target",
+      "dist",
+    ]);
+  });
+
+  it("export keeps nested source named like scratch and drops only the root scratch", async () => {
+    const localDir = await createFixtureRootDir("paperclip-anchor-export-local-");
+    await writeTree(localDir, { ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES });
+    const remoteDir = await createFixtureRootDir("paperclip-anchor-export-remote-");
+    const spec = buildStubSpec(remoteDir);
+
+    await syncDirectoryToSsh({
+      spec,
+      localDir,
+      remoteDir: FAKE_REMOTE_ROOT,
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    });
+
+    for (const relative of Object.keys(NESTED_SOURCE_FILES)) {
+      expect(await pathExists(path.join(remoteDir, relative)), relative).toBe(true);
+    }
+    for (const relative of Object.keys(ROOT_SCRATCH_FILES)) {
+      expect(await pathExists(path.join(remoteDir, relative)), relative).toBe(false);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  it("sync-back keeps nested source named like scratch and drops only the root scratch", async () => {
+    const remoteDir = await createFixtureRootDir("paperclip-anchor-back-remote-");
+    await writeTree(remoteDir, { ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES });
+    const spec = buildStubSpec(remoteDir);
+    const localDir = await createFixtureRootDir("paperclip-anchor-back-local-");
+
+    await syncDirectoryFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      localDir,
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    });
+
+    for (const relative of Object.keys(NESTED_SOURCE_FILES)) {
+      expect(await pathExists(path.join(localDir, relative)), relative).toBe(true);
+    }
+    for (const relative of Object.keys(ROOT_SCRATCH_FILES)) {
+      expect(await pathExists(path.join(localDir, relative)), relative).toBe(false);
+    }
+  }, TEST_TIMEOUT_MS);
+});
+
+describe("SSH workspace restore never deletes local scratch or nested source", () => {
+  // The baseline shapes the restore merge sees: the one remote-managed-runtime
+  // captures today, and one captured before the scratch excludes existed.
+  const baselineShapes = [
+    { label: "a baseline that excludes the scratch", exclude: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES] },
+    { label: "a baseline that still lists the scratch", exclude: [".paperclip-runtime"] },
+  ];
+
+  for (const shape of baselineShapes) {
+    it(`keeps local scratch and nested source with ${shape.label}`, async () => {
+      const localDir = await createFixtureRootDir("paperclip-restore-keep-local-");
+      await writeTree(localDir, { ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES });
+      const remoteDir = await createFixtureRootDir("paperclip-restore-keep-remote-");
+      const spec = buildStubSpec(remoteDir);
+
+      await prepareWorkspaceForSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+      const baseline = await captureDirectorySnapshot(localDir, { exclude: shape.exclude });
+      // The remote run edits one file and adds another.
+      await writeFile(path.join(remoteDir, "keep.txt"), "edited remotely\n");
+      await writeFile(path.join(remoteDir, "added.txt"), "added remotely\n");
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: FAKE_REMOTE_ROOT,
+        baselineSnapshot: baseline,
+      });
+
+      await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("edited remotely\n");
+      await expect(readFile(path.join(localDir, "added.txt"), "utf8")).resolves.toBe("added remotely\n");
+      for (const [relative, content] of Object.entries({ ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES })) {
+        if (relative === "keep.txt") continue;
+        await expect(readFile(path.join(localDir, relative), "utf8"), relative).resolves.toBe(content);
+      }
+    }, TEST_TIMEOUT_MS);
+  }
+
+  it("leaves a git-backed workspace clean after a round trip with nested target source", async () => {
+    const localDir = await createFixtureRootDir("paperclip-restore-git-local-");
+    await git(localDir, "init", "-q", "-b", "main");
+    await writeTree(localDir, NESTED_SOURCE_FILES);
+    await git(localDir, "add", "-A");
+    await git(localDir, "commit", "-q", "-m", "initial");
+    await writeTree(localDir, ROOT_SCRATCH_FILES);
+    await writeFile(path.join(localDir, ".gitignore"), "/node_modules/\n/target/\n/.claude/worktrees/\n");
+    await git(localDir, "add", ".gitignore");
+    await git(localDir, "commit", "-q", "-m", "ignore scratch");
+    const remoteDir = await createFixtureRootDir("paperclip-restore-git-remote-");
+    const spec = buildStubSpec(remoteDir);
+
+    const prepared = await prepareWorkspaceForSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+    expect(prepared.gitBacked).toBe(true);
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [".git", ".git/*", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    });
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: FAKE_REMOTE_ROOT,
+      baselineSnapshot: baseline,
+      restoreGitHistory: true,
+    });
+
+    expect((await git(localDir, "status", "--porcelain")).trim()).toBe("");
+    for (const relative of Object.keys(ROOT_SCRATCH_FILES)) {
+      expect(await pathExists(path.join(localDir, relative)), relative).toBe(true);
+    }
+  }, GIT_ROUND_TRIP_TIMEOUT_MS);
+
+  it("plain restore preserves root scratch but still replaces other workspace content", async () => {
+    const remoteDir = await createFixtureRootDir("paperclip-restore-plain-remote-");
+    await writeTree(remoteDir, { ...NESTED_SOURCE_FILES, ".claude/settings.json": "remote settings\n" });
+    const spec = buildStubSpec(remoteDir);
+    const localDir = await createFixtureRootDir("paperclip-restore-plain-local-");
+    await writeTree(localDir, {
+      ...ROOT_SCRATCH_FILES,
+      ".claude/settings.json": "stale local settings\n",
+      "stale.txt": "removed remotely\n",
+    });
+
+    await restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+
+    for (const [relative, content] of Object.entries(ROOT_SCRATCH_FILES)) {
+      await expect(readFile(path.join(localDir, relative), "utf8"), relative).resolves.toBe(content);
+    }
+    await expect(readFile(path.join(localDir, ".claude/settings.json"), "utf8")).resolves.toBe("remote settings\n");
+    expect(await pathExists(path.join(localDir, "stale.txt"))).toBe(false);
+    await expect(readFile(path.join(localDir, "src/commands/target/index.ts"), "utf8")).resolves.toBe(
+      "export const target = 1;\n",
+    );
+  }, TEST_TIMEOUT_MS);
+});
+
 describe("SSH sync-back size cap", () => {
   it("resolves the cap from the environment with a safe default", () => {
     expect(resolveSshSyncBackMaxBytes({})).toBe(SSH_SYNC_BACK_DEFAULT_MAX_BYTES);
@@ -279,7 +477,7 @@ describe("SSH sync-back size cap", () => {
       spec,
       remoteDir: FAKE_REMOTE_ROOT,
       localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     }).then(
       () => null,
       (error: unknown) => error,
