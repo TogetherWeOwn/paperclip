@@ -65,6 +65,33 @@ runtime boundary:
 - workspace runtime-service mutations are denied unless the boundary explicitly
   grants the `runtime.manage` tool class
 
+### Designating a low-trust sandbox
+
+Environment selection is agent default, then instance default, then local. It
+does not look at the trust preset by itself, so a low-trust run on an agent with
+no sandbox binding would land on local and be refused. To give low-trust runs a
+sandbox without binding any agent or moving the instance default, an instance
+admin designates one with `PATCH /api/instance/settings/general`:
+
+```json
+{ "lowTrustSandboxEnvironmentId": "<sandbox environment id>" }
+```
+
+Send `null` to clear it. The environment must be an active `sandbox`-driver
+environment (not the probe-only `fake` provider). Behavior:
+
+- only a run whose trust preset resolves to `low_trust_review` reads it, and only
+  when its selection would otherwise land on local; trusted runs never move
+- an agent or instance default that already points at a non-local environment
+  keeps it
+- it is checked again at run time (active, `sandbox` driver, not bound to
+  another company). An unusable designation is logged and ignored
+- with no usable designation the run fails with
+  `low_trust_requires_sandbox_environment`, exactly as before
+
+Deleting or archiving the designated environment therefore fails low-trust runs
+closed; it never falls back to local. Clear the setting first.
+
 The Docker workflow in `doc/UNTRUSTED-PR-REVIEW.md` remains useful for manual
 local review, but Paperclip-managed low-trust execution requires a sandboxed
 environment instead of a host-local adapter process.

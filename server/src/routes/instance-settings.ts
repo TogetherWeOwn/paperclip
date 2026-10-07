@@ -221,6 +221,18 @@ export function instanceSettingsRoutes(db: Db) {
         () => svc.getGeneral(),
         (field) => hidden.has(`instance.general.${field}`),
       );
+      // The low-trust sandbox designation places untrusted-code runs, so only a
+      // real, active sandbox-driver environment may be designated. null clears it.
+      if (Object.prototype.hasOwnProperty.call(req.body, "lowTrustSandboxEnvironmentId")) {
+        await assertEnvironmentSelectionForCompany(
+          environments,
+          "instance",
+          typeof req.body.lowTrustSandboxEnvironmentId === "string"
+            ? req.body.lowTrustSandboxEnvironmentId
+            : null,
+          { allowedDrivers: ["sandbox"] },
+        );
+      }
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

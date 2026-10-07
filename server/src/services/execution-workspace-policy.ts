@@ -275,7 +275,8 @@ export type ExecutionWorkspaceEnvironmentSource =
   | "agent"
   | "instance"
   | "default"
-  | "managed";
+  | "managed"
+  | "low_trust_sandbox";
 
 export type ExecutionWorkspaceEnvironmentResolution = {
   environmentId: string;
@@ -307,6 +308,23 @@ export function resolveExecutionWorkspaceEnvironmentId(input: {
    */
   managedSandboxOnly?: boolean;
   managedSandboxEnvironmentId?: string | null;
+  /**
+   * Trust-aware sandbox designation. `lowTrustReview` is true only when the
+   * run's trust preset resolved to `low_trust_review`. Such a run whose
+   * selection would land on local is redirected to the designated low-trust
+   * sandbox environment instead — the agent and instance defaults are never
+   * rewritten, so trusted runs keep their own selection. With no designation
+   * the selection stays local and the low-trust gate
+   * (`assertLowTrustWorkspaceIsolation`) rejects the run with
+   * `low_trust_requires_sandbox_environment`: it fails closed, never local.
+   * The caller passes a designation only after it has verified the row is an
+   * active, usable sandbox environment (see low-trust-sandbox-environment.ts).
+   * Non-local selections (an explicitly bound sandbox, ssh) are untouched.
+   * Takes precedence over the managed-sandbox redirect, which only applies to
+   * a selection this redirect did not already move.
+   */
+  lowTrustReview?: boolean;
+  lowTrustSandboxEnvironmentId?: string | null;
 }): ExecutionWorkspaceEnvironmentResolution {
   const resolved = ((): ExecutionWorkspaceEnvironmentResolution => {
     if (input.agentDefaultEnvironmentId) {
@@ -326,6 +344,16 @@ export function resolveExecutionWorkspaceEnvironmentId(input: {
       source: "default",
     };
   })();
+  if (
+    input.lowTrustReview === true &&
+    input.lowTrustSandboxEnvironmentId &&
+    resolved.environmentId === input.localDefaultEnvironmentId
+  ) {
+    return {
+      environmentId: input.lowTrustSandboxEnvironmentId,
+      source: "low_trust_sandbox",
+    };
+  }
   if (input.managedSandboxOnly !== true || resolved.environmentId !== input.localDefaultEnvironmentId) {
     return resolved;
   }

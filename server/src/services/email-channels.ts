@@ -39,6 +39,7 @@ import type {
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
+import { resolveLowTrustSandboxEnvironment } from "./low-trust-sandbox-environment.js";
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
@@ -645,13 +646,22 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       const managed = experimental.enableManagedSandboxOnly
         ? await envs.findManagedSandboxEnvironment(companyId)
         : null;
+      const instanceSettingsRow = await settings.get();
+      const lowTrustDesignation = await resolveLowTrustSandboxEnvironment({
+        designatedEnvironmentId:
+          instanceSettingsRow.general.lowTrustSandboxEnvironmentId ?? null,
+        companyId,
+        environments: envs,
+      });
       const selected = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
-          (await settings.get()).defaultEnvironmentId ?? null,
+          instanceSettingsRow.defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: local.id,
         managedSandboxOnly: experimental.enableManagedSandboxOnly,
         managedSandboxEnvironmentId: managed?.id,
+        lowTrustReview: true,
+        lowTrustSandboxEnvironmentId: lowTrustDesignation.environmentId,
       });
       const environment = await envs.getById(selected.environmentId);
       const owners = environment
