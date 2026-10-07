@@ -145,6 +145,17 @@ authoritative decision of `in_progress`, and no durable wait path usually mean
 the result/disposition contract is failing to converge. Fix the status or
 continuation decision; increasing the polling interval only hides the bug.
 
+### Blocker cycles during recovery
+
+For an open-child wait, recovery checks whether the source issue can already
+reach the child through explicit `blocks` edges. Adding the reverse wait edge
+would close a cycle. If the cycle validator rejects a write, recovery also
+checks every requested blocker, including existing blockers. It parks the source
+issue as `blocked` without adding the edge, resolves an active recovery action as
+blocked, and posts one marker-tagged notice. If the graph changes before the
+fallback check, the notice may not include the exact path. This prevents the
+same graph shape from crashing a later startup or periodic recovery sweep.
+
 ## Primary implementation locations
 
 - `server/src/index.ts` — startup recovery and periodic heartbeat scheduler.
