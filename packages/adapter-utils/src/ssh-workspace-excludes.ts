@@ -18,20 +18,31 @@ export const SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES = [
   "target",
 ] as const;
 
-// tar matches a bare `--exclude target` against every path component, so the
-// same names must be anchored to the archive root (`./`, since the transfer
-// archives `.`) to match only at the workspace root.
+// `./` denotes a root-relative exclude in the transfer API. GNU tar accepts
+// it directly, but bsdtar strips it and needs `^` instead. Resolve the dialect
+// where the archive is created, not from the OS of the receiving host.
 export const SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES: readonly string[] =
   SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((entry) => `./${entry}`);
 
-/**
- * Translate a merge/snapshot-grammar exclude list into tar grammar. Entries
- * that name agent-local scratch are anchored to the workspace root; every other
- * entry passes through unchanged, so existing excludes keep their behavior. A
- * snapshot's exclude list must go through this before it reaches tar, or its
- * plain `target` would match `src/commands/target/` at depth.
- */
+export type SshTarFlavor = "gnu" | "bsd";
+
+export function resolveSshTarFlavor(version: string): SshTarFlavor {
+  if (version.includes("GNU tar")) return "gnu";
+  if (version.trimStart().startsWith("bsdtar ")) return "bsd";
+  throw new Error("Unsupported tar for root-relative SSH workspace excludes; use GNU tar or bsdtar");
+}
+
+/** Translate workspace snapshot excludes into root-relative transfer patterns. */
 export function toSshTarExcludes(exclude: readonly string[]): string[] {
   const scratch = new Set<string>(SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES);
-  return [...new Set(exclude.map((entry) => (scratch.has(entry) ? `./${entry}` : entry)))];
+  return [...new Set(exclude.map((entry) => scratch.has(entry) ? `./${entry}` : entry))];
+}
+
+/**
+ * Translate explicit root-relative transfer patterns for the creating tar.
+ * Generic unanchored patterns keep their existing tar semantics.
+ * libarchive's `^` anchor: https://github.com/libarchive/libarchive/blob/v3.7.4/libarchive/archive_pathmatch.c
+ */
+export function translateSshTarExcludes(exclude: readonly string[], flavor: SshTarFlavor): string[] {
+  return exclude.map((entry) => flavor === "bsd" && entry.startsWith("./") ? `^${entry.slice(2)}` : entry);
 }

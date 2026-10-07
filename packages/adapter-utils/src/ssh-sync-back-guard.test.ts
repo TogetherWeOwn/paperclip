@@ -18,7 +18,7 @@ import {
   syncDirectoryToSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
-import { toSshTarExcludes } from "./ssh-workspace-excludes.js";
+import { resolveSshTarFlavor, toSshTarExcludes, translateSshTarExcludes } from "./ssh-workspace-excludes.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 // A nested agent worktree plus build outputs once filled a production host's
@@ -36,6 +36,15 @@ case "$last" in
   *) echo "stub-ssh: unexpected trailing arg: $last" >&2; exit 99;;
 esac
 rewritten=$(printf '%s' "$payload" | sed "s|$STUB_SSH_REMOTE_ROOT|$STUB_SSH_FIXTURE_DIR|g")
+if [ -n "$STUB_SSH_REMOTE_BIN" ]; then
+  PATH="$STUB_SSH_REMOTE_BIN:$PATH"
+  # The preflight sources login profiles. Restore the selected tar afterwards,
+  # from a fixture-owned home, rather than let /etc/profile reset the matrix.
+  HOME="$STUB_SSH_REMOTE_BIN/home"
+  mkdir -p "$HOME"
+  printf '%s\\n' 'PATH="$STUB_SSH_REMOTE_BIN:$PATH"; export PATH' > "$HOME/.zprofile"
+  export PATH HOME
+fi
 eval "sh -c $rewritten"
 `;
 
@@ -56,6 +65,16 @@ async function createFixtureRootDir(prefix: string): Promise<string> {
 async function installStubSsh(): Promise<void> {
   const binDir = await createFixtureRootDir("paperclip-stub-ssh-bin-");
   await writeFile(path.join(binDir, "ssh"), STUB_SOURCE, { mode: 0o755 });
+  // Optional absolute binary paths exercise GNU/BSD and mixed-host round trips
+  // with real tars, rather than a mock of their incompatible pattern matching.
+  if (process.env.PAPERCLIP_TEST_LOCAL_TAR) {
+    await symlink(process.env.PAPERCLIP_TEST_LOCAL_TAR, path.join(binDir, "tar"));
+  }
+  if (process.env.PAPERCLIP_TEST_REMOTE_TAR) {
+    const remoteBinDir = await createFixtureRootDir("paperclip-stub-remote-bin-");
+    await symlink(process.env.PAPERCLIP_TEST_REMOTE_TAR, path.join(remoteBinDir, "tar"));
+    process.env.STUB_SSH_REMOTE_BIN = remoteBinDir;
+  }
   process.env.PATH = `${binDir}${path.delimiter}${originalPath}`;
 }
 
@@ -122,6 +141,9 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES;
   delete process.env.STUB_SSH_REMOTE_ROOT;
   delete process.env.STUB_SSH_FIXTURE_DIR;
+  delete process.env.STUB_SSH_REMOTE_BIN;
+  delete process.env.STUB_SSH_REAL_TAR;
+  delete process.env.STUB_SSH_TAR_LOG;
   while (fixtureRoots.length > 0) {
     const root = fixtureRoots.pop();
     if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
@@ -300,6 +322,112 @@ describe("SSH workspace excludes are anchored to the workspace root", () => {
     ]);
   });
 
+  it("uses caret anchors for bsdtar without changing other exclude patterns", () => {
+    expect(translateSshTarExcludes([".git", "dist", "target", "./node_modules", "./.claude/worktrees"], "bsd")).toEqual([
+      ".git", "dist", "target", "^node_modules", "^.claude/worktrees",
+    ]);
+  });
+
+  it.each(["export", "sync-back"])("keeps generic unanchored excludes at every depth during %s", async (direction) => {
+    const sourceDir = await createFixtureRootDir("paperclip-generic-exclude-source-");
+    const destinationDir = await createFixtureRootDir("paperclip-generic-exclude-destination-");
+    const excluded = {
+      "node_modules/root/index.js": "root dependency",
+      "packages/app/node_modules/dep/index.js": "nested dependency",
+    };
+    await writeTree(sourceDir, { "keep.txt": "deliverable", ...excluded });
+    const spec = buildStubSpec(direction === "export" ? destinationDir : sourceDir);
+
+    if (direction === "export") {
+      await syncDirectoryToSsh({ spec, localDir: sourceDir, remoteDir: FAKE_REMOTE_ROOT, exclude: ["node_modules"] });
+    } else {
+      await syncDirectoryFromSsh({ spec, remoteDir: FAKE_REMOTE_ROOT, localDir: destinationDir, exclude: ["node_modules"] });
+    }
+
+    await expect(readFile(path.join(destinationDir, "keep.txt"), "utf8")).resolves.toBe("deliverable");
+    for (const relative of Object.keys(excluded)) {
+      expect(await pathExists(path.join(destinationDir, relative)), relative).toBe(false);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  it("uses the selected remote tar for both preflight and download", async () => {
+    const remoteBin = await createFixtureRootDir("paperclip-recording-remote-tar-");
+    const { stdout } = await execFileAsync("sh", ["-c", "command -v tar"], {
+      env: { ...process.env, PATH: originalPath },
+    });
+    process.env.STUB_SSH_REAL_TAR = process.env.PAPERCLIP_TEST_REMOTE_TAR ?? stdout.trim();
+    process.env.STUB_SSH_TAR_LOG = path.join(remoteBin, "calls.txt");
+    await writeFile(path.join(remoteBin, "tar"), `#!/bin/sh
+printf '%s\\n' "$*" >> "$STUB_SSH_TAR_LOG"
+exec "$STUB_SSH_REAL_TAR" "$@"
+`, { mode: 0o755 });
+    process.env.STUB_SSH_REMOTE_BIN = remoteBin;
+    const remoteDir = await createFixtureRootDir("paperclip-recording-tar-source-");
+    await writeTree(remoteDir, { ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES });
+    const localDir = await createFixtureRootDir("paperclip-recording-tar-destination-");
+    const spec = buildStubSpec(remoteDir);
+
+    await syncDirectoryFromSsh({
+      spec, remoteDir: FAKE_REMOTE_ROOT, localDir,
+      exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    });
+
+    const calls = (await readFile(process.env.STUB_SSH_TAR_LOG, "utf8")).trim().split("\n");
+    expect(calls.filter((call) => call === "--version")).toHaveLength(2);
+    expect(calls.filter((call) => call.includes(" -cf - ."))).toHaveLength(2);
+    expect(calls).toHaveLength(4);
+    await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe(NESTED_SOURCE_FILES["keep.txt"]);
+  }, TEST_TIMEOUT_MS);
+
+  it("refuses an unknown local tar before exporting workspace contents", async () => {
+    const bin = await createFixtureRootDir("paperclip-unknown-local-tar-bin-");
+    await writeFile(path.join(bin, "tar"), `#!/bin/sh
+if [ "$1" = --version ]; then printf 'unknown tar\\n'; exit 0; fi
+exit 99
+`, { mode: 0o755 });
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+    const localDir = await createFixtureRootDir("paperclip-unknown-export-local-");
+    await writeFile(path.join(localDir, "keep.txt"), "local work");
+    const remoteDir = await createFixtureRootDir("paperclip-unknown-export-remote-");
+    const spec = buildStubSpec(remoteDir);
+
+    await expect(syncDirectoryToSsh({
+      spec, localDir, remoteDir: FAKE_REMOTE_ROOT,
+      exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    })).rejects.toThrow("Unsupported tar");
+    expect(await readdir(remoteDir)).toEqual([]);
+    await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("local work");
+  }, TEST_TIMEOUT_MS);
+
+  it("refuses an unknown remote tar without changing local data or leaking staging", async () => {
+    const remoteBin = await createFixtureRootDir("paperclip-unknown-tar-bin-");
+    await writeFile(path.join(remoteBin, "tar"),
+      `#!/bin/sh
+if [ "$1" = --version ]; then printf 'unknown tar\\n'; exit 0; fi
+exit 99
+`,
+      { mode: 0o755 });
+    process.env.STUB_SSH_REMOTE_BIN = remoteBin;
+    const remoteDir = await createFixtureRootDir("paperclip-unknown-tar-remote-");
+    const spec = buildStubSpec(remoteDir);
+    const localDir = await createFixtureRootDir("paperclip-unknown-tar-local-");
+    await writeFile(path.join(localDir, "keep.txt"), "local work");
+    const stagingBefore = await listSyncBackStagingDirs();
+
+    await expect(syncDirectoryFromSsh({
+      spec, remoteDir: FAKE_REMOTE_ROOT, localDir,
+      exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    })).rejects.toThrow("Unsupported tar");
+    await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("local work");
+    expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+  }, TEST_TIMEOUT_MS);
+
+  it("identifies the creating tar and refuses unknown implementations", () => {
+    expect(resolveSshTarFlavor("tar (GNU tar) 1.35\\n")).toBe("gnu");
+    expect(resolveSshTarFlavor("bsdtar 3.7.4 - libarchive 3.7.4\\n")).toBe("bsd");
+    expect(() => resolveSshTarFlavor("unknown tar")).toThrow("Unsupported tar");
+  });
+
   it("export keeps nested source named like scratch and drops only the root scratch", async () => {
     const localDir = await createFixtureRootDir("paperclip-anchor-export-local-");
     await writeTree(localDir, { ...NESTED_SOURCE_FILES, ...ROOT_SCRATCH_FILES });
@@ -410,6 +538,37 @@ describe("SSH workspace restore never deletes local scratch or nested source", (
     expect((await git(localDir, "status", "--porcelain")).trim()).toBe("");
     for (const relative of Object.keys(ROOT_SCRATCH_FILES)) {
       expect(await pathExists(path.join(localDir, relative)), relative).toBe(true);
+    }
+  }, GIT_ROUND_TRIP_TIMEOUT_MS);
+
+  it("preserves uncommitted edits and untracked nested source through a git round trip", async () => {
+    const localDir = await createFixtureRootDir("paperclip-restore-dirty-local-");
+    await git(localDir, "init", "-q", "-b", "main");
+    await writeTree(localDir, NESTED_SOURCE_FILES);
+    await git(localDir, "add", "-A");
+    await git(localDir, "commit", "-q", "-m", "initial");
+    const edits = {
+      "src/commands/target/index.ts": "uncommitted edit\\n",
+      "src/commands/target/new.ts": "untracked source\\n",
+      "packages/app/node_modules/vendored.js": "uncommitted vendor edit\\n",
+      "packages/app/.claude/worktrees/new.md": "untracked notes\\n",
+    };
+    await writeTree(localDir, edits);
+    const statusBefore = await git(localDir, "status", "--porcelain");
+    const remoteDir = await createFixtureRootDir("paperclip-restore-dirty-remote-");
+    const spec = buildStubSpec(remoteDir);
+
+    await prepareWorkspaceForSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+    for (const [relative, content] of Object.entries(edits)) {
+      await expect(readFile(path.join(remoteDir, relative), "utf8"), relative).resolves.toBe(content);
+    }
+    await restoreWorkspaceFromSshExecution({
+      spec, localDir, remoteDir: FAKE_REMOTE_ROOT, restoreGitHistory: true,
+    });
+
+    expect(await git(localDir, "status", "--porcelain")).toBe(statusBefore);
+    for (const [relative, content] of Object.entries(edits)) {
+      await expect(readFile(path.join(localDir, relative), "utf8"), relative).resolves.toBe(content);
     }
   }, GIT_ROUND_TRIP_TIMEOUT_MS);
 

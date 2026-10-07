@@ -17,7 +17,10 @@ import { shouldExcludePath } from "./exclude-patterns.js";
 import {
   SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
   SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
+  resolveSshTarFlavor,
   toSshTarExcludes,
+  translateSshTarExcludes,
+  type SshTarFlavor,
 } from "./ssh-workspace-excludes.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -415,9 +418,13 @@ async function createSshAuthArgs(
   };
 }
 
-function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+function tarExcludeArgs(exclude: string[] | undefined, flavor: SshTarFlavor = "gnu"): string[] {
+  const combined = ["._*", ...translateSshTarExcludes(exclude ?? [], flavor)];
   return combined.flatMap((entry) => ["--exclude", entry]);
+}
+
+function hasRootRelativeTarExcludes(exclude: string[] | undefined): boolean {
+  return (exclude ?? []).some((entry) => entry.startsWith("./"));
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -507,10 +514,17 @@ export function assertSshSyncBackSizeWithinCap(input: {
  * never disagree on what is included.
  */
 function buildRemoteWorkspaceDownloadScript(remoteDir: string, exclude?: string[]): string {
-  return [
-    `cd ${shellQuote(remoteDir)}`,
-    `tar ${[...tarExcludeArgs(exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
-  ].join(" && ");
+  const tarCommand = (flavor: SshTarFlavor) =>
+    `tar ${[...tarExcludeArgs(exclude, flavor).map(shellQuote), "-cf", "-", "."].join(" ")}`;
+  // Probe on the creating host: the server and remote can use different tars.
+  // Both the pre-flight and transfer execute this exact dialect selection.
+  const archive = hasRootRelativeTarExcludes(exclude)
+    ? `case "$(tar --version)" in ` +
+      `*"GNU tar"*) ${tarCommand("gnu")} ;; ` +
+      `bsdtar\\ *) ${tarCommand("bsd")} ;; ` +
+      `*) printf '%s\\n' 'Unsupported tar for root-relative SSH workspace excludes; use GNU tar or bsdtar' >&2; exit 1 ;; esac`
+    : tarCommand("gnu");
+  return `cd ${shellQuote(remoteDir)} && ${archive}`;
 }
 
 /**
@@ -1558,12 +1572,15 @@ export async function syncDirectoryToSsh(input: {
     : null;
 
   try {
+    const flavor = hasRootRelativeTarExcludes(input.exclude)
+      ? resolveSshTarFlavor((await execFileText("tar", ["--version"])).stdout)
+      : "gnu";
     await new Promise<void>((resolve, reject) => {
     const tarArgs = [
       ...(input.followSymlinks ? ["-h"] : []),
       "-C",
       input.localDir,
-      ...tarExcludeArgs(input.exclude),
+      ...tarExcludeArgs(input.exclude, flavor),
       "-cf",
       "-",
       ".",
@@ -1635,11 +1652,13 @@ export async function syncDirectoryToSsh(input: {
       sshExitCode = code;
       maybeFinish();
     });
-    }).finally(auth.cleanup);
+    });
     await progress?.finish();
   } catch (error) {
     await progress?.fail();
     throw error;
+  } finally {
+    await auth.cleanup();
   }
 }
 

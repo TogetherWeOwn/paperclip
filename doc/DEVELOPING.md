@@ -80,6 +80,45 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### SSH workspace synchronization
+
+SSH execution excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
+`node_modules/`, and `target/` from export and sync-back. These directories contain
+local runtime state, nested agent checkouts, and build outputs. Restore preserves
+the local copies. The remote run must install dependencies or rebuild outputs.
+Nested source such as `src/commands/target/` still transfers. Do not use a root
+`target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
+tracks it.
+
+The archive creator selects root-relative exclude syntax from its own `tar
+--version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server
+and remote can use different implementations. Unknown implementations fail the
+transfer rather than risk deleting nested source.
+
+`PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES` sets the sync-back cap in bytes on the server.
+The default is 2 GiB. Missing, invalid, and non-positive values use the default.
+Sync-back measures the excluded archive before download and checks the extracted
+staging directory before replacing workspace contents. A cap refusal leaves the
+workspace untouched. Normal success and failure paths remove staging directories;
+a hard process kill can still leave one behind.
+
+To verify GNU/BSD compatibility, install both tar implementations and run the
+focused suite for all four local/remote pairs. Set `GNU_TAR` and `BSD_TAR` to their
+absolute executable paths (`gtar` and `bsdtar` are common names):
+
+```sh
+for LOCAL_TAR in "$GNU_TAR" "$BSD_TAR"; do
+  for REMOTE_TAR in "$GNU_TAR" "$BSD_TAR"; do
+    PAPERCLIP_TEST_LOCAL_TAR="$LOCAL_TAR" PAPERCLIP_TEST_REMOTE_TAR="$REMOTE_TAR" \
+      pnpm exec vitest run packages/adapter-utils/src/ssh-sync-back-guard.test.ts \
+      packages/adapter-utils/src/remote-managed-runtime.test.ts || exit "$?"
+  done
+done
+```
+
+These tests run real archive creation and extraction through a fake SSH transport.
+They do not require an SSH host or a database.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.
