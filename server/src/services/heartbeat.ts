@@ -132,6 +132,7 @@ export {
   revokeHeartbeatRunGatewayTokens,
   buildPaperclipRuntimeMcpServers,
   createManagedMcpRunConfig,
+  heartbeatRunGatewayTokenTtlMs,
   mergeCoalescedContextSnapshot,
   resolveExternalChatWakeProvider,
   attestReviewedExternalChatRun,
