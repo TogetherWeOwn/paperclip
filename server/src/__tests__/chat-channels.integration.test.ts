@@ -72449,6 +72449,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .returning();
         return row!;
       };
+      // Slack only: link an identity before it has posted anything.
+      const preLink = async (userId: string) => {
+        const [principal] = await db
+          .insert(chatExternalPrincipals)
+          .values({
+            companyId: fixture.companyId,
+            provider: "slack",
+            providerAccountId: "T-PAPERCLIP",
+            externalId: userId,
+          })
+          .returning();
+        const [row] = await db
+          .insert(chatIdentityLinks)
+          .values({
+            companyId: fixture.companyId,
+            endpointId: configured.endpoint.id,
+            principalId: principal!.id,
+            paperclipUserId: "owner-user",
+            status: "linked",
+            confirmedAt: new Date(),
+          })
+          .returning();
+        return row!;
+      };
       const revoke = (linkId: string) =>
         db
           .update(chatIdentityLinks)
@@ -72485,6 +72509,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         fixture,
         lanes,
         link,
+        preLink,
         principalFor,
         revoke,
         send,
@@ -73125,7 +73150,53 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
     });
 
-    it("aims a linked user's Slack Stop at the verified lane, not the newest generation", async () => {
+    it("does not let an editor whose link was revoked write into the verified task", async () => {
+      const f = await laneFixture("edit");
+      const verifiedLink = await f.preLink(OWNER);
+      const messageId = await f.send(OWNER, "@maya start", {
+        trigger: "mention",
+      });
+      await db
+        .update(chatEndpoints)
+        .set({ status: "active" })
+        .where(eq(chatEndpoints.id, f.endpoint.id));
+      const [verified] = await f.lanes();
+      expect(verified!.issue.sourceTrust).toBeNull();
+      const edit = (text: string, editedAt: string) => ({
+        endpointId: f.endpoint.id,
+        provider: "slack" as const,
+        thread: f.channel.thread,
+        message: {
+          ...makeMessage({ id: messageId, text, userId: OWNER }),
+          metadata: {
+            dateSent: new Date("2026-09-04T10:00:00.000Z"),
+            edited: true,
+            editedAt: new Date(editedAt),
+          },
+        } as Message,
+      });
+      const countComments = async () =>
+        (await f.commentsOf(verified!.issue.id)).length;
+
+      const before = await countComments();
+      await f.callbacks.onMessageUpdated!(
+        edit("@maya start, corrected by the linked user", "2026-09-04T10:01:00.000Z"),
+      );
+      expect(await countComments()).toBe(before + 1);
+
+      await f.revoke(verifiedLink.id);
+      await f.callbacks.onMessageUpdated!(
+        edit("@maya start, rewritten after revocation", "2026-09-04T10:02:00.000Z"),
+      );
+      expect(await countComments()).toBe(before + 1);
+      expect(
+        (await f.commentsOf(verified!.issue.id)).map((comment) => comment.body),
+      ).not.toContainEqual(expect.stringContaining("after revocation"));
+    });
+
+    it.each(["both lanes busy", "only the guest lane busy"] as const)(
+      "aims a linked user's Slack Stop at the right lane when %s",
+      async (busy) => {
       // Slack validates Stop events against its real id shapes.
       const owner = "UOWNERSTOP";
       const f = await laneFixture(
@@ -73182,8 +73253,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(issues.id, issueId));
         return id;
       };
-      const verifiedRun = await seedRun(verified!.issue.id);
-      await seedRun(guest!.issue.id);
+      const verifiedRun =
+        busy === "both lanes busy" ? await seedRun(verified!.issue.id) : null;
+      const guestRun = await seedRun(guest!.issue.id);
+      const expectedRun = verifiedRun ?? guestRun;
+      const expectedIssue =
+        verifiedRun === null ? guest!.issue.id : verified!.issue.id;
       const workspaceId = (await f.service.get(f.endpoint.id)).providerAccountId;
       const body = JSON.stringify({
         type: "event_callback",
@@ -73211,7 +73286,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).resolves.toMatchObject({ status: 202 });
 
       expect(f.cancelRun).toHaveBeenCalledTimes(1);
-      expect(f.cancelRun.mock.calls[0]![0]).toBe(verifiedRun);
+      expect(f.cancelRun.mock.calls[0]![0]).toBe(expectedRun);
       const [stop] = await db
         .select()
         .from(chatActions)
@@ -73222,10 +73297,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ),
         );
       expect(stop!.payload).toMatchObject({
-        issueId: verified!.issue.id,
-        target: { id: verifiedRun, kind: "run" },
+        issueId: expectedIssue,
+        target: { id: expectedRun, kind: "run" },
       });
-    });
+    },
+    );
   });
 
   function lanesCount(rows: unknown[]) {

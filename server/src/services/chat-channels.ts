@@ -10,6 +10,14 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
+import {
+  chatTrustLaneOfIssue,
+  invokerLaneRow,
+  TRUST_LANE_AUDIENCE_MAX_PRINCIPALS,
+  TRUST_LANE_AUDIENCE_NOTICE,
+  TRUST_LANE_THREAD_ROWS_MAX,
+  type ChatTrustLane,
+} from "./chat-trust-lane.js";
 function githubPolicyRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
@@ -1729,43 +1737,6 @@ function nonDirectDestinationAllowed(
   }
   return resource.enabled;
 }
-
-/**
- * The authority a chat-bound task executes under. Admitting a sponsored guest
- * stamps the task as quarantined and attaches the low-trust policy; chat
- * ingress never clears that stamp, so the lane is a property of the task and
- * not of whoever spoke last.
- */
-type ChatTrustLane = "guest" | "verified";
-
-function chatTrustLaneOfIssue(
-  issue: Pick<typeof issues.$inferSelect, "sourceTrust">,
-): ChatTrustLane {
-  return issue.sourceTrust?.preset === LOW_TRUST_REVIEW_PRESET &&
-    issue.sourceTrust.disposition === "quarantined"
-    ? "guest"
-    : "verified";
-}
-
-/**
- * The task a command or Stop in a native thread acts on: the invoker's own
- * lane, newest first. A verified invoker may fall back to the newest guest
- * task. A guest never reaches a verified task.
- */
-function invokerLaneRow<
-  Row extends { issue: Pick<typeof issues.$inferSelect, "sourceTrust"> },
->(rowsNewestFirst: Row[], invokerVerified: boolean): Row | null {
-  const own = rowsNewestFirst.find(
-    (row) => (chatTrustLaneOfIssue(row.issue) === "verified") === invokerVerified,
-  );
-  return own ?? (invokerVerified ? (rowsNewestFirst[0] ?? null) : null);
-}
-
-/** Bound on how many other participants one trusted-lane admission will vet. */
-const TRUST_LANE_AUDIENCE_MAX_PRINCIPALS = 25;
-
-const TRUST_LANE_AUDIENCE_NOTICE =
-  "I can't run this request in this thread because it includes participants who aren't linked to a Paperclip account, and my replies would be visible to them. Start a new thread or send a direct message to continue.";
 
 function linearControlCommand(text: string): "new" | "close" | "status" | null {
   const match = /^\/(new|close|status)(?:@[\w.-]+)?\s*$/i.exec(text.trim());
@@ -18536,9 +18507,32 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   lifecyclePrincipal.id,
                 )
               : null;
-          const authorizedPrincipalId = authorization?.allowed
-            ? (lifecyclePrincipal?.id ?? null)
-            : null;
+          // A guest, including a linked user whose link was revoked, never
+          // writes into a verified-lane task, even by editing a message that
+          // the task already holds.
+          const guestEditsVerifiedTask =
+            authorization?.allowed === true &&
+            authorization.userId === null &&
+            (currentEndpoint.provider === "slack" ||
+              currentEndpoint.provider === "discord") &&
+            currentConversation !== null &&
+            !currentConversation.isDirectMessage &&
+            (await tx
+              .select({ sourceTrust: issues.sourceTrust })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, currentEndpoint.companyId),
+                  eq(issues.id, linkedTarget.issueId),
+                ),
+              )
+              .then((rows) =>
+                rows[0] ? chatTrustLaneOfIssue(rows[0]) === "verified" : false,
+              ));
+          const authorizedPrincipalId =
+            authorization?.allowed && !guestEditsVerifiedTask
+              ? (lifecyclePrincipal?.id ?? null)
+              : null;
           if (!authorizedPrincipalId) {
             if (
               await retainSourceInvalidation(
@@ -23275,10 +23269,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     ),
                   )
                   .orderBy(desc(chatConversations.sessionGeneration))
+                  // Only a thread holds one task per trust lane. A direct
+                  // message needs just its newest generation.
+                  .limit(
+                    invocation.sourceKind === "native_thread"
+                      ? TRUST_LANE_THREAD_ROWS_MAX
+                      : 1,
+                  )
                   .for("update", { of: chatConversations })
                   .then((rows) =>
-                    // A thread can hold one task per trust lane. A command
-                    // acts on the invoker's own lane, never on another's.
+                    // A command acts on the invoker's own lane, never on
+                    // another's.
                     invocation.sourceKind === "native_thread"
                       ? (invokerLaneRow(rows, principal.userId !== null)
                           ?.conversation ?? null)
@@ -26324,14 +26325,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
         .orderBy(desc(chatConversations.sessionGeneration))
         .for("update", { of: chatConversations })
-        .then((rows) =>
+        .then((rows) => {
+          if (rows[0]?.conversation.isDirectMessage)
+            return rows[0].conversation;
           // A thread can hold one task per trust lane. Only a linked user may
-          // Stop, so prefer the verified lane (a guest's Stop is denied when
-          // it executes) over simply the newest generation.
-          rows[0]?.conversation.isDirectMessage
-            ? rows[0].conversation
-            : (invokerLaneRow(rows, true)?.conversation ?? null),
-        );
+          // Stop (a guest's Stop is denied when it executes), so prefer the
+          // verified lane, among the tasks that have a run in flight.
+          const busy = rows.filter((row) => row.issue.executionRunId !== null);
+          return (
+            invokerLaneRow(busy.length > 0 ? busy : rows, true)?.conversation ??
+            null
+          );
+        });
       const principal = await tx
         .select()
         .from(chatExternalPrincipals)
