@@ -6,7 +6,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -232,6 +232,17 @@ export function instanceSettingsRoutes(db: Db) {
             : null,
           { allowedDrivers: ["sandbox"] },
         );
+        // A retained VM would carry one untrusted run's content into the next.
+        const designated =
+          typeof req.body.lowTrustSandboxEnvironmentId === "string"
+            ? await environments.getById(req.body.lowTrustSandboxEnvironmentId)
+            : null;
+        if (designated?.config?.reuseLease === true) {
+          throw unprocessable(
+            "A low-trust sandbox environment must not reuse leases (reuseLease must be off).",
+            { code: "low_trust_sandbox_reuses_lease" },
+          );
+        }
       }
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);

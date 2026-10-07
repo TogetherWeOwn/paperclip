@@ -511,6 +511,11 @@ describe("instance settings routes", () => {
         { id: SANDBOX_ENV_ID, driver: "sandbox", status: "active", config: { provider: "fake" } },
         "probe-only",
       ],
+      [
+        "an environment that reuses leases",
+        { id: SANDBOX_ENV_ID, driver: "sandbox", status: "active", config: { provider: "exe-dev", reuseLease: true } },
+        "must not reuse leases",
+      ],
     ])("rejects %s with 422 and writes nothing", async (_label, environment, message) => {
       mockEnvironmentService.getById.mockResolvedValue(environment);
       const app = await createApp(adminActor);

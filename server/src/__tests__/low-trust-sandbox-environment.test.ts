@@ -71,6 +71,11 @@ describe("resolveLowTrustSandboxEnvironment", () => {
       "environment_probe_only_provider",
     ],
     [
+      "an environment that retains its VM between runs",
+      [{ ...exeDevSandbox, config: { provider: "exe-dev", reuseLease: true } }],
+      "environment_reuses_lease",
+    ],
+    [
       "an environment bound to another company",
       [{ ...exeDevSandbox, boundCompanyIds: ["company-2"] }],
       "environment_bound_to_other_company",
@@ -176,6 +181,7 @@ describe("low-trust sandbox placement (resolver + low-trust gate)", () => {
     ["deleted", []],
     ["archived", [{ ...exeDevSandbox, status: "archived" as const }]],
     ["not a sandbox driver", [{ ...exeDevSandbox, driver: "ssh" as const }]],
+    ["reusing its lease", [{ ...exeDevSandbox, config: { provider: "exe-dev", reuseLease: true } }]],
     ["bound to another company", [{ ...exeDevSandbox, boundCompanyIds: ["company-2"] }]],
   ])("fails closed when the designated environment is %s", async (_label, environments) => {
     await expect(

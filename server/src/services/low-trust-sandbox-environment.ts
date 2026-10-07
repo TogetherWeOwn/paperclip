@@ -10,6 +10,7 @@ export type LowTrustSandboxDesignationRejection =
   | "environment_not_active"
   | "environment_not_sandbox"
   | "environment_probe_only_provider"
+  | "environment_reuses_lease"
   | "environment_bound_to_other_company";
 
 type LowTrustSandboxEnvironmentReader = {
@@ -22,8 +23,10 @@ type LowTrustSandboxEnvironmentReader = {
  * it is used to place a `low_trust_review` run. The setting is plain data, so
  * the row can have been archived, deleted or re-pointed since it was written;
  * checking at use time keeps a stale designation from landing untrusted code
- * on an unusable or foreign environment. An unbound (instance-global)
- * environment is open to every company; a bound one only to its owners.
+ * on an unusable or foreign environment. A designated environment must also
+ * keep `reuseLease` off: a retained VM would carry one untrusted run's content
+ * into the next. An unbound (instance-global) environment is open to every
+ * company; a bound one only to its owners.
  */
 export async function resolveLowTrustSandboxEnvironment(input: {
   designatedEnvironmentId: string | null | undefined;
@@ -41,6 +44,9 @@ export async function resolveLowTrustSandboxEnvironment(input: {
   const config = environment.config && typeof environment.config === "object" ? environment.config : {};
   if ((config as Record<string, unknown>).provider === "fake") {
     return { environmentId: null, rejection: "environment_probe_only_provider" };
+  }
+  if ((config as Record<string, unknown>).reuseLease === true) {
+    return { environmentId: null, rejection: "environment_reuses_lease" };
   }
   const owners = await input.environments.listBoundCompanyIds(environment.id);
   if (owners.length > 0 && !owners.includes(input.companyId)) {

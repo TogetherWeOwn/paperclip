@@ -78,14 +78,15 @@ admin designates one with `PATCH /api/instance/settings/general`:
 ```
 
 Send `null` to clear it. The environment must be an active `sandbox`-driver
-environment (not the probe-only `fake` provider). Behavior:
+environment that does not reuse leases (`reuseLease` off, so no VM is kept
+between runs) and is not the probe-only `fake` provider. Behavior:
 
 - only a run whose trust preset resolves to `low_trust_review` reads it, and only
   when its selection would otherwise land on local; trusted runs never move
 - an agent or instance default that already points at a non-local environment
   keeps it
-- it is checked again at run time (active, `sandbox` driver, not bound to
-  another company). An unusable designation is logged and ignored
+- it is checked again at run time (active, `sandbox` driver, `reuseLease` off,
+  not bound to another company). An unusable designation is logged and ignored
 - with no usable designation the run fails with
   `low_trust_requires_sandbox_environment`, exactly as before
 
