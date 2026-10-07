@@ -234,6 +234,7 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { isAssigneeTerminalCloseOfBlockedCard } from "./issues-low-trust-terminal-close.js";
 import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
@@ -6507,9 +6508,16 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: {
+      resumeIntent?: boolean;
+      allowLowTrustTerminalClose?: boolean;
+    } = {},
   ) {
-    if (
+    if (options.allowLowTrustTerminalClose === true) {
+      // Waives only the low-trust 403; an invalid or conflicting trust policy
+      // still throws (fail closed).
+      await actorIsLowTrustReview(req, issue.companyId, issue);
+    } else if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
     )
       return false;
@@ -12921,10 +12929,24 @@ export function issueRoutes(
           await requireRecoverySourceMutationAuthority(req, existing);
         }
       }
+      // A low-trust assignee may close its own blocked card (recovery parks
+      // failed review cards there); reopen/resume/blockers stay denied above.
+      const allowLowTrustTerminalClose = isAssigneeTerminalCloseOfBlockedCard({
+        actorType: req.actor.type,
+        actorAgentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
+        issueStatus: existing.status,
+        assigneeAgentId: existing.assigneeAgentId,
+        targetStatus: updateFields.status,
+        resumeRequested: resumeRequested === true,
+        reopenRequested: reopenRequested === true,
+        setsBlockers: Array.isArray(req.body.blockedByIssueIds),
+      });
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(req, res, existing, {
+          allowLowTrustTerminalClose,
+        }))
       ) {
         return;
       }
