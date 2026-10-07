@@ -6302,6 +6302,114 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ]);
   });
 
+  it("parks a parent-child cycle from active recovery actions once", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const childId = randomUUID();
+    const actionId = randomUUID();
+
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, issueId));
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      parentId: issueId,
+      title: "Blocked cyclic child",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: childId,
+      type: "blocks",
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target",
+      fingerprint: `active-cycle-test:${issueId}`,
+      evidence: {},
+      nextAction: "Record a durable disposition.",
+      wakePolicy: {
+        type: "bounded_owner_disposition_repair",
+        attempt: 1,
+        maxAttempts: 5,
+      },
+      attemptCount: 1,
+      maxAttempts: 5,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const firstSweep = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(firstSweep.issueIds).toContain(issueId);
+    const parkedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parkedIssue?.status).toBe("blocked");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    await expect(sourceBlockerIssueIds(companyId, childId)).resolves.toEqual([
+      issueId,
+    ]);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId))
+      .then((rows) => rows[0] ?? null);
+    expect(action).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+      resolutionNote: "parent_child_blocks_cycle",
+    });
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain(`${issuePrefix}-1 --blocks--> ${issuePrefix}-2`);
+    expect(comments[0]?.body).toContain(`${issuePrefix}-1 -> ${issuePrefix}-2 -> ${issuePrefix}-1`);
+    expect(comments[0]?.body).toContain("parent_child_blocks_cycle:");
+
+    const secondSweep = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondSweep.issueIds).not.toContain(issueId);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId)),
+    ).resolves.toMatchObject([
+      expect.objectContaining({
+        status: "resolved",
+        outcome: "blocked",
+        resolutionNote: "parent_child_blocks_cycle",
+      }),
+    ]);
+  });
+
   it("parks cycle errors from existing requested blockers without rethrowing", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
