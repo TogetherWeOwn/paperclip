@@ -38,8 +38,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { environmentService } from "./environments.js";
-import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
-import { resolveLowTrustSandboxEnvironment } from "./low-trust-sandbox-environment.js";
+import { selectLowTrustReviewEnvironment } from "./low-trust-sandbox-environment.js";
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
@@ -641,32 +640,13 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         throw badRequest(
           "Low-trust email agents require isolated workspaces and a sandbox environment. Complete runtime setup before connecting this inbox.",
         );
-      const envs = environmentService(db);
-      const local = await envs.ensureLocalEnvironment(companyId);
-      const managed = experimental.enableManagedSandboxOnly
-        ? await envs.findManagedSandboxEnvironment(companyId)
-        : null;
-      const instanceSettingsRow = await settings.get();
-      const lowTrustDesignation = await resolveLowTrustSandboxEnvironment({
-        designatedEnvironmentId:
-          instanceSettingsRow.general.lowTrustSandboxEnvironmentId ?? null,
+      const { environment, owners } = await selectLowTrustReviewEnvironment({
         companyId,
-        environments: envs,
-      });
-      const selected = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
-        instanceDefaultEnvironmentId:
-          instanceSettingsRow.defaultEnvironmentId ?? null,
-        localDefaultEnvironmentId: local.id,
         managedSandboxOnly: experimental.enableManagedSandboxOnly,
-        managedSandboxEnvironmentId: managed?.id,
-        lowTrustReview: true,
-        lowTrustSandboxEnvironmentId: lowTrustDesignation.environmentId,
+        instanceSettings: await settings.get(),
+        environments: environmentService(db),
       });
-      const environment = await envs.getById(selected.environmentId);
-      const owners = environment
-        ? await envs.listBoundCompanyIds(environment.id)
-        : [];
       if (
         environment?.driver !== "sandbox" ||
         environment.status !== "active" ||

@@ -1,4 +1,5 @@
 import type { Environment } from "@paperclipai/shared";
+import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
 
 /**
  * Why a stored low-trust sandbox designation cannot be used for a run. Callers
@@ -53,4 +54,50 @@ export async function resolveLowTrustSandboxEnvironment(input: {
     return { environmentId: null, rejection: "environment_bound_to_other_company" };
   }
   return { environmentId: environment.id, rejection: null };
+}
+
+type LowTrustReadinessEnvironmentReader = LowTrustSandboxEnvironmentReader & {
+  ensureLocalEnvironment(companyId?: string): Promise<{ id: string }>;
+  findManagedSandboxEnvironment(companyId: string): Promise<{ id: string } | null>;
+};
+
+/**
+ * Pick the environment a `low_trust_review` run for this agent would land on,
+ * for setup-time readiness checks. Run placement and these checks must agree:
+ * a check that ignores the instance's low-trust designation reports "not ready"
+ * for an agent whose runs would in fact use the designated sandbox. Setup paths
+ * (email inbox, GitHub review bot) call this instead of re-composing the
+ * selection inputs.
+ */
+export async function selectLowTrustReviewEnvironment(input: {
+  companyId: string;
+  agentDefaultEnvironmentId: string | null | undefined;
+  managedSandboxOnly: boolean;
+  instanceSettings: {
+    defaultEnvironmentId?: string | null;
+    general: { lowTrustSandboxEnvironmentId?: string | null };
+  };
+  environments: LowTrustReadinessEnvironmentReader;
+}) {
+  const local = await input.environments.ensureLocalEnvironment(input.companyId);
+  const managed = input.managedSandboxOnly
+    ? await input.environments.findManagedSandboxEnvironment(input.companyId)
+    : null;
+  const designation = await resolveLowTrustSandboxEnvironment({
+    designatedEnvironmentId: input.instanceSettings.general.lowTrustSandboxEnvironmentId ?? null,
+    companyId: input.companyId,
+    environments: input.environments,
+  });
+  const selected = resolveExecutionWorkspaceEnvironmentId({
+    agentDefaultEnvironmentId: input.agentDefaultEnvironmentId ?? null,
+    instanceDefaultEnvironmentId: input.instanceSettings.defaultEnvironmentId ?? null,
+    localDefaultEnvironmentId: local.id,
+    managedSandboxOnly: input.managedSandboxOnly,
+    managedSandboxEnvironmentId: managed?.id,
+    lowTrustReview: true,
+    lowTrustSandboxEnvironmentId: designation.environmentId,
+  });
+  const environment = await input.environments.getById(selected.environmentId);
+  const owners = environment ? await input.environments.listBoundCompanyIds(environment.id) : [];
+  return { selected, environment, owners };
 }

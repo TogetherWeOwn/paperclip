@@ -93,6 +93,9 @@ between runs) and is not the probe-only `fake` provider. Behavior:
 Deleting or archiving the designated environment therefore fails low-trust runs
 closed; it never falls back to local. Clear the setting first.
 
+The GitHub review-bot and email-inbox setup checks use the same selection, so a
+low-trust agent whose runs would use the designation is reported ready.
+
 The Docker workflow in `doc/UNTRUSTED-PR-REVIEW.md` remains useful for manual
 local review, but Paperclip-managed low-trust execution requires a sandboxed
 environment instead of a host-local adapter process.

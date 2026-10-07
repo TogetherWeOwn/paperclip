@@ -85,6 +85,7 @@ import {
   environmentLeases,
   principalPermissionGrants,
   toolConnections,
+  environments,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
@@ -132,6 +133,7 @@ import {
 } from "../services/chat-teams-personal-recipient.js";
 import * as discordQuestionForms from "../services/chat-discord-question-forms.js";
 import { issueService } from "../services/issues.js";
+import { environmentService } from "../services/environments.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -2293,6 +2295,57 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           (check) => check.key === "permissions",
         ),
       ).toMatchObject({ ok: false });
+    });
+    it("counts the instance low-trust sandbox designation when verifying a low-trust bot agent", async () => {
+      const f = await reviewBotFixture();
+      await db
+        .update(agents)
+        .set({ permissions: { trustPreset: "low_trust_review" } })
+        .where(eq(agents.id, f.assignedAgentId));
+      const permissions = {
+        contents: "read",
+        issues: "write",
+        metadata: "read",
+        pull_requests: "write",
+        checks: "write",
+      };
+      f.setAppAccess({
+        permissions,
+        events: ["issue_comment", "pull_request_review_comment", "pull_request"],
+      });
+      f.setSupplementalProviderFetch(async (input) =>
+        String(input).endsWith("/app/installations/2468")
+          ? Response.json({ permissions, suspended_at: null })
+          : undefined,
+      );
+      const settings = instanceSettingsService(db);
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+      const isolation = async () =>
+        (await f.management.verification(f.endpoint.id)).checks.find(
+          (check) => check.key === "isolation",
+        );
+      try {
+        // No binding and no designation: the agent resolves to local.
+        expect(await isolation()).toMatchObject({ ok: false });
+        const sandbox = await environmentService(db).create({
+          name: `low-trust-sandbox-${randomUUID()}`,
+          driver: "sandbox",
+          config: { provider: "exe-dev", reuseLease: false },
+        });
+        await settings.updateGeneral({
+          lowTrustSandboxEnvironmentId: sandbox.id,
+        });
+        expect(await isolation()).toMatchObject({ ok: true });
+        // A designation that retains its VM is unusable at run time, so setup
+        // must not report ready either.
+        await db
+          .update(environments)
+          .set({ config: { provider: "exe-dev", reuseLease: true } })
+          .where(eq(environments.id, sandbox.id));
+        expect(await isolation()).toMatchObject({ ok: false });
+      } finally {
+        await settings.updateGeneral({ lowTrustSandboxEnvironmentId: null });
+      }
     });
     it("keeps GitHub publication I/O outside transactions and fences an expired owner's receipt", async () => {
       const f = await reviewBotFixture();

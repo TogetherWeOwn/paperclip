@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { resolveExecutionWorkspaceEnvironmentId } from "../services/execution-workspace-policy.ts";
 import { preflightLowTrustWorkspaceIsolation } from "../services/heartbeat.ts";
-import { resolveLowTrustSandboxEnvironment } from "../services/low-trust-sandbox-environment.ts";
+import {
+  resolveLowTrustSandboxEnvironment,
+  selectLowTrustReviewEnvironment,
+} from "../services/low-trust-sandbox-environment.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const COMPANY_ID = "company-1";
@@ -219,5 +222,76 @@ describe("low-trust sandbox placement (resolver + low-trust gate)", () => {
     ).resolves.toMatchObject({
       resolution: { environmentId: "env-agent-ssh", source: "agent" },
     });
+  });
+});
+
+// Setup-time readiness checks (GitHub review bot, email inbox) call this instead
+// of composing the selection themselves, so a check can never disagree with run
+// placement about where a low-trust agent would land.
+describe("selectLowTrustReviewEnvironment (setup readiness)", () => {
+  function select(input: {
+    designatedEnvironmentId?: string | null;
+    instanceDefaultEnvironmentId?: string | null;
+    agentDefaultEnvironmentId?: string | null;
+    managedSandboxOnly?: boolean;
+    environments?: FakeEnvironment[];
+    managedSandboxId?: string | null;
+  }) {
+    const rows = [localEnvironment, ...(input.environments ?? [exeDevSandbox])];
+    return selectLowTrustReviewEnvironment({
+      companyId: COMPANY_ID,
+      agentDefaultEnvironmentId: input.agentDefaultEnvironmentId ?? null,
+      managedSandboxOnly: input.managedSandboxOnly ?? false,
+      instanceSettings: {
+        defaultEnvironmentId: input.instanceDefaultEnvironmentId ?? null,
+        general: { lowTrustSandboxEnvironmentId: input.designatedEnvironmentId ?? null },
+      },
+      environments: {
+        ...fakeEnvironments(rows),
+        ensureLocalEnvironment: async () => ({ id: LOCAL_ID }),
+        findManagedSandboxEnvironment: async () =>
+          input.managedSandboxId ? { id: input.managedSandboxId } : null,
+      },
+    });
+  }
+
+  it("selects the designated sandbox for an agent with no binding, which the old check reported as not ready", async () => {
+    const result = await select({ designatedEnvironmentId: SANDBOX_ID });
+    expect(result.selected).toEqual({ environmentId: SANDBOX_ID, source: "low_trust_sandbox" });
+    expect(result.environment).toMatchObject({ id: SANDBOX_ID, driver: "sandbox", status: "active" });
+    expect(result.owners).toEqual([]);
+  });
+
+  it("selects local when nothing is designated, so readiness stays not-ready", async () => {
+    const result = await select({});
+    expect(result.selected.environmentId).toBe(LOCAL_ID);
+    expect(result.environment?.driver).toBe("local");
+  });
+
+  it("selects local when the designation is unusable, so readiness stays not-ready", async () => {
+    const result = await select({
+      designatedEnvironmentId: SANDBOX_ID,
+      environments: [{ ...exeDevSandbox, config: { provider: "exe-dev", reuseLease: true } }],
+    });
+    expect(result.selected.environmentId).toBe(LOCAL_ID);
+  });
+
+  it("keeps an explicit agent binding ahead of the designation", async () => {
+    const result = await select({
+      designatedEnvironmentId: SANDBOX_ID,
+      agentDefaultEnvironmentId: "env-agent-ssh",
+      environments: [exeDevSandbox, { id: "env-agent-ssh", driver: "ssh", status: "active", config: {} }],
+    });
+    expect(result.selected).toEqual({ environmentId: "env-agent-ssh", source: "agent" });
+    expect(result.environment?.driver).toBe("ssh");
+  });
+
+  it("reports the owning companies so the caller can refuse a foreign environment", async () => {
+    const result = await select({
+      designatedEnvironmentId: SANDBOX_ID,
+      instanceDefaultEnvironmentId: SANDBOX_ID,
+      environments: [{ ...exeDevSandbox, boundCompanyIds: [COMPANY_ID] }],
+    });
+    expect(result.owners).toEqual([COMPANY_ID]);
   });
 });
