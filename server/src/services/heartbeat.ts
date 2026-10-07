@@ -4484,17 +4484,18 @@ type ManagedMcpGatewayRunConfig = {
 };
 
 const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
+const RUN_GATEWAY_TOKEN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export function heartbeatRunGatewayTokenTtlMs(): number {
-  const parsed = Number.parseInt(
-    readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS) ?? "",
-    10,
-  );
+  const raw = readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS);
+  // Digits only: "24h" or "8.64e7" must not be read as 24 ms or 8 ms.
+  if (!raw || !/^\d+$/.test(raw)) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (parsed <= 0) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
   // The gateway rejects tokens whose run is no longer active, so a long TTL
-  // only keeps tools working for the lifetime of a still-running run.
-  return Number.isSafeInteger(parsed) && parsed > 0
-    ? parsed
-    : RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  // only keeps tools working for the lifetime of a still-running run. The cap
+  // keeps an oversized value from producing an invalid expiry date.
+  return Math.min(parsed, RUN_GATEWAY_TOKEN_MAX_TTL_MS);
 }
 
 function configuredPaperclipApiBaseUrl(): string | null {
