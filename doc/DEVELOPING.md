@@ -32,6 +32,11 @@ New workflow versions merged into master then receive runner access without a
 separate SHA allowlist update. Dependabot leaves this first-party reference on
 master.
 
+The caller also exposes exact `pr-lint` and `ci-ok` checks on `pull_request`:
+`pr-lint` runs the PR quality gates with a read-only token and `--no-comment`,
+while `ci-ok` runs after the reusable `ci` job and fails unless that native CI
+result is `success`; it makes no status API calls or independent passing claims.
+
 Keep the `.github/**` rule in `.github/CODEOWNERS` and the active master ruleset's
 code-owner review requirement enabled. This covers the caller, the trusted
 workflow, and CODEOWNERS itself. Existing administrator pull-request bypasses
