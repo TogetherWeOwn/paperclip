@@ -46821,6 +46821,46 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
     }
 
+    it("acts on the invoker's own lane when a thread holds a guest task and a verified task", async () => {
+      const f = await commandFixture();
+      try {
+        const guestConversation = (
+          await f.service.listConversations(f.endpoint.id)
+        ).find((candidate) => candidate.id !== f.conversation.id)!;
+        expect(guestConversation.issueIdentifier).not.toBe(
+          f.conversation.issueIdentifier,
+        );
+        const statusFor = async (overrides: Record<string, unknown> = {}) => {
+          const status = f.interaction("status", overrides);
+          await f.adapter.handleGatewayInteraction(status);
+          const content = (
+            status.editReply as unknown as {
+              mock: { calls: Array<[{ content: string }]> };
+            }
+          ).mock.calls[0]![0].content;
+          return content;
+        };
+        // The linked user sees their own task.
+        const linkedStatus = await statusFor();
+        expect(linkedStatus).toContain(f.conversation.issueIdentifier!);
+        expect(linkedStatus).not.toContain(guestConversation.issueIdentifier!);
+        // A guest sees only the guest task, never the verified one.
+        const guestStatus = await statusFor({
+          user: {
+            id: "777777777777777701",
+            username: "guest",
+            globalName: "Guest",
+            bot: false,
+            discriminator: "0",
+          },
+        });
+        expect(guestStatus).toContain(guestConversation.issueIdentifier!);
+        expect(guestStatus).not.toContain(f.conversation.issueIdentifier!);
+      } finally {
+        await f.close();
+      }
+    });
+
     it.each(["working", "final", "unknown_final", "card"] as const)(
       "qualifies pinned Discord close-owned progress retirement (%s)",
       async (mode) => {
@@ -72321,6 +72361,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       label: string,
       overrides: Parameters<typeof configuredSlackEndpoint>[1] = {},
       provider: "slack" | "discord" = "slack",
+      slackChannelId = `C-LANE-${label}`,
     ) {
       const fixture = await seedCompany();
       const configured =
@@ -72328,7 +72369,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ? await configuredDiscordEndpoint(fixture, overrides)
           : await configuredSlackEndpoint(fixture, overrides);
       const channelId =
-        provider === "discord" ? "333333333333333401" : `C-LANE-${label}`;
+        provider === "discord" ? "333333333333333401" : slackChannelId;
       const channel = makeThread({
         channelId,
         id:
@@ -73002,6 +73043,72 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         );
       });
 
+      it("vets at most 25 other participants and refuses a larger audience", async () => {
+        const f = await laneFixture("audience-cap");
+        await f.send(OWNER, "@maya hello", { trigger: "mention" });
+        const [guest] = await f.lanes();
+        const addLinkedParticipant = async (index: number) => {
+          const [participant] = await db
+            .insert(chatExternalPrincipals)
+            .values({
+              companyId: f.fixture.companyId,
+              provider: "slack",
+              providerAccountId: "T-PAPERCLIP",
+              externalId: `U-CROWD-${index}`,
+            })
+            .returning();
+          await db.insert(chatIdentityLinks).values({
+            companyId: f.fixture.companyId,
+            endpointId: f.endpoint.id,
+            principalId: participant!.id,
+            paperclipUserId: "owner-user",
+            status: "linked",
+            confirmedAt: new Date(),
+          });
+          const providerEventId = `crowd-event-${index}`;
+          const [delivery] = await db
+            .insert(chatDeliveries)
+            .values({
+              companyId: f.fixture.companyId,
+              endpointId: f.endpoint.id,
+              conversationId: guest!.conversation.id,
+              principalId: participant!.id,
+              providerEventId,
+              deduplicationKey: createHash("sha256")
+                .update(providerEventId)
+                .digest("hex"),
+              eventKind: "message",
+              normalizedEvent: {},
+              state: "processed",
+            })
+            .returning();
+          await db.insert(chatMessageLinks).values({
+            companyId: f.fixture.companyId,
+            endpointId: f.endpoint.id,
+            conversationId: guest!.conversation.id,
+            deliveryId: delivery!.id,
+            providerMessageId: `crowd-message-${index}`,
+            direction: "inbound",
+          });
+        };
+        for (let index = 0; index < 25; index += 1) {
+          await addLinkedParticipant(index);
+        }
+        await f.link(OWNER);
+        await f.send(OWNER, "with exactly 25 linked participants");
+        expect(await f.lanes()).toHaveLength(2);
+
+        await addLinkedParticipant(25);
+        await f.send(OWNER, "with 26 linked participants");
+        const lanes = await f.lanes();
+        expect(
+          (await f.commentsOf(lanes[1]!.issue.id)).map((comment) => comment.body),
+        ).toEqual(["with exactly 25 linked participants"]);
+        expect(f.channel.post).toHaveBeenCalledWith(
+          expect.stringMatching(/aren't linked/),
+        );
+      });
+
       it("refuses when another linked participant has lost membership", async () => {
         const f = await laneFixture("audience-lapsed");
         await addTeammate(f.fixture.companyId, "lapsed-user", "inactive");
@@ -73015,6 +73122,108 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(f.channel.post).toHaveBeenCalledWith(
           expect.stringMatching(noticePattern),
         );
+      });
+    });
+
+    it("aims a linked user's Slack Stop at the verified lane, not the newest generation", async () => {
+      // Slack validates Stop events against its real id shapes.
+      const owner = "UOWNERSTOP";
+      const f = await laneFixture(
+        "stop",
+        { allowUnlinkedPeople: true },
+        "slack",
+        "CLANESTOP",
+      );
+      // Verified first, so a later guest creates the newer generation.
+      const [verifiedPrincipal] = await db
+        .insert(chatExternalPrincipals)
+        .values({
+          companyId: f.fixture.companyId,
+          provider: "slack",
+          providerAccountId: "T-PAPERCLIP",
+          externalId: owner,
+        })
+        .returning();
+      await db.insert(chatIdentityLinks).values({
+        companyId: f.fixture.companyId,
+        endpointId: f.endpoint.id,
+        principalId: verifiedPrincipal!.id,
+        paperclipUserId: "owner-user",
+        status: "linked",
+        confirmedAt: new Date(),
+      });
+      await f.send(owner, "@maya start", { trigger: "mention" });
+      await f.send("UGUESTSTOP", "guest follow-up");
+      await db
+        .update(chatEndpoints)
+        .set({ status: "active" })
+        .where(eq(chatEndpoints.id, f.endpoint.id));
+      const [verified, guest] = await f.lanes();
+      expect(verified!.issue.sourceTrust).toBeNull();
+      expect(guest!.issue.sourceTrust).toMatchObject({
+        disposition: "quarantined",
+      });
+
+      const stopSecond = Math.floor(Date.now() / 1_000);
+      const seedRun = async (issueId: string) => {
+        const id = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id,
+          companyId: f.fixture.companyId,
+          agentId: f.fixture.assignedAgentId,
+          status: "running",
+          createdAt: new Date((stopSecond - 2) * 1_000),
+          startedAt: new Date((stopSecond - 1) * 1_000),
+          contextSnapshot: { issueId, source: "chat:slack" },
+        });
+        await db
+          .update(issues)
+          .set({ executionRunId: id, status: "in_progress" })
+          .where(eq(issues.id, issueId));
+        return id;
+      };
+      const verifiedRun = await seedRun(verified!.issue.id);
+      await seedRun(guest!.issue.id);
+      const workspaceId = (await f.service.get(f.endpoint.id)).providerAccountId;
+      const body = JSON.stringify({
+        type: "event_callback",
+        team_id: workspaceId,
+        event_id: "EvLaneStop1",
+        event: {
+          type: "agent_session_stopped",
+          channel: f.channel.thread.channelId,
+          thread_ts: "9100.1",
+          event_ts: `${stopSecond}.234567`,
+          streaming_message_ts: [],
+          user: owner,
+        },
+      });
+      await expect(
+        f.service.handleWebhook(
+          f.endpoint.publicId,
+          "slack",
+          signedSlackWebhookRequest({
+            body,
+            contentType: "application/json",
+            url: `https://paperclip.example/api/chat-webhooks/${f.endpoint.publicId}/slack`,
+          }),
+        ),
+      ).resolves.toMatchObject({ status: 202 });
+
+      expect(f.cancelRun).toHaveBeenCalledTimes(1);
+      expect(f.cancelRun.mock.calls[0]![0]).toBe(verifiedRun);
+      const [stop] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, f.endpoint.id),
+            eq(chatActions.providerActionId, "slack_session_stop:EvLaneStop1"),
+          ),
+        );
+      expect(stop!.payload).toMatchObject({
+        issueId: verified!.issue.id,
+        target: { id: verifiedRun, kind: "run" },
       });
     });
   });

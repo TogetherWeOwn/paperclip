@@ -1747,6 +1747,20 @@ function chatTrustLaneOfIssue(
     : "verified";
 }
 
+/**
+ * The task a command or Stop in a native thread acts on: the invoker's own
+ * lane, newest first. A verified invoker may fall back to the newest guest
+ * task. A guest never reaches a verified task.
+ */
+function invokerLaneRow<
+  Row extends { issue: Pick<typeof issues.$inferSelect, "sourceTrust"> },
+>(rowsNewestFirst: Row[], invokerVerified: boolean): Row | null {
+  const own = rowsNewestFirst.find(
+    (row) => (chatTrustLaneOfIssue(row.issue) === "verified") === invokerVerified,
+  );
+  return own ?? (invokerVerified ? (rowsNewestFirst[0] ?? null) : null);
+}
+
 /** Bound on how many other participants one trusted-lane admission will vet. */
 const TRUST_LANE_AUDIENCE_MAX_PRINCIPALS = 25;
 
@@ -10517,15 +10531,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     ) {
       const others = await tx
         .selectDistinct({ principalId: chatDeliveries.principalId })
-        .from(chatDeliveries)
+        .from(chatMessageLinks)
+        .innerJoin(
+          chatDeliveries,
+          and(
+            eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+            eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+          ),
+        )
         .where(
           and(
-            eq(chatDeliveries.companyId, input.endpoint.companyId),
-            eq(chatDeliveries.endpointId, input.endpoint.id),
+            eq(chatMessageLinks.companyId, input.endpoint.companyId),
+            eq(chatMessageLinks.endpointId, input.endpoint.id),
             inArray(
-              chatDeliveries.conversationId,
+              chatMessageLinks.conversationId,
               rows.map((row) => row.conversation.id),
             ),
+            eq(chatMessageLinks.direction, "inbound"),
             isNotNull(chatDeliveries.principalId),
             ne(chatDeliveries.principalId, input.principalId),
           ),
@@ -16144,11 +16166,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
 
       const inboundActivityPublications: ActivityPublication[] = [];
-      // GitHub keeps its own per-repository authority model; linear surfaces
-      // end a task with /new or /close. Native threads stay bound to one task
-      // for life, so each trust lane needs its own task in that thread.
+      // Slack and Discord native threads stay bound to one task for life, so
+      // each trust lane needs its own task in that thread. Linear surfaces end
+      // a task with /new or /close, and the other providers keep their own
+      // thread, control and authority models.
       const trustLanesIsolated =
-        surfaceKind === "native_thread" && endpoint.provider !== "github";
+        surfaceKind === "native_thread" &&
+        (endpoint.provider === "slack" || endpoint.provider === "discord");
       let trustLaneRefused = false;
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
@@ -16199,7 +16223,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             },
             taskTx,
           );
-          await taskTx
+          const inserted = await taskTx
             .insert(chatConversations)
             .values({
               companyId: endpoint.companyId,
@@ -16220,7 +16244,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               state: "active",
               lastActivityAt: new Date(),
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning({ id: chatConversations.id });
+          // A lane task joins only the conversation created for it. If
+          // another writer already owns this generation, roll back and retry
+          // the delivery rather than bind this message to the other lane.
+          if (laneSessionGeneration !== null && inserted.length === 0)
+            throw conflict(
+              "Another task already owns this conversation generation",
+            );
           conversation = await taskTx
             .select()
             .from(chatConversations)
@@ -16233,10 +16265,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ),
             )
             .then((rows) => rows[0] ?? null);
-          // A lane's task must be bound only to the conversation created for
-          // it; never join whichever lane won a generation race.
-          if (laneSessionGeneration !== null && conversation?.issueId !== issue.id)
-            conversation = null;
         }
         if (!conversation)
           throw conflict(
@@ -23223,8 +23251,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               : null
             : invocation.sourceKind !== "guild_channel"
               ? await tx
-                  .select()
+                  .select({ conversation: chatConversations, issue: issues })
                   .from(chatConversations)
+                  .innerJoin(
+                    issues,
+                    and(
+                      eq(issues.companyId, chatConversations.companyId),
+                      eq(issues.id, chatConversations.issueId),
+                    ),
+                  )
                   .where(
                     and(
                       eq(chatConversations.companyId, scope.companyId),
@@ -23240,9 +23275,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     ),
                   )
                   .orderBy(desc(chatConversations.sessionGeneration))
-                  .limit(1)
-                  .for("update")
-                  .then((rows) => rows[0] ?? null)
+                  .for("update", { of: chatConversations })
+                  .then((rows) =>
+                    // A thread can hold one task per trust lane. A command
+                    // acts on the invoker's own lane, never on another's.
+                    invocation.sourceKind === "native_thread"
+                      ? (invokerLaneRow(rows, principal.userId !== null)
+                          ?.conversation ?? null)
+                      : (rows[0]?.conversation ?? null),
+                  )
               : null;
           if (
             (receipt?.target && !conversation) ||
@@ -26264,8 +26305,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (!currentEndpoint || currentEndpoint.provider !== "slack") return null;
 
       const conversation = await tx
-        .select()
+        .select({ conversation: chatConversations, issue: issues })
         .from(chatConversations)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, chatConversations.companyId),
+            eq(issues.id, chatConversations.issueId),
+          ),
+        )
         .where(
           and(
             eq(chatConversations.companyId, currentEndpoint.companyId),
@@ -26275,9 +26323,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ),
         )
         .orderBy(desc(chatConversations.sessionGeneration))
-        .limit(1)
-        .for("update")
-        .then((rows) => rows[0] ?? null);
+        .for("update", { of: chatConversations })
+        .then((rows) =>
+          // A thread can hold one task per trust lane. Only a linked user may
+          // Stop, so prefer the verified lane (a guest's Stop is denied when
+          // it executes) over simply the newest generation.
+          rows[0]?.conversation.isDirectMessage
+            ? rows[0].conversation
+            : (invokerLaneRow(rows, true)?.conversation ?? null),
+        );
       const principal = await tx
         .select()
         .from(chatExternalPrincipals)
