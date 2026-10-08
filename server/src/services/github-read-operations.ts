@@ -54,20 +54,31 @@ const MAX_LOG_BYTES = 1024 * 1024;
 const MAX_WEBHOOK_RESPONSE_BYTES = 512 * 1024;
 const MAX_WEBHOOKS = 100;
 const LOG_DOWNLOAD_HOST = /^productionresultssa\d+\.blob\.core\.windows\.net$/i;
-// Secret-name affixes are bounded so these patterns stay linear on a 1 MiB log made of
-// long dash- or underscore-joined runs. An unbounded affix backtracks quadratically.
-const SECRET_NAME = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|(?:access[-_]?|auth[-_]?|refresh[-_]?|id[-_]?)?token|secret|passw(?:or)?d|credential|private[-_]?key|cookie|connection[-_]?string|jwt|bearer|authorization|signature|sig)[A-Za-z0-9_-]{0,64}`;
+// Secret-name affixes are bounded, and each name must start where no name character
+// precedes it. Together these keep the patterns linear on a 1 MiB log made of long dash- or
+// underscore-joined runs: an unbounded affix, or a start at every dash, backtracks heavily.
+// `sig` and `signature` count only as a whole name, so `assignee` and `--signoff` stay readable.
+const SECRET_WORDS = String.raw`api[-_]?key|(?:access[-_]?|auth[-_]?|refresh[-_]?|id[-_]?)?token|secret|passw(?:or)?d|credential|private[-_]?key|cookie|connection[-_]?string|jwt|bearer|authorization`;
+const SECRET_NAME = String.raw`(?:[A-Za-z0-9_-]{0,64}(?:${SECRET_WORDS})[A-Za-z0-9_-]{0,64}|signature|sig)`;
+const NAME_START = String.raw`(?<![A-Za-z0-9_-])`;
 const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
 const PROVIDER_KEY_PATTERN = /\b(?:sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,})\b/g;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
-const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|$)/g;
+const PEM_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----/g;
+const PEM_END_PATTERN = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g;
+const PEM_MAX_BLOCK_CHARS = 16 * 1024;
+// A header with no END line is redacted together with the base64-looking lines that follow it,
+// or to the end of a log that the size cap cut. A banner such as `echo "-----BEGIN ..."` keeps
+// the rest of the log.
+const PEM_BODY_LINES_PATTERN = /(?:\r?\n(?:\S{1,40}Z )?[A-Za-z0-9+/=]{16,}[ \t]*)*/y;
 const ADD_MASK_PATTERN = /(::add-mask::)\S*/gi;
-const BEARER_PATTERN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
-const AUTHORIZATION_PATTERN = /\b(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)[^\s,;]+/gi;
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
+const AUTHORIZATION_PATTERN = /\b(authorization\s*[:=]\s*)[^\r\n]+/gi;
 const URL_CREDENTIAL_PATTERN = /\b([a-z][a-z0-9+.-]{0,20}:\/\/)[^\s/@:]{1,200}:[^\s/@]{1,200}@/gi;
-const JSON_SECRET_FIELD_PATTERN = new RegExp(String.raw`("(?:${SECRET_NAME})"\s*:\s*")(?:\\.|[^"\\])*"`, "gi");
-const CLI_SECRET_OPTION_PATTERN = new RegExp(String.raw`(\B--?${SECRET_NAME}(?:=|\s+))(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)`, "gi");
-const SECRET_ASSIGNMENT_PATTERN = new RegExp(String.raw`(\b${SECRET_NAME}\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;"']+)`, "gi");
+const BASIC_AUTH_OPTION_PATTERN = /(\s-u\s+)[^\s:]{1,200}:\S{1,200}/g;
+const JSON_SECRET_FIELD_PATTERN = new RegExp(String.raw`(["']${SECRET_NAME}["']\s*:\s*)(["'])(?:\\.|(?!\2)[^\\\r\n])*\2?`, "gi");
+const CLI_SECRET_OPTION_PATTERN = new RegExp(String.raw`((?<![A-Za-z0-9_-])--?${SECRET_NAME}(?:=|\s+))(?:"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s"']+)`, "gi");
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(String.raw`(${NAME_START}${SECRET_NAME}\s*[:=]\s*)(?:"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s,;"']+)`, "gi");
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"']+/gi;
 const REDACTED = "[REDACTED]";
 
@@ -175,9 +186,41 @@ function checkedLogDownloadUrl(location: string | null) {
   return url.toString();
 }
 
-export function sanitizeGitHubDiagnosticText(value: string, secretValues: string[]) {
-  return redactRegisteredSecretValues(value, secretValues)
-    .replace(PEM_BLOCK_PATTERN, "[REDACTED PRIVATE KEY]")
+// Linear in the log size: END markers are located once and the BEGIN scan only moves forward,
+// so a log full of unmatched headers cannot make each header rescan the rest of the log.
+function redactPrivateKeyBlocks(text: string, truncated: boolean) {
+  if (!text.includes("PRIVATE KEY-----")) return text;
+  const ends = [...text.matchAll(PEM_END_PATTERN)].map((match) => match.index! + match[0].length);
+  let endIndex = 0;
+  let cursor = 0;
+  let out = "";
+  for (const begin of text.matchAll(PEM_BEGIN_PATTERN)) {
+    const start = begin.index!;
+    if (start < cursor) continue;
+    const headerEnd = start + begin[0].length;
+    while (endIndex < ends.length && ends[endIndex]! <= headerEnd) endIndex += 1;
+    const end = ends[endIndex];
+    let blockEnd: number;
+    if (end !== undefined && end - start <= PEM_MAX_BLOCK_CHARS) {
+      blockEnd = end;
+    } else if (truncated) {
+      blockEnd = text.length;
+    } else {
+      PEM_BODY_LINES_PATTERN.lastIndex = headerEnd;
+      blockEnd = headerEnd + (PEM_BODY_LINES_PATTERN.exec(text)?.[0].length ?? 0);
+    }
+    out += text.slice(cursor, start) + "[REDACTED PRIVATE KEY]";
+    cursor = blockEnd;
+  }
+  return out + text.slice(cursor);
+}
+
+export function sanitizeGitHubDiagnosticText(
+  value: string,
+  secretValues: string[],
+  options: { truncated?: boolean } = {},
+) {
+  return redactPrivateKeyBlocks(redactRegisteredSecretValues(value, secretValues), options.truncated === true)
     .replace(ADD_MASK_PATTERN, `$1${REDACTED}`)
     .replace(GITHUB_TOKEN_PATTERN, REDACTED)
     .replace(PROVIDER_KEY_PATTERN, REDACTED)
@@ -185,7 +228,8 @@ export function sanitizeGitHubDiagnosticText(value: string, secretValues: string
     .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
     .replace(AUTHORIZATION_PATTERN, `$1${REDACTED}`)
     .replace(URL_CREDENTIAL_PATTERN, `$1${REDACTED}@`)
-    .replace(JSON_SECRET_FIELD_PATTERN, `$1${REDACTED}"`)
+    .replace(BASIC_AUTH_OPTION_PATTERN, `$1${REDACTED}`)
+    .replace(JSON_SECRET_FIELD_PATTERN, `$1$2${REDACTED}$2`)
     .replace(CLI_SECRET_OPTION_PATTERN, `$1${REDACTED}`)
     .replace(SECRET_ASSIGNMENT_PATTERN, `$1${REDACTED}`)
     .replace(URL_PATTERN, stripSecretBearingUrlParts);
@@ -318,6 +362,7 @@ export function githubReadOperationsService(
         const logs = sanitizeGitHubDiagnosticText(
           body.truncated ? dropTrailingPartialToken(registeredRedactions) : registeredRedactions,
           credential.token ? [credential.token] : [],
+          { truncated: body.truncated },
         );
         return {
           repositoryId: parsed.repositoryId,

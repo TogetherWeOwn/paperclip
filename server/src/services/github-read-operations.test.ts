@@ -177,6 +177,23 @@ describe("githubReadOperationsService", () => {
     expect(result.logs).not.toContain("GH_TOKEN");
   });
 
+  it("never returns the head of a multi-word secret that the size cap split", async () => {
+    const head = `${"x".repeat(1024 * 1024 - 70)}\nDB_PASSWORD="correct horse battery staple and more words`;
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return calls === 1
+        ? redirect(SAFE_DOWNLOAD)
+        : new Response(`${head} that continue past the cap"\n`, { status: 200, headers: { "content-type": "text/plain" } });
+    }) as unknown as typeof fetch;
+
+    const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+
+    expect(result.truncated).toBe(true);
+    expect(result.logs).not.toContain("correct horse");
+    expect(result.logs).not.toContain("battery");
+  });
+
   it("reports a mid-stream failure as a sanitized 422", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
@@ -343,10 +360,77 @@ describe("sanitizeGitHubDiagnosticText", () => {
     expect(sanitizeGitHubDiagnosticText(line, [])).toBe(line);
   });
 
-  it("stays linear on a large log made of dash-joined runs", () => {
-    const hostile = `token ${"a-".repeat(128 * 1024)}\n${"KEY_".repeat(64 * 1024)}x\n`;
+  it.each([
+    ["a- runs after a keyword", `token ${"a-".repeat(512 * 1024)}\n`],
+    ["jwt- runs", `${"jwt-".repeat(256 * 1024)}\n`],
+    ["sig- runs", `${"sig-".repeat(256 * 1024)}\n`],
+    ["-sig runs", `${"-sig".repeat(256 * 1024)}\n`],
+    ["--token- runs", `${"--token-".repeat(128 * 1024)}\n`],
+    ["KEY_ runs", `${"KEY_".repeat(256 * 1024)}x\n`],
+    ["quote runs", `${'password="'.repeat(105 * 1024)}\n`],
+    ["BEGIN headers", `${"-----BEGIN PRIVATE KEY-----\n".repeat(37 * 1024)}`],
+  ])("stays linear on a 1 MiB log of %s", (_label, hostile) => {
+    expect(hostile.length).toBeGreaterThanOrEqual(1024 * 1024 - 8);
     const started = Date.now();
     sanitizeGitHubDiagnosticText(hostile, []);
-    expect(Date.now() - started).toBeLessThan(2000);
+    sanitizeGitHubDiagnosticText(hostile, [], { truncated: true });
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("redacts each complete key block and keeps the text around and between them", () => {
+    const block = (body: string) => `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`;
+    const output = sanitizeGitHubDiagnosticText(
+      `before\n${block("firstSecretBody0123456789")}\nbetween\n${block("secondSecretBody0123456789")}\nafter`,
+      [],
+    );
+    expect(output).toBe("before\n[REDACTED PRIVATE KEY]\nbetween\n[REDACTED PRIVATE KEY]\nafter");
+  });
+
+  it("does not let a banner header swallow a distant, unrelated end marker", () => {
+    const filler = "line of ordinary output\n".repeat(2000);
+    const output = sanitizeGitHubDiagnosticText(
+      `echo "-----BEGIN PRIVATE KEY-----"\n${filler}-----END PRIVATE KEY-----\ntail`,
+      [],
+    );
+    expect(output).toContain("tail");
+    expect(output).toContain("line of ordinary output");
+  });
+
+  it("keeps the rest of the log when a key header has no matching end", () => {
+    const log = 'echo "-----BEGIN PRIVATE KEY-----" > key.pem\nstep two output\nTests: 1 failed\nError: assertion failed';
+    const output = sanitizeGitHubDiagnosticText(log, []);
+    expect(output).toContain("Tests: 1 failed");
+    expect(output).toContain("Error: assertion failed");
+  });
+
+  it("redacts an unterminated key body, and everything after a header in a truncated log", () => {
+    const body = "2026-10-08T00:00:00.1234567Z -----BEGIN PRIVATE KEY-----\n2026-10-08T00:00:00.1234568Z MIIEvQIBADANBgkqhkiG9w0BAQEF\n2026-10-08T00:00:00.1234569Z AASCBKcwggSjAgEAAoIBAQC7VJTUt9Us\nnext step";
+    const unterminated = sanitizeGitHubDiagnosticText(body, []);
+    expect(unterminated).not.toContain("MIIEvQIBAD");
+    expect(unterminated).not.toContain("AASCBKcwgg");
+    expect(unterminated).toContain("next step");
+    expect(sanitizeGitHubDiagnosticText(body, [], { truncated: true })).not.toContain("next step");
+  });
+
+  it.each([
+    ['PASSWORD="correct horse battery', "correct horse battery"],
+    ["PASSWORD='my pass", "my pass"],
+    ['token="line1\nline2"', "line1"],
+    ["Authorization: token 0123456789abcdef0123456789abcdef01234567", "0123456789abcdef"],
+    ["Authorization: Digest username=admin, response=abcdef0123", "abcdef0123"],
+    ["{'password': 'py-secret'}", "py-secret"],
+    ["curl -u admin:s3cr3tpass https://example.test", "s3cr3tpass"],
+  ])("redacts %s", (input, secret) => {
+    expect(sanitizeGitHubDiagnosticText(input, [])).not.toContain(secret);
+  });
+
+  it.each([
+    "assignee: octocat",
+    "design: dark",
+    "signal: SIGTERM",
+    'git commit --signoff -m "msg"',
+    "Basic functionality-and-setup works",
+  ])("leaves ordinary text alone: %s", (line) => {
+    expect(sanitizeGitHubDiagnosticText(line, [])).toBe(line);
   });
 });
