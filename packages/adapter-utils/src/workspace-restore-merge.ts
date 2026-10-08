@@ -462,6 +462,16 @@ export async function mergeDirectoryWithBaseline(input: {
 }): Promise<void> {
   const source = await captureDirectorySnapshot(input.sourceDir, { exclude: input.baseline.exclude });
   await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+    // A literal excluded descendant must survive replacement of its ancestor,
+    // not just leaf deletion. Reject before Git integration or any file writes.
+    for (const [relative, entry] of source.entries) {
+      if (entry.kind === "dir" || entriesMatch(input.baseline.entries.get(relative), entry)) continue;
+      if (input.baseline.exclude.some((excluded) => excluded.replace(/^\.\//, "").startsWith(`${relative}/`))) {
+        throw Object.assign(new Error("Workspace restore cannot replace an excluded path's ancestor"), {
+          code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE",
+        });
+      }
+    }
     await input.beforeApply?.();
     const current = await captureDirectorySnapshot(canonicalTargetDir, { exclude: input.baseline.exclude });
     const deletedLeafEntries = [...input.baseline.entries.entries()]
