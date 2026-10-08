@@ -8,6 +8,7 @@ import { ensureManagedProjectWorkspace, prepareProjectRepositoryWorkspaces } fro
 import { buildGitAuthInvocation, GIT_CREDENTIAL_TOKEN_ENV_KEY } from "../services/git-credentials.ts";
 import { sanitizeRuntimeServiceBaseEnv } from "../services/workspace-runtime.ts";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.ts";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 
 const execFile = promisify(execFileCallback);
 
@@ -184,6 +185,180 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
     }
   });
 
+  it.each(["missing", "stripped"] as const)("restores while a %s nested checkout's clone is held and retains late files", async (mode) => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    const restoreSource = await fs.mkdtemp(path.join(tempHome, "restore-source-"));
+    let releaseClone!: () => void;
+    const cloneRelease = new Promise<void>((resolve) => { releaseClone = resolve; });
+    let enterClone!: () => void;
+    const cloneEntered = new Promise<void>((resolve) => { enterClone = resolve; });
+    let pending: ReturnType<typeof prepareProjectRepositoryWorkspaces> | undefined;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: `repo-slow-clone-${mode}`, projectId: "two", repoUrl: first });
+      const input = { cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [{ id: "second", repoUrl: second, repoRef: null }] };
+      const [repo] = await prepareProjectRepositoryWorkspaces(input);
+      const nestedCwd = repo!.cwd;
+      await fs.rm(mode === "missing" ? nestedCwd : path.join(nestedCwd, ".git"), { recursive: true, force: true });
+      if (mode === "stripped") await fs.writeFile(path.join(nestedCwd, "before.txt"), "original snapshot\n");
+      const baseline = await captureDirectorySnapshot(anchor.cwd, { exclude: [".git", ".paperclip-runtime"] });
+      await fs.cp(anchor.cwd, restoreSource, { recursive: true });
+      const restoredNested = path.join(restoreSource, path.relative(anchor.cwd, nestedCwd));
+      await fs.mkdir(restoredNested, { recursive: true });
+      await fs.writeFile(path.join(restoredNested, "late.txt"), "restored during clone\n");
+      await fs.writeFile(path.join(restoreSource, "agent-output.txt"), "run output\n");
+      pending = prepareProjectRepositoryWorkspaces({
+        ...input,
+        resolveGitAuth: async () => { enterClone(); await cloneRelease; return null; },
+      });
+      await cloneEntered;
+      // Advance only the lock's wall clock: old setup times out immediately
+      // rather than requiring a 30-second sleep. Filesystem/Git remain real.
+      let now = Date.now();
+      clock = vi.spyOn(Date, "now").mockImplementation(() => { now += 31_000; return now; });
+      await mergeDirectoryWithBaseline({ baseline, sourceDir: restoreSource, targetDir: anchor.cwd });
+      clock.mockRestore();
+      expect(await fs.readFile(path.join(anchor.cwd, "agent-output.txt"), "utf8")).toBe("run output\n");
+      expect(await fs.readFile(path.join(nestedCwd, "late.txt"), "utf8")).toBe("restored during clone\n");
+      releaseClone();
+      const [recovered] = await pending;
+      expect(recovered!.warnings).toHaveLength(1);
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: nestedCwd })).stdout.trim()).toBe("true");
+      expect(await fs.readFile(path.join(anchor.cwd, "agent-output.txt"), "utf8")).toBe("run output\n");
+      const detached = path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories");
+      const retained = await fs.readdir(detached);
+      expect(retained).toHaveLength(1);
+      expect(await fs.readFile(path.join(detached, retained[0]!, "late.txt"), "utf8")).toBe("restored during clone\n");
+      if (mode === "stripped") expect(await fs.readFile(path.join(detached, retained[0]!, "before.txt"), "utf8")).toBe("original snapshot\n");
+      expect(await fs.readdir(path.join(anchor.cwd, ".paperclip-runtime", "repository-clones"))).toEqual([]);
+    } finally {
+      clock?.mockRestore();
+      releaseClone();
+      if (pending) await Promise.allSettled([pending]);
+      await Promise.all([first, second, restoreSource].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("repairs an earlier adopted checkout stripped by restore while a later checkout clones", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    const third = await createLocalSourceRepo();
+    const restoreSource = await fs.mkdtemp(path.join(tempHome, "restore-source-"));
+    let releaseClone!: () => void;
+    const cloneRelease = new Promise<void>((resolve) => { releaseClone = resolve; });
+    let enterClone!: () => void;
+    const cloneEntered = new Promise<void>((resolve) => { enterClone = resolve; });
+    let pending: ReturnType<typeof prepareProjectRepositoryWorkspaces> | undefined;
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-set-revalidation", projectId: "two", repoUrl: first });
+      const input = {
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }, { id: "third", repoUrl: third, repoRef: null }],
+      };
+      const [earlier, later] = await prepareProjectRepositoryWorkspaces(input);
+      await fs.writeFile(path.join(earlier!.cwd, "survivor.txt"), "adopted dirty work\n");
+      await fs.rm(later!.cwd, { recursive: true, force: true });
+      const baseline = await captureDirectorySnapshot(anchor.cwd, { exclude: [".git", ".paperclip-runtime"] });
+      await fs.cp(anchor.cwd, restoreSource, { recursive: true });
+      // SSH transfer strips nested .git, but its baseline includes that metadata.
+      await fs.rm(path.join(restoreSource, path.relative(anchor.cwd, earlier!.cwd), ".git"), { recursive: true, force: true });
+      pending = prepareProjectRepositoryWorkspaces({
+        ...input,
+        resolveGitAuth: async (url) => { if (url === third) { enterClone(); await cloneRelease; } return null; },
+      });
+      await cloneEntered;
+      await mergeDirectoryWithBaseline({ baseline, sourceDir: restoreSource, targetDir: anchor.cwd });
+      await expect(fs.stat(path.join(earlier!.cwd, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+      releaseClone();
+      const repaired = await pending;
+      expect(repaired.map((repo) => repo.cwd)).toEqual([earlier!.cwd, later!.cwd]);
+      expect(repaired[0]!.warnings).toHaveLength(1);
+      for (const repo of repaired) expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repo.cwd })).stdout.trim()).toBe("true");
+      const detached = path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories");
+      const retained = await fs.readdir(detached);
+      expect(retained).toHaveLength(1);
+      expect(await fs.readFile(path.join(detached, retained[0]!, "survivor.txt"), "utf8")).toBe("adopted dirty work\n");
+    } finally {
+      releaseClone();
+      if (pending) await Promise.allSettled([pending]);
+      await Promise.all([first, second, third, restoreSource].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("recreates the repositories parent removed by restore during clone preparation", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    const restoreSource = await fs.mkdtemp(path.join(tempHome, "restore-source-"));
+    let releaseClone!: () => void;
+    const cloneRelease = new Promise<void>((resolve) => { releaseClone = resolve; });
+    let enterClone!: () => void;
+    const cloneEntered = new Promise<void>((resolve) => { enterClone = resolve; });
+    let pending: ReturnType<typeof prepareProjectRepositoryWorkspaces> | undefined;
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-parent-deletion", projectId: "two", repoUrl: first });
+      const input = { cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [{ id: "second", repoUrl: second, repoRef: null }] };
+      const [repo] = await prepareProjectRepositoryWorkspaces(input);
+      await fs.rm(path.join(repo!.cwd, ".git"), { recursive: true, force: true });
+      const baseline = await captureDirectorySnapshot(anchor.cwd, { exclude: [".git", ".paperclip-runtime"] });
+      await fs.cp(anchor.cwd, restoreSource, { recursive: true });
+      await fs.rm(path.join(restoreSource, ".paperclip-repositories"), { recursive: true, force: true });
+      await fs.writeFile(path.join(restoreSource, "agent-output.txt"), "run output\n");
+      pending = prepareProjectRepositoryWorkspaces({
+        ...input,
+        resolveGitAuth: async () => { enterClone(); await cloneRelease; return null; },
+      });
+      await cloneEntered;
+      await mergeDirectoryWithBaseline({ baseline, sourceDir: restoreSource, targetDir: anchor.cwd });
+      await expect(fs.stat(path.join(anchor.cwd, ".paperclip-repositories"))).rejects.toMatchObject({ code: "ENOENT" });
+      releaseClone();
+      const [recovered] = await pending;
+      expect(recovered!.cwd).toBe(repo!.cwd);
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: recovered!.cwd })).stdout.trim()).toBe("true");
+      expect(await fs.readFile(path.join(anchor.cwd, "agent-output.txt"), "utf8")).toBe("run output\n");
+      expect(await fs.readdir(path.join(anchor.cwd, ".paperclip-runtime", "repository-clones"))).toEqual([]);
+    } finally {
+      releaseClone();
+      if (pending) await Promise.allSettled([pending]);
+      await Promise.all([first, second, restoreSource].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("adopts a valid checkout restored while cloning instead of quarantining its work", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    let releaseClone!: () => void;
+    const cloneRelease = new Promise<void>((resolve) => { releaseClone = resolve; });
+    let enterClone!: () => void;
+    const cloneEntered = new Promise<void>((resolve) => { enterClone = resolve; });
+    let pending: ReturnType<typeof prepareProjectRepositoryWorkspaces> | undefined;
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-restored-git", projectId: "two", repoUrl: first });
+      const input = { cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [{ id: "second", repoUrl: second, repoRef: null }] };
+      const [repo] = await prepareProjectRepositoryWorkspaces(input);
+      const nestedCwd = repo!.cwd;
+      await fs.rm(nestedCwd, { recursive: true, force: true });
+      pending = prepareProjectRepositoryWorkspaces({
+        ...input,
+        resolveGitAuth: async () => { enterClone(); await cloneRelease; return null; },
+      });
+      await cloneEntered;
+      await execFile("git", ["clone", second, nestedCwd]);
+      await fs.writeFile(path.join(nestedCwd, "README.md"), "restored dirty work\n");
+      releaseClone();
+      const [adopted] = await pending;
+      expect(adopted!.warnings).toBeUndefined();
+      expect(await fs.readFile(path.join(nestedCwd, "README.md"), "utf8")).toBe("restored dirty work\n");
+      await expect(fs.stat(path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readdir(path.join(anchor.cwd, ".paperclip-runtime", "repository-clones"))).toEqual([]);
+    } finally {
+      releaseClone();
+      if (pending) await Promise.allSettled([pending]);
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
   it.each(["simple", "dot-segment"] as const)("preserves secondary checkout hints through a %s symlinked anchor", async (mode) => {
     const first = await createLocalSourceRepo();
     const second = await createLocalSourceRepo();
@@ -232,6 +407,63 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
         .rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("holds the anchor lock while validating an adopted linked-worktree Git file", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    const restoreSource = await fs.mkdtemp(path.join(tempHome, "restore-source-"));
+    let releaseValidation!: () => void;
+    const validationRelease = new Promise<void>((resolve) => { releaseValidation = resolve; });
+    let enterValidation!: () => void;
+    const validationEntered = new Promise<void>((resolve) => { enterValidation = resolve; });
+    const stat = fs.stat.bind(fs);
+    let statSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    let pending: ReturnType<typeof prepareProjectRepositoryWorkspaces> | undefined;
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-gitfile-restore", projectId: "two", repoUrl: first });
+      const input = { cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [{ id: "second", repoUrl: second, repoRef: null }] };
+      const [initial] = await prepareProjectRepositoryWorkspaces(input);
+      const cwd = initial!.cwd;
+      await fs.rm(cwd, { recursive: true, force: true });
+      await execFile("git", ["worktree", "add", "-b", "linked-work", cwd], { cwd: second });
+      await fs.writeFile(path.join(cwd, "README.md"), "dirty linked work\n");
+      const metadataPath = path.join(cwd, ".git");
+      const baseline = await captureDirectorySnapshot(anchor.cwd, { exclude: [".git", ".paperclip-runtime"] });
+      await fs.cp(anchor.cwd, restoreSource, { recursive: true });
+      await fs.rm(path.join(restoreSource, path.relative(anchor.cwd, cwd), ".git"));
+      let held = false;
+      statSpy = vi.spyOn(fs, "stat").mockImplementation(async (filename, options) => {
+        const result = await stat(filename, options);
+        if (filename === metadataPath && !held) {
+          held = true;
+          enterValidation();
+          await validationRelease;
+        }
+        return result;
+      });
+      pending = prepareProjectRepositoryWorkspaces(input);
+      await validationEntered;
+      // A deliberate long validation proves the restore cannot remove the Git
+      // file between stat and rev-parse. The production lock still fails closed.
+      let now = Date.now();
+      clock = vi.spyOn(Date, "now").mockImplementation(() => { now += 31_000; return now; });
+      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir: restoreSource, targetDir: anchor.cwd }))
+        .rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
+      clock.mockRestore();
+      releaseValidation();
+      const [reused] = await pending;
+      expect(reused!.warnings).toBeUndefined();
+      expect((await fs.lstat(metadataPath)).isFile()).toBe(true);
+      expect(await fs.readFile(path.join(cwd, "README.md"), "utf8")).toBe("dirty linked work\n");
+    } finally {
+      clock?.mockRestore();
+      releaseValidation();
+      if (pending) await Promise.allSettled([pending]);
+      statSpy?.mockRestore();
+      await Promise.all([first, second, restoreSource].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
     }
   });
 

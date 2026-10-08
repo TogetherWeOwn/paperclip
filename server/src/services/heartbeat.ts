@@ -2468,6 +2468,21 @@ export async function ensureManagedProjectWorkspace(input: {
   return result;
 }
 
+async function hasAdoptableManagedWorkspaceGit(cwd: string): Promise<boolean> {
+  const metadata = await fs.stat(path.resolve(cwd, ".git")).catch(() => null);
+  if (metadata?.isDirectory()) return true;
+  if (!metadata?.isFile()) return false;
+  try {
+    const toplevel = await runLocalGit(cwd, ["rev-parse", "--show-toplevel"], { timeout: 10_000, maxBuffer: 16 * 1024 });
+    if (await fs.realpath(toplevel.stdout.trim()) !== await fs.realpath(cwd)) {
+      throw new Error("Git file does not identify this workspace as its repository root");
+    }
+    return true;
+  } catch (error) {
+    throw new Error(`Managed workspace Git file is unusable at "${cwd}".`, { cause: error });
+  }
+}
+
 async function materializeManagedProjectWorkspace(
   cwd: string,
   input: {
@@ -2475,10 +2490,14 @@ async function materializeManagedProjectWorkspace(
     repoRef?: string | null;
     localSource?: string | null;
     resolveGitAuth?: GitRemoteAuthProvider | null;
+    repositoryAnchor?: string;
   },
 ): Promise<{ cwd: string; warning: string | null }> {
   await fs.mkdir(path.dirname(cwd), { recursive: true });
-  const stats = await fs.stat(cwd).catch(() => null);
+  const stats = await fs.lstat(cwd).catch(() => null);
+  if (input.repositoryAnchor && stats && !stats.isDirectory()) {
+    throw new Error("Invalid project repository checkout path");
+  }
 
   if (!input.repoUrl) {
     if (!stats) {
@@ -2487,25 +2506,17 @@ async function materializeManagedProjectWorkspace(
     return { cwd, warning: null };
   }
 
-  const hasAdoptableGitMetadata = async () => {
-    const metadata = await fs.stat(path.resolve(cwd, ".git")).catch(() => null);
-    if (metadata?.isDirectory()) return true;
-    if (!metadata?.isFile()) return false;
-    try {
-      const toplevel = await runLocalGit(cwd, ["rev-parse", "--show-toplevel"], { timeout: 10_000, maxBuffer: 16 * 1024 });
-      if (await fs.realpath(toplevel.stdout.trim()) !== await fs.realpath(cwd)) {
-        throw new Error("Git file does not identify this workspace as its repository root");
-      }
-      return true;
-    } catch (error) {
-      throw new Error(`Managed workspace Git file is unusable at "${cwd}".`, { cause: error });
-    }
-  };
-  if (await hasAdoptableGitMetadata()) {
-    return { cwd, warning: null };
-  }
+  const adoptable = input.repositoryAnchor
+    ? await withDirectoryMergeLock(input.repositoryAnchor, async (anchor) => {
+      await ensureProjectRepositoriesRoot(anchor);
+      const current = await fs.lstat(cwd).catch(() => null);
+      if (current && !current.isDirectory()) throw new Error("Invalid project repository checkout path");
+      return await hasAdoptableManagedWorkspaceGit(cwd);
+    })
+    : await hasAdoptableManagedWorkspaceGit(cwd);
+  if (adoptable) return { cwd, warning: null };
 
-  if (stats) {
+  if (stats && !input.repositoryAnchor) {
     const entries = await fs.readdir(cwd).catch(() => []);
     if (entries.length > 0) {
       return {
@@ -2516,6 +2527,8 @@ async function materializeManagedProjectWorkspace(
     await fs.rm(cwd, { recursive: true, force: true });
   }
 
+  // Clone outside the anchor's restore lock. Nested clone staging stays in
+  // excluded runtime state, so a concurrent restore cannot transfer or erase it.
   // Clone into a temp sibling, then move into place atomically. The shared target directory
   // is never created in a partial state and never removed on failure, so a concurrent
   // materialization (another process, or a run racing this one) can neither adopt a broken
@@ -2523,7 +2536,10 @@ async function materializeManagedProjectWorkspace(
   const auth = input.resolveGitAuth && !input.localSource
     ? await input.resolveGitAuth(input.repoUrl)
     : null;
-  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
+  const clonePrefix = input.repositoryAnchor
+    ? path.join(await projectRepositoryRuntimeDir(input.repositoryAnchor, "repository-clones"), ".clone-")
+    : `${cwd}.clone-`;
+  const cloneTmpDir = await fs.mkdtemp(clonePrefix);
   try {
     await execFile(
       "git",
@@ -2568,6 +2584,30 @@ async function materializeManagedProjectWorkspace(
     throw new Error(message);
   }
 
+  if (input.repositoryAnchor) {
+    try {
+      return await withDirectoryMergeLock(input.repositoryAnchor, async (anchor) => {
+        // Restore may have replaced or populated the destination while we cloned.
+        // Adopt valid history, or preserve the latest non-Git files, never a stale
+        // pre-clone observation. Only publication and moves hold the restore lock.
+        await ensureProjectRepositoriesRoot(anchor);
+        const existing = await fs.lstat(cwd).catch(() => null);
+        if (existing && !existing.isDirectory()) throw new Error("Invalid project repository checkout path");
+        if (await hasAdoptableManagedWorkspaceGit(cwd)) return { cwd, warning: null };
+        let warning: string | null = null;
+        if (existing) {
+          const quarantine = path.join(await projectRepositoryRuntimeDir(anchor, "detached-repositories"), randomUUID());
+          await fs.rename(cwd, quarantine);
+          warning = `Managed workspace path "${cwd}" already exists but is not a git checkout. Preserved the snapshot at "${quarantine}" and re-provisioned a clean checkout.`;
+        }
+        await fs.rename(cloneTmpDir, cwd);
+        return { cwd, warning };
+      });
+    } finally {
+      await fs.rm(cloneTmpDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
   try {
     await fs.rename(cloneTmpDir, cwd);
   } catch (renameError) {
@@ -2576,7 +2616,7 @@ async function materializeManagedProjectWorkspace(
       .catch(() => undefined);
     // The target appearing between the emptiness check and the rename means another
     // materialization won the race; adopt its checkout instead of failing the run.
-    if (await hasAdoptableGitMetadata()) {
+    if (await hasAdoptableManagedWorkspaceGit(cwd)) {
       return { cwd, warning: null };
     }
     const reason =
@@ -2586,6 +2626,20 @@ async function materializeManagedProjectWorkspace(
     );
   }
   return { cwd, warning: null };
+}
+
+async function ensureProjectRepositoriesRoot(anchor: string): Promise<void> {
+  await fs.mkdir(path.join(anchor, PROJECT_REPOSITORIES_DIR), { recursive: true });
+  if (await fs.realpath(path.join(anchor, PROJECT_REPOSITORIES_DIR)) !== path.join(anchor, PROJECT_REPOSITORIES_DIR)) {
+    throw new Error("Project repositories directory escapes the task workspace");
+  }
+}
+
+async function projectRepositoryRuntimeDir(anchor: string, name: string): Promise<string> {
+  const directory = path.join(anchor, ".paperclip-runtime", name);
+  await fs.mkdir(directory, { recursive: true });
+  if (await fs.realpath(directory) !== directory) throw new Error("Project repository runtime directory escapes the task workspace");
+  return directory;
 }
 
 const projectRepositoryPreparations = new Map<string, Promise<void>>();
@@ -2604,10 +2658,9 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   projectRepositoryPreparations.set(cwd, current);
   await previous;
   try {
-    // Queue setup in this server process and lock the stable anchor, not a
-    // child we may rename. Child-only restore locks are a separate boundary.
-    const results = await withDirectoryMergeLock(cwd, (canonicalCwd) =>
-      prepareProjectRepositoryWorkspacesLocked({ ...input, cwd: canonicalCwd }));
+    // Serialize setup without making restores wait through network clones.
+    // Individual publication/retention steps lock the stable anchor below.
+    const results = await prepareProjectRepositoryWorkspacesSequential({ ...input, cwd });
     // Keep the caller's alias so lexical relative paths in workspace hints do
     // not escape a symlinked anchor. Mutations used the canonical locked path.
     const prefix = input.cwd.endsWith(path.sep) ? input.cwd : `${input.cwd}${path.sep}`;
@@ -2618,7 +2671,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   }
 }
 
-async function prepareProjectRepositoryWorkspacesLocked(input: Parameters<typeof prepareProjectRepositoryWorkspaces>[0]) {
+async function prepareProjectRepositoryWorkspacesSequential(input: Parameters<typeof prepareProjectRepositoryWorkspaces>[0]) {
   const identity = (url: string) => url.trim().replace(/\.git\/?$/, "").replace(/\/$/, "");
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
   const selected = input.workspaces.filter((workspace) => {
@@ -2628,19 +2681,18 @@ async function prepareProjectRepositoryWorkspacesLocked(input: Parameters<typeof
   });
   const root = path.join(input.cwd, PROJECT_REPOSITORIES_DIR);
   if (selected.length === 0 && !(await fs.lstat(root).catch(() => null))) return [];
-  await fs.mkdir(root, { recursive: true });
-  if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
-    throw new Error("Project repositories directory escapes the task workspace");
-  }
-  const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
-    .then((result) => path.resolve(input.cwd, result.stdout.trim()));
-  const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
-  if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
-    await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
-  }
+  await withDirectoryMergeLock(input.cwd, async (anchor) => {
+    await ensureProjectRepositoriesRoot(anchor);
+    const excludePath = await execFile("git", ["-C", anchor, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
+      .then((result) => path.resolve(anchor, result.stdout.trim()));
+    const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
+    if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+    }
+  });
   const results: Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }> = [];
-  for (const workspace of selected) {
+  const prepare = async (workspace: typeof selected[number]) => {
     const repoUrl = workspace.repoUrl!;
     const name = (deriveRepoNameFromRepoUrl(repoUrl) ?? "repo").replace(/[^a-zA-Z0-9_-]/g, "-");
     const key = `${name}-${createHash("sha256").update(JSON.stringify([workspace.id, identity(repoUrl), workspace.repoRef, workspace.cwd ?? null])).digest("hex").slice(0, 12)}`;
@@ -2650,32 +2702,45 @@ async function prepareProjectRepositoryWorkspacesLocked(input: Parameters<typeof
     const localSource = workspace.cwd && workspace.cwd !== REPO_ONLY_CWD_SENTINEL
       && await fs.stat(workspace.cwd).then((entry) => entry.isDirectory()).catch(() => false)
       ? workspace.cwd : null;
-    let result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
-    let warnings: string[] = [];
-    if (result.warning) {
-      // A previous run can leave files without `.git` here: sync excludes
-      // match `.git` at every depth, so a nested checkout reconstituted from
-      // sync data keeps its files but loses its history. Preserve the snapshot
-      // for forensics (never delete it here) and re-provision a clean checkout
-      // so this run — and every continuation inheriting this workspace — works.
-      const quarantine = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-      await fs.mkdir(path.dirname(quarantine), { recursive: true });
-      await fs.rename(cwd, quarantine);
-      warnings = [`Managed workspace path "${cwd}" already exists but is not a git checkout. Preserved the snapshot at "${quarantine}" and re-provisioned a clean checkout.`];
-      result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
-      if (result.warning) throw new Error(result.warning);
+    const result = await materializeManagedProjectWorkspace(cwd, {
+      repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth,
+      repositoryAnchor: input.cwd,
+    });
+    const warnings = result.warning ? [result.warning] : [];
+    return { workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef, ...(warnings.length > 0 ? { warnings } : {}) };
+  };
+  for (const workspace of selected) results.push(await prepare(workspace));
+  // A restore during a later clone can strip a checkout already adopted above.
+  // Validate the whole set at the final barrier, and stage any repairs unlocked.
+  // Bound retries so continuous restores fail closed rather than loop forever.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const repairs = await withDirectoryMergeLock(input.cwd, async (anchor) => {
+      await ensureProjectRepositoriesRoot(anchor);
+      const missing: number[] = [];
+      for (const [index, repo] of results.entries()) {
+        const stats = await fs.lstat(repo.cwd).catch(() => null);
+        if (stats && !stats.isDirectory()) throw new Error("Invalid project repository checkout path");
+        if (!(await hasAdoptableManagedWorkspaceGit(repo.cwd))) missing.push(index);
+      }
+      if (missing.length > 0) return missing;
+      // Retain detached checkout work outside the synchronized repository set.
+      const active = new Set(results.map((repo) => path.basename(repo.cwd)));
+      for (const entry of await fs.readdir(root)) {
+        if (active.has(entry) || entry.includes(".clone-")) continue;
+        const retained = path.join(await projectRepositoryRuntimeDir(anchor, "detached-repositories"), randomUUID());
+        await fs.rename(path.join(root, entry), retained);
+      }
+      return [];
+    });
+    if (repairs.length === 0) return results;
+    if (attempt === 2) throw new Error("Project repositories changed repeatedly during setup");
+    for (const index of repairs) {
+      const repaired = await prepare(selected[index]!);
+      const warnings = [...(results[index]!.warnings ?? []), ...(repaired.warnings ?? [])];
+      results[index] = { ...repaired, ...(warnings.length > 0 ? { warnings } : {}) };
     }
-    results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef, ...(warnings.length > 0 ? { warnings } : {}) });
   }
-  // Retain detached checkout work outside the synchronized repository set.
-  const active = new Set(results.map((repo) => path.basename(repo.cwd)));
-  for (const entry of await fs.readdir(root)) {
-    if (active.has(entry) || entry.includes(".clone-")) continue;
-    const retained = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-    await fs.mkdir(path.dirname(retained), { recursive: true });
-    await fs.rename(path.join(root, entry), retained);
-  }
-  return results;
+  throw new Error("Project repositories could not be stabilized");
 }
 
 /**
