@@ -34,6 +34,12 @@ export {
   type NativeFinalizationResultInput,
 } from "./validators/native-finalization.js";
 export {
+  nativeSiblingLivenessVerdictSchema,
+  nativeSiblingLivenessResponseSchema,
+  nativeSiblingLivenessResponseV1Schema,
+  type NativeSiblingLivenessResponseInput,
+} from "./validators/sibling-liveness.js";
+export {
   NATIVE_FINALIZATION_SCHEMA,
   type NativeFinalizationResult,
   type NativeFinalizationResultV1,
@@ -41,6 +47,12 @@ export {
   type NativeRuntimeMode,
   type NativeRunTerminalState,
 } from "./types/native-finalization.js";
+export {
+  NATIVE_SIBLING_LIVENESS_SCHEMA,
+  type NativeSiblingLivenessResponse,
+  type NativeSiblingLivenessResponseV1,
+  type NativeSiblingLivenessVerdict,
+} from "./types/sibling-liveness.js";
 export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,

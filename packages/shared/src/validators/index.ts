@@ -15,6 +15,12 @@ export {
   nativeReportedWorkDispositionSchema,
   type NativeFinalizationResultInput,
 } from "./native-finalization.js";
+export {
+  nativeSiblingLivenessVerdictSchema,
+  nativeSiblingLivenessResponseSchema,
+  nativeSiblingLivenessResponseV1Schema,
+  type NativeSiblingLivenessResponseInput,
+} from "./sibling-liveness.js";
 
 export {
   decisionEffectStalenessSchema,
