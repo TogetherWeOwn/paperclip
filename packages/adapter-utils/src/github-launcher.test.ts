@@ -9,16 +9,27 @@ import { afterEach, describe, expect, it } from "vitest";
 import { githubBrokerEnvironment, githubLauncherSource, LEGACY_GITHUB_LAUNCHER_SHA256 } from "./github-launcher.js";
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
-// The launcher deployed before the recursion fix (b721d24ca), byte for byte.
-const legacyLauncherSource = () => readFile(new URL("./test-fixtures/github-launcher-b721d24ca.txt", import.meta.url), "utf8");
+// Launchers shipped before the recursion fix, byte for byte: 5442f2d86 ran in production, b721d24ca is on master.
+const legacyLauncherSource = (revision: "5442f2d86" | "b721d24ca") =>
+  readFile(new URL(`./test-fixtures/github-launcher-${revision}.txt`, import.meta.url), "utf8");
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("managed GitHub launchers", () => {
-  it("lists distinct SHA-256 digests of earlier launcher releases", () => {
+  it("lists distinct SHA-256 digests of earlier launcher releases", async () => {
     expect(new Set(LEGACY_GITHUB_LAUNCHER_SHA256).size).toBe(LEGACY_GITHUB_LAUNCHER_SHA256.length);
     for (const digest of LEGACY_GITHUB_LAUNCHER_SHA256) expect(digest).toMatch(/^[a-f0-9]{64}$/);
     expect(LEGACY_GITHUB_LAUNCHER_SHA256).not.toContain(sha256(githubLauncherSource()));
+    for (const revision of ["5442f2d86", "b721d24ca"] as const) {
+      expect(LEGACY_GITHUB_LAUNCHER_SHA256).toContain(sha256(await legacyLauncherSource(revision)));
+    }
+  });
+
+  it("keeps the launcher under the recognition size cap and forces the legacy list to follow source changes", () => {
+    // Other copies of this launcher are only recognised below 16 KiB.
+    expect(Buffer.byteLength(githubLauncherSource())).toBeLessThan(16384);
+    // When this digest changes, append the previous value to LEGACY_GITHUB_LAUNCHER_SHA256 first.
+    expect(sha256(githubLauncherSource())).toBe("c8c3de47810be11c441f704357fe44e95b9bec78d162984cc7df86c412905463");
   });
 
   it("passes the shim-free PATH to wrappers and reaches the next Git executable once", async () => {
@@ -29,16 +40,18 @@ describe("managed GitHub launchers", () => {
     const legacyLauncherDir = path.join(root, "legacy-managed");
     const editedLauncherDir = path.join(root, "edited");
     const quotedLauncherDir = path.join(root, "quoted");
+    const mixedDir = path.join(root, "mixed");
     const wrapperDir = path.join(root, "wrapper");
     const realDir = path.join(root, "real");
-    for (const dir of [launcherDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, wrapperDir, realDir]) await mkdir(dir);
+    for (const dir of [launcherDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, mixedDir, wrapperDir, realDir]) await mkdir(dir);
     const wrapperTrace = path.join(root, "wrapper-trace");
     const realTrace = path.join(root, "real-trace");
     await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
     await writeFile(path.join(otherLauncherDir, "git"), githubLauncherSource(), { mode: 0o700 });
-    const legacySource = await legacyLauncherSource();
-    expect(LEGACY_GITHUB_LAUNCHER_SHA256).toContain(sha256(legacySource));
-    await writeFile(path.join(legacyLauncherDir, "git"), legacySource, { mode: 0o700 });
+    await writeFile(path.join(legacyLauncherDir, "git"), await legacyLauncherSource("5442f2d86"), { mode: 0o700 });
+    // A directory mixing a genuine launcher with another tool keeps that tool reachable.
+    await writeFile(path.join(mixedDir, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(mixedDir, "git"), "#!/usr/bin/env node\nprocess.stdout.write('mixed dir git must not be reached\\n');\n", { mode: 0o700 });
     // Lookalikes are not byte-identical to any shipped launcher, so they must stay on PATH.
     // They only provide `gh`, so the launcher never resolves them as the next `git`.
     await writeFile(path.join(editedLauncherDir, "gh"), `${githubLauncherSource()}// local edit\n`, { mode: 0o700 });
@@ -81,7 +94,7 @@ process.stdout.write("real git reached\\n");
       ...process.env,
       ...githubBrokerEnvironment({ WRAPPER_BIN: wrapperDir, WRAPPER_TRACE: wrapperTrace, REAL_TRACE: realTrace }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
       GH_CONFIG_DIR: path.join(root, "config"),
-      PATH: [launcherDir, wrapperDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, realDir, process.env.PATH].join(path.delimiter),
+      PATH: [launcherDir, wrapperDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, realDir, mixedDir, process.env.PATH].join(path.delimiter),
     } });
     const wrapperRuns = (await readFile(wrapperTrace, "utf8")).trim().split("\n");
     const wrapperEnv = JSON.parse(wrapperRuns[0]!);
@@ -93,6 +106,7 @@ process.stdout.write("real git reached\\n");
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(legacyLauncherDir);
     expect(wrapperEnv.path.split(path.delimiter)).toContain(editedLauncherDir);
     expect(wrapperEnv.path.split(path.delimiter)).toContain(quotedLauncherDir);
+    expect(wrapperEnv.path.split(path.delimiter)).toContain(mixedDir);
     expect(wrapperEnv.active).toBeUndefined();
     expect((await readFile(realTrace, "utf8")).trim().split("\n")).toHaveLength(1);
     expect(brokerRequests).toBe(1);
@@ -229,7 +243,7 @@ process.stdout.write(JSON.stringify({
     const bin = path.join(root, "managed"), otherBin = path.join(root, "other-managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo");
     for (const dir of [bin, otherBin, realBin, repo, path.join(bin, "gh-config")]) await mkdir(dir, { recursive: true });
     for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
-    await writeFile(path.join(otherBin, "git"), await legacyLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(otherBin, "git"), await legacyLauncherSource("b721d24ca"), { mode: 0o700 });
     await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
 const {execFileSync}=require('node:child_process');
 const identity=execFileSync('git',['var','GIT_AUTHOR_IDENT'],{encoding:'utf8'}).trim();
