@@ -9,7 +9,7 @@ import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
 const legacyLauncherSource = () => githubLauncherSource()
-  .replace("// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1\n", "")
+  .replace(/^\/\/ PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:[a-f0-9]{64}\n/m, "")
   .replace(/function hasManagedLauncher\(dir\) \{\n[\s\S]*?\n\}\n/, "")
   .replace("const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {\n  try { if (fs.realpathSync(p) === directory) return false; } catch {}\n  return !hasManagedLauncher(p);\n});", "const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {\n  try { return fs.realpathSync(p) !== directory; } catch { return true; }\n});")
   .replace(/function runResolved\(env\) \{\n[\s\S]*?\n\}\n/, "")
@@ -29,16 +29,15 @@ describe("managed GitHub launchers", () => {
     const wrapperTrace = path.join(root, "wrapper-trace");
     const realTrace = path.join(root, "real-trace");
     await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
-    await writeFile(path.join(otherLauncherDir, "git"), `#!/usr/bin/env node
-// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1
-process.stdout.write("current launcher reached\\n");
-`, { mode: 0o700 });
+    await writeFile(path.join(otherLauncherDir, "git"), githubLauncherSource(), { mode: 0o700 });
     const legacySource = legacyLauncherSource();
     expect(legacySource).not.toContain("PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1");
     expect(legacySource).not.toContain("function runResolved(env) {");
     await writeFile(path.join(legacyLauncherDir, "git"), legacySource, { mode: 0o700 });
     await writeFile(path.join(wrapperDir, "git"), `#!/usr/bin/env node
-// Custom wrapper, not the managed launcher: PAPERCLIP_GITHUB_BROKER_TOKEN /runtime-tools/github/credentials
+// Custom wrapper with a copied signature comment.
+// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1
+// PAPERCLIP_GITHUB_BROKER_TOKEN /runtime-tools/github/credentials
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -74,6 +73,7 @@ process.stdout.write("real git reached\\n");
     const wrapperEnv = JSON.parse(wrapperRuns[0]!);
     expect(result.stdout).toBe("real git reached\n");
     expect(wrapperRuns).toHaveLength(1);
+    expect(wrapperEnv.path.split(path.delimiter)).toContain(wrapperDir);
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(launcherDir);
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(otherLauncherDir);
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(legacyLauncherDir);

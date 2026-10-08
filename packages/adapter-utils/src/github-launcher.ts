@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
+
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
 export function githubLauncherSource(): string {
-  return String.raw`#!/usr/bin/env node
-// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1
+  const hashPlaceholder = "__PAPERCLIP_GITHUB_LAUNCHER_SOURCE_HASH__";
+  const source = String.raw`#!/usr/bin/env node
+// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:${hashPlaceholder}
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -9,15 +12,23 @@ const { spawn } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
 function hasManagedLauncher(dir) {
-  // Use a versioned marker for current launchers and a strict fingerprint for older ones.
+  // Current launchers carry a content hash; legacy launchers use a strict fingerprint.
+  const markerPrefix = 'PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:';
+  const hashPlaceholder = '${hashPlaceholder}';
+  const { createHash } = require('node:crypto');
   return ['git', 'gh'].some(name => {
     try {
       const candidate = path.join(dir, name);
       const stat = fs.statSync(candidate);
       if (!stat.isFile() || stat.size > 16384) return false;
       const source = fs.readFileSync(candidate, 'utf8');
+      const signature = source.match(/PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:([a-f0-9]{64})/);
+      const normalizedSource = signature
+        ? source.replace(signature[0], markerPrefix + hashPlaceholder)
+        : null;
       const currentSignature = source.startsWith('#!/usr/bin/env node')
-        && source.includes('PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1');
+        && normalizedSource !== null
+        && createHash('sha256').update(normalizedSource).digest('hex') === signature[1];
       const legacySignature = source.startsWith('#!/usr/bin/env node')
         && source.includes("const { spawn } = require('node:child_process');")
         && source.includes('const directory = path.dirname(fs.realpathSync(process.argv[1]));')
@@ -125,6 +136,8 @@ async function main() {
 }
 main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
 `;
+  const sourceHash = createHash("sha256").update(source).digest("hex");
+  return source.replace(hashPlaceholder, sourceHash);
 }
 
 /** Override inherited credentials even when adapters merge the host environment later. */
