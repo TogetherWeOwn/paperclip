@@ -76,6 +76,8 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
         cwd: anchor.cwd, anchorRepoUrl: first,
         workspaces: [{ id: "missing", repoUrl: path.join(first, "missing.git"), repoRef: null }],
       })).rejects.toThrow("Failed to prepare managed checkout");
+      await expect(prepareProjectRepositoryWorkspaces({ cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [] }))
+        .resolves.toEqual([]);
     } finally {
       await fs.rm(first, { recursive: true, force: true });
     }
@@ -110,6 +112,149 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
       const retained = await fs.readdir(detached);
       expect(retained).toHaveLength(1);
       expect(await fs.readFile(path.join(detached, retained[0]!, "survivor.txt"), "utf8")).toBe("kept\n");
+    } finally {
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("serializes nested repair before a concurrent setup can use a stale non-Git warning", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    let releaseRepair!: () => void;
+    const repairRelease = new Promise<void>((resolve) => { releaseRepair = resolve; });
+    let enterRepair!: () => void;
+    const repairEntered = new Promise<void>((resolve) => { enterRepair = resolve; });
+    let enterConcurrentSetup!: () => void;
+    const concurrentEntered = new Promise<void>((resolve) => { enterConcurrentSetup = resolve; });
+    const rename = fs.rename.bind(fs);
+    const realpath = fs.realpath.bind(fs);
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
+    const pending: Array<ReturnType<typeof prepareProjectRepositoryWorkspaces>> = [];
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-concurrent-repair", projectId: "two", repoUrl: first });
+      const input = {
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      };
+      const [repo] = await prepareProjectRepositoryWorkspaces(input);
+      const nestedCwd = repo!.cwd;
+      await fs.rm(path.join(nestedCwd, ".git"), { recursive: true, force: true });
+      await fs.writeFile(path.join(nestedCwd, "survivor.txt"), "kept\n", "utf8");
+      let repairRenames = 0;
+      renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+        if (source === nestedCwd) {
+          repairRenames += 1;
+          if (repairRenames === 1) {
+            enterRepair();
+            await repairRelease;
+          } else {
+            // Without the lock the second caller also reaches quarantine.
+            enterConcurrentSetup();
+          }
+        }
+        return rename(source, destination);
+      });
+      realpathSpy = vi.spyOn(fs, "realpath").mockImplementation(async (directory, options) => {
+        if (repairRenames > 0 && directory === anchor.cwd) enterConcurrentSetup();
+        return realpath(directory, options);
+      });
+      pending.push(prepareProjectRepositoryWorkspaces(input));
+      await repairEntered;
+      pending.push(prepareProjectRepositoryWorkspaces(input));
+      // Release only after the other caller enters canonical setup discovery.
+      // Both callers are live; no timing-based sleep or polling is needed.
+      await concurrentEntered;
+      releaseRepair();
+      const results = await Promise.all(pending);
+      expect(results.map(([result]) => result!.cwd)).toEqual([nestedCwd, nestedCwd]);
+      expect(results.flatMap(([result]) => result!.warnings ?? [])).toHaveLength(1);
+      expect(repairRenames).toBe(1);
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: nestedCwd })).stdout.trim()).toBe("true");
+      const detached = path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories");
+      const retained = await fs.readdir(detached);
+      expect(retained).toHaveLength(1);
+      expect(await fs.readFile(path.join(detached, retained[0]!, "survivor.txt"), "utf8")).toBe("kept\n");
+    } finally {
+      releaseRepair();
+      await Promise.allSettled(pending);
+      renameSpy?.mockRestore();
+      realpathSpy?.mockRestore();
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it.each(["simple", "dot-segment"] as const)("preserves secondary checkout hints through a %s symlinked anchor", async (mode) => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: `repo-alias-${mode}`, projectId: "two", repoUrl: first });
+      const alias = path.join(tempHome, `anchor-alias-${mode}`);
+      const child = path.join(path.dirname(anchor.cwd), "alias-child");
+      await fs.mkdir(child);
+      await fs.symlink(mode === "simple" ? anchor.cwd : child, alias);
+      const inputCwd = mode === "simple" ? alias : `${alias}/../${path.basename(anchor.cwd)}`;
+      const [repo] = await prepareProjectRepositoryWorkspaces({
+        cwd: inputCwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      });
+      const relative = path.relative(inputCwd, repo!.cwd);
+      expect(relative).toMatch(/^\.paperclip-repositories\//);
+      expect(repo!.cwd.startsWith(`${inputCwd}/`)).toBe(true);
+      expect(await fs.realpath(repo!.cwd)).toBe(await fs.realpath(path.join(anchor.cwd, relative)));
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repo!.cwd })).stdout.trim()).toBe("true");
+    } finally {
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it("adopts a linked worktree's Git file without quarantining its dirty work", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-gitfile", projectId: "two", repoUrl: first });
+      const input = {
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      };
+      const [initial] = await prepareProjectRepositoryWorkspaces(input);
+      const cwd = initial!.cwd;
+      await fs.rm(cwd, { recursive: true, force: true });
+      await execFile("git", ["worktree", "add", "-b", "linked-work", cwd], { cwd: second });
+      await fs.writeFile(path.join(cwd, "README.md"), "dirty linked work\n");
+      expect((await fs.lstat(path.join(cwd, ".git"))).isFile()).toBe(true);
+      const [reused] = await prepareProjectRepositoryWorkspaces(input);
+      expect(reused!.cwd).toBe(cwd);
+      expect(reused!.warnings).toBeUndefined();
+      expect(await fs.readFile(path.join(cwd, "README.md"), "utf8")).toBe("dirty linked work\n");
+      expect((await execFile("git", ["branch", "--show-current"], { cwd })).stdout.trim()).toBe("linked-work");
+      await expect(fs.stat(path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
+  it.each(["dangling", "malformed"] as const)("fails explicitly on a %s Git file without moving dirty work", async (kind) => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: `repo-invalid-gitfile-${kind}`, projectId: "two", repoUrl: first });
+      const input = {
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      };
+      const [initial] = await prepareProjectRepositoryWorkspaces(input);
+      const cwd = initial!.cwd;
+      await fs.rm(path.join(cwd, ".git"), { recursive: true, force: true });
+      const metadata = kind === "dangling" ? `gitdir: ${path.join(tempHome, "missing-backing.git")}\n` : "not a git file\n";
+      await fs.writeFile(path.join(cwd, ".git"), metadata);
+      await fs.writeFile(path.join(cwd, "README.md"), "dirty work remains\n");
+      await expect(prepareProjectRepositoryWorkspaces(input)).rejects.toThrow("Managed workspace Git file is unusable");
+      expect(await fs.readFile(path.join(cwd, ".git"), "utf8")).toBe(metadata);
+      expect(await fs.readFile(path.join(cwd, "README.md"), "utf8")).toBe("dirty work remains\n");
+      await expect(fs.stat(path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories")))
+        .rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
     }

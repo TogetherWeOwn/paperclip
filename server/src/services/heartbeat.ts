@@ -39,9 +39,9 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, runLocalGit } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
-import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -468,6 +468,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "./execution-workspace-policy.js";
+import { resolveLowTrustSandboxEnvironment } from "./low-trust-sandbox-environment.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
@@ -2486,12 +2487,21 @@ async function materializeManagedProjectWorkspace(
     return { cwd, warning: null };
   }
 
-  const hasAdoptableGitDir = () =>
-    fs
-      .stat(path.resolve(cwd, ".git"))
-      .then((entry) => entry.isDirectory())
-      .catch(() => false);
-  if (await hasAdoptableGitDir()) {
+  const hasAdoptableGitMetadata = async () => {
+    const metadata = await fs.stat(path.resolve(cwd, ".git")).catch(() => null);
+    if (metadata?.isDirectory()) return true;
+    if (!metadata?.isFile()) return false;
+    try {
+      const toplevel = await runLocalGit(cwd, ["rev-parse", "--show-toplevel"], { timeout: 10_000, maxBuffer: 16 * 1024 });
+      if (await fs.realpath(toplevel.stdout.trim()) !== await fs.realpath(cwd)) {
+        throw new Error("Git file does not identify this workspace as its repository root");
+      }
+      return true;
+    } catch (error) {
+      throw new Error(`Managed workspace Git file is unusable at "${cwd}".`, { cause: error });
+    }
+  };
+  if (await hasAdoptableGitMetadata()) {
     return { cwd, warning: null };
   }
 
@@ -2566,7 +2576,7 @@ async function materializeManagedProjectWorkspace(
       .catch(() => undefined);
     // The target appearing between the emptiness check and the rename means another
     // materialization won the race; adopt its checkout instead of failing the run.
-    if (await hasAdoptableGitDir()) {
+    if (await hasAdoptableGitMetadata()) {
       return { cwd, warning: null };
     }
     const reason =
@@ -2578,6 +2588,8 @@ async function materializeManagedProjectWorkspace(
   return { cwd, warning: null };
 }
 
+const projectRepositoryPreparations = new Map<string, Promise<void>>();
+
 /** Keep every distinct project repository inside the task's writable/synced root. */
 export async function prepareProjectRepositoryWorkspaces(input: {
   cwd: string;
@@ -2585,6 +2597,28 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   workspaces: Array<Pick<typeof projectWorkspaces.$inferSelect, "id" | "repoUrl" | "repoRef"> & { cwd?: string | null }>;
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }>> {
+  const cwd = await fs.realpath(input.cwd);
+  const previous = projectRepositoryPreparations.get(cwd) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  projectRepositoryPreparations.set(cwd, current);
+  await previous;
+  try {
+    // Queue setup in this server process and lock the stable anchor, not a
+    // child we may rename. Child-only restore locks are a separate boundary.
+    const results = await withDirectoryMergeLock(cwd, (canonicalCwd) =>
+      prepareProjectRepositoryWorkspacesLocked({ ...input, cwd: canonicalCwd }));
+    // Keep the caller's alias so lexical relative paths in workspace hints do
+    // not escape a symlinked anchor. Mutations used the canonical locked path.
+    const prefix = input.cwd.endsWith(path.sep) ? input.cwd : `${input.cwd}${path.sep}`;
+    return results.map((repo) => ({ ...repo, cwd: `${prefix}${path.relative(cwd, repo.cwd)}` }));
+  } finally {
+    release();
+    if (projectRepositoryPreparations.get(cwd) === current) projectRepositoryPreparations.delete(cwd);
+  }
+}
+
+async function prepareProjectRepositoryWorkspacesLocked(input: Parameters<typeof prepareProjectRepositoryWorkspaces>[0]) {
   const identity = (url: string) => url.trim().replace(/\.git\/?$/, "").replace(/\/$/, "");
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
   const selected = input.workspaces.filter((workspace) => {
@@ -4496,6 +4530,21 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
+const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
+const RUN_GATEWAY_TOKEN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export function heartbeatRunGatewayTokenTtlMs(): number {
+  const raw = readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS);
+  // Digits only: "24h" or "8.64e7" must not be read as 24 ms or 8 ms.
+  if (!raw || !/^\d+$/.test(raw)) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (parsed <= 0) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  // The gateway rejects tokens whose run is no longer active, so a long TTL
+  // only keeps tools working for the lifetime of a still-running run. The cap
+  // keeps an oversized value from producing an invalid expiry date.
+  return Math.min(parsed, RUN_GATEWAY_TOKEN_MAX_TTL_MS);
+}
+
 function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
   return configured
@@ -4820,7 +4869,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       clientLabel: `${input.agent.name} heartbeat run`,
       ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: new Date(Date.now() + heartbeatRunGatewayTokenTtlMs()),
     },
     actor: { agentId: input.agent.id },
   });
@@ -5117,7 +5166,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + heartbeatRunGatewayTokenTtlMs());
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({
@@ -21595,6 +21644,32 @@ export function heartbeatService(
       const managedSandboxEnvironment = managedSandboxOnly
         ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
         : null;
+      // Trust-aware placement: only a `low_trust_review` run reads the
+      // instance's designated low-trust sandbox, and only when its selection
+      // would land on local. The designation is re-verified here; an unusable
+      // one is dropped (and logged) so the low-trust gate fails closed with
+      // `low_trust_requires_sandbox_environment` rather than running on local.
+      const isLowTrustReviewRun = trustPreset.kind === "low_trust_review";
+      const lowTrustSandboxDesignation = isLowTrustReviewRun
+        ? await resolveLowTrustSandboxEnvironment({
+            designatedEnvironmentId:
+              resolvedInstanceSettings.general.lowTrustSandboxEnvironmentId ??
+              null,
+            companyId: agent.companyId,
+            environments: environmentsSvc,
+          })
+        : null;
+      if (lowTrustSandboxDesignation?.rejection) {
+        logger.warn(
+          {
+            runId: run.id,
+            agentId: agent.id,
+            companyId: agent.companyId,
+            rejection: lowTrustSandboxDesignation.rejection,
+          },
+          "Ignoring the designated low-trust sandbox environment: it is not usable for this run",
+        );
+      }
       const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
@@ -21602,6 +21677,9 @@ export function heartbeatService(
         localDefaultEnvironmentId: localEnvironment.id,
         managedSandboxOnly,
         managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
+        lowTrustReview: isLowTrustReviewRun,
+        lowTrustSandboxEnvironmentId:
+          lowTrustSandboxDesignation?.environmentId ?? null,
       });
       const effectiveExecutionWorkspaceMode: ReturnType<
         typeof resolveExecutionWorkspaceMode
@@ -24525,8 +24603,10 @@ export function heartbeatService(
                   ) {
                     repairedExpectedBranchName = coherence.branchName;
                     executionWorkspace.branchName = coherence.branchName;
-                    executionWorkspace.warnings.push(...coherence.warnings);
                   }
+                  // A repair that keeps the recorded branch (a restore) still
+                  // changed the worktree, and its warning names any rescue branch.
+                  executionWorkspace.warnings.push(...coherence.warnings);
                 } catch (repairErr) {
                   const workspaceValidationFailure =
                     isWorkspaceValidationFailure(repairErr) ? repairErr : null;

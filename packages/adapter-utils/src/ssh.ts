@@ -13,6 +13,15 @@ import {
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { shouldExcludePath } from "./exclude-patterns.js";
+import {
+  SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+  SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
+  resolveSshTarFlavor,
+  toSshTarExcludes,
+  translateSshTarExcludes,
+  type SshTarFlavor,
+} from "./ssh-workspace-excludes.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -409,9 +418,13 @@ async function createSshAuthArgs(
   };
 }
 
-function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+function tarExcludeArgs(exclude: string[] | undefined, flavor: SshTarFlavor = "gnu"): string[] {
+  const combined = ["._*", ...translateSshTarExcludes(exclude ?? [], flavor)];
   return combined.flatMap((entry) => ["--exclude", entry]);
+}
+
+function hasRootRelativeTarExcludes(exclude: string[] | undefined): boolean {
+  return (exclude ?? []).some((entry) => entry.startsWith("./"));
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -420,6 +433,152 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
     // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
     COPYFILE_DISABLE: "1",
   };
+}
+
+export { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES };
+
+/**
+ * Return `baseline` with the SSH agent-local scratch treated as out of scope
+ * for the restore merge. The sync-back no longer carries these paths, so a
+ * baseline that still lists them would make the merge read them as remote
+ * deletions and remove the local copies (including uncommitted work in nested
+ * agent worktrees). Dropping the entries and adding the excludes makes the
+ * merge ignore these paths on both sides, however the baseline was captured.
+ */
+export function withSshAgentLocalExcludes(baseline: DirectorySnapshot): DirectorySnapshot {
+  return {
+    exclude: [...new Set([...baseline.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],
+    entries: new Map(
+      [...baseline.entries].filter(
+        ([relative]) => !shouldExcludePath(relative, SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES),
+      ),
+    ),
+  };
+}
+
+/** Default bound on an SSH workspace sync-back payload, before any transfer. */
+export const SSH_SYNC_BACK_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+/**
+ * Resolve the sync-back size cap from `PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES`
+ * (bytes). Missing, unparseable, or non-positive values fall back to
+ * {@link SSH_SYNC_BACK_DEFAULT_MAX_BYTES} so a bad setting fails open to the
+ * default cap instead of disabling the bound or refusing every sync-back.
+ */
+export function resolveSshSyncBackMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES?.trim();
+  if (!raw) return SSH_SYNC_BACK_DEFAULT_MAX_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return SSH_SYNC_BACK_DEFAULT_MAX_BYTES;
+  return Math.floor(parsed);
+}
+
+/**
+ * Thrown when an SSH workspace sync-back would exceed its size cap, so the
+ * caller fails closed with a clear error instead of copying until ENOSPC.
+ * The message carries only the remote directory path and byte counts, never
+ * credentials or connection details.
+ */
+export class SshSyncBackSizeLimitExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SshSyncBackSizeLimitExceededError";
+  }
+}
+
+/**
+ * Refuse an SSH workspace sync-back whose measured source exceeds its cap.
+ * Both the pre-flight remote estimate and the post-extract staging size pass
+ * through here, so either one fails closed before the copy reaches the
+ * workspace (or another staging directory).
+ */
+export function assertSshSyncBackSizeWithinCap(input: {
+  sourceBytes: number;
+  capBytes: number;
+  remoteDir: string;
+}): void {
+  if (input.sourceBytes <= input.capBytes) return;
+  throw new SshSyncBackSizeLimitExceededError(
+    `Refusing SSH workspace sync-back from ${input.remoteDir}: ` +
+      `measured ${input.sourceBytes} bytes exceeds the ${input.capBytes}-byte cap ` +
+      `(PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES). ` +
+      `Agent-local directories (${SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.join(", ")}) are already excluded; ` +
+      `raise the cap only for a workspace that genuinely needs it.`,
+  );
+}
+
+/**
+ * The exact remote shell script the sync-back transfer runs: archive the
+ * remote directory to stdout with the caller's excludes. The size pre-flight
+ * pipes this same script into `wc -c`, so the estimate and the transfer can
+ * never disagree on what is included.
+ */
+function buildRemoteWorkspaceDownloadScript(remoteDir: string, exclude?: string[]): string {
+  const tarCommand = (flavor: SshTarFlavor) =>
+    `tar ${[...tarExcludeArgs(exclude, flavor).map(shellQuote), "-cf", "-", "."].join(" ")}`;
+  // Probe on the creating host: the server and remote can use different tars.
+  // Both the pre-flight and transfer execute this exact dialect selection.
+  const archive = hasRootRelativeTarExcludes(exclude)
+    ? `case "$(tar --version)" in ` +
+      `*"GNU tar"*) ${tarCommand("gnu")} ;; ` +
+      `bsdtar\\ *) ${tarCommand("bsd")} ;; ` +
+      `*) printf '%s\\n' 'Unsupported tar for root-relative SSH workspace excludes; use GNU tar or bsdtar' >&2; exit 1 ;; esac`
+    : tarCommand("gnu");
+  return `cd ${shellQuote(remoteDir)} && ${archive}`;
+}
+
+/**
+ * Measure the exact byte count the sync-back transfer would stream, by running
+ * the same tar script into `wc -c` on the remote first. Pruned excludes never
+ * reach the wire, so excluded directories cannot trip the cap — only the
+ * bytes that would actually land in the staging directory count.
+ */
+async function measureRemoteWorkspaceDownloadBytes(input: {
+  spec: SshConnectionConfig;
+  remoteDir: string;
+  exclude?: string[];
+}): Promise<number> {
+  let stdout: string;
+  try {
+    const result = await runSshScript(
+      input.spec,
+      `${buildRemoteWorkspaceDownloadScript(input.remoteDir, input.exclude)} | wc -c`,
+      { timeoutMs: 300_000, maxBuffer: 16 * 1024 },
+    );
+    stdout = result.stdout;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to measure SSH sync-back size for ${input.remoteDir}: ${reason}`);
+  }
+  const bytes = Number.parseInt(stdout.trim(), 10);
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    throw new Error(`Failed to measure SSH sync-back size for ${input.remoteDir}: unexpected output ${JSON.stringify(stdout.trim())}`);
+  }
+  return bytes;
+}
+
+/**
+ * Sum the regular-file bytes under a staging directory without following
+ * symlinks (an `lstat` walk), so a link pointing outside the tree counts only
+ * itself and can never inflate or loop the measurement.
+ */
+export async function measureDirectoryFileBytes(dir: string): Promise<number> {
+  let total = 0;
+  const walk = async (current: string): Promise<void> => {
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      const stats = await fs.lstat(full).catch(() => null);
+      if (!stats) continue;
+      if (stats.isDirectory() && !stats.isSymbolicLink()) {
+        await walk(full);
+      } else if (stats.isFile() || stats.isSymbolicLink()) {
+        total += stats.size;
+      }
+    }
+  };
+  await walk(dir);
+  return total;
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
@@ -583,18 +742,32 @@ async function runSshScript(
   );
 }
 
+// Clear `localDir` ahead of a sync-back copy, keeping the listed entries. An
+// entry is a path relative to `localDir` and may be nested (`.claude/worktrees`):
+// its ancestors are emptied rather than removed so the preserved path survives.
 async function clearLocalDirectory(
   localDir: string,
-  preserveEntries: string[] = [],
+  preserveEntries: readonly string[] = [],
 ): Promise<void> {
   await fs.mkdir(localDir, { recursive: true });
-  const preserve = new Set(preserveEntries);
-  const entries = await fs.readdir(localDir);
-  await Promise.all(
-    entries
-      .filter((entry) => !preserve.has(entry))
-      .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
-  );
+  const preserve = preserveEntries.map((entry) => entry.replace(/^\.\//, "").replace(/\/+$/, ""));
+  const clear = async (relative: string): Promise<void> => {
+    const entries = await fs.readdir(relative ? path.join(localDir, relative) : localDir);
+    await Promise.all(
+      entries.map(async (entry) => {
+        const entryRelative = relative ? `${relative}/${entry}` : entry;
+        if (preserve.includes(entryRelative)) return;
+        const keepsDescendant = preserve.some((kept) => kept.startsWith(`${entryRelative}/`));
+        const entryPath = path.join(localDir, entryRelative);
+        if (keepsDescendant && (await fs.lstat(entryPath)).isDirectory()) {
+          await clear(entryRelative);
+          return;
+        }
+        await fs.rm(entryPath, { recursive: true, force: true });
+      }),
+    );
+  };
+  await clear("");
 }
 
 async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
@@ -1399,12 +1572,15 @@ export async function syncDirectoryToSsh(input: {
     : null;
 
   try {
+    const flavor = hasRootRelativeTarExcludes(input.exclude)
+      ? resolveSshTarFlavor((await execFileText("tar", ["--version"])).stdout)
+      : "gnu";
     await new Promise<void>((resolve, reject) => {
     const tarArgs = [
       ...(input.followSymlinks ? ["-h"] : []),
       "-C",
       input.localDir,
-      ...tarExcludeArgs(input.exclude),
+      ...tarExcludeArgs(input.exclude, flavor),
       "-cf",
       "-",
       ".",
@@ -1476,11 +1652,13 @@ export async function syncDirectoryToSsh(input: {
       sshExitCode = code;
       maybeFinish();
     });
-    }).finally(auth.cleanup);
+    });
     await progress?.finish();
   } catch (error) {
     await progress?.fail();
     throw error;
+  } finally {
+    await auth.cleanup();
   }
 }
 
@@ -1489,16 +1667,13 @@ export async function syncDirectoryFromSsh(input: {
   remoteDir: string;
   localDir: string;
   exclude?: string[];
-  preserveLocalEntries?: string[];
+  preserveLocalEntries?: readonly string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
-  const remoteTarScript = [
-    `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
-  ].join(" && ");
+  const remoteTarScript = buildRemoteWorkspaceDownloadScript(input.remoteDir, input.exclude);
   const sshArgs = [
     ...auth.args,
     "-p",
@@ -1523,6 +1698,18 @@ export async function syncDirectoryFromSsh(input: {
     : null;
 
   try {
+    // Fail closed before any byte lands on local disk: measure the exact
+    // stream with the same tar script the transfer runs, and refuse when it
+    // exceeds the cap instead of copying until ENOSPC. A refusal here still
+    // runs the `finally` below, so no staging directory is left behind.
+    const capBytes = resolveSshSyncBackMaxBytes();
+    const estimatedBytes = await measureRemoteWorkspaceDownloadBytes({
+      spec: input.spec,
+      remoteDir: input.remoteDir,
+      exclude: input.exclude,
+    });
+    assertSshSyncBackSizeWithinCap({ sourceBytes: estimatedBytes, capBytes, remoteDir: input.remoteDir });
+
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1590,6 +1777,12 @@ export async function syncDirectoryFromSsh(input: {
     });
     await progress?.finish();
 
+    // The remote tree can grow between the pre-flight and the transfer, so
+    // re-check what actually landed before copying it over the workspace (or
+    // over another staging directory on the baseline path).
+    const stagedBytes = await measureDirectoryFileBytes(stagingDir);
+    assertSshSyncBackSizeWithinCap({ sourceBytes: stagedBytes, capBytes, remoteDir: input.remoteDir });
+
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
@@ -1622,7 +1815,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1643,7 +1836,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1660,6 +1853,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   if (input.baselineSnapshot) {
+    // The sync-back never carries the agent-local scratch, so the merge must
+    // not read its absence as a remote deletion of the local copies.
+    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -1679,12 +1875,17 @@ export async function restoreWorkspaceFromSshExecution(input: {
         spec: input.spec,
         remoteDir,
         localDir: stagingDir,
-        exclude: input.baselineSnapshot.exclude,
+        // The baseline exclude is merge grammar and may predate the SSH
+        // agent-local scratch; `baseline` has it merged in, and tar needs the
+        // scratch anchored to the root so this inner transfer (staging
+        // directory into staging directory) carries neither nested worktrees
+        // nor build outputs, yet keeps nested source named like them.
+        exclude: toSshTarExcludes(baseline.exclude),
         onProgress: input.onProgress,
         progressLabel: "workspace",
       });
       await mergeDirectoryWithBaseline({
-        baseline: input.baselineSnapshot,
+        baseline,
         sourceDir: stagingDir,
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
@@ -1722,8 +1923,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime"],
-      preserveLocalEntries: [".git"],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      // Excluded from the download, so nothing replaces them: keep the local copies.
+      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1734,7 +1936,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

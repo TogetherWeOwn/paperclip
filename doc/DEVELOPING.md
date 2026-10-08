@@ -80,6 +80,45 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### SSH workspace synchronization
+
+SSH execution excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
+`node_modules/`, and `target/` from export and sync-back. These directories contain
+local runtime state, nested agent checkouts, and build outputs. Restore preserves
+the local copies. The remote run must install dependencies or rebuild outputs.
+Nested source such as `src/commands/target/` still transfers. Do not use a root
+`target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
+tracks it.
+
+The archive creator selects root-relative exclude syntax from its own `tar
+--version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server
+and remote can use different implementations. Unknown implementations fail the
+transfer rather than risk deleting nested source.
+
+`PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES` sets the sync-back cap in bytes on the server.
+The default is 2 GiB. Missing, invalid, and non-positive values use the default.
+Sync-back measures the excluded archive before download and checks the extracted
+staging directory before replacing workspace contents. A cap refusal leaves the
+workspace untouched. Normal success and failure paths remove staging directories;
+a hard process kill can still leave one behind.
+
+To verify GNU/BSD compatibility, install both tar implementations and run the
+focused suite for all four local/remote pairs. Set `GNU_TAR` and `BSD_TAR` to their
+absolute executable paths (`gtar` and `bsdtar` are common names):
+
+```sh
+for LOCAL_TAR in "$GNU_TAR" "$BSD_TAR"; do
+  for REMOTE_TAR in "$GNU_TAR" "$BSD_TAR"; do
+    PAPERCLIP_TEST_LOCAL_TAR="$LOCAL_TAR" PAPERCLIP_TEST_REMOTE_TAR="$REMOTE_TAR" \
+      pnpm exec vitest run packages/adapter-utils/src/ssh-sync-back-guard.test.ts \
+      packages/adapter-utils/src/remote-managed-runtime.test.ts || exit "$?"
+  done
+done
+```
+
+These tests run real archive creation and extraction through a fake SSH transport.
+They do not require an SSH host or a database.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.
@@ -692,6 +731,12 @@ Sandbox staging, including Daytona, transfers each repository's Git history and 
 
 Staging preserves relative symlink targets in secondary repositories, including skill links such as `.claude/skills/demo -> ../../skills/demo`. It does not rewrite them to host temporary paths or copy their target contents in place of the link. Daytona still rejects outbound archives with absolute or escaping link targets before extraction.
 
+If a managed secondary checkout loses its `.git` directory but keeps its files, snapshotting skips that checkout with a warning. Its files stay host-local and restore does not delete them. Diagnostics contain at most 32 warnings; when more checkouts are skipped, the last warning summarizes the remaining count. Every skipped path stays protected regardless of the diagnostic limit. Errors while reading a confirmed Git repository still fail closed.
+
+On the next setup, Paperclip preserves the non-Git directory under `.paperclip-runtime/detached-repositories/` and provisions a clean checkout at the original path. The preserved files are not replayed into the clean checkout. Existing Git directories and usable linked-worktree Git files are adopted, not quarantined. Dangling or malformed Git files fail setup explicitly without moving the checkout's files. A canonical-anchor queue serializes setup calls in the server process, including callers using a workspace alias. Setup also holds the existing anchor directory-merge lock through discovery, repair and inactive-checkout retention; its timeout remains fail-closed. This does not serialize child-only restores or guarantee exclusion of independent server or remote writers. Secondary checkout hints retain the caller's anchor alias.
+
+Restore refuses a file or symlink replacement of an ancestor of a literal excluded path before Git integration or file writes. A skipped directory's files must not be committed in the anchor's Git history: ignored paths cannot remove committed content from the staged Git clone. Snapshotting rejects that unsupported layout rather than transferring the supposedly skipped files. Recovery never rewrites the anchor's Git history.
+
 If a repository is detached or its source configuration changes, its previous task copy is retained under `.paperclip-runtime/detached-repositories/` and excluded from future sandbox transfers. Referenced projects continue to use the separate read-only multi-project workspace behavior.
 
 ## Config Freshness
@@ -979,6 +1024,8 @@ eval "$(npx paperclipai worktree env)"
 For project execution worktrees, Paperclip can also run a project-defined provision command after it creates or reuses an isolated git worktree. Configure this on the project's execution workspace policy (`workspaceStrategy.provisionCommand`). The command runs inside the derived worktree and receives `PAPERCLIP_WORKSPACE_*`, `PAPERCLIP_PROJECT_ID`, `PAPERCLIP_AGENT_ID`, and `PAPERCLIP_ISSUE_*` environment variables so each repo can bootstrap itself however it wants.
 
 An issue can pin its isolated worktree to an exact pre-existing branch instead of a template-derived one — the contract PR-preparation tasks use. Set the issue's `executionWorkspaceSettings` to `{ "mode": "isolated_workspace", "workspaceStrategy": { "type": "git_worktree", "existingBranch": "<branch>" } }`. The validator requires isolated mode plus a `git_worktree` strategy and rejects `branchTemplate` alongside `existingBranch`. At dispatch the runtime attaches (never creates, renames, fast-forwards, or resets) that branch: it reuses a registered worktree that already has the branch checked out (including legacy `.worktrees/` paths), otherwise it attaches the branch under the managed worktree parent. A missing branch, an occupied worktree path on another branch, or a non-worktree strategy fails closed with a `workspace_validation_failed` error instead of falling back to the shared checkout or a derived branch, and an inherited `reuse_existing` workspace binding on a different branch is ignored in favor of realizing the pinned branch.
+
+When a run reuses an isolated worktree, Paperclip checks that HEAD is on the branch recorded for the workspace and repairs the drift it can prove safe. A clean worktree whose checked-out branch is forward of the recorded branch adopts that branch (`enableWorkspaceBranchReconcileForward`). A clean worktree that is detached, behind, or diverged gets the recorded branch checked out again (`enableWorkspaceDirtyQuarantineRepair`). A detached commit that no ref reaches is first pinned on `paperclip/rescue/<issue>/detached-<time>`, and a displaced named branch keeps its own ref. A dirty worktree is committed to a rescue branch before the restore. The restore is refused while another run is running in the same worktree, while a runtime service of the workspace is running, or while an interrupted git operation (rebase, merge, bisect) is in progress. Before a run starts, a branch that an operator owns only ever gets this plain checkout. Every repair writes an `execution_workspace.*` activity entry. Anything else fails closed with `workspace_validation_failed`.
 
 Heavier setup that is only needed by a managed runtime service can use `workspaceStrategy.runtimeProvisionCommand`. Paperclip runs this command lazily before spawning the first service in a start batch, serializes concurrent provisioning for the same workspace, and records the attempt as `workspace_runtime_provision`. The command receives the same workspace environment as `provisionCommand` and should be idempotent because later service-start batches invoke it again.
 

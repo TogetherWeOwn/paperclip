@@ -1,10 +1,44 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Db } from "@paperclipai/db";
 import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
+  instanceSettingsService,
   normalizeExperimentalSettings,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
+
+const LOW_TRUST_SANDBOX_ENV_ID = "33333333-3333-4333-8333-333333333333";
+
+/** Echoes the persisted `general` back through `.update().set().where().returning()`. */
+function generalStubDb(initialGeneral: Record<string, unknown>) {
+  let row: Record<string, unknown> = {
+    id: "row-1",
+    singletonKey: "default",
+    defaultEnvironmentId: null,
+    general: initialGeneral,
+    experimental: {},
+    createdAt: new Date("2026-06-20T00:00:00.000Z"),
+    updatedAt: new Date("2026-06-20T00:00:00.000Z"),
+  };
+  const db = {
+    select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }),
+    insert: () => {
+      throw new Error("unexpected insert in test");
+    },
+    update: () => ({
+      set: (values: Record<string, unknown>) => ({
+        where: () => ({
+          returning: () => {
+            row = { ...row, ...values };
+            return Promise.resolve([row]);
+          },
+        }),
+      }),
+    }),
+  } as unknown as Db;
+  return db;
+}
 
 describe("instance settings service", () => {
   it("keeps chat connectors opt-in across legacy storage and patches without disabling Apps", () => {
@@ -425,4 +459,19 @@ describe("instance settings service", () => {
     expect(getExperimental).not.toHaveBeenCalled();
   });
 
+  it("persists the low-trust sandbox designation, keeps it across unrelated writes, and clears it with null", async () => {
+    const svc = instanceSettingsService(generalStubDb({}), { runtimeEnv: {} });
+    expect((await svc.getGeneral()).lowTrustSandboxEnvironmentId).toBeUndefined();
+
+    const designated = await svc.updateGeneral({ lowTrustSandboxEnvironmentId: LOW_TRUST_SANDBOX_ENV_ID });
+    expect(designated.general.lowTrustSandboxEnvironmentId).toBe(LOW_TRUST_SANDBOX_ENV_ID);
+    expect((await svc.getGeneral()).lowTrustSandboxEnvironmentId).toBe(LOW_TRUST_SANDBOX_ENV_ID);
+
+    const unrelated = await svc.updateGeneral({ keyboardShortcuts: true });
+    expect(unrelated.general.lowTrustSandboxEnvironmentId).toBe(LOW_TRUST_SANDBOX_ENV_ID);
+
+    const cleared = await svc.updateGeneral({ lowTrustSandboxEnvironmentId: null });
+    expect(cleared.general.lowTrustSandboxEnvironmentId).toBeUndefined();
+    expect((await svc.getGeneral()).lowTrustSandboxEnvironmentId).toBeUndefined();
+  });
 });

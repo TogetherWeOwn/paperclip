@@ -52,6 +52,23 @@ their own review issue (`done` — the verdict is the deliverable; the
 system-attributed stop-only relay when they enter `blocked` or `cancelled`.
 Never instruct a contained delegate to comment on its parent issue.
 
+## Closing a Blocked Low-Trust Card
+
+Moving a card out of `blocked` needs explicit resume authority, which a
+low-trust card denies. Terminal-run recovery parks a failed low-trust review
+card in `blocked`, so the one transition below is allowed through
+`PATCH /issues/:id`:
+
+- the actor is an agent **and** the card's current assignee;
+- the card is `blocked` and the target status is `done` or `cancelled`.
+
+Everything else out of `blocked` stays denied for a low-trust actor: any other
+target status, `reopen`, `resume`, `blockedByIssueIds`, and any card the actor
+is not assigned to. The remaining resume checks (pause hold, unresolved
+blockers) still apply, and an invalid trust policy still fails closed. This adds
+no capability: a low-trust assignee can already move an `in_progress` card to
+`done`.
+
 ## Runtime Containment
 
 Managed `low_trust_review` runs fail closed unless Paperclip can enforce the
@@ -64,6 +81,37 @@ runtime boundary:
 - inline sensitive environment values such as API keys and tokens are rejected
 - workspace runtime-service mutations are denied unless the boundary explicitly
   grants the `runtime.manage` tool class
+
+### Designating a low-trust sandbox
+
+Environment selection is agent default, then instance default, then local. It
+does not look at the trust preset by itself, so a low-trust run on an agent with
+no sandbox binding would land on local and be refused. To give low-trust runs a
+sandbox without binding any agent or moving the instance default, an instance
+admin designates one with `PATCH /api/instance/settings/general`:
+
+```json
+{ "lowTrustSandboxEnvironmentId": "<sandbox environment id>" }
+```
+
+Send `null` to clear it. The environment must be an active `sandbox`-driver
+environment that does not reuse leases (`reuseLease` off, so no VM is kept
+between runs) and is not the probe-only `fake` provider. Behavior:
+
+- only a run whose trust preset resolves to `low_trust_review` reads it, and only
+  when its selection would otherwise land on local; trusted runs never move
+- an agent or instance default that already points at a non-local environment
+  keeps it
+- it is checked again at run time (active, `sandbox` driver, `reuseLease` off,
+  not bound to another company). An unusable designation is logged and ignored
+- with no usable designation the run fails with
+  `low_trust_requires_sandbox_environment`, exactly as before
+
+Deleting or archiving the designated environment therefore fails low-trust runs
+closed; it never falls back to local. Clear the setting first.
+
+The GitHub review-bot and email-inbox setup checks use the same selection, so a
+low-trust agent whose runs would use the designation is reported ready.
 
 The Docker workflow in `doc/UNTRUSTED-PR-REVIEW.md` remains useful for manual
 local review, but Paperclip-managed low-trust execution requires a sandboxed

@@ -11,7 +11,11 @@ import {
   type AdapterExecutionTarget,
   type PreparedAdapterExecutionTargetRuntime,
 } from "@paperclipai/adapter-utils/execution-target";
-import type { GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import {
+  MAX_REPOSITORY_WARNINGS,
+  MAX_REPOSITORY_WARNING_LENGTH,
+  type GitWorkspaceSnapshot,
+} from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   directorySnapshotSha256,
   parseDirectorySnapshot,
@@ -366,10 +370,10 @@ function parseGitSnapshot(
   // fatal descriptor errors. Bounded like every other parsed field.
   let repositoryWarnings: string[] | undefined;
   if (candidate.repositoryWarnings !== undefined) {
-    if (!Array.isArray(candidate.repositoryWarnings) || candidate.repositoryWarnings.length > 32) return undefined;
+    if (!Array.isArray(candidate.repositoryWarnings) || candidate.repositoryWarnings.length > MAX_REPOSITORY_WARNINGS) return undefined;
     const cleaned: string[] = [];
     for (const warning of candidate.repositoryWarnings) {
-      if (typeof warning !== "string" || warning.length === 0 || warning.length > 1000) return undefined;
+      if (typeof warning !== "string" || warning.length === 0 || warning.length > MAX_REPOSITORY_WARNING_LENGTH) return undefined;
       cleaned.push(warning);
     }
     repositoryWarnings = cleaned;
