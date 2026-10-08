@@ -25,6 +25,7 @@ function runResolved(env) {
 }
 async function main() {
   let env = { ...process.env };
+  delete env.PAPERCLIP_GITHUB_SHIM_ACTIVE;
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
@@ -98,18 +99,9 @@ async function main() {
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  env.PAPERCLIP_GITHUB_SHIM_ACTIVE = '1';
   runResolved(env);
 }
-if (process.env.PAPERCLIP_GITHUB_SHIM_ACTIVE === '1') {
-  runResolved({
-    ...process.env,
-    PATH: originalPath.join(path.delimiter),
-    PAPERCLIP_GITHUB_SHIM_ACTIVE: '1',
-  });
-} else {
-  main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
-}
+main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
 `;
 }
 

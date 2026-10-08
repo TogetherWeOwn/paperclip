@@ -58,13 +58,13 @@ process.stdout.write("real git reached\\n");
     expect(result.stdout).toBe("real git reached\n");
     expect(wrapperRuns).toHaveLength(1);
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(launcherDir);
-    expect(wrapperEnv.active).toBe("1");
+    expect(wrapperEnv.active).toBeUndefined();
     expect((await readFile(realTrace, "utf8")).trim().split("\n")).toHaveLength(1);
     expect(brokerRequests).toBe(1);
   });
 
-  it("skips broker and config setup for a re-entered launcher", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-reentry-"));
+  it("does not trust a caller marker to skip broker mediation or config isolation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-forged-marker-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const launcherDir = path.join(root, "managed");
     const realDir = path.join(root, "real");
@@ -74,14 +74,21 @@ process.stdout.write("real git reached\\n");
     await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
     await writeFile(path.join(realDir, "git"), `#!/usr/bin/env node
 const fs = require("node:fs");
-process.stdout.write(JSON.stringify({ configExists: fs.existsSync(process.env.GH_CONFIG_DIR), token: process.env.GH_TOKEN, active: process.env.PAPERCLIP_GITHUB_SHIM_ACTIVE }));
+process.stdout.write(JSON.stringify({
+  configExists: fs.existsSync(process.env.GH_CONFIG_DIR),
+  token: process.env.GH_TOKEN ?? null,
+  global: process.env.GIT_CONFIG_GLOBAL,
+  askpass: process.env.GIT_ASKPASS,
+  marker: process.env.PAPERCLIP_GITHUB_SHIM_ACTIVE ?? null,
+  config: process.env.GH_CONFIG_DIR,
+}));
 `, { mode: 0o700 });
 
     let brokerRequests = 0;
     const server = createServer((_req, res) => {
       brokerRequests++;
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ status: "absent", env: {} }));
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "broker-token" } }));
     });
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
@@ -93,11 +100,21 @@ process.stdout.write(JSON.stringify({ configExists: fs.existsSync(process.env.GH
       ...process.env,
       ...environment,
       GH_CONFIG_DIR: configRoot,
+      GH_TOKEN: "caller-token",
+      GIT_CONFIG_GLOBAL: "/caller/config",
+      GIT_ASKPASS: "/caller/askpass",
       PATH: [launcherDir, realDir, path.dirname(process.execPath)].join(path.delimiter),
       PAPERCLIP_GITHUB_SHIM_ACTIVE: "1",
     } });
-    expect(JSON.parse(result.stdout)).toEqual({ configExists: false, token: "", active: "1" });
-    expect(brokerRequests).toBe(0);
+    const child = JSON.parse(result.stdout);
+    expect(child.configExists).toBe(true);
+    expect(child.token).toBe("broker-token");
+    expect(child.global).toBe("/dev/null");
+    expect(child.askpass).toBeUndefined();
+    expect(child.marker).toBeNull();
+    expect(child.config).not.toBe(configRoot);
+    expect(child.config.startsWith(`${configRoot}${path.sep}`)).toBe(true);
+    expect(brokerRequests).toBe(1);
   });
 
   it.each(["repository", "command"])("uses explicit %s identity for local commits without managed credentials", async (identitySource) => {
@@ -187,7 +204,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     let releaseCapture: (() => void) | null = null;
     const server = createServer((req, res) => {
       captures++;
-      expect(req.headers.authorization).toBe("Bearer run-capability");
+      expect(req.headers["x-paperclip-github-capability"]).toBe("run-capability");
       const selected = user;
       res.setHeader("content-type", "application/json");
       const finish = () => res.end(JSON.stringify(selected ? { status: "available", env: {
