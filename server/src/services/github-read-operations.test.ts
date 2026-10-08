@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { forbidden } from "../errors.js";
-import { githubReadOperationsService, type GitHubReadRunClaims } from "./github-read-operations.js";
+import {
+  githubReadOperationsService,
+  sanitizeGitHubDiagnosticText,
+  type GitHubReadRunClaims,
+} from "./github-read-operations.js";
 
 const mocks = vi.hoisted(() => ({
   validate: vi.fn(),
@@ -38,13 +42,16 @@ function redirect(location: string | null) {
 }
 
 function textStream(totalBytes: number, chunkBytes = 64 * 1024) {
+  const line = new TextEncoder().encode("log line 0123\n");
   let sent = 0;
   return new Response(
     new ReadableStream<Uint8Array>({
       pull(controller) {
         if (sent >= totalBytes) return controller.close();
         const size = Math.min(chunkBytes, totalBytes - sent);
-        controller.enqueue(new Uint8Array(size).fill(97));
+        const chunk = new Uint8Array(size);
+        for (let index = 0; index < size; index += 1) chunk[index] = line[(sent + index) % line.length]!;
+        controller.enqueue(chunk);
         sent += size;
       },
     }),
@@ -138,7 +145,7 @@ describe("githubReadOperationsService", () => {
     ).rejects.toMatchObject({ status: 422 });
   });
 
-  it("truncates a log stream at 1 MiB while it streams", async () => {
+  it("truncates a log stream at 1 MiB while it streams and drops the cut line", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
       calls += 1;
@@ -148,7 +155,49 @@ describe("githubReadOperationsService", () => {
     const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
 
     expect(result.truncated).toBe(true);
-    expect(result.logs.length).toBe(1024 * 1024);
+    expect(result.logs.length).toBeLessThan(1024 * 1024);
+    expect(result.logs.length).toBeGreaterThan(1024 * 1024 - 64);
+    expect(result.logs).toMatch(/log( line( 0123)?)?$/);
+  });
+
+  it("never returns the head of a secret that the size cap split", async () => {
+    const head = `${"x".repeat(1024 * 1024 - 8)}\nGH_TOKEN=ghp_ABCDEF`;
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return calls === 1
+        ? redirect(SAFE_DOWNLOAD)
+        : new Response(`${head}GHIJKLMNOPQRSTUVWXYZ0123456789\n`, { status: 200, headers: { "content-type": "text/plain" } });
+    }) as unknown as typeof fetch;
+
+    const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+
+    expect(result.truncated).toBe(true);
+    expect(result.logs).not.toContain("ghp_");
+    expect(result.logs).not.toContain("GH_TOKEN");
+  });
+
+  it("reports a mid-stream failure as a sanitized 422", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return redirect(SAFE_DOWNLOAD);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull() {
+            throw new Error(`socket reset near ${TOKEN}`);
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/plain" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const failure = await service(fetchImpl)
+      .actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" })
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ status: 422 });
+    expect(String((failure as Error).message)).not.toContain(TOKEN);
   });
 
   it.each([
@@ -239,5 +288,65 @@ describe("githubReadOperationsService", () => {
 
     expect(failure).toMatchObject({ status: 422 });
     expect(String((failure as Error).message)).not.toContain(TOKEN);
+  });
+});
+
+describe("sanitizeGitHubDiagnosticText", () => {
+  const KEY = ["-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEAfixture", "-----END RSA PRIVATE KEY-----"].join("\n");
+  it.each([
+    ["classic token", "run ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 done", "ghp_ABCDEF"],
+    ["server token", "ghs_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", "ghs_ABCDEF"],
+    ["fine-grained token", "github_pat_11ABCDEFG0abcdefghijklmnop_qrstuvwxyz", "github_pat_11"],
+    ["oauth token", "gho_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", "gho_ABCDEF"],
+    ["prefixed env token", "GITHUB_TOKEN=abc123def456", "abc123def456"],
+    ["npm token", "NPM_TOKEN=npm_fixturevalue1234", "npm_fixturevalue1234"],
+    ["node auth token", "NODE_AUTH_TOKEN: fixturevalue5678", "fixturevalue5678"],
+    ["password env", "DB_PASSWORD=hunter2hunter2", "hunter2hunter2"],
+    ["aws secret", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI"],
+    ["client secret", "AZURE_CLIENT_SECRET=fixture~secret.value", "fixture~secret"],
+    ["quoted env value", 'MY_API_KEY="quoted value 123"', "quoted value 123"],
+    ["json secret", '{"token": "abc123json", "name": "ok"}', "abc123json"],
+    ["json password", '{"password":"p@ss\\"word"}', "p@ss"],
+    ["cli option", "deploy --password hunter2hunter2 --verbose", "hunter2hunter2"],
+    ["cli option equals", "deploy --api-key=fixturekey123", "fixturekey123"],
+    ["bearer header", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", "abcdefghijklmnopqrstuvwxyz"],
+    ["basic header", "Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA"],
+    ["jwt", "id eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.c2lnbmF0dXJl end", "eyJhbGci"],
+    ["add-mask", "::add-mask::supersecretvalue", "supersecretvalue"],
+    ["provider key", "key sk-ABCDEFGHIJKLMNOPQRSTUV and AKIAABCDEFGHIJKLMNOP", "sk-ABCDEF"],
+    ["pem block", `before\n${KEY}\nafter`, "MIIEowIBAAKC"],
+    ["truncated pem", "before\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq", "MIIEvQIBAD"],
+    ["database url credentials", "connect postgres://admin:s3cr3tpw@db.internal/app", "s3cr3tpw"],
+    ["https url credentials", "fetch https://user:pw1234@example.test/path", "pw1234"],
+    ["signed url query", "get https://store.test/log.txt?sv=2024&sig=abcDEF123%2Bxyz", "abcDEF123"],
+  ])("redacts %s", (_label, input, secret) => {
+    const output = sanitizeGitHubDiagnosticText(input, []);
+    expect(output).not.toContain(secret);
+  });
+
+  it.each([
+    "run ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 done",
+    "DB_PASSWORD=hunter2hunter2",
+    '{"token": "abc123json"}',
+    "::add-mask::supersecretvalue",
+  ])("marks the redaction in %s", (input) => {
+    expect(sanitizeGitHubDiagnosticText(input, [])).toContain("[REDACTED]");
+  });
+
+  it("redacts registered secret values wherever they appear", () => {
+    expect(sanitizeGitHubDiagnosticText("echo plain-registered-value", ["plain-registered-value"]))
+      .not.toContain("plain-registered-value");
+  });
+
+  it("keeps ordinary log text readable", () => {
+    const line = "2026-10-08T00:00:00.0000000Z ##[group]Run pnpm test\nAll 42 tests passed in 3.1s";
+    expect(sanitizeGitHubDiagnosticText(line, [])).toBe(line);
+  });
+
+  it("stays linear on a large log made of dash-joined runs", () => {
+    const hostile = `token ${"a-".repeat(128 * 1024)}\n${"KEY_".repeat(64 * 1024)}x\n`;
+    const started = Date.now();
+    sanitizeGitHubDiagnosticText(hostile, []);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });

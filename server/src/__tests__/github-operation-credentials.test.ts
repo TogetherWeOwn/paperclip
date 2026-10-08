@@ -34,7 +34,10 @@ import {
   reserveSteeredIdentity,
   acceptSteeredIdentity,
 } from "../services/run-identity.js";
-import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import {
+  resolveGitHubOperationCredentials,
+  withGitHubOperationCredential,
+} from "../services/github-operation-credentials.js";
 import {
   filterResolvedGitHubConnectionsForRun,
   resolveManagedGitHubIdentitySelection,
@@ -338,6 +341,23 @@ const support = await getEmbeddedPostgresTestSupport();
         status: "available",
         grantId: older.id,
       });
+    });
+
+    it("does not try another grant when a diagnostics credential read fails", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      await grant(input, "A");
+      vault.resolveUserSecretValue.mockClear();
+      vault.resolveUserSecretValue.mockRejectedValueOnce(
+        new Error("secret provider failed"),
+      );
+      const operation = vi.fn(async () => "unreachable");
+
+      await expect(
+        withGitHubOperationCredential(db, input, operation),
+      ).rejects.toThrow();
+      expect(operation).not.toHaveBeenCalled();
+      expect(vault.resolveUserSecretValue).toHaveBeenCalledTimes(1);
     });
 
     it("uses one stable grant when the same person connects the same GitHub account twice", async () => {

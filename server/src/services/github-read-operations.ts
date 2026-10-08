@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { z } from "zod";
 import { forbidden, payloadTooLarge, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { stripSecretBearingUrlParts } from "../middleware/redact-sensitive.js";
 import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";
 import { connectionIntentService } from "./connection-intents.js";
@@ -47,17 +48,28 @@ type RepositoryId = (typeof GITHUB_DIAGNOSTIC_REPOSITORY_IDS)[number];
 type FetchLike = typeof fetch;
 
 const GITHUB_API_BASE = "https://api.github.com";
-const GITHUB_API_VERSION = "2026-03-10";
+const GITHUB_API_VERSION = "2022-11-28";
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_LOG_BYTES = 1024 * 1024;
 const MAX_WEBHOOK_RESPONSE_BYTES = 512 * 1024;
 const MAX_WEBHOOKS = 100;
 const LOG_DOWNLOAD_HOST = /^productionresultssa\d+\.blob\.core\.windows\.net$/i;
-const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gi;
-const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
+// Secret-name affixes are bounded so these patterns stay linear on a 1 MiB log made of
+// long dash- or underscore-joined runs. An unbounded affix backtracks quadratically.
+const SECRET_NAME = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|(?:access[-_]?|auth[-_]?|refresh[-_]?|id[-_]?)?token|secret|passw(?:or)?d|credential|private[-_]?key|cookie|connection[-_]?string|jwt|bearer|authorization|signature|sig)[A-Za-z0-9_-]{0,64}`;
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+const PROVIDER_KEY_PATTERN = /\b(?:sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,})\b/g;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|$)/g;
+const ADD_MASK_PATTERN = /(::add-mask::)\S*/gi;
+const BEARER_PATTERN = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
 const AUTHORIZATION_PATTERN = /\b(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)[^\s,;]+/gi;
-const SECRET_ASSIGNMENT_PATTERN = /\b((?:access[_-]?token|token|password|secret|api[_-]?key|client[_-]?secret|signature|sig)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+const URL_CREDENTIAL_PATTERN = /\b([a-z][a-z0-9+.-]{0,20}:\/\/)[^\s/@:]{1,200}:[^\s/@]{1,200}@/gi;
+const JSON_SECRET_FIELD_PATTERN = new RegExp(String.raw`("(?:${SECRET_NAME})"\s*:\s*")(?:\\.|[^"\\])*"`, "gi");
+const CLI_SECRET_OPTION_PATTERN = new RegExp(String.raw`(\B--?${SECRET_NAME}(?:=|\s+))(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)`, "gi");
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(String.raw`(\b${SECRET_NAME}\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;"']+)`, "gi");
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"']+/gi;
+const REDACTED = "[REDACTED]";
 
 function repositoryApiUrl(repositoryId: RepositoryId, resource: string) {
   const repository = GITHUB_DIAGNOSTIC_REPOSITORIES[repositoryId];
@@ -126,6 +138,8 @@ async function readBoundedText(response: Response, maxBytes: number) {
       chunks.push(value);
       byteLength += value.byteLength;
     }
+  } catch {
+    throw unprocessable("GitHub read operation could not be completed");
   } finally {
     reader.releaseLock();
   }
@@ -154,23 +168,40 @@ function checkedLogDownloadUrl(location: string | null) {
     || url.hash
     || !LOG_DOWNLOAD_HOST.test(url.hostname)
   ) {
+    // Hostname only: operators need it to confirm the allowlist, and the path and query can carry signed values.
+    logger.warn({ host: url.hostname.slice(0, 255) }, "Rejected unapproved GitHub job-log redirect host");
     throw forbidden("GitHub returned an unapproved job-log redirect");
   }
   return url.toString();
 }
 
-function sanitizeText(value: string, secretValues: string[]) {
-  const withKnownSecretsRedacted = redactRegisteredSecretValues(value, secretValues);
-  return withKnownSecretsRedacted
-    .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]")
-    .replace(BEARER_PATTERN, "Bearer [REDACTED]")
-    .replace(AUTHORIZATION_PATTERN, "$1[REDACTED]")
-    .replace(SECRET_ASSIGNMENT_PATTERN, "$1[REDACTED]")
+export function sanitizeGitHubDiagnosticText(value: string, secretValues: string[]) {
+  return redactRegisteredSecretValues(value, secretValues)
+    .replace(PEM_BLOCK_PATTERN, "[REDACTED PRIVATE KEY]")
+    .replace(ADD_MASK_PATTERN, `$1${REDACTED}`)
+    .replace(GITHUB_TOKEN_PATTERN, REDACTED)
+    .replace(PROVIDER_KEY_PATTERN, REDACTED)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
+    .replace(AUTHORIZATION_PATTERN, `$1${REDACTED}`)
+    .replace(URL_CREDENTIAL_PATTERN, `$1${REDACTED}@`)
+    .replace(JSON_SECRET_FIELD_PATTERN, `$1${REDACTED}"`)
+    .replace(CLI_SECRET_OPTION_PATTERN, `$1${REDACTED}`)
+    .replace(SECRET_ASSIGNMENT_PATTERN, `$1${REDACTED}`)
     .replace(URL_PATTERN, stripSecretBearingUrlParts);
 }
 
+// A log cut at the byte cap can end inside a secret. Keep only complete whitespace-delimited
+// text so a partial token never reaches the sanitizer's blind spot.
+function dropTrailingPartialToken(value: string) {
+  for (let index = value.length - 1; index >= 0; index -= 1) {
+    if (/\s/.test(value[index]!)) return value.slice(0, index);
+  }
+  return "";
+}
+
 function sanitizeStrings(value: unknown, secretValues: string[]): unknown {
-  if (typeof value === "string") return sanitizeText(value, secretValues);
+  if (typeof value === "string") return sanitizeGitHubDiagnosticText(value, secretValues);
   if (Array.isArray(value)) return value.map((entry) => sanitizeStrings(entry, secretValues));
   if (typeof value !== "object" || value === null) return value;
   return Object.fromEntries(
@@ -284,8 +315,8 @@ export function githubReadOperationsService(
           claims.run_id,
           body.text,
         );
-        const logs = sanitizeText(
-          registeredRedactions,
+        const logs = sanitizeGitHubDiagnosticText(
+          body.truncated ? dropTrailingPartialToken(registeredRedactions) : registeredRedactions,
           credential.token ? [credential.token] : [],
         );
         return {
