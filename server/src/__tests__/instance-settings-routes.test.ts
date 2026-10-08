@@ -443,6 +443,106 @@ describe("instance settings routes", () => {
     expect(mockInstanceSettingsService.update).not.toHaveBeenCalled();
   });
 
+  describe("low-trust sandbox designation (general settings)", () => {
+    const SANDBOX_ENV_ID = "22222222-2222-4222-8222-222222222222";
+    const adminActor = {
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    };
+
+    it("designates an active sandbox environment", async () => {
+      mockEnvironmentService.getById.mockResolvedValue({
+        id: SANDBOX_ENV_ID,
+        driver: "sandbox",
+        status: "active",
+        config: { provider: "exe-dev" },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ lowTrustSandboxEnvironmentId: SANDBOX_ENV_ID });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+        lowTrustSandboxEnvironmentId: SANDBOX_ENV_ID,
+      });
+    });
+
+    it("clears the designation with null without looking up an environment", async () => {
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ lowTrustSandboxEnvironmentId: null });
+
+      expect(res.status).toBe(200);
+      expect(mockEnvironmentService.getById).not.toHaveBeenCalled();
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+        lowTrustSandboxEnvironmentId: null,
+      });
+    });
+
+    it.each([
+      ["a missing environment", null, "Environment not found"],
+      [
+        "an archived environment",
+        { id: SANDBOX_ENV_ID, driver: "sandbox", status: "archived", config: {} },
+        "Environment is archived",
+      ],
+      [
+        "a non-sandbox environment",
+        { id: SANDBOX_ENV_ID, driver: "ssh", status: "active", config: {} },
+        'driver "ssh" is not allowed here',
+      ],
+      [
+        "the probe-only fake sandbox provider",
+        { id: SANDBOX_ENV_ID, driver: "sandbox", status: "active", config: { provider: "fake" } },
+        "probe-only",
+      ],
+      [
+        "an environment that reuses leases",
+        { id: SANDBOX_ENV_ID, driver: "sandbox", status: "active", config: { provider: "exe-dev", reuseLease: true } },
+        "must not reuse leases",
+      ],
+    ])("rejects %s with 422 and writes nothing", async (_label, environment, message) => {
+      mockEnvironmentService.getById.mockResolvedValue(environment);
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ lowTrustSandboxEnvironmentId: SANDBOX_ENV_ID });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain(message);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-uuid designation at validation", async () => {
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ lowTrustSandboxEnvironmentId: "not-a-uuid" });
+
+      expect(res.status).toBe(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("leaves general writes that omit the key alone", async () => {
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ keyboardShortcuts: true });
+
+      expect(res.status).toBe(200);
+      expect(mockEnvironmentService.getById).not.toHaveBeenCalled();
+    });
+  });
+
   it("allows local board users to update guarded dev-server auto-restart", async () => {
     const app = await createApp({
       type: "board",

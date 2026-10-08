@@ -509,6 +509,109 @@ describe("execution workspace policy helpers", () => {
     ).toThrow(ManagedSandboxUnavailableError);
   });
 
+  describe("low-trust sandbox designation", () => {
+    const base = {
+      agentDefaultEnvironmentId: null,
+      instanceDefaultEnvironmentId: null,
+      localDefaultEnvironmentId: "local-env",
+      lowTrustSandboxEnvironmentId: "low-trust-env",
+    };
+
+    it("redirects a low-trust run that would land on local to the designated sandbox", () => {
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({ ...base, lowTrustReview: true }),
+      ).toEqual({ environmentId: "low-trust-env", source: "low_trust_sandbox" });
+      // An explicit local binding on the agent lands on local too.
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          agentDefaultEnvironmentId: "local-env",
+          lowTrustReview: true,
+        }),
+      ).toEqual({ environmentId: "low-trust-env", source: "low_trust_sandbox" });
+    });
+
+    it("leaves the selection on local without a designation so the low-trust gate fails closed", () => {
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          lowTrustReview: true,
+          lowTrustSandboxEnvironmentId: null,
+        }),
+      ).toEqual({ environmentId: "local-env", source: "default" });
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          lowTrustReview: true,
+          lowTrustSandboxEnvironmentId: undefined,
+        }),
+      ).toEqual({ environmentId: "local-env", source: "default" });
+    });
+
+    it("never moves a trusted run, whatever the designation", () => {
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({ ...base, lowTrustReview: false }),
+      ).toEqual({ environmentId: "local-env", source: "default" });
+      expect(resolveExecutionWorkspaceEnvironmentId(base)).toEqual({
+        environmentId: "local-env",
+        source: "default",
+      });
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          agentDefaultEnvironmentId: "agent-env",
+          instanceDefaultEnvironmentId: "instance-env",
+        }),
+      ).toEqual({ environmentId: "agent-env", source: "agent" });
+    });
+
+    it("keeps an explicit non-local binding on the low-trust run (the designation is a local-landing fallback)", () => {
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          agentDefaultEnvironmentId: "agent-sandbox-env",
+          lowTrustReview: true,
+        }),
+      ).toEqual({ environmentId: "agent-sandbox-env", source: "agent" });
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          instanceDefaultEnvironmentId: "instance-env",
+          lowTrustReview: true,
+        }),
+      ).toEqual({ environmentId: "instance-env", source: "instance" });
+    });
+
+    it("takes precedence over the managed-sandbox redirect, and leaves it in force when undesignated", () => {
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          lowTrustReview: true,
+          managedSandboxOnly: true,
+          managedSandboxEnvironmentId: "managed-env",
+        }),
+      ).toEqual({ environmentId: "low-trust-env", source: "low_trust_sandbox" });
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          lowTrustReview: true,
+          lowTrustSandboxEnvironmentId: null,
+          managedSandboxOnly: true,
+          managedSandboxEnvironmentId: "managed-env",
+        }),
+      ).toEqual({ environmentId: "managed-env", source: "managed" });
+      // A trusted run keeps the managed redirect, never the low-trust env.
+      expect(
+        resolveExecutionWorkspaceEnvironmentId({
+          ...base,
+          lowTrustReview: false,
+          managedSandboxOnly: true,
+          managedSandboxEnvironmentId: "managed-env",
+        }),
+      ).toEqual({ environmentId: "managed-env", source: "managed" });
+    });
+  });
+
   it("maps persisted execution workspace modes back to issue settings", () => {
     expect(issueExecutionWorkspaceModeForPersistedWorkspace("isolated_workspace")).toBe("isolated_workspace");
     expect(issueExecutionWorkspaceModeForPersistedWorkspace("operator_branch")).toBe("operator_branch");

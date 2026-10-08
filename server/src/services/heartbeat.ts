@@ -456,6 +456,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "./execution-workspace-policy.js";
+import { resolveLowTrustSandboxEnvironment } from "./low-trust-sandbox-environment.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
@@ -20636,6 +20637,32 @@ export function heartbeatService(
       const managedSandboxEnvironment = managedSandboxOnly
         ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
         : null;
+      // Trust-aware placement: only a `low_trust_review` run reads the
+      // instance's designated low-trust sandbox, and only when its selection
+      // would land on local. The designation is re-verified here; an unusable
+      // one is dropped (and logged) so the low-trust gate fails closed with
+      // `low_trust_requires_sandbox_environment` rather than running on local.
+      const isLowTrustReviewRun = trustPreset.kind === "low_trust_review";
+      const lowTrustSandboxDesignation = isLowTrustReviewRun
+        ? await resolveLowTrustSandboxEnvironment({
+            designatedEnvironmentId:
+              resolvedInstanceSettings.general.lowTrustSandboxEnvironmentId ??
+              null,
+            companyId: agent.companyId,
+            environments: environmentsSvc,
+          })
+        : null;
+      if (lowTrustSandboxDesignation?.rejection) {
+        logger.warn(
+          {
+            runId: run.id,
+            agentId: agent.id,
+            companyId: agent.companyId,
+            rejection: lowTrustSandboxDesignation.rejection,
+          },
+          "Ignoring the designated low-trust sandbox environment: it is not usable for this run",
+        );
+      }
       const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
@@ -20643,6 +20670,9 @@ export function heartbeatService(
         localDefaultEnvironmentId: localEnvironment.id,
         managedSandboxOnly,
         managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
+        lowTrustReview: isLowTrustReviewRun,
+        lowTrustSandboxEnvironmentId:
+          lowTrustSandboxDesignation?.environmentId ?? null,
       });
       const effectiveExecutionWorkspaceMode: ReturnType<
         typeof resolveExecutionWorkspaceMode

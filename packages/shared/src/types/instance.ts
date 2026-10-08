@@ -38,6 +38,14 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Environment (driver `sandbox`) that runs the trust preset
+   * `low_trust_review` whenever its environment selection would otherwise land
+   * on local. Trusted runs never read it. Absent/`null` = no designation: a
+   * low-trust run that lands on local fails closed
+   * (`low_trust_requires_sandbox_environment`).
+   */
+  lowTrustSandboxEnvironmentId?: string | null;
 }
 
 export interface InstanceExperimentalSettings {
