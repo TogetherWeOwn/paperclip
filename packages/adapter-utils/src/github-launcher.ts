@@ -1,14 +1,36 @@
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
 export function githubLauncherSource(): string {
   return String.raw`#!/usr/bin/env node
+// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
+function hasManagedLauncher(dir) {
+  // Use a versioned marker for current launchers and a strict fingerprint for older ones.
+  return ['git', 'gh'].some(name => {
+    try {
+      const candidate = path.join(dir, name);
+      const stat = fs.statSync(candidate);
+      if (!stat.isFile() || stat.size > 16384) return false;
+      const source = fs.readFileSync(candidate, 'utf8');
+      const currentSignature = source.startsWith('#!/usr/bin/env node')
+        && source.includes('PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1');
+      const legacySignature = source.startsWith('#!/usr/bin/env node')
+        && source.includes("const { spawn } = require('node:child_process');")
+        && source.includes('const directory = path.dirname(fs.realpathSync(process.argv[1]));')
+        && source.includes("const executable = originalPath.map(p => path.join(p, program)).find(p => {")
+        && source.includes('PAPERCLIP_GITHUB_BROKER_TOKEN')
+        && source.includes('/runtime-tools/github/credentials');
+      return currentSignature || legacySignature;
+    } catch { return false; }
+  });
+}
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
-  try { return fs.realpathSync(p) !== directory; } catch { return true; }
+  try { if (fs.realpathSync(p) === directory) return false; } catch {}
+  return !hasManagedLauncher(p);
 });
 const executable = originalPath.map(p => path.join(p, program)).find(p => {
   try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }

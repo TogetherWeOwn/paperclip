@@ -8,6 +8,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
+const legacyLauncherSource = () => githubLauncherSource()
+  .replace("// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1\n", "")
+  .replace(/function hasManagedLauncher\(dir\) \{\n[\s\S]*?\n\}\n/, "")
+  .replace("const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {\n  try { if (fs.realpathSync(p) === directory) return false; } catch {}\n  return !hasManagedLauncher(p);\n});", "const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {\n  try { return fs.realpathSync(p) !== directory; } catch { return true; }\n});")
+  .replace(/function runResolved\(env\) \{\n[\s\S]*?\n\}\n/, "")
+  .replace("  runResolved(env);", "  process.stdout.write('legacy launcher reached\\n');");
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("managed GitHub launchers", () => {
@@ -15,13 +21,24 @@ describe("managed GitHub launchers", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-path-wrapper-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const launcherDir = path.join(root, "managed");
+    const otherLauncherDir = path.join(root, "other-managed");
+    const legacyLauncherDir = path.join(root, "legacy-managed");
     const wrapperDir = path.join(root, "wrapper");
     const realDir = path.join(root, "real");
-    for (const dir of [launcherDir, wrapperDir, realDir]) await mkdir(dir);
+    for (const dir of [launcherDir, otherLauncherDir, legacyLauncherDir, wrapperDir, realDir]) await mkdir(dir);
     const wrapperTrace = path.join(root, "wrapper-trace");
     const realTrace = path.join(root, "real-trace");
     await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(otherLauncherDir, "git"), `#!/usr/bin/env node
+// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1
+process.stdout.write("current launcher reached\\n");
+`, { mode: 0o700 });
+    const legacySource = legacyLauncherSource();
+    expect(legacySource).not.toContain("PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1");
+    expect(legacySource).not.toContain("function runResolved(env) {");
+    await writeFile(path.join(legacyLauncherDir, "git"), legacySource, { mode: 0o700 });
     await writeFile(path.join(wrapperDir, "git"), `#!/usr/bin/env node
+// Custom wrapper, not the managed launcher: PAPERCLIP_GITHUB_BROKER_TOKEN /runtime-tools/github/credentials
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -51,13 +68,15 @@ process.stdout.write("real git reached\\n");
       ...process.env,
       ...githubBrokerEnvironment({ WRAPPER_BIN: wrapperDir, WRAPPER_TRACE: wrapperTrace, REAL_TRACE: realTrace }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
       GH_CONFIG_DIR: path.join(root, "config"),
-      PATH: [launcherDir, wrapperDir, realDir, process.env.PATH].join(path.delimiter),
+      PATH: [launcherDir, wrapperDir, otherLauncherDir, legacyLauncherDir, realDir, process.env.PATH].join(path.delimiter),
     } });
     const wrapperRuns = (await readFile(wrapperTrace, "utf8")).trim().split("\n");
     const wrapperEnv = JSON.parse(wrapperRuns[0]!);
     expect(result.stdout).toBe("real git reached\n");
     expect(wrapperRuns).toHaveLength(1);
     expect(wrapperEnv.path.split(path.delimiter)).not.toContain(launcherDir);
+    expect(wrapperEnv.path.split(path.delimiter)).not.toContain(otherLauncherDir);
+    expect(wrapperEnv.path.split(path.delimiter)).not.toContain(legacyLauncherDir);
     expect(wrapperEnv.active).toBeUndefined();
     expect((await readFile(realTrace, "utf8")).trim().split("\n")).toHaveLength(1);
     expect(brokerRequests).toBe(1);
@@ -191,9 +210,10 @@ process.stdout.write(JSON.stringify({
   it("captures each command's identity and clears host credentials when the next person has none", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-launcher-test-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
-    const bin = path.join(root, "managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo");
-    for (const dir of [bin, realBin, repo, path.join(bin, "gh-config")]) await mkdir(dir, { recursive: true });
+    const bin = path.join(root, "managed"), otherBin = path.join(root, "other-managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo");
+    for (const dir of [bin, otherBin, realBin, repo, path.join(bin, "gh-config")]) await mkdir(dir, { recursive: true });
     for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(otherBin, "git"), legacyLauncherSource(), { mode: 0o700 });
     await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
 const {execFileSync}=require('node:child_process');
 const identity=execFileSync('git',['var','GIT_AUTHOR_IDENT'],{encoding:'utf8'}).trim();
@@ -220,7 +240,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     const address = server.address() as { port: number };
     const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
-    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${otherBin}:${realBin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
     await git("config", "user.name", "Repository Author");
