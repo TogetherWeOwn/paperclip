@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,95 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("managed GitHub launchers", () => {
+  it("passes the shim-free PATH to wrappers and reaches the next Git executable once", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-path-wrapper-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const launcherDir = path.join(root, "managed");
+    const wrapperDir = path.join(root, "wrapper");
+    const realDir = path.join(root, "real");
+    for (const dir of [launcherDir, wrapperDir, realDir]) await mkdir(dir);
+    const wrapperTrace = path.join(root, "wrapper-trace");
+    const realTrace = path.join(root, "real-trace");
+    await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(wrapperDir, "git"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+fs.appendFileSync(process.env.WRAPPER_TRACE, JSON.stringify({ path: process.env.PATH, active: process.env.PAPERCLIP_GITHUB_SHIM_ACTIVE }) + "\\n");
+const env = { ...process.env, PATH: process.env.PATH.split(path.delimiter).filter(dir => dir !== process.env.WRAPPER_BIN).join(path.delimiter) };
+const result = spawnSync("git", process.argv.slice(2), { env, encoding: "utf8" });
+if (result.error) throw result.error;
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`, { mode: 0o700 });
+    await writeFile(path.join(realDir, "git"), `#!/usr/bin/env node
+require("node:fs").appendFileSync(process.env.REAL_TRACE, "run\\n");
+process.stdout.write("real git reached\\n");
+`, { mode: 0o700 });
+
+    let brokerRequests = 0;
+    const server = createServer((_req, res) => {
+      brokerRequests++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "absent", env: {} }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const { port } = server.address() as { port: number };
+    const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
+      ...process.env,
+      ...githubBrokerEnvironment({ WRAPPER_BIN: wrapperDir, WRAPPER_TRACE: wrapperTrace, REAL_TRACE: realTrace }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"),
+      PATH: [launcherDir, wrapperDir, realDir, process.env.PATH].join(path.delimiter),
+    } });
+    const wrapperRuns = (await readFile(wrapperTrace, "utf8")).trim().split("\n");
+    const wrapperEnv = JSON.parse(wrapperRuns[0]!);
+    expect(result.stdout).toBe("real git reached\n");
+    expect(wrapperRuns).toHaveLength(1);
+    expect(wrapperEnv.path.split(path.delimiter)).not.toContain(launcherDir);
+    expect(wrapperEnv.active).toBe("1");
+    expect((await readFile(realTrace, "utf8")).trim().split("\n")).toHaveLength(1);
+    expect(brokerRequests).toBe(1);
+  });
+
+  it("skips broker and config setup for a re-entered launcher", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-reentry-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const launcherDir = path.join(root, "managed");
+    const realDir = path.join(root, "real");
+    await mkdir(launcherDir);
+    await mkdir(realDir);
+    const configRoot = path.join(root, "config");
+    await writeFile(path.join(launcherDir, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realDir, "git"), `#!/usr/bin/env node
+const fs = require("node:fs");
+process.stdout.write(JSON.stringify({ configExists: fs.existsSync(process.env.GH_CONFIG_DIR), token: process.env.GH_TOKEN, active: process.env.PAPERCLIP_GITHUB_SHIM_ACTIVE }));
+`, { mode: 0o700 });
+
+    let brokerRequests = 0;
+    const server = createServer((_req, res) => {
+      brokerRequests++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "absent", env: {} }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const { port } = server.address() as { port: number };
+    const broker = { url: `http://127.0.0.1:${port}`, token: "run-capability" };
+    const environment = githubBrokerEnvironment({ PAPERCLIP_GITHUB_SHIM_ACTIVE: "1", GH_TOKEN: "host-token" }, broker);
+    expect(environment.PAPERCLIP_GITHUB_SHIM_ACTIVE).toBe("");
+    const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
+      ...process.env,
+      ...environment,
+      GH_CONFIG_DIR: configRoot,
+      PATH: [launcherDir, realDir, path.dirname(process.execPath)].join(path.delimiter),
+      PAPERCLIP_GITHUB_SHIM_ACTIVE: "1",
+    } });
+    expect(JSON.parse(result.stdout)).toEqual({ configExists: false, token: "", active: "1" });
+    expect(brokerRequests).toBe(0);
+  });
+
   it.each(["repository", "command"])("uses explicit %s identity for local commits without managed credentials", async (identitySource) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-identity-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
