@@ -408,8 +408,8 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after).toEqual(before);
   });
 
-  it.each([{ incident: "TOG-11377", recoveryCount: 1 }, { incident: "TOG-10968", recoveryCount: 5 }])(
-    "$incident: delivers one new user turn after cancel-before-launch with $recoveryCount resolved holds", async ({ recoveryCount }) => {
+  it.each([{ recoveryCount: 1 }, { recoveryCount: 5 }])(
+    "delivers one new user turn after cancel-before-launch with $recoveryCount resolved holds", async ({ recoveryCount }) => {
       const f = await seedNeverStartedLegacy(recoveryCount);
       const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, processGroupId: null,
@@ -446,7 +446,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(after).toEqual(before);
     });
 
-  it("TOG-11303: delivers one reviewer-CHANGES turn after never-started waiting_on_review park", async () => {
+  it("delivers one reviewer-CHANGES turn after never-started waiting_on_review park", async () => {
     const f = await seedNeverStartedLegacy(1);
     await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
       error: "Continuation parked: issue is waiting on review/approval" })
@@ -483,7 +483,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after).toEqual(before);
   });
 
-  it("TOG-11303: an active pause hold still defers the never-started waiting_on_review turn", async () => {
+  it("an active pause hold still defers the never-started waiting_on_review turn", async () => {
     const f = await seedNeverStartedLegacy(1);
     await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
       error: "Continuation parked: issue is waiting on review/approval" })
@@ -507,7 +507,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
   });
 
-  it("TOG-10968: five repeated holds do not waive another source's missing stop evidence", async () => {
+  it("five repeated holds do not waive another source's missing stop evidence", async () => {
     const f = await seedNeverStartedLegacy(5), otherId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: otherId, companyId: f.companyId, agentId: f.agentId,
       runtimeMode: "legacy", status: "failed", contextSnapshot: { issueId: f.issueId },

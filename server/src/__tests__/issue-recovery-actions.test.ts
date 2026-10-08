@@ -1731,7 +1731,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     };
   }
 
-  it("TOG-11377: delivers accepted reconciliation for a never-started cancellation without native stop evidence", async () => {
+  it("delivers accepted reconciliation for a never-started cancellation without native stop evidence", async () => {
     const { companyId, coderId, sourceIssueId, previousRunId, action, heartbeat } = await seedReconciledDelivery();
     await db.update(heartbeatRuns).set({ status: "cancelled", startedAt: null,
       finishedAt: new Date("2026-05-13T18:01:00Z") }).where(eq(heartbeatRuns.id, previousRunId));
