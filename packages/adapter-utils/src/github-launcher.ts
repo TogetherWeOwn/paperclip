@@ -1,14 +1,47 @@
+import { createHash } from "node:crypto";
+
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
 export function githubLauncherSource(): string {
-  return String.raw`#!/usr/bin/env node
+  const hashPlaceholder = "__PAPERCLIP_GITHUB_LAUNCHER_SOURCE_HASH__";
+  const source = String.raw`#!/usr/bin/env node
+// PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:${hashPlaceholder}
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
+function hasManagedLauncher(dir) {
+  // Current launchers carry a content hash; legacy launchers use a strict fingerprint.
+  const markerPrefix = 'PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:';
+  const hashPlaceholder = '${hashPlaceholder}';
+  const { createHash } = require('node:crypto');
+  return ['git', 'gh'].some(name => {
+    try {
+      const candidate = path.join(dir, name);
+      const stat = fs.statSync(candidate);
+      if (!stat.isFile() || stat.size > 16384) return false;
+      const source = fs.readFileSync(candidate, 'utf8');
+      const signature = source.match(/PAPERCLIP_GITHUB_LAUNCHER_SIGNATURE: paperclip-managed-github-launcher:v1:([a-f0-9]{64})/);
+      const normalizedSource = signature
+        ? source.replace(signature[0], markerPrefix + hashPlaceholder)
+        : null;
+      const currentSignature = source.startsWith('#!/usr/bin/env node')
+        && normalizedSource !== null
+        && createHash('sha256').update(normalizedSource).digest('hex') === signature[1];
+      const legacySignature = source.startsWith('#!/usr/bin/env node')
+        && source.includes("const { spawn } = require('node:child_process');")
+        && source.includes('const directory = path.dirname(fs.realpathSync(process.argv[1]));')
+        && source.includes("const executable = originalPath.map(p => path.join(p, program)).find(p => {")
+        && source.includes('PAPERCLIP_GITHUB_BROKER_TOKEN')
+        && source.includes('/runtime-tools/github/credentials');
+      return currentSignature || legacySignature;
+    } catch { return false; }
+  });
+}
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
-  try { return fs.realpathSync(p) !== directory; } catch { return true; }
+  try { if (fs.realpathSync(p) === directory) return false; } catch {}
+  return !hasManagedLauncher(p);
 });
 const executable = originalPath.map(p => path.join(p, program)).find(p => {
   try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
@@ -17,8 +50,15 @@ if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
 }
+function runResolved(env) {
+  const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
+  child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
+  child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });
+}
 async function main() {
   let env = { ...process.env };
+  delete env.PAPERCLIP_GITHUB_SHIM_ACTIVE;
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
@@ -92,20 +132,19 @@ async function main() {
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
-  child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
-  child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });
+  runResolved(env);
 }
 main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
 `;
+  const sourceHash = createHash("sha256").update(source).digest("hex");
+  return source.replace(hashPlaceholder, sourceHash);
 }
 
 /** Override inherited credentials even when adapters merge the host environment later. */
 export function githubBrokerEnvironment(input: Record<string, unknown>, broker: { url: string; token: string }): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(input)) if (typeof value === "string") env[key] = value;
-  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "PAPERCLIP_GITHUB_OPERATION_ACTIVE"]) env[key] = "";
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "PAPERCLIP_GITHUB_OPERATION_ACTIVE", "PAPERCLIP_GITHUB_SHIM_ACTIVE"]) env[key] = "";
   for (const key of Object.keys(env)) {
     if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) env[key] = "";
   }
