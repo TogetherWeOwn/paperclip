@@ -16133,6 +16133,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.configure(endpoint.id, { action: "verify" }, "owner-user");
     const callbacks = runtime.configurations.get(endpoint.id)?.callbacks;
     if (!callbacks) throw new Error("Expected endpoint callbacks");
+    fixtureServices.add(service);
     const slackTimestamp = (milliseconds: number) =>
       `${Math.floor(Date.parse("2026-09-05T17:50:03.000Z") / 1_000)}.${String(milliseconds * 1_000).padStart(6, "0")}`;
     const thread = makeThread({
@@ -16229,6 +16230,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       publicBaseUrl: "https://paperclip.example",
       runtime: new FakeChatSdkRuntime() as unknown as ChatSdkRuntime,
     });
+    fixtureServices.add(competingService);
     deferred.shift()?.();
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
@@ -16244,13 +16246,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
+    // Eight serial delivery transactions can exceed waitFor's default 1s
+    // under CI load. Keep the complete batch assertion with a bounded wait.
     await vi.waitFor(async () => {
       const rows = await db
         .select({ id: issueComments.id })
         .from(issueComments)
         .where(eq(issueComments.issueId, conversation.issueId));
       expect(rows).toHaveLength(8);
-    });
+    }, { timeout: 10_000 });
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
