@@ -63,6 +63,37 @@ function service(fetchImpl: typeof fetch) {
   return githubReadOperationsService({} as never, { fetch: fetchImpl });
 }
 
+function bodyStream(text: string, chunkBytes = 64 * 1024) {
+  const bytes = new TextEncoder().encode(text);
+  let sent = 0;
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= bytes.byteLength) return controller.close();
+        const size = Math.min(chunkBytes, bytes.byteLength - sent);
+        controller.enqueue(bytes.slice(sent, sent + size));
+        sent += size;
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/plain" } },
+  );
+}
+
+function fetchLog(log: string) {
+  let calls = 0;
+  const fetchImpl = vi.fn(async () => {
+    calls += 1;
+    return calls === 1 ? redirect(SAFE_DOWNLOAD) : bodyStream(log);
+  }) as unknown as typeof fetch;
+  return service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+}
+
+// Builds a log whose last 1 MiB opens `offset` bytes into `secret`, so the window cuts the secret mid-line.
+function logWindowStartingInside(secret: string, offset: number) {
+  const suffix = `${"y".repeat(1024 * 1024 + offset - secret.length - 1)}\n`;
+  return { log: `x\n${secret}${suffix}`, suffix };
+}
+
 describe("githubReadOperationsService", () => {
   beforeEach(() => {
     mocks.validate.mockReset().mockResolvedValue(undefined);
@@ -145,11 +176,11 @@ describe("githubReadOperationsService", () => {
     ).rejects.toMatchObject({ status: 422 });
   });
 
-  it("truncates a log stream at 1 MiB while it streams and drops the cut line", async () => {
+  it("keeps the last 1 MiB of a log stream, starting and ending on whole lines", async () => {
     let calls = 0;
     const fetchImpl = vi.fn(async () => {
       calls += 1;
-      return calls === 1 ? redirect(SAFE_DOWNLOAD) : textStream(8 * 1024 * 1024);
+      return calls === 1 ? redirect(SAFE_DOWNLOAD) : textStream(14 * 600_000);
     }) as unknown as typeof fetch;
 
     const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
@@ -157,41 +188,35 @@ describe("githubReadOperationsService", () => {
     expect(result.truncated).toBe(true);
     expect(result.logs.length).toBeLessThan(1024 * 1024);
     expect(result.logs.length).toBeGreaterThan(1024 * 1024 - 64);
-    expect(result.logs).toMatch(/log( line( 0123)?)?$/);
+    expect(result.logs.startsWith("log line 0123\n")).toBe(true);
+    expect(result.logs.replaceAll("log line 0123\n", "")).toBe("");
   });
 
-  it("never returns the head of a secret that the size cap split", async () => {
-    const head = `${"x".repeat(1024 * 1024 - 8)}\nGH_TOKEN=ghp_ABCDEF`;
-    let calls = 0;
-    const fetchImpl = vi.fn(async () => {
-      calls += 1;
-      return calls === 1
-        ? redirect(SAFE_DOWNLOAD)
-        : new Response(`${head}GHIJKLMNOPQRSTUVWXYZ0123456789\n`, { status: 200, headers: { "content-type": "text/plain" } });
-    }) as unknown as typeof fetch;
-
-    const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+  it("keeps the failing final step of a log that streams past 1 MiB", async () => {
+    const result = await fetchLog(`${"log line 0123\n".repeat(150_000)}##[error] Process completed with exit code 1\n`);
 
     expect(result.truncated).toBe(true);
-    expect(result.logs).not.toContain("ghp_");
-    expect(result.logs).not.toContain("GH_TOKEN");
+    expect(result.logs.endsWith("##[error] Process completed with exit code 1\n")).toBe(true);
   });
 
-  it("never returns the head of a multi-word secret that the size cap split", async () => {
-    const head = `${"x".repeat(1024 * 1024 - 70)}\nDB_PASSWORD="correct horse battery staple and more words`;
-    let calls = 0;
-    const fetchImpl = vi.fn(async () => {
-      calls += 1;
-      return calls === 1
-        ? redirect(SAFE_DOWNLOAD)
-        : new Response(`${head} that continue past the cap"\n`, { status: 200, headers: { "content-type": "text/plain" } });
-    }) as unknown as typeof fetch;
+  it("drops the partial line a window start cuts through a token", async () => {
+    const secret = "\nGH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+    const { log, suffix } = logWindowStartingInside(secret, secret.indexOf("ABCDEF"));
 
-    const result = await service(fetchImpl).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+    const result = await fetchLog(log);
 
     expect(result.truncated).toBe(true);
-    expect(result.logs).not.toContain("correct horse");
-    expect(result.logs).not.toContain("battery");
+    expect(result.logs).toBe(suffix);
+  });
+
+  it("drops the partial line a window start cuts through a multi-word secret", async () => {
+    const secret = 'DB_PASSWORD="correct horse battery staple and more words that continue past the cap"\n';
+    const { log, suffix } = logWindowStartingInside(secret, secret.indexOf("battery"));
+
+    const result = await fetchLog(log);
+
+    expect(result.truncated).toBe(true);
+    expect(result.logs).toBe(suffix);
   });
 
   it("reports a mid-stream failure as a sanitized 422", async () => {
@@ -369,6 +394,7 @@ describe("sanitizeGitHubDiagnosticText", () => {
     ["KEY_ runs", `${"KEY_".repeat(256 * 1024)}x\n`],
     ["quote runs", `${'password="'.repeat(105 * 1024)}\n`],
     ["BEGIN headers", `${"-----BEGIN PRIVATE KEY-----\n".repeat(37 * 1024)}`],
+    ["END markers", `${"-----END PRIVATE KEY-----\n".repeat(40 * 1024)}`],
   ])("stays linear on a 1 MiB log of %s", (_label, hostile) => {
     expect(hostile.length).toBeGreaterThanOrEqual(1024 * 1024 - 8);
     const started = Date.now();
@@ -403,13 +429,23 @@ describe("sanitizeGitHubDiagnosticText", () => {
     expect(output).toContain("Error: assertion failed");
   });
 
-  it("redacts an unterminated key body, and everything after a header in a truncated log", () => {
+  it("redacts an unterminated key body and keeps the prose after it, truncated or not", () => {
     const body = "2026-10-08T00:00:00.1234567Z -----BEGIN PRIVATE KEY-----\n2026-10-08T00:00:00.1234568Z MIIEvQIBADANBgkqhkiG9w0BAQEF\n2026-10-08T00:00:00.1234569Z AASCBKcwggSjAgEAAoIBAQC7VJTUt9Us\nnext step";
     const unterminated = sanitizeGitHubDiagnosticText(body, []);
     expect(unterminated).not.toContain("MIIEvQIBAD");
     expect(unterminated).not.toContain("AASCBKcwgg");
     expect(unterminated).toContain("next step");
-    expect(sanitizeGitHubDiagnosticText(body, [], { truncated: true })).not.toContain("next step");
+    expect(sanitizeGitHubDiagnosticText(body, [], { truncated: true })).toBe(unterminated);
+  });
+
+  it("redacts the tail of a key whose header a truncated log cut off", () => {
+    const output = sanitizeGitHubDiagnosticText(
+      "2026-10-08T00:00:00.1234568Z MIIEvQIBADANBgkqhkiG9w0BAQEF\n-----END PRIVATE KEY-----\nnext step",
+      [],
+      { truncated: true },
+    );
+    expect(output).not.toContain("MIIEvQIBAD");
+    expect(output).toBe("[REDACTED PRIVATE KEY]\nnext step");
   });
 
   it.each([

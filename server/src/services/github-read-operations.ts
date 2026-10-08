@@ -67,9 +67,8 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g
 const PEM_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----/g;
 const PEM_END_PATTERN = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g;
 const PEM_MAX_BLOCK_CHARS = 16 * 1024;
-// A header with no END line is redacted together with the base64-looking lines that follow it,
-// or to the end of a log that the size cap cut. A banner such as `echo "-----BEGIN ..."` keeps
-// the rest of the log.
+// A header with no END line redacts only the base64-looking lines that follow it, so a banner
+// such as `echo "-----BEGIN ..."` keeps the rest of the log.
 const PEM_BODY_LINES_PATTERN = /(?:\r?\n(?:\S{1,40}Z )?[A-Za-z0-9+/=]{16,}[ \t]*)*/y;
 const ADD_MASK_PATTERN = /(::add-mask::)\S*/gi;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
@@ -161,6 +160,40 @@ async function readBoundedText(response: Response, maxBytes: number) {
   };
 }
 
+// Reads the whole stream but keeps only its last maxBytes, so the final step of a long log survives.
+async function readTailText(response: Response, maxBytes: number) {
+  const reader = response.body?.getReader();
+  if (!reader) return { text: "", truncated: false };
+
+  let chunks: Uint8Array[] = [];
+  let retained = 0;
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      chunks.push(value);
+      retained += value.byteLength;
+      if (retained > 2 * maxBytes) {
+        const tail = Buffer.concat(chunks, retained).subarray(retained - maxBytes);
+        chunks = [tail];
+        retained = tail.byteLength;
+      }
+    }
+  } catch {
+    throw unprocessable("GitHub read operation could not be completed");
+  } finally {
+    reader.releaseLock();
+  }
+
+  const kept = Buffer.concat(chunks, retained);
+  return {
+    text: new TextDecoder().decode(kept.subarray(Math.max(0, kept.byteLength - maxBytes))),
+    truncated: totalBytes > maxBytes,
+  };
+}
+
 function checkedLogDownloadUrl(location: string | null) {
   if (!location) throw unprocessable("GitHub did not provide a job-log download URL");
   let url: URL;
@@ -194,6 +227,12 @@ function redactPrivateKeyBlocks(text: string, truncated: boolean) {
   let endIndex = 0;
   let cursor = 0;
   let out = "";
+  // A truncated log can start inside a key body, leaving an END whose BEGIN was cut off.
+  const firstBegin = text.search(PEM_BEGIN_PATTERN);
+  if (truncated && ends.length > 0 && (firstBegin === -1 || ends[0]! <= firstBegin)) {
+    out = text.slice(0, Math.max(0, ends[0]! - PEM_MAX_BLOCK_CHARS)) + "[REDACTED PRIVATE KEY]";
+    cursor = ends[0]!;
+  }
   for (const begin of text.matchAll(PEM_BEGIN_PATTERN)) {
     const start = begin.index!;
     if (start < cursor) continue;
@@ -203,8 +242,6 @@ function redactPrivateKeyBlocks(text: string, truncated: boolean) {
     let blockEnd: number;
     if (end !== undefined && end - start <= PEM_MAX_BLOCK_CHARS) {
       blockEnd = end;
-    } else if (truncated) {
-      blockEnd = text.length;
     } else {
       PEM_BODY_LINES_PATTERN.lastIndex = headerEnd;
       blockEnd = headerEnd + (PEM_BODY_LINES_PATTERN.exec(text)?.[0].length ?? 0);
@@ -235,13 +272,10 @@ export function sanitizeGitHubDiagnosticText(
     .replace(URL_PATTERN, stripSecretBearingUrlParts);
 }
 
-// A log cut at the byte cap can end inside a secret. Keep only complete whitespace-delimited
-// text so a partial token never reaches the sanitizer's blind spot.
-function dropTrailingPartialToken(value: string) {
-  for (let index = value.length - 1; index >= 0; index -= 1) {
-    if (/\s/.test(value[index]!)) return value.slice(0, index);
-  }
-  return "";
+// A truncated tail starts mid-line, so its first line may begin inside a secret.
+function dropLeadingPartialLine(value: string) {
+  const newline = value.indexOf("\n");
+  return newline === -1 ? "" : value.slice(newline + 1);
 }
 
 function sanitizeStrings(value: unknown, secretValues: string[]): unknown {
@@ -353,14 +387,15 @@ export function githubReadOperationsService(
           await discardBody(download);
           throw unprocessable("GitHub returned an unsupported job-log format");
         }
-        const body = await readBoundedText(download, MAX_LOG_BYTES);
+        const body = await readTailText(download, MAX_LOG_BYTES);
+        const tail = body.truncated ? dropLeadingPartialLine(body.text) : body.text;
         const registeredRedactions = await secretRedaction.redactForRun(
           claims.company_id,
           claims.run_id,
-          body.text,
+          tail,
         );
         const logs = sanitizeGitHubDiagnosticText(
-          body.truncated ? dropTrailingPartialToken(registeredRedactions) : registeredRedactions,
+          registeredRedactions,
           credential.token ? [credential.token] : [],
           { truncated: body.truncated },
         );
