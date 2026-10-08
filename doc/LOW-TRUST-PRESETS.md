@@ -52,6 +52,23 @@ their own review issue (`done` — the verdict is the deliverable; the
 system-attributed stop-only relay when they enter `blocked` or `cancelled`.
 Never instruct a contained delegate to comment on its parent issue.
 
+## Closing a Blocked Low-Trust Card
+
+Moving a card out of `blocked` needs explicit resume authority, which a
+low-trust card denies. Terminal-run recovery parks a failed low-trust review
+card in `blocked`, so the one transition below is allowed through
+`PATCH /issues/:id`:
+
+- the actor is an agent **and** the card's current assignee;
+- the card is `blocked` and the target status is `done` or `cancelled`.
+
+Everything else out of `blocked` stays denied for a low-trust actor: any other
+target status, `reopen`, `resume`, `blockedByIssueIds`, and any card the actor
+is not assigned to. The remaining resume checks (pause hold, unresolved
+blockers) still apply, and an invalid trust policy still fails closed. This adds
+no capability: a low-trust assignee can already move an `in_progress` card to
+`done`.
+
 ## Runtime Containment
 
 Managed `low_trust_review` runs fail closed unless Paperclip can enforce the

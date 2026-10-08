@@ -2,7 +2,7 @@
 /**
  * run-quality-gates.mjs
  * Orchestrates all quality gates. Fetches PR data once, runs all gates,
- * posts or updates a single consolidated comment via commitperclip.
+ * and posts or updates one consolidated comment unless --no-comment is set.
  *
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH
  * Exit: 0 if all quality gates pass, 1 if any fail.
@@ -82,6 +82,25 @@ async function upsertComment(token, repo, prNumber, body, existing) {
   }
 }
 
+export async function publishQualityGateComment({
+  noComment = false,
+  fetchFromGitHub = ghFetch,
+  postComment = upsertComment,
+  token,
+  repo,
+  prNumber,
+  author,
+  failures,
+  informational,
+}) {
+  if (noComment) return;
+
+  const existing = await findExistingComment(fetchFromGitHub, token, repo, prNumber);
+  if (failures.length > 0 || informational.length > 0 || existing) {
+    await postComment(token, repo, prNumber, buildComment(author, failures, informational), existing);
+  }
+}
+
 async function main() {
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
 
@@ -150,13 +169,15 @@ async function main() {
   ];
   const allPassed = allFailures.length === 0;
 
-  const commentBody = buildComment(author, allFailures, informational);
-
-  // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
-  if (allFailures.length > 0 || informational.length > 0 || existing) {
-    await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
-  }
+  await publishQualityGateComment({
+    noComment: process.argv.includes('--no-comment'),
+    token: GH_TOKEN,
+    repo: GH_REPO,
+    prNumber,
+    author,
+    failures: allFailures,
+    informational,
+  });
 
   console.log(JSON.stringify({ passed: allPassed, failures: allFailures, informational }));
   process.exit(allPassed ? 0 : 1);
