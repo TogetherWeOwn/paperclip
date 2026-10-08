@@ -170,6 +170,11 @@ export interface AdapterRuntimeMcpAccess {
 }
 
 export type AdapterRuntimeToolDelivery = "native_mcp" | "environment" | "invocation_context";
+export type AdapterRuntimeToolName =
+  | "connections_search"
+  | "connection_request"
+  | "github_actions_job_logs"
+  | "github_repository_webhooks";
 
 export interface AdapterRuntimeToolAccess {
   version: 1;
@@ -182,7 +187,7 @@ export interface AdapterRuntimeToolAccess {
   };
   bearerToken: string;
   expiresAt: string;
-  tools: readonly ["connections_search", "connection_request"];
+  tools: readonly AdapterRuntimeToolName[];
 }
 
 export interface AdapterRuntimeEvent {

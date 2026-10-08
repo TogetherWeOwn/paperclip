@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CONNECTION_REQUEST_TOOL_DESCRIPTION,
-  CONNECTION_RUNTIME_TOOL_NAMES,
   CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
+  RUNTIME_TOOL_NAMES,
 } from "@paperclipai/shared";
 import {
   RUNTIME_CONNECTION_TOOL_DEFINITIONS,
@@ -10,10 +10,10 @@ import {
 } from "./connection-intents.js";
 
 describe("runtime connection MCP contract", () => {
-  it("advertises both canonical tools with the shared descriptions and narrow schemas", () => {
+  it("advertises all canonical runtime tools with narrow schemas", () => {
     expect(
       RUNTIME_CONNECTION_TOOL_DEFINITIONS.map((tool) => tool.name),
-    ).toEqual(CONNECTION_RUNTIME_TOOL_NAMES);
+    ).toEqual(RUNTIME_TOOL_NAMES);
     expect(RUNTIME_CONNECTION_TOOL_DEFINITIONS).toEqual([
       {
         name: "connections_search",
@@ -44,6 +44,33 @@ describe("runtime connection MCP contract", () => {
             },
           },
           required: ["service"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "github_actions_job_logs",
+        description:
+          "Read bounded, sanitized Actions job logs from a server-pinned repository. Only an immutable repositoryId and positive numeric jobId are accepted; no owner, repository name, URL, path, or method can be supplied. GitHub credentials stay server-side.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repositoryId: { type: "string", enum: ["1396224242", "1396224001", "1319564297"] },
+            jobId: { type: "string", pattern: "^[1-9][0-9]{0,19}$" },
+          },
+          required: ["repositoryId", "jobId"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "github_repository_webhooks",
+        description:
+          "List sanitized webhook metadata for a server-pinned repository. Only an immutable repositoryId is accepted; URLs, webhook configuration secrets, owner, repository name, paths, and methods are never returned or caller-selected.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repositoryId: { type: "string", enum: ["1396224242", "1396224001", "1319564297"] },
+          },
+          required: ["repositoryId"],
           additionalProperties: false,
         },
       },

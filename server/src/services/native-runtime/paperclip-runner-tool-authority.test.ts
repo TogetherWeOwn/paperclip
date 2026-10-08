@@ -91,7 +91,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(27);
+    expect(authority.definitions()).toHaveLength(29);
     const questions = authority.definitions().find(tool => tool.name === "request_human_input")!;
     expect(questions.description).toContain("ask only the next unanswered question");
     expect(questions.description).toContain("Never infer answers");
@@ -102,7 +102,10 @@ describe("PaperclipRunnerToolAuthority", () => {
     expect(authority.definitions().map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
         "connections_search",
-        "connection_request", "create_project", "list_project_repositories", "list_projects",
+        "connection_request",
+        "github_actions_job_logs",
+        "github_repository_webhooks",
+        "create_project", "list_project_repositories", "list_projects",
         "get_task_context",
         "get_task_history",
         "search_tasks",
