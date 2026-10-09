@@ -502,7 +502,12 @@ async function probeRemoteDirSize(input: {
   const script = [
     `cd ${shellQuote(input.remoteDir)} 2>/dev/null || exit 0`,
     `size=$(du -sk ${gnuFlags} . 2>/dev/null | cut -f1)`,
-    `if [ -n "$size" ]; then echo "x $size"; exit 0; fi`,
+    // tar streams a sparse file as zeros, so the restore writes its apparent size.
+    `if [ -n "$size" ]; then`,
+    `  apparent=$(du -sk --apparent-size ${gnuFlags} . 2>/dev/null | cut -f1)`,
+    `  if [ -n "$apparent" ] && [ "$apparent" -gt "$size" ]; then size=$apparent; fi`,
+    `  echo "x $size"; exit 0`,
+    `fi`,
     `size=$(du -sk ${bsdFlags} . 2>/dev/null | cut -f1)`,
     `if [ -n "$size" ]; then echo "${bsdExcludeAware ? "x" : "p"} $size"; exit 0; fi`,
     `size=$(du -sk . 2>/dev/null | cut -f1)`,
@@ -519,9 +524,10 @@ async function probeRemoteDirSize(input: {
   }
 }
 
-// Peak staging usage is one copy of the restored tree; the 2x factor leaves
-// room for `du` under-counting and for the merge into the workspace.
-const STAGING_SPACE_FACTOR = 2;
+// Peak staging usage is one copy of the restored tree. The 2x factor in the
+// issue becomes "every tree plus the largest": each merge can add a full copy
+// to a workspace that shares the temp volume, and the next tree stages on top.
+// For a single tree that is exactly 2x.
 const STAGING_SPACE_ERROR_CODE = "ssh_sync_insufficient_staging_space";
 
 function formatGiB(bytes: number): string {
@@ -530,15 +536,18 @@ function formatGiB(bytes: number): string {
 
 // Refuses the restore before anything is written when the temp volume cannot
 // hold the staged copy, instead of failing mid-extract with ENOSPC and leaving
-// a half-filled disk. Skipped when the estimate is unavailable or still counts
-// excluded paths, so an uncertain figure never blocks a restore that would fit.
-async function assertStagingSpace(estimate: RemoteDirSizeEstimate | null): Promise<void> {
-  if (!estimate?.excludeAware) {
+// a half-filled disk. Trees whose size is unavailable, or still counts excluded
+// paths, are left out of the sum with a warning, so an uncertain figure never
+// blocks a restore that would fit.
+async function assertStagingSpace(estimates: ReadonlyArray<RemoteDirSizeEstimate | null>): Promise<void> {
+  const known = estimates.filter((estimate): estimate is RemoteDirSizeEstimate => estimate?.excludeAware === true);
+  if (known.length < estimates.length) {
     console.warn(
-      "[paperclip] Skipping the SSH restore free-space check: the remote size of the restored files is unavailable.",
+      `[paperclip] The SSH restore free-space check skips ${estimates.length - known.length} of ${estimates.length} ` +
+        "sizes: the remote cannot report a size that leaves out the excluded paths.",
     );
-    return;
   }
+  if (known.length === 0) return;
   const stagingRoot = os.tmpdir();
   let freeBytes: number;
   try {
@@ -548,12 +557,13 @@ async function assertStagingSpace(estimate: RemoteDirSizeEstimate | null): Promi
     console.warn(`[paperclip] Skipping the SSH restore free-space check: cannot read the free space of ${stagingRoot}.`);
     return;
   }
-  const requiredBytes = estimate.bytes * STAGING_SPACE_FACTOR;
+  const totalBytes = known.reduce((sum, estimate) => sum + estimate.bytes, 0);
+  const requiredBytes = totalBytes + Math.max(...known.map((estimate) => estimate.bytes));
   if (freeBytes >= requiredBytes) return;
   throw Object.assign(
     new Error(
       `Not enough free space in ${stagingRoot} to restore the workspace from SSH: ` +
-        `${formatGiB(estimate.bytes)} to restore (${formatGiB(requiredBytes)} required), ` +
+        `${formatGiB(totalBytes)} to restore (${formatGiB(requiredBytes)} required), ` +
         `${formatGiB(freeBytes)} free. Free up space or point TMPDIR at a larger volume.`,
     ),
     { code: STAGING_SPACE_ERROR_CODE },
@@ -1763,7 +1773,7 @@ export async function syncDirectoryFromSsh(input: {
     remoteDir: input.remoteDir,
     exclude: input.exclude,
   });
-  await assertStagingSpace(remoteSize);
+  await assertStagingSpace([remoteSize]);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   try {
     await extractDirectoryFromSsh({
@@ -1885,8 +1895,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
     throw new Error(`Workspace baseline must exclude ${PROJECT_REPOSITORIES_DIR} when project repositories are restored separately`);
   }
   // Probe every baseline tree before the first write, so a restore that cannot
-  // fit is refused whole instead of stopping half-applied. The trees stage one
-  // at a time, so the largest one decides how much temp space the restore needs.
+  // fit is refused whole instead of stopping half-applied. With git history, the
+  // bundle of each tree is downloaded to the temp directory too; the remote
+  // `.git` size bounds it.
   const remoteSizes = new Map<string, RemoteDirSizeEstimate | null>();
   if (input.baselineSnapshot) {
     const trees = [
@@ -1896,14 +1907,14 @@ export async function restoreWorkspaceFromSshExecution(input: {
       })),
       { remoteDir, exclude: input.baselineSnapshot.exclude },
     ];
-    const estimates = await Promise.all(
-      trees.map((tree) => probeRemoteDirSize({ spec: input.spec, remoteDir: tree.remoteDir, exclude: tree.exclude })),
-    );
-    trees.forEach((tree, index) => remoteSizes.set(tree.remoteDir, estimates[index]));
-    const aware = estimates.filter((estimate): estimate is RemoteDirSizeEstimate => estimate?.excludeAware === true);
-    await assertStagingSpace(
-      aware.length > 0 ? aware.reduce((largest, next) => (next.bytes > largest.bytes ? next : largest)) : null,
-    );
+    const [fileEstimates, historyEstimates] = await Promise.all([
+      Promise.all(trees.map((tree) => probeRemoteDirSize({ spec: input.spec, remoteDir: tree.remoteDir, exclude: tree.exclude }))),
+      Promise.all(trees.map((tree) => input.restoreGitHistory
+        ? probeRemoteDirSize({ spec: input.spec, remoteDir: path.posix.join(tree.remoteDir, ".git") })
+        : undefined)),
+    ]);
+    trees.forEach((tree, index) => remoteSizes.set(tree.remoteDir, fileEstimates[index]));
+    await assertStagingSpace([...fileEstimates, ...historyEstimates.filter((estimate) => estimate !== undefined)]);
   }
   for (const repository of repositories) {
     const repositoryRemoteDir = path.posix.join(remoteDir, repository.path);
@@ -1977,6 +1988,10 @@ async function restoreWorkspaceRootFromSsh(input: {
         baseline: input.baselineSnapshot,
         sourceDir: stagingDir,
         targetDir: input.localDir,
+        // Local nested worktrees are not in the staged tree. A remote that
+        // replaces their parent must not delete them.
+        protectedPatterns: resolveNestedWorktreeExcludes(input).filter((pattern) =>
+          input.baselineSnapshot?.exclude.includes(pattern)),
         // Git history advances via integrateImportedGitHead; the working tree
         // still comes from the remote file snapshot so dirty remote edits win.
         beforeApply: importedHead

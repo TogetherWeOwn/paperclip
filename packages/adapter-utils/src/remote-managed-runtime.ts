@@ -204,6 +204,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        nestedWorktreeDirs: input.nestedWorktreeDirs,
         onProgress: input.onProgress,
         repositories: repositoryBaselines,
       });
@@ -273,6 +274,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          nestedWorktreeDirs: input.nestedWorktreeDirs,
           onProgress,
           repositories: repositoryBaselines,
         });
