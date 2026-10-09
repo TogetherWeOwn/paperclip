@@ -377,6 +377,62 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(await suggestGrants()).toHaveLength(1);
   }, 20_000);
 
+  it("refuses an agent enable that would overwrite a board-issued grant", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const steward = await insertAgentMembership(db, company.id, "Overwrite steward");
+    const target = await insertAgentMembership(db, company.id, "Overwrite target");
+    const stewardReport = await insertAgentMembership(db, company.id, "Overwrite report");
+    await db.update(agents).set({ reportsTo: steward.agent.id }).where(eq(agents.id, stewardReport.agent.id));
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: steward.agent.id,
+      permissionKey: "users:manage_permissions",
+      scope: null,
+      grantedByUserId: owner.principalId,
+    });
+    const app = await createAgentApp(db, company.id, steward.agent.id);
+    const boardApp = await createApp(db, company.id, owner.principalId);
+    const route = (membershipId: string) =>
+      `/api/companies/${company.id}/members/${membershipId}/permissions/agents:suggest-changes`;
+    const suggestGrants = () => db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"));
+    const narrowOverwrite = { enabled: true, scope: { managedSubtreeAgentIds: [stewardReport.agent.id] } };
+
+    const boardUnscoped = await request(boardApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: null });
+    expect(boardUnscoped.status, JSON.stringify(boardUnscoped.body)).toBe(200);
+
+    const overwriteUnscoped = await request(app).patch(route(target.membership.id)).send(narrowOverwrite);
+    expect(overwriteUnscoped.status, JSON.stringify(overwriteUnscoped.body)).toBe(403);
+    expect(await suggestGrants()).toEqual([
+      expect.objectContaining({
+        principalId: target.agent.id,
+        scope: null,
+        grantedByUserId: owner.principalId,
+      }),
+    ]);
+
+    const revokeAfterFailedOverwrite = await request(app).patch(route(target.membership.id))
+      .send({ enabled: false });
+    expect(revokeAfterFailedOverwrite.status, JSON.stringify(revokeAfterFailedOverwrite.body)).toBe(403);
+    expect(await suggestGrants()).toHaveLength(1);
+
+    const boardScoped = await request(boardApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [target.agent.id] } });
+    expect(boardScoped.status, JSON.stringify(boardScoped.body)).toBe(200);
+
+    const overwriteScoped = await request(app).patch(route(target.membership.id)).send(narrowOverwrite);
+    expect(overwriteScoped.status, JSON.stringify(overwriteScoped.body)).toBe(403);
+    expect(await suggestGrants()).toEqual([
+      expect.objectContaining({
+        principalId: target.agent.id,
+        scope: { managedSubtreeAgentIds: [target.agent.id] },
+        grantedByUserId: owner.principalId,
+      }),
+    ]);
+  }, 20_000);
+
   it("rejects the targeted grant route for human memberships", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({
