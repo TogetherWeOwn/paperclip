@@ -429,6 +429,14 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
   });
 
+  it.each([
+    "run cancelled before issue reassignment", "run cancelled before issue terminalization",
+    "run interrupted by board comment", "source run cancelled for isolated external-chat answer continuation",
+  ])("admits a never-started legacy run cancelled with the server note %s", async eventMessage => {
+    const f = await seedNeverStartedLegacy(1, { eventMessage });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
   it("admits a started run whose remaining hold is covered by accepted reconciliations, once", async () => {
     const f = await seedNeverStartedLegacy(3);
     await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:59:00Z") }).where(eq(heartbeatRuns.id, f.sourceRunId));
@@ -454,6 +462,18 @@ const support = await getEmbeddedPostgresTestSupport();
   it("does not treat a cancellation note that carries a launch status as cancelled before launch", async () => {
     const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled", eventPayload: { status: "running" } });
     expect(await admit(f)).toBeNull();
+  });
+
+  it("retains a never-started hold while its local environment lease is pending cleanup", async () => {
+    const f = await seedNeverStartedLegacy();
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, heartbeatRunId: f.sourceRunId,
+      provider: "local", status: "pending_cleanup", leasePolicy: "ephemeral", releasedAt: new Date(), cleanupStatus: null });
+    try {
+      expect(await admit(f)).toBeNull();
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    }
   });
 
   it.each([{ recoveryCount: 1 }, { recoveryCount: 5 }])(
