@@ -961,6 +961,13 @@ function makeMessage(input: {
   } as unknown as Message;
 }
 
+function countMatches(texts: string[], pattern: RegExp): number {
+  return texts.reduce(
+    (total, text) => total + (text.match(pattern)?.length ?? 0),
+    0,
+  );
+}
+
 function boardActor(companyId: string, userId = "owner-user") {
   return {
     type: "board" as const,
@@ -26645,6 +26652,141 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.processPendingPublications();
     expect(providerRuntime.posts).toHaveLength(4);
     expect(providerRuntime.edits).toHaveLength(2);
+  });
+
+  it("keeps a GitHub run's final comment free of its Board link and tracker id", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredGitHubEndpoint(fixture);
+    const thread = makeThread({
+      channelId: "github:paperclipai/paperclip",
+      id: "github:paperclipai/paperclip:issue:418",
+      name: "paperclipai/paperclip",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({
+        id: "41801",
+        text: "@maya summarize the change",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    const [issue] = await db
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.id, conversation.issueId));
+    const prefix = issue.identifier.slice(0, issue.identifier.lastIndexOf("-"));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "github",
+        providerMessageId: "41801",
+      }),
+    });
+    await addSelectedChatFinal({
+      agentId: fixture.assignedAgentId,
+      body: `Done. Details: https://paperclip.example/${prefix}/issues/${issue.identifier} (${issue.identifier}).`,
+      companyId: fixture.companyId,
+      issueId: conversation.issueId,
+      runId,
+    });
+    await service.processPendingPublications();
+
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    const delivered = [
+      ...(providerRuntime?.posts ?? []).map((post) => post.text),
+      ...(providerRuntime?.edits ?? []).map((edit) => edit.text),
+    ];
+    expect(delivered.join("\n")).toContain("Done.");
+    expect(countMatches(delivered, /paperclip\.example/g)).toBe(0);
+    expect(
+      countMatches(delivered, new RegExp(`\\b${prefix}-\\d+\\b`, "g")),
+    ).toBe(0);
+  });
+
+  it("keeps a GitHub progress notice that names its task free of its Board link and tracker id", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredGitHubEndpoint(fixture);
+    const thread = makeThread({
+      channelId: "github:paperclipai/paperclip",
+      id: "github:paperclipai/paperclip:issue:419",
+      name: "paperclipai/paperclip",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({
+        id: "41901",
+        text: "@maya track this change",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    const [issue] = await db
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.id, conversation.issueId));
+    const prefix = issue.identifier.slice(0, issue.identifier.lastIndexOf("-"));
+    const title = `Follow ${issue.identifier} at https://paperclip.example/${prefix}/issues/${issue.identifier}`;
+    await db.update(issues).set({ title }).where(eq(issues.id, conversation.issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "github",
+        providerMessageId: "41901",
+      }),
+    });
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `run:${runId}:working:${endpoint.id}`,
+      payload: {
+        text: `${issue.identifier}: ${title} — in progress`,
+        progressState: "working",
+      },
+      state: "pending",
+    });
+    await service.processPendingPublications();
+
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    const delivered = [
+      ...(providerRuntime?.posts ?? []).map((post) => post.text),
+      ...(providerRuntime?.edits ?? []).map((edit) => edit.text),
+    ];
+    expect(delivered.join("\n")).toContain("in progress");
+    expect(countMatches(delivered, /paperclip\.example/g)).toBe(0);
+    expect(
+      countMatches(delivered, new RegExp(`\\b${prefix}-\\d+\\b`, "g")),
+    ).toBe(0);
   });
 
   describe("Telegram callback-only native private responses", () => {
