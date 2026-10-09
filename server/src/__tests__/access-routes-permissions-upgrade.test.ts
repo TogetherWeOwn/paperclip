@@ -33,20 +33,34 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 type Db = ReturnType<typeof createDb>;
 
 async function createApp(db: Db, companyId: string, userId: string) {
+  return createAppForActor(db, {
+    type: "board",
+    userId,
+    source: "local_implicit",
+    companyIds: [companyId],
+    memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+    isInstanceAdmin: true,
+  });
+}
+
+async function createAgentApp(db: Db, companyId: string, agentId: string) {
+  return createAppForActor(db, {
+    type: "agent",
+    agentId,
+    companyId,
+    runId: null,
+    source: "agent_key",
+  });
+}
+
+async function createAppForActor(db: Db, actor: Record<string, unknown>) {
   process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
   process.env.PAPERCLIP_IN_WORKTREE = "false";
   const { accessRoutes } = await import("../routes/access.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = {
-      type: "board",
-      userId,
-      source: "local_implicit",
-      companyIds: [companyId],
-      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
-      isInstanceAdmin: true,
-    };
+    req.actor = actor as any;
     next();
   });
   app.use("/api", accessRoutes(db, {
@@ -82,6 +96,24 @@ async function createCompanyWithOwner(db: Db) {
     .returning()
     .then((rows) => rows[0]!);
   return { company, owner };
+}
+
+async function insertAgentMembership(db: Db, companyId: string, name: string) {
+  const agent = await db.insert(agents).values({
+    companyId,
+    name,
+    role: "manager",
+    adapterType: "process",
+    adapterConfig: {},
+  }).returning().then((rows) => rows[0]!);
+  const membership = await db.insert(companyMemberships).values({
+    companyId,
+    principalType: "agent",
+    principalId: agent.id,
+    status: "active",
+    membershipRole: "member",
+  }).returning().then((rows) => rows[0]!);
+  return { agent, membership };
 }
 
 describeEmbeddedPostgres("access routes permissions upgrade compatibility", () => {
@@ -233,6 +265,49 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     ]);
     expect(await db.select().from(companyMemberships).where(eq(companyMemberships.id, membership.id)))
       .toEqual([expect.objectContaining({ status: "active", membershipRole: "member" })]);
+  });
+
+  it("lets an agent steward delegate only narrow grants to a peer, never to itself", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const steward = await insertAgentMembership(db, company.id, "Grant steward");
+    const target = await insertAgentMembership(db, company.id, "Grant target");
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: steward.agent.id,
+      permissionKey: "users:manage_permissions",
+      scope: null,
+      grantedByUserId: owner.principalId,
+    });
+    const app = await createAgentApp(db, company.id, steward.agent.id);
+    const route = (membershipId: string) =>
+      `/api/companies/${company.id}/members/${membershipId}/permissions/agents:suggest-changes`;
+    const suggestGrants = () => db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"));
+
+    const selfGrant = await request(app)
+      .patch(route(steward.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [steward.agent.id] } });
+    const unscopedPeerGrant = await request(app).patch(route(target.membership.id)).send({ enabled: true });
+    const emptyScopePeerGrant = await request(app)
+      .patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [] } });
+
+    expect(selfGrant.status, JSON.stringify(selfGrant.body)).toBe(403);
+    expect(unscopedPeerGrant.status, JSON.stringify(unscopedPeerGrant.body)).toBe(403);
+    expect(emptyScopePeerGrant.status, JSON.stringify(emptyScopePeerGrant.body)).toBe(403);
+    expect(await suggestGrants()).toEqual([]);
+
+    const scope = { managedSubtreeAgentIds: [steward.agent.id] };
+    const scopedPeerGrant = await request(app).patch(route(target.membership.id)).send({ enabled: true, scope });
+    expect(scopedPeerGrant.status, JSON.stringify(scopedPeerGrant.body)).toBe(200);
+    expect(await suggestGrants()).toEqual([
+      expect.objectContaining({ principalId: target.agent.id, scope }),
+    ]);
+
+    const revoke = await request(app).patch(route(target.membership.id)).send({ enabled: false });
+    expect(revoke.status, JSON.stringify(revoke.body)).toBe(200);
+    expect(await suggestGrants()).toEqual([]);
   });
 
   it("rejects the targeted grant route for human memberships", async () => {
