@@ -299,6 +299,32 @@ describe("detectClaudeLoginRequired login prompt scope", () => {
     });
     expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
   });
+
+  it("does not take the login URL from an echoed user event", () => {
+    const stdout = [
+      streamEvent({
+        type: "user",
+        message: { content: [{ type: "text", text: "Open https://claude.ai/login to switch accounts." }] },
+      }),
+      streamEvent(SUCCESSFUL_RESULT),
+    ].join("\n");
+    expect(detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" })).toEqual({
+      requiresLogin: false,
+      loginUrl: null,
+    });
+  });
+
+  it("takes the login URL from an authentication_failed message", () => {
+    const stdout = streamEvent({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Not logged in · Please run /login: https://claude.ai/login" }] },
+      error: "authentication_failed",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" })).toEqual({
+      requiresLogin: true,
+      loginUrl: "https://claude.ai/login",
+    });
+  });
 });
 
 describe("isClaudeModelNotFoundError", () => {

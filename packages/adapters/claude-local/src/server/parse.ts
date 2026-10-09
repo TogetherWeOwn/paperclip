@@ -9,7 +9,7 @@ import {
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
 // asks the user to log in. The detector matches them only against login
-// evidence, see collectClaudeLoginPromptLines.
+// evidence, see collectClaudeLoginEvidenceLines.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -229,7 +229,7 @@ function claudeFailureEventTexts(event: Record<string, unknown>): string[] {
   ];
 }
 
-function collectClaudeLoginPromptLines(input: {
+function collectClaudeLoginEvidenceLines(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
@@ -260,11 +260,12 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const loginPrompt = collectClaudeLoginPromptLines({
+  const evidenceLines = collectClaudeLoginEvidenceLines({
     parsed,
     stdout: input.stdout,
     stderr: input.stderr,
-  }).some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
+  });
+  const loginPrompt = evidenceLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
 
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
@@ -276,7 +277,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl(evidenceLines.join("\n")),
   };
 }
 
