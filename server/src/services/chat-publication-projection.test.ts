@@ -320,6 +320,38 @@ describe("scrubInternalReferences", () => {
     expect(scrubInternalReferences(text, scope)).toBe(text);
   });
 
+  it("leaves loopback addresses in ordinary technical text unchanged", () => {
+    const text =
+      "Postgres listens on 127.0.0.1:5432, `curl localhost:3000/health`, and [::1]:3100 is IPv6 loopback.";
+    expect(
+      scrubInternalReferences(text, {
+        internalOrigins: [
+          "http://127.0.0.1:3100",
+          "http://localhost:3000",
+          "http://[::1]:3100",
+        ],
+        trackerPrefixes: [],
+      }),
+    ).toBe(text);
+  });
+
+  it("keeps an internal host that is a path segment of an external link", () => {
+    const text =
+      "See https://github.com/o/r/blob/main/board.example.invalid/x.md and [the file](https://github.com/o/r/blob/main/board.example.invalid/x.md).";
+    expect(scrubInternalReferences(text, scope)).toBe(text);
+  });
+
+  it("still removes internal hosts after an email sign, an ssh remote, or a protocol-relative slash", () => {
+    expect(
+      scrubInternalReferences(
+        "Mail ops@board.example.invalid, clone git@board.example.invalid:o/r.git, or open //board.example.invalid/x",
+        scope,
+      ),
+    ).toBe(
+      "Mail ops@[internal link removed], clone git@[internal link removed]:o/r.git, or open //[internal link removed]",
+    );
+  });
+
   it("matches the company prefix case-sensitively", () => {
     expect(
       scrubInternalReferences("utf-8 UTF-8", {

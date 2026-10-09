@@ -330,13 +330,18 @@ function isInternalUrl(candidate: string, hosts: ReadonlySet<string>): boolean {
   return hostname !== null && hosts.has(hostname);
 }
 
+const LOOPBACK_HOSTNAME_RE =
+  /^(?:localhost|[a-z0-9-]+\.localhost|127(?:\.\d{1,3}){3}|\[::1\])$/;
+
 function bareInternalHostPattern(hosts: ReadonlySet<string>): RegExp | null {
   const alternatives = [...hosts]
+    .filter((host) => !LOOPBACK_HOSTNAME_RE.test(host))
     .sort((a, b) => b.length - a.length)
     .map((host) => host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  // A host right after a path slash is a segment of another URL, not a link to it.
   return alternatives.length
     ? new RegExp(
-        `(?<![A-Za-z0-9.-])(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
+        `(?<![A-Za-z0-9.-])(?<![^/]/)(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
         "gi",
       )
     : null;
