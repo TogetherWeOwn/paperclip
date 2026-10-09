@@ -43,6 +43,11 @@ async function git(cwd: string, args: string[]): Promise<void> {
   await execFileAsync("git", ["-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.com", ...args]);
 }
 
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args]);
+  return stdout.trim();
+}
+
 async function exists(target: string): Promise<boolean> {
   return await stat(target).then(() => true, () => false);
 }
@@ -351,6 +356,33 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     await expect(prepared.restoreWorkspace()).rejects.toMatchObject({ code: "workspace_restore_protected_children" });
 
     // The merge refuses before it applies anything.
+    expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
+    expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("local\n");
+    expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
+  });
+
+  it("refuses a protected parent replacement before the local branch advances", async () => {
+    await writeTree(localDir, { "packages/a/x.ts": "local\n", "other.txt": "local\n" });
+    await git(localDir, ["init", "-q", "-b", "main"]);
+    await git(localDir, ["add", "-A"]);
+    await git(localDir, ["commit", "-q", "-m", "init"]);
+    // Untracked, so only the protection check stands between it and the merge.
+    await writeTree(localDir, { "packages/a/.claude/worktrees/wt/f.txt": "local worktree\n" });
+    const initialHead = await gitOutput(localDir, ["rev-parse", "main"]);
+    const prepared = await prepare();
+    const remote = prepared.workspaceRemoteDir;
+
+    // The remote run commits, and replaces the directory that holds the worktree.
+    await rm(path.join(remote, "packages/a"), { recursive: true });
+    await writeFile(path.join(remote, "packages/a"), "now a file\n");
+    await writeFile(path.join(remote, "other.txt"), "remote\n");
+    await git(remote, ["add", "-A"]);
+    await git(remote, ["commit", "-q", "-m", "remote work"]);
+
+    await expect(prepared.restoreWorkspace()).rejects.toMatchObject({ code: "workspace_restore_protected_children" });
+
+    // A refused restore leaves the checkout exactly as it was: same branch tip, same files.
+    expect(await gitOutput(localDir, ["rev-parse", "main"])).toBe(initialHead);
     expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
     expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("local\n");
     expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
