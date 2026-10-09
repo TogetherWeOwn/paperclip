@@ -280,7 +280,23 @@ export interface InternalReferenceScope {
 
 const INTERNAL_LINK_REMOVED = "[internal link removed]";
 const INTERNAL_REFERENCE = "[internal reference]";
-const TRAILING_URL_PUNCTUATION_RE = /[.,;:!?)\]]+$/;
+const TRAILING_URL_PUNCTUATION = new Set([
+  ".",
+  ",",
+  ";",
+  ":",
+  "!",
+  "?",
+  ")",
+  "]",
+]);
+
+function splitTrailingUrlPunctuation(match: string): [string, string] {
+  let end = match.length;
+  while (end > 0 && TRAILING_URL_PUNCTUATION.has(match.charAt(end - 1)))
+    end -= 1;
+  return [match.slice(0, end), match.slice(end)];
+}
 
 function hostnameOf(candidate: string): string | null {
   try {
@@ -296,7 +312,11 @@ function hostnameOf(candidate: string): string | null {
 function internalHostnames(origins: readonly string[]): Set<string> {
   const hosts = new Set<string>();
   for (const origin of origins) {
-    const hostname = hostnameOf(origin.trim());
+    const value = origin.trim();
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+      ? value
+      : `https://${value}`;
+    const hostname = hostnameOf(withScheme);
     if (hostname) hosts.add(hostname);
   }
   return hosts;
@@ -340,8 +360,7 @@ export function scrubInternalReferences(
     isInternalUrl(href, hosts) ? INTERNAL_LINK_REMOVED : match,
   );
   output = output.replace(PLAIN_HTTP_URL_RE, (match) => {
-    const trailing = match.match(TRAILING_URL_PUNCTUATION_RE)?.[0] ?? "";
-    const candidate = trailing ? match.slice(0, -trailing.length) : match;
+    const [candidate, trailing] = splitTrailingUrlPunctuation(match);
     return isInternalUrl(candidate, hosts)
       ? `${INTERNAL_LINK_REMOVED}${trailing}`
       : match;

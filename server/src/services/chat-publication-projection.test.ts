@@ -261,6 +261,22 @@ describe("scrubInternalReferences", () => {
     ).toBe("Open [internal link removed]");
   });
 
+  it("accepts an internal origin configured without a scheme", () => {
+    expect(
+      scrubInternalReferences("Open https://board.example.invalid/x now.", {
+        internalOrigins: ["board.example.invalid"],
+        trackerPrefixes: [],
+      }),
+    ).toBe("Open [internal link removed] now.");
+  });
+
+  it("scans a long trailing punctuation run in linear time", () => {
+    const text = `https://board.example.invalid/x${"!".repeat(200_000)}x`;
+    expect(scrubInternalReferences(text, scope)).toBe(
+      "[internal link removed]",
+    );
+  });
+
   it("rescans link labels for internal URLs and tracker ids", () => {
     expect(
       scrubInternalReferences(
