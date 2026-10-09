@@ -40955,7 +40955,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(callbacks.onReaction).toBeTypeOf("function");
   });
 
-  it("publishes GitHub questions as link-only cards with no executable callback", async () => {
+  it("publishes GitHub questions as cards without task links or executable callbacks", async () => {
     const fixture = await seedCompany();
     const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
     process.env.PAPERCLIP_PUBLIC_URL = "https://paperclip.example";
@@ -41024,15 +41024,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "published",
         payload: {
           interactionId: interaction.id,
-          card: {
-            actions: [
-              {
-                type: "link",
-                label: "Open in Paperclip",
-                url: `https://paperclip.example/issues/${conversation!.issueId}`,
-              },
-            ],
-          },
+          card: expect.not.objectContaining({ actions: expect.anything() }),
         },
       });
       expect(callbacks.onAction).toBeUndefined();
@@ -41049,7 +41041,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).toHaveLength(0);
       expect(
         JSON.stringify(runtime.endpoints.get(endpoint.id)?.posts),
-      ).toContain(`https://paperclip.example/issues/${conversation!.issueId}`);
+      ).not.toContain(`https://paperclip.example/issues/${conversation!.issueId}`);
     } finally {
       if (previousPublicUrl === undefined)
         delete process.env.PAPERCLIP_PUBLIC_URL;
@@ -41166,14 +41158,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         payload: {
           interactionId: interaction.id,
           progressState: "waiting_for_input",
-          card: {
-            actions: [
-              expect.objectContaining({
-                label: "Open in Paperclip",
-                type: "link",
-              }),
-            ],
-          },
+          card: expect.not.objectContaining({ actions: expect.anything() }),
         },
       });
 
@@ -41432,8 +41417,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     for (const testCase of [
       {
         publicBaseUrl: "https://board.paperclip.example",
-        expectedFallback: (issueId: string) =>
-          `File saved on the Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments. Download it: https://board.paperclip.example/issues/${issueId}`,
+        expectedFallback: () =>
+          "File saved on the private Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments.",
       },
       {
         publicBaseUrl: "http://127.0.0.1:3103",
@@ -41521,11 +41506,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).toBe(true);
       expect(posts.every((post) => post.files === undefined)).toBe(true);
       expect(storage.storage.getObject).not.toHaveBeenCalled();
-      if (testCase.publicBaseUrl.startsWith("http://127.0.0.1")) {
-        expect(
-          posts.every((post) => !post.text.includes(testCase.publicBaseUrl)),
-        ).toBe(true);
-      }
+      expect(
+        posts.every((post) => !post.text.includes(testCase.publicBaseUrl)),
+      ).toBe(true);
       await service.shutdown();
     }
   });
@@ -59345,7 +59328,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           {
             threadId: context.thread.thread.id,
             messageId: "outbound-1",
-            text: "Maya is making progress…",
+            text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
           },
         ]);
         expect(
@@ -59367,7 +59350,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect.objectContaining({
             idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:making_progress:1`,
             payload: {
-              text: "Maya is making progress…",
+              text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
               progressState: "working",
             },
             providerMessageId: "outbound-1",
@@ -59451,7 +59434,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           {
             threadId: context.thread.thread.id,
             messageId: "outbound-1",
-            text: "Maya is making progress…",
+            text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
           },
         ]);
         const publications = await db
@@ -64994,7 +64977,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   }
 
-  it("adds a durable safe task link to the exact GitHub native omission final", async () => {
+  it("posts the GitHub native omission final without a Board link", async () => {
     const context = await githubOmissionFixture();
     try {
       expect(context.action.payload.attachmentOmissionReasons).toEqual({
@@ -65003,8 +64986,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(context.egress).toHaveBeenCalledTimes(1);
       await expect(context.repair()).resolves.toBe(true);
       await context.service.processPendingPublications(100);
-      const taskUrl = `https://paperclip.example/issues/${context.issue.id}`;
-      const expected = `${context.result.summary}\n\n[Open this Paperclip task](${taskUrl})`;
+      const expected = context.result.summary;
       expect(context.providerRuntime.posts.map((post) => post.text)).toEqual([
         expected,
       ]);
@@ -65036,17 +65018,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   });
 
   it.each([
-    { base: null, expected: null },
-    { base: "http://127.0.0.1:3137", expected: null },
-    { base: "https://user:secret@board.example", expected: null },
-    { base: "https://10.0.0.1", expected: null },
-    {
-      base: "https://board.example/prefix?token=PRIVATE#fragment",
-      expected: "https://board.example",
-    },
+    null,
+    "http://127.0.0.1:3137",
+    "https://user:secret@board.example",
+    "https://10.0.0.1",
+    "https://board.example/prefix?token=PRIVATE#fragment",
   ])(
-    "uses only the configured safe Board origin for GitHub omission navigation: $base",
-    async ({ base, expected }) => {
+    "never adds Board navigation to GitHub omission finals for Board origin %s",
+    async (base) => {
       const context = await githubOmissionFixture();
       let restarted: ReturnType<typeof createService> | undefined;
       try {
@@ -65063,11 +65042,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await restarted.service.processPendingPublications(100);
         const text = restarted.runtime.endpoints.get(context.endpoint.id)!
           .posts[0]!.text;
-        expect(text).toBe(
-          expected
-            ? `${context.result.summary}\n\n[Open this Paperclip task](${expected}/issues/${context.issue.id})`
-            : context.result.summary,
-        );
+        expect(text).toBe(context.result.summary);
         for (const secret of [
           "PRIVATE",
           "secret@",
@@ -65084,91 +65059,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
-  it.each(["append_link", "existing_link"] as const)(
-    "keeps GitHub omission navigation byte-stable across a retry and Board-origin change: %s",
-    async (mode) => {
-      const context = await githubOmissionFixture(
-        true,
-        undefined,
-        mode === "existing_link"
-          ? (issueId) =>
-              `Attach directly: [Open this Paperclip task](https://paperclip.example/issues/${issueId})`
-          : undefined,
-      );
-      let restarted: ReturnType<typeof createService> | undefined;
-      try {
-        await expect(context.repair()).resolves.toBe(true);
-        context.providerRuntime.postError = Object.assign(
-          new Error("Rate limited"),
-          { name: "RateLimitError", retryAfter: 60 },
-        );
-        await context.service.processPendingPublications(100);
-        const [before] = await db
-          .select()
-          .from(chatPublications)
-          .where(
-            and(
-              eq(chatPublications.endpointId, context.endpoint.id),
-              isNotNull(chatPublications.commentId),
-            ),
-          );
-        expect(before).toMatchObject({ state: "retry", attempts: 1 });
-        expect(
-          before.payload.text.match(/Open this Paperclip task/g),
-        ).toHaveLength(1);
-        const [preparation] = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, context.endpoint.id),
-              eq(chatActions.kind, "github_omission_navigation"),
-            ),
-          );
-        expect(preparation.payload).toMatchObject({
-          publicationId: before.id,
-          runId: context.runId,
-          resultId: context.accepted.resultId,
-          preparedTextSha256: createHash("sha256")
-            .update(before.payload.text)
-            .digest("hex"),
-        });
-        await context.service.shutdown();
-        restarted = createService(
-          new FakeChatSdkRuntime(),
-          context.providerFetch!,
-          { publicBaseUrl: "https://changed.example" },
-        );
-        await db
-          .update(chatPublications)
-          .set({ nextAttemptAt: new Date(0) })
-          .where(eq(chatPublications.id, before.id));
-        await restarted.service.processPendingPublications(100);
-        await restarted.service.processPendingPublications(100);
-        expect(
-          restarted.runtime.endpoints
-            .get(context.endpoint.id)!
-            .posts.map((post) => post.text),
-        ).toEqual([before.payload.text]);
-        await expect(
-          db
-            .select({
-              state: chatPublications.state,
-              attempts: chatPublications.attempts,
-              payload: chatPublications.payload,
-            })
-            .from(chatPublications)
-            .where(eq(chatPublications.id, before.id)),
-        ).resolves.toEqual([
-          { state: "published", attempts: 2, payload: before.payload },
-        ]);
-      } finally {
-        await restarted?.service.shutdown();
-        await context.cleanup();
-      }
-    },
-  );
-
   it.each([
     "no_omission",
     "forged_hint",
@@ -65178,7 +65068,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "principal_revoked",
     "generation_changed",
   ] as const)(
-    "does not grant GitHub omission navigation from $0",
+    "does not add a Board link to GitHub omission finals from $0",
     async (mode) => {
       const context = await githubOmissionFixture(
         !["no_omission", "forged_hint"].includes(mode),
@@ -65255,271 +65145,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(
             context.providerRuntime.posts.map((post) => post.text),
           ).toEqual([context.result.summary]);
-        await expect(
-          db
-            .select({ id: chatActions.id })
-            .from(chatActions)
-            .where(
-              and(
-                eq(chatActions.endpointId, context.endpoint.id),
-                eq(chatActions.kind, "github_omission_navigation"),
-              ),
-            ),
-        ).resolves.toEqual([]);
-      } finally {
-        await context.cleanup();
-      }
-    },
-  );
-
-  it.each(["complete_batch", "dropped_sibling", "old_omission"] as const)(
-    "binds GitHub omission navigation to the complete current batch: %s",
-    async (mode) => {
-      let currentCommentId = "";
-      const context = await githubOmissionFixture(true, async (source) => {
-        const callbacks = source.runtime.configurations.get(
-          source.endpoint.id,
-        )!.callbacks;
-        await deliverMessage({
-          callbacks,
-          endpointId: source.endpoint.id,
-          provider: "github",
-          thread: source.thread.thread,
-          message: makeMessage({
-            id: "990099",
-            text: "A plain current follow-up",
-            userId: "42",
-          }),
-          trigger: "subscribed_message",
-        });
-        const [second] = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.conversationId, source.conversation.id),
-              eq(chatActions.kind, "inbound_wakeup"),
-              sql`${chatActions.id} <> ${source.action.id}::uuid`,
-            ),
-          );
-        expect(second).toBeDefined();
-        expect(second.payload.attachmentOmissionReasons ?? {}).toEqual({});
-        currentCommentId = String(second.payload.commentId);
-        if (mode === "old_omission") {
-          const historicalRunId = randomUUID();
-          await db.insert(heartbeatRuns).values({
-            id: historicalRunId,
-            companyId: source.fixture.companyId,
-            agentId: source.fixture.assignedAgentId,
-            status: "failed",
-            wakeupRequestId: source.receipt.id,
-            finishedAt: new Date(),
-            contextSnapshot: {
-              issueId: source.issue.id,
-              source: "chat:github",
-              wakeCommentIds: [source.action.payload.commentId],
-            },
-          });
-          await db
-            .update(agentWakeupRequests)
-            .set({ runId: historicalRunId })
-            .where(eq(agentWakeupRequests.id, source.receipt.id));
-          await db
-            .update(agentWakeupRequests)
-            .set({ status: "failed", runId: source.runId })
-            .where(eq(agentWakeupRequests.id, second.id));
-          await db
-            .update(heartbeatRuns)
-            .set({ wakeupRequestId: second.id })
-            .where(eq(heartbeatRuns.id, source.runId));
-        } else {
-          const [receipt] = await db
-            .select()
-            .from(agentWakeupRequests)
-            .where(eq(agentWakeupRequests.id, second.id));
-          await db
-            .update(agentWakeupRequests)
-            .set({
-              status: "coalesced",
-              runId: null,
-              payload: {
-                ...receipt.payload,
-                coalescedIntoWakeupRequestId: source.receipt.id,
-              },
-            })
-            .where(eq(agentWakeupRequests.id, second.id));
-        }
-        await db
-          .update(heartbeatRuns)
-          .set({
-            contextSnapshot: {
-              issueId: source.issue.id,
-              taskKey: source.issue.identifier,
-              source: "chat:github",
-              wakeCommentId: currentCommentId,
-              wakeCommentIds:
-                mode === "old_omission"
-                  ? [currentCommentId]
-                  : [source.action.payload.commentId, currentCommentId],
-            },
-          })
-          .where(eq(heartbeatRuns.id, source.runId));
-      });
-      try {
-        expect(context.action.payload.attachmentOmissionReasons).toEqual({
-          download_unavailable: 1,
-        });
-        await expect(context.repair()).resolves.toBe(true);
-        if (mode === "dropped_sibling") {
-          await db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: {
-                issueId: context.issue.id,
-                taskKey: context.issue.identifier,
-                source: "chat:github",
-                wakeCommentId: currentCommentId,
-                wakeCommentIds: [currentCommentId],
-              },
-            })
-            .where(eq(heartbeatRuns.id, context.runId));
-        }
-        await context.service.processPendingPublications(100);
-        expect(context.providerRuntime.posts.map((post) => post.text)).toEqual(
-          mode === "dropped_sibling"
-            ? []
-            : [
-                mode === "complete_batch"
-                  ? `${context.result.summary}\n\n[Open this Paperclip task](https://paperclip.example/issues/${context.issue.id})`
-                  : context.result.summary,
-              ],
-        );
-        const preparations = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, context.endpoint.id),
-              eq(chatActions.kind, "github_omission_navigation"),
-            ),
-          );
-        expect(preparations).toHaveLength(mode === "complete_batch" ? 1 : 0);
-      } finally {
-        await context.cleanup();
-      }
-    },
-  );
-
-  it.each([
-    "text",
-    "progress",
-    "card",
-    "interaction",
-    "explicit",
-    "no_comment",
-    "source_revoked",
-    "control",
-  ] as const)(
-    "refuses changed prepared GitHub omission navigation on retry: %s",
-    async (mode) => {
-      const context = await githubOmissionFixture();
-      try {
-        await expect(context.repair()).resolves.toBe(true);
-        context.providerRuntime.postError = Object.assign(
-          new Error("Rate limited"),
-          { name: "RateLimitError", retryAfter: 60 },
-        );
-        await context.service.processPendingPublications(100);
-        const [publication] = await db
-          .select()
-          .from(chatPublications)
-          .where(
-            and(
-              eq(chatPublications.endpointId, context.endpoint.id),
-              isNotNull(chatPublications.commentId),
-            ),
-          );
-        expect(publication).toMatchObject({ state: "retry", attempts: 1 });
-        expect(publication.payload.text).toContain("Open this Paperclip task");
-        const payload = { ...publication.payload };
-        if (mode === "text") payload.text += "\nChanged after preparation";
-        if (mode === "progress") payload.progressState = "completed";
-        if (mode === "card")
-          payload.card = {
-            title: "Changed presentation",
-            children: [],
-          } as never;
-        if (mode === "interaction") payload.interactionId = randomUUID();
-        if (mode === "source_revoked")
-          await db
-            .update(chatEndpoints)
-            .set({ allowUnlinkedPeople: false })
-            .where(eq(chatEndpoints.id, context.endpoint.id));
-        if (mode === "control")
-          await db.insert(chatActions).values({
-            companyId: context.fixture.companyId,
-            endpointId: context.endpoint.id,
-            conversationId: context.conversation.id,
-            principalId: context.action.principalId,
-            kind: "task_control_authorization",
-            status: "issued",
-            providerActionId: `task-control-authorization:${publication.id}`,
-            payload: {},
-          });
-        await db
-          .update(chatPublications)
-          .set({
-            payload,
-            nextAttemptAt: new Date(0),
-            ...(mode === "explicit"
-              ? { idempotencyKey: `explicit-board:${publication.id}` }
-              : {}),
-            ...(mode === "control"
-              ? { idempotencyKey: `control:probe:${publication.id}` }
-              : {}),
-            ...(mode === "no_comment" ? { commentId: null } : {}),
-          })
-          .where(eq(chatPublications.id, publication.id));
-        context.providerRuntime.postError = undefined;
-        await context.service.processPendingPublications(100);
-        expect(context.providerRuntime.posts).toEqual([]);
-        expect(context.providerRuntime.edits).toEqual([]);
-        const [after] = await db
-          .select()
-          .from(chatPublications)
-          .where(eq(chatPublications.id, publication.id));
-        expect(after.state).toBe("cancelled");
-        const preparations = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, context.endpoint.id),
-              eq(chatActions.kind, "github_omission_navigation"),
-            ),
-          );
-        expect(preparations).toHaveLength(1);
-        expect(preparations[0].status).toBe("processed");
-        expect(preparations[0].payload.preparedTextSha256).toBe(
-          createHash("sha256").update(publication.payload.text).digest("hex"),
-        );
-        if (mode === "control") {
-          const [authorization] = await db
-            .select()
-            .from(chatActions)
-            .where(
-              eq(
-                chatActions.providerActionId,
-                `task-control-authorization:${publication.id}`,
-              ),
-            );
-          // Refusal leaves the claim issued, allowing the existing no-send
-          // settlement to cancel it instead of stranding it in processing.
-          expect(authorization.status).toBe("cancelled");
-          expect(authorization.result).toEqual({
-            code: "task_control_authorization_changed",
-          });
-        }
       } finally {
         await context.cleanup();
       }

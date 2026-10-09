@@ -187,6 +187,7 @@ export function nativeTelegramConfirmation(
 function textForQuestionInteraction(
   interaction: AskUserQuestionsInteraction,
   taskUrl: string | null,
+  omitTaskPointer: boolean,
 ): string {
   const lines = [
     interaction.payload.title ?? interaction.title ?? "Input needed",
@@ -197,20 +198,26 @@ function textForQuestionInteraction(
     for (const option of question.options) lines.push(`- ${option.label}`);
     lines.push("");
   }
-  lines.push(
-    taskUrl
-      ? `Open the task in Paperclip to respond: ${taskUrl}`
-      : "Open the task in Paperclip to respond.",
-  );
-  return lines.join("\n");
+  if (!omitTaskPointer)
+    lines.push(
+      taskUrl
+        ? `Open the task in Paperclip to respond: ${taskUrl}`
+        : "Open the task in Paperclip to respond.",
+    );
+  return lines.join("\n").trimEnd();
 }
 
-function genericInteractionText(taskUrl: string | null): string {
+function genericInteractionText(
+  taskUrl: string | null,
+  omitTaskPointer: boolean,
+): string {
   return [
     "This task needs an authorized response in Paperclip.",
-    taskUrl
-      ? `Open the task in Paperclip to respond: ${taskUrl}`
-      : "Open the task in Paperclip to respond.",
+    omitTaskPointer
+      ? null
+      : taskUrl
+        ? `Open the task in Paperclip to respond: ${taskUrl}`
+        : "Open the task in Paperclip to respond.",
   ]
     .filter((value): value is string => Boolean(value))
     .join("\n\n");
@@ -281,7 +288,6 @@ export async function enqueueIssueInteractionChatPublications(
     );
   if (bindings.length === 0) return [];
 
-  const taskUrl = publicChatInteractionTaskUrl(interaction.issueId);
   const question =
     interaction.kind === "ask_user_questions"
       ? nativeChatQuestion(interaction)
@@ -289,6 +295,10 @@ export async function enqueueIssueInteractionChatPublications(
   const inserted: Array<typeof chatPublications.$inferSelect> = [];
   for (const { conversation, endpoint } of bindings) {
     if (endpoint.assignedAgentId !== interaction.createdByAgentId) continue;
+    const omitTaskPointer = endpoint.provider === "github";
+    const taskUrl = omitTaskPointer
+      ? null
+      : publicChatInteractionTaskUrl(interaction.issueId);
     const formDraft =
       interaction.kind === "ask_user_questions" &&
       (endpoint.provider === "slack" ||
@@ -373,8 +383,8 @@ export async function enqueueIssueInteractionChatPublications(
             : [];
     const text =
       interaction.kind === "ask_user_questions"
-        ? textForQuestionInteraction(interaction, taskUrl)
-        : genericInteractionText(taskUrl);
+        ? textForQuestionInteraction(interaction, taskUrl, omitTaskPointer)
+        : genericInteractionText(taskUrl, omitTaskPointer);
     const payload = projectSafeChatPublication({
       classification: "external",
       source: "issue_interaction",

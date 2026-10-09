@@ -341,8 +341,15 @@ import {
   NativeChatReviewPresentationContentionError,
 } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
-import { projectSafeChatPublication } from "./chat-publication-projection.js";
-import { safeChatTaskUrl } from "./chat-task-url.js";
+import {
+  projectSafeChatPublication,
+  scrubExternalChatCard,
+  scrubInternalReferences,
+} from "./chat-publication-projection.js";
+import {
+  githubEgressReferenceScope,
+  safeChatTaskUrl,
+} from "./chat-task-url.js";
 import {
   resyncGitHubAppWebhook,
   listGitHubAppWebhookDeliveries,
@@ -14096,6 +14103,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             return 0;
           if (prior && !(await inboundQueueNoticeStillVisible(tx, prior)))
             return 0;
+          const [noticeEndpoint] = await tx
+            .select({ provider: chatEndpoints.provider })
+            .from(chatEndpoints)
+            .where(
+              and(
+                eq(chatEndpoints.companyId, action.companyId),
+                eq(chatEndpoints.id, action.endpointId),
+              ),
+            )
+            .limit(1);
           const rows = await tx
             .insert(chatPublications)
             .values({
@@ -14113,7 +14130,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               payload: projectSafeChatPublication({
                 classification: "external",
                 source: "safe_milestone",
-                text: inboundWakePublicationText(context.state),
+                text: inboundWakePublicationText(
+                  context.state,
+                  noticeEndpoint?.provider ?? "",
+                ),
                 progressState: context.state === "queued" ? "queued" : "failed",
               }),
             })
@@ -33264,7 +33284,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     };
   }
 
-  async function postSafePublication(input: {
+  async function scrubGitHubPublication(
+    payload: SafeChatPublicationPayload,
+    companyId: string,
+  ): Promise<SafeChatPublicationPayload> {
+    const scope = await githubEgressReferenceScope(
+      db,
+      companyId,
+      getTaskBaseUrl(),
+    );
+    return {
+      ...payload,
+      text: scrubInternalReferences(payload.text, scope),
+      ...(payload.card
+        ? { card: scrubExternalChatCard(payload.card, scope) }
+        : {}),
+    };
+  }
+
+  async function postSafePublication(request: {
     endpoint: EndpointRow;
     conversation: ConversationRow;
     publication: typeof chatPublications.$inferSelect;
@@ -33276,6 +33314,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       receipt: SlackFileUploadAcceptedReceipt,
     ) => Promise<void>;
   }) {
+    const input =
+      request.endpoint.provider === "github"
+        ? {
+            ...request,
+            payload: await scrubGitHubPublication(
+              request.payload,
+              request.publication.companyId,
+            ),
+          }
+        : request;
     const endpointRuntime = await runtimeFor(input.endpoint);
     const thread = endpointRuntime.thread(input.conversation.externalThreadId);
     const card = safeCardForPublication(input.payload, input.endpoint.provider);
@@ -33318,10 +33366,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           files = uploads;
         }
       } else if (files.length === 0) {
-        const taskUrl = safeChatTaskUrl(
-          getTaskBaseUrl(),
-          input.publication.issueId,
-        );
+        const taskUrl =
+          input.endpoint.provider === "github"
+            ? null
+            : safeChatTaskUrl(getTaskBaseUrl(), input.publication.issueId);
         if (
           input.endpoint.provider === "github" ||
           input.endpoint.provider === "microsoft-teams"
@@ -33727,169 +33775,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
-  /** Add navigation only from the exact accepted native input batch. The
-   * omission text/model response is not authority, nor is an older task file. */
-  async function githubCurrentOmissionPreparedText(
-    tx: DbOrTransaction,
-    publication: typeof chatPublications.$inferSelect,
-    endpoint: EndpointRow,
-  ): Promise<string | null | false> {
-    if (endpoint.provider !== "github") return null;
-    const preparationKey = `github-omission-navigation:${publication.id}`;
-    const [prepared] = await tx
-      .select()
-      .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.companyId, publication.companyId),
-          eq(chatActions.endpointId, publication.endpointId),
-          eq(chatActions.conversationId, publication.conversationId),
-          eq(chatActions.providerActionId, preparationKey),
-        ),
-      )
-      .limit(1);
-    // A prepared final cannot become a different kind of publication while
-    // retaining the decorated body. Check its receipt before these exclusions.
-    if (
-      !publication.commentId ||
-      publication.payload.progressState !== undefined ||
-      publication.payload.interactionId ||
-      publication.payload.card ||
-      publication.payload.attachmentIds?.length ||
-      publication.payload.transportPart ||
-      publication.idempotencyKey.startsWith("control:") ||
-      isExplicitOperatorPublication(publication)
-    )
-      return prepared ? false : null;
-    const taskUrl = prepared
-      ? typeof prepared.payload.taskUrl === "string"
-        ? safeChatTaskUrl(prepared.payload.taskUrl, publication.issueId)
-        : null
-      : safeChatTaskUrl(getTaskBaseUrl(), publication.issueId);
-    if (
-      prepared &&
-      (prepared.kind !== "github_omission_navigation" ||
-        prepared.status !== "processed" ||
-        prepared.payload.version !== 1 ||
-        prepared.payload.publicationId !== publication.id ||
-        taskUrl !== prepared.payload.taskUrl ||
-        prepared.payload.preparedTextSha256 !==
-          createHash("sha256").update(publication.payload.text).digest("hex"))
-    )
-      return false;
-    if (!taskUrl) return prepared ? false : null;
-    const [origin] = await tx
-      .select({ run: heartbeatRuns, resultId: nativeRunFinalizations.resultId })
-      .from(issueComments)
-      .innerJoin(
-        heartbeatRuns,
-        and(
-          eq(heartbeatRuns.id, issueComments.createdByRunId),
-          eq(heartbeatRuns.companyId, publication.companyId),
-          eq(heartbeatRuns.nativeIssueId, publication.issueId),
-          eq(heartbeatRuns.agentId, endpoint.assignedAgentId),
-          eq(heartbeatRuns.runtimeMode, "native"),
-          eq(heartbeatRuns.status, "succeeded"),
-          isNotNull(heartbeatRuns.finishedAt),
-        ),
-      )
-      .innerJoin(
-        nativeRunFinalizations,
-        and(
-          eq(nativeRunFinalizations.companyId, publication.companyId),
-          eq(nativeRunFinalizations.issueId, publication.issueId),
-          eq(nativeRunFinalizations.runId, heartbeatRuns.id),
-          eq(nativeRunFinalizations.phase, "committed"),
-        ),
-      )
-      .where(
-        and(
-          eq(issueComments.id, publication.commentId),
-          eq(issueComments.companyId, publication.companyId),
-          eq(issueComments.issueId, publication.issueId),
-          eq(issueComments.authorAgentId, endpoint.assignedAgentId),
-          isNull(issueComments.deletedAt),
-        ),
-      )
-      .limit(1);
-    const presentation = origin?.run.resultJson?.presentationDecision as
-      Record<string, unknown> | undefined;
-    if (!origin?.resultId || presentation?.commentId !== publication.commentId)
-      return prepared ? false : null;
-    if (
-      prepared &&
-      (prepared.payload.runId !== origin.run.id ||
-        prepared.payload.resultId !== origin.resultId)
-    )
-      return false;
-    try {
-      // This existing publication proof includes the accepted response_wake
-      // result, immutable owner/coalesced receipts, every current source,
-      // runtime/generation, source edits/deletes and current principal access.
-      const source = await failedChatRetrySource(tx, {
-        companyId: publication.companyId,
-        issueId: publication.issueId,
-        agentId: origin.run.agentId,
-        failedRunId: origin.run.id,
-        publication: true,
-        committedResponse: { resultId: origin.resultId },
-      });
-      if (
-        source.endpointId !== endpoint.id ||
-        source.conversationId !== publication.conversationId
-      )
-        return prepared ? false : null;
-      const omitted = source.sources.some((entry) => {
-        const count = (
-          entry.omissionReasons as Record<string, unknown> | undefined
-        )?.download_unavailable;
-        return (
-          typeof count === "number" && Number.isSafeInteger(count) && count > 0
-        );
-      });
-      if (!omitted) return prepared ? false : null;
-      if (prepared) return publication.payload.text;
-      const text = publication.payload.text.includes(taskUrl)
-        ? publication.payload.text
-        : `${publication.payload.text}\n\n[Open this Paperclip task](${taskUrl})`;
-      await tx.insert(chatActions).values({
-        companyId: publication.companyId,
-        endpointId: publication.endpointId,
-        conversationId: publication.conversationId,
-        kind: "github_omission_navigation",
-        providerActionId: preparationKey,
-        status: "processed",
-        payload: {
-          version: 1,
-          publicationId: publication.id,
-          runId: origin.run.id,
-          resultId: origin.resultId,
-          taskUrl,
-          preparedTextSha256: createHash("sha256").update(text).digest("hex"),
-        },
-      });
-      return text;
-    } catch (error) {
-      if (
-        isExternalChatWaitAuthorizationContention(error) ||
-        error instanceof NativeChatReviewPresentationContentionError
-      )
-        throw new NativeChatReviewPresentationContentionError();
-      if (
-        isExternalActionAuthorizationChange(error) ||
-        (error &&
-          typeof error === "object" &&
-          "details" in error &&
-          error.details &&
-          typeof error.details === "object" &&
-          "code" in error.details &&
-          error.details.code === "chat_failed_run_retry_not_authorized")
-      )
-        return prepared ? false : null;
-      throw new FailedChatRetryPublicationReadError();
-    }
-  }
-
   async function claimPublicationTransportAuthorization(input: {
     credentialLease: CredentialMutationLeaseGuard;
     endpoint: EndpointRow;
@@ -33899,7 +33784,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     authorizationActionId: string | null;
     conversation: ConversationRow;
     endpoint: EndpointRow;
-    preparedText: string | null;
   } | null> {
     return db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
@@ -34115,12 +33999,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           }
         }
       }
-      const preparedText = await githubCurrentOmissionPreparedText(
-        tx,
-        input.publication,
-        endpoint,
-      );
-      if (preparedText === false) return null;
       if (authorizationAction?.principalId) {
         const authorization = await lockCurrentPrincipalAuthorization(
           tx,
@@ -34150,16 +34028,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!claimedAuthorization) return null;
         authorizationActionId = claimedAuthorization.id;
       }
-      if (preparedText !== null) {
-        // Persist the exact provider text before I/O. A retry must reuse this
-        // body, not accumulate links or regenerate it from changed settings.
-        await tx
-          .update(chatPublications)
-          .set({
-            payload: { ...input.publication.payload, text: preparedText },
-          })
-          .where(eq(chatPublications.id, input.publication.id));
-      }
       await input.credentialLease.assertOwned(tx);
       // The publication's streaming row plus the optional authorization action
       // are the durable transport claim. Their database locks are released
@@ -34170,7 +34038,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         authorizationActionId,
         conversation,
         endpoint,
-        preparedText,
       };
     });
   }
@@ -37522,7 +37389,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // not when the command was admitted. If an already-streaming final
         // publication won the race, this reply reflects Paperclip's latest
         // authoritative task state after that earlier send commits.
-        let payload = await currentTaskControlPayload(publication);
+        const payload = await currentTaskControlPayload(publication);
         await withCredentialMutationLease(
           recordForLease.endpoint,
           async (credentialGuard) => {
@@ -37612,8 +37479,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               // point. Provider I/O runs without a database transaction or
               // row lock. The renewable lease preserves credential/runtime
               // identity until conditional settlement.
-              if (authorizationClaim.preparedText !== null)
-                payload = { ...payload, text: authorizationClaim.preparedText };
               const telegramDraft =
                 authorizationClaim.endpoint.provider === "telegram" &&
                 authorizationClaim.conversation.isDirectMessage &&
