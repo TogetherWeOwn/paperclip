@@ -310,6 +310,73 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(await suggestGrants()).toEqual([]);
   });
 
+  it("rejects junk scopes, outside roots, and board-issued revokes for agent stewards", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const steward = await insertAgentMembership(db, company.id, "Scope steward");
+    const target = await insertAgentMembership(db, company.id, "Scope target");
+    const outsider = await insertAgentMembership(db, company.id, "Outsider manager");
+    const outsiderReport = await insertAgentMembership(db, company.id, "Outsider report");
+    await db.update(agents).set({ reportsTo: outsider.agent.id }).where(eq(agents.id, outsiderReport.agent.id));
+    const stewardReport = await insertAgentMembership(db, company.id, "Steward report");
+    await db.update(agents).set({ reportsTo: steward.agent.id }).where(eq(agents.id, stewardReport.agent.id));
+    const topLevel = await insertAgentMembership(db, company.id, "Top-level agent");
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: steward.agent.id,
+      permissionKey: "users:manage_permissions",
+      scope: null,
+      grantedByUserId: owner.principalId,
+    });
+    const app = await createAgentApp(db, company.id, steward.agent.id);
+    const boardApp = await createApp(db, company.id, owner.principalId);
+    const route = (membershipId: string) =>
+      `/api/companies/${company.id}/members/${membershipId}/permissions/agents:suggest-changes`;
+    const suggestGrants = () => db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"));
+
+    for (const scope of [
+      { managedSubtreeAgentIds: [""] },
+      { managedSubtreeAgentIds: [null] },
+      { managedSubtreeAgentIds: [123] },
+      { managedSubtreeAgentIds: ["   "] },
+      { managedSubtreeAgentIds: [steward.agent.id], extra: "x" },
+      { managedSubtreeAgentIds: [randomUUID()] },
+    ]) {
+      const res = await request(app).patch(route(target.membership.id)).send({ enabled: true, scope });
+      expect(res.status, JSON.stringify({ scope, body: res.body })).toBe(403);
+    }
+    expect(await suggestGrants()).toEqual([]);
+
+    for (const rootId of [outsider.agent.id, outsiderReport.agent.id, topLevel.agent.id]) {
+      const res = await request(app).patch(route(target.membership.id))
+        .send({ enabled: true, scope: { managedSubtreeAgentIds: [rootId] } });
+      expect(res.status, JSON.stringify({ rootId, body: res.body })).toBe(403);
+    }
+    expect(await suggestGrants()).toEqual([]);
+
+    const validDescendant = await request(app).patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [stewardReport.agent.id] } });
+    expect(validDescendant.status, JSON.stringify(validDescendant.body)).toBe(200);
+    const cleanup = await request(app).patch(route(target.membership.id)).send({ enabled: false });
+    expect(cleanup.status, JSON.stringify(cleanup.body)).toBe(200);
+    expect(await suggestGrants()).toEqual([]);
+
+    const boardScoped = await request(boardApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [target.agent.id] } });
+    expect(boardScoped.status, JSON.stringify(boardScoped.body)).toBe(200);
+    const stewardRevokeBoardScoped = await request(app).patch(route(target.membership.id)).send({ enabled: false });
+    expect(stewardRevokeBoardScoped.status, JSON.stringify(stewardRevokeBoardScoped.body)).toBe(403);
+    expect(await suggestGrants()).toHaveLength(1);
+
+    const boardUnscoped = await request(boardApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: null });
+    expect(boardUnscoped.status, JSON.stringify(boardUnscoped.body)).toBe(200);
+    const stewardRevokeBoardUnscoped = await request(app).patch(route(target.membership.id)).send({ enabled: false });
+    expect(stewardRevokeBoardUnscoped.status, JSON.stringify(stewardRevokeBoardUnscoped.body)).toBe(403);
+    expect(await suggestGrants()).toHaveLength(1);
+  }, 20_000);
+
   it("rejects the targeted grant route for human memberships", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({

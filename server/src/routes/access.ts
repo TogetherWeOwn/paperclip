@@ -4637,13 +4637,74 @@ export function accessRoutes(
         throw conflict("Archived agent memberships cannot receive permission changes");
       }
       if (req.actor.type === "agent") {
-        // An agent steward may delegate narrowly but never widen itself or hand out company-wide read.
-        if (memberToUpdate.principalId === req.actor.agentId) {
+        // An agent steward may delegate narrowly but never widen access:
+        // enable requires a validated scope rooted inside its own reporting
+        // subtree, and revoke is limited to agent-issued narrow grants.
+        // Board-issued or company-wide grants need the board to change.
+        const callerAgentId = req.actor.agentId;
+        if (!callerAgentId) throw forbidden("Agent authentication required");
+        if (memberToUpdate.principalId === callerAgentId) {
           throw forbidden("Agents cannot change their own permissions");
         }
-        const subtree = req.body.scope?.managedSubtreeAgentIds;
-        if (req.body.enabled && !(Array.isArray(subtree) && subtree.length > 0)) {
-          throw forbidden("Agent callers must grant agents:suggest-changes with a nonempty managedSubtreeAgentIds scope");
+        const companyAgents = await agents.list(companyId, { includeTerminated: true });
+        const reportsById = new Map<string, string | null>(
+          companyAgents.map((entry) => [entry.id as string, (entry.reportsTo as string | null) ?? null]),
+        );
+        const isInSubtree = (rootId: string, targetId: string): boolean => {
+          if (rootId === targetId) return true;
+          let cursor: string | null = targetId;
+          for (let depth = 0; cursor && depth < 50; depth += 1) {
+            const parent = reportsById.get(cursor);
+            if (parent === undefined) return false;
+            if (parent === rootId) return true;
+            cursor = parent;
+          }
+          return false;
+        };
+        const narrowScopeRoots = (scope: unknown): string[] | null => {
+          if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+          const keys = Object.keys(scope as Record<string, unknown>);
+          if (keys.length !== 1 || keys[0] !== "managedSubtreeAgentIds") return null;
+          const raw = (scope as Record<string, unknown>).managedSubtreeAgentIds;
+          if (!Array.isArray(raw) || raw.length === 0 || raw.length > 50) return null;
+          const normalized: string[] = [];
+          for (const entry of raw) {
+            if (typeof entry !== "string") return null;
+            const trimmed = entry.trim();
+            if (!isUuidLike(trimmed)) return null;
+            if (!reportsById.has(trimmed)) return null;
+            if (!normalized.includes(trimmed)) normalized.push(trimmed);
+          }
+          return normalized.length > 0 ? normalized : null;
+        };
+        if (req.body.enabled) {
+          const normalized = narrowScopeRoots(req.body.scope);
+          if (!normalized) {
+            throw forbidden("Agent callers must grant agents:suggest-changes with a validated managedSubtreeAgentIds scope of company agents");
+          }
+          for (const rootId of normalized) {
+            if (!isInSubtree(callerAgentId, rootId)) {
+              throw forbidden("Agent callers may only grant subtrees inside their own reporting subtree");
+            }
+          }
+          req.body.scope = { managedSubtreeAgentIds: normalized };
+        } else {
+          const existing = await access.listPrincipalGrants(companyId, "agent", memberToUpdate.principalId);
+          const current = existing.find((grant) => grant.permissionKey === "agents:suggest-changes");
+          if (current) {
+            if (current.grantedByUserId !== null && current.grantedByUserId !== undefined) {
+              throw forbidden("Agents cannot revoke grants issued by the board");
+            }
+            const stored = narrowScopeRoots(current.scope);
+            if (!stored) {
+              throw forbidden("Agents cannot revoke company-wide or unscoped grants");
+            }
+            for (const rootId of stored) {
+              if (!isInSubtree(callerAgentId, rootId)) {
+                throw forbidden("Agents cannot revoke grants outside their own reporting subtree");
+              }
+            }
+          }
         }
       }
 
