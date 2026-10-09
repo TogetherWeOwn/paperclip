@@ -5,6 +5,7 @@ import {
   asBoolean,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
@@ -243,6 +244,13 @@ function claudeResultReportsFailure(parsed: Record<string, unknown>): boolean {
   );
 }
 
+// appendWithCap keeps only the tail of a full capture, so its first line may be cut mid-event.
+function claudeStdoutLines(stdout: string): string[] {
+  const [first = "", ...rest] = stdout.split(/\r?\n/);
+  const captureMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
+  return captureMayBeCut && parseJson(first.trim()) === null ? rest : [first, ...rest];
+}
+
 // One event's text is one evidence unit, so a login phrase may span its lines.
 function collectClaudeLoginEvidence(input: {
   parsed: Record<string, unknown> | null;
@@ -250,7 +258,7 @@ function collectClaudeLoginEvidence(input: {
   stderr: string;
 }): string[] {
   const units: string[] = [];
-  for (const rawLine of input.stdout.split(/\r?\n/)) {
+  for (const rawLine of claudeStdoutLines(input.stdout)) {
     const event = parseObject(parseJson(rawLine.trim()));
     if (typeof event.type !== "string") {
       units.push(rawLine);

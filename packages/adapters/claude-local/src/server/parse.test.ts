@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { appendWithCap, MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
@@ -338,6 +339,51 @@ describe("detectClaudeLoginRequired login prompt scope", () => {
       error: "authentication_failed",
     });
     expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("does not classify a login phrase in the cut first line of a full capture", () => {
+    const toolResult = `${"x".repeat(MAX_CAPTURE_BYTES)} unauthorized https://docs.example.com/unauthorized`;
+    const stdout = appendWithCap(
+      "",
+      [
+        streamEvent({ type: "system", subtype: "init", session_id: "session-1" }),
+        streamEvent({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: toolResult }] },
+        }),
+        streamEvent(SUCCESSFUL_RESULT),
+      ].join("\n"),
+    );
+    expect(detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" })).toEqual({
+      requiresLogin: false,
+      loginUrl: null,
+    });
+  });
+
+  it("still classifies a structured auth failure that follows a cut first line", () => {
+    const bigToolResult = "x".repeat(MAX_CAPTURE_BYTES);
+    const failedResult = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    };
+    const stdout = appendWithCap(
+      "",
+      [
+        streamEvent({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: bigToolResult }] },
+        }),
+        streamEvent({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+          error: "authentication_failed",
+        }),
+        streamEvent(failedResult),
+      ].join("\n"),
+    );
+    expect(detectClaudeLoginRequired({ parsed: failedResult, stdout, stderr: "" }).requiresLogin).toBe(true);
   });
 });
 
