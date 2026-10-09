@@ -207,12 +207,14 @@ function textForQuestionInteraction(
   return lines.join("\n").trimEnd();
 }
 
-function genericInteractionText(
+export function genericInteractionText(
   taskUrl: string | null,
   omitTaskPointer: boolean,
 ): string {
   return [
-    "This task needs an authorized response in Paperclip.",
+    omitTaskPointer
+      ? "This request needs an authorized response."
+      : "This task needs an authorized response in Paperclip.",
     omitTaskPointer
       ? null
       : taskUrl

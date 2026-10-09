@@ -13665,6 +13665,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             current.status === "deferred_issue_execution"
               ? "queued"
               : "not_started";
+          const [endpoint] = await tx
+            .select({ provider: chatEndpoints.provider })
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, source.endpointId));
           return (
             await tx
               .insert(chatPublications)
@@ -13686,7 +13690,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   text:
                     state === "queued"
                       ? "Your retry is queued."
-                      : "This retry was not started. Open the task in Paperclip for details.",
+                      : endpoint?.provider === "github"
+                        ? "This retry was not started."
+                        : "This retry was not started. Open the task in Paperclip for details.",
                   progressState: state === "queued" ? "queued" : "failed",
                 }),
                 state: "pending",

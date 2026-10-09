@@ -300,9 +300,12 @@ function splitTrailingUrlPunctuation(match: string): [string, string] {
 
 function hostnameOf(candidate: string): string | null {
   try {
-    const hostname = new URL(
-      candidate.startsWith("//") ? `https:${candidate}` : candidate,
-    ).hostname;
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(candidate)
+      ? candidate
+      : candidate.startsWith("//")
+        ? `https:${candidate}`
+        : `https://${candidate}`;
+    const hostname = new URL(withScheme).hostname;
     return hostname.toLowerCase().replace(/\.$/, "") || null;
   } catch {
     return null;
@@ -325,6 +328,18 @@ function internalHostnames(origins: readonly string[]): Set<string> {
 function isInternalUrl(candidate: string, hosts: ReadonlySet<string>): boolean {
   const hostname = hostnameOf(candidate);
   return hostname !== null && hosts.has(hostname);
+}
+
+function bareInternalHostPattern(hosts: ReadonlySet<string>): RegExp | null {
+  const alternatives = [...hosts]
+    .sort((a, b) => b.length - a.length)
+    .map((host) => host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return alternatives.length
+    ? new RegExp(
+        `(?<![A-Za-z0-9.-])(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
+        "gi",
+      )
+    : null;
 }
 
 function trackerIdPattern(prefixes: readonly string[]): RegExp | null {
@@ -365,6 +380,12 @@ export function scrubInternalReferences(
       ? `${INTERNAL_LINK_REMOVED}${trailing}`
       : match;
   });
+  const bareHosts = bareInternalHostPattern(hosts);
+  if (bareHosts)
+    output = output.replace(bareHosts, (match) => {
+      const [, trailing] = splitTrailingUrlPunctuation(match);
+      return `${INTERNAL_LINK_REMOVED}${trailing}`;
+    });
   return trackers ? output.replace(trackers, INTERNAL_REFERENCE) : output;
 }
 

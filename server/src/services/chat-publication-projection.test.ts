@@ -294,6 +294,32 @@ describe("scrubInternalReferences", () => {
     );
   });
 
+  it("removes schemeless internal hosts with their paths and markdown targets", () => {
+    expect(
+      scrubInternalReferences(
+        "See board.example.invalid/ACME/issues/abc. Also [board](board.example.invalid/x). Open BOARD.EXAMPLE.INVALID/y.",
+        scope,
+      ),
+    ).toBe(
+      "See [internal link removed]. Also board. Open [internal link removed].",
+    );
+  });
+
+  it("removes a schemeless internal host with its query or fragment", () => {
+    expect(
+      scrubInternalReferences(
+        "Open board.example.invalid?issue=abc#top now.",
+        scope,
+      ),
+    ).toBe("Open [internal link removed] now.");
+  });
+
+  it("leaves subdomains and look-alike hosts of an internal origin unchanged", () => {
+    const text =
+      "sub.board.example.invalid and board.example.invalid.test and board.example.invalidx";
+    expect(scrubInternalReferences(text, scope)).toBe(text);
+  });
+
   it("matches the company prefix case-sensitively", () => {
     expect(
       scrubInternalReferences("utf-8 UTF-8", {
