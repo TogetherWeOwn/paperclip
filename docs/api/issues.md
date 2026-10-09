@@ -49,6 +49,8 @@ This read is limited to the caller's own, currently running native execution of 
 - `409`: the run owns the issue but is no longer current: it ended, was stopped, is a held native runner, its agent is paused, or the issue is no longer in progress.
 - `503`: a read failed, timed out, or the verdict could not be delivered inside its validity window.
 
+`clear` only reports that no other execution of this issue was observed; it is not company-lifecycle liveness, so a paused or archived company is not reflected in it.
+
 A successful response has exactly this versioned shape and is not cacheable:
 
 ```json
@@ -64,7 +66,7 @@ A successful response has exactly this versioned shape and is not cacheable:
 
 - `clear`: both reads found no other queued or running execution attributed to this exact issue.
 - `sibling`: at least one read found a queued or running peer execution; same-agent peers count.
-- `unknown`: incomplete, stale, contradictory, or ambiguous state prevented a reliable verdict. A run bound to the issue by its native owner, durable issue binding, snapshot `issueId`, or snapshot `taskId` is examined. If these name different issues, a value is unusable, or the run's lifecycle fields disagree with its status, the verdict is `unknown`. A `scheduled_retry` run also produces `unknown`, and so do policy documents of the caller that cannot be interpreted.
+- `unknown`: incomplete, stale, contradictory, or ambiguous state prevented a reliable verdict. A run is examined when its native owner, durable issue binding, snapshot `issueId`, snapshot `taskId`, or snapshot `taskKey` names this issue by its id or identifier, compared case-insensitively. If any of those values names a different issue, names no issue, or is not a string, or the run's lifecycle fields disagree with its status, the verdict is `unknown`. A `scheduled_retry` run also produces `unknown`, and so do policy documents of the caller that cannot be interpreted.
 
 The response contains no peer identifiers or run details. Its observation expires three seconds after `observedAt`; clients must discard it after `expiresAt` and make no assumption from a non-200 response. The verdict computation writes nothing, and the transaction is read-only. Authentication is shared with every agent route and may record the run's identity context as it does for any agent request. The response carries `Cache-Control: no-store` and no validator. Wake requests that have not yet become runs are not executions and are not counted, and a verdict is not a lock on future execution.
 

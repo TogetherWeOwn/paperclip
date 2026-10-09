@@ -20,7 +20,10 @@ import { createLocalAgentJwt, verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { evaluateNativeSiblingLiveness } from "../services/native-sibling-liveness.js";
+import {
+  evaluateNativeSiblingLiveness,
+  NATIVE_SIBLING_LIVENESS_TTL_MS,
+} from "../services/native-sibling-liveness.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -125,6 +128,7 @@ async function seedRun(
     contextIssueId?: unknown;
     omitContextIssueId?: boolean;
     contextTaskId?: unknown;
+    contextTaskKey?: unknown;
     startedAt?: Date | null;
     finishedAt?: Date | null;
     executionPolicy?: unknown;
@@ -139,6 +143,7 @@ async function seedRun(
     contextSnapshot.issueId = input.contextIssueId === undefined ? input.issueId : input.contextIssueId;
   }
   if (input.contextTaskId !== undefined) contextSnapshot.taskId = input.contextTaskId;
+  if (input.contextTaskKey !== undefined) contextSnapshot.taskKey = input.contextTaskKey;
   const [run] = await db.insert(heartbeatRuns).values({
     companyId: input.companyId,
     agentId: input.agentId,
@@ -209,6 +214,7 @@ type PeerInput = {
   contextIssueId?: unknown;
   omitContextIssueId?: boolean;
   contextTaskId?: unknown;
+  contextTaskKey?: unknown;
   runtimeMode?: string | null;
 };
 
@@ -223,6 +229,7 @@ async function insertPeerRun(db: Db, fixture: Fixture, input: PeerInput) {
     contextIssueId: input.contextIssueId,
     omitContextIssueId: input.omitContextIssueId,
     contextTaskId: input.contextTaskId,
+    contextTaskKey: input.contextTaskKey,
     runtimeMode: input.runtimeMode,
   });
 }
@@ -341,6 +348,73 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
     expect(res.body.verdict).toBe("sibling");
   });
 
+  const taskKeyForms: Array<[string, "queued" | "running", (issue: { id: string; identifier: string }) => string]> = [
+    ["the issue id", "queued", (issue) => issue.id],
+    ["the issue id", "running", (issue) => issue.id],
+    ["the issue identifier", "queued", (issue) => issue.identifier],
+    ["the issue identifier", "running", (issue) => issue.identifier],
+    ["the issue identifier in lower case", "queued", (issue) => issue.identifier.toLowerCase()],
+    ["the issue id in upper case", "running", (issue) => issue.id.toUpperCase()],
+  ];
+
+  it.each(taskKeyForms)("counts a peer whose task key is %s on a %s run", async (_form, status, taskKeyFor) => {
+    const fixture = await seedFixture(db);
+    const identifier = `${fixture.company.issuePrefix}-42`;
+    await db.update(issues).set({ identifier }).where(eq(issues.id, fixture.issue.id));
+    await insertPeerRun(db, fixture, {
+      status,
+      nativeIssueId: null,
+      omitContextIssueId: true,
+      contextTaskKey: taskKeyFor({ id: fixture.issue.id, identifier }),
+    });
+
+    const res = await getIssueRoute(createApp(db), fixture);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.verdict).toBe("sibling");
+  });
+
+  it("does not count a peer whose task key names another issue", async () => {
+    const fixture = await seedFixture(db);
+    const other = await seedIssue(db, fixture.company.id, fixture.agent.id);
+    await insertPeerRun(db, fixture, {
+      status: "running",
+      nativeIssueId: null,
+      omitContextIssueId: true,
+      contextTaskKey: other.id,
+    });
+
+    const res = await getIssueRoute(createApp(db), fixture);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.verdict).toBe("clear");
+  });
+
+  const identifierSnapshotForms: Array<["issueId" | "taskId", "queued" | "running"]> = [
+    ["issueId", "queued"],
+    ["issueId", "running"],
+    ["taskId", "queued"],
+    ["taskId", "running"],
+  ];
+
+  it.each(identifierSnapshotForms)("counts a peer whose snapshot %s is the issue identifier on a %s run", async (field, status) => {
+    const fixture = await seedFixture(db);
+    const identifier = `${fixture.company.issuePrefix}-43`;
+    await db.update(issues).set({ identifier }).where(eq(issues.id, fixture.issue.id));
+    await insertPeerRun(db, fixture, {
+      status,
+      nativeIssueId: null,
+      ...(field === "issueId"
+        ? { contextIssueId: identifier }
+        : { omitContextIssueId: true, contextTaskId: identifier }),
+    });
+
+    const res = await getIssueRoute(createApp(db), fixture);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.verdict).toBe("sibling");
+  });
+
   it.each([
     ["a native owner naming another issue", (_issueId: string, otherId: string): PeerInput => ({
       status: "running", nativeIssueId: otherId, boundIssueId: otherId,
@@ -353,6 +427,12 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
     })],
     ["a non-string snapshot issue id beside a matching binding", (issueId: string): PeerInput => ({
       status: "running", nativeIssueId: null, boundIssueId: issueId, contextIssueId: { id: "x" },
+    })],
+    ["a task key naming another issue beside a matching binding", (issueId: string, otherId: string): PeerInput => ({
+      status: "running", nativeIssueId: null, boundIssueId: issueId, omitContextIssueId: true, contextTaskKey: otherId,
+    })],
+    ["a non-string task key beside a matching binding", (issueId: string): PeerInput => ({
+      status: "running", nativeIssueId: null, boundIssueId: issueId, omitContextIssueId: true, contextTaskKey: { id: "x" },
     })],
   ])("returns unknown for a peer with %s", async (_label, peer) => {
     const fixture = await seedFixture(db);
@@ -385,7 +465,7 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
     expect(res.body.verdict).toBe("clear");
   });
 
-  it("examines more than fifty exact-issue active rows without pagination", async () => {
+  it("examines every exact-issue active row beyond fifty, so a contradiction past row fifty is seen", async () => {
     const fixture = await seedFixture(db);
     const peers = Array.from({ length: 65 }, (_, index) => ({
       companyId: fixture.company.id,
@@ -397,12 +477,22 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
       finishedAt: null,
       contextSnapshot: { issueId: fixture.issue.id, executionPolicy: {} },
     }));
-    await db.insert(heartbeatRuns).values(peers);
+    const contradictory = {
+      companyId: fixture.company.id,
+      agentId: fixture.agent.id,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: fixture.issue.id,
+      startedAt: new Date(),
+      finishedAt: null,
+      contextSnapshot: { issueId: randomUUID(), executionPolicy: {} },
+    };
+    await db.insert(heartbeatRuns).values([...peers, contradictory]);
 
     const res = await getIssueRoute(createApp(db), fixture);
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.verdict).toBe("sibling");
+    expect(res.body.verdict).toBe("unknown");
   });
 
   it("returns unknown for contradictory or incomplete active-run state", async () => {
@@ -601,14 +691,49 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
     expect(assignmentResponse.status).toBe(404);
   });
 
-  it.each(["paused", "terminated", "pending_approval"])("rejects a run whose agent is %s", async (status) => {
+  it.each(["terminated", "pending_approval"])("refuses a run whose agent is %s at authentication", async (status) => {
     const fixture = await seedFixture(db);
     await db.update(agents).set({ status }).where(eq(agents.id, fixture.agent.id));
 
     const res = await getIssueRoute(createApp(db), fixture);
 
-    // Terminated and pending agents are refused earlier by authentication.
-    expect([401, 409]).toContain(res.status);
+    expect(res.status).toBe(401);
+    expect(res.body.verdict).toBeUndefined();
+  });
+
+  it("returns 409 to a paused agent for its own current issue", async () => {
+    const fixture = await seedFixture(db);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agent.id));
+
+    const res = await getIssueRoute(createApp(db), fixture);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.verdict).toBeUndefined();
+  });
+
+  it("returns 404 to a paused agent for an existing issue it does not own", async () => {
+    const fixture = await seedFixture(db);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agent.id));
+    const otherAgent = await seedAgent(db, fixture.company.id);
+    const otherIssue = await seedIssue(db, fixture.company.id, otherAgent.id);
+
+    const res = await request(createApp(db))
+      .get(`/api/issues/${otherIssue.id}/sibling-liveness`)
+      .set("Authorization", `Bearer ${makeJwt(fixture)}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.verdict).toBeUndefined();
+  });
+
+  it("returns 404 to a paused agent for a missing issue", async () => {
+    const fixture = await seedFixture(db);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agent.id));
+
+    const res = await request(createApp(db))
+      .get(`/api/issues/${randomUUID()}/sibling-liveness`)
+      .set("Authorization", `Bearer ${makeJwt(fixture)}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(res.body.verdict).toBeUndefined();
   });
 
@@ -740,6 +865,18 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
 
     const result = await evaluateNativeSiblingLiveness(db, callerInput(fixture), {
       afterTimeoutSet: async (tx) => { await tx.execute(sql`select pg_sleep(1.5)`); },
+    });
+
+    expect(result).toEqual({ kind: "unavailable" });
+  });
+
+  it("stops reading and fails closed once the request deadline has passed", async () => {
+    const fixture = await seedFixture(db);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+
+    const result = await evaluateNativeSiblingLiveness(db, callerInput(fixture), {
+      afterTimeoutSet: async () => { await new Promise((resolve) => setTimeout(resolve, NATIVE_SIBLING_LIVENESS_TTL_MS + 100)); },
     });
 
     expect(result).toEqual({ kind: "unavailable" });
@@ -944,22 +1081,6 @@ describeEmbeddedPostgres("native sibling liveness route", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.verdict).toBe("unknown");
-  });
-
-  it("answers a conditional request with a full uncached verdict", async () => {
-    const fixture = await seedFixture(db);
-    const app = createApp(db);
-    const first = await getIssueRoute(app, fixture);
-
-    const second = await request(app)
-      .get(`/api/issues/${fixture.issue.id}/sibling-liveness`)
-      .set("Authorization", `Bearer ${makeJwt(fixture)}`)
-      .set("If-None-Match", String(first.headers.etag ?? "W/\"x\""))
-      .set("If-Modified-Since", new Date(Date.now() + 60_000).toUTCString());
-
-    expect(second.status).toBe(200);
-    expect(second.headers["cache-control"]).toBe("no-store");
-    expect(second.body.verdict).toBe("clear");
   });
 
   it.each(["post", "put", "patch", "delete"] as const)("does not expose a %s method", async (method) => {

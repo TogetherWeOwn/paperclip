@@ -1,4 +1,4 @@
-import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, issues, projects, type Db } from "@paperclipai/db";
 import {
   NATIVE_SIBLING_LIVENESS_SCHEMA,
@@ -14,6 +14,10 @@ export const NATIVE_SIBLING_LIVENESS_TTL_MS = 3_000;
 
 /** Statuses under which the platform does not let an agent run or authenticate. */
 const INELIGIBLE_AGENT_STATUSES: ReadonlySet<string> = new Set(["paused", "terminated", "pending_approval"]);
+
+class RequestDeadlineExceeded extends Error {
+  readonly code = "request_deadline_exceeded";
+}
 
 export type NativeSiblingLivenessInput = {
   companyId: string;
@@ -61,7 +65,7 @@ function buildResponse(
 const INVALID_ATTRIBUTION = "__invalid__";
 
 /** Reads a string id from the run snapshot; present non-string values stay visible as invalid. */
-function snapshotIdSql(key: "issueId" | "taskId") {
+function snapshotIdSql(key: "issueId" | "taskId" | "taskKey") {
   const value = sql`(${heartbeatRuns.contextSnapshot} -> ${key})`;
   return sql<string | null>`case
     when ${value} is null or jsonb_typeof(${value}) = 'null' then null
@@ -70,21 +74,37 @@ function snapshotIdSql(key: "issueId" | "taskId") {
   end`;
 }
 
+type IssueKey = { id: string; identifier: string | null };
+
 type ActiveRunRow = {
   finishedAt: Date | null;
   issueId: string | null;
   nativeIssueId: string | null;
   snapshotIssueId: string | null;
   snapshotTaskId: string | null;
+  snapshotTaskKey: string | null;
   startedAt: Date | null;
   status: string;
 };
 
-/** A row counts only when every attribution it carries names this issue and its lifecycle is coherent. */
-function isCompleteActiveRun(row: ActiveRunRow, issueId: string): boolean {
-  const attributions = [row.nativeIssueId, row.issueId, row.snapshotIssueId, row.snapshotTaskId];
-  if (attributions.some((value) => value !== null && value !== issueId)) return false;
-  if (!attributions.some((value) => value === issueId)) return false;
+/** Matches the issue id or identifier, ignoring case. */
+function namesIssue(value: string, issue: IssueKey): boolean {
+  return value.toLowerCase() === issue.id.toLowerCase() ||
+    (issue.identifier !== null && value.toUpperCase() === issue.identifier.toUpperCase());
+}
+
+/** The SQL form of namesIssue, so the read selects the rows the verdict checks. */
+function namesIssueSql(value: SQL<string | null>, issue: IssueKey) {
+  return sql`(lower(${value}) = ${issue.id.toLowerCase()} or upper(${value}) = ${issue.identifier?.toUpperCase() ?? null})`;
+}
+
+/** A row counts only when every binding and snapshot id it carries names this issue and its lifecycle is coherent. */
+function isCompleteActiveRun(row: ActiveRunRow, issue: IssueKey): boolean {
+  const bindings = [row.nativeIssueId, row.issueId];
+  const snapshotIds = [row.snapshotIssueId, row.snapshotTaskId, row.snapshotTaskKey];
+  if (bindings.some((value) => value !== null && value !== issue.id)) return false;
+  if (snapshotIds.some((value) => value !== null && !namesIssue(value, issue))) return false;
+  if (![...bindings, ...snapshotIds].some((value) => value !== null)) return false;
   if (row.status === "queued") return row.startedAt === null && row.finishedAt === null;
   if (row.status === "running") return row.startedAt !== null && row.finishedAt === null;
   return false;
@@ -92,17 +112,23 @@ function isCompleteActiveRun(row: ActiveRunRow, issueId: string): boolean {
 
 type CallerState =
   | { kind: "not_found" | "forbidden" | "conflict" }
-  | { kind: "caller"; issueId: string; companyId: string; complete: boolean };
+  | { kind: "caller"; issue: IssueKey; companyId: string; complete: boolean };
 
 /**
  * Reads the caller's authority: the issue, agent, run and policy rows that make it
  * the current standard-trust native owner. `complete` is false when a policy
  * document cannot be interpreted, so no verdict can be trusted.
  */
-async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promise<CallerState> {
+async function readCallerState(
+  tx: Db,
+  input: NativeSiblingLivenessInput,
+  withinDeadline: () => void,
+): Promise<CallerState> {
+  withinDeadline();
   const [issue] = await tx
     .select({
       id: issues.id,
+      identifier: issues.identifier,
       companyId: issues.companyId,
       status: issues.status,
       workMode: issues.workMode,
@@ -116,13 +142,14 @@ async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promi
     .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return { kind: "not_found" };
 
+  withinDeadline();
   const [agent] = await tx
     .select({ companyId: agents.companyId, status: agents.status, permissions: agents.permissions })
     .from(agents)
     .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
   if (!agent) return { kind: "forbidden" };
-  if (INELIGIBLE_AGENT_STATUSES.has(agent.status)) return { kind: "conflict" };
 
+  withinDeadline();
   const [run] = await tx
     .select({
       id: heartbeatRuns.id,
@@ -161,6 +188,7 @@ async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promi
   ) {
     return { kind: "not_found" };
   }
+  if (INELIGIBLE_AGENT_STATUSES.has(agent.status)) return { kind: "conflict" };
   if (
     issue.status !== "in_progress" ||
     run.status !== "running" ||
@@ -185,7 +213,8 @@ async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promi
     return { kind: "forbidden" };
   }
 
-  const incomplete = { kind: "caller", issueId: issue.id, companyId: issue.companyId, complete: false } as const;
+  const callerIssue = { id: issue.id, identifier: issue.identifier };
+  const incomplete = { kind: "caller", issue: callerIssue, companyId: issue.companyId, complete: false } as const;
   const runContext = asRecord(run.contextSnapshot);
   if (!runContext) return incomplete;
   const runPolicy = runContext.executionPolicy;
@@ -198,6 +227,7 @@ async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promi
   }
   let project: { companyId: string; executionWorkspacePolicy: unknown } | null = null;
   if (issue.projectId) {
+    withinDeadline();
     const [projectRow] = await tx
       .select({ companyId: projects.companyId, executionWorkspacePolicy: projects.executionWorkspacePolicy })
       .from(projects)
@@ -214,13 +244,15 @@ async function readCallerState(tx: Db, input: NativeSiblingLivenessInput): Promi
     run: { companyId: run.companyId, executionPolicy: runPolicy },
   });
   if (trust.kind !== "standard") return { kind: "forbidden" };
-  return { kind: "caller", issueId: issue.id, companyId: issue.companyId, complete: true };
+  return { kind: "caller", issue: callerIssue, companyId: issue.companyId, complete: true };
 }
 
-/** Every queued, running or retry-scheduled run that any binding attributes to the issue. */
-async function readActiveRuns(tx: Db, companyId: string, issueId: string) {
+/** Every queued, running or retry-scheduled run that any binding or snapshot id attributes to the issue. */
+async function readActiveRuns(tx: Db, companyId: string, issue: IssueKey, withinDeadline: () => void) {
   const snapshotIssueId = snapshotIdSql("issueId");
   const snapshotTaskId = snapshotIdSql("taskId");
+  const snapshotTaskKey = snapshotIdSql("taskKey");
+  withinDeadline();
   return tx
     .select({
       id: heartbeatRuns.id,
@@ -229,6 +261,7 @@ async function readActiveRuns(tx: Db, companyId: string, issueId: string) {
       nativeIssueId: heartbeatRuns.nativeIssueId,
       snapshotIssueId,
       snapshotTaskId,
+      snapshotTaskKey,
       startedAt: heartbeatRuns.startedAt,
       finishedAt: heartbeatRuns.finishedAt,
     })
@@ -237,10 +270,11 @@ async function readActiveRuns(tx: Db, companyId: string, issueId: string) {
       eq(heartbeatRuns.companyId, companyId),
       inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
       or(
-        eq(heartbeatRuns.nativeIssueId, issueId),
-        eq(heartbeatRuns.issueId, issueId),
-        sql`${snapshotIssueId} = ${issueId}`,
-        sql`${snapshotTaskId} = ${issueId}`,
+        eq(heartbeatRuns.nativeIssueId, issue.id),
+        eq(heartbeatRuns.issueId, issue.id),
+        namesIssueSql(snapshotIssueId, issue),
+        namesIssueSql(snapshotTaskId, issue),
+        namesIssueSql(snapshotTaskKey, issue),
       ),
     ));
 }
@@ -248,8 +282,8 @@ async function readActiveRuns(tx: Db, companyId: string, issueId: string) {
 type Verdict = NativeSiblingLivenessResponse["verdict"];
 
 /** Clear needs the caller to be among the examined runs and every examined run to be coherent. */
-function verdictFor(rows: Array<ActiveRunRow & { id: string }>, runId: string, issueId: string): Verdict {
-  if (!rows.some((row) => row.id === runId) || !rows.every((row) => isCompleteActiveRun(row, issueId))) {
+function verdictFor(rows: Array<ActiveRunRow & { id: string }>, runId: string, issue: IssueKey): Verdict {
+  if (!rows.some((row) => row.id === runId) || !rows.every((row) => isCompleteActiveRun(row, issue))) {
     return "unknown";
   }
   return rows.some((row) => row.id !== runId) ? "sibling" : "clear";
@@ -259,6 +293,13 @@ function verdictFor(rows: Array<ActiveRunRow & { id: string }>, runId: string, i
 function leastReassuring(a: Verdict, b: Verdict): Verdict {
   const rank: Record<Verdict, number> = { clear: 0, unknown: 1, sibling: 2 };
   return rank[b] > rank[a] ? b : a;
+}
+
+/** Checked before each read, so a request past its verdict window stops reading. */
+function deadlineAt(startedAt: Date): () => void {
+  return () => {
+    if (Date.now() - startedAt.getTime() >= NATIVE_SIBLING_LIVENESS_TTL_MS) throw new RequestDeadlineExceeded();
+  };
 }
 
 const READ_ONLY_SNAPSHOT = { isolationLevel: "repeatable read", accessMode: "read only" } as const;
@@ -276,8 +317,8 @@ export type NativeSiblingLivenessTestHooks = {
  *
  * The snapshot is a read-only repeatable-read transaction that takes no row
  * locks, so it cannot block or deadlock the platform's writers. Every queued,
- * running or retry-scheduled run attributed to the issue by any durable binding
- * or snapshot id is examined. An unusable or contradictory attribution makes the
+ * running or retry-scheduled run attributed to the issue by any durable binding or
+ * snapshot id is examined. An unusable or contradictory attribution makes the
  * verdict unknown; wake requests not yet promoted to a run are not executions and
  * are not counted. The whole observation is repeated in a second fresh snapshot
  * and the less reassuring verdict wins, so a revocation committed in between never
@@ -289,16 +330,17 @@ export async function evaluateNativeSiblingLiveness(
   input: NativeSiblingLivenessInput,
   hooks: NativeSiblingLivenessTestHooks = {},
 ): Promise<NativeSiblingLivenessEvaluation> {
+  const startedAt = new Date();
+  const withinDeadline = deadlineAt(startedAt);
   const observe = async (tx: Db) => {
-    const caller = await readCallerState(tx, input);
+    const caller = await readCallerState(tx, input, withinDeadline);
     if (caller.kind !== "caller") return caller;
     const verdict: Verdict = caller.complete
-      ? verdictFor(await readActiveRuns(tx, caller.companyId, caller.issueId), input.runId, caller.issueId)
+      ? verdictFor(await readActiveRuns(tx, caller.companyId, caller.issue, withinDeadline), input.runId, caller.issue)
       : "unknown";
     return { kind: "observed" as const, caller, verdict };
   };
   try {
-    const startedAt = new Date();
     const first = await db.transaction(async (tx) => {
       await tx.execute(sql`set local statement_timeout = '1000ms'`);
       await hooks.afterTimeoutSet?.(tx as unknown as Db);
@@ -317,7 +359,7 @@ export async function evaluateNativeSiblingLiveness(
     if (Date.now() - startedAt.getTime() >= NATIVE_SIBLING_LIVENESS_TTL_MS) return { kind: "unavailable" };
     return {
       kind: "response",
-      response: buildResponse(first.caller.issueId, input.runId, leastReassuring(first.verdict, second.verdict), startedAt),
+      response: buildResponse(first.caller.issue.id, input.runId, leastReassuring(first.verdict, second.verdict), startedAt),
     };
   } catch (err) {
     // Timeouts and failed reads are expected fail-closed outcomes; log the error
