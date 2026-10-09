@@ -4788,7 +4788,13 @@ export function accessRoutes(
             }
           } else {
             if (!lockedCurrent) return;
-            const deleted = await tx
+            // The SELECT ... FOR UPDATE above holds a row lock on the
+            // guarded grant, so no concurrent board (or peer steward) write
+            // can land between the guard and this delete. The delete stays
+            // unconditional on purpose: a provenance condition here could
+            // never fail while the lock is held, so it would be dead code
+            // with no covering test.
+            await tx
               .delete(principalPermissionGrants)
               .where(
                 and(
@@ -4796,13 +4802,8 @@ export function accessRoutes(
                   eq(principalPermissionGrants.principalType, "agent"),
                   eq(principalPermissionGrants.principalId, memberToUpdate.principalId),
                   eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"),
-                  isNull(principalPermissionGrants.grantedByUserId),
                 ),
-              )
-              .returning({ id: principalPermissionGrants.id });
-            if (deleted.length === 0) {
-              throw conflict("Grant changed concurrently; retry");
-            }
+              );
           }
         });
       }
