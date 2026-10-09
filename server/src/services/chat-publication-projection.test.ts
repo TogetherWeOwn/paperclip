@@ -341,6 +341,12 @@ describe("scrubInternalReferences", () => {
     expect(scrubInternalReferences(text, scope)).toBe(text);
   });
 
+  it("removes an internal host written after a leading or space-separated slash", () => {
+    expect(
+      scrubInternalReferences("see /board.example.invalid/x and /board.example.invalid", scope),
+    ).toBe("see /[internal link removed] and /[internal link removed]");
+  });
+
   it("still removes internal hosts after an email sign, an ssh remote, or a protocol-relative slash", () => {
     expect(
       scrubInternalReferences(

@@ -341,7 +341,7 @@ function bareInternalHostPattern(hosts: ReadonlySet<string>): RegExp | null {
   // A host right after a path slash is a segment of another URL, not a link to it.
   return alternatives.length
     ? new RegExp(
-        `(?<![A-Za-z0-9.-])(?<![^/]/)(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
+        `(?<![A-Za-z0-9.-])(?<![A-Za-z0-9._~%-]/)(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
         "gi",
       )
     : null;
