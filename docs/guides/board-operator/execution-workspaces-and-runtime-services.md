@@ -140,6 +140,8 @@ Code state moves between runs through the local execution-workspace cwd alone â€
 - Each run's prepare step bundles the local worktree to the run's remote dir over ssh, with no `git remote` configured.
 - Other project repositories under `.paperclip-repositories/` make the same round trip. Each one is bundled and restored as its own Git checkout.
 - The adapter's restore step at the end of the run writes any new remote commits back into the local worktree directly.
+- Nested worktrees under `.paperclip/worktrees` and `.claude/worktrees` (at any depth) are neither uploaded nor restored. They are large, and the local copy is left in place. A caller can replace this list with the `nestedWorktreeDirs` option, and `[]` syncs them.
+- The restore extracts the remote tree into one staging directory under the system temp directory, so peak temp usage is about one copy of the restored tree. Before it writes anything, it compares the free space there with twice the estimated size of the restored tree. If the space is short, the restore fails at once with an error that names the directory. Set `TMPDIR` to a larger volume to fix it. When the remote host cannot report a size that leaves out the excluded paths (for example a BSD `du`), the check is skipped and a warning is logged.
 - Adapters must never `git push` from runtime code, and must never assume a remote exists.
 - A failed restore is a run-level error and records `workspace_finalize=failed` on the execution workspace, which gates dependent issue wakes until the next successful finalize.
 
