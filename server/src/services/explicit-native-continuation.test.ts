@@ -618,7 +618,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
     });
 
-  it.each(["accepted", "wrong_run", "wrong_owner", "active", "unverified", "missing_actor", "missing_time", "stale", "later_launch", "later_tool", "later_process", "live_process", "cleanup", "controller", "other_source"])(
+  it.each(["accepted", "wrong_run", "wrong_owner", "active", "unverified", "missing_actor", "missing_time", "stale", "later_launch", "later_tool", "later_output", "later_process", "live_process", "cleanup", "controller", "other_source"])(
     "uses accepted reconciliation only for its exact stopped source (%s)", async evidence => {
       const f = await seed();
       await db.update(heartbeatRuns).set({ processPid: evidence === "live_process" ? process.pid : null,
@@ -636,6 +636,8 @@ const support = await getEmbeddedPostgresTestSupport();
         runId: f.sourceRunId, agentId: f.agentId, eventType: PROCESS_START_REQUESTED, stream: "system" });
       if (evidence === "later_tool") await appendHeartbeatRunEvent(db, { companyId: f.companyId,
         runId: f.sourceRunId, agentId: f.agentId, eventType: "tool.execution.started", stream: "system" });
+      if (evidence === "later_output") await db.update(heartbeatRuns).set({ lastOutputAt: new Date("2026-09-11T10:45:00Z") })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
       if (evidence === "later_process") await db.update(heartbeatRuns).set({ processStartedAt: new Date("2026-09-11T10:31:00Z") })
         .where(eq(heartbeatRuns.id, f.sourceRunId));
       if (evidence === "controller") await db.update(nativeRunFinalizations).set({ leaseOwner: "still-active" })

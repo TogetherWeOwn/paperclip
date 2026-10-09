@@ -259,7 +259,8 @@ export async function admitExplicitNativeContinuation(input: {
       )).limit(1) : [];
       const reconciled = reconciledAction?.status === "resolved" && reconciledAction.kind === "active_run_watchdog" &&
         reconciledAction.returnOwnerAgentId === agentId && reconciledAt && reconciledAt >= run.finishedAt! &&
-        !laterLaunch && (!run.processStartedAt || run.processStartedAt <= reconciledAt);
+        !laterLaunch && !(run.lastOutputAt && reconciledAt && run.lastOutputAt > reconciledAt) &&
+        (!run.processStartedAt || run.processStartedAt <= reconciledAt);
       if (reconciled && reconciledAction) for (const row of pendingReconciliations) reconciledActionIds.add(row.id);
       if (!unusedAdmission && !cancelledStartup && !neverStarted) {
         // A missing process identity alone is not evidence that a provider exited.
