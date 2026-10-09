@@ -561,6 +561,25 @@ export const chatPublications = pgTable(
       table.companyId,
       table.idempotencyKey,
     ),
+    // Host-verified lookup indexes for the chat milestone reconciliation
+    // query (enqueueChatRunMilestones). The names must stay byte-identical
+    // to the definitions built CONCURRENTLY on live deployments; the
+    // migration adopts those definitions instead of rebuilding them.
+    index("ops_chatpub_company_issue_interaction_published_idx")
+      .on(
+        table.companyId,
+        table.issueId,
+        sql`(( ${table.payload} ->> 'interactionId' ))`,
+      )
+      .where(sql`${table.state} = 'published'`),
+    // drizzle-orm 0.45.2 has no INCLUDE clause support, so the covering
+    // column (comment_id) lives in the migration SQL only; see the 0280
+    // migration header. Keep this entry aligned with that SQL definition.
+    index("ops_chatpub_company_endpoint_conversation_idx").on(
+      table.companyId,
+      table.endpointId,
+      table.conversationId,
+    ),
     foreignKey({
       columns: [table.companyId, table.endpointId],
       foreignColumns: [chatEndpoints.companyId, chatEndpoints.id],
