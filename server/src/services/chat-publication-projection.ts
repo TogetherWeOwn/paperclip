@@ -334,7 +334,7 @@ function trackerIdPattern(prefixes: readonly string[]): RegExp | null {
   return alternatives.length
     ? new RegExp(
         `(?<![A-Za-z0-9_])(?:${alternatives.join("|")})-\\d+(?![A-Za-z0-9_])`,
-        "gi",
+        "g",
       )
     : null;
 }

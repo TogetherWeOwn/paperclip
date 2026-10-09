@@ -288,10 +288,19 @@ describe("scrubInternalReferences", () => {
     );
   });
 
-  it("removes tracker ids of the company's own prefix only", () => {
+  it("removes uppercase tracker ids of the company's own prefix only", () => {
     expect(scrubInternalReferences("Fixed ACME-123 and acme-7.", scope)).toBe(
-      "Fixed [internal reference] and [internal reference].",
+      "Fixed [internal reference] and acme-7.",
     );
+  });
+
+  it("matches the company prefix case-sensitively", () => {
+    expect(
+      scrubInternalReferences("utf-8 UTF-8", {
+        internalOrigins: [],
+        trackerPrefixes: ["UTF"],
+      }),
+    ).toBe("utf-8 [internal reference]");
   });
 
   it("leaves other identifiers, lookalike hosts, and embedded prefixes untouched", () => {

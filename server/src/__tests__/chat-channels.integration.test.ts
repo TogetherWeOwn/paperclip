@@ -3232,6 +3232,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         conclusion: "failure",
         details_url: "https://github.com/paperclipai/paperclip/pull/91",
       });
+      const summaries = [...comments.values()].filter((c) =>
+        c.body.includes("## Paperclip Review"),
+      );
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.body).not.toMatch(
+        /Task:|Review history|\[Run\]|current-vanity\.example/,
+      );
       const publishedCount = mutations.length;
       targetTip = "f".repeat(40);
       const retried = await service.execute(
