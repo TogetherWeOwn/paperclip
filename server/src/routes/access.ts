@@ -4646,6 +4646,16 @@ export function accessRoutes(
       if (memberToUpdate.status === "archived") {
         throw conflict("Archived agent memberships cannot receive permission changes");
       }
+      if (req.actor.type === "agent") {
+        // An agent steward may delegate narrowly but never widen itself or hand out company-wide read.
+        if (memberToUpdate.principalId === req.actor.agentId) {
+          throw forbidden("Agents cannot change their own permissions");
+        }
+        const subtree = req.body.scope?.managedSubtreeAgentIds;
+        if (req.body.enabled && !(Array.isArray(subtree) && subtree.length > 0)) {
+          throw forbidden("Agent callers must grant agents:suggest-changes with a nonempty managedSubtreeAgentIds scope");
+        }
+      }
 
       const updated = await access.setMemberPermission(
         companyId,
