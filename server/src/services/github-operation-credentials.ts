@@ -13,6 +13,7 @@ import { captureRunIdentity } from "./run-identity.js";
 import {
   buildGitAuthInvocation,
   resolveManagedGitHubCredential,
+  type GitCredential,
 } from "./git-credentials.js";
 import { secretService } from "./secrets.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
@@ -191,4 +192,75 @@ export async function resolveGitHubOperationCredentials(
     ...summary,
     env,
   };
+}
+
+/** Use a managed credential inside trusted server code without returning it to the caller. */
+export async function withGitHubOperationCredential<T>(
+  db: Db,
+  input: { companyId: string; agentId: string; runId: string },
+  operation: (credential: GitCredential) => Promise<T>,
+): Promise<T> {
+  const { run, context } = await captureRunIdentity(db, input);
+  if (!context) throw forbidden("This run predates managed GitHub credentials");
+
+  const saveSummary = async (summary: GitHubCredentialSummary) => {
+    await db
+      .update(runIdentityContexts)
+      .set({ github: summary })
+      .where(eq(runIdentityContexts.id, context.id));
+  };
+
+  if (!(await allowsGitHubCredentialExport(db, run))) {
+    await saveSummary({
+      status: "unavailable",
+      reason: "GitHub diagnostics are not available to low-trust or unverified executions",
+    });
+    throw forbidden("GitHub diagnostics are not available to low-trust or unverified executions");
+  }
+
+  let resolved: Awaited<ReturnType<typeof resolveManagedGitHubCredential>> | null = null;
+  try {
+    resolved = await resolveManagedGitHubCredential(
+      db,
+      secretService(db),
+      input.companyId,
+      {
+        agentId: input.agentId,
+        heartbeatRunId: input.runId,
+        allowStandingDelegation: false,
+        allowRefresh: false,
+        allowAlternate: false,
+        responsibleUserId:
+          context.cause === "company_default"
+            ? null
+            : (context.responsibleUserId ?? null),
+        issueId:
+          typeof run.contextSnapshot?.issueId === "string"
+            ? run.contextSnapshot.issueId
+            : null,
+      },
+    );
+  } catch {
+    // Credential-store details can contain sensitive values. Keep the caller error generic.
+  }
+
+  if (!resolved?.credential) {
+    await saveSummary({
+      status: resolved?.configured ? "unavailable" : "absent",
+      source: resolved?.identitySource ?? "personal",
+      reason: "A managed GitHub identity is not available for this run",
+    });
+    throw forbidden("A managed GitHub identity is not available for this run");
+  }
+
+  await saveSummary({
+    status: "available",
+    source: resolved.credential.identitySource,
+    login: resolved.credential.githubIdentity?.login,
+    connectionId: resolved.credential.connectionId,
+    grantId: resolved.credential.grantId,
+    authenticationMode: "managed",
+  });
+
+  return operation(resolved.credential);
 }
