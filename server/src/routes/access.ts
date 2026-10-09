@@ -4639,8 +4639,10 @@ export function accessRoutes(
       if (req.actor.type === "agent") {
         // An agent steward may delegate narrowly but never widen access:
         // enable requires a validated scope rooted inside its own reporting
-        // subtree, and revoke is limited to agent-issued narrow grants.
-        // Board-issued or company-wide grants need the board to change.
+        // subtree, and both enable and revoke are refused when the target
+        // already holds a board-issued or company-wide grant. The enable
+        // side must be guarded too: overwriting such a grant would relabel
+        // it as agent-issued and make a follow-up revoke succeed.
         const callerAgentId = req.actor.agentId;
         if (!callerAgentId) throw forbidden("Agent authentication required");
         if (memberToUpdate.principalId === callerAgentId) {
@@ -4688,21 +4690,23 @@ export function accessRoutes(
             }
           }
           req.body.scope = { managedSubtreeAgentIds: normalized };
-        } else {
-          const existing = await access.listPrincipalGrants(companyId, "agent", memberToUpdate.principalId);
-          const current = existing.find((grant) => grant.permissionKey === "agents:suggest-changes");
-          if (current) {
-            if (current.grantedByUserId !== null && current.grantedByUserId !== undefined) {
-              throw forbidden("Agents cannot revoke grants issued by the board");
-            }
-            const stored = narrowScopeRoots(current.scope);
-            if (!stored) {
-              throw forbidden("Agents cannot revoke company-wide or unscoped grants");
-            }
-            for (const rootId of stored) {
-              if (!isInSubtree(callerAgentId, rootId)) {
-                throw forbidden("Agents cannot revoke grants outside their own reporting subtree");
-              }
+        }
+        // Both directions share one existing-grant guard. Without it on
+        // enable, a steward could narrow a board-issued company-wide grant
+        // (relabeling it as agent-issued) and then revoke it outright.
+        const existing = await access.listPrincipalGrants(companyId, "agent", memberToUpdate.principalId);
+        const current = existing.find((grant) => grant.permissionKey === "agents:suggest-changes");
+        if (current) {
+          if (current.grantedByUserId !== null && current.grantedByUserId !== undefined) {
+            throw forbidden("Agents cannot change grants issued by the board");
+          }
+          const stored = narrowScopeRoots(current.scope);
+          if (!stored) {
+            throw forbidden("Agents cannot change company-wide or unscoped grants");
+          }
+          for (const rootId of stored) {
+            if (!isInSubtree(callerAgentId, rootId)) {
+              throw forbidden("Agents cannot change grants outside their own reporting subtree");
             }
           }
         }
