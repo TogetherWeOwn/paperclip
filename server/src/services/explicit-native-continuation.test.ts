@@ -618,7 +618,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
     });
 
-  it.each(["accepted", "wrong_run", "wrong_owner", "active", "unverified", "missing_actor", "missing_time", "stale", "later_launch", "later_process", "live_process", "cleanup", "controller", "other_source"])(
+  it.each(["accepted", "wrong_run", "wrong_owner", "active", "unverified", "missing_actor", "missing_time", "stale", "later_launch", "later_tool", "later_process", "live_process", "cleanup", "controller", "other_source"])(
     "uses accepted reconciliation only for its exact stopped source (%s)", async evidence => {
       const f = await seed();
       await db.update(heartbeatRuns).set({ processPid: evidence === "live_process" ? process.pid : null,
@@ -634,6 +634,8 @@ const support = await getEmbeddedPostgresTestSupport();
           } } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       if (evidence === "later_launch") await appendHeartbeatRunEvent(db, { companyId: f.companyId,
         runId: f.sourceRunId, agentId: f.agentId, eventType: PROCESS_START_REQUESTED, stream: "system" });
+      if (evidence === "later_tool") await appendHeartbeatRunEvent(db, { companyId: f.companyId,
+        runId: f.sourceRunId, agentId: f.agentId, eventType: "tool.execution.started", stream: "system" });
       if (evidence === "later_process") await db.update(heartbeatRuns).set({ processStartedAt: new Date("2026-09-11T10:31:00Z") })
         .where(eq(heartbeatRuns.id, f.sourceRunId));
       if (evidence === "controller") await db.update(nativeRunFinalizations).set({ leaseOwner: "still-active" })
@@ -655,6 +657,29 @@ const support = await getEmbeddedPostgresTestSupport();
       if (evidence !== "accepted") expect(action.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
       await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
     });
+
+  it("keeps another owner's accepted reconciliation pending through this owner's admission", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:00:00Z") }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const executionReconciliation = { runId: f.sourceRunId, providerStopped: true, actionOutcome: "not_performed",
+      outcomeEvidence: "Operator verified the provider stopped and the action was never submitted.",
+      actorId: "board", recordedAt: "2026-09-11T10:30:00Z" };
+    await db.update(issueRecoveryActions).set({ status: "resolved", returnOwnerAgentId: f.agentId,
+      updatedAt: new Date("2026-09-11T10:00:00Z"),
+      evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" }, executionReconciliation },
+    }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({ id: otherAgentId, companyId: f.companyId, name: "Other owner", role: "engineer",
+      adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    const foreignFingerprint = `${f.sourceRunId}:other-owner`;
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "uncertain_external_action", fingerprint: foreignFingerprint, status: "resolved",
+      returnOwnerAgentId: otherAgentId, nextAction: "Verify the other owner's hold.",
+      evidence: { runId: f.sourceRunId, executionReconciliation }, updatedAt: new Date("2026-09-11T09:00:00Z") });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    const [foreign] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.fingerprint, foreignFingerprint));
+    expect(foreign.evidence.continuationDelivery ?? "pending").toBe("pending");
+  });
 
   it.each(["verified", "unproven", "changed", "dry_run", "retry", "duplicate"])(
     "requires exact local cleanup for a new turn after worker loss (%s)", async mode => {

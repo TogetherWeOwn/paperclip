@@ -237,6 +237,8 @@ export async function admitExplicitNativeContinuation(input: {
       // It never waives current process ownership, controller or cleanup gates.
       const pendingReconciliations = await db.select().from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.kind, "active_run_watchdog"),
+        eq(issueRecoveryActions.returnOwnerAgentId, agentId),
         sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
         sql`coalesce(${issueRecoveryActions.evidence}->>'continuationDelivery', 'pending') = 'pending'`,
       )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
@@ -252,7 +254,8 @@ export async function admitExplicitNativeContinuation(input: {
         eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id),
         gt(heartbeatRunEvents.createdAt, reconciledAt),
         inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded",
-          "adapter.invoke", "harness.ready", "session.started", "session.resumed", "turn.started"]),
+          "adapter.invoke", "harness.ready", "session.started", "session.resumed", "session.updated", "turn.started",
+          "provider.event", "provider.rpc_result", "tool.execution.started"]),
       )).limit(1) : [];
       const reconciled = reconciledAction?.status === "resolved" && reconciledAction.kind === "active_run_watchdog" &&
         reconciledAction.returnOwnerAgentId === agentId && reconciledAt && reconciledAt >= run.finishedAt! &&
