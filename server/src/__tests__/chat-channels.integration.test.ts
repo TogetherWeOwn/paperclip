@@ -2784,6 +2784,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         status: "completed", conclusion: "action_required", head_sha: head,
         details_url: "https://github.com/paperclipai/paperclip/pull/83",
       })]);
+      expect(JSON.stringify(writes)).not.toContain("current-vanity.example");
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
     });
     it("uses task-bound bot tools and deterministic checks, then denies revoked people", async () => {
@@ -3261,6 +3262,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await expect(
         service.execute(session, "read_pull_request", { section: "metadata" }),
       ).rejects.toThrow("no longer authorized");
+      const published = JSON.stringify(mutations);
+      expect(published).toContain("https://github.com/paperclipai/paperclip/pull/91");
+      expect(published).not.toMatch(/vanity\.example/);
     });
   });
 
