@@ -15,11 +15,13 @@ import {
 export const GITHUB_DIAGNOSTIC_REPOSITORY_IDS = [
   "1396224242",
   "1396224001",
+  "1319564297",
 ] as const;
 
 export const GITHUB_DIAGNOSTIC_REPOSITORIES = {
   "1396224242": { owner: "TogetherWeOwn", repo: "two-bot-next" },
   "1396224001": { owner: "TogetherWeOwn", repo: "two-web-next" },
+  "1319564297": { owner: "TogetherWeOwn", repo: "kofra" },
 } as const satisfies Record<
   (typeof GITHUB_DIAGNOSTIC_REPOSITORY_IDS)[number],
   { owner: string; repo: string }

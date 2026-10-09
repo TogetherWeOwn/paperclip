@@ -54,7 +54,7 @@ describe("runtime connection MCP contract", () => {
         inputSchema: {
           type: "object",
           properties: {
-            repositoryId: { type: "string", enum: ["1396224242", "1396224001"] },
+            repositoryId: { type: "string", enum: ["1396224242", "1396224001", "1319564297"] },
             jobId: { type: "string", pattern: "^[1-9][0-9]{0,19}$" },
           },
           required: ["repositoryId", "jobId"],
@@ -68,7 +68,7 @@ describe("runtime connection MCP contract", () => {
         inputSchema: {
           type: "object",
           properties: {
-            repositoryId: { type: "string", enum: ["1396224242", "1396224001"] },
+            repositoryId: { type: "string", enum: ["1396224242", "1396224001", "1319564297"] },
           },
           required: ["repositoryId"],
           additionalProperties: false,
