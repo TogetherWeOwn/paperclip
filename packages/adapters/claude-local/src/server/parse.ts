@@ -203,19 +203,30 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
-// The CLI reports a login prompt as plain text, as an assistant message marked
-// with the structured authentication_failed error, or as the result of a failed
-// run. Other stream-json events carry model, user, and tool prose, so the prompt
-// markers never read them.
+// The CLI reports a login prompt as plain text, as an error-typed or is_error
+// stream event, or as an assistant message marked with the structured
+// authentication_failed error. Other stream-json events carry model, user, and
+// tool prose, so the prompt markers never read them.
 const CLAUDE_STRUCTURED_AUTH_FAILURE = "authentication_failed";
 
-function claudeAssistantTextBlocks(event: Record<string, unknown>): string[] {
+function claudeStreamEventReportsFailure(event: Record<string, unknown>): boolean {
+  return event.type === "error" || event.is_error === true || event.error === CLAUDE_STRUCTURED_AUTH_FAILURE;
+}
+
+function claudeFailureEventTexts(event: Record<string, unknown>): string[] {
   const message = parseObject(event.message);
   const content = Array.isArray(message.content) ? message.content : [];
-  return content.flatMap((entry) => {
+  const blockTexts = content.flatMap((entry) => {
     const block = parseObject(entry);
     return asString(block.type, "") === "text" ? [asString(block.text, "")] : [];
   });
+  return [
+    asString(event.result, ""),
+    asString(event.message, ""),
+    ...extractClaudeErrorMessages({ errors: [event.error] }),
+    ...extractClaudeErrorMessages(event),
+    ...blockTexts,
+  ];
 }
 
 function collectClaudeLoginPromptLines(input: {
@@ -228,13 +239,13 @@ function collectClaudeLoginPromptLines(input: {
     const event = parseObject(parseJson(rawLine.trim()));
     if (typeof event.type !== "string") {
       candidates.push(rawLine);
-    } else if (event.type === "assistant" && event.error === CLAUDE_STRUCTURED_AUTH_FAILURE) {
-      candidates.push(...claudeAssistantTextBlocks(event));
+    } else if (claudeStreamEventReportsFailure(event)) {
+      candidates.push(...claudeFailureEventTexts(event));
     }
   }
   candidates.push(input.stderr);
   if (input.parsed && claudeResultIndicatesAuthFailure(input.parsed)) {
-    candidates.push(asString(input.parsed.result, ""), ...extractClaudeErrorMessages(input.parsed));
+    candidates.push(...claudeFailureEventTexts(input.parsed));
   }
   return candidates
     .join("\n")

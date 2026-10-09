@@ -281,6 +281,24 @@ describe("detectClaudeLoginRequired login prompt scope", () => {
       }).requiresLogin,
     ).toBe(true);
   });
+
+  it("classifies an error-typed stream event that carries the login prompt", () => {
+    const stdout = streamEvent({
+      type: "error",
+      error: { type: "authentication_error", message: "Invalid API key · Please run /login" },
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("classifies a failed result line on stdout when no parsed result is passed", () => {
+    const stdout = streamEvent({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
 });
 
 describe("isClaudeModelNotFoundError", () => {
