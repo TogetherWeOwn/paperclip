@@ -679,6 +679,22 @@ async function assertNoProtectedChildren(
   }
 }
 
+// Applies `assertNoProtectedChildren` to every source entry that would replace
+// a local directory. It reads the target directly, not through a snapshot, so
+// the caller can run it before anything else changes.
+async function assertNoProtectedReplacements(
+  targetDir: string,
+  baseline: DirectorySnapshot,
+  source: DirectorySnapshot,
+  protectedPatterns: readonly string[],
+): Promise<void> {
+  for (const [relative, entry] of orderedEntries(source)) {
+    if (entry.kind === "dir" || entriesMatch(baseline.entries.get(relative), entry)) continue;
+    const local = await fs.lstat(path.join(targetDir, relative)).catch(() => null);
+    if (local?.isDirectory()) await assertNoProtectedChildren(targetDir, relative, protectedPatterns);
+  }
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
@@ -700,6 +716,11 @@ export async function mergeDirectoryWithBaseline(input: {
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
   try {
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+      // Refuse before `beforeApply`: the caller advances the local git branch
+      // there, and a refused restore must leave the checkout untouched.
+      if (input.protectedPatterns?.length) {
+        await assertNoProtectedReplacements(canonicalTargetDir, input.baseline, source, input.protectedPatterns);
+      }
       await input.beforeApply?.();
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
@@ -709,13 +730,6 @@ export async function mergeDirectoryWithBaseline(input: {
         if (input.conflictPolicy === "reject") {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
-        }
-        if (input.protectedPatterns?.length) {
-          for (const [relative, entry] of orderedEntries(source)) {
-            if (entry.kind === "dir" || current.entries.get(relative)?.kind !== "dir") continue;
-            if (entriesMatch(input.baseline.entries.get(relative), entry)) continue;
-            await assertNoProtectedChildren(canonicalTargetDir, relative, input.protectedPatterns);
-          }
         }
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
