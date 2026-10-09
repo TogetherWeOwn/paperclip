@@ -22,7 +22,10 @@ export async function isNeverStartedLegacyRun(db: Db, run: Run, coordinator: Coo
     or(isNotNull(heartbeatRunEvents.sourceEventId), ne(heartbeatRunEvents.eventType, "lifecycle"),
       sql`coalesce(${heartbeatRunEvents.stream}, '') <> 'system'`,
       sql`not (coalesce(${heartbeatRunEvents.payload}->>'status', '') in ('queued', 'scheduled_retry', 'cancelled')
-        or (coalesce(${heartbeatRunEvents.message}, '') = 'run cancelled' and ${heartbeatRunEvents.payload} is null))`),
+        or (coalesce(${heartbeatRunEvents.payload}->>'status', '') = ''
+          and (coalesce(${heartbeatRunEvents.message}, '') like 'run cancelled%'
+            or (coalesce(${heartbeatRunEvents.payload}->>'automaticRecovery', '') = 'preserve_without_replay_v1'
+              and coalesce(${heartbeatRunEvents.payload}->>'replay', '') = 'blocked'))))`),
   )).limit(1);
   return !execution;
 }

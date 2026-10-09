@@ -18,6 +18,7 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { markExecutionReconciliation, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
@@ -375,14 +376,14 @@ const support = await getEmbeddedPostgresTestSupport();
     return result;
   });
 
-  async function seedNeverStartedLegacy(recoveryCount = 1) {
+  async function seedNeverStartedLegacy(recoveryCount = 1, cancel: { reason?: string; eventMessage?: string; eventPayload?: Record<string, unknown> } = {}) {
     const f = await seed();
     await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
     await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null,
       status: "queued", processPid: null, finishedAt: null }).where(eq(heartbeatRuns.id, f.sourceRunId));
     // Exercise the real cancel-before-launch writer, including its lifecycle event.
-    await heartbeatService(db).cancelRun(f.sourceRunId);
+    await heartbeatService(db).cancelRun(f.sourceRunId, cancel.reason, { eventMessage: cancel.eventMessage, eventPayload: cancel.eventPayload });
     // Historical cancellations predate server-owned conversation adapter evidence.
     await db.update(heartbeatRuns).set({ resultJson: null, finishedAt: new Date("2026-09-11T10:00:00Z") })
       .where(eq(heartbeatRuns.id, f.sourceRunId));
@@ -406,6 +407,53 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
     expect(after).toEqual(before);
+  });
+
+  it("admits a never-started legacy hold after the real settler records its replay block", async () => {
+    const f = await seedNeverStartedLegacy();
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, returnOwnerAgentId: f.agentId,
+      evidence: { runId: f.sourceRunId } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await settleUnrecoverableExecutions(db);
+    const events = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+    expect(events.map(event => event.payload)).toContainEqual(expect.objectContaining({
+      automaticRecovery: "preserve_without_replay_v1", replay: "blocked",
+    }));
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("admits a never-started legacy run cancelled with a caller-supplied cancellation note", async () => {
+    const f = await seedNeverStartedLegacy(1, { reason: "Stopped from the bound Slack agent session",
+      eventMessage: "run cancelled from Slack", eventPayload: { endpointId: randomUUID() } });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
+  it("admits a started run whose remaining hold is covered by accepted reconciliations, once", async () => {
+    const f = await seedNeverStartedLegacy(3);
+    await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:59:00Z") }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    // The active-source index allows one open hold at a time, so each hold settles in its own cycle.
+    const holdIds = (await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(row => row.id);
+    for (const id of holdIds) {
+      await db.update(issueRecoveryActions).set({ status: "active", outcome: null, returnOwnerAgentId: f.agentId,
+        evidence: { runId: f.sourceRunId } }).where(eq(issueRecoveryActions.id, id));
+      await settleUnrecoverableExecutions(db);
+    }
+    const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    for (const hold of holds.slice(0, 2)) await markExecutionReconciliation(db, hold, { runId: f.sourceRunId, providerStopped: true,
+      actionOutcome: "not_performed", outcomeEvidence: "Operator verified the provider stopped." }, "board");
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await admit(f)).toBeNull();
+    const rows = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(rows).toHaveLength(3);
+    expect(rows.filter(row => row.evidence.executionReconciliation).map(row => row.evidence.continuationDelivery)).toEqual(["delivered", "delivered"]);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("does not treat a cancellation note that carries a launch status as cancelled before launch", async () => {
+    const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled", eventPayload: { status: "running" } });
+    expect(await admit(f)).toBeNull();
   });
 
   it.each([{ recoveryCount: 1 }, { recoveryCount: 5 }])(

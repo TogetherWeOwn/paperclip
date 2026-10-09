@@ -5,7 +5,7 @@ import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
-import { and, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
   environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
@@ -149,6 +149,7 @@ export async function admitExplicitNativeContinuation(input: {
   const sources: Run[] = [];
   const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
   const cancelledStartupIds = new Set<string>();
+  const reconciledActionIds = new Set<string>();
   for (const action of actions) {
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
     if (typeof runId !== "string") return blocked("source_missing", "The stopped run could not be identified. Your message is saved.");
@@ -232,14 +233,20 @@ export async function admitExplicitNativeContinuation(input: {
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       const neverStarted = await isNeverStartedLegacyRun(db, run, coordinator);
-      // An accepted decision is stop evidence only for this action's exact source.
+      // An accepted decision is stop evidence for its exact source run, whichever hold recorded it.
       // It never waives current process ownership, controller or cleanup gates.
+      const pendingReconciliations = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+        sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+        sql`coalesce(${issueRecoveryActions.evidence}->>'continuationDelivery', 'pending') = 'pending'`,
+      )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
+      const reconciledAction = pendingReconciliations[0];
       const reconciliation = z.object({
         runId: z.literal(run.id), providerStopped: z.literal(true),
         actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
         outcomeEvidence: z.string().trim().min(20),
         actorId: z.string().trim().min(1), recordedAt: z.string().datetime(),
-      }).safeParse(action.evidence.executionReconciliation);
+      }).safeParse(reconciledAction?.evidence.executionReconciliation);
       const reconciledAt = reconciliation.success ? new Date(reconciliation.data.recordedAt) : null;
       const [laterLaunch] = reconciledAt ? await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
         eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id),
@@ -247,9 +254,10 @@ export async function admitExplicitNativeContinuation(input: {
         inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded",
           "adapter.invoke", "harness.ready", "session.started", "session.resumed", "turn.started"]),
       )).limit(1) : [];
-      const reconciled = action.status === "resolved" && action.kind === "active_run_watchdog" &&
-        action.returnOwnerAgentId === agentId && reconciledAt && reconciledAt >= run.finishedAt! &&
+      const reconciled = reconciledAction?.status === "resolved" && reconciledAction.kind === "active_run_watchdog" &&
+        reconciledAction.returnOwnerAgentId === agentId && reconciledAt && reconciledAt >= run.finishedAt! &&
         !laterLaunch && (!run.processStartedAt || run.processStartedAt <= reconciledAt);
+      if (reconciled && reconciledAction) for (const row of pendingReconciliations) reconciledActionIds.add(row.id);
       if (!unusedAdmission && !cancelledStartup && !neverStarted) {
         // A missing process identity alone is not evidence that a provider exited.
         if (!run.processPid && !run.processGroupId && !reconciled &&
@@ -325,6 +333,10 @@ export async function admitExplicitNativeContinuation(input: {
       },
     }).where(eq(issueRecoveryActions.id, action.id));
   }
+  if (reconciledActionIds.size) await db.update(issueRecoveryActions).set({
+    evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"delivered"}'::jsonb`,
+  }).where(and(eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.id, [...reconciledActionIds]),
+    sql`coalesce(${issueRecoveryActions.evidence}->>'continuationDelivery', 'pending') = 'pending'`));
   await persistActivity(db, { companyId, actorType: "user", actorId,
     action: "issue.execution_recovery_settled", entityType: "issue", entityId: issueId,
     details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
