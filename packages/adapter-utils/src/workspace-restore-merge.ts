@@ -653,11 +653,43 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
+const PROTECTED_CHILDREN_ERROR_CODE = "workspace_restore_protected_children";
+
+// Refuses to replace `relative` when it holds a path the restore must never
+// touch. The merge captures the target without its excluded paths, so it cannot
+// see them when a replaced directory is removed with everything below it.
+async function assertNoProtectedChildren(
+  targetDir: string,
+  relative: string,
+  protectedPatterns: readonly string[],
+): Promise<void> {
+  const pending = [relative];
+  for (let current = pending.pop(); current !== undefined; current = pending.pop()) {
+    const entries = await fs.readdir(path.join(targetDir, current), { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const child = path.posix.join(current, entry.name);
+      if (shouldExcludePath(child, protectedPatterns)) {
+        throw Object.assign(
+          new Error(`Cannot replace ${relative}: it holds ${child}, which a restore never removes.`),
+          { code: PROTECTED_CHILDREN_ERROR_CODE },
+        );
+      }
+      if (entry.isDirectory()) pending.push(child);
+    }
+  }
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
+  /**
+   * Exclude patterns whose matches must survive the merge. A source entry that
+   * would replace a directory holding such a path fails before anything is
+   * applied, instead of deleting it.
+   */
+  protectedPatterns?: readonly string[];
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
@@ -677,6 +709,13 @@ export async function mergeDirectoryWithBaseline(input: {
         if (input.conflictPolicy === "reject") {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
+        }
+        if (input.protectedPatterns?.length) {
+          for (const [relative, entry] of orderedEntries(source)) {
+            if (entry.kind === "dir" || current.entries.get(relative)?.kind !== "dir") continue;
+            if (entriesMatch(input.baseline.entries.get(relative), entry)) continue;
+            await assertNoProtectedChildren(canonicalTargetDir, relative, input.protectedPatterns);
+          }
         }
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
