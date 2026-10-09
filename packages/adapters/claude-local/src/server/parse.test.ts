@@ -325,6 +325,20 @@ describe("detectClaudeLoginRequired login prompt scope", () => {
       loginUrl: "https://claude.ai/login",
     });
   });
+
+  it("does not classify a success result whose error field is set and whose answer repeats a login phrase", () => {
+    const parsed = { ...SUCCESSFUL_RESULT, error: "none", result: "Recipients that are unauthorized are rejected." };
+    expect(detectClaudeLoginRequired({ parsed, stdout: streamEvent(parsed), stderr: "" }).requiresLogin).toBe(false);
+  });
+
+  it("classifies a login prompt that spans lines inside one authentication_failed message", () => {
+    const stdout = streamEvent({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Invalid API key\n\nRun `claude login` to continue." }] },
+      error: "authentication_failed",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
 });
 
 describe("isClaudeModelNotFoundError", () => {
