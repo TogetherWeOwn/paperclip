@@ -2750,11 +2750,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, late.id)))[0].state).toBe("superseded");
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, unrelated.id)))[0].state).toBe("queued");
     });
-    it("links a gated GitHub check to the current vanity review page before a task exists", async () => {
+    it("uses a public PR URL for gated GitHub checks before a task exists", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
       const f = await reviewBotFixture();
-      const [company] = await db.select().from(companies).where(eq(companies.id, f.companyId));
       const head = "b".repeat(40);
       const event = githubAutomaticReviewEvent({
         action: "opened", installation: { id: 2468 },
@@ -2783,7 +2782,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await checks.processPending();
       expect(writes).toEqual([expect.objectContaining({
         status: "completed", conclusion: "action_required", head_sha: head,
-        details_url: `https://current-vanity.example/${company.issuePrefix}/apps/chat/${f.endpoint.id}/reviews`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/83",
       })]);
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
     });
@@ -2791,7 +2790,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
       const f = await reviewBotFixture();
-      const [company] = await db.select().from(companies).where(eq(companies.id, f.companyId));
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
         id: "github:paperclipai/paperclip:91",
@@ -2843,7 +2841,32 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         issueId: conversation.issueId,
         runId: run.id,
       };
-      expect(await githubBotToolsForSession(db, session)).toHaveLength(6);
+      const [storedSubmission] = await db.select().from(toolCatalogEntries).where(and(
+        eq(toolCatalogEntries.connectionId, f.endpoint.connectionId),
+        eq(toolCatalogEntries.toolName, "submit_review"),
+      ));
+      const oldSchema = structuredClone(storedSubmission.inputSchema) as {
+        properties: {
+          findings: { items: { properties: Record<string, unknown>; required: string[] } };
+          summary: { maxLength: number };
+        };
+      };
+      const oldFinding = oldSchema.properties.findings.items;
+      for (const field of ["title", "basePath", "evidence", "suggestion"])
+        delete oldFinding.properties[field];
+      oldFinding.required = oldFinding.required.filter((field: string) => field !== "title");
+      oldSchema.properties.summary.maxLength = 24000;
+      await db.update(toolCatalogEntries).set({
+        inputSchema: oldSchema, description: "Pre-deployment contract",
+      }).where(eq(toolCatalogEntries.id, storedSubmission.id));
+      const discovered = await githubBotToolsForSession(db, session);
+      expect(discovered).toHaveLength(6);
+      const submission = discovered.find((tool) => tool.upstreamToolName === "submit_review")!;
+      expect(submission.parametersSchema).toEqual(storedSubmission.inputSchema);
+      expect(submission.description).toContain("never format markdown");
+      await db.update(toolCatalogEntries).set({ status: "quarantined" }).where(eq(toolCatalogEntries.id, storedSubmission.id));
+      expect((await githubBotToolsForSession(db, session)).some((tool) => tool.upstreamToolName === "submit_review")).toBe(false);
+      await db.update(toolCatalogEntries).set({ status: "active" }).where(eq(toolCatalogEntries.id, storedSubmission.id));
       expect(
         await githubBotToolsForSession(db, { ...session, issueId: randomUUID() }),
       ).toHaveLength(0);
@@ -2858,7 +2881,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         }
       >();
       let head = "b".repeat(40);
-      let check = { id: 99, status: "completed", external_id: `${f.endpoint.id}:91:${head}`, app: { id: Number(f.endpoint.botExternalId) } };
+      const mergeBase = "e".repeat(40);
+      let targetTip = "a".repeat(40);
+      const reads: string[] = [];
+      let check = {
+        id: 99,
+        status: "completed",
+        external_id: `${f.endpoint.id}:91:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://internal.example/reviews",
+      };
+      let duplicateCheck: typeof check = {
+        ...check,
+        id: 98,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
+      };
       const pull = () => ({
         number: 91,
         title: "Test PR",
@@ -2866,7 +2903,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "open",
         draft: false,
         head: { sha: head },
-        base: { sha: "a".repeat(40), ref: "master" },
+        base: { sha: targetTip, ref: "master" },
         user: { id: 42, login: "octocat", type: "User" },
         labels: [],
       });
@@ -2884,7 +2921,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             id,
             html_url: `https://github.com/test/receipt/${mutations.length}`,
           };
-          if (url.includes("/check-runs")) check = { ...check, id, status: String(body.status) };
+          if (url.includes("/check-runs"))
+            check = {
+              ...check,
+              id,
+              ...(body.status !== undefined
+                ? { status: String(body.status) }
+                : {}),
+              ...(body.details_url !== undefined
+                ? { details_url: String(body.details_url) }
+                : {}),
+            };
           if (
             url.endsWith("/issues/91/comments") ||
             url.includes("/issues/comments/")
@@ -2897,11 +2944,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           }
           return Response.json(receipt);
         }
+        reads.push(url);
+        if (url.includes("/contents/"))
+          return Response.json({ content: "base-content", encoding: "base64", sha: mergeBase, size: 12 });
         if (url.includes("/issues/91/comments?"))
           return Response.json([...comments.values()]);
         if (url.endsWith("/pulls/91")) return Response.json(pull());
         if (url.includes("/compare/"))
           return Response.json({
+            merge_base_commit: { sha: mergeBase },
             status: "ahead",
             total_commits: 1,
             files: [
@@ -2917,7 +2968,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           return Response.json([
             {
               filename: "src/math.ts",
-              status: "modified",
+              previous_filename: "src/old-math.ts",
+              status: "renamed",
               patch:
                 head === "b".repeat(40)
                   ? "@@ -1 +1 @@\n-return a + b\n+return a - b"
@@ -2927,13 +2979,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             },
           ]);
         if (url.includes("/check-runs?"))
-          return Response.json({ check_runs: [check] });
+          return Response.json({
+            check_runs:
+              check.details_url === "https://current-vanity.example/reviews"
+                ? [duplicateCheck, check]
+                : [check],
+          });
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", {
+      expect(await service.execute(session, "read_pull_request", {
         section: "metadata",
-      });
+      })).toMatchObject({ diffBaseSha: mergeBase });
+      await service.execute(session, "read_file", { path: "src/old-math.ts", revision: "base" });
+      expect(reads.at(-1)).toContain(`/contents/src/old-math.ts?ref=${mergeBase}`);
       // Merely discussing or inspecting a PR must not invalidate its rating.
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
       expect(mutations).toHaveLength(0);
@@ -2945,10 +3004,47 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         url: "https://api.github.com/repos/paperclipai/paperclip/check-runs",
         body: {
           status: "in_progress", external_id: `${f.endpoint.id}:91:${head}`,
-          details_url: `https://current-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
         },
       });
       expect(mutations.at(-1)?.body).not.toHaveProperty("conclusion");
+      const [checkAction] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, f.endpoint.id),
+            eq(chatActions.kind, "github_review_check"),
+          ),
+        );
+      const actionResult = checkAction.result as Record<string, unknown>;
+      await db
+        .update(chatActions)
+        .set({ result: { ...actionResult, retryAt: null } })
+        .where(eq(chatActions.id, checkAction.id));
+      const existingCheckId = check.id;
+      const existingCheckStatus = check.status;
+      check = {
+        ...check,
+        details_url: "https://current-vanity.example/reviews",
+      };
+      const mutationCount = mutations.length;
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      expect(mutations).toHaveLength(mutationCount + 1);
+      expect(mutations.at(-1)).toMatchObject({
+        url: `https://api.github.com/repos/paperclipai/paperclip/check-runs/${existingCheckId}`,
+        body: {
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
+        },
+      });
+      const [reconciledCheckAction] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, checkAction.id));
+      expect(
+        (reconciledCheckAction.result as Record<string, unknown>).state,
+      ).toBe(actionResult.state);
+      expect(check.status).toBe(existingCheckStatus);
       const assessment = {
         reviewedCommit: head,
         score: 2,
@@ -2956,7 +3052,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         summary: "Addition subtracts",
         rationale: "Returning a minus b is incorrect.",
         coverage: {
-          reviewedPaths: ["src/math.ts"],
+          reviewedPaths: ["src/math.ts", "src/old-math.ts"],
           omittedPaths: [],
           limitations: [],
         },
@@ -2968,10 +3064,26 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             side: "RIGHT",
             severity: "error",
             category: "correctness",
+            title: "Incorrect operator",
             body: "Use addition.",
+          },
+          {
+            key: "removed-addition",
+            path: "src/math.ts",
+            basePath: "src/old-math.ts",
+            line: 1,
+            side: "LEFT",
+            severity: "error",
+            category: "correctness",
+            title: "Removed addition",
+            body: "The previous filename contained the correct addition.",
           },
         ],
       };
+      await expect(service.execute(session, "submit_review", {
+        ...assessment,
+        findings: [{ ...assessment.findings[1], basePath: "src/math.ts" }],
+      })).rejects.toThrow("basePath must match GitHub's base filename");
       const result = await service.execute(
         session,
         "submit_review",
@@ -2989,15 +3101,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ),
         );
       expect(publication.status).toBe("processed");
-      expect(
-        mutations.find((m) => m.body.conclusion === "failure")?.body,
-      ).toMatchObject({
+      const leftComment = mutations.find((mutation) => mutation.body.side === "LEFT");
+      expect(leftComment?.body.body).toContain(`blob/${mergeBase}/src/old-math.ts`);
+      expect(leftComment?.body.body).not.toContain(`blob/${targetTip}/src/old-math.ts`);
+      expect(leftComment?.body.body).not.toContain(`blob/${head}/src/math.ts`);
+      const [submittedReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id));
+      expect(submittedReview.event.diffBaseSha).toBe(mergeBase);
+      const failedCheck = mutations.find(
+        (m) => m.body.conclusion === "failure",
+      )?.body;
+      expect(failedCheck).toMatchObject({
         name: "Paperclip Review",
         head_sha: head,
         conclusion: "failure",
-        details_url: `https://current-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
       });
       const publishedCount = mutations.length;
+      targetTip = "f".repeat(40);
       const retried = await service.execute(
         session,
         "submit_review",
@@ -3006,6 +3126,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
       expect(retried).toMatchObject({ status: "processed", score: 2 });
       expect(mutations).toHaveLength(publishedCount);
+      expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, submittedReview.id)))[0].event.diffBaseSha).toBe(mergeBase);
       const boundThreads = await db.select().from(chatConversations).where(eq(chatConversations.endpointId, f.endpoint.id));
       const findingThread = boundThreads.find((row) => row.externalThreadId.includes(":rc:"))!;
       expect(findingThread).toMatchObject({
@@ -3099,11 +3220,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         score: 5,
         conclusion: "success",
       });
-      expect(
-        mutations.filter((m) => m.url.endsWith("/check-runs")).at(-1)?.body,
-      ).toMatchObject({
+      const successfulCheck = mutations
+        .filter((m) => m.url.endsWith("/check-runs"))
+        .at(-1)?.body;
+      expect(successfulCheck).toMatchObject({
         head_sha: head, conclusion: "success",
-        details_url: `https://renamed-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
       });
       expect(comments.size).toBe(1);
       expect([...comments.values()][0]?.body).toContain("Addition is correct");

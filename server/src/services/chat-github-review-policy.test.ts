@@ -11,6 +11,7 @@ import {
   githubReviewSchedulingDecision,
   matchesGitHubReviewPattern,
   validateGitHubReviewAssessment,
+  validatePersistedGitHubReviewAssessment,
 } from "./chat-github-review-policy.js";
 
 const context: GitHubReviewEventContext = {
@@ -203,6 +204,38 @@ describe("GitHub score validation", () => {
     invalid.coverage.limitations = ["x".repeat(257)];
     expect(() => validateGitHubReviewAssessment(invalid, context.headSha, defaultGitHubReviewPolicy()))
       .toThrow(expect.objectContaining({ status: 400, message: expect.stringContaining("coverage.limitations.0") }));
+  });
+  it("accepts queued pre-template assessments when publication retries", () => {
+    const policy = defaultGitHubReviewPolicy();
+    const category = policy.findingCategories[0];
+    if (!category) throw new Error("Expected a default finding category.");
+    const legacy = {
+      ...assessment(),
+      summary: "s".repeat(2001),
+      findings: [
+        {
+          key: "legacy",
+          path: "src/a.ts",
+          line: 1,
+          side: "LEFT" as const,
+          severity: "warning" as const,
+          category,
+          body: "The old persisted finding has no title.",
+        },
+      ],
+    };
+    expect(() =>
+      validateGitHubReviewAssessment(legacy, context.headSha, policy),
+    ).toThrow(expect.objectContaining({ status: 400 }));
+
+    const published = validatePersistedGitHubReviewAssessment(
+      legacy,
+      context.headSha,
+      policy,
+    );
+    expect(published.summary).toBe(legacy.summary);
+    expect(published.findings[0]?.title).toBe(category);
+    expect(published.findings[0]?.basePath).toBeUndefined();
   });
   it("incomplete reviews never pass even at 5/5 or report-only", () => {
     expect(
