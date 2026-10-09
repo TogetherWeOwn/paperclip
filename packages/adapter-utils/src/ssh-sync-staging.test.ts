@@ -19,6 +19,11 @@ import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 const FAKE_SSH = `#!/bin/sh
 for last; do :; done
 printf '%s\\n---\\n' "$last" >> "$FAKE_SSH_LOG"
+if [ -n "$FAKE_SSH_HOOK_MATCH" ] && printf '%s' "$last" | grep -q -F -- "$FAKE_SSH_HOOK_MATCH"; then
+  sh -c "$FAKE_SSH_HOOK"
+  echo "injected ssh failure" >&2
+  exit 1
+fi
 if [ -n "$FAKE_REMOTE_PATH" ]; then
   last=$(printf '%s' "$last" | sed "s|exec sh -c '|exec sh -c 'PATH=$FAKE_REMOTE_PATH:\\$PATH; |")
 fi
@@ -386,6 +391,75 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
     expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("local\n");
     expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
+  });
+
+  it("keeps a local nested worktree inside a project repository", async () => {
+    await writeTree(localDir, { "src/app.ts": "export const app = 1;\n" });
+    await git(localDir, ["init", "-q", "-b", "main"]);
+    await git(localDir, ["add", "src"]);
+    await git(localDir, ["commit", "-q", "-m", "init"]);
+    const repository = path.join(localDir, ".paperclip-repositories/app");
+    await writeTree(repository, { "README.md": "repository\n" });
+    await git(repository, ["init", "-q", "-b", "main"]);
+    await git(repository, ["add", "-A"]);
+    await git(repository, ["commit", "-q", "-m", "init"]);
+    // Untracked and never uploaded, so only the repository baseline exclude keeps
+    // the restore from reading it as a deletion on the remote.
+    await writeTree(repository, { ".claude/worktrees/wt/f.txt": "local worktree\n" });
+
+    const prepared = await prepare();
+    await writeFile(path.join(prepared.workspaceRemoteDir, ".paperclip-repositories/app/README.md"), "edited remotely\n");
+    await prepared.restoreWorkspace();
+
+    expect(await readFile(path.join(repository, "README.md"), "utf8")).toBe("edited remotely\n");
+    expect(await readFile(path.join(repository, ".claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
+  });
+
+  async function localTreeWithCustomWorktree(): Promise<void> {
+    await writeTree(localDir, {
+      "custom/keep.txt": "local\n",
+      "custom/wt/f.txt": "local worktree\n",
+      "other.txt": "local\n",
+    });
+  }
+
+  async function expectCustomWorktreeUntouched(): Promise<void> {
+    expect(await readFile(path.join(localDir, "custom/wt/f.txt"), "utf8")).toBe("local worktree\n");
+    expect(await readFile(path.join(localDir, "custom/keep.txt"), "utf8")).toBe("local\n");
+    expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
+  }
+
+  async function replaceCustomWithFile(remote: string): Promise<void> {
+    await rm(path.join(remote, "custom"), { recursive: true });
+    await writeFile(path.join(remote, "custom"), "now a file\n");
+    await writeFile(path.join(remote, "other.txt"), "remote\n");
+  }
+
+  it("protects a custom nestedWorktreeDirs list when the remote replaces its parent directory", async () => {
+    await localTreeWithCustomWorktree();
+    const prepared = await prepare({ nestedWorktreeDirs: ["custom/wt"] });
+    await replaceCustomWithFile(prepared.workspaceRemoteDir);
+
+    await expect(prepared.restoreWorkspace()).rejects.toMatchObject({ code: "workspace_restore_protected_children" });
+
+    await expectCustomWorktreeUntouched();
+  });
+
+  it("protects a custom nestedWorktreeDirs list in the restore that follows a failed asset upload", async () => {
+    await localTreeWithCustomWorktree();
+    const assetDir = path.join(root, "asset");
+    await writeTree(assetDir, { "a.txt": "asset\n" });
+    // The remote changes after the workspace upload, then the asset upload fails.
+    const hook = `rm -rf '${remoteCwd}/.paperclip-runtime/runs/run-1/workspace/custom' && printf 'now a file\\n' > '${remoteCwd}/.paperclip-runtime/runs/run-1/workspace/custom'`;
+    vi.stubEnv("FAKE_SSH_HOOK_MATCH", "failing-asset-marker");
+    vi.stubEnv("FAKE_SSH_HOOK", hook);
+
+    await expect(prepare({
+      nestedWorktreeDirs: ["custom/wt"],
+      assets: [{ key: "failing-asset-marker", localDir: assetDir }],
+    })).rejects.toMatchObject({ code: "workspace_restore_protected_children" });
+
+    await expectCustomWorktreeUntouched();
   });
 
   itWithGnuDu("sizes the free-space check by what will be restored, not by excluded paths", async () => {
