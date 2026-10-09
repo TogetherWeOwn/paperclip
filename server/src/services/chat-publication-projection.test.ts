@@ -341,6 +341,28 @@ describe("scrubInternalReferences", () => {
     expect(scrubInternalReferences(text, scope)).toBe(text);
   });
 
+  it("removes an internal host after a word and slash when no URL scheme precedes it", () => {
+    expect(
+      scrubInternalReferences(
+        "see docs/board.example.invalid/ACME/issues/42, ops/board.example.invalid and /data/board.example.invalid/logs",
+        scope,
+      ),
+    ).toBe(
+      "see docs/[internal link removed], ops/[internal link removed] and /data/[internal link removed]",
+    );
+  });
+
+  it("removes an internal host after a scheme-less URL token but keeps it after a schemed one", () => {
+    expect(
+      scrubInternalReferences(
+        "a.example.com/board.example.invalid and (https://example.com/p/board.example.invalid/x)",
+        scope,
+      ),
+    ).toBe(
+      "a.example.com/[internal link removed] and (https://example.com/p/board.example.invalid/x)",
+    );
+  });
+
   it("removes an internal host written after a leading or space-separated slash", () => {
     expect(
       scrubInternalReferences("see /board.example.invalid/x and /board.example.invalid", scope),

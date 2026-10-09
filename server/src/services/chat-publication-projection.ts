@@ -330,6 +330,22 @@ function isInternalUrl(candidate: string, hosts: ReadonlySet<string>): boolean {
   return hostname !== null && hosts.has(hostname);
 }
 
+// Text before a match that ends inside an external URL's path, such as
+// `https://example.com/a/`. Scanned over a bounded tail so long tokens stay linear.
+const INSIDE_URL_PATH_RE = /(?:^|[\s(<[])[a-z][a-z0-9+.-]*:\/\/[^\s<>()[\]]*\/$/i;
+const INSIDE_URL_LOOKBACK = 2048;
+
+/**
+ * An internal host that is a path segment of another URL is part of that link,
+ * not a link to this runtime. Only URLs with a scheme qualify: `docs/<host>` is
+ * prose and is still scrubbed.
+ */
+function isPathSegmentOfExternalUrl(text: string, offset: number): boolean {
+  return INSIDE_URL_PATH_RE.test(
+    text.slice(Math.max(0, offset - INSIDE_URL_LOOKBACK), offset),
+  );
+}
+
 const LOOPBACK_HOSTNAME_RE =
   /^(?:localhost|[a-z0-9-]+\.localhost|127(?:\.\d{1,3}){3}|\[::1\])$/;
 
@@ -338,10 +354,9 @@ function bareInternalHostPattern(hosts: ReadonlySet<string>): RegExp | null {
     .filter((host) => !LOOPBACK_HOSTNAME_RE.test(host))
     .sort((a, b) => b.length - a.length)
     .map((host) => host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  // A host right after a path slash is a segment of another URL, not a link to it.
   return alternatives.length
     ? new RegExp(
-        `(?<![A-Za-z0-9.-])(?<![A-Za-z0-9._~%-]/)(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
+        `(?<![A-Za-z0-9.-])(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
         "gi",
       )
     : null;
@@ -387,10 +402,16 @@ export function scrubInternalReferences(
   });
   const bareHosts = bareInternalHostPattern(hosts);
   if (bareHosts)
-    output = output.replace(bareHosts, (match) => {
-      const [, trailing] = splitTrailingUrlPunctuation(match);
-      return `${INTERNAL_LINK_REMOVED}${trailing}`;
-    });
+    output = output.replace(
+      bareHosts,
+      (match, ...rest: unknown[]) => {
+        const offset = rest[rest.length - 2] as number;
+        const whole = rest[rest.length - 1] as string;
+        if (isPathSegmentOfExternalUrl(whole, offset)) return match;
+        const [, trailing] = splitTrailingUrlPunctuation(match);
+        return `${INTERNAL_LINK_REMOVED}${trailing}`;
+      },
+    );
   return trackers ? output.replace(trackers, INTERNAL_REFERENCE) : output;
 }
 
