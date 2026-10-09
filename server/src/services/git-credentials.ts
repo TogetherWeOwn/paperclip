@@ -471,6 +471,8 @@ export async function resolveManagedGitHubCredential(
     responsibleUserId?: string | null;
     agentId?: string | null;
     allowStandingDelegation?: boolean;
+    allowRefresh?: boolean;
+    allowAlternate?: boolean;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
@@ -491,7 +493,7 @@ export async function resolveManagedGitHubCredential(
     const refreshedAt = grant.providerTenant?.oauth?.refreshedAt;
     const expiryMs = typeof expiresAt === "string" ? Date.parse(expiresAt) : Number.NaN;
     const refreshedMs = typeof refreshedAt === "string" ? Date.parse(refreshedAt) : Number.NaN;
-    if (Number.isFinite(expiryMs) && (
+    if (context.allowRefresh !== false && Number.isFinite(expiryMs) && (
       expiryMs <= Date.now() + 60 * 60_000
       || !Number.isFinite(refreshedMs)
       || refreshedMs <= Date.now() - 30 * 24 * 60 * 60_000
@@ -565,7 +567,9 @@ export async function resolveManagedGitHubCredential(
   } catch {
     failure = { configured: true, identitySource: selection.identitySource, error: "GitHub credentials are temporarily unavailable" };
   }
-  // Retry credential acquisition, never the GitHub operation. An alternate
+  // Runtime diagnostics do not retry a failed credential resolution with a different grant.
+  if (context.allowAlternate === false) return failure;
+  // Other callers may retry credential acquisition, never the GitHub operation. An alternate
   // authorization must still belong to this exact principal and account.
   const alternate = await resolveManagedGitHubIdentitySelection(db, companyId, {
     ...context, excludeGrantId: selection.grant.id,

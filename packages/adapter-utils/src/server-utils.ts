@@ -4715,6 +4715,14 @@ export async function runChildProcess(
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    /**
+     * Default true: the child starts from the server's environment minus the
+     * server-secret denylist, then `env` is merged over it. Set false to start
+     * from an empty environment so the child sees exactly `env` (plus a default
+     * PATH when `env` has none). Used by agents that read untrusted input and
+     * must not inherit anything by ambient name.
+     */
+    inheritServerEnv?: boolean;
   },
 ): Promise<RunProcessResult> {
   const onLogError =
@@ -4725,7 +4733,7 @@ export async function runChildProcess(
       env: prunedRawMerged,
       dropped: droppedEnvKeys,
     } = pruneOversizedLaunchEnvWithReport({
-      ...sanitizeInheritedPaperclipEnv(process.env),
+      ...(opts.inheritServerEnv === false ? {} : sanitizeInheritedPaperclipEnv(process.env)),
       ...opts.env,
     });
     if (droppedEnvKeys.length) {

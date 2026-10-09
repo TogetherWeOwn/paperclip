@@ -85,6 +85,7 @@ import {
   environmentLeases,
   principalPermissionGrants,
   toolConnections,
+  environments,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
@@ -132,6 +133,7 @@ import {
 } from "../services/chat-teams-personal-recipient.js";
 import * as discordQuestionForms from "../services/chat-discord-question-forms.js";
 import { issueService } from "../services/issues.js";
+import { environmentService } from "../services/environments.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -2294,6 +2296,57 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
       ).toMatchObject({ ok: false });
     });
+    it("counts the instance low-trust sandbox designation when verifying a low-trust bot agent", async () => {
+      const f = await reviewBotFixture();
+      await db
+        .update(agents)
+        .set({ permissions: { trustPreset: "low_trust_review" } })
+        .where(eq(agents.id, f.assignedAgentId));
+      const permissions = {
+        contents: "read",
+        issues: "write",
+        metadata: "read",
+        pull_requests: "write",
+        checks: "write",
+      };
+      f.setAppAccess({
+        permissions,
+        events: ["issue_comment", "pull_request_review_comment", "pull_request"],
+      });
+      f.setSupplementalProviderFetch(async (input) =>
+        String(input).endsWith("/app/installations/2468")
+          ? Response.json({ permissions, suspended_at: null })
+          : undefined,
+      );
+      const settings = instanceSettingsService(db);
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+      const isolation = async () =>
+        (await f.management.verification(f.endpoint.id)).checks.find(
+          (check) => check.key === "isolation",
+        );
+      try {
+        // No binding and no designation: the agent resolves to local.
+        expect(await isolation()).toMatchObject({ ok: false });
+        const sandbox = await environmentService(db).create({
+          name: `low-trust-sandbox-${randomUUID()}`,
+          driver: "sandbox",
+          config: { provider: "exe-dev", reuseLease: false },
+        });
+        await settings.updateGeneral({
+          lowTrustSandboxEnvironmentId: sandbox.id,
+        });
+        expect(await isolation()).toMatchObject({ ok: true });
+        // A designation that retains its VM is unusable at run time, so setup
+        // must not report ready either.
+        await db
+          .update(environments)
+          .set({ config: { provider: "exe-dev", reuseLease: true } })
+          .where(eq(environments.id, sandbox.id));
+        expect(await isolation()).toMatchObject({ ok: false });
+      } finally {
+        await settings.updateGeneral({ lowTrustSandboxEnvironmentId: null });
+      }
+    });
     it("keeps GitHub publication I/O outside transactions and fences an expired owner's receipt", async () => {
       const f = await reviewBotFixture();
       const scope = {
@@ -2419,6 +2472,58 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
         "owner-user",
       );
+      // Low-trust model credential boundary: the assigned review agent holds
+      // one model binding plus one non-model binding, and a second agent holds
+      // its own model binding. Only the assigned agent's model binding may
+      // land on the persisted boundary.
+      const [modelSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-model-${randomUUID()}`,
+          name: `Low trust model ${randomUUID()}`,
+        })
+        .returning();
+      const [ghSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-gh-${randomUUID()}`,
+          name: `Low trust gh ${randomUUID()}`,
+        })
+        .returning();
+      const [otherModelSecret] = await db
+        .insert(companySecrets)
+        .values({
+          companyId: f.companyId,
+          key: `low-trust-other-model-${randomUUID()}`,
+          name: `Low trust other model ${randomUUID()}`,
+        })
+        .returning();
+      const [modelBinding] = await db
+        .insert(companySecretBindings)
+        .values({
+          companyId: f.companyId,
+          secretId: modelSecret.id,
+          targetType: "agent",
+          targetId: f.assignedAgentId,
+          configPath: "env.ANTHROPIC_AUTH_TOKEN",
+        })
+        .returning();
+      await db.insert(companySecretBindings).values({
+        companyId: f.companyId,
+        secretId: ghSecret.id,
+        targetType: "agent",
+        targetId: f.assignedAgentId,
+        configPath: "env.GH_TOKEN",
+      });
+      await db.insert(companySecretBindings).values({
+        companyId: f.companyId,
+        secretId: otherModelSecret.id,
+        targetType: "agent",
+        targetId: f.replacementAgentId,
+        configPath: "env.ANTHROPIC_AUTH_TOKEN",
+      });
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
         id: "github:paperclipai/paperclip:94",
@@ -2464,6 +2569,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           allowedAgentIds: [f.assignedAgentId],
         },
       });
+      // The persisted boundary carries exactly the assigned review agent's
+      // model binding: the same-agent GH_TOKEN and the other agent's model
+      // binding stay refused.
+      const boundaryIds = (
+        task.executionPolicy as unknown as {
+          authorizationPolicy?: {
+            trustBoundary?: { allowedSecretBindingIds?: unknown };
+          };
+        }
+      )?.authorizationPolicy?.trustBoundary?.allowedSecretBindingIds;
+      expect(boundaryIds).toEqual([modelBinding.id]);
       const [run] = await db
         .insert(heartbeatRuns)
         .values({
@@ -16017,6 +16133,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.configure(endpoint.id, { action: "verify" }, "owner-user");
     const callbacks = runtime.configurations.get(endpoint.id)?.callbacks;
     if (!callbacks) throw new Error("Expected endpoint callbacks");
+    fixtureServices.add(service);
     const slackTimestamp = (milliseconds: number) =>
       `${Math.floor(Date.parse("2026-09-05T17:50:03.000Z") / 1_000)}.${String(milliseconds * 1_000).padStart(6, "0")}`;
     const thread = makeThread({
@@ -16113,6 +16230,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       publicBaseUrl: "https://paperclip.example",
       runtime: new FakeChatSdkRuntime() as unknown as ChatSdkRuntime,
     });
+    fixtureServices.add(competingService);
     deferred.shift()?.();
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
@@ -16128,13 +16246,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
+    // Eight serial delivery transactions can exceed waitFor's default 1s
+    // under CI load. Keep the complete batch assertion with a bounded wait.
     await vi.waitFor(async () => {
       const rows = await db
         .select({ id: issueComments.id })
         .from(issueComments)
         .where(eq(issueComments.issueId, conversation.issueId));
       expect(rows).toHaveLength(8);
-    });
+    }, { timeout: 10_000 });
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)

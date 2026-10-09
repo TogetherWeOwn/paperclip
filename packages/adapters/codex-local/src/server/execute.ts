@@ -106,6 +106,7 @@ import {
   createCodexAcpExecutor,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
+import { isIsolatedRuntime, isolatedRuntimeEnv } from "./isolated-runtime.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -634,6 +635,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const isolateRuntime = isIsolatedRuntime(config);
+  if (isolateRuntime && executionTargetIsRemote) {
+    // The sandbox and SSH lanes add their own bridge and credential env after
+    // this point; isolation cannot vouch for what they carry.
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_isolation_unsupported",
+      errorMessage:
+        "adapterConfig.isolateRuntime is only supported for local execution targets; refusing to start a remote run without it.",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
+  }
   let configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -747,25 +764,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  // Ends this run's hold on the managed MCP block in config.toml (see
+  // writeManagedCodexMcpConfig). Called from the outer `finally`, so the run
+  // JWT and gateway bearers it carries never outlive the run on disk.
+  let releaseManagedMcpConfig: (() => Promise<void>) | null = null;
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
     }
     const paperclipBaseEnv = buildPaperclipEnv(agent);
-    const runtimeMcpGateways = (ctx.runtimeMcp?.getServers() ?? []).map((server) => ({
-      name: server.name,
-      endpointPath: server.url,
-      bearerToken: server.token,
-    }));
-    const managedMcpGateways = mergeManagedCodexMcpGateways(
-      runtimeMcpGateways,
-      managedMcpGatewaysFromContext(context),
-    );
+    // An isolated run gets no MCP gateway whatever the heartbeat delivered. The
+    // empty list still goes through the writer below, which strips any managed
+    // block an earlier run left in this home.
+    const runtimeMcpGateways = isolateRuntime
+      ? []
+      : (ctx.runtimeMcp?.getServers() ?? []).map((server) => ({
+          name: server.name,
+          endpointPath: server.url,
+          bearerToken: server.token,
+        }));
+    const managedMcpGateways = isolateRuntime
+      ? []
+      : mergeManagedCodexMcpGateways(
+          runtimeMcpGateways,
+          managedMcpGatewaysFromContext(context),
+        );
     const managedMcp = await writeManagedCodexMcpConfig({
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
+      // A user-supplied CODEX_HOME is not ours to clean up.
+      scrubOnRelease: isManagedCodexHomePath(process.env, agent.companyId, effectiveCodexHome),
     });
+    releaseManagedMcpConfig = managedMcp.release;
     if (managedMcpGateways.length > 0) {
       await onLog(
         "stdout",
@@ -966,7 +997,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
     }
     env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
-    if (authToken) {
+    if (authToken && !isolateRuntime) {
       env.PAPERCLIP_API_KEY = authToken;
     }
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
@@ -984,6 +1015,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (paperclipBridge) {
         Object.assign(env, paperclipBridge.env);
       }
+    }
+    // Read before an isolated run narrows `env`: it shapes the sandbox args, not the child's env.
+    const runnerNetworkAccess = env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled";
+    if (isolateRuntime) {
+      // The child is spawned with `inheritServerEnv: false`, so this is its whole
+      // environment. Replace in place: `env` is also what `adapter.invoke` logs.
+      const kept = isolatedRuntimeEnv(env);
+      for (const key of Object.keys(env)) delete env[key];
+      Object.assign(env, kept);
+      await onLog(
+        "stdout",
+        `[paperclip] isolateRuntime: Codex environment limited to ${Object.keys(env).length} variable(s); no MCP gateways; no run token in the process.\n`,
+      );
     }
     const effectiveEnv = Object.fromEntries(
       Object.entries({ ...process.env, ...env }).filter(
@@ -1225,7 +1269,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
-          networkAccess: env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
+          networkAccess: runnerNetworkAccess,
         },
       );
       const args = execArgs.args;
@@ -1341,6 +1385,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runLogTail: paperclipBridge?.runLogTail,
           settleRunDisposition: paperclipBridge?.settleRunDisposition,
           localProcessSandbox,
+          inheritServerEnv: !isolateRuntime,
         });
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
@@ -1628,6 +1673,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
-    await preparedRuntimeConfig.cleanup();
+    try {
+      await preparedRuntimeConfig.cleanup();
+    } finally {
+      // After the provider-config restore above, which rewrites config.toml from
+      // its pre-run copy, so a stale MCP block cannot be restored behind us.
+      if (releaseManagedMcpConfig) {
+        await releaseManagedMcpConfig().catch(async (error) => {
+          await onLog(
+            "stderr",
+            `[paperclip] Failed to remove the managed MCP block from the Codex config: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+          );
+        });
+      }
+    }
   }
 }

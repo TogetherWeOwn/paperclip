@@ -32,7 +32,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
@@ -269,6 +269,14 @@ const exposurePortPairClaims = new ExposurePortPairClaims();
  */
 const OPEN_EXECUTION_WORKSPACE_LEASE_STATUSES = ["active", "idle", "in_review"] as const;
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+/**
+ * `git worktree list --porcelain` grows with every registered linked worktree
+ * (about 380 bytes each), so a repository with many execution worktrees
+ * outgrows the diagnostic capture cap. This bound is still finite, but sized
+ * for tens of thousands of entries; output past it is an error, not a
+ * silently shortened list.
+ */
+const GIT_WORKTREE_LIST_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
 export const WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS = 32;
 const ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES = ["provisioning", "starting", "running"] as const;
 const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.sock";
@@ -825,21 +833,27 @@ function trimToLastBytes(value: string, limit: number) {
 function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator {
   const limit = Math.max(1, Math.trunc(maxBytes));
   let text = "";
+  let textBytes = 0;
   let truncated = false;
   let totalBytes = 0;
 
   return {
     append(chunk: string) {
       if (!chunk) return;
-      totalBytes += Buffer.byteLength(chunk, "utf8");
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      totalBytes += chunkBytes;
 
-      const combined = text + chunk;
-      if (Buffer.byteLength(combined, "utf8") <= limit) {
-        text = combined;
+      // Track the retained size incrementally so a large, still-under-limit
+      // capture is not re-measured (and its concatenation re-flattened) on
+      // every chunk.
+      if (textBytes + chunkBytes <= limit) {
+        text += chunk;
+        textBytes += chunkBytes;
         return;
       }
 
-      text = trimToLastBytes(combined, limit);
+      text = trimToLastBytes(text + chunk, limit);
+      textBytes = Buffer.byteLength(text, "utf8");
       truncated = true;
     },
     finish(): ProcessOutputCapture {
@@ -909,15 +923,43 @@ async function executeProcess(input: {
   };
 }
 
-async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+/**
+ * A git command succeeded but its stdout did not fit the capture bound, so the
+ * retained text is a partial tail. Callers parse stdout as data, and a partial
+ * list reads as a complete one, so this is an error rather than a result.
+ */
+class GitOutputTruncatedError extends Error {
+  readonly limitBytes: number;
+  readonly totalBytes: number;
+
+  constructor(input: { limitBytes: number; totalBytes: number }) {
+    super(
+      `git output exceeded the ${input.limitBytes}-byte capture limit (${input.totalBytes} bytes total); refusing to use a truncated result`,
+    );
+    this.name = "GitOutputTruncatedError";
+    this.limitBytes = input.limitBytes;
+    this.totalBytes = input.totalBytes;
+  }
+}
+
+async function runGit(
+  args: string[],
+  cwd: string,
+  opts?: { env?: NodeJS.ProcessEnv; maxStdoutBytes?: number },
+): Promise<string> {
+  const limitBytes = opts?.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES;
   const proc = await executeProcess({
     command: "git",
     args,
     cwd,
     env: opts?.env,
+    maxStdoutBytes: limitBytes,
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  if (proc.stdoutTruncated) {
+    throw new GitOutputTruncatedError({ limitBytes, totalBytes: proc.stdoutBytes });
   }
   return proc.stdout.trim();
 }
@@ -976,13 +1018,18 @@ export async function refreshRemoteTrackingBaseRef(
 
   const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
   try {
-    await runGit([
-      ...(auth?.configArgs ?? []),
-      "fetch",
-      "--prune",
-      remoteTracking.remote,
-      `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
-    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
+    await recordGitOperation(null, {
+      phase: "worktree_prepare",
+      args: [
+        ...(auth?.configArgs ?? []),
+        "fetch",
+        "--prune",
+        remoteTracking.remote,
+        `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
+      ],
+      cwd: repoRoot,
+      env: auth ? { ...process.env, ...auth.env } : undefined,
+    });
     return [];
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
@@ -1249,10 +1296,12 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   db: Db;
   executionWorkspaceId: string | null;
   evidence: GitWorktreeBranchIncoherenceEvidence;
+  repairLabel?: string;
 }) {
+  const repairLabel = input.repairLabel ?? "dirty quarantine repair";
   if (!input.executionWorkspaceId) {
     input.evidence.safeRepair.eligible = false;
-    input.evidence.safeRepair.reason = "dirty quarantine repair requires an execution workspace id for runtime-service checks";
+    input.evidence.safeRepair.reason = `${repairLabel} requires an execution workspace id for runtime-service checks`;
     throw branchIncoherenceValidationFailure(input.evidence);
   }
 
@@ -1262,7 +1311,7 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
     .where(eq(executionWorkspaces.id, input.executionWorkspaceId));
   if (!workspace) {
     input.evidence.safeRepair.eligible = false;
-    input.evidence.safeRepair.reason = "dirty quarantine repair requires a persisted execution workspace for runtime-service checks";
+    input.evidence.safeRepair.reason = `${repairLabel} requires a persisted execution workspace for runtime-service checks`;
     throw branchIncoherenceValidationFailure(input.evidence);
   }
 
@@ -1274,7 +1323,88 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
 
   input.evidence.safeRepair.eligible = false;
   input.evidence.safeRepair.reason =
-    `dirty quarantine repair requires runtime service "${activeService.serviceName}" (${activeService.id}) to be stopped; current status is ${activeService.status}`;
+    `${repairLabel} requires runtime service "${activeService.serviceName}" (${activeService.id}) to be stopped; current status is ${activeService.status}`;
+  throw branchIncoherenceValidationFailure(input.evidence);
+}
+
+function worktreePathVariants(worktreePath: string) {
+  const variants = new Set([worktreePath, path.resolve(worktreePath)]);
+  try {
+    variants.add(realpathSync(worktreePath));
+  } catch {
+    // A path that cannot be resolved is matched as written.
+  }
+  return [...variants];
+}
+
+function escapeLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * Refuses while a runtime service could see the worktree's files change. It
+ * does not rely on a known execution workspace id: a fresh realization has no
+ * row yet, and a path can be shared by several rows. A service counts when it
+ * belongs to any open workspace row at the path (including the caller's own
+ * id), or when its own working directory is the path or inside it.
+ */
+async function assertNoRuntimeServiceInWorktree(input: {
+  db: Db;
+  companyId: string;
+  worktreePath: string;
+  executionWorkspaceId: string | null;
+  evidence: GitWorktreeBranchIncoherenceEvidence;
+  repairLabel: string;
+}) {
+  const variants = worktreePathVariants(input.worktreePath);
+  const pathMatches = variants.flatMap((value) => [
+    eq(executionWorkspaces.providerRef, value),
+    eq(executionWorkspaces.cwd, value),
+  ]);
+  const workspaceRows = await input.db
+    .select()
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.companyId, input.companyId),
+      isNull(executionWorkspaces.closedAt),
+      ne(executionWorkspaces.status, "archived"),
+      or(
+        ...pathMatches,
+        ...(input.executionWorkspaceId ? [eq(executionWorkspaces.id, input.executionWorkspaceId)] : []),
+      ),
+    ));
+
+  let activeService: { id: string; serviceName: string; status: string } | null = null;
+  for (const workspace of workspaceRows) {
+    activeService = await findActiveRuntimeServiceBlockingDirtyQuarantine({ db: input.db, workspace });
+    if (activeService) break;
+  }
+  if (!activeService) {
+    const cwdMatches = variants.flatMap((value) => [
+      eq(workspaceRuntimeServices.cwd, value),
+      like(workspaceRuntimeServices.cwd, `${escapeLikePattern(value.replace(/\/+$/, ""))}/%`),
+    ]);
+    const [service] = await input.db
+      .select({
+        id: workspaceRuntimeServices.id,
+        serviceName: workspaceRuntimeServices.serviceName,
+        status: workspaceRuntimeServices.status,
+      })
+      .from(workspaceRuntimeServices)
+      .where(and(
+        eq(workspaceRuntimeServices.companyId, input.companyId),
+        ne(workspaceRuntimeServices.status, "stopped"),
+        or(...cwdMatches),
+      ))
+      .orderBy(desc(workspaceRuntimeServices.updatedAt), desc(workspaceRuntimeServices.createdAt))
+      .limit(1);
+    activeService = service ?? null;
+  }
+  if (!activeService) return;
+
+  input.evidence.safeRepair.eligible = false;
+  input.evidence.safeRepair.reason =
+    `${input.repairLabel} requires runtime service "${activeService.serviceName}" (${activeService.id}) to be stopped; current status is ${activeService.status}`;
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
@@ -1912,13 +2042,262 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     };
   } catch (error) {
     if (rescueBranchCreated && !expectedBranchRestored) {
-      await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
+      await recordGitOperation(null, {
+        phase: input.phase ?? "worktree_prepare",
+        args: ["checkout", input.expectedBranchName],
+        cwd: input.worktreePath,
+      }).catch(() => null);
     }
     if (error instanceof WorkspaceRuntimeValidationFailure) throw error;
     input.evidence.safeRepair.succeeded = false;
     input.evidence.safeRepair.reason = formatDirtyQuarantineFailure(error);
     throw branchIncoherenceValidationFailure(input.evidence);
   }
+}
+
+type CleanBranchRestoreResult = {
+  displacedBranch: string | null;
+  displacedSha: string | null;
+  restoredSha: string | null;
+  rescueBranch: string | null;
+};
+
+function buildDetachedHeadRescueBranch(sourceIssue: ExecutionWorkspaceIssueRef | null) {
+  const issueComponent = sanitizeBranchName(sourceIssue?.identifier ?? sourceIssue?.id ?? "issue");
+  return sanitizeBranchName(`paperclip/rescue/${issueComponent}/detached-${formatUtcBranchTimestamp()}`);
+}
+
+/**
+ * Whether any ref (branch, remote-tracking branch, tag, stash) reaches the
+ * commit. `null` means git could not answer, which callers treat as "not
+ * reachable" so that a rescue branch is created rather than skipped.
+ */
+async function isCommitReachableFromAnyRef(repoRoot: string, sha: string): Promise<boolean | null> {
+  const containing = await runGit(
+    ["for-each-ref", "--contains", sha, "--count=1", "--format=%(refname)"],
+    repoRoot,
+  ).catch(() => null);
+  return containing === null ? null : containing.length > 0;
+}
+
+/**
+ * Checks the recorded branch back out in a clean worktree whose HEAD drifted
+ * off it: detached at another commit, behind the recorded branch, or on a
+ * branch that diverges from it. No file or ref is lost:
+ *
+ * - The tree is clean, so `git checkout` rewrites nothing the agent edited.
+ * - A displaced named branch keeps its ref. A displaced detached HEAD that no
+ *   ref reaches is pinned on a rescue branch first.
+ * - The recorded branch is only checked out, never moved.
+ *
+ * It refuses while another run is running in the same worktree, because moving
+ * HEAD under a running run is the shared-worktree collision itself.
+ */
+async function restoreCleanWorktreeToRecordedBranch(input: {
+  db: Db | null | undefined;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  heartbeatRunId: string | null;
+  evidence: GitWorktreeBranchIncoherenceEvidence;
+  phase?: "worktree_prepare" | "workspace_finalize";
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<CleanBranchRestoreResult> {
+  const { evidence } = input;
+  const refuse = (reason: string): never => {
+    evidence.safeRepair.eligible = false;
+    evidence.safeRepair.reason = reason;
+    throw branchIncoherenceValidationFailure(evidence);
+  };
+
+  if (!input.db) {
+    return refuse("clean branch restore requires database access for the running-run check and audit");
+  }
+  const companyId = await readIssueCompanyId(input.db, evidence.sourceIssueId);
+  if (!companyId) {
+    return refuse("clean branch restore requires a source issue company for audit");
+  }
+  if (evidence.inProgressOperation) {
+    // An interrupted rebase, merge or bisect keeps state beside HEAD. A plain
+    // checkout would leave that state behind and wedge the next git command.
+    return refuse(
+      `clean branch restore refused because an interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[evidence.inProgressOperation]} is in progress`,
+    );
+  }
+  const busyRun = await executionWorkspaceService(input.db).findRunningRunInWorktree({
+    companyId,
+    worktreePath: input.worktreePath,
+    executionWorkspaceId: evidence.executionWorkspaceId,
+    excludingRunId: input.heartbeatRunId,
+  });
+  if (busyRun) {
+    const issueText = busyRun.issueIdentifier ? ` on ${busyRun.issueIdentifier}` : "";
+    return refuse(`clean branch restore refused because run ${busyRun.id}${issueText} is running in this worktree`);
+  }
+  // A runtime service started from this worktree would see its files change.
+  // Fresh realization has no workspace id yet, so the check goes by path.
+  await assertNoRuntimeServiceInWorktree({
+    db: input.db,
+    companyId,
+    worktreePath: input.worktreePath,
+    executionWorkspaceId: evidence.executionWorkspaceId,
+    evidence,
+    repairLabel: "clean branch restore",
+  });
+
+  // Inspection ran before the checks above. Pin and switch only the HEAD that
+  // exists now, so a commit made in that window is not left unreferenced.
+  const currentSha = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+  const currentBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath)
+    .catch(() => null);
+  if (currentSha !== evidence.provenance.actualHeadSha || currentBranch !== evidence.actualBranch) {
+    return refuse("clean branch restore refused because HEAD moved after the worktree was inspected");
+  }
+
+  const displacedSha = evidence.provenance.actualHeadSha;
+  const displacedBranch = evidence.actualBranch;
+  const baseMetadata = {
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    expectedBranchName: input.expectedBranchName,
+    actualBranchName: displacedBranch,
+    branchIncoherenceCleanRestore: true,
+    fingerprint: evidence.fingerprint,
+    sourceIssueId: evidence.sourceIssueId,
+    executionWorkspaceId: evidence.executionWorkspaceId,
+  };
+  const phase = input.phase ?? "worktree_prepare";
+
+  evidence.safeRepair.eligible = true;
+  evidence.safeRepair.attempted = true;
+  let rescueBranch: string | null = null;
+  try {
+    await assertGitIndexIsUnlocked(input.worktreePath);
+    if (displacedBranch === null && displacedSha && await isCommitReachableFromAnyRef(input.repoRoot, displacedSha) !== true) {
+      rescueBranch = buildDetachedHeadRescueBranch(input.sourceIssue);
+      await recordGitOperation(input.recorder, {
+        phase,
+        args: ["branch", rescueBranch, displacedSha],
+        cwd: input.worktreePath,
+        metadata: { ...baseMetadata, rescueBranch },
+        successMessage: `Pinned detached HEAD ${formatShortSha(displacedSha)} on rescue branch ${rescueBranch}\n`,
+        failureLabel: `git branch ${rescueBranch}`,
+      });
+    }
+    await recordGitOperation(input.recorder, {
+      phase,
+      args: ["checkout", input.expectedBranchName],
+      cwd: input.worktreePath,
+      metadata: { ...baseMetadata, rescueBranch },
+      successMessage: `Restored recorded branch ${input.expectedBranchName} in clean git worktree ${input.worktreePath}\n`,
+      failureLabel: `git checkout ${input.expectedBranchName}`,
+    });
+  } catch (error) {
+    evidence.safeRepair.succeeded = false;
+    evidence.safeRepair.reason = `clean branch restore failed: ${error instanceof Error ? error.message : String(error)}`;
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+
+  const repairedBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath)
+    .catch(() => null);
+  if (repairedBranch !== input.expectedBranchName) {
+    evidence.safeRepair.succeeded = false;
+    evidence.safeRepair.reason = `clean branch restore completed but HEAD is ${formatBranchForMessage(repairedBranch)}`;
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+  const restoredSha = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+
+  evidence.safeRepair.succeeded = true;
+  evidence.safeRepair.reason = rescueBranch
+    ? `clean worktree restored to the recorded branch; detached HEAD pinned on ${rescueBranch}`
+    : "clean worktree restored to the recorded branch";
+
+  const result: CleanBranchRestoreResult = { displacedBranch, displacedSha, restoredSha, rescueBranch };
+  await logCleanBranchRestoreActivity({
+    db: input.db,
+    companyId,
+    evidence,
+    result,
+    heartbeatRunId: input.heartbeatRunId,
+  });
+  if (rescueBranch) {
+    // Only a rescue leaves something a human or agent may need to find again.
+    await writeCleanBranchRestoreRescueComment({
+      db: input.db,
+      companyId,
+      evidence,
+      sourceIssue: input.sourceIssue,
+      result,
+      heartbeatRunId: input.heartbeatRunId,
+    });
+  }
+  return result;
+}
+
+async function logCleanBranchRestoreActivity(input: {
+  db: Db;
+  companyId: string;
+  evidence: GitWorktreeBranchIncoherenceEvidence;
+  result: CleanBranchRestoreResult;
+  heartbeatRunId: string | null;
+}) {
+  await logActivity(input.db, {
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "workspace_runtime",
+    runId: input.heartbeatRunId,
+    action: "execution_workspace.branch_restored",
+    entityType: input.evidence.executionWorkspaceId ? "execution_workspace" : "issue",
+    entityId: input.evidence.executionWorkspaceId ?? input.evidence.sourceIssueId ?? input.companyId,
+    details: {
+      reason: GIT_WORKTREE_BRANCH_INCOHERENCE_REASON,
+      sourceIssueId: input.evidence.sourceIssueId,
+      executionWorkspaceId: input.evidence.executionWorkspaceId,
+      worktreePath: input.evidence.worktreePath,
+      expectedBranch: input.evidence.expectedBranch,
+      displacedBranch: input.result.displacedBranch,
+      displacedSha: input.result.displacedSha,
+      restoredSha: input.result.restoredSha,
+      ancestryVerdict: input.evidence.provenance.ancestryVerdict,
+      rescueBranch: input.result.rescueBranch,
+      fingerprint: input.evidence.fingerprint,
+      actor: {
+        type: "system",
+        id: "workspace_runtime",
+        source: "workspace_runtime",
+      },
+    },
+  });
+}
+
+async function writeCleanBranchRestoreRescueComment(input: {
+  db: Db;
+  companyId: string;
+  evidence: GitWorktreeBranchIncoherenceEvidence;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  result: CleanBranchRestoreResult;
+  heartbeatRunId: string | null;
+}) {
+  if (!input.evidence.sourceIssueId) return;
+  await input.db.insert(issueComments).values({
+    companyId: input.companyId,
+    issueId: input.evidence.sourceIssueId,
+    authorAgentId: null,
+    authorUserId: null,
+    authorType: "system",
+    createdByRunId: input.heartbeatRunId,
+    body: [
+      "Execution workspace branch restored; a detached commit was pinned before the switch.",
+      "",
+      `- Source issue: ${formatIssueReference(input.evidence.sourceIssueId, input.evidence.sourceIdentifier ?? input.sourceIssue?.identifier ?? null)}`,
+      `- Worktree: \`${input.evidence.worktreePath}\``,
+      `- Restored branch: \`${input.evidence.expectedBranch}\``,
+      `- Detached HEAD: \`${input.result.displacedSha ?? "unknown"}\``,
+      `- Rescue branch: \`${input.result.rescueBranch}\``,
+      `- Fingerprint: \`${input.evidence.fingerprint}\``,
+    ].join("\n"),
+  });
 }
 
 async function recordForwardBranchReconcileOperation(input: {
@@ -2087,6 +2466,19 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
+  /**
+   * Restore the recorded branch in a clean worktree. Defaults to
+   * `enableWorkspaceDirtyQuarantineRepair`. A caller that must only repair a
+   * dirty worktree passes `false`.
+   */
+  enableWorkspaceCleanRestore?: boolean;
+  /**
+   * The recorded branch belongs to an operator, not to this runtime. Its
+   * identity and tip must not change, so the only repair allowed is checking
+   * it back out in a clean worktree. Never adopts another branch, moves a ref,
+   * or commits.
+   */
+  restoreOnly?: boolean;
   persistForwardReconcile?: boolean;
   reconcileOperationPhase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
@@ -2110,6 +2502,43 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     sourceIssue: input.sourceIssue,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
   });
+
+  // A clean worktree needs no rescue commit, so restoring the recorded branch
+  // is the one repair that is safe for every ownership and every ancestry.
+  const cleanRestoreAllowed =
+    (input.enableWorkspaceCleanRestore ?? input.enableWorkspaceDirtyQuarantineRepair === true) &&
+    evidence.cleanliness === "clean" &&
+    evidence.provenance.registeredPathFound &&
+    evidence.provenance.expectedBranchExists;
+  const restoreCleanWorktree = async (): Promise<GitWorktreeBranchCoherenceResult> => {
+    const result = await restoreCleanWorktreeToRecordedBranch({
+      db: input.db,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName,
+      sourceIssue: input.sourceIssue,
+      heartbeatRunId: input.heartbeatRunId ?? null,
+      evidence,
+      phase: input.reconcileOperationPhase,
+      recorder: input.recorder ?? null,
+    });
+    return {
+      branchName: expectedBranchName,
+      reconciledForward: false,
+      warnings: [
+        `Execution workspace HEAD was on "${formatBranchForMessage(result.displacedBranch)}" (${formatShortSha(result.displacedSha)}), off recorded branch "${expectedBranchName}". Paperclip checked out the recorded branch again in the clean worktree at ${input.worktreePath}.${result.rescueBranch ? ` The detached commit is kept on rescue branch "${result.rescueBranch}".` : ""}`,
+      ],
+    };
+  };
+
+  if (input.restoreOnly === true) {
+    // Without a safe restore, fall through to the caller's own validation so an
+    // operator-owned branch keeps its existing fail-closed message.
+    if (!cleanRestoreAllowed) {
+      return { branchName: expectedBranchName, reconciledForward: false, warnings: [] };
+    }
+    return restoreCleanWorktree();
+  }
 
   if (evidence.cleanliness === "dirty" && input.enableWorkspaceDirtyQuarantineRepair === true) {
     if (!input.db) {
@@ -2261,6 +2690,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   }
 
   if (!evidence.safeRepair.eligible) {
+    // Detached, behind or diverged from the recorded branch, in a clean
+    // worktree: nothing here can prove a forward-only adoption, but nothing
+    // is lost by restoring the recorded branch either.
+    if (cleanRestoreAllowed) return restoreCleanWorktree();
     throw branchIncoherenceValidationFailure(evidence);
   }
 
@@ -2610,6 +3043,7 @@ export type ManagedGitWorktreeBranchInspection = {
     | "missing_worktree"
     | "not_a_git_checkout"
     | "not_registered"
+    | "worktree_list_unavailable"
     | "wrong_repository_root"
     | "branch_mismatch"
     | null;
@@ -2658,12 +3092,33 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   return path.dirname(path.resolve(checkoutRoot, commonDir));
 }
 
+/**
+ * Every registered worktree, or a throw. A list that did not fit
+ * `maxStdoutBytes` raises `GitOutputTruncatedError` instead of returning the
+ * entries that survived, so "not in the list" is never a statement about a
+ * partial list.
+ */
+async function readGitWorktreeList(
+  repoRoot: string,
+  opts?: { maxStdoutBytes?: number },
+): Promise<GitWorktreeListEntry[]> {
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    maxStdoutBytes: opts?.maxStdoutBytes ?? GIT_WORKTREE_LIST_MAX_STDOUT_BYTES,
+  });
+  return parseGitWorktreeListPorcelain(raw);
+}
+
 async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+  const entries = await readGitWorktreeList(repoRoot).catch((error) => {
+    // An unreadable list is "no match" as before, but a truncated one must not
+    // read as "no worktree holds this branch".
+    if (error instanceof GitOutputTruncatedError) throw error;
+    return null;
+  });
+  if (!entries) return null;
 
   const expectedBranchRef = `refs/heads/${branchName}`;
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (entry.branch !== expectedBranchRef) continue;
     return path.resolve(entry.worktree);
   }
@@ -2672,11 +3127,13 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
 }
 
 async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
+  // Diagnostic evidence only: a null here (including an unusable truncated
+  // list) makes the safe-repair path ineligible, which is the conservative side.
+  const entries = await readGitWorktreeList(repoRoot).catch(() => null);
+  if (!entries) return null;
 
   const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (await resolvePathForWorktreeComparison(entry.worktree) === expectedPath) {
       return entry;
     }
@@ -2735,12 +3192,13 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
 }
 
-async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+async function listLinkedGitWorktreePaths(
+  repoRoot: string,
+  opts?: { maxStdoutBytes?: number },
+): Promise<Set<string>> {
   const paths = new Set<string>();
-  for (const line of output.split("\n")) {
-    if (!line.startsWith("worktree ")) continue;
-    const worktree = line.slice("worktree ".length).trim();
+  for (const entry of await readGitWorktreeList(repoRoot, opts)) {
+    const worktree = entry.worktree.trim();
     if (!worktree) continue;
     paths.add(await resolvePathForWorktreeComparison(worktree));
   }
@@ -2751,6 +3209,8 @@ export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
   repoRoot?: string | null;
+  /** Bound on the `git worktree list --porcelain` capture. Defaults to GIT_WORKTREE_LIST_MAX_STDOUT_BYTES. */
+  worktreeListMaxBytes?: number;
 }): Promise<ManagedGitWorktreeBranchInspection> {
   const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   const expectedBranchName = asString(input.expectedBranchName, "").trim() || null;
@@ -2783,8 +3243,22 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  let listedWorktrees: Set<string>;
+  try {
+    listedWorktrees = await listLinkedGitWorktreePaths(repoRoot, { maxStdoutBytes: input.worktreeListMaxBytes });
+  } catch (error) {
+    // Fail closed, but do not call the path unregistered: a list that could not
+    // be read in full says nothing about whether this path is in it.
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ...base,
+      valid: false,
+      reason: `could not enumerate \`git worktree list\` to verify registration (${detail})`,
+      reasonCode: "worktree_list_unavailable",
+      repoRoot,
+    };
+  }
+  if (!listedWorktrees.has(worktreePath)) {
     return {
       ...base,
       valid: false,
@@ -2969,56 +3443,61 @@ async function runWorkspaceCommand(input: {
   );
 }
 
-async function recordGitOperation(
+export async function recordGitOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
     phase: WorkspaceOperationPhase;
     args: string[];
     cwd: string;
+    env?: NodeJS.ProcessEnv;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     failureLabel?: string | null;
   },
 ): Promise<string> {
-  if (!recorder) {
-    return runGit(input.args, input.cwd);
-  }
-
   let stdout = "";
   let stderr = "";
   let code: number | null = null;
-  await recorder.recordOperation({
-    phase: input.phase,
-    command: formatCommandForDisplay("git", input.args),
-    cwd: input.cwd,
-    metadata: input.metadata ?? null,
-    run: async () => {
-      const result = await executeProcess({
-        command: "git",
-        args: input.args,
-        cwd: input.cwd,
-      });
-      stdout = result.stdout;
-      stderr = result.stderr;
-      code = result.code;
-      return {
-        status: result.code === 0 ? "succeeded" : "failed",
-        exitCode: result.code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        system: result.code === 0 ? input.successMessage ?? null : null,
-        metadata:
-          result.stdoutTruncated || result.stderrTruncated
-            ? {
-                stdoutTruncated: result.stdoutTruncated,
-                stderrTruncated: result.stderrTruncated,
-                stdoutBytes: result.stdoutBytes,
-                stderrBytes: result.stderrBytes,
-              }
-            : null,
-      };
-    },
-  });
+  // Mutation stdout is bounded diagnostic text, not a machine-readable result.
+  // Recording must not change whether an already-completed mutation succeeded.
+  const run = async () => {
+    const result = await executeProcess({
+      command: "git",
+      args: input.args,
+      cwd: input.cwd,
+      env: input.env,
+    });
+    stdout = result.stdout;
+    stderr = result.stderr;
+    code = result.code;
+    return {
+      status: result.code === 0 ? "succeeded" as const : "failed" as const,
+      exitCode: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      system: result.code === 0 ? input.successMessage ?? null : null,
+      metadata:
+        result.stdoutTruncated || result.stderrTruncated
+          ? {
+              stdoutTruncated: result.stdoutTruncated,
+              stderrTruncated: result.stderrTruncated,
+              stdoutBytes: result.stdoutBytes,
+              stderrBytes: result.stderrBytes,
+            }
+          : null,
+    };
+  };
+  if (recorder) {
+    await recorder.recordOperation({
+      phase: input.phase,
+      command: formatCommandForDisplay("git", input.args),
+      cwd: input.cwd,
+      metadata: input.metadata ?? null,
+      run,
+    });
+  } else {
+    await run();
+  }
 
   if (code !== 0) {
     const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
@@ -3714,12 +4193,13 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const repairWarnings: string[] = [];
-    if (await isGitCheckout(reuseWorktreePath) && realized.branchCreatedByRuntime) {
-      // Branch-coherence repair may check out another branch, adopt a forward
-      // branch, or move the recorded ref from a detached HEAD. Those repairs
-      // are valid only for a branch that this runtime created. An attached
-      // operator-owned branch must retain its exact identity and tip; the
-      // validation below rejects any mismatch without mutating Git state.
+    if (await isGitCheckout(reuseWorktreePath)) {
+      // Branch-coherence repair may adopt a forward branch or move the recorded
+      // ref from a detached HEAD. Those repairs are valid only for a branch
+      // that this runtime created. An attached operator-owned branch must
+      // retain its exact identity and tip, so it only gets a plain checkout of
+      // that branch in a clean worktree (`restoreOnly`); the validation below
+      // rejects any other mismatch without mutating Git state.
       const coherence = await ensureGitWorktreeBranchCoherent({
         db: input.db ?? null,
         repoRoot,
@@ -3730,6 +4210,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         heartbeatRunId: input.heartbeatRunId ?? null,
         enableWorkspaceBranchReconcileForward: input.enableWorkspaceBranchReconcileForward === true,
         enableWorkspaceDirtyQuarantineRepair: input.enableWorkspaceDirtyQuarantineRepair === true,
+        restoreOnly: !realized.branchCreatedByRuntime,
         persistForwardReconcile: false,
         reconcileOperationPhase: "worktree_prepare",
         recorder: input.recorder ?? null,
@@ -3810,7 +4291,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   }
 
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  await recordGitOperation(null, {
+    phase: "worktree_prepare",
+    args: ["worktree", "prune"],
+    cwd: repoRoot,
+  }).catch(() => {});
   const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
   const restoreRefreshWarnings = restoreBaseRef
     ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)

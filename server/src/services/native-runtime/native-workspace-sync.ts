@@ -11,7 +11,11 @@ import {
   type AdapterExecutionTarget,
   type PreparedAdapterExecutionTargetRuntime,
 } from "@paperclipai/adapter-utils/execution-target";
-import type { GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import {
+  MAX_REPOSITORY_WARNINGS,
+  MAX_REPOSITORY_WARNING_LENGTH,
+  type GitWorkspaceSnapshot,
+} from "@paperclipai/adapter-utils/git-workspace-sync";
 import {
   directorySnapshotSha256,
   parseDirectorySnapshot,
@@ -362,6 +366,18 @@ function parseGitSnapshot(
       repositories.push({ path: repo.path, snapshot });
     }
   }
+  // Nested checkouts that lost `.git` in transit ride as warnings, never as
+  // fatal descriptor errors. Bounded like every other parsed field.
+  let repositoryWarnings: string[] | undefined;
+  if (candidate.repositoryWarnings !== undefined) {
+    if (!Array.isArray(candidate.repositoryWarnings) || candidate.repositoryWarnings.length > MAX_REPOSITORY_WARNINGS) return undefined;
+    const cleaned: string[] = [];
+    for (const warning of candidate.repositoryWarnings) {
+      if (typeof warning !== "string" || warning.length === 0 || warning.length > MAX_REPOSITORY_WARNING_LENGTH) return undefined;
+      cleaned.push(warning);
+    }
+    repositoryWarnings = cleaned;
+  }
   return {
     headCommit: candidate.headCommit,
     branchName: candidate.branchName as string | null,
@@ -369,6 +385,7 @@ function parseGitSnapshot(
     deletedPaths: [...(candidate.deletedPaths as string[])],
     ignoredPaths: [...(candidate.ignoredPaths as string[])],
     ...(repositories.length ? { repositories } : {}),
+    ...(repositoryWarnings?.length ? { repositoryWarnings } : {}),
   };
 }
 

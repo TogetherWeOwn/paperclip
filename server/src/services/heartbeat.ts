@@ -39,9 +39,9 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, runLocalGit } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
-import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -88,7 +88,7 @@ import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   CHAT_PROVIDERS,
   CONNECTION_INTENT_AGENT_GUIDANCE,
-  CONNECTION_RUNTIME_TOOL_NAMES,
+  RUNTIME_TOOL_NAMES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
@@ -468,6 +468,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "./execution-workspace-policy.js";
+import { resolveLowTrustSandboxEnvironment } from "./low-trust-sandbox-environment.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
@@ -2467,6 +2468,21 @@ export async function ensureManagedProjectWorkspace(input: {
   return result;
 }
 
+async function hasAdoptableManagedWorkspaceGit(cwd: string): Promise<boolean> {
+  const metadata = await fs.stat(path.resolve(cwd, ".git")).catch(() => null);
+  if (metadata?.isDirectory()) return true;
+  if (!metadata?.isFile()) return false;
+  try {
+    const toplevel = await runLocalGit(cwd, ["rev-parse", "--show-toplevel"], { timeout: 10_000, maxBuffer: 16 * 1024 });
+    if (await fs.realpath(toplevel.stdout.trim()) !== await fs.realpath(cwd)) {
+      throw new Error("Git file does not identify this workspace as its repository root");
+    }
+    return true;
+  } catch (error) {
+    throw new Error(`Managed workspace Git file is unusable at "${cwd}".`, { cause: error });
+  }
+}
+
 async function materializeManagedProjectWorkspace(
   cwd: string,
   input: {
@@ -2474,10 +2490,14 @@ async function materializeManagedProjectWorkspace(
     repoRef?: string | null;
     localSource?: string | null;
     resolveGitAuth?: GitRemoteAuthProvider | null;
+    repositoryAnchor?: string;
   },
 ): Promise<{ cwd: string; warning: string | null }> {
   await fs.mkdir(path.dirname(cwd), { recursive: true });
-  const stats = await fs.stat(cwd).catch(() => null);
+  const stats = await fs.lstat(cwd).catch(() => null);
+  if (input.repositoryAnchor && stats && !stats.isDirectory()) {
+    throw new Error("Invalid project repository checkout path");
+  }
 
   if (!input.repoUrl) {
     if (!stats) {
@@ -2486,16 +2506,17 @@ async function materializeManagedProjectWorkspace(
     return { cwd, warning: null };
   }
 
-  const hasAdoptableGitDir = () =>
-    fs
-      .stat(path.resolve(cwd, ".git"))
-      .then((entry) => entry.isDirectory())
-      .catch(() => false);
-  if (await hasAdoptableGitDir()) {
-    return { cwd, warning: null };
-  }
+  const adoptable = input.repositoryAnchor
+    ? await withDirectoryMergeLock(input.repositoryAnchor, async (anchor) => {
+      await ensureProjectRepositoriesRoot(anchor);
+      const current = await fs.lstat(cwd).catch(() => null);
+      if (current && !current.isDirectory()) throw new Error("Invalid project repository checkout path");
+      return await hasAdoptableManagedWorkspaceGit(cwd);
+    })
+    : await hasAdoptableManagedWorkspaceGit(cwd);
+  if (adoptable) return { cwd, warning: null };
 
-  if (stats) {
+  if (stats && !input.repositoryAnchor) {
     const entries = await fs.readdir(cwd).catch(() => []);
     if (entries.length > 0) {
       return {
@@ -2506,6 +2527,8 @@ async function materializeManagedProjectWorkspace(
     await fs.rm(cwd, { recursive: true, force: true });
   }
 
+  // Clone outside the anchor's restore lock. Nested clone staging stays in
+  // excluded runtime state, so a concurrent restore cannot transfer or erase it.
   // Clone into a temp sibling, then move into place atomically. The shared target directory
   // is never created in a partial state and never removed on failure, so a concurrent
   // materialization (another process, or a run racing this one) can neither adopt a broken
@@ -2513,7 +2536,10 @@ async function materializeManagedProjectWorkspace(
   const auth = input.resolveGitAuth && !input.localSource
     ? await input.resolveGitAuth(input.repoUrl)
     : null;
-  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
+  const clonePrefix = input.repositoryAnchor
+    ? path.join(await projectRepositoryRuntimeDir(input.repositoryAnchor, "repository-clones"), ".clone-")
+    : `${cwd}.clone-`;
+  const cloneTmpDir = await fs.mkdtemp(clonePrefix);
   try {
     await execFile(
       "git",
@@ -2558,6 +2584,30 @@ async function materializeManagedProjectWorkspace(
     throw new Error(message);
   }
 
+  if (input.repositoryAnchor) {
+    try {
+      return await withDirectoryMergeLock(input.repositoryAnchor, async (anchor) => {
+        // Restore may have replaced or populated the destination while we cloned.
+        // Adopt valid history, or preserve the latest non-Git files, never a stale
+        // pre-clone observation. Only publication and moves hold the restore lock.
+        await ensureProjectRepositoriesRoot(anchor);
+        const existing = await fs.lstat(cwd).catch(() => null);
+        if (existing && !existing.isDirectory()) throw new Error("Invalid project repository checkout path");
+        if (await hasAdoptableManagedWorkspaceGit(cwd)) return { cwd, warning: null };
+        let warning: string | null = null;
+        if (existing) {
+          const quarantine = path.join(await projectRepositoryRuntimeDir(anchor, "detached-repositories"), randomUUID());
+          await fs.rename(cwd, quarantine);
+          warning = `Managed workspace path "${cwd}" already exists but is not a git checkout. Preserved the snapshot at "${quarantine}" and re-provisioned a clean checkout.`;
+        }
+        await fs.rename(cloneTmpDir, cwd);
+        return { cwd, warning };
+      });
+    } finally {
+      await fs.rm(cloneTmpDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
   try {
     await fs.rename(cloneTmpDir, cwd);
   } catch (renameError) {
@@ -2566,7 +2616,7 @@ async function materializeManagedProjectWorkspace(
       .catch(() => undefined);
     // The target appearing between the emptiness check and the rename means another
     // materialization won the race; adopt its checkout instead of failing the run.
-    if (await hasAdoptableGitDir()) {
+    if (await hasAdoptableManagedWorkspaceGit(cwd)) {
       return { cwd, warning: null };
     }
     const reason =
@@ -2578,13 +2628,50 @@ async function materializeManagedProjectWorkspace(
   return { cwd, warning: null };
 }
 
+async function ensureProjectRepositoriesRoot(anchor: string): Promise<void> {
+  await fs.mkdir(path.join(anchor, PROJECT_REPOSITORIES_DIR), { recursive: true });
+  if (await fs.realpath(path.join(anchor, PROJECT_REPOSITORIES_DIR)) !== path.join(anchor, PROJECT_REPOSITORIES_DIR)) {
+    throw new Error("Project repositories directory escapes the task workspace");
+  }
+}
+
+async function projectRepositoryRuntimeDir(anchor: string, name: string): Promise<string> {
+  const directory = path.join(anchor, ".paperclip-runtime", name);
+  await fs.mkdir(directory, { recursive: true });
+  if (await fs.realpath(directory) !== directory) throw new Error("Project repository runtime directory escapes the task workspace");
+  return directory;
+}
+
+const projectRepositoryPreparations = new Map<string, Promise<void>>();
+
 /** Keep every distinct project repository inside the task's writable/synced root. */
 export async function prepareProjectRepositoryWorkspaces(input: {
   cwd: string;
   anchorRepoUrl: string | null;
   workspaces: Array<Pick<typeof projectWorkspaces.$inferSelect, "id" | "repoUrl" | "repoRef"> & { cwd?: string | null }>;
   resolveGitAuth?: GitRemoteAuthProvider | null;
-}): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null }>> {
+}): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }>> {
+  const cwd = await fs.realpath(input.cwd);
+  const previous = projectRepositoryPreparations.get(cwd) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  projectRepositoryPreparations.set(cwd, current);
+  await previous;
+  try {
+    // Serialize setup without making restores wait through network clones.
+    // Individual publication/retention steps lock the stable anchor below.
+    const results = await prepareProjectRepositoryWorkspacesSequential({ ...input, cwd });
+    // Keep the caller's alias so lexical relative paths in workspace hints do
+    // not escape a symlinked anchor. Mutations used the canonical locked path.
+    const prefix = input.cwd.endsWith(path.sep) ? input.cwd : `${input.cwd}${path.sep}`;
+    return results.map((repo) => ({ ...repo, cwd: `${prefix}${path.relative(cwd, repo.cwd)}` }));
+  } finally {
+    release();
+    if (projectRepositoryPreparations.get(cwd) === current) projectRepositoryPreparations.delete(cwd);
+  }
+}
+
+async function prepareProjectRepositoryWorkspacesSequential(input: Parameters<typeof prepareProjectRepositoryWorkspaces>[0]) {
   const identity = (url: string) => url.trim().replace(/\.git\/?$/, "").replace(/\/$/, "");
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
   const selected = input.workspaces.filter((workspace) => {
@@ -2594,19 +2681,18 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   });
   const root = path.join(input.cwd, PROJECT_REPOSITORIES_DIR);
   if (selected.length === 0 && !(await fs.lstat(root).catch(() => null))) return [];
-  await fs.mkdir(root, { recursive: true });
-  if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
-    throw new Error("Project repositories directory escapes the task workspace");
-  }
-  const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
-    .then((result) => path.resolve(input.cwd, result.stdout.trim()));
-  const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
-  if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
-    await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
-  }
-  const results = [];
-  for (const workspace of selected) {
+  await withDirectoryMergeLock(input.cwd, async (anchor) => {
+    await ensureProjectRepositoriesRoot(anchor);
+    const excludePath = await execFile("git", ["-C", anchor, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
+      .then((result) => path.resolve(anchor, result.stdout.trim()));
+    const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
+    if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+    }
+  });
+  const results: Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null; warnings?: string[] }> = [];
+  const prepare = async (workspace: typeof selected[number]) => {
     const repoUrl = workspace.repoUrl!;
     const name = (deriveRepoNameFromRepoUrl(repoUrl) ?? "repo").replace(/[^a-zA-Z0-9_-]/g, "-");
     const key = `${name}-${createHash("sha256").update(JSON.stringify([workspace.id, identity(repoUrl), workspace.repoRef, workspace.cwd ?? null])).digest("hex").slice(0, 12)}`;
@@ -2616,19 +2702,45 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     const localSource = workspace.cwd && workspace.cwd !== REPO_ONLY_CWD_SENTINEL
       && await fs.stat(workspace.cwd).then((entry) => entry.isDirectory()).catch(() => false)
       ? workspace.cwd : null;
-    const result = await materializeManagedProjectWorkspace(cwd, { repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth });
-    if (result.warning) throw new Error(result.warning);
-    results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
+    const result = await materializeManagedProjectWorkspace(cwd, {
+      repoUrl, repoRef: workspace.repoRef, localSource, resolveGitAuth: input.resolveGitAuth,
+      repositoryAnchor: input.cwd,
+    });
+    const warnings = result.warning ? [result.warning] : [];
+    return { workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef, ...(warnings.length > 0 ? { warnings } : {}) };
+  };
+  for (const workspace of selected) results.push(await prepare(workspace));
+  // A restore during a later clone can strip a checkout already adopted above.
+  // Validate the whole set at the final barrier, and stage any repairs unlocked.
+  // Bound retries so continuous restores fail closed rather than loop forever.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const repairs = await withDirectoryMergeLock(input.cwd, async (anchor) => {
+      await ensureProjectRepositoriesRoot(anchor);
+      const missing: number[] = [];
+      for (const [index, repo] of results.entries()) {
+        const stats = await fs.lstat(repo.cwd).catch(() => null);
+        if (stats && !stats.isDirectory()) throw new Error("Invalid project repository checkout path");
+        if (!(await hasAdoptableManagedWorkspaceGit(repo.cwd))) missing.push(index);
+      }
+      if (missing.length > 0) return missing;
+      // Retain detached checkout work outside the synchronized repository set.
+      const active = new Set(results.map((repo) => path.basename(repo.cwd)));
+      for (const entry of await fs.readdir(root)) {
+        if (active.has(entry) || entry.includes(".clone-")) continue;
+        const retained = path.join(await projectRepositoryRuntimeDir(anchor, "detached-repositories"), randomUUID());
+        await fs.rename(path.join(root, entry), retained);
+      }
+      return [];
+    });
+    if (repairs.length === 0) return results;
+    if (attempt === 2) throw new Error("Project repositories changed repeatedly during setup");
+    for (const index of repairs) {
+      const repaired = await prepare(selected[index]!);
+      const warnings = [...(results[index]!.warnings ?? []), ...(repaired.warnings ?? [])];
+      results[index] = { ...repaired, ...(warnings.length > 0 ? { warnings } : {}) };
+    }
   }
-  // Retain detached checkout work outside the synchronized repository set.
-  const active = new Set(results.map((repo) => path.basename(repo.cwd)));
-  for (const entry of await fs.readdir(root)) {
-    if (active.has(entry) || entry.includes(".clone-")) continue;
-    const retained = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-    await fs.mkdir(path.dirname(retained), { recursive: true });
-    await fs.rename(path.join(root, entry), retained);
-  }
-  return results;
+  throw new Error("Project repositories could not be stabilized");
 }
 
 /**
@@ -4483,6 +4595,21 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
+const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
+const RUN_GATEWAY_TOKEN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export function heartbeatRunGatewayTokenTtlMs(): number {
+  const raw = readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS);
+  // Digits only: "24h" or "8.64e7" must not be read as 24 ms or 8 ms.
+  if (!raw || !/^\d+$/.test(raw)) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (parsed <= 0) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  // The gateway rejects tokens whose run is no longer active, so a long TTL
+  // only keeps tools working for the lifetime of a still-running run. The cap
+  // keeps an oversized value from producing an invalid expiry date.
+  return Math.min(parsed, RUN_GATEWAY_TOKEN_MAX_TTL_MS);
+}
+
 function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
   return configured
@@ -4807,7 +4934,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       clientLabel: `${input.agent.name} heartbeat run`,
       ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: new Date(Date.now() + heartbeatRunGatewayTokenTtlMs()),
     },
     actor: { agentId: input.agent.id },
   });
@@ -4861,7 +4988,7 @@ function createAdapterRuntimeToolAccess(input: {
     },
     bearerToken: minted.token,
     expiresAt: minted.expiresAt,
-    tools: CONNECTION_RUNTIME_TOOL_NAMES,
+    tools: RUNTIME_TOOL_NAMES,
   });
 }
 
@@ -5104,7 +5231,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + heartbeatRunGatewayTokenTtlMs());
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({
@@ -9423,6 +9550,207 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export interface PresentationWakeProvenance {
+  wakeReason: string | null;
+  wakeCommentId: string | null;
+}
+
+/**
+ * Derive the wake provenance the no-progress/no-event suppression reads.
+ * Pure snapshot read: the wake reason plus the wake comment id (including
+ * batched/coalesced comment ids). Extracted from run finalization so the
+ * suppression contract is covered by tests, not just by inspection.
+ */
+export function derivePresentationWakeProvenance(
+  contextSnapshot: unknown,
+): PresentationWakeProvenance {
+  const snapshot = parseObject(contextSnapshot);
+  return {
+    wakeReason: readNonEmptyString(snapshot.wakeReason),
+    wakeCommentId: deriveCommentId(snapshot, null),
+  };
+}
+
+export interface PresentationProgressInput {
+  companyId: string;
+  runId: string;
+  issueId: string | null;
+  hasExistingRunComment: boolean;
+}
+
+/**
+ * Activity actions that are monitor housekeeping, not issue-visible progress
+ * for presentation purposes. A monitor wake's own re-arm writes
+ * `issue.monitor_scheduled` plus an `issue.updated` row whose changes only
+ * touch monitor fields; counting either as progress defeats the no-progress
+ * no-event suppression, because every no-op monitor wake re-arms its monitor
+ * and would therefore always "make progress". The scheduling writes
+ * themselves are untouched — only the publish decision ignores them.
+ */
+export const PRESENTATION_MONITOR_HOUSEKEEPING_ACTIONS: ReadonlySet<string> =
+  new Set(["issue.monitor_scheduled"]);
+
+/**
+ * Top-level `issue.updated` change keys that only re-arm or inspect the
+ * monitor. `executionState`/`executionPolicy` transitions are compared with
+ * their `monitor` sub-object stripped, so a stage or status advance still
+ * counts as progress.
+ */
+export const PRESENTATION_MONITOR_ONLY_UPDATE_KEYS: ReadonlySet<string> =
+  new Set([
+    "monitorNotes",
+    "executionState",
+    "executionPolicy",
+    "monitorNextCheckAt",
+    "monitorScheduledBy",
+    "monitorWakeRequestedAt",
+    "statusVersion",
+  ]);
+
+function canonicalizeForMonitorComparison(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalizeForMonitorComparison).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const entries = Object.keys(record)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${canonicalizeForMonitorComparison(record[key])}`,
+      );
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function withoutMonitorSubObject(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const { monitor: _ignored, ...rest } = value as Record<string, unknown>;
+  return rest;
+}
+
+/**
+ * Keys a freshly created execution policy may carry besides its `monitor`
+ * sub-object when the creation is just a monitor re-arm (no stages planned,
+ * no workflow configured). A creation carrying anything else — planned
+ * stages, an approval chain, etc. — is real work, not housekeeping.
+ */
+const SCHEDULING_ONLY_POLICY_KEYS: ReadonlySet<string> = new Set([
+  "mode",
+  "stages",
+  "commentRequired",
+]);
+
+function isSchedulingOnlyPolicyCreation(value: unknown): boolean {
+  const stripped = withoutMonitorSubObject(value);
+  if (!stripped || typeof stripped !== "object" || Array.isArray(stripped)) {
+    return false;
+  }
+  for (const [key, entry] of Object.entries(
+    stripped as Record<string, unknown>,
+  )) {
+    if (!SCHEDULING_ONLY_POLICY_KEYS.has(key)) return false;
+    if (key === "stages") {
+      if (entry === undefined || entry === null) continue;
+      if (!Array.isArray(entry) || entry.length > 0) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether an `issue.updated` activity row is monitor-only housekeeping (a
+ * monitor re-arm) rather than issue-visible progress. Returns false —
+ * counting as progress — for anything unclassifiable, so real progress is
+ * never silently suppressed.
+ */
+export function isMonitorOnlyIssueUpdateDetails(details: unknown): boolean {
+  if (!details || typeof details !== "object" || Array.isArray(details)) {
+    return false;
+  }
+  const changes = (details as Record<string, unknown>).changes;
+  if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+    return false;
+  }
+  const entries = Object.entries(changes as Record<string, unknown>);
+  if (entries.length === 0) return true;
+  for (const [key, change] of entries) {
+    if (!PRESENTATION_MONITOR_ONLY_UPDATE_KEYS.has(key)) return false;
+    if (key === "executionState" || key === "executionPolicy") {
+      if (!change || typeof change !== "object" || Array.isArray(change)) {
+        return false;
+      }
+      const transition = change as Record<string, unknown>;
+      if (!("to" in transition) && !("from" in transition)) return false;
+      const from = (transition as { from?: unknown }).from ?? null;
+      if (from === null) {
+        // A first-time policy/state creation by the run. The monitor re-arm
+        // path creates the execution policy when none exists, so a
+        // scheduling-only skeleton still counts as housekeeping; anything
+        // richer (planned stages, workflow state) counts as progress.
+        if (
+          key !== "executionPolicy" ||
+          !isSchedulingOnlyPolicyCreation(
+            (transition as { to?: unknown }).to,
+          )
+        ) {
+          return false;
+        }
+        continue;
+      }
+      if (
+        canonicalizeForMonitorComparison(
+          withoutMonitorSubObject((transition as { to?: unknown }).to),
+        ) !== canonicalizeForMonitorComparison(withoutMonitorSubObject(from))
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Resolve whether a run left issue-visible progress for presentation
+ * purposes. An explicit run comment counts as progress (it keeps reuse
+ * precedence inside the resolver); otherwise progress is any
+ * ISSUE_PROGRESS_ACTIVITY_ACTIONS row attributed to this run on this issue,
+ * excluding monitor housekeeping (the run's own monitor re-arm). Returns
+ * undefined when there is no issue, preserving legacy behavior for callers
+ * without an issue context.
+ */
+export async function readPresentationRunMadeIssueProgress(
+  db: Db,
+  input: PresentationProgressInput,
+): Promise<boolean | undefined> {
+  if (!input.issueId) return undefined;
+  if (input.hasExistingRunComment) return true;
+  const candidateRows = await db
+    .select({ action: activityLog.action, details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.runId, input.runId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        inArray(activityLog.action, ISSUE_PROGRESS_ACTIVITY_ACTIONS),
+      ),
+    )
+    .limit(50);
+  return candidateRows.some(
+    (row) =>
+      !PRESENTATION_MONITOR_HOUSEKEEPING_ACTIONS.has(row.action) &&
+      !(
+        row.action === "issue.updated" &&
+        isMonitorOnlyIssueUpdateDetails(row.details)
+      ),
+  );
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -10651,8 +10979,15 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(
+    companyId: string,
+    issueId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
@@ -10763,6 +11098,10 @@ export function heartbeatService(
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (
       !issueContext ||
@@ -10773,7 +11112,7 @@ export function heartbeatService(
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await queryDb
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -10790,7 +11129,7 @@ export function heartbeatService(
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await queryDb
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -10819,7 +11158,7 @@ export function heartbeatService(
       }
     }
 
-    const routine = await db
+    const routine = await queryDb
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -10840,8 +11179,14 @@ export function heartbeatService(
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(
+    companyId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    const company = await queryDb
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -10851,7 +11196,7 @@ export function heartbeatService(
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10867,7 +11212,7 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10886,9 +11231,13 @@ export function heartbeatService(
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await queryDb
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -10924,7 +11273,12 @@ export function heartbeatService(
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the reads
+    // reuse the transaction's connection instead of acquiring a second pooled
+    // connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
+    const queryDb = input.queryDb ?? db;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -10944,7 +11298,7 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await queryDb
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -10969,7 +11323,7 @@ export function heartbeatService(
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await queryDb
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -10991,11 +11345,12 @@ export function heartbeatService(
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      queryDb,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, queryDb);
   }
 
   async function resolveResponsibleUserIdForRun(input: {
@@ -11056,8 +11411,14 @@ export function heartbeatService(
     });
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(
+    agentId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -11094,8 +11455,12 @@ export function heartbeatService(
     agentId: string,
     adapterType: string,
     taskKey: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
-    return db
+    return queryDb
       .select()
       .from(agentTaskSessions)
       .where(
@@ -12148,6 +12513,9 @@ export function heartbeatService(
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` for the same
+    // nested-pool reason as getTaskSession.
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -12156,6 +12524,7 @@ export function heartbeatService(
         agent.id,
         agent.adapterType,
         taskKey,
+        queryDb,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -12167,7 +12536,7 @@ export function heartbeatService(
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, queryDb);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -12189,6 +12558,10 @@ export function heartbeatService(
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the session
+    // read reuses the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -12205,6 +12578,7 @@ export function heartbeatService(
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.queryDb,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,
@@ -12217,11 +12591,15 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the resume
+    // reads reuse the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
 
-    const resumeRun = await db
+    const resumeRun = await queryDb
       .select({
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -12248,6 +12626,7 @@ export function heartbeatService(
           agent.id,
           agent.adapterType,
           resumeTaskKey,
+          queryDb,
         )
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
@@ -21330,6 +21709,32 @@ export function heartbeatService(
       const managedSandboxEnvironment = managedSandboxOnly
         ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
         : null;
+      // Trust-aware placement: only a `low_trust_review` run reads the
+      // instance's designated low-trust sandbox, and only when its selection
+      // would land on local. The designation is re-verified here; an unusable
+      // one is dropped (and logged) so the low-trust gate fails closed with
+      // `low_trust_requires_sandbox_environment` rather than running on local.
+      const isLowTrustReviewRun = trustPreset.kind === "low_trust_review";
+      const lowTrustSandboxDesignation = isLowTrustReviewRun
+        ? await resolveLowTrustSandboxEnvironment({
+            designatedEnvironmentId:
+              resolvedInstanceSettings.general.lowTrustSandboxEnvironmentId ??
+              null,
+            companyId: agent.companyId,
+            environments: environmentsSvc,
+          })
+        : null;
+      if (lowTrustSandboxDesignation?.rejection) {
+        logger.warn(
+          {
+            runId: run.id,
+            agentId: agent.id,
+            companyId: agent.companyId,
+            rejection: lowTrustSandboxDesignation.rejection,
+          },
+          "Ignoring the designated low-trust sandbox environment: it is not usable for this run",
+        );
+      }
       const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
@@ -21337,6 +21742,9 @@ export function heartbeatService(
         localDefaultEnvironmentId: localEnvironment.id,
         managedSandboxOnly,
         managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
+        lowTrustReview: isLowTrustReviewRun,
+        lowTrustSandboxEnvironmentId:
+          lowTrustSandboxDesignation?.environmentId ?? null,
       });
       const effectiveExecutionWorkspaceMode: ReturnType<
         typeof resolveExecutionWorkspaceMode
@@ -22441,6 +22849,9 @@ export function heartbeatService(
         });
         const paths = new Map(repositories.map((repo) => [repo.workspaceId, repo.cwd]));
         projectRepositoryPaths.push(...repositories.map((repo) => path.relative(executionWorkspace.cwd, repo.cwd)));
+        for (const repo of repositories) {
+          if (repo.warnings?.length) resolvedWorkspace.warnings.push(...repo.warnings);
+        }
         if (resolvedWorkspace.workspaceId) paths.set(resolvedWorkspace.workspaceId, executionWorkspace.cwd);
         resolvedWorkspace.workspaceHints = resolvedWorkspace.workspaceHints.map((hint) => ({
           ...hint, cwd: paths.get(hint.workspaceId) ?? hint.cwd,
@@ -23401,6 +23812,15 @@ export function heartbeatService(
           target: executionTarget,
           workspaceId: persistedExecutionWorkspace?.id ?? null,
         });
+        // isolateRuntime is applied by the legacy codex adapter. The native runner
+        // would run the agent without it, so refuse rather than silently widen.
+        if (
+          nativeRuntimeResolution.kind === "native" &&
+          agent.adapterType === "codex_local" &&
+          parseObject(agent.adapterConfig).isolateRuntime === true
+        ) {
+          throw new Error("isolate_runtime_unsupported_on_native_runtime");
+        }
         let nativeExecution: NativeExecutionInput | null = null;
         let nativeRunnerInstanceId: string | null = null;
         if (nativeRuntimeResolution.kind === "native") {
@@ -24248,8 +24668,10 @@ export function heartbeatService(
                   ) {
                     repairedExpectedBranchName = coherence.branchName;
                     executionWorkspace.branchName = coherence.branchName;
-                    executionWorkspace.warnings.push(...coherence.warnings);
                   }
+                  // A repair that keeps the recorded branch (a restore) still
+                  // changed the worktree, and its warning names any rescue branch.
+                  executionWorkspace.warnings.push(...coherence.warnings);
                 } catch (repairErr) {
                   const workspaceValidationFailure =
                     isWorkspaceValidationFailure(repairErr) ? repairErr : null;
@@ -24634,13 +25056,20 @@ export function heartbeatService(
                   }
                 : {}),
             };
-            const runtimeTools = createAdapterRuntimeToolAccess({
-              agentId: agent.id,
-              companyId: agent.companyId,
-              runId: run.id,
-              responsibleUserId: run.responsibleUserId,
-            });
-            if (!runtimeTools) {
+            // An isolated codex run (adapterConfig.isolateRuntime) is handed no MCP
+            // gateway and no run token, so none is minted for it.
+            const isolatedRuntime =
+              agent.adapterType === "codex_local" &&
+              parseObject(runtimeConfig).isolateRuntime === true;
+            const runtimeTools = isolatedRuntime
+              ? undefined
+              : createAdapterRuntimeToolAccess({
+                  agentId: agent.id,
+                  companyId: agent.companyId,
+                  runId: run.id,
+                  responsibleUserId: run.responsibleUserId,
+                });
+            if (!runtimeTools && !isolatedRuntime) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -24650,11 +25079,13 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
-              db,
-              agent,
-              runId: run.id,
-            });
+            const runtimeMcpServers = isolatedRuntime
+              ? []
+              : await buildPaperclipRuntimeMcpServers({
+                  db,
+                  agent,
+                  runId: run.id,
+                });
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
             if (runtimeTools && runtimeToolDelivery === "native_mcp") {
@@ -24665,7 +25096,7 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+            if (!isolatedRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
               runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
                 token: authToken, connectionId: "paperclip-project-tools" });
             }
@@ -24673,14 +25104,16 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = await createManagedMcpRunConfig({
-              db,
-              agent,
-              runId: run.id,
-              config: runtimeConfig,
-              projectId: issueRef?.projectId ?? null,
-              issueId: issueRef?.id ?? null,
-            });
+            const managedMcpConfig = isolatedRuntime
+              ? null
+              : await createManagedMcpRunConfig({
+                  db,
+                  agent,
+                  runId: run.id,
+                  config: runtimeConfig,
+                  projectId: issueRef?.projectId ?? null,
+                  issueId: issueRef?.id ?? null,
+                });
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
@@ -24760,7 +25193,7 @@ export function heartbeatService(
                         startedAt: meta.startedAt,
                       });
                     },
-                    authToken: authToken ?? undefined,
+                    authToken: isolatedRuntime ? undefined : authToken ?? undefined,
                   });
                 },
               );
@@ -25407,6 +25840,24 @@ export function heartbeatService(
               livenessRun.contextSnapshot,
               externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
             );
+            // No-progress, no-event suppression: a wake that carried no new
+            // event plus a run that left no issue-visible progress must not
+            // publish its final message as a comment. The text stays in the
+            // run log. Progress is any ISSUE_PROGRESS_ACTIVITY_ACTIONS row
+            // attributed to this run, or an explicit run comment (which keeps
+            // reuse precedence inside the resolver).
+            const presentationWake = derivePresentationWakeProvenance(
+              livenessRun.contextSnapshot,
+            );
+            const presentationWakeReason = presentationWake.wakeReason;
+            const presentationWakeCommentId = presentationWake.wakeCommentId;
+            const presentationRunMadeIssueProgress =
+              await readPresentationRunMadeIssueProgress(db, {
+                companyId: livenessRun.companyId,
+                runId: livenessRun.id,
+                issueId,
+                hasExistingRunComment: Boolean(existingRunComment),
+              });
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
               conversationTurnFinished: isConversation(issueContext) &&
@@ -25424,6 +25875,9 @@ export function heartbeatService(
                 Boolean(adapterResult.nativeFinalization) &&
                 externalChatPresentationAuthorization ===
                   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+              wakeReason: presentationWakeReason,
+              wakeCommentId: presentationWakeCommentId,
+              runMadeIssueProgress: presentationRunMadeIssueProgress,
             });
             let presentationDecision: RunPresentationDecision =
               resolved.decision;
@@ -26868,7 +27322,12 @@ export function heartbeatService(
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // session read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    const resolveHasResolvablePriorSessionWorkspace = async (
+      queryDb?: Pick<Db, "select">,
+    ) => {
       if (hasResolvablePriorSessionWorkspace !== null)
         return hasResolvablePriorSessionWorkspace;
       hasResolvablePriorSessionWorkspace = issueId
@@ -26877,6 +27336,7 @@ export function heartbeatService(
             contextSnapshot: enrichedContextSnapshot,
             taskKey: effectiveTaskKey,
             explicitResumeSession,
+            queryDb,
           })
         : false;
       return hasResolvablePriorSessionWorkspace;
@@ -26945,15 +27405,20 @@ export function heartbeatService(
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // responsible-user reads reuse the transaction's connection instead of
+    // acquiring a second pooled connection (pool deadlock at saturation). The
+    // pre-lock call sites pass nothing and keep the pooled `db` behavior.
+    const resolveQueuedResponsibleUserId = (queryDb?: Pick<Db, "select">) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, queryDb)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          queryDb,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
@@ -26965,6 +27430,7 @@ export function heartbeatService(
             requestedByActorId: opts.requestedByActorId ?? null,
             source,
             triggerDetail,
+            queryDb,
           });
         if (!queuedResponsibleUserId) {
           throw new HttpError(
@@ -27989,8 +28455,10 @@ export function heartbeatService(
                 issue.executionWorkspacePreference,
               existingExecutionWorkspaceStatus,
             });
+            // TOG-9736: pass tx so the inner task-session read reuses the
+            // transaction's connection (nested-pool deadlock at saturation).
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await resolveHasResolvablePriorSessionWorkspace(tx);
 
             if (
               isUnrunnableWorktreeCombo({
@@ -28426,7 +28894,9 @@ export function heartbeatService(
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              // TOG-9736: pass tx so the responsible-user reads reuse the
+              // transaction's connection (nested-pool deadlock at saturation).
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -28698,7 +29168,9 @@ export function heartbeatService(
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          // TOG-9736: pass tx so the responsible-user reads reuse the
+          // transaction's connection (nested-pool deadlock at saturation).
+          responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
