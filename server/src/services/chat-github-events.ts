@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import {
+  chatConversations,
   chatEndpoints,
   chatEndpointResources,
   chatExternalPrincipals,
@@ -8,6 +9,7 @@ import {
   chatGitHubReviews,
   chatIdentityLinks,
   companyMemberships,
+  issues,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -199,4 +201,61 @@ export async function githubPreviousAssessment(
     .orderBy(desc(chatGitHubReviews.createdAt))
     .limit(1);
   return review ?? null;
+}
+
+type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+const GITHUB_PULL_THREAD_PATTERN = /^github:([^/:]+\/[^/:]+):([1-9][0-9]*)$/;
+
+/**
+ * Normalized key for a PR-level GitHub thread (`github:<owner>/<repo>:<pr>`),
+ * or null for review-comment (`:rc:`), issue (`:issue:`), and non-GitHub threads.
+ *
+ * Repository matching is case-insensitive: GitHub owner/repo names are
+ * case-preserving but not case-significant, while inbound webhook payloads
+ * vary (`Acme/app` vs `acme/app`). Without this, the same
+ * PR binds one card per casing and the reviewer queue fills with duplicates.
+ */
+export function githubPullThreadKey(threadId: string): string | null {
+  const match = GITHUB_PULL_THREAD_PATTERN.exec(threadId);
+  if (!match) return null;
+  return `github:${match[1]!.toLowerCase()}:${match[2]!}`;
+}
+
+/**
+ * One live card per repo:PR. When a PR-level thread has no bound conversation
+ * (e.g. an earlier card was opened under a differently-cased thread id),
+ * reuse the newest conversation whose issue is still open instead of spawning
+ * a duplicate card. Returns null when no open card exists.
+ */
+export async function reuseOpenGitHubPullConversation(
+  database: DbOrTransaction,
+  input: { companyId: string; endpointId: string; threadId: string },
+): Promise<{
+  conversation: typeof chatConversations.$inferSelect;
+  issue: typeof issues.$inferSelect;
+} | null> {
+  const key = githubPullThreadKey(input.threadId);
+  if (!key) return null;
+  const [match] = await database
+    .select({ conversation: chatConversations, issue: issues })
+    .from(chatConversations)
+    .innerJoin(
+      issues,
+      and(
+        eq(issues.id, chatConversations.issueId),
+        eq(issues.companyId, chatConversations.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(chatConversations.companyId, input.companyId),
+        eq(chatConversations.endpointId, input.endpointId),
+        sql`lower(${chatConversations.externalThreadId}) = ${key}`,
+        inArray(issues.status, ["todo", "in_progress"]),
+      ),
+    )
+    .orderBy(desc(chatConversations.createdAt))
+    .limit(1);
+  return match ?? null;
 }

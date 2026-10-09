@@ -94,7 +94,7 @@ function readLowTrustAllowedBindingIds(value: unknown): string[] {
 }
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
-import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment } from "./chat-github-events.js";
+import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
 import { githubReviewPrompt } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
@@ -15694,6 +15694,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               )
               .then((rows) => rows[0] ?? null)
           : null;
+      if (!existingConversation && endpoint.provider === "github") {
+        // One live card per repo:PR. PR-level thread ids vary in repository
+        // casing across webhook paths (`Acme/app` vs
+        // `acme/app`), so the exact lookup above misses a still-open
+        // card bound under the other casing. Reuse that card so this event
+        // lands on it as a comment/wake instead of spawning a duplicate.
+        const fallback = await reuseOpenGitHubPullConversation(db, {
+          companyId: endpoint.companyId,
+          endpointId: endpoint.id,
+          threadId: thread.id,
+        });
+        if (fallback) {
+          existingConversation = fallback.conversation;
+          existingIssue = fallback.issue;
+        }
+      }
       if (
         isLinear &&
         existingConversation &&
@@ -16164,6 +16180,29 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         taskUserId: string | null,
       ) => {
         let conversation = existingConversation;
+        if (!conversation) {
+          const pullKey =
+            taskEndpoint.provider === "github"
+              ? githubPullThreadKey(thread.id)
+              : null;
+          if (pullKey) {
+            // Serialize concurrent first-events for one PR (e.g. a push and a
+            // mention arriving together under different thread casings). The
+            // loser reuses the winner's card instead of spawning a duplicate.
+            await taskTx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${`github-pull:${taskEndpoint.companyId}:${taskEndpoint.id}:${pullKey}`}, 0))`,
+            );
+            const raced = await reuseOpenGitHubPullConversation(taskTx, {
+              companyId: taskEndpoint.companyId,
+              endpointId: taskEndpoint.id,
+              threadId: thread.id,
+            });
+            if (raced) {
+              conversation = raced.conversation;
+              existingIssue = raced.issue;
+            }
+          }
+        }
         if (!conversation) {
           const sessionGeneration = isLinear
             ? (latestConversation?.sessionGeneration ?? 0) + 1
