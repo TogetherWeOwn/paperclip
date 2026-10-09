@@ -433,6 +433,119 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     ]);
   }, 20_000);
 
+  it("pins each branch of the agent existing-grant guard", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const steward = await insertAgentMembership(db, company.id, "Pin steward");
+    const target = await insertAgentMembership(db, company.id, "Pin target");
+    const stewardReport = await insertAgentMembership(db, company.id, "Pin steward report");
+    await db.update(agents).set({ reportsTo: steward.agent.id }).where(eq(agents.id, stewardReport.agent.id));
+    const peerSteward = await insertAgentMembership(db, company.id, "Pin peer steward");
+    const peerReport = await insertAgentMembership(db, company.id, "Pin peer report");
+    await db.update(agents).set({ reportsTo: peerSteward.agent.id }).where(eq(agents.id, peerReport.agent.id));
+    for (const membership of [steward, peerSteward]) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: membership.agent.id,
+        permissionKey: "users:manage_permissions",
+        scope: null,
+        grantedByUserId: owner.principalId,
+      });
+    }
+    const app = await createAgentApp(db, company.id, steward.agent.id);
+    const peerApp = await createAgentApp(db, company.id, peerSteward.agent.id);
+    const boardApp = await createApp(db, company.id, owner.principalId);
+    const route = (membershipId: string) =>
+      `/api/companies/${company.id}/members/${membershipId}/permissions/agents:suggest-changes`;
+    const suggestGrants = () => db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"));
+    const clearGrants = () => db.delete(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"));
+    const validNarrow = { enabled: true, scope: { managedSubtreeAgentIds: [stewardReport.agent.id] } };
+
+    // 1. Board-issued narrow grant rooted INSIDE the steward's subtree.
+    // Only the grantedByUserId branch refuses this: the stored scope is
+    // narrow and inside, so the other two branches pass.
+    await clearGrants();
+    const boardInside = await request(boardApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [stewardReport.agent.id] } });
+    expect(boardInside.status, JSON.stringify(boardInside.body)).toBe(200);
+    for (const body of [validNarrow, { enabled: false }]) {
+      const res = await request(app).patch(route(target.membership.id)).send(body);
+      expect(res.status, JSON.stringify({ body, res: res.body })).toBe(403);
+    }
+    expect(await suggestGrants()).toEqual([
+      expect.objectContaining({
+        principalId: target.agent.id,
+        scope: { managedSubtreeAgentIds: [stewardReport.agent.id] },
+        grantedByUserId: owner.principalId,
+      }),
+    ]);
+
+    // 2. Peer-steward agent-issued narrow grant rooted OUTSIDE the steward's
+    // subtree. Only the stored-root isInSubtree branch refuses this: the
+    // granter is null and the scope is narrow.
+    await clearGrants();
+    const peerGrant = await request(peerApp).patch(route(target.membership.id))
+      .send({ enabled: true, scope: { managedSubtreeAgentIds: [peerReport.agent.id] } });
+    expect(peerGrant.status, JSON.stringify(peerGrant.body)).toBe(200);
+    for (const body of [validNarrow, { enabled: false }]) {
+      const res = await request(app).patch(route(target.membership.id)).send(body);
+      expect(res.status, JSON.stringify({ body, res: res.body })).toBe(403);
+    }
+    expect(await suggestGrants()).toEqual([
+      expect.objectContaining({
+        principalId: target.agent.id,
+        scope: { managedSubtreeAgentIds: [peerReport.agent.id] },
+        grantedByUserId: null,
+      }),
+    ]);
+
+    // 3. Null-provenance company-wide/unscoped shapes. Only the !stored
+    // branch refuses these: the granter is null so the board branch passes.
+    for (const scope of [null, {}, { managedSubtreeAgentId: stewardReport.agent.id }, { managedSubtreeAgentIds: [stewardReport.agent.id], extra: 1 }]) {
+      await clearGrants();
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: target.agent.id,
+        permissionKey: "agents:suggest-changes",
+        scope,
+        grantedByUserId: null,
+      });
+      for (const body of [validNarrow, { enabled: false }]) {
+        const res = await request(app).patch(route(target.membership.id)).send(body);
+        expect(res.status, JSON.stringify({ scope, body, res: res.body })).toBe(403);
+      }
+      expect(await suggestGrants()).toHaveLength(1);
+    }
+
+    // 4. Mixed inside+outside roots: one outside root is enough to refuse.
+    await clearGrants();
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: target.agent.id,
+      permissionKey: "agents:suggest-changes",
+      scope: { managedSubtreeAgentIds: [stewardReport.agent.id, peerReport.agent.id] },
+      grantedByUserId: null,
+    });
+    for (const body of [validNarrow, { enabled: false }]) {
+      const res = await request(app).patch(route(target.membership.id)).send(body);
+      expect(res.status, JSON.stringify({ body, res: res.body })).toBe(403);
+    }
+    expect(await suggestGrants()).toHaveLength(1);
+
+    // Control: agent-issued narrow fully inside the steward's subtree can
+    // still be replaced and revoked.
+    await clearGrants();
+    const insideGrant = await request(app).patch(route(target.membership.id)).send(validNarrow);
+    expect(insideGrant.status, JSON.stringify(insideGrant.body)).toBe(200);
+    const insideRevoke = await request(app).patch(route(target.membership.id)).send({ enabled: false });
+    expect(insideRevoke.status, JSON.stringify(insideRevoke.body)).toBe(200);
+    expect(await suggestGrants()).toEqual([]);
+  }, 30_000);
+
   it("rejects the targeted grant route for human memberships", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({

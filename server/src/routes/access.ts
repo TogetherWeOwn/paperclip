@@ -4710,16 +4710,103 @@ export function accessRoutes(
             }
           }
         }
+        // Atomic guard+write: re-check the locked row inside the write
+        // transaction so a concurrent board (or peer steward) grant cannot
+        // slip between the pre-check above and the write below. The
+        // conditional upsert/delete on grantedByUserId IS NULL makes the
+        // board-issued win atomic even when there was no row to lock.
+        await db.transaction(async (tx) => {
+          const locked = await tx
+            .select()
+            .from(principalPermissionGrants)
+            .where(
+              and(
+                eq(principalPermissionGrants.companyId, companyId),
+                eq(principalPermissionGrants.principalType, "agent"),
+                eq(principalPermissionGrants.principalId, memberToUpdate.principalId),
+                eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"),
+              ),
+            )
+            .for("update");
+          const lockedCurrent = locked[0];
+          if (lockedCurrent) {
+            if (lockedCurrent.grantedByUserId !== null && lockedCurrent.grantedByUserId !== undefined) {
+              throw forbidden("Agents cannot change grants issued by the board");
+            }
+            const stored = narrowScopeRoots(lockedCurrent.scope);
+            if (!stored) {
+              throw forbidden("Agents cannot change company-wide or unscoped grants");
+            }
+            for (const rootId of stored) {
+              if (!isInSubtree(callerAgentId, rootId)) {
+                throw forbidden("Agents cannot change grants outside their own reporting subtree");
+              }
+            }
+          }
+          if (req.body.enabled) {
+            const now = new Date();
+            const writeScope = (req.body.scope ?? null) as Record<string, unknown> | null;
+            const rows = await tx
+              .insert(principalPermissionGrants)
+              .values({
+                companyId,
+                principalType: "agent",
+                principalId: memberToUpdate.principalId,
+                permissionKey: "agents:suggest-changes",
+                scope: writeScope,
+                grantedByUserId: null,
+                createdAt: now,
+                updatedAt: now,
+              })
+              .onConflictDoUpdate({
+                target: [
+                  principalPermissionGrants.companyId,
+                  principalPermissionGrants.principalType,
+                  principalPermissionGrants.principalId,
+                  principalPermissionGrants.permissionKey,
+                ],
+                set: {
+                  scope: writeScope,
+                  grantedByUserId: null,
+                  updatedAt: now,
+                },
+                setWhere: isNull(principalPermissionGrants.grantedByUserId),
+              })
+              .returning({ id: principalPermissionGrants.id });
+            if (rows.length === 0) {
+              throw conflict("Grant changed concurrently; retry");
+            }
+          } else {
+            if (!lockedCurrent) return;
+            const deleted = await tx
+              .delete(principalPermissionGrants)
+              .where(
+                and(
+                  eq(principalPermissionGrants.companyId, companyId),
+                  eq(principalPermissionGrants.principalType, "agent"),
+                  eq(principalPermissionGrants.principalId, memberToUpdate.principalId),
+                  eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"),
+                  isNull(principalPermissionGrants.grantedByUserId),
+                ),
+              )
+              .returning({ id: principalPermissionGrants.id });
+            if (deleted.length === 0) {
+              throw conflict("Grant changed concurrently; retry");
+            }
+          }
+        });
       }
 
-      const updated = await access.setMemberPermission(
-        companyId,
-        memberId,
-        permissionKey,
-        req.body.enabled,
-        req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-        req.body.scope ?? null,
-      );
+      const updated = req.actor.type === "agent"
+        ? memberToUpdate
+        : await access.setMemberPermission(
+          companyId,
+          memberId,
+          permissionKey,
+          req.body.enabled,
+          req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+          req.body.scope ?? null,
+        );
       if (!updated) throw notFound("Member not found");
 
       const grants = await access.listPrincipalGrants(
