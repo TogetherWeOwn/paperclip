@@ -546,6 +546,86 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
     expect(await suggestGrants()).toEqual([]);
   }, 30_000);
 
+  it("returns 409 when a board grant lands between the guard read and the write", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const steward = await insertAgentMembership(db, company.id, "Race steward");
+    const target = await insertAgentMembership(db, company.id, "Race target");
+    const stewardReport = await insertAgentMembership(db, company.id, "Race steward report");
+    await db.update(agents).set({ reportsTo: steward.agent.id }).where(eq(agents.id, stewardReport.agent.id));
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: steward.agent.id,
+      permissionKey: "users:manage_permissions",
+      scope: null,
+      grantedByUserId: owner.principalId,
+    });
+    const app = await createAgentApp(db, company.id, steward.agent.id);
+    const route = `/api/companies/${company.id}/members/${target.membership.id}/permissions/agents:suggest-changes`;
+    const narrowEnable = { enabled: true, scope: { managedSubtreeAgentIds: [stewardReport.agent.id] } };
+
+    // Deterministic TOCTOU fixture: proxy the transaction client so the
+    // route's locked grant SELECT resolves first, then a board-issued
+    // unscoped grant lands on a second connection before the route's
+    // conditional upsert runs. Without the setWhere provenance condition the
+    // upsert would overwrite the board grant (200); with it the write touches
+    // zero rows and the route answers 409 with the board grant intact.
+    let raced = false;
+    const proxyBuilder = (builder: any): any =>
+      new Proxy(builder, {
+        get(builderTarget: any, prop: string | symbol) {
+          if (prop === "then") {
+            return (onFulfilled: any, onRejected: any) =>
+              Promise.resolve(builderTarget)
+                .then(async (rows: any) => {
+                  if (!raced) {
+                    raced = true;
+                    await db.insert(principalPermissionGrants).values({
+                      companyId: company.id,
+                      principalType: "agent",
+                      principalId: target.agent.id,
+                      permissionKey: "agents:suggest-changes",
+                      scope: null,
+                      grantedByUserId: owner.principalId,
+                    });
+                  }
+                  return rows;
+                })
+                .then(onFulfilled, onRejected);
+          }
+          const value = Reflect.get(builderTarget, prop, builderTarget);
+          if (typeof value === "function") {
+            return (...args: any[]) => proxyBuilder(value.apply(builderTarget, args));
+          }
+          return value;
+        },
+      });
+    const realTransaction = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((async (callback: any) => {
+      return realTransaction(async (tx: any) => {
+        const rawSelect = tx.select.bind(tx);
+        tx.select = (...args: any[]) => proxyBuilder(rawSelect(...args));
+        return callback(tx);
+      });
+    }) as any);
+
+    try {
+      const res = await request(app).patch(route).send(narrowEnable);
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(raced).toBe(true);
+      expect(await db.select().from(principalPermissionGrants)
+        .where(eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"))).toEqual([
+        expect.objectContaining({
+          principalId: target.agent.id,
+          scope: null,
+          grantedByUserId: owner.principalId,
+        }),
+      ]);
+    } finally {
+      transactionSpy.mockRestore();
+    }
+  }, 20_000);
+
   it("rejects the targeted grant route for human memberships", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({
