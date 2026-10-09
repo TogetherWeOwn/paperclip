@@ -20,7 +20,9 @@ const NEVER_STARTED_CANCEL_MESSAGES = [
 /** Historical queued legacy cancellations have no process to stop. Require
  * untouched launch metadata, fully released leases with no pending or failed
  * cleanup, and only queue, cancellation, or settlement lifecycle events under
- * the run lock. Current execution controls remain the caller's gates. */
+ * the run lock. A server cancel note also covers the closed-issue status the
+ * terminalization writer echoes beside it. Current execution controls remain
+ * the caller's gates. */
 export async function isNeverStartedLegacyRun(db: Db, run: Run, coordinator: Coordinator | undefined) {
   if (run.runtimeMode !== "legacy" || run.status !== "cancelled" || !run.finishedAt || coordinator ||
       run.startedAt || run.processPid || run.processGroupId || run.processStartedAt ||
@@ -41,7 +43,9 @@ export async function isNeverStartedLegacyRun(db: Db, run: Run, coordinator: Coo
         or (coalesce(${heartbeatRunEvents.payload}->>'status', '') = ''
           and (coalesce(${heartbeatRunEvents.message}, '') in (${sql.join(NEVER_STARTED_CANCEL_MESSAGES.map(message => sql`${message}`), sql`, `)})
             or (coalesce(${heartbeatRunEvents.payload}->>'automaticRecovery', '') = 'preserve_without_replay_v1'
-              and coalesce(${heartbeatRunEvents.payload}->>'replay', '') = 'blocked'))))`),
+              and coalesce(${heartbeatRunEvents.payload}->>'replay', '') = 'blocked')))
+        or (coalesce(${heartbeatRunEvents.message}, '') in (${sql.join(NEVER_STARTED_CANCEL_MESSAGES.map(message => sql`${message}`), sql`, `)})
+          and coalesce(${heartbeatRunEvents.payload}->>'status', '') = 'done'))`),
   )).limit(1);
   return !execution;
 }

@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   approvals, issueApprovals, issueThreadInteractions,
@@ -440,6 +440,45 @@ const support = await getEmbeddedPostgresTestSupport();
   it("does not treat a cancellation note that carries a launch status as cancelled before launch", async () => {
     const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled", eventPayload: { status: "running" } });
     expect(await admit(f)).toBeNull();
+  });
+
+  it.each(["done", "cancelled"])("admits a never-started legacy run cancelled for issue terminalization with the writer's %s status echo", async status => {
+    // routes/issues.ts echoes the closed issue's status beside the cancel note.
+    const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled before issue terminalization",
+      eventPayload: { issueId: randomUUID(), status } });
+    const events = await db.select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+    expect(events).toContainEqual({ message: "run cancelled before issue terminalization",
+      payload: expect.objectContaining({ status }) });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
+  it("redelivers a deferred never-started message on the periodic resume scan", async () => {
+    const f = await seedNeverStartedLegacy();
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [f.commentId] },
+        executionWait: { reason: "process_identity_missing", message: "Waiting for execution recovery. Your message is saved." } },
+      updatedAt: new Date(0) });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) })
+        .where(eq(agentWakeupRequests.id, queueId));
+      await heartbeatService(db).resumeExecutionWaitComments();
+    }
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    expect(receipt.status).toBe("coalesced");
+    // The agent slot is free (the source run is cancelled), so ordinary admission
+    // dispatches the successor immediately instead of leaving it queued. The
+    // second scan must not deliver twice: exactly one successor run exists.
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      ne(heartbeatRuns.id, f.sourceRunId)));
+    expect(successors).toHaveLength(1);
+    expect(successors[0].contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.sourceRunId,
+      explicitUserContinuation: { commentId: f.commentId } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
   it("retains a never-started hold while its local environment lease is pending cleanup", async () => {
