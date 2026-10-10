@@ -163,6 +163,12 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+# Agents build native code in task workspaces (Rust build scripts, node-gyp,
+# cc-linked crates). Separate layer so the CLI tool layer above keeps its cache.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential pkg-config \
+  && rm -rf /var/lib/apt/lists/* \
+  && cc --version >/dev/null && make --version >/dev/null && pkg-config --version >/dev/null
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
