@@ -147,6 +147,84 @@ export async function githubBotCredentials(
 }
 
 /** Least-privilege short-lived token restricted to the single task repository. */
+const INSTALLATION_TOKEN_SKEW_MS = 60_000;
+const INSTALLATION_TOKEN_CACHE_MAX = 500;
+const INSTALLATION_TOKEN_FALLBACK_TTL_MS = 55 * 60_000;
+
+type InstallationTokenEntry = { token: string; expiresAtMs: number };
+const installationTokenCache = new Map<string, InstallationTokenEntry>();
+const installationTokenInflight = new Map<string, Promise<string>>();
+
+function installationTokenCacheKey(input: {
+  companyId: string;
+  endpointId: string;
+  installationId: string;
+  repositoryId: string;
+}): string {
+  return `${input.companyId}:${input.endpointId}:${input.installationId}:${input.repositoryId}`;
+}
+
+function readCachedInstallationToken(key: string, now: number): string | null {
+  const entry = installationTokenCache.get(key);
+  if (!entry) return null;
+  if (now >= entry.expiresAtMs - INSTALLATION_TOKEN_SKEW_MS) {
+    installationTokenCache.delete(key);
+    return null;
+  }
+  // Refresh recency without reordering expiry semantics.
+  installationTokenCache.delete(key);
+  installationTokenCache.set(key, entry);
+  return entry.token;
+}
+
+function storeInstallationToken(key: string, token: string, expiresAtMs: number): void {
+  if (installationTokenCache.has(key)) installationTokenCache.delete(key);
+  while (installationTokenCache.size >= INSTALLATION_TOKEN_CACHE_MAX) {
+    const oldest = installationTokenCache.keys().next();
+    if (oldest.done) break;
+    installationTokenCache.delete(oldest.value);
+  }
+  installationTokenCache.set(key, { token, expiresAtMs });
+}
+
+export const __installationTokenTestSeams = {
+  key: installationTokenCacheKey,
+  read: readCachedInstallationToken,
+  store: storeInstallationToken,
+  skewMs: INSTALLATION_TOKEN_SKEW_MS,
+  max: INSTALLATION_TOKEN_CACHE_MAX,
+} as const;
+
+/**
+ * Drop cached tokens for one repository. The key embeds the installation id,
+ * which callers do not hold, so match by company/endpoint/repository affixes.
+ * Used when GitHub rejects a cached token (401): the App may have been
+ * suspended, re-installed, or re-scoped mid-TTL. Returns evicted count.
+ */
+export function evictGithubBotRepositoryToken(input: {
+  companyId: string;
+  endpointId: string;
+  repositoryId: string;
+}): number {
+  const prefix = `${input.companyId}:${input.endpointId}:`;
+  const suffix = `:${input.repositoryId}`;
+  let evicted = 0;
+  for (const key of [...installationTokenCache.keys()]) {
+    if (key.startsWith(prefix) && key.endsWith(suffix)) {
+      installationTokenCache.delete(key);
+      evicted += 1;
+    }
+  }
+  return evicted;
+}
+
+/** Test seam only. Never exposes token material. */
+export function __clearGithubBotTokenCacheForTests(): void {
+  installationTokenCache.clear();
+  for (const [, pending] of installationTokenInflight) pending.catch(() => {});
+  installationTokenInflight.clear();
+}
+
 export async function githubBotRepositoryToken(
   db: Db,
   companyId: string,
@@ -167,25 +245,77 @@ export async function githubBotRepositoryToken(
     !Number.isSafeInteger(Number(repositoryId))
   )
     throw conflict("Verify the GitHub App installation first");
-  const issued = await githubBotRequest<{ token?: string }>(
-    fetchImpl,
-    result.appJwt,
-    `/app/installations/${encodeURIComponent(result.credentials.installationId)}/access_tokens`,
-    {
-      method: "POST",
-      body: {
-        repository_ids: [Number(repositoryId)],
-        permissions: {
-          contents: "read",
-          metadata: "read",
-          issues: "write",
-          pull_requests: "write",
-          checks: "write",
+  const key = installationTokenCacheKey({
+    companyId,
+    endpointId,
+    installationId: result.credentials.installationId,
+    repositoryId,
+  });
+  const cached = readCachedInstallationToken(key, Date.now());
+  if (cached) return cached;
+  const ongoing = installationTokenInflight.get(key);
+  if (ongoing) return ongoing;
+  const issue = (async () => {
+    const issued = await githubBotRequest<{ token?: string; expires_at?: string }>(
+      fetchImpl,
+      result.appJwt,
+      `/app/installations/${encodeURIComponent(result.credentials.installationId)}/access_tokens`,
+      {
+        method: "POST",
+        body: {
+          repository_ids: [Number(repositoryId)],
+          permissions: {
+            contents: "read",
+            metadata: "read",
+            issues: "write",
+            pull_requests: "write",
+            checks: "write",
+          },
         },
       },
-    },
-  );
-  if (!issued.token)
-    throw unprocessable("GitHub did not issue an installation token");
-  return issued.token;
+    );
+    if (!issued.token)
+      throw unprocessable("GitHub did not issue an installation token");
+    const parsed = typeof issued.expires_at === "string" ? Date.parse(issued.expires_at) : Number.NaN;
+    storeInstallationToken(
+      key,
+      issued.token,
+      Number.isFinite(parsed) ? parsed : Date.now() + INSTALLATION_TOKEN_FALLBACK_TTL_MS,
+    );
+    return issued.token;
+  })();
+  installationTokenInflight.set(key, issue);
+  try {
+    return await issue;
+  } finally {
+    installationTokenInflight.delete(key);
+  }
+}
+
+/**
+ * Authenticated GitHub request for one repository. Reuses the cached
+ * installation token; when GitHub rejects it with 401 (revoked or re-scoped
+ * mid-TTL), evicts the entry and retries once with a freshly issued token.
+ * Only the first 401 retries — a second 401 propagates to the caller.
+ */
+export async function githubBotRepositoryRequest<T>(
+  db: Db,
+  companyId: string,
+  endpointId: string,
+  repositoryId: string,
+  path: string,
+  options: Parameters<typeof githubBotRequest>[3] = {},
+  fetchImpl = fetch,
+): Promise<T> {
+  const token = await githubBotRepositoryToken(db, companyId, endpointId, repositoryId, fetchImpl);
+  try {
+    return await githubBotRequest<T>(fetchImpl, token, path, options);
+  } catch (error) {
+    const providerStatus = (error as { details?: { providerStatus?: unknown } })
+      ?.details?.providerStatus;
+    if (providerStatus !== 401) throw error;
+    evictGithubBotRepositoryToken({ companyId, endpointId, repositoryId });
+    const fresh = await githubBotRepositoryToken(db, companyId, endpointId, repositoryId, fetchImpl);
+    return githubBotRequest<T>(fetchImpl, fresh, path, options);
+  }
 }

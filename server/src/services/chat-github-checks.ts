@@ -23,6 +23,7 @@ import {
   type GitHubReviewCheckResponse,
 } from "./chat-github-check-reconciliation.js";
 import {
+  evictGithubBotRepositoryToken,
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
@@ -253,24 +254,47 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   : state === "running"
                     ? "Agent is reviewing this commit"
                     : "Waiting for the assigned agent";
-          const token = await githubBotRepositoryToken(
+          const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
+          // One token per check action, reused across its GitHub calls; a 401
+          // evicts and retries once with a fresh token.
+          let token = await githubBotRepositoryToken(
             db,
             action.companyId,
             action.endpointId,
             event.repositoryId,
             lease.fetch,
           );
-          const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
-          const request = <T>(
+          const request = async <T>(
             path: string,
             options?: Parameters<typeof githubBotRequest>[3],
-          ) =>
-            githubBotRequest<T>(
-              lease.fetch,
-              token,
-              `${prefix}${path}`,
-              options,
-            );
+          ): Promise<T> => {
+            try {
+              return await githubBotRequest<T>(
+                lease.fetch,
+                token,
+                `${prefix}${path}`,
+                options,
+              );
+            } catch (error) {
+              const providerStatus = (
+                error as { details?: { providerStatus?: unknown } }
+              )?.details?.providerStatus;
+              if (providerStatus !== 401) throw error;
+              evictGithubBotRepositoryToken({
+                companyId: action.companyId,
+                endpointId: action.endpointId,
+                repositoryId: event.repositoryId,
+              });
+              token = await githubBotRepositoryToken(
+                db,
+                action.companyId,
+                action.endpointId,
+                event.repositoryId,
+                lease.fetch,
+              );
+              return githubBotRequest<T>(lease.fetch, token, `${prefix}${path}`, options);
+            }
+          };
           const current = await request<{ head: { sha: string } }>(
             `/pulls/${event.pullNumber}`,
           );

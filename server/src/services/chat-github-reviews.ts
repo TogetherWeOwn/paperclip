@@ -35,6 +35,7 @@ import {
 } from "@paperclipai/shared";
 import { HttpError, conflict, forbidden, notFound } from "../errors.js";
 import {
+  evictGithubBotRepositoryToken,
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
@@ -311,22 +312,49 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     source: Awaited<ReturnType<typeof scope>>,
     requestFetch = fetchImpl,
   ) {
-    const token = await githubBotRepositoryToken(
+    const prefix = `/repos/${source.repository.split("/").map(encodeURIComponent).join("/")}`;
+    // Resolve the installation token once per review client: every request
+    // below reuses it, so one review pays one credential resolution plus one
+    // cached token lookup instead of one resolution per GitHub call. A 401
+    // evicts the entry and retries once with a freshly issued token.
+    const companyId = source.endpoint.companyId;
+    const endpointId = source.endpoint.id;
+    const repositoryId = source.repositoryId;
+    let token = await githubBotRepositoryToken(
       db,
-      source.endpoint.companyId,
-      source.endpoint.id,
-      source.repositoryId,
+      companyId,
+      endpointId,
+      repositoryId,
       requestFetch,
     );
-    const prefix = `/repos/${source.repository.split("/").map(encodeURIComponent).join("/")}`;
-    return {
-      prefix,
-      request: <T>(
-        path: string,
-        options?: Parameters<typeof githubBotRequest>[3],
-      ) =>
-        githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options),
+    const request = async <T>(
+      path: string,
+      options?: Parameters<typeof githubBotRequest>[3],
+    ): Promise<T> => {
+      try {
+        return await githubBotRequest<T>(
+          requestFetch,
+          token,
+          `${prefix}${path}`,
+          options,
+        );
+      } catch (error) {
+        const providerStatus = (
+          error as { details?: { providerStatus?: unknown } }
+        )?.details?.providerStatus;
+        if (providerStatus !== 401) throw error;
+        evictGithubBotRepositoryToken({ companyId, endpointId, repositoryId });
+        token = await githubBotRepositoryToken(
+          db,
+          companyId,
+          endpointId,
+          repositoryId,
+          requestFetch,
+        );
+        return githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options);
+      }
     };
+    return { prefix, request };
   }
   async function diffBaseSha(
     api: Awaited<ReturnType<typeof client>>,
