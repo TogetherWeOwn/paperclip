@@ -2709,6 +2709,73 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, late.id)))[0].state).toBe("superseded");
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, unrelated.id)))[0].state).toBe("queued");
     });
+    it("keeps a completed assessment's check when a duplicate review row lands on the same head", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const deliveryId = randomUUID();
+      const payload = {
+        action: "opened",
+        installation: { id: 2468 },
+        repository: { id: 97531, full_name: "paperclipai/paperclip", name: "paperclip", owner: { id: 1357, login: "paperclipai" } },
+        sender: { id: 42, login: "octocat" },
+        pull_request: {
+          number: 84, title: "Duplicate review request", body: "", draft: false,
+          base: { sha: "a".repeat(40), ref: "master" },
+          head: { sha: head },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        },
+      };
+      const checkWrites: string[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/84")) return Response.json(payload.pull_request);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && (init?.method === "POST" || init?.method === "PATCH")) {
+          checkWrites.push(url);
+          return Response.json({ id: 84, html_url: "https://github.com/checks/84" });
+        }
+        return undefined;
+      });
+      expect((await f.service.handleWebhook(f.endpoint.publicId, "github", signedGitHubWebhookRequest({
+        event: "pull_request", delivery: deliveryId, payload, webhookSecret: f.webhookSecret,
+      }))).status).toBeLessThan(300);
+      await expect.poll(async () => (await db.select().from(chatGitHubReviews)
+        .where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).length, { timeout: 10000 }).toBe(1);
+      const [assessed] = await db.update(chatGitHubReviews).set({
+        state: "completed",
+        conclusion: "success",
+        assessment: {
+          reviewedCommit: head,
+          score: 5,
+          complete: true,
+          summary: "Looks correct",
+          rationale: "No defects found.",
+          coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] },
+          findings: [],
+        } as never,
+        createdAt: new Date(Date.now() - 60_000),
+      }).where(eq(chatGitHubReviews.endpointId, f.endpoint.id)).returning();
+      const duplicateDeliveryId = randomUUID();
+      await db.insert(chatGitHubReviews).values({
+        companyId: assessed.companyId, endpointId: assessed.endpointId, issueId: assessed.issueId,
+        repositoryId: assessed.repositoryId, repository: assessed.repository, pullNumber: assessed.pullNumber,
+        headSha: assessed.headSha, deliveryId: duplicateDeliveryId, configurationRevision: assessed.configurationRevision,
+        policySnapshot: assessed.policySnapshot, event: assessed.event, state: "queued",
+      });
+      const checks = githubReviewCheckService(db, f.providerFetch);
+      const [activeEndpoint] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
+      await checks.enqueue(activeEndpoint, githubAutomaticReviewEvent(payload, duplicateDeliveryId)!, true, "authorized");
+      await checks.processPending();
+      const [action] = await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.providerActionId, `github-check:${duplicateDeliveryId}`),
+      ));
+      expect(action).toMatchObject({
+        status: "processed",
+        result: { code: "assessment_owns_check", reviewId: assessed.id },
+      });
+      expect(checkWrites).toEqual([]);
+    });
     it("links a gated GitHub check to the current vanity review page before a task exists", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
