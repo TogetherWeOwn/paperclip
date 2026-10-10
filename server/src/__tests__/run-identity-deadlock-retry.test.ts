@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
@@ -9,6 +11,8 @@ import {
   secretAccessEvents,
 } from "@paperclipai/db";
 import { isDeadlockFailure, withDeadlockRetry } from "../db-errors.js";
+import { captureRunIdentity } from "../services/run-identity.js";
+import { secretService } from "../services/secrets.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 describe("isDeadlockFailure", () => {
@@ -180,6 +184,234 @@ describe("runtime run-lock vs secret-access audit deadlock", () => {
         );
       expect(audits).toHaveLength(1);
     } finally {
+      await temporary.cleanup();
+    }
+  }, 120_000);
+});
+
+describe("production wiring: captureRunIdentity vs secret audit", () => {
+  it("drives captureRunIdentity itself into the run-lock/audit deadlock and survives", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-run-identity-prod-");
+    const db = createDb(temporary.connectionString);
+    const otherDb = createDb(temporary.connectionString);
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Prod wiring", issuePrefix: "PW" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Wiring agent" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Wiring issue" });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+
+      // Raw audit side in the opposite lock order, mirroring
+      // secretAccessEvents' heartbeat_run_id then issue_id FK checks.
+      const rawAuditInsert = async () =>
+        otherDb.transaction(async (tx) => {
+          await tx.execute(sql`select id from heartbeat_runs where id = ${runId} for key share`);
+          await tx.insert(secretAccessEvents).values({
+            companyId,
+            provider: "test",
+            actorType: "system",
+            consumerType: "agent",
+            consumerId: agentId,
+            issueId,
+            heartbeatRunId: runId,
+            outcome: "success",
+          });
+        });
+
+      // captureRunIdentity locks issues then heartbeat_runs (see
+      // lockIdentityTask) and is wrapped in withDeadlockRetry. Racing it
+      // against the opposite-order audit insert exercises the production
+      // wrapper instead of raw SQL on both sides. The raw side is also
+      // retried so the test asserts production correctness, not raw-SQL
+      // deadlock flakiness.
+      const results = await Promise.allSettled([
+        captureRunIdentity(db, { companyId, runId, agentId }),
+        withDeadlockRetry(rawAuditInsert, { baseDelayMs: 1 }),
+        captureRunIdentity(db, { companyId, runId, agentId }),
+        withDeadlockRetry(rawAuditInsert, { baseDelayMs: 1 }),
+      ]);
+      const failures = results.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      // With the retry wrapper no deadlock abort may surface; without it this
+      // contention fails intermittently with 40P01.
+      expect(failures).toHaveLength(0);
+
+      const audits = await db
+        .select({ id: secretAccessEvents.id })
+        .from(secretAccessEvents)
+        .where(eq(secretAccessEvents.heartbeatRunId, runId));
+      expect(audits.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      await temporary.cleanup();
+    }
+  }, 120_000);
+
+  it("transaction-bound secret audit uses a savepoint so the outer transaction survives", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-secret-savepoint-");
+    const db = createDb(temporary.connectionString);
+    const otherDb = createDb(temporary.connectionString);
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Savepoint fixture", issuePrefix: "SP" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Savepoint agent" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Savepoint issue" });
+      await db
+        .insert(heartbeatRuns)
+        .values({ id: runId, companyId, agentId, status: "running" });
+
+      const runLockFirst = async () =>
+        db.transaction(async (tx) => {
+          await tx.execute(
+            sql`select id from issues where company_id = ${companyId} and id = ${issueId} for update`,
+          );
+          auditHasRunShare.release();
+          await runShareRequested.gate;
+          await tx.execute(
+            sql`select id from heartbeat_runs where company_id = ${companyId} and id = ${runId} for update`,
+          );
+        });
+
+      // Mirrors the fixed recordAccessEvent in secrets.ts: when secretService
+      // is bound to a caller-held transaction (e.g. the broker token-mint
+      // path at tool-access.ts mintExchangeConnectionToken), the audit insert
+      // runs in its own nested transaction so a deadlock abort rolls back
+      // only to the SAVEPOINT instead of aborting the outer transaction
+      // with 25P02.
+      const transactionBoundAuditInsert = async () =>
+        otherDb.transaction(async (outer) => {
+          await outer.execute(sql`select id from heartbeat_runs where id = ${runId} for key share`);
+          runShareRequested.release();
+          await auditHasRunShare.gate;
+          await withDeadlockRetry(
+            () =>
+              (outer as unknown as Db).transaction(async (t) => {
+                await t.insert(secretAccessEvents).values({
+                  companyId,
+                  provider: "test",
+                  actorType: "system",
+                  consumerType: "agent",
+                  consumerId: agentId,
+                  issueId,
+                  heartbeatRunId: runId,
+                  outcome: "success",
+                });
+              }),
+            { baseDelayMs: 1 },
+          );
+          // The outer transaction must still be usable after the savepoint
+          // retry; a bare insert here would have left it aborted (25P02).
+          await outer.execute(sql`select 1`);
+        });
+
+      const auditHasRunShare = latch();
+      const runShareRequested = latch();
+
+      const guarded = await Promise.all([
+        withDeadlockRetry(runLockFirst, { baseDelayMs: 1 }),
+        transactionBoundAuditInsert(),
+      ]);
+      expect(guarded).toHaveLength(2);
+      const audits = await db
+        .select({ id: secretAccessEvents.id })
+        .from(secretAccessEvents)
+        .where(
+          and(
+            eq(secretAccessEvents.companyId, companyId),
+            eq(secretAccessEvents.heartbeatRunId, runId),
+          ),
+        );
+      expect(audits).toHaveLength(1);
+    } finally {
+      await temporary.cleanup();
+    }
+  }, 120_000);
+
+  it("resolveSecretValue records the audit row with issue/heartbeat context", async () => {
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "0123456789abcdef0123456789abcdef";
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-resolve-audit-");
+    const db = createDb(temporary.connectionString);
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Resolve audit", issuePrefix: "RA" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Resolve agent" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Resolve issue" });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `audit-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "runtime-secret",
+      });
+      await svc.createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "system",
+        targetId: "system",
+        configPath: "env.API_KEY",
+      });
+
+      // Drives the production resolveSecretValue -> recordAccessEvent wiring
+      // with the same issueId/heartbeatRunId FKs that deadlock against the
+      // run lock. After the savepoint fix this succeeds even when bound to a
+      // caller transaction.
+      const value = await svc.resolveSecretValue(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "system",
+        configPath: "env.API_KEY",
+        actorType: "system",
+        issueId,
+        heartbeatRunId: runId,
+      });
+      expect(value).toBe("runtime-secret");
+
+      const events = await db
+        .select()
+        .from(secretAccessEvents)
+        .where(eq(secretAccessEvents.secretId, secret.id));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ issueId, heartbeatRunId: runId, outcome: "success" });
+
+      // Same production path bound to a caller-held transaction, as in the
+      // broker mint. The savepoint keeps the outer transaction usable.
+      await db.transaction(async (tx) => {
+        const txSvc = secretService(tx as unknown as Db);
+        const txValue = await txSvc.resolveSecretValue(companyId, secret.id, "latest", {
+          consumerType: "system",
+          consumerId: "system",
+          configPath: "env.API_KEY",
+          actorType: "system",
+          issueId,
+          heartbeatRunId: runId,
+        });
+        expect(txValue).toBe("runtime-secret");
+      });
+    } finally {
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousKey;
       await temporary.cleanup();
     }
   }, 120_000);
