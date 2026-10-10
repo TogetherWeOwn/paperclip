@@ -4,8 +4,16 @@ import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
 } from "./chat-github-publication-lease.js";
-import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
-import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import {
+  projectSafeChatPublicationText,
+  scrubInternalReferences,
+} from "./chat-publication-projection.js";
+import {
+  githubPullPermalink,
+  renderInlineFinding,
+  renderReviewSummary,
+} from "./chat-github-review-template.js";
+import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { createHash } from "node:crypto";
 import { githubResponseCommentService, writeGitHubResponseComment } from "./chat-github-response-comments.js";
@@ -22,7 +30,6 @@ import {
   chatGitHubConfigurations,
   chatGitHubReviews,
   chatMessageLinks,
-  companies,
   heartbeatRuns,
   issues,
   projects,
@@ -46,6 +53,7 @@ import {
   githubReviewPathIsExcluded,
   githubReviewLineIsInPatch,
   validateGitHubReviewAssessment,
+  validatePersistedGitHubReviewAssessment,
 } from "./chat-github-review-policy.js";
 import {
   isIssueWithinLowTrustBoundary,
@@ -328,6 +336,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options),
     };
   }
+  async function diffBaseSha(
+    api: Awaited<ReturnType<typeof client>>,
+    baseSha: string,
+    headSha: string,
+  ) {
+    const comparison = await api.request<{ merge_base_commit: { sha: string } }>(
+      `/compare/${githubCommitSchema.parse(baseSha)}...${githubCommitSchema.parse(headSha)}?per_page=1&page=1`,
+    );
+    return githubCommitSchema.parse(comparison.merge_base_commit.sha);
+  }
   async function reviewForHead(
     source: Awaited<ReturnType<typeof scope>>,
     pull: Pull,
@@ -571,6 +589,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         return {
           untrusted: true,
           pull,
+          diffBaseSha: await diffBaseSha(api, pull.base.sha, pull.head.sha),
           reviewPolicy: configuration?.policy ?? source.policy,
           configurationRevision:
             configuration?.revision ?? source.config.revision,
@@ -668,8 +687,11 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         githubReviewPathIsExcluded(parsed.path, source.policy)
       )
         throw forbidden("This path is excluded from the review");
+      const revision = parsed.revision === "head"
+        ? pull.head.sha
+        : await diffBaseSha(api, pull.base.sha, pull.head.sha);
       const result = await api.request<Record<string, unknown>>(
-        `/contents/${parsed.path.split("/").map(encodeURIComponent).join("/")}?ref=${parsed.revision === "head" ? pull.head.sha : pull.base.sha}`,
+        `/contents/${parsed.path.split("/").map(encodeURIComponent).join("/")}?ref=${revision}`,
       );
       // Provider URLs can contain credentials or direct download capabilities.
       return {
@@ -708,6 +730,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           ...source.policy.ignoredPaths,
         ],
       });
+      const reviewedDiffBase = await diffBaseSha(api, pull.base.sha, pull.head.sha);
       const files: File[] = [];
       for (let page = 1; page <= 30; page++) {
         const batch = await api.request<File[]>(
@@ -728,10 +751,21 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             source.policy,
           ),
       );
-      const paths = new Set(permittedFiles.map((f) => f.filename));
+      const paths = new Set(
+        permittedFiles.flatMap((file) =>
+          file.previous_filename
+            ? [file.filename, file.previous_filename]
+            : [file.filename],
+        ),
+      );
       const byPath = new Map(
         permittedFiles.map((file) => [file.filename, file]),
       );
+      if (assessment.findings.some((finding) =>
+        finding.side === "LEFT" && finding.basePath !==
+          (byPath.get(finding.path)?.previous_filename ?? finding.path)
+      ))
+        throw conflict("LEFT-side basePath must match GitHub's base filename for the changed file.");
       if (
         assessment.findings.some(
           (finding) =>
@@ -782,6 +816,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           .update(chatGitHubReviews)
           .set({
             assessment,
+            event: current.assessment
+              ? current.event
+              : { ...current.event, diffBaseSha: reviewedDiffBase },
             conclusion: githubReviewConclusion(
               assessment,
               review.policySnapshot.ratingThreshold,
@@ -1001,6 +1038,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           throw forbidden("Invalid GitHub publication binding");
         try {
           const source = await scope(session, true);
+          const egressScope = await githubEgressReferenceScope(
+            db,
+            source.endpoint.companyId,
+            null,
+          );
+          const publicReviewText = (text: string) =>
+            scrubInternalReferences(
+              projectSafeChatPublicationText(text),
+              egressScope,
+            );
           if (
             source.endpoint.id !== action.endpointId ||
             source.conversation.id !== action.conversationId ||
@@ -1078,7 +1125,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           let receipt: Record<string, unknown>;
           if (operation === "comment" || operation === "update_comment") {
             receipt = await writeGitHubResponseComment(db, source, api, lease, {
-              body: String(action.payload.body), final: operation === "comment", versionAt: action.createdAt,
+              body: publicReviewText(String(action.payload.body)), final: operation === "comment", versionAt: action.createdAt,
             }, async () => assertPublicationAuthority(await scope(session, true), action));
             if (operation === "comment") await githubResponseCommentService(db, fetchImpl).finishRun({ companyId: session.companyId, issueId: source.issue.id, runId: source.run.id, endpointId: source.endpoint.id }, source,
               receipt as { id: string; url: string }, api, lease, async () => assertPublicationAuthority(await scope(session, true), action));
@@ -1104,7 +1151,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                   body: {
                     commit_id: parsed.reviewedCommit,
                     event: parsed.event,
-                    body: `${projectSafeChatPublicationText(parsed.body)}\n\n${publicationMarker}`,
+                    body: `${publicReviewText(parsed.body)}\n\n${publicationMarker}`,
                   },
                 },
               ));
@@ -1125,7 +1172,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             if (!review?.assessment)
               throw conflict("Review assessment is unavailable");
             await currentHead(review.headSha);
-            const assessment = validateGitHubReviewAssessment(
+            const assessment = validatePersistedGitHubReviewAssessment(
               review.assessment,
               review.headSha,
               {
@@ -1140,26 +1187,24 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               assessment,
               review.policySnapshot.ratingThreshold,
             );
-            const origin = runtimePublicOrigin();
-            const [company] = await db
-              .select({ prefix: companies.issuePrefix })
-              .from(companies)
-              .where(eq(companies.id, source.endpoint.companyId));
-            const board =
-              origin && company
-                ? `${origin}/${encodeURIComponent(company.prefix)}`
-                : null;
-            const taskLink = board
-              ? `[${source.issue.identifier}](${board}/issues/${source.issue.id})`
-              : source.issue.identifier;
-            const runLink = board
-              ? `[Run](${board}/agents/${source.agent.id}/runs/${source.run.id})`
-              : `Run: ${source.run.id}`;
-            const historyLink = board
-              ? ` · [Review history](${board}/apps/chat/${source.endpoint.id}/reviews)`
-              : "";
-            const summary = projectSafeChatPublicationText(
-              `## Paperclip Review — ${assessment.complete ? `${assessment.score}/5` : "Incomplete"}\n\n${assessment.summary}\n\n${assessment.rationale}\n\nReviewed commit: \`${review.headSha}\`\n\nCoverage: ${assessment.coverage.reviewedPaths.length} files.\n${assessment.coverage.limitations.join("\n")}\n\nTask: ${taskLink} · ${runLink}${historyLink}`,
+            // LEFT coordinates are relative to the diff merge base, not the
+            // target branch tip. Resolve old rows by their pinned commit pair.
+            const evidenceBase = review.event.diffBaseSha ?? (
+              assessment.findings.some((finding) => finding.side === "LEFT" && finding.basePath)
+                ? await diffBaseSha(api, review.event.baseSha, review.headSha)
+                : review.event.baseSha
+            );
+            // Internal Task/Run/history links are omitted; check runs use the
+            // public PR permalink as their Details URL.
+            const summary = publicReviewText(
+              renderReviewSummary({
+                assessment,
+                repository: source.repository,
+                pullNumber: source.number,
+                headSha: review.headSha,
+                baseSha: evidenceBase,
+                scope: egressScope,
+              }),
             );
             const summaryMarker = marker(
               "review",
@@ -1227,7 +1272,17 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                     {
                       method: "POST",
                       body: {
-                        body: `**${finding.severity} · ${finding.category}**\n\n${projectSafeChatPublicationText(finding.body)}\n\n${findingMarker}`,
+                        body: `${publicReviewText(
+                          renderInlineFinding({
+                            finding,
+                            score: assessment.score,
+                            complete: assessment.complete,
+                            repository: source.repository,
+                            headSha: review.headSha,
+                            baseSha: evidenceBase,
+                            scope: egressScope,
+                          }),
+                        )}\n\n${findingMarker}`,
                         commit_id: review.headSha,
                         path: finding.path,
                         line: finding.line,
@@ -1299,7 +1354,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 name: "Paperclip Review",
                 head_sha: review.headSha,
                 external_id: `${source.endpoint.id}:${source.number}:${review.headSha}`,
-                ...(board ? { details_url: `${board}/issues/${source.issue.id}` } : {}),
+                details_url: githubPullPermalink(source.repository, source.number),
                 status: "completed",
                 conclusion,
                 output: {

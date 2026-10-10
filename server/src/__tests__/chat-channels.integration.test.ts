@@ -981,6 +981,13 @@ function makeMessage(input: {
   } as unknown as Message;
 }
 
+function countMatches(texts: string[], pattern: RegExp): number {
+  return texts.reduce(
+    (total, text) => total + (text.match(pattern)?.length ?? 0),
+    0,
+  );
+}
+
 function boardActor(companyId: string, userId = "owner-user") {
   return {
     type: "board" as const,
@@ -4832,11 +4839,77 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, late.id)))[0].state).toBe("superseded");
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, unrelated.id)))[0].state).toBe("queued");
     });
-    it("links a gated GitHub check to the current vanity review page before a task exists", async () => {
+    it("keeps a completed assessment's check when a duplicate review row lands on the same head", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const deliveryId = randomUUID();
+      const payload = {
+        action: "opened",
+        installation: { id: 2468 },
+        repository: { id: 97531, full_name: "paperclipai/paperclip", name: "paperclip", owner: { id: 1357, login: "paperclipai" } },
+        sender: { id: 42, login: "octocat" },
+        pull_request: {
+          number: 84, title: "Duplicate review request", body: "", draft: false,
+          base: { sha: "a".repeat(40), ref: "master" },
+          head: { sha: head },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        },
+      };
+      const checkWrites: string[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/84")) return Response.json(payload.pull_request);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && (init?.method === "POST" || init?.method === "PATCH")) {
+          checkWrites.push(url);
+          return Response.json({ id: 84, html_url: "https://github.com/checks/84" });
+        }
+        return undefined;
+      });
+      expect((await f.service.handleWebhook(f.endpoint.publicId, "github", signedGitHubWebhookRequest({
+        event: "pull_request", delivery: deliveryId, payload, webhookSecret: f.webhookSecret,
+      }))).status).toBeLessThan(300);
+      await expect.poll(async () => (await db.select().from(chatGitHubReviews)
+        .where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).length, { timeout: 10000 }).toBe(1);
+      const [assessed] = await db.update(chatGitHubReviews).set({
+        state: "completed",
+        conclusion: "success",
+        assessment: {
+          reviewedCommit: head,
+          score: 5,
+          complete: true,
+          summary: "Looks correct",
+          rationale: "No defects found.",
+          coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] },
+          findings: [],
+        } as never,
+        createdAt: new Date(Date.now() - 60_000),
+      }).where(eq(chatGitHubReviews.endpointId, f.endpoint.id)).returning();
+      const duplicateDeliveryId = randomUUID();
+      await db.insert(chatGitHubReviews).values({
+        companyId: assessed.companyId, endpointId: assessed.endpointId, issueId: assessed.issueId,
+        repositoryId: assessed.repositoryId, repository: assessed.repository, pullNumber: assessed.pullNumber,
+        headSha: assessed.headSha, deliveryId: duplicateDeliveryId, configurationRevision: assessed.configurationRevision,
+        policySnapshot: assessed.policySnapshot, event: assessed.event, state: "queued",
+      });
+      const checks = githubReviewCheckService(db, f.providerFetch);
+      const [activeEndpoint] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
+      await checks.enqueue(activeEndpoint, githubAutomaticReviewEvent(payload, duplicateDeliveryId)!, true, "authorized");
+      await checks.processPending();
+      const [action] = await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.providerActionId, `github-check:${duplicateDeliveryId}`),
+      ));
+      expect(action).toMatchObject({
+        status: "processed",
+        result: { code: "assessment_owns_check", reviewId: assessed.id },
+      });
+      expect(checkWrites).toEqual([]);
+    });
+    it("uses a public PR URL for gated GitHub checks before a task exists", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
       const f = await reviewBotFixture();
-      const [company] = await db.select().from(companies).where(eq(companies.id, f.companyId));
       const head = "b".repeat(40);
       const event = githubAutomaticReviewEvent({
         action: "opened", installation: { id: 2468 },
@@ -4865,15 +4938,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await checks.processPending();
       expect(writes).toEqual([expect.objectContaining({
         status: "completed", conclusion: "action_required", head_sha: head,
-        details_url: `https://current-vanity.example/${company.issuePrefix}/apps/chat/${f.endpoint.id}/reviews`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/83",
       })]);
+      expect(JSON.stringify(writes)).not.toContain("current-vanity.example");
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
     });
     it("uses task-bound bot tools and deterministic checks, then denies revoked people", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());
       const f = await reviewBotFixture();
-      const [company] = await db.select().from(companies).where(eq(companies.id, f.companyId));
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
         id: "github:paperclipai/paperclip:91",
@@ -4926,7 +4999,32 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         issueId: conversation.issueId,
         runId: run.id,
       };
-      expect(await githubBotToolsForSession(db, session)).toHaveLength(7);
+      const [storedSubmission] = await db.select().from(toolCatalogEntries).where(and(
+        eq(toolCatalogEntries.connectionId, f.endpoint.connectionId),
+        eq(toolCatalogEntries.toolName, "submit_review"),
+      ));
+      const oldSchema = structuredClone(storedSubmission.inputSchema) as {
+        properties: {
+          findings: { items: { properties: Record<string, unknown>; required: string[] } };
+          summary: { maxLength: number };
+        };
+      };
+      const oldFinding = oldSchema.properties.findings.items;
+      for (const field of ["title", "basePath", "evidence", "suggestion"])
+        delete oldFinding.properties[field];
+      oldFinding.required = oldFinding.required.filter((field: string) => field !== "title");
+      oldSchema.properties.summary.maxLength = 24000;
+      await db.update(toolCatalogEntries).set({
+        inputSchema: oldSchema, description: "Pre-deployment contract",
+      }).where(eq(toolCatalogEntries.id, storedSubmission.id));
+      const discovered = await githubBotToolsForSession(db, session);
+      expect(discovered).toHaveLength(7);
+      const submission = discovered.find((tool) => tool.upstreamToolName === "submit_review")!;
+      expect(submission.parametersSchema).toEqual(storedSubmission.inputSchema);
+      expect(submission.description).toContain("never format markdown");
+      await db.update(toolCatalogEntries).set({ status: "quarantined" }).where(eq(toolCatalogEntries.id, storedSubmission.id));
+      expect((await githubBotToolsForSession(db, session)).some((tool) => tool.upstreamToolName === "submit_review")).toBe(false);
+      await db.update(toolCatalogEntries).set({ status: "active" }).where(eq(toolCatalogEntries.id, storedSubmission.id));
       expect(
         await githubBotToolsForSession(db, { ...session, issueId: randomUUID() }),
       ).toHaveLength(0);
@@ -4942,7 +5040,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       >();
       for (const comment of f.responseComments.values()) comments.set(comment.id, comment);
       let head = "b".repeat(40);
-      let check = { id: 99, status: "completed", external_id: `${f.endpoint.id}:91:${head}`, app: { id: Number(f.endpoint.botExternalId) } };
+      const mergeBase = "e".repeat(40);
+      let targetTip = "a".repeat(40);
+      const reads: string[] = [];
+      let check = {
+        id: 99,
+        status: "completed",
+        external_id: `${f.endpoint.id}:91:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://internal.example/reviews",
+      };
+      let duplicateCheck: typeof check = {
+        ...check,
+        id: 98,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
+      };
       const pull = () => ({
         number: 91,
         title: "Test PR",
@@ -4950,7 +5062,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "open",
         draft: false,
         head: { sha: head },
-        base: { sha: "a".repeat(40), ref: "master" },
+        base: { sha: targetTip, ref: "master" },
         user: { id: 42, login: "octocat", type: "User" },
         labels: [],
       });
@@ -4970,7 +5082,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             id,
             html_url: `https://github.com/test/receipt/${mutations.length}`,
           };
-          if (url.includes("/check-runs")) check = { ...check, id, status: String(body.status) };
+          if (url.includes("/check-runs"))
+            check = {
+              ...check,
+              id,
+              ...(body.status !== undefined
+                ? { status: String(body.status) }
+                : {}),
+              ...(body.details_url !== undefined
+                ? { details_url: String(body.details_url) }
+                : {}),
+            };
           if (
             url.endsWith("/issues/91/comments") ||
             url.includes("/issues/comments/")
@@ -4983,11 +5105,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           }
           return Response.json(receipt);
         }
+        reads.push(url);
+        if (url.includes("/contents/"))
+          return Response.json({ content: "base-content", encoding: "base64", sha: mergeBase, size: 12 });
         if (url.includes("/issues/91/comments?"))
           return Response.json([...comments.values()]);
         if (url.endsWith("/pulls/91")) return Response.json(pull());
         if (url.includes("/compare/"))
           return Response.json({
+            merge_base_commit: { sha: mergeBase },
             status: "ahead",
             total_commits: 1,
             files: [
@@ -5003,7 +5129,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           return Response.json([
             {
               filename: "src/math.ts",
-              status: "modified",
+              previous_filename: "src/old-math.ts",
+              status: "renamed",
               patch:
                 head === "b".repeat(40)
                   ? "@@ -1 +1 @@\n-return a + b\n+return a - b"
@@ -5013,13 +5140,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             },
           ]);
         if (url.includes("/check-runs?"))
-          return Response.json({ check_runs: [check] });
+          return Response.json({
+            check_runs:
+              check.details_url === "https://current-vanity.example/reviews"
+                ? [duplicateCheck, check]
+                : [check],
+          });
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", {
+      expect(await service.execute(session, "read_pull_request", {
         section: "metadata",
-      });
+      })).toMatchObject({ diffBaseSha: mergeBase });
+      await service.execute(session, "read_file", { path: "src/old-math.ts", revision: "base" });
+      expect(reads.at(-1)).toContain(`/contents/src/old-math.ts?ref=${mergeBase}`);
       // Merely discussing or inspecting a PR must not invalidate its rating.
       expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
       expect(mutations).toHaveLength(0);
@@ -5031,10 +5165,47 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         url: "https://api.github.com/repos/paperclipai/paperclip/check-runs",
         body: {
           status: "in_progress", external_id: `${f.endpoint.id}:91:${head}`,
-          details_url: `https://current-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
         },
       });
       expect(mutations.at(-1)?.body).not.toHaveProperty("conclusion");
+      const [checkAction] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, f.endpoint.id),
+            eq(chatActions.kind, "github_review_check"),
+          ),
+        );
+      const actionResult = checkAction.result as Record<string, unknown>;
+      await db
+        .update(chatActions)
+        .set({ result: { ...actionResult, retryAt: null } })
+        .where(eq(chatActions.id, checkAction.id));
+      const existingCheckId = check.id;
+      const existingCheckStatus = check.status;
+      check = {
+        ...check,
+        details_url: "https://current-vanity.example/reviews",
+      };
+      const mutationCount = mutations.length;
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      expect(mutations).toHaveLength(mutationCount + 1);
+      expect(mutations.at(-1)).toMatchObject({
+        url: `https://api.github.com/repos/paperclipai/paperclip/check-runs/${existingCheckId}`,
+        body: {
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
+        },
+      });
+      const [reconciledCheckAction] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, checkAction.id));
+      expect(
+        (reconciledCheckAction.result as Record<string, unknown>).state,
+      ).toBe(actionResult.state);
+      expect(check.status).toBe(existingCheckStatus);
       const assessment = {
         reviewedCommit: head,
         score: 2,
@@ -5042,7 +5213,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         summary: "Addition subtracts",
         rationale: "Returning a minus b is incorrect.",
         coverage: {
-          reviewedPaths: ["src/math.ts"],
+          reviewedPaths: ["src/math.ts", "src/old-math.ts"],
           omittedPaths: [],
           limitations: [],
         },
@@ -5054,10 +5225,26 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             side: "RIGHT",
             severity: "error",
             category: "correctness",
+            title: "Incorrect operator",
             body: "Use addition.",
+          },
+          {
+            key: "removed-addition",
+            path: "src/math.ts",
+            basePath: "src/old-math.ts",
+            line: 1,
+            side: "LEFT",
+            severity: "error",
+            category: "correctness",
+            title: "Removed addition",
+            body: "The previous filename contained the correct addition.",
           },
         ],
       };
+      await expect(service.execute(session, "submit_review", {
+        ...assessment,
+        findings: [{ ...assessment.findings[1], basePath: "src/math.ts" }],
+      })).rejects.toThrow("basePath must match GitHub's base filename");
       const result = await service.execute(
         session,
         "submit_review",
@@ -5093,15 +5280,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await expect(resolveChatRunPresentationAuthorizationReason(db, presentation)).resolves.toBe("internal_agent_write");
       await db.update(chatActions).set({ payload: publication.payload }).where(eq(chatActions.id, publication.id));
       await expect(resolveChatRunPresentationAuthorizationReason(db, { ...presentation, companyId: randomUUID() })).resolves.toBe("internal_agent_write");
-      expect(
-        mutations.find((m) => m.body.conclusion === "failure")?.body,
-      ).toMatchObject({
+      const leftComment = mutations.find((mutation) => mutation.body.side === "LEFT");
+      expect(leftComment?.body.body).toContain(`blob/${mergeBase}/src/old-math.ts`);
+      expect(leftComment?.body.body).not.toContain(`blob/${targetTip}/src/old-math.ts`);
+      expect(leftComment?.body.body).not.toContain(`blob/${head}/src/math.ts`);
+      const [submittedReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id));
+      expect(submittedReview.event.diffBaseSha).toBe(mergeBase);
+      const failedCheck = mutations.find(
+        (m) => m.body.conclusion === "failure",
+      )?.body;
+      expect(failedCheck).toMatchObject({
         name: "Paperclip Review",
         head_sha: head,
         conclusion: "failure",
-        details_url: `https://current-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
       });
+      const summaries = [...comments.values()].filter((c) =>
+        c.body.includes("## Paperclip Review"),
+      );
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]?.body).not.toMatch(
+        /Task:|Review history|\[Run\]|current-vanity\.example/,
+      );
       const publishedCount = mutations.length;
+      targetTip = "f".repeat(40);
       const retried = await service.execute(
         session,
         "submit_review",
@@ -5110,6 +5312,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
       expect(retried).toMatchObject({ status: "processed", score: 2 });
       expect(mutations).toHaveLength(publishedCount);
+      expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, submittedReview.id)))[0].event.diffBaseSha).toBe(mergeBase);
       const boundThreads = await db.select().from(chatConversations).where(eq(chatConversations.endpointId, f.endpoint.id));
       const findingThread = boundThreads.find((row) => row.externalThreadId.includes(":rc:"))!;
       expect(findingThread).toMatchObject({
@@ -5203,11 +5406,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         score: 5,
         conclusion: "success",
       });
-      expect(
-        mutations.filter((m) => m.url.endsWith("/check-runs")).at(-1)?.body,
-      ).toMatchObject({
+      const successfulCheck = mutations
+        .filter((m) => m.url.endsWith("/check-runs"))
+        .at(-1)?.body;
+      expect(successfulCheck).toMatchObject({
         head_sha: head, conclusion: "success",
-        details_url: `https://renamed-vanity.example/${company.issuePrefix}/issues/${conversation.issueId}`,
+        details_url: "https://github.com/paperclipai/paperclip/pull/91",
       });
       expect(comments.size).toBe(1);
       expect([...comments.values()][0]?.body).toContain("Addition is correct");
@@ -5243,6 +5447,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await expect(
         service.execute(session, "read_pull_request", { section: "metadata" }),
       ).rejects.toThrow("no longer authorized");
+      const published = JSON.stringify(mutations);
+      expect(published).toContain("https://github.com/paperclipai/paperclip/pull/91");
+      expect(published).not.toMatch(/vanity\.example/);
     });
   });
 
@@ -29340,6 +29547,141 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(runtime.endpoints.get(endpoint.id)?.posts.some(post => JSON.stringify(post).includes("Legacy answer survives upgrade"))).toBe(true);
   });
 
+  it("keeps a GitHub run's final comment free of its Board link and tracker id", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredGitHubEndpoint(fixture);
+    const thread = makeThread({
+      channelId: "github:paperclipai/paperclip",
+      id: "github:paperclipai/paperclip:issue:418",
+      name: "paperclipai/paperclip",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({
+        id: "41801",
+        text: "@maya summarize the change",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    const [issue] = await db
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.id, conversation.issueId));
+    const prefix = issue.identifier.slice(0, issue.identifier.lastIndexOf("-"));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "github",
+        providerMessageId: "41801",
+      }),
+    });
+    await addSelectedChatFinal({
+      agentId: fixture.assignedAgentId,
+      body: `Done. Details: https://paperclip.example/${prefix}/issues/${issue.identifier} (${issue.identifier}).`,
+      companyId: fixture.companyId,
+      issueId: conversation.issueId,
+      runId,
+    });
+    await service.processPendingPublications();
+
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    const delivered = [
+      ...(providerRuntime?.posts ?? []).map((post) => post.text),
+      ...(providerRuntime?.edits ?? []).map((edit) => edit.text),
+    ];
+    expect(delivered.join("\n")).toContain("Done.");
+    expect(countMatches(delivered, /paperclip\.example/g)).toBe(0);
+    expect(
+      countMatches(delivered, new RegExp(`\\b${prefix}-\\d+\\b`, "g")),
+    ).toBe(0);
+  });
+
+  it("keeps a GitHub progress notice that names its task free of its Board link and tracker id", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredGitHubEndpoint(fixture);
+    const thread = makeThread({
+      channelId: "github:paperclipai/paperclip",
+      id: "github:paperclipai/paperclip:issue:419",
+      name: "paperclipai/paperclip",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "github",
+      thread: thread.thread,
+      message: makeMessage({
+        id: "41901",
+        text: "@maya track this change",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    const [issue] = await db
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(eq(issues.id, conversation.issueId));
+    const prefix = issue.identifier.slice(0, issue.identifier.lastIndexOf("-"));
+    const title = `Follow ${issue.identifier} at https://paperclip.example/${prefix}/issues/${issue.identifier}`;
+    await db.update(issues).set({ title }).where(eq(issues.id, conversation.issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "github",
+        providerMessageId: "41901",
+      }),
+    });
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `run:${runId}:working:${endpoint.id}`,
+      payload: {
+        text: `${issue.identifier}: ${title} — in progress`,
+        progressState: "working",
+      },
+      state: "pending",
+    });
+    await service.processPendingPublications();
+
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    const delivered = [
+      ...(providerRuntime?.posts ?? []).map((post) => post.text),
+      ...(providerRuntime?.edits ?? []).map((edit) => edit.text),
+    ];
+    expect(delivered.join("\n")).toContain("in progress");
+    expect(countMatches(delivered, /paperclip\.example/g)).toBe(0);
+    expect(
+      countMatches(delivered, new RegExp(`\\b${prefix}-\\d+\\b`, "g")),
+    ).toBe(0);
+  });
+
   describe("Telegram callback-only native private responses", () => {
     async function nativePrivateFixture(linked = false, privateChat = false) {
       const fixture = await seedCompany();
@@ -44011,7 +44353,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(callbacks.onReaction).toBeTypeOf("function");
   });
 
-  it("publishes GitHub questions as link-only cards with no executable callback", async () => {
+  it("publishes GitHub questions as cards without task links or executable callbacks", async () => {
     const fixture = await seedCompany();
     const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
     process.env.PAPERCLIP_PUBLIC_URL = "https://paperclip.example";
@@ -44080,15 +44422,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "published",
         payload: {
           interactionId: interaction.id,
-          card: {
-            actions: [
-              {
-                type: "link",
-                label: "Open in Paperclip",
-                url: `https://paperclip.example/issues/${conversation!.issueId}`,
-              },
-            ],
-          },
+          card: expect.not.objectContaining({ actions: expect.anything() }),
         },
       });
       expect(callbacks.onAction).toBeUndefined();
@@ -44105,7 +44439,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).toHaveLength(0);
       expect(
         JSON.stringify(runtime.endpoints.get(endpoint.id)?.posts),
-      ).toContain(`https://paperclip.example/issues/${conversation!.issueId}`);
+      ).not.toContain(`https://paperclip.example/issues/${conversation!.issueId}`);
     } finally {
       if (previousPublicUrl === undefined)
         delete process.env.PAPERCLIP_PUBLIC_URL;
@@ -44226,14 +44560,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         payload: {
           interactionId: interaction.id,
           progressState: "waiting_for_input",
-          card: {
-            actions: [
-              expect.objectContaining({
-                label: "Open in Paperclip",
-                type: "link",
-              }),
-            ],
-          },
+          card: expect.not.objectContaining({ actions: expect.anything() }),
         },
       });
 
@@ -44465,8 +44792,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     for (const testCase of [
       {
         publicBaseUrl: "https://board.paperclip.example",
-        expectedFallback: (issueId: string) =>
-          `File saved on the Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments. Download it: https://board.paperclip.example/issues/${issueId}`,
+        expectedFallback: () =>
+          "File saved on the private Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments.",
       },
       {
         publicBaseUrl: "http://127.0.0.1:3103",
@@ -44554,11 +44881,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).toBe(true);
       expect(posts.every((post) => post.files === undefined)).toBe(true);
       expect(storage.storage.getObject).not.toHaveBeenCalled();
-      if (testCase.publicBaseUrl.startsWith("http://127.0.0.1")) {
-        expect(
-          posts.every((post) => !post.text.includes(testCase.publicBaseUrl)),
-        ).toBe(true);
-      }
+      expect(
+        posts.every((post) => !post.text.includes(testCase.publicBaseUrl)),
+      ).toBe(true);
       await service.shutdown();
     }
   });
@@ -62469,7 +62794,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           {
             threadId: context.thread.thread.id,
             messageId: "outbound-1",
-            text: "Maya is making progress…",
+            text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
           },
         ]);
         expect(
@@ -62491,7 +62816,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect.objectContaining({
             idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:making_progress:1`,
             payload: {
-              text: "Maya is making progress…",
+              text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
               progressState: "working",
             },
             providerMessageId: "outbound-1",
@@ -62575,7 +62900,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           {
             threadId: context.thread.thread.id,
             messageId: "outbound-1",
-            text: "Maya is making progress…",
+            text: `${provider === "github" ? "The assistant" : "Maya"} is making progress…`,
           },
         ]);
         const publications = await db
@@ -68056,24 +68381,175 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   }
 
-  it.each([true, false])("keeps recovered GitHub final prose and attachment navigation internal (omission: %s)", async unavailable => {
-    const context = await githubOmissionFixture(unavailable);
+  it("posts the GitHub native omission final without a Board link", async () => {
+    const context = await githubOmissionFixture();
     try {
       await expect(context.repair()).resolves.toBe(false);
       await context.service.processPendingPublications(100);
-      expect(context.providerRuntime.posts).toEqual([]);
-      expect(context.providerRuntime.edits).toEqual([]);
-      const publications = await db.select().from(chatPublications).where(and(
-        eq(chatPublications.endpointId, context.endpoint.id), isNotNull(chatPublications.commentId),
-      ));
-      expect(publications.every(publication => publication.state === "cancelled")).toBe(true);
-      expect(await resolveChatRunPresentationAuthorizationReason(db, {
-        companyId: context.fixture.companyId, issueId: context.issue.id, runId: context.runId,
-      })).toBe("internal_agent_write");
+      const expected = context.result.summary;
+      expect(context.providerRuntime.posts.map((post) => post.text)).toEqual([
+        expected,
+      ]);
+      const [publication] = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, context.endpoint.id),
+            isNotNull(chatPublications.commentId),
+          ),
+        );
+      expect(publication).toMatchObject({
+        state: "published",
+        attempts: 1,
+        payload: { text: expected },
+      });
+      await context.service.processPendingPublications(100);
+      expect(context.providerRuntime.posts).toHaveLength(1);
+      await expect(
+        db
+          .select({ id: issueAttachments.id })
+          .from(issueAttachments)
+          .where(eq(issueAttachments.issueId, context.issue.id)),
+      ).resolves.toEqual([]);
     } finally {
       await context.cleanup();
     }
   });
+
+  it.each([
+    null,
+    "http://127.0.0.1:3137",
+    "https://user:secret@board.example",
+    "https://10.0.0.1",
+    "https://board.example/prefix?token=PRIVATE#fragment",
+  ])(
+    "never adds Board navigation to GitHub omission finals for Board origin %s",
+    async (base) => {
+      const context = await githubOmissionFixture();
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        await context.service.shutdown();
+        restarted = createService(
+          new FakeChatSdkRuntime(),
+          context.providerFetch!,
+          {
+            publicBaseUrl: base,
+            webhookPublicBaseUrl: "https://ingress.example:8443",
+          },
+        );
+        await restarted.service.processPendingPublications(100);
+        const text = restarted.runtime.endpoints.get(context.endpoint.id)!
+          .posts[0]!.text;
+        expect(text).toBe(context.result.summary);
+        for (const secret of [
+          "PRIVATE",
+          "secret@",
+          "127.0.0.1",
+          "10.0.0.1",
+          "ingress.example",
+          "#fragment",
+        ])
+          expect(text).not.toContain(secret);
+      } finally {
+        await restarted?.service.shutdown();
+        await context.cleanup();
+      }
+    },
+  );
+
+  it.each([
+    "no_omission",
+    "forged_hint",
+    "explicit_board",
+    "progress",
+    "source_edited",
+    "principal_revoked",
+    "generation_changed",
+  ] as const)(
+    "does not add a Board link to GitHub omission finals from $0",
+    async (mode) => {
+      const context = await githubOmissionFixture(
+        !["no_omission", "forged_hint"].includes(mode),
+      );
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        const [publication] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        if (mode === "forged_hint")
+          await db
+            .update(chatPublications)
+            .set({
+              payload: {
+                ...publication.payload,
+                attachmentOmissionReasons: { download_unavailable: 1 },
+              } as typeof publication.payload,
+            })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "explicit_board")
+          await db
+            .update(chatPublications)
+            .set({ idempotencyKey: `explicit-board:${publication.id}` })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "progress")
+          await db
+            .update(chatPublications)
+            .set({
+              payload: { ...publication.payload, progressState: "completed" },
+            })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "source_edited")
+          await db
+            .update(issueComments)
+            .set({
+              body: "Source changed",
+              updatedAt: new Date(Date.now() + 1),
+            })
+            .where(
+              eq(issueComments.id, String(context.action.payload.commentId)),
+            );
+        if (mode === "principal_revoked")
+          await db
+            .update(chatEndpoints)
+            .set({ allowUnlinkedPeople: false })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        if (mode === "generation_changed")
+          await db
+            .update(chatEndpoints)
+            .set({
+              setup: sql`jsonb_set(${chatEndpoints.setup}, '{runtimeGeneration}', to_jsonb(coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::int, 0) + 1))`,
+            })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        await context.service.processPendingPublications(100);
+        if (
+          ["source_edited", "principal_revoked", "generation_changed"].includes(
+            mode,
+          )
+        ) {
+          expect(context.providerRuntime.posts).toEqual([]);
+          await expect(
+            db
+              .select({ state: chatPublications.state })
+              .from(chatPublications)
+              .where(eq(chatPublications.id, publication.id)),
+          ).resolves.toEqual([{ state: "cancelled" }]);
+        } else
+          expect(
+            context.providerRuntime.posts.map((post) => post.text),
+          ).toEqual([context.result.summary]);
+      } finally {
+        await context.cleanup();
+      }
+    },
+  );
 
   async function linkedCommittedResponseFailure(
     context: Awaited<ReturnType<typeof committedChatResponseRecoveryFixture>>,
