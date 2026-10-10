@@ -29,6 +29,8 @@ import {
   type ChatChannelServiceOptions,
 } from "../services/chat-channels.js";
 import { accessService } from "../services/access.js";
+import { logActivity } from "../services/activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { recordChatWebhookStage } from "../services/chat-webhook-diagnostics.js";
 import {
@@ -380,6 +382,59 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         req.params.deliveryId as string,
       );
       res.status(204).end();
+    },
+  );
+
+  router.post(
+    "/chat-endpoints/:endpointId/github/review-on-green",
+    async (req, res) => {
+      if (!(await assertEndpointManagementAccess(req, res))) return;
+      const repository = req.body?.repository;
+      const pullNumber = req.body?.pullNumber;
+      if (
+        typeof repository !== "string" ||
+        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+        typeof pullNumber !== "number" ||
+        !Number.isSafeInteger(pullNumber) ||
+        pullNumber < 1
+      )
+        throw badRequest("repository (owner/name) and pullNumber are required");
+      const outcome = await service.requestGitHubReviewOnGreen(
+        endpointId(req),
+        repository,
+        pullNumber,
+      );
+      // The review itself is attributed to the PR author; record who asked.
+      const endpoint = await service.get(endpointId(req));
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: endpoint.companyId,
+        actorType: actor.actorType === "agent" ? "agent" : "user",
+        actorId: actor.actorId,
+        action: "chat.github.review_on_green_requested",
+        entityType: "chat_endpoint",
+        entityId: endpointId(req),
+        details: {
+          repository,
+          pullNumber,
+          headSha: outcome.headSha ?? null,
+          status: outcome.status,
+          reason: outcome.reason ?? null,
+        },
+      }).catch((error) =>
+        logger.warn(
+          {
+            endpointId: endpointId(req),
+            actorId: actor.actorId,
+            repository,
+            pullNumber,
+            outcome,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "review-on-green audit record failed",
+        ),
+      );
+      res.json(outcome);
     },
   );
 

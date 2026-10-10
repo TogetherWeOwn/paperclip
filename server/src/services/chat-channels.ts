@@ -98,6 +98,7 @@ import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAss
 import { githubReviewPrompt } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
+import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { githubChatRegistrationService } from "./chat-github-registration.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
@@ -27464,7 +27465,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (!matchesGitHubIngressFence(runtimeContext))
       return ignoreSupersededIngress();
     if (provider === "github" && request.headers.get("x-github-event") === "pull_request") {
-      const event = githubAutomaticReviewEvent(await request.clone().json(), request.headers.get("x-github-delivery") ?? "");
+      const pullRequestPayload: unknown = await request.clone().json();
+      const transition = githubHeadTransition(pullRequestPayload);
+      if (transition) {
+        try {
+          await supersedeQueuedGitHubReviews(db, { companyId: endpoint.companyId, endpointId: endpoint.id, ...transition });
+        } catch (error) {
+          logger.warn({ endpointId: endpoint.id, error: redactError(error) }, "Superseding queued GitHub reviews failed");
+        }
+      }
+      const event = githubAutomaticReviewEvent(pullRequestPayload, request.headers.get("x-github-delivery") ?? "");
       if (!event) return new Response("ignored", { status: 200 });
       const admission = await githubAutomaticAdmission(db, endpoint, event);
       if (admission) await githubReviewCheckService(db, fetchImpl).enqueue(endpoint, event, admission.allowed, admission.reason);
@@ -29277,6 +29287,120 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ? Buffer.from(JSON.stringify([last.createdAt, last.id])).toString("base64url")
         : null,
     };
+  }
+
+  /**
+   * Request one automatic review for a pull request head whose required checks
+   * are all green. GitHub data (author, head, checks) is read with the
+   * endpoint's own App token; authority is the PR author's, exactly as for a
+   * pull_request webhook, and the policy must list the checks_green event.
+   * Idempotent per head: a queued/running/completed review is never repeated.
+   */
+  async function requestGitHubReviewOnGreen(
+    endpointId: string,
+    repository: string,
+    pullNumber: number,
+  ): Promise<GitHubGreenRequestOutcome> {
+    const record = await endpointRecord(endpointId);
+    if (!record || record.endpoint.provider !== "github")
+      throw notFound("GitHub bot not found");
+    const endpoint = record.endpoint;
+    const [resource] = await db
+      .select()
+      .from(chatEndpointResources)
+      .where(
+        and(
+          eq(chatEndpointResources.companyId, endpoint.companyId),
+          eq(chatEndpointResources.endpointId, endpoint.id),
+          eq(chatEndpointResources.providerResourceId, repository.toLowerCase()),
+        ),
+      );
+    const repositoryId = String(resource?.metadata?.providerRepositoryId ?? "");
+    if (
+      !resource?.enabled ||
+      resource.availability !== "available" ||
+      !/^[1-9][0-9]*$/.test(repositoryId)
+    )
+      throw conflict("The repository is not enabled for this GitHub bot");
+    const prepared = await githubGreenReviewContext({
+      db,
+      fetchImpl,
+      companyId: endpoint.companyId,
+      endpointId: endpoint.id,
+      repositoryId,
+      repository: resource.providerResourceId,
+      pullNumber,
+    });
+    if (!prepared.ready) return prepared.outcome;
+    const event = prepared.context;
+    const admission = await githubAutomaticAdmission(db, endpoint, event);
+    if (admission)
+      await githubReviewCheckService(db, fetchImpl).enqueue(
+        endpoint,
+        event,
+        admission.allowed,
+        admission.reason,
+      );
+    if (!admission?.allowed)
+      return {
+        status: "not_admitted",
+        headSha: event.headSha,
+        reason: admission?.reason ?? "not_configured",
+      };
+    const previousAssessment = await githubPreviousAssessment(
+      db,
+      endpoint,
+      event.repositoryId,
+      event.pullNumber,
+    );
+    if (previousAssessment)
+      event.priorReviewedHeadSha = previousAssessment.headSha;
+    const endpointRuntime = await runtimeFor(endpoint);
+    const runtimeContext = runtimeContexts.get(endpointRuntime as object);
+    if (!runtimeContext)
+      throw conflict("Chat endpoint runtime is not current", {
+        code: "chat_endpoint_runtime_superseded",
+      });
+    const thread = endpointRuntime.thread(
+      `github:${event.repository}:${event.pullNumber}`,
+    );
+    const message = {
+      id: `pr-event:${event.deliveryId}`,
+      threadId: thread.id,
+      text: githubReviewPrompt(event, admission.policy, admission.revision),
+      formatted: { type: "root", children: [] },
+      raw: {},
+      author: {
+        userId: event.author.id,
+        userName: event.author.login,
+        fullName: event.author.login,
+        isBot: false,
+        isMe: false,
+        isSystem: false,
+      },
+      metadata: { dateSent: new Date(), edited: false },
+      attachments: [],
+      links: [],
+      isMention: true,
+    } as unknown as Message;
+    githubAutomaticMessages.set(message, {
+      context: event,
+      revision: admission.revision,
+      policy: admission.policy,
+    });
+    await processMessage(
+      endpoint,
+      thread,
+      message,
+      "mention",
+      true,
+      `https://github.com/${event.repository}/pull/${event.pullNumber}`,
+      { ...runtimeContext, endpointRuntime },
+      undefined,
+      null,
+      false,
+    );
+    return { status: "requested", headSha: event.headSha, reason: admission.reason };
   }
 
   async function replayDelivery(endpointId: string, deliveryId: string) {
@@ -38508,6 +38632,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     listActivity,
     listActivityPage,
     replayDelivery,
+    requestGitHubReviewOnGreen,
     replayPublication,
     resolveAction,
     resolvePublication,

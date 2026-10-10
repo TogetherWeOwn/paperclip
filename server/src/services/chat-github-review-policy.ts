@@ -1,5 +1,6 @@
 import { badRequest, conflict } from "../errors.js";
 import {
+  DEFAULT_GITHUB_REVIEW_PROMPTS,
   GITHUB_REVIEW_RUBRIC,
   githubReviewAssessmentSchema,
   githubPersistedReviewAssessmentSchema,
@@ -274,7 +275,7 @@ export function githubReviewPrompt(
     "GitHub channel request for the assigned Paperclip agent. Continue this ordinary Paperclip task.",
     `Review configuration revision: ${revision}.`,
     "Use this task's GitHub bot tools. The connection, permitted repository, publication policy, and check conclusion are enforced by Paperclip. Never substitute personal credentials.",
-    policy.prompts[context.event],
+    policy.prompts[context.event] ?? DEFAULT_GITHUB_REVIEW_PROMPTS[context.event],
     policy.instructions,
     "Assessment rubric (0–5):",
     ...GITHUB_REVIEW_RUBRIC,
