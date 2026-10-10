@@ -2292,7 +2292,7 @@ describe("agent issue mutation checkout ownership", () => {
       },
     );
 
-    it("retries legacy stranded evidence that stores only latestRunId (TOG-20700)", async () => {
+    it("retries legacy stranded evidence that stores only latestRunId", async () => {
       // Producer/consumer mismatch: stranded actions created before the
       // canonical evidence.runId stored the failed run as latestRunId with
       // sourceRunId null. The route must resolve that single-source fallback
@@ -2319,7 +2319,7 @@ describe("agent issue mutation checkout ownership", () => {
       });
     });
 
-    it("prefers canonical evidence.runId over legacy latestRunId (TOG-20700)", async () => {
+    it("prefers canonical evidence.runId over legacy latestRunId", async () => {
       const { db } = setupChatRecovery({
         evidence: {
           runId: ownerRunId,
