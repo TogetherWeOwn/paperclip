@@ -613,6 +613,90 @@ describe("suggestion replacement integrity", () => {
   });
 });
 
+describe("internal reference scrubbing scope", () => {
+  const scope = {
+    internalOrigins: ["https://board.example.invalid"],
+    trackerPrefixes: ["ACME"],
+  };
+
+  it("scrubs tracker ids and internal hosts before Markdown escaping", () => {
+    const tagged = finding({
+      title: "Follow-up ACME-123 on board.example.invalid",
+      body: "Follow-up ACME-123 on board.example.invalid and https://board.example.invalid/x",
+      evidence: "Follow-up ACME-123 on board.example.invalid",
+    });
+    const input = {
+      assessment: assessment({
+        summary: "Follow-up ACME-123 on board.example.invalid",
+        rationale: "Follow-up ACME-123 on board.example.invalid",
+        coverage: {
+          reviewedPaths: ["src/a.ts"],
+          omittedPaths: [],
+          limitations: ["Follow-up ACME-123 on board.example.invalid"],
+        },
+        findings: [tagged],
+      }),
+      repository: REPOSITORY,
+      pullNumber: 42,
+      headSha: HEAD_SHA,
+      baseSha: HEAD_SHA,
+      scope,
+    };
+    const posts = [
+      renderReviewSummary(input),
+      renderInlineFinding({
+        finding: tagged,
+        score: 3,
+        complete: true,
+        repository: REPOSITORY,
+        headSha: HEAD_SHA,
+        baseSha: HEAD_SHA,
+        scope,
+      }),
+    ];
+    for (const post of posts) {
+      const unescaped = post.replace(/\\/g, "");
+      expect(unescaped).not.toContain("ACME-123");
+      expect(unescaped).not.toContain("board.example.invalid");
+      expect(post).toContain("internal reference");
+      expect(post).toContain("internal link removed");
+    }
+  });
+
+  it("omits a suggestion the egress scrub would rewrite", () => {
+    const suggested = finding({
+      suggestion: 'const prefix = "ACME-1"; // board.example.invalid',
+    });
+    const posts = [
+      renderReviewSummary({
+        assessment: assessment({ findings: [suggested] }),
+        repository: REPOSITORY,
+        pullNumber: 42,
+        headSha: HEAD_SHA,
+        baseSha: HEAD_SHA,
+        scope,
+      }),
+      renderInlineFinding({
+        finding: suggested,
+        score: 3,
+        complete: true,
+        repository: REPOSITORY,
+        headSha: HEAD_SHA,
+        baseSha: HEAD_SHA,
+        scope,
+      }),
+    ];
+    for (const post of posts) {
+      expect(post).toContain(
+        "Suggestion omitted because publication sanitization would change the replacement.",
+      );
+      expect(post).not.toContain("```suggestion");
+      expect(post.replace(/\\/g, "")).not.toContain("ACME-1");
+      expect(post.replace(/\\/g, "")).not.toContain("board.example.invalid");
+    }
+  });
+});
+
 describe("assessment schema bounds", () => {
   it("rejects a null line and an over-long title", () => {
     const base = assessment({ findings: [finding()] });

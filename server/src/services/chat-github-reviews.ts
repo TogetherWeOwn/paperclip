@@ -1229,6 +1229,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 pullNumber: source.number,
                 headSha: review.headSha,
                 baseSha: evidenceBase,
+                scope: egressScope,
               }),
             );
             const summaryMarker = marker(
@@ -1306,6 +1307,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                             repository: source.repository,
                             headSha: review.headSha,
                             baseSha: evidenceBase,
+                            scope: egressScope,
                           }),
                         )}\n\n${findingMarker}`,
                         commit_id: review.headSha,

@@ -3,6 +3,10 @@ import type {
   GitHubReviewFinding,
 } from "@paperclipai/shared";
 import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import {
+  scrubInternalReferences,
+  type InternalReferenceScope,
+} from "./chat-publication-projection.js";
 
 /** Hard ceiling for any single rendered review post. */
 export const REVIEW_POST_MAX_CHARS = 60_000;
@@ -129,11 +133,16 @@ function singleLine(text: string): string {
 /**
  * Sanitize model-controlled text before rendering it as literal Markdown.
  * Server-generated links and formatting are added separately so prose cannot
- * add Markdown or HTML.
+ * add Markdown or HTML. When a scope is given, this runtime's own links and
+ * the company's own tracker ids are removed before escaping, because the
+ * escape step backslash-escapes the punctuation the scrub patterns match and
+ * GitHub renders those escapes back to the original characters.
  */
-function escapeMarkdownText(text: string): string {
+function escapeMarkdownText(text: string, scope?: InternalReferenceScope): string {
+  const projected = projectSafeChatPublicationText(text);
+  const scrubbed = scope ? scrubInternalReferences(projected, scope) : projected;
   let escaped = "";
-  for (const character of singleLine(projectSafeChatPublicationText(text))) {
+  for (const character of singleLine(scrubbed)) {
     if (character === "&") escaped += "&amp;";
     else if (character === "<") escaped += "&lt;";
     else if (character === ">") escaped += "&gt;";
@@ -151,8 +160,8 @@ function escapeMarkdownText(text: string): string {
 }
 
 /** Escape model text before placing it in a GFM table cell. */
-function escapeTableCell(text: string): string {
-  return escapeMarkdownText(text);
+function escapeTableCell(text: string, scope?: InternalReferenceScope): string {
+  return escapeMarkdownText(text, scope);
 }
 
 function findingPermalinkPath(
@@ -164,10 +173,11 @@ function findingPermalinkPath(
 
 function findingLocationLabel(
   finding: Pick<GitHubReviewFinding, "path" | "side" | "basePath" | "line">,
+  scope?: InternalReferenceScope,
 ): string {
   const path = findingPermalinkPath(finding);
   const location = path ? `${path}:${finding.line}` : `LEFT side, line ${finding.line}`;
-  return escapeMarkdownText(singleLine(location));
+  return escapeMarkdownText(singleLine(location), scope);
 }
 
 function findingFilePermalink(
@@ -187,19 +197,24 @@ function findingLocationLink(
   repository: string,
   headSha: string,
   baseSha: string,
+  scope?: InternalReferenceScope,
 ): string {
-  const label = findingLocationLabel(finding);
+  const label = findingLocationLabel(finding, scope);
   const permalink = findingFilePermalink(finding, repository, headSha, baseSha);
   return permalink ? `[${label}](${permalink})` : label;
 }
 
-function renderSuggestionBlock(suggestion: string): string {
+function renderSuggestionBlock(suggestion: string, scope?: InternalReferenceScope): string {
   // Never change executable replacement text, including significant indentation.
   // Project the complete block so prose trimming cannot dedent its first line.
   if (suggestion.includes("```"))
     return "Suggestion omitted because it contains an unsafe code fence.";
   const block = `\`\`\`suggestion\n${suggestion}\n\`\`\``;
   if (projectSafeChatPublicationText(block) !== block)
+    return "Suggestion omitted because publication sanitization would change the replacement.";
+  // The egress scrub runs after rendering and is not escaped, so it would
+  // rewrite executable code. Omit instead, like the guard above.
+  if (scope && scrubInternalReferences(block, scope) !== block)
     return "Suggestion omitted because publication sanitization would change the replacement.";
   return block;
 }
@@ -218,6 +233,7 @@ export interface RenderReviewSummaryInput {
   pullNumber: number;
   headSha: string;
   baseSha: string;
+  scope?: InternalReferenceScope;
 }
 
 export interface RenderInlineFindingInput {
@@ -227,6 +243,7 @@ export interface RenderInlineFindingInput {
   repository: string;
   headSha: string;
   baseSha: string;
+  scope?: InternalReferenceScope;
 }
 
 function renderFindingDetails(
@@ -235,27 +252,29 @@ function renderFindingDetails(
   repository: string,
   headSha: string,
   baseSha: string,
+  scope?: InternalReferenceScope,
 ): string {
   const locationLink = findingLocationLink(
     finding,
     repository,
     headSha,
     baseSha,
+    scope,
   );
-  const title = escapeMarkdownText(singleLine(finding.title));
-  const category = escapeMarkdownText(singleLine(finding.category));
+  const title = escapeMarkdownText(singleLine(finding.title), scope);
+  const category = escapeMarkdownText(singleLine(finding.category), scope);
   const evidence = finding.evidence
-    ? ` — ${escapeMarkdownText(finding.evidence)}`
+    ? ` — ${escapeMarkdownText(finding.evidence, scope)}`
     : "";
   const fix = finding.suggestion
-    ? `Fix:\n${renderSuggestionBlock(finding.suggestion)}`
+    ? `Fix:\n${renderSuggestionBlock(finding.suggestion, scope)}`
     : "Fix: no suggestion provided.";
   return [
     `<details><summary>${index}. ${emojiFor(finding.severity)} ${labelFor(finding.severity)}</summary>`,
     ``,
     `**${title}** · ${category} · ${locationLink}`,
     ``,
-    `What: ${escapeMarkdownText(finding.body)}`,
+    `What: ${escapeMarkdownText(finding.body, scope)}`,
     ``,
     `Evidence: ${locationLink}${evidence}`,
     ``,
@@ -271,7 +290,7 @@ function renderFindingDetails(
  * preserving the existing sanitizer order.
  */
 export function renderReviewSummary(input: RenderReviewSummaryInput): string {
-  const { assessment, repository, pullNumber, headSha, baseSha } = input;
+  const { assessment, repository, pullNumber, headSha, baseSha, scope } = input;
   const commitUrl = githubCommitPermalink(repository, headSha);
   const pullUrl = githubPullPermalink(repository, pullNumber);
   const headline = assessment.complete
@@ -284,7 +303,7 @@ export function renderReviewSummary(input: RenderReviewSummaryInput): string {
     ``,
     `Files reviewed: ${assessment.coverage.reviewedPaths.length}`,
     ``,
-    escapeMarkdownText(assessment.summary),
+    escapeMarkdownText(assessment.summary, scope),
     ``,
   ];
   if (assessment.findings.length === 0) {
@@ -300,11 +319,11 @@ export function renderReviewSummary(input: RenderReviewSummaryInput): string {
       `|---|----------|---------|----------|`,
       ...assessment.findings.map(
         (finding, i) =>
-          `| ${i + 1} | ${emojiFor(finding.severity)} ${labelFor(finding.severity)} | ${escapeTableCell(finding.title)} | ${findingLocationLink(finding, repository, headSha, baseSha)} |`,
+          `| ${i + 1} | ${emojiFor(finding.severity)} ${labelFor(finding.severity)} | ${escapeTableCell(finding.title, scope)} | ${findingLocationLink(finding, repository, headSha, baseSha, scope)} |`,
       ),
       ``,
       ...assessment.findings.flatMap((finding, i) => [
-        renderFindingDetails(finding, i + 1, repository, headSha, baseSha),
+        renderFindingDetails(finding, i + 1, repository, headSha, baseSha, scope),
         ``,
       ]),
     );
@@ -313,11 +332,11 @@ export function renderReviewSummary(input: RenderReviewSummaryInput): string {
     ? ` · ${assessment.coverage.omittedPaths.length} omitted`
     : "";
   const limitationText = assessment.coverage.limitations
-    .map((limitation) => escapeMarkdownText(singleLine(limitation)))
+    .map((limitation) => escapeMarkdownText(singleLine(limitation), scope))
     .join("; ");
   const limitations = limitationText ? `\nLimitations: ${limitationText}` : "";
   const rationale = assessment.rationale
-    ? `\nRationale: ${escapeMarkdownText(assessment.rationale)}`
+    ? `\nRationale: ${escapeMarkdownText(assessment.rationale, scope)}`
     : "";
   lines.push(
     `Coverage: ${assessment.coverage.reviewedPaths.length} file(s) reviewed${omitted}${limitations}${rationale}`,
@@ -331,34 +350,35 @@ export function renderReviewSummary(input: RenderReviewSummaryInput): string {
  * idempotency marker.
  */
 export function renderInlineFinding(input: RenderInlineFindingInput): string {
-  const { finding, score, complete, repository, headSha, baseSha } = input;
+  const { finding, score, complete, repository, headSha, baseSha, scope } = input;
   const commitUrl = githubCommitPermalink(repository, headSha);
-  const category = escapeMarkdownText(singleLine(finding.category));
-  const title = escapeMarkdownText(singleLine(finding.title));
+  const category = escapeMarkdownText(singleLine(finding.category), scope);
+  const title = escapeMarkdownText(singleLine(finding.title), scope);
   const locationLink = findingLocationLink(
     finding,
     repository,
     headSha,
     baseSha,
+    scope,
   );
   const verdict = complete ? `${score}/5` : "incomplete";
   const lines: string[] = [
     `**${emojiFor(finding.severity)} ${labelFor(finding.severity)} · ${category}** — ${title} · ${verdict} · [\`${headSha.slice(0, 7)}\`](${commitUrl})`,
     ``,
-    escapeMarkdownText(finding.body),
+    escapeMarkdownText(finding.body, scope),
     ``,
-    `Evidence: ${locationLink}${finding.evidence ? ` — ${escapeMarkdownText(finding.evidence)}` : ""}`,
+    `Evidence: ${locationLink}${finding.evidence ? ` — ${escapeMarkdownText(finding.evidence, scope)}` : ""}`,
     ``,
   ];
   if (finding.suggestion) {
-    lines.push(renderSuggestionBlock(finding.suggestion), ``);
+    lines.push(renderSuggestionBlock(finding.suggestion, scope), ``);
   }
   lines.push(
     `<details><summary>Full context</summary>`,
     ``,
-    escapeMarkdownText(finding.body),
+    escapeMarkdownText(finding.body, scope),
     ``,
-    `Category: ${category} · Side: ${finding.side} · Key: ${escapeMarkdownText(finding.key)}`,
+    `Category: ${category} · Side: ${finding.side} · Key: ${escapeMarkdownText(finding.key, scope)}`,
     `</details>`,
   );
   return truncatePost(lines.join("\n"));
