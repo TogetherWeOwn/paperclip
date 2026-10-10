@@ -26,6 +26,7 @@ const eventLabels = {
   ready_for_review: "Ready for review",
   mention: "Mention",
   comment: "Follow-up comment",
+  checks_green: "Required checks green",
 };
 export function GitHubToggle({
   label,
@@ -98,7 +99,7 @@ export function GitHubPolicyEditor({
       </div>
       <div>
         <h3 className="text-sm font-medium">Automatic review events</h3>
-        {GITHUB_REVIEW_EVENTS.slice(0, 4).map((event) => (
+        {GITHUB_REVIEW_EVENTS.filter((event) => event !== "mention" && event !== "comment").map((event) => (
           <GitHubToggle
             key={event}
             label={eventLabels[event]}

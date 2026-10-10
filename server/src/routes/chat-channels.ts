@@ -384,6 +384,30 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   );
 
   router.post(
+    "/chat-endpoints/:endpointId/github/review-on-green",
+    async (req, res) => {
+      if (!(await assertEndpointManagementAccess(req, res))) return;
+      const repository = req.body?.repository;
+      const pullNumber = req.body?.pullNumber;
+      if (
+        typeof repository !== "string" ||
+        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+        typeof pullNumber !== "number" ||
+        !Number.isSafeInteger(pullNumber) ||
+        pullNumber < 1
+      )
+        throw badRequest("repository (owner/name) and pullNumber are required");
+      res.json(
+        await service.requestGitHubReviewOnGreen(
+          endpointId(req),
+          repository,
+          pullNumber,
+        ),
+      );
+    },
+  );
+
+  router.post(
     "/chat-endpoints/:endpointId/publications/:publicationId/replay",
     async (req, res) => {
       if (!(await assertEndpointManagementAccess(req, res))) return;

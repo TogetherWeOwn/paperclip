@@ -6,6 +6,8 @@ export const GITHUB_REVIEW_EVENTS = [
   "ready_for_review",
   "mention",
   "comment",
+  /** Server-side: the head's required checks finished green (see chat-github-green-gate). */
+  "checks_green",
 ] as const;
 export type GitHubReviewEvent = (typeof GITHUB_REVIEW_EVENTS)[number];
 
@@ -153,12 +155,15 @@ export const DEFAULT_GITHUB_REVIEW_PROMPTS: Record<GitHubReviewEvent, string> =
       "Respond to the authorized person's request in this GitHub conversation. If they request a review, assess the current head using the review tools.",
     comment:
       "Continue the existing Paperclip task with this GitHub reply. Ordinary discussion does not change the review rating.",
+    checks_green:
+      "Every required check on this pull request head finished green. Review the current head (recheck prior findings if a previous assessment exists) and submit a structured assessment.",
   };
 
 export function defaultGitHubReviewPolicy(): GitHubReviewPolicy {
   return {
     invocation: "linked_authors",
-    events: [...GITHUB_REVIEW_EVENTS],
+    // checks_green is opt-in per configuration.
+    events: GITHUB_REVIEW_EVENTS.filter((event) => event !== "checks_green"),
     reviewDrafts: false,
     reviewBotAuthors: false,
     includeAuthors: [],

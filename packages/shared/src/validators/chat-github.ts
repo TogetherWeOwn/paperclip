@@ -15,6 +15,8 @@ const prompts = z
     ready_for_review: z.string().max(12000),
     mention: z.string().max(12000),
     comment: z.string().max(12000),
+    // Optional so configurations saved before this event existed stay valid.
+    checks_green: z.string().max(12000).optional(),
   })
   .strict();
 export const githubReviewPolicySchema = z
