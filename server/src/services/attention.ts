@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -11,7 +11,6 @@ import {
   decisionTrainingExamples,
   decisionTriage,
   decisions,
-  heartbeatRuns,
   inboxDismissals,
   invites,
   issueApprovals,
@@ -1066,6 +1065,65 @@ function readRunIssueId(contextSnapshot: Record<string, unknown> | null) {
   return typeof issueId === "string" && issueId.length > 0 ? issueId : null;
 }
 
+/**
+ * Returns the exhausted runs that a newer run of the same agent has superseded
+ * on the same issue key (`issueId`, falling back to `taskId`; an empty or
+ * missing key is its own "no issue" key, as in readRunIssueId).
+ *
+ * Each probe is an index range scan over runs newer than the failed run, so
+ * the cost scales with the number of exhausted runs, not with every run the
+ * failing agents made since the oldest one. Projecting context fields from a
+ * full time window instead detoasts every run snapshot in that window.
+ */
+async function listSupersededFailedRunIds(
+  db: Db,
+  companyId: string,
+  failedRows: Array<{ id: string; contextSnapshot: Record<string, unknown> | null }>,
+) {
+  if (failedRows.length === 0) return new Set<string>();
+  const failedValues = sql.join(
+    failedRows.map((row) => sql`(${row.id}::uuid, ${readRunIssueId(row.contextSnapshot)}::text)`),
+    sql`, `,
+  );
+  const rows = Array.from(await db.execute(sql`
+    select failed_key.run_id::text as "runId"
+    from (values ${failedValues}) as failed_key(run_id, issue_id)
+    join heartbeat_runs failed
+      on failed.id = failed_key.run_id
+     and failed.company_id = ${companyId}
+    where (
+      failed_key.issue_id is not null
+      and exists (
+        select 1 from heartbeat_runs newer
+        where newer.company_id = failed.company_id
+          and (newer.context_snapshot ->> 'issueId') = failed_key.issue_id
+          and newer.created_at > failed.created_at
+          and newer.agent_id = failed.agent_id
+      )
+    ) or (
+      failed_key.issue_id is not null
+      and exists (
+        select 1 from heartbeat_runs newer
+        where newer.company_id = failed.company_id
+          and (newer.context_snapshot ->> 'taskId') = failed_key.issue_id
+          and newer.created_at > failed.created_at
+          and newer.agent_id = failed.agent_id
+          and (newer.context_snapshot ->> 'issueId') is null
+      )
+    ) or (
+      failed_key.issue_id is null
+      and exists (
+        select 1 from heartbeat_runs newer
+        where newer.company_id = failed.company_id
+          and newer.agent_id = failed.agent_id
+          and newer.created_at > failed.created_at
+          and nullif(coalesce(newer.context_snapshot ->> 'issueId', newer.context_snapshot ->> 'taskId'), '') is null
+      )
+    )
+  `)) as Array<{ runId: string }>;
+  return new Set(rows.map((row) => row.runId));
+}
+
 export function attentionService(db: Db, serviceOptions: AttentionServiceOptions = {}) {
   const openDecisionLimit = Math.min(
     Math.max(Math.trunc(serviceOptions.openDecisionLimit ?? OPEN_DECISION_DEFAULT_LIMIT), 1),
@@ -1663,51 +1721,18 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
       const failedRows = await listAttentionExhaustedRuns(db, companyId);
       const failedIssueIds = failedRows.map((row) => readRunIssueId(row.contextSnapshot));
-      const failedAgentIds = [...new Set(failedRows.map((row) => row.agentId))];
-      const oldestFailedRunCreatedAt = failedRows.reduce<Date | null>((oldest, row) => {
-        if (!oldest || row.createdAt < oldest) return row.createdAt;
-        return oldest;
-      }, null);
-      const [failedIssueMap, failedImageMap, newerRuns] = await Promise.all([
+      const [failedIssueMap, failedImageMap, supersededRunIds] = await Promise.all([
         issueSummaryMap(
           db,
           companyId,
           failedIssueIds,
         ),
         issueImageMap(db, companyId, failedIssueIds),
-        oldestFailedRunCreatedAt && failedAgentIds.length > 0
-          ? db
-            .select({
-              agentId: heartbeatRuns.agentId,
-              createdAt: heartbeatRuns.createdAt,
-              // Project just the ids readRunIssueId needs; pulling the whole
-              // context_snapshot detoasts megabytes per feed build.
-              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-              runTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
-            })
-            .from(heartbeatRuns)
-            .where(and(
-              eq(heartbeatRuns.companyId, companyId),
-              inArray(heartbeatRuns.agentId, failedAgentIds),
-              gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
-            ))
-          : Promise.resolve([]),
+        listSupersededFailedRunIds(db, companyId, failedRows),
       ]);
-      const latestRunCreatedAtByKey = new Map<string, Date>();
-      for (const newerRun of newerRuns) {
-        const newerRunIssueId = readRunIssueId({ issueId: newerRun.runIssueId, taskId: newerRun.runTaskId });
-        const newerRunKey = `${newerRun.agentId}:${newerRunIssueId ?? ""}`;
-        const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
-        if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
-          latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
-        }
-      }
       for (const run of failedRows) {
+        if (supersededRunIds.has(run.id)) continue;
         const issueId = readRunIssueId(run.contextSnapshot);
-        const runKey = `${run.agentId}:${issueId ?? ""}`;
-        const hasNewerRun = (latestRunCreatedAtByKey.get(runKey)?.getTime() ?? 0) > run.createdAt.getTime();
-        if (hasNewerRun) continue;
-
         const issue = issueId ? failedIssueMap.get(issueId) ?? null : null;
         const dedupKey = `run:${run.id}`;
         add(createItem({
