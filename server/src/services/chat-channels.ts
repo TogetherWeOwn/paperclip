@@ -94,11 +94,11 @@ function readLowTrustAllowedBindingIds(value: unknown): string[] {
 }
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
-import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment } from "./chat-github-events.js";
 import { githubReviewPrompt } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
+import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { githubChatRegistrationService } from "./chat-github-registration.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
