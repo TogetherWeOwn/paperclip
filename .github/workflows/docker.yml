@@ -33,6 +33,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+    permissions:
+      contents: read
+    with:
+      scope: docker
+
   # Multi-arch by native runner, not QEMU.
   #
   # This was one job building linux/amd64,linux/arm64 together on an x86
@@ -56,6 +63,9 @@ jobs:
   # digest; `merge` assembles the manifest list. Both architectures remain
   # available to self-hosted installations and downstream image composers.
   build-and-push:
+    needs: changes
+    # Fork validation must never acquire registry write authority.
+    if: github.repository == 'paperclipai/paperclip' && needs.changes.outputs.affected == 'true'
     strategy:
       # Independent legs: one architecture failing should still publish
       # nothing, but it must not also hide the other's logs behind a
@@ -204,11 +214,14 @@ jobs:
       # deliberately absent here — the channel tag is moved by the
       # dist-tag-checked retag step below, never by the build matrix,
       # so parallel canary builds cannot race it backwards.
+      - name: Normalize registry image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -237,7 +250,7 @@ jobs:
           # By digest, not by tag: two runners cannot each push the same tag
           # and end up with a manifest list. Each leg publishes an untagged
           # image and `merge` names them together.
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # Registry-backed BuildKit cache instead of type=gha: the Actions
           # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
           # evict each other, so most builds ran effectively cold. The cache
@@ -246,8 +259,8 @@ jobs:
           #
           # Per-arch refs now the legs are separate runners: a shared ref would
           # have each leg overwrite the other's cache on every build.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
       # The digest is the only thing `merge` needs from this job. Carried as an
@@ -269,10 +282,65 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Forks validate a local image only. No registry login, cache export, write
+  # token, digest upload, manifest push, channel promotion, or attestation.
+  build-only:
+    needs: changes
+    if: github.repository != 'paperclipai/paperclip' && needs.changes.outputs.affected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Normalize registry image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Prepare local build context
+        run: |
+          set -euo pipefail
+          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          changed="$(git status --porcelain)"
+          if [ -n "$changed" ] && printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+            printf 'Unexpected build-context changes:\n%s\n' "$changed"
+            exit 1
+          fi
+          echo "BUILD_VERSION=$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)" >> "$GITHUB_ENV"
+          echo "TOOLS_EPOCH=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Build local production image without publication
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}:validation
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ env.BUILD_VERSION }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ env.TOOLS_EPOCH }}
+      - name: Verify local PID 1 reaps orphaned processes
+        run: docker run --rm -i "${{ env.IMAGE }}:validation" sh -s < scripts/assert-orphan-reaping.sh
+      - name: Record non-publishing result
+        run: echo 'Fork production image built and verified locally; nothing was published.' >> "$GITHUB_STEP_SUMMARY"
+
   # Names the per-architecture digests as one manifest list under the real
   # tags. Nothing is publicly tagged until this runs, so a half-published
   # multi-arch image is not a state anything can pull.
   merge-and-push:
+    if: github.repository == 'paperclipai/paperclip'
     needs: build-and-push
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -322,11 +390,14 @@ jobs:
       # absent, exactly as in the build job's mapping: the channel tag is
       # moved only by the dist-tag-checked promote_canary_channel job below,
       # so parallel canary-tag builds can never race the channel backwards.
+      - name: Normalize registry image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -345,7 +416,7 @@ jobs:
           set -euo pipefail
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       # PID 1 must be an init that reaps adopted orphans. With node there, the
       # orphans agent runs leave behind are never wait()ed and pin as zombies
@@ -403,7 +474,7 @@ jobs:
   # promotion is gated on its own completed pushes). Every interleaving
   # converges the Docker channel onto the npm channel.
   promote_canary_channel:
-    if: startsWith(github.ref, 'refs/tags/canary/v')
+    if: github.repository == 'paperclipai/paperclip' && startsWith(github.ref, 'refs/tags/canary/v')
     # merge-and-push, not build-and-push: the per-arch legs push untagged
     # digests, and the production `sha-*` tags this promotion retags only
     # exist once the manifest merge has named them.
@@ -417,6 +488,8 @@ jobs:
       group: docker-canary-channel-promotion
       cancel-in-progress: false
     steps:
+      - name: Normalize registry image
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -426,7 +499,7 @@ jobs:
 
       - name: Converge the channel tags onto the current npm canary
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ env.IMAGE }}
           GH_TOKEN: ${{ github.token }}
         run: |
           current="$(curl -fsS "https://registry.npmjs.org/-/package/@paperclipai%2Fdb/dist-tags" | jq -er .canary)"
