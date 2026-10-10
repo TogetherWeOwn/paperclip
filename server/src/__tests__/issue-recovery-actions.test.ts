@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -12,7 +12,9 @@ import {
   authUsers,
   agentWakeupRequests,
   activityLog,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   environmentLeases,
   environments,
@@ -148,6 +150,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(workspaceOperations);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
@@ -759,6 +763,109 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
+  // A consumed failed run must not suppress a budget-driven escalation for an
+  // invokable assignee. The assignee stays idle (invokable) but its lifetime
+  // budget hard-stop is exceeded, so the board must still see the reopened
+  // source even though the latestRun pointer names the adjudicated run.
+  // Guards the budget leg of the consumed-run bypass independently of the
+  // invokable leg above.
+  it("still escalates a reopened source whose assignee is over budget but invokable", async () => {
+    const { companyId, coderId, sourceIssueId, staleRun, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: coderId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId: coderId,
+      provider: "openai",
+      model: "test-model",
+      costCents: 125,
+      occurredAt: new Date(),
+    });
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
+  // For an in_review issue with a pending execution stage the sweep escalates
+  // the review participant, not the source assignee. A consumed failed run
+  // must not suppress that lane when the participant is over budget: reopen
+  // after owner_completed to in_review (manager participant, coder return
+  // assignee), pause the manager for budget, and run the sweep. Base
+  // escalates to blocked; the assignee-only bypass skipped with no action.
+  it("still escalates a reopened in_review source whose review participant is over budget", async () => {
+    const { companyId, coderId, sourceIssueId, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+    // The seed helper models a two-agent company (manager + coder); the
+    // reviewer is the agent that is not the source assignee.
+    const [manager] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), ne(agents.id, coderId)))
+      .limit(1);
+    const managerId = manager!.id;
+
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, managerId));
+    const sweep = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+
+    const result = await sweep.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(current).toMatchObject({ status: "blocked" });
     const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
     expect(active).not.toBeNull();
     expect(active!.id).not.toBe(firstActionId);

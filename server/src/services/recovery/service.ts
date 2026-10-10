@@ -3988,24 +3988,42 @@ export function recoveryService(
       input.recoveryCause,
     );
     // A consumed failed run only suppresses a replay of that run's own
-    // failure. When the fresh source assignee is currently not invokable or
+    // failure. When the fresh recovery target is currently not invokable or
     // is over budget, the escalation is for live state the board must see —
     // even if the latestRun pointer still names the adjudicated run (e.g. a
     // reopen after owner_completed with a paused assignee). Suppressing those
-    // would park the issue in_progress with no live path, no action and no
-    // wake.
+    // would park the issue with no live path, no action and no wake. For an
+    // in_review issue with a pending execution stage the sweep escalates the
+    // review participant, not the source assignee, so mirror that effective
+    // target here.
+    let effectiveRecoveryAgentId: string | null =
+      issue.assigneeAgentId ?? null;
+    if (issue.status === "in_review") {
+      const executionState = parseIssueExecutionState(issue.executionState);
+      const currentParticipant =
+        executionState?.status === "pending"
+          ? executionState.currentParticipant
+          : null;
+      if (
+        currentParticipant?.type === "agent" &&
+        currentParticipant.agentId
+      ) {
+        effectiveRecoveryAgentId = currentParticipant.agentId;
+      }
+    }
     let liveStateNeedsBoard = false;
-    if (!issue.assigneeAgentId) {
+    if (!effectiveRecoveryAgentId) {
       liveStateNeedsBoard = true;
     } else {
-      const sourceAgent = await getAgent(issue.assigneeAgentId);
+      const recoveryTargetAgent = await getAgent(effectiveRecoveryAgentId);
       const invokable =
-        sourceAgent && sourceAgent.companyId === issue.companyId
-          ? await isAgentInvokable(sourceAgent)
+        recoveryTargetAgent &&
+        recoveryTargetAgent.companyId === issue.companyId
+          ? await isAgentInvokable(recoveryTargetAgent)
           : false;
       const budgetBlocked = await isInvocationBudgetBlocked(
         issue,
-        issue.assigneeAgentId,
+        effectiveRecoveryAgentId,
       );
       liveStateNeedsBoard = !invokable || budgetBlocked;
     }
