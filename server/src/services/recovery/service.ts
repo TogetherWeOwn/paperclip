@@ -3904,6 +3904,45 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  /**
+   * An explicit owner_completed resolution adjudicates the exact failed run
+   * named in the action evidence. A stale tick replaying the same run must
+   * not mint a new active recovery from already-consumed evidence; only a
+   * genuinely new failure reopens recovery.
+   */
+  async function isFailedRunConsumedByExplicitCompletion(input: {
+    companyId: string;
+    sourceIssueId: string;
+    latestRun: LatestIssueRun;
+  }): Promise<boolean> {
+    const runId = input.latestRun?.id;
+    if (!runId) return false;
+    const settled = await db
+      .select({
+        outcome: issueRecoveryActions.outcome,
+        evidence: issueRecoveryActions.evidence,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+          inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt))
+      .limit(25);
+    return settled.some((row) => {
+      if (row.outcome !== "owner_completed") return false;
+      const evidence = parseObject(row.evidence);
+      return (
+        evidence.latestRunId === runId ||
+        evidence.runId === runId ||
+        evidence.sourceRunId === runId
+      );
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3913,10 +3952,33 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
-    if (isStrandedIssueRecoveryIssue(input.issue)) {
+    // The caller may hold a pre-completion snapshot while a stale tick or
+    // callback replays the same failed run. Re-read the source: a terminal
+    // source stays terminal, and the newer status version wins over the
+    // snapshot for every write below.
+    const [freshIssue] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.issue.companyId),
+          eq(issues.id, input.issue.id),
+        ),
+      )
+      .limit(1);
+    if (
+      !freshIssue ||
+      freshIssue.status === "done" ||
+      freshIssue.status === "cancelled"
+    ) {
+      return null;
+    }
+    const issue = freshIssue;
+    const previousStatus = freshIssue.status as StrandedPreviousStatus;
+    if (isStrandedIssueRecoveryIssue(issue)) {
       return escalateStrandedRecoveryIssueInPlace({
-        issue: input.issue,
-        previousStatus: input.previousStatus,
+        issue,
+        previousStatus,
         latestRun: input.latestRun,
       });
     }
@@ -3925,9 +3987,18 @@ export function recoveryService(
       input.latestRun,
       input.recoveryCause,
     );
+    if (
+      await isFailedRunConsumedByExplicitCompletion({
+        companyId: issue.companyId,
+        sourceIssueId: issue.id,
+        latestRun: input.latestRun,
+      })
+    ) {
+      return null;
+    }
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
-      issue: input.issue,
-      previousStatus: input.previousStatus,
+      issue: issue,
+      previousStatus: previousStatus,
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
@@ -3938,31 +4009,31 @@ export function recoveryService(
       Boolean(recoveryAction.returnOwnerAgentId);
     if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: input.issue,
+        issue: issue,
         latestRun: input.latestRun,
         actionId: recoveryAction.id,
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
+      issue.companyId,
+      issue.id,
     );
-    const updated = await issuesSvc.update(input.issue.id, {
+    const updated = await issuesSvc.update(issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
-      updated.assigneeAgentId === input.issue.assigneeAgentId &&
-      updated.assigneeUserId === input.issue.assigneeUserId;
+      updated.assigneeAgentId === issue.assigneeAgentId &&
+      updated.assigneeUserId === issue.assigneeUserId;
 
     const recoveryOwner = recoveryAction.ownerAgentId
       ? await getAgent(recoveryAction.ownerAgentId)
       : null;
-    const sourceAssignee = input.issue.assigneeAgentId
-      ? await getAgent(input.issue.assigneeAgentId)
+    const sourceAssignee = issue.assigneeAgentId
+      ? await getAgent(issue.assigneeAgentId)
       : null;
     let notice: SuccessfulRunHandoffNotice | null = null;
     if (
@@ -3983,13 +4054,13 @@ export function recoveryService(
                   heartbeatRuns.id,
                   input.successfulRunHandoffEvidence.sourceRunId,
                 ),
-                eq(heartbeatRuns.companyId, input.issue.companyId),
+                eq(heartbeatRuns.companyId, issue.companyId),
               ),
             )
             .limit(1)
         : [];
       notice = buildSuccessfulRunHandoffExhaustedNotice({
-        issue: input.issue,
+        issue: issue,
         sourceRun: sourceRun ?? null,
         correctiveRun: input.latestRun
           ? {
@@ -4002,7 +4073,7 @@ export function recoveryService(
         recoveryIssue: null,
         recoveryActionId: recoveryAction.id,
         recoveryOwner,
-        latestIssueStatus: input.issue.status,
+        latestIssueStatus: issue.status,
         latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
         missingDisposition:
           input.successfulRunHandoffEvidence.missingDisposition,
@@ -4046,7 +4117,7 @@ export function recoveryService(
         .from(issueComments)
         .where(
           and(
-            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.issueId, issue.id),
             eq(issueComments.authorType, "system"),
           ),
         )
@@ -4065,7 +4136,7 @@ export function recoveryService(
       if (!hasEscalationComment) {
         if (notice) {
           await issuesSvc.addComment(
-            input.issue.id,
+            issue.id,
             notice.body,
             {},
             {
@@ -4076,7 +4147,7 @@ export function recoveryService(
           );
         } else {
           await issuesSvc.addComment(
-            input.issue.id,
+            issue.id,
             escalationNotice.body,
             {},
             {
@@ -4090,7 +4161,7 @@ export function recoveryService(
     }
 
     await logActivity(db, {
-      companyId: input.issue.companyId,
+      companyId: issue.companyId,
       actorType: "system",
       actorId: "system",
       agentId: null,
@@ -4100,11 +4171,11 @@ export function recoveryService(
           ? "issue.successful_run_handoff_escalated"
           : "issue.updated",
       entityType: "issue",
-      entityId: input.issue.id,
+      entityId: issue.id,
       details: {
-        identifier: input.issue.identifier,
+        identifier: issue.identifier,
         status: "blocked",
-        previousStatus: input.previousStatus,
+        previousStatus: previousStatus,
         source:
           input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
             ? "recovery.reconcile_successful_run_handoff_missing_state"
@@ -4128,8 +4199,8 @@ export function recoveryService(
         routingPolicy:
           parseObject(recoveryAction.evidence).routingPolicy ?? null,
         sourceAssigneeBefore: {
-          agentId: input.issue.assigneeAgentId,
-          userId: input.issue.assigneeUserId,
+          agentId: issue.assigneeAgentId,
+          userId: issue.assigneeUserId,
         },
         sourceAssigneeAfter: {
           agentId: updated.assigneeAgentId,
@@ -4143,10 +4214,10 @@ export function recoveryService(
     if (!sourceAssigneePreserved) {
       logger.error(
         {
-          issueId: input.issue.id,
-          beforeAssigneeAgentId: input.issue.assigneeAgentId,
+          issueId: issue.id,
+          beforeAssigneeAgentId: issue.assigneeAgentId,
           afterAssigneeAgentId: updated.assigneeAgentId,
-          beforeAssigneeUserId: input.issue.assigneeUserId,
+          beforeAssigneeUserId: issue.assigneeUserId,
           afterAssigneeUserId: updated.assigneeUserId,
         },
         "automatic stranded recovery observed a concurrent source-owner change",
