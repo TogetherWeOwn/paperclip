@@ -182,11 +182,13 @@ export const GITHUB_GREEN_REVIEW_MAX_ATTEMPTS = 3;
 
 /**
  * Decides whether a head may get a (re)review and under which delivery id.
- * Review rows and deliveries are unique per delivery id, so a retry after a
- * failed attempt needs a fresh id: attempt N>1 is suffixed with `:attempt-N`.
- * A delivery already recorded under the chosen id means a request is in
- * flight (or was dropped before any review row existed); that is reported,
- * never silently repeated.
+ * Review rows and deliveries are unique per delivery id, so each attempt has
+ * its own id: attempt 1 is `checks-green:<repo>:<pr>:<head>`, attempt N>1
+ * appends `:attempt-N`. An attempt is spent when its review row ended
+ * incomplete/error/superseded, or when its delivery ended failed/filtered
+ * without ever writing a review row (the row insert rolls back with the task
+ * transaction). A delivery still pending under an attempt's id is in flight
+ * and is reported, never repeated.
  */
 export async function githubGreenReviewAttempt(
   db: Db,
@@ -202,7 +204,10 @@ export async function githubGreenReviewAttempt(
   | { kind: "ready"; deliveryId: string; attempt: number }
 > {
   const rows = await db
-    .select({ state: chatGitHubReviews.state })
+    .select({
+      state: chatGitHubReviews.state,
+      deliveryId: chatGitHubReviews.deliveryId,
+    })
     .from(chatGitHubReviews)
     .where(
       and(
@@ -213,30 +218,36 @@ export async function githubGreenReviewAttempt(
         eq(chatGitHubReviews.headSha, input.headSha),
       ),
     );
-  if (rows.some((row) => ["queued", "running", "completed"].includes(row.state)))
+  if (rows.some((row) => LIVE_OR_DONE.has(row.state)))
     return { kind: "already_reviewed" };
-  const failed = rows.filter((row) =>
-    ["incomplete", "error", "superseded"].includes(row.state),
-  ).length;
-  if (failed >= GITHUB_GREEN_REVIEW_MAX_ATTEMPTS)
-    return { kind: "retries_exhausted" };
-  const attempt = failed + 1;
   const base = `checks-green:${input.repositoryId}:${input.pullNumber}:${input.headSha}`;
-  const deliveryId = attempt === 1 ? base : `${base}:attempt-${attempt}`;
-  const [pending] = await db
-    .select({ id: chatDeliveries.id })
+  const deliveries = await db
+    .select({
+      state: chatDeliveries.state,
+      deliveryId: sql<string>`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId'`,
+    })
     .from(chatDeliveries)
     .where(
       and(
         eq(chatDeliveries.companyId, input.companyId),
         eq(chatDeliveries.endpointId, input.endpointId),
-        sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' = ${deliveryId}`,
+        sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' like ${`${base}%`}`,
       ),
-    )
-    .limit(1);
-  if (pending) return { kind: "already_requested" };
-  return { kind: "ready", deliveryId, attempt };
+    );
+  for (let attempt = 1; attempt <= GITHUB_GREEN_REVIEW_MAX_ATTEMPTS; attempt++) {
+    const deliveryId = attempt === 1 ? base : `${base}:attempt-${attempt}`;
+    const review = rows.find((row) => row.deliveryId === deliveryId);
+    if (review) continue; // not live or done (checked above): a spent attempt
+    const delivery = deliveries.find((row) => row.deliveryId === deliveryId);
+    if (!delivery) return { kind: "ready", deliveryId, attempt };
+    if (DEAD_DELIVERY.has(delivery.state)) continue;
+    return { kind: "already_requested" };
+  }
+  return { kind: "retries_exhausted" };
 }
+
+const LIVE_OR_DONE = new Set(["queued", "running", "completed"]);
+const DEAD_DELIVERY = new Set(["failed", "filtered"]);
 
 /**
  * A queued review that never started is dead once its head moves or the pull

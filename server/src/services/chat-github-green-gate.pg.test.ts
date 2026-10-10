@@ -207,6 +207,41 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
     });
   });
 
+  it("spends an attempt whose delivery failed before writing a review row", async () => {
+    const f = await fixture();
+    const scope = {
+      companyId: f.companyId,
+      endpointId: f.endpointId,
+      repositoryId: REPO,
+      pullNumber: PR,
+      headSha: NEW,
+    };
+    const base = `checks-green:${REPO}:${PR}:${NEW}`;
+    const delivery = (
+      deliveryId: string,
+      state: NonNullable<(typeof chatDeliveries.$inferInsert)["state"]>,
+    ) =>
+      db.insert(chatDeliveries).values({
+        companyId: f.companyId,
+        endpointId: f.endpointId,
+        providerEventId: `github:x:pr-event:${deliveryId}`,
+        deduplicationKey: `pr-event:${deliveryId}`,
+        eventKind: "mention",
+        normalizedEvent: { githubAutomatic: { context: { deliveryId } } },
+        state,
+      });
+    await delivery(base, "failed");
+    expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+      kind: "ready",
+      deliveryId: `${base}:attempt-2`,
+      attempt: 2,
+    });
+    await delivery(`${base}:attempt-2`, "received");
+    expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+      kind: "already_requested",
+    });
+  });
+
   it("reports a live or finished review and an in-flight request instead of repeating it", async () => {
     const f = await fixture();
     const scope = {
