@@ -109,6 +109,17 @@ Formal **APPROVE** and **REQUEST_CHANGES** are separate governed tools, each off
 by default. Enabling either does not automatically perform it. A score of 5/5
 alone never approves a PR.
 
+Before a new formal review POST, Paperclip checks the task/run and conversation
+binding, current authority, formal-review permission, and PR head again after
+reading the retry history. A matching publication marker recovers the existing
+receipt without another POST.
+
+This final preflight is not an atomic transaction with GitHub. A concurrent push
+or authority change can still race the checks and the remote write. The request
+pins the reviewed commit, but does not guarantee that it remains the PR head when
+GitHub accepts the review. This check does not grant merge authority or establish
+a separate reviewer identity.
+
 To enforce the rating at merge time, configure GitHub branch protection or a
 ruleset to require **Paperclip Review**, selecting this bot App as the source
 where supported. Paperclip does not change repository rules. GitHub account and
