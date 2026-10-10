@@ -3780,12 +3780,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ...runAttachTemplate,
         paperclipNextAuthority: { identity: desired, connection },
       };
+      const attachStartAckedSeq = core.store.state.ackedSourceSeq;
       core.queueCommand("run.attach", payload, commandId, true);
       await this.#waitCommand("run.attach", commandId);
       const attached = core.getCommand(commandId);
       if (attached?.status !== "completed") {
         throw new Error("native_runner_prp_run_rotation_failed");
       }
+      // The run.attach result and the run.attached event replay are
+      // independent frames: the result can become visible before the replayed
+      // event commits on a reconnected runner (lost-ack). Rotating on the
+      // result alone snapshots state without the event. Gate rotation on the
+      // attach-event commit.
+      await this.#waitForWarmAttachEventCommit(core, prior, attachStartAckedSeq);
 
       activationStarted = true;
       core.rotateRunIdentity(desired, runAttachTemplate);
@@ -5761,6 +5768,30 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     throw new Error(
       `${this.#startupComplete ? "provider_transport_failed" : this.#startupFailureCode}: PRP command ${type} timed out`,
+    );
+  }
+
+  async #waitForWarmAttachEventCommit(
+    core: DurablePrpControlPlane,
+    prior: DurableRecoveryIdentity,
+    startAckedSeq: number,
+    deadline = Date.now() + 30_000,
+  ): Promise<void> {
+    while (Date.now() < deadline) {
+      this.#throwIfFailed();
+      const committed = core.store.state.committedEvents.some(
+        (event) =>
+          event.eventType === "run.attached" &&
+          event.sourceSeq > startAckedSeq &&
+          event.envelope["runId"] === prior.runId,
+      );
+      if (committed) return;
+      if (await this.#runnerHasExited())
+        throw new Error("runnerd exited while waiting for run.attached commit");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    throw new Error(
+      "native_runner_warm_transition_attachment_unproven: run.attach completed without its run.attached event commit",
     );
   }
 
