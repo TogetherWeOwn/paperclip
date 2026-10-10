@@ -3987,12 +3987,35 @@ export function recoveryService(
       input.latestRun,
       input.recoveryCause,
     );
+    // A consumed failed run only suppresses a replay of that run's own
+    // failure. When the fresh source assignee is currently not invokable or
+    // is over budget, the escalation is for live state the board must see —
+    // even if the latestRun pointer still names the adjudicated run (e.g. a
+    // reopen after owner_completed with a paused assignee). Suppressing those
+    // would park the issue in_progress with no live path, no action and no
+    // wake.
+    let liveStateNeedsBoard = false;
+    if (!issue.assigneeAgentId) {
+      liveStateNeedsBoard = true;
+    } else {
+      const sourceAgent = await getAgent(issue.assigneeAgentId);
+      const invokable =
+        sourceAgent && sourceAgent.companyId === issue.companyId
+          ? await isAgentInvokable(sourceAgent)
+          : false;
+      const budgetBlocked = await isInvocationBudgetBlocked(
+        issue,
+        issue.assigneeAgentId,
+      );
+      liveStateNeedsBoard = !invokable || budgetBlocked;
+    }
     if (
-      await isFailedRunConsumedByExplicitCompletion({
+      !liveStateNeedsBoard &&
+      (await isFailedRunConsumedByExplicitCompletion({
         companyId: issue.companyId,
         sourceIssueId: issue.id,
         latestRun: input.latestRun,
-      })
+      }))
     ) {
       return null;
     }

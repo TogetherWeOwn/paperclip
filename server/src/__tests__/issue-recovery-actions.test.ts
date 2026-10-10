@@ -740,6 +740,30 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(active!.id).not.toBe(firstActionId);
   });
 
+  // A consumed failed run must not suppress an escalation driven by live
+  // source state. Reopen after owner_completed with a paused assignee: the
+  // sweep's "assignee not invokable" branch must still reach the board even
+  // though the latestRun pointer still names the adjudicated run.
+  it("still escalates a reopened source whose assignee is no longer invokable", async () => {
+    const { companyId, coderId, sourceIssueId, staleRun, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
   // Model the production payload: `requestedRef` keeps the operator spelling,
   // and the fingerprint carries the canonical remote ref. Two equivalent
   // spellings of one remote branch share `identityRef`, so they share one
