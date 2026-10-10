@@ -134,7 +134,26 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
           .from(chatGitHubReviews)
           .where(eq(chatGitHubReviews.id, id))
       )[0]!.state;
-    return { companyId, endpointId, review, stateOf };
+    /** Production shape: the review row stores the chat_deliveries row id. */
+    const delivery = async (
+      deliveryId: string,
+      state: NonNullable<(typeof chatDeliveries.$inferInsert)["state"]> = "processed",
+    ) => {
+      const [row] = await db
+        .insert(chatDeliveries)
+        .values({
+          companyId,
+          endpointId,
+          providerEventId: `github:x:pr-event:${deliveryId}`,
+          deduplicationKey: `pr-event:${deliveryId}`,
+          eventKind: "mention",
+          normalizedEvent: { githubAutomatic: { context: { deliveryId } } },
+          state,
+        })
+        .returning({ id: chatDeliveries.id });
+      return row!.id;
+    };
+    return { companyId, endpointId, review, stateOf, delivery };
   }
 
   it("supersedes only never-started queued rows of older heads on synchronize", async () => {
@@ -178,34 +197,46 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
     expect(await f.stateOf(other.id)).toBe("completed");
   });
 
-  it("retries a failed head under a fresh delivery id, then stops", async () => {
-    const f = await fixture();
-    const scope = {
-      companyId: f.companyId,
-      endpointId: f.endpointId,
-      repositoryId: REPO,
-      pullNumber: PR,
-      headSha: NEW,
-    };
-    const base = `checks-green:${REPO}:${PR}:${NEW}`;
-    expect(await githubGreenReviewAttempt(db, scope)).toEqual({
-      kind: "ready",
-      deliveryId: base,
-      attempt: 1,
-    });
-    await f.review(NEW, "error", { deliveryId: base });
-    expect(await githubGreenReviewAttempt(db, scope)).toEqual({
-      kind: "ready",
-      deliveryId: `${base}:attempt-2`,
-      attempt: 2,
-    });
-    await f.review(NEW, "incomplete", { deliveryId: `${base}:attempt-2` });
-    await f.review(NEW, "superseded", { deliveryId: `${base}:attempt-3` });
-    expect(GITHUB_GREEN_REVIEW_MAX_ATTEMPTS).toBe(3);
-    expect(await githubGreenReviewAttempt(db, scope)).toEqual({
-      kind: "retries_exhausted",
-    });
-  });
+  it.each(["error", "incomplete", "superseded"] as const)(
+    "retries a head whose review ended %s under a fresh delivery id, then stops",
+    async (failedState) => {
+      const f = await fixture();
+      const scope = {
+        companyId: f.companyId,
+        endpointId: f.endpointId,
+        repositoryId: REPO,
+        pullNumber: PR,
+        headSha: NEW,
+      };
+      const base = `checks-green:${REPO}:${PR}:${NEW}`;
+      expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+        kind: "ready",
+        deliveryId: base,
+        attempt: 1,
+      });
+      await f.review(NEW, failedState, { deliveryId: await f.delivery(base) });
+      expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+        kind: "ready",
+        deliveryId: `${base}:attempt-2`,
+        attempt: 2,
+      });
+      await f.review(NEW, failedState, {
+        deliveryId: await f.delivery(`${base}:attempt-2`),
+      });
+      expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+        kind: "ready",
+        deliveryId: `${base}:attempt-3`,
+        attempt: 3,
+      });
+      await f.review(NEW, failedState, {
+        deliveryId: await f.delivery(`${base}:attempt-3`),
+      });
+      expect(GITHUB_GREEN_REVIEW_MAX_ATTEMPTS).toBe(3);
+      expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+        kind: "retries_exhausted",
+      });
+    },
+  );
 
   it("spends an attempt whose delivery failed before writing a review row", async () => {
     const f = await fixture();
@@ -217,26 +248,13 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
       headSha: NEW,
     };
     const base = `checks-green:${REPO}:${PR}:${NEW}`;
-    const delivery = (
-      deliveryId: string,
-      state: NonNullable<(typeof chatDeliveries.$inferInsert)["state"]>,
-    ) =>
-      db.insert(chatDeliveries).values({
-        companyId: f.companyId,
-        endpointId: f.endpointId,
-        providerEventId: `github:x:pr-event:${deliveryId}`,
-        deduplicationKey: `pr-event:${deliveryId}`,
-        eventKind: "mention",
-        normalizedEvent: { githubAutomatic: { context: { deliveryId } } },
-        state,
-      });
-    await delivery(base, "failed");
+    await f.delivery(base, "failed");
     expect(await githubGreenReviewAttempt(db, scope)).toEqual({
       kind: "ready",
       deliveryId: `${base}:attempt-2`,
       attempt: 2,
     });
-    await delivery(`${base}:attempt-2`, "received");
+    await f.delivery(`${base}:attempt-2`, "received");
     expect(await githubGreenReviewAttempt(db, scope)).toEqual({
       kind: "already_requested",
     });
@@ -251,20 +269,11 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
       pullNumber: PR,
       headSha: NEW,
     };
-    const deliveryId = `checks-green:${REPO}:${PR}:${NEW}`;
-    await db.insert(chatDeliveries).values({
-      companyId: f.companyId,
-      endpointId: f.endpointId,
-      providerEventId: `github:x:pr-event:${deliveryId}`,
-      deduplicationKey: `pr-event:${deliveryId}`,
-      eventKind: "mention",
-      normalizedEvent: { githubAutomatic: { context: { deliveryId } } },
-      state: "processed",
-    });
+    const deliveryRowId = await f.delivery(`checks-green:${REPO}:${PR}:${NEW}`);
     expect(await githubGreenReviewAttempt(db, scope)).toEqual({
       kind: "already_requested",
     });
-    await f.review(NEW, "running", { deliveryId });
+    await f.review(NEW, "running", { deliveryId: deliveryRowId });
     expect(await githubGreenReviewAttempt(db, scope)).toEqual({
       kind: "already_reviewed",
     });

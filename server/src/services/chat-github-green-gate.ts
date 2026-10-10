@@ -206,6 +206,7 @@ export async function githubGreenReviewAttempt(
   const rows = await db
     .select({
       state: chatGitHubReviews.state,
+      /** The chat_deliveries row id that started this review. */
       deliveryId: chatGitHubReviews.deliveryId,
     })
     .from(chatGitHubReviews)
@@ -223,6 +224,7 @@ export async function githubGreenReviewAttempt(
   const base = `checks-green:${input.repositoryId}:${input.pullNumber}:${input.headSha}`;
   const deliveries = await db
     .select({
+      id: chatDeliveries.id,
       state: chatDeliveries.state,
       deliveryId: sql<string>`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId'`,
     })
@@ -236,10 +238,11 @@ export async function githubGreenReviewAttempt(
     );
   for (let attempt = 1; attempt <= GITHUB_GREEN_REVIEW_MAX_ATTEMPTS; attempt++) {
     const deliveryId = attempt === 1 ? base : `${base}:attempt-${attempt}`;
-    const review = rows.find((row) => row.deliveryId === deliveryId);
-    if (review) continue; // not live or done (checked above): a spent attempt
     const delivery = deliveries.find((row) => row.deliveryId === deliveryId);
     if (!delivery) return { kind: "ready", deliveryId, attempt };
+    // Review rows reference the chat_deliveries row id, not the event's
+    // delivery id. A row here is not live or done (checked above): spent.
+    if (rows.some((row) => row.deliveryId === delivery.id)) continue;
     if (DEAD_DELIVERY.has(delivery.state)) continue;
     return { kind: "already_requested" };
   }

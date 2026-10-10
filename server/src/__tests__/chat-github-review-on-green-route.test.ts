@@ -4,8 +4,13 @@ import type { Db } from "@paperclipai/db";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const hasPermission = vi.fn();
+const logActivity = vi.fn();
 vi.mock("../services/access.js", () => ({
   accessService: () => ({ hasPermission }),
+}));
+vi.mock("../services/activity-log.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/activity-log.js")>()),
+  logActivity,
 }));
 
 const { errorHandler } = await import("../middleware/error-handler.js");
@@ -50,6 +55,7 @@ beforeEach(() => {
     reason: "automatic_review",
   });
   hasPermission.mockResolvedValue(true);
+  logActivity.mockResolvedValue({});
 });
 
 describe("POST /chat-endpoints/:endpointId/github/review-on-green", () => {
@@ -73,6 +79,29 @@ describe("POST /chat-endpoints/:endpointId/github/review-on-green", () => {
       "acme/app",
       7,
     );
+    expect(logActivity).toHaveBeenCalledWith(expect.anything(), {
+      companyId,
+      actorType: "user",
+      actorId: "manager-user",
+      action: "chat.github.review_on_green_requested",
+      entityType: "chat_endpoint",
+      entityId: endpointId,
+      details: {
+        repository: "acme/app",
+        pullNumber: 7,
+        headSha: "b".repeat(40),
+        status: "requested",
+        reason: "automatic_review",
+      },
+    });
+  });
+
+  it("still answers when the audit record cannot be written", async () => {
+    logActivity.mockRejectedValue(new Error("db down"));
+    await request(app(manager))
+      .post(path)
+      .send({ repository: "acme/app", pullNumber: 7 })
+      .expect(200);
   });
 
   it("rejects agent actors before touching the endpoint", async () => {
