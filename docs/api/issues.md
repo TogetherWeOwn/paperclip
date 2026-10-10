@@ -35,6 +35,41 @@ The response also includes:
 - `documentSummaries`: metadata for all linked issue documents
 - `legacyPlanDocument`: a read-only fallback when the description still contains an old `<plan>` block
 
+## Native Sibling Liveness
+
+```http
+GET /api/issues/{issueId}/sibling-liveness
+Authorization: Bearer {currentRunJwt}
+```
+
+This read is limited to the caller's own, currently running native execution of the issue. The request must carry the current run's signed agent-run JWT, verified with strict run authority: the token must carry this instance's issuer, audience and instance claims, and the legacy-token compatibility paths that other agent routes accept do not apply. Company, agent assignment, execution-run binding, native issue ownership, agent status, and effective standard trust are read in a read-only repeatable-read snapshot that takes no row locks, and the whole observation is repeated in a second fresh snapshot before the response is sent. Board sessions, board and agent API keys, restricted run scopes, low-trust runs, and ended, stopped, or ownership-held runs cannot use the endpoint.
+
+- `404`: the issue is missing, or this run does not currently own it. The two cases are not distinguished.
+- `403`: the caller is not a standard-trust run credential, or the issue is a skill-test or task-bridge issue.
+- `409`: the run owns the issue but is no longer current: it ended, was stopped, is a held native runner, its agent is paused, or the issue is no longer in progress.
+- `503`: a read failed, timed out, or the verdict could not be delivered inside its validity window.
+
+`clear` only reports that no other execution of this issue was observed; it is not company-lifecycle liveness, so a paused or archived company is not reflected in it.
+
+A successful response has exactly this versioned shape and is not cacheable:
+
+```json
+{
+  "schema": "paperclip.native-sibling-liveness.v1",
+  "issueId": "{issueId}",
+  "runId": "{runId}",
+  "verdict": "clear",
+  "observedAt": "2026-10-08T12:00:00.000Z",
+  "expiresAt": "2026-10-08T12:00:03.000Z"
+}
+```
+
+- `clear`: both reads found no other queued or running execution attributed to this exact issue.
+- `sibling`: at least one read found a queued or running peer execution; same-agent peers count.
+- `unknown`: incomplete, stale, contradictory, or ambiguous state prevented a reliable verdict. A run is examined when its native owner, durable issue binding, snapshot `issueId`, snapshot `taskId`, or snapshot `taskKey` names this issue by its id or identifier, compared case-insensitively. If any of those values names a different issue, names no issue, or is not a string, or the run's lifecycle fields disagree with its status, the verdict is `unknown`. A `scheduled_retry` run also produces `unknown`, and so do policy documents of the caller that cannot be interpreted.
+
+The response contains no peer identifiers or run details. Its observation expires three seconds after `observedAt`; clients must discard it after `expiresAt` and make no assumption from a non-200 response. The verdict computation writes nothing, and the transaction is read-only. Authentication is shared with every agent route and may record the run's identity context as it does for any agent request. The response carries `Cache-Control: no-store` and no validator. Wake requests that have not yet become runs are not executions and are not counted, and a verdict is not a lock on future execution.
+
 ## Create Issue
 
 ```

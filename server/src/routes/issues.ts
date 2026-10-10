@@ -12,6 +12,8 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { evaluateNativeSiblingLiveness } from "../services/native-sibling-liveness.js";
+import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -112,6 +114,7 @@ import {
   isMarkdownArtifactWorkProduct,
   isMarkdownAttachmentContent,
   isUuidLike,
+  nativeSiblingLivenessResponseSchema,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
   type CompanySearchExtractQuery,
@@ -3601,6 +3604,63 @@ export function issueRoutes(
     if (req.method !== "GET") return svc.getById(id);
     return memoizeIssueRead(req, id, () => svc.getById(id));
   }
+
+  // Registered ahead of the issue-detail ETag middleware so route matching alone
+  // decides that this verdict is never revalidated or cached.
+  router.get("/issues/:id/sibling-liveness", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const actor = req.actor;
+    const bearer = /^bearer\s+(\S+)$/i.exec(req.header("authorization") ?? "")?.[1];
+    // The verdict attests live authority, so re-verify the credential without the
+    // legacy-token compatibility exceptions that ordinary agent routes accept.
+    const claims = bearer ? verifyLocalAgentJwt(bearer, { strictRunAuthority: true }) : null;
+    if (
+      actor.type !== "agent" ||
+      actor.source !== "agent_jwt" ||
+      !actor.companyId ||
+      !actor.agentId ||
+      !actor.runId ||
+      (actor.keyScope !== undefined && actor.keyScope !== null && actor.keyScope.kind !== "standard") ||
+      !claims ||
+      claims.sub !== actor.agentId ||
+      claims.company_id !== actor.companyId ||
+      claims.run_id !== actor.runId
+    ) {
+      res.status(403).json({ error: "Current standard-trust agent run required" });
+      return;
+    }
+
+    const issueId = req.params.id as string;
+    if (!nativeSiblingLivenessResponseSchema.shape.issueId.safeParse(issueId).success) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    const result = await evaluateNativeSiblingLiveness(db, {
+      companyId: actor.companyId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      issueId,
+    });
+    if (result.kind === "not_found") {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (result.kind === "forbidden") {
+      res.status(403).json({ error: "Current run is not eligible for sibling liveness" });
+      return;
+    }
+    if (result.kind === "conflict") {
+      res.status(409).json({ error: "Current run is no longer eligible for sibling liveness" });
+      return;
+    }
+    if (result.kind === "unavailable") {
+      res.status(503).json({ error: "Sibling liveness is unavailable" });
+      return;
+    }
+    // `end` rather than `json`: Express would attach a validator and could answer a
+    // conditional request with 304, and this verdict must never be revalidated.
+    res.status(200).type("application/json").end(JSON.stringify(result.response));
+  });
 
   const issueDetailEtag = privateJsonEtag();
   router.use((req, res, next) => {

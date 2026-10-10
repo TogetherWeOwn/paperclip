@@ -67,6 +67,7 @@ import {
   updateIssueWorkProductSchema,
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
+  nativeSiblingLivenessResponseSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
   runnerGoalActionRequestSchema,
@@ -1716,7 +1717,11 @@ function resolveOperationAuthLevel(
   if (/^\/api\/companies\/\{companyId\}\/agents\/\{agentId\}\/dot-binding(?:\/event-test)?$/.test(path)) return "board";
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/companies/{companyId}/agent-commentary") return "agent_heartbeat";
-  if (key === "POST /api/mcp/project-tools" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools") return "agent_run";
+  if (
+    key === "POST /api/mcp/project-tools" ||
+    key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" ||
+    key === "GET /api/issues/{id}/sibling-liveness"
+  ) return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -10365,6 +10370,24 @@ registerCurrentRoute({
   tags: ["routines"],
   summary: "Update a routine description annotation thread",
   body: updateDocumentAnnotationThreadSchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/sibling-liveness",
+  tags: ["issues"],
+  summary: "Read the current native run's issue sibling-liveness verdict",
+  responses: {
+    200: r.ok(nativeSiblingLivenessResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    503: {
+      description: "Sibling liveness could not be established",
+      content: { "application/json": { schema: ErrorSchema } },
+    },
+  },
 });
 
 registerCurrentRoute({

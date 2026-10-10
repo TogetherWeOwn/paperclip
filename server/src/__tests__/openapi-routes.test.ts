@@ -379,6 +379,11 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/health"].get.security).toEqual([]);
     expect(res.body.paths["/api/mcp/project-tools"].post.security).toEqual([{ AgentRunAuth: [] }]);
     expect(res.body.paths["/api/mcp/project-tools"].post["x-paperclip-authorization"]).toEqual({ actor: "agent", heartbeatBound: true, taskBound: true });
+    const siblingLiveness = res.body.paths["/api/issues/{id}/sibling-liveness"].get;
+    expect(siblingLiveness.security).toEqual([{ AgentRunAuth: [] }]);
+    expect(siblingLiveness["x-paperclip-authorization"]).toEqual({ actor: "agent", heartbeatBound: true, taskBound: true });
+    expect(Object.keys(siblingLiveness.responses).sort()).toEqual(["200", "401", "403", "404", "409", "503"]);
+    expect(res.body.paths["/api/issues/{id}/sibling-liveness"].post).toBeUndefined();
     expect(res.body.paths["/mcp/gateways/{gatewayPublicId}"].post.security).toEqual([]);
     expect(res.body.paths["/api/mcp/gateways/{gatewayPublicId}"]).toBeUndefined();
     expect(res.body.paths["/api/companies"].get.parameters).toContainEqual({

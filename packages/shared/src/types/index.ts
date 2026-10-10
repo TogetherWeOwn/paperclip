@@ -7,6 +7,12 @@ export {
   type NativeRuntimeMode,
   type NativeRunTerminalState,
 } from "./native-finalization.js";
+export {
+  NATIVE_SIBLING_LIVENESS_SCHEMA,
+  type NativeSiblingLivenessResponse,
+  type NativeSiblingLivenessResponseV1,
+  type NativeSiblingLivenessVerdict,
+} from "./sibling-liveness.js";
 export type {
   ConnectionAvailabilityState,
   ConnectionSearchResultItem,
