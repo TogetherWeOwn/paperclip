@@ -57,6 +57,7 @@ const eventLabels = {
   ready_for_review: "Ready for review",
   mention: "Mention",
   comment: "Follow-up comment",
+  checks_green: "Required checks green",
 };
 function GitHubHelp({
   label,
@@ -378,7 +379,7 @@ export function GitHubPolicyEditor({
               className="grid gap-x-6 gap-y-3 sm:grid-cols-2"
               aria-label="Automatic events"
             >
-              {GITHUB_REVIEW_EVENTS.slice(0, 4).map((event) => (
+              {GITHUB_REVIEW_EVENTS.filter((event) => event !== "mention" && event !== "comment").map((event) => (
                 <Label
                   key={event}
                   className="flex cursor-pointer items-center gap-3 text-sm font-normal"

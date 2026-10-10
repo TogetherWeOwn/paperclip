@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { GITHUB_REVIEW_EVENTS } from "../types/chat-github.js";
+import {
+  DEFAULT_GITHUB_REVIEW_PROMPTS,
+  GITHUB_REVIEW_EVENTS,
+} from "../types/chat-github.js";
 
 export const githubIdSchema = z.string().regex(/^[1-9][0-9]{0,19}$/);
 export const githubCommitSchema = z
@@ -15,6 +18,11 @@ const prompts = z
     ready_for_review: z.string().max(12000),
     mention: z.string().max(12000),
     comment: z.string().max(12000),
+    // Defaulted so configurations saved before this event existed stay valid.
+    checks_green: z
+      .string()
+      .max(12000)
+      .default(DEFAULT_GITHUB_REVIEW_PROMPTS.checks_green),
   })
   .strict();
 export const githubReviewPolicySchema = z

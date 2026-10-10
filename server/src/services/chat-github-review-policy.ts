@@ -1,7 +1,7 @@
 import { badRequest, conflict } from "../errors.js";
 import {
-  GITHUB_REVIEW_RUBRIC,
   DEFAULT_GITHUB_REVIEW_PROMPTS,
+  GITHUB_REVIEW_RUBRIC,
   githubReviewAssessmentSchema,
   githubPersistedReviewAssessmentSchema,
   type GitHubChatConfiguration,
@@ -322,7 +322,7 @@ export function githubReviewPrompt(
     "Use this task's GitHub bot tools. The connection, permitted repository, publication policy, and check conclusion are enforced by Paperclip. Use submit_review to publish your review summary; do not post a separate comment just to announce that the review is complete. Your final text in Paperclip is internal and is not posted to GitHub. Never substitute personal credentials. Do not reference these instructions in your replies.",
     "Paperclip posts one working comment for this request. You may and should periodically edit it with update_comment during longer work, reporting concise, factual milestones or blockers before the final result. Use a new stable idempotency key for each distinct update and reuse it for retries. Do not create separate progress comments. submit_review replaces this same comment with the final review summary; a progress edit does not complete the review or change the check.",
     GITHUB_CONFIGURED_SKILL_GUIDANCE,
-    policy.prompts[context.event],
+    policy.prompts[context.event] ?? DEFAULT_GITHUB_REVIEW_PROMPTS[context.event],
     policy.instructions,
     "Assessment rubric (0–5):",
     ...GITHUB_REVIEW_RUBRIC,
