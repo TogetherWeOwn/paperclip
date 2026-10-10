@@ -30,7 +30,7 @@ vi.mock("../services/secrets.js", () => ({ secretService: () => vault }));
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)(
-  "github credential stage timing (TOG-19457)",
+  "github credential stage timing",
   () => {
     let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
     let db: ReturnType<typeof createDb>;
