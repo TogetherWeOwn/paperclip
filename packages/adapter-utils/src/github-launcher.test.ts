@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -51,7 +51,7 @@ describe("managed GitHub launchers", () => {
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
-    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
+    const result = await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Probe"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
@@ -114,7 +114,9 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     const address = server.address() as { port: number };
     const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
-    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    // Every operation must recapture here, so the per-run credential cache is off.
+    PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS: "0" };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
     await git("config", "user.name", "Repository Author");
@@ -153,4 +155,92 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+  async function brokerFixture(prefix: string) {
+    const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), repo = path.join(root, "repo"), upstream = path.join(root, "upstream");
+    for (const dir of [bin, repo, upstream]) await mkdir(dir, { recursive: true });
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(String(req.headers["x-paperclip-github-capability"]));
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "credential-secret-value", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const envFor = (capability: string, extra: Record<string, string> = {}) => ({
+      ...process.env,
+      ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: capability }),
+      PATH: `${bin}:${process.env.PATH}`, ...extra,
+    });
+    await exec("git", ["init", upstream]);
+    await exec("git", ["-C", upstream, "-c", "user.name=U", "-c", "user.email=u@example.test", "commit", "--allow-empty", "-m", "upstream"]);
+    await exec("git", ["init", repo]);
+    await exec("git", ["-C", repo, "remote", "add", "origin", upstream]);
+    const git = (env: NodeJS.ProcessEnv, ...args: string[]) => exec(path.join(bin, "git"), args, { cwd: repo, env });
+    return { bin, repo, requests, envFor, git };
+  }
+
+  it("captures credentials only for network, identity, and unknown Git commands", async () => {
+    const f = await brokerFixture("paperclip-github-network-only-");
+    const env = f.envFor("run-capability", { PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS: "0" });
+    for (const args of [
+      ["status", "--porcelain"], ["-c", "core.quotePath=false", "status"], ["-C", f.repo, "diff"], ["log", "--oneline", "-1", "--all"],
+      ["rev-parse", "--git-dir"], ["branch", "--list"], ["worktree", "list"], ["config", "user.name", "Local"], ["remote", "-v"],
+      ["remote", "get-url", "origin"], ["--no-pager", "show-ref"], ["--version"],
+    ]) await f.git(env, ...args).catch(() => undefined);
+    expect(f.requests).toEqual([]);
+    await f.git(env, "fetch", "origin");
+    expect(f.requests).toHaveLength(1);
+    await f.git(env, "-C", f.repo, "-c", "protocol.version=2", "ls-remote", "origin");
+    await f.git(env, "remote", "update");
+    await f.git(env, "commit", "--allow-empty", "-m", "managed identity");
+    expect(f.requests).toHaveLength(4);
+    expect((await f.git(env, "log", "-1", "--format=%an")).stdout.trim()).toBe("Managed");
+    expect(f.requests).toHaveLength(4);
+  }, 30_000);
+
+  it("captures credentials for local commands in a partial clone, which can fetch lazily", async () => {
+    const f = await brokerFixture("paperclip-github-partial-");
+    const env = f.envFor("run-capability", { PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS: "0" });
+    await exec("git", ["-C", f.repo, "config", "core.repositoryformatversion", "1"]);
+    await exec("git", ["-C", f.repo, "config", "extensions.partialClone", "origin"]);
+    await f.git(env, "status", "--porcelain");
+    expect(f.requests).toHaveLength(1);
+  }, 30_000);
+
+  it("reuses a sealed per-run credential capture until it expires", async () => {
+    const f = await brokerFixture("paperclip-github-cache-");
+    const env = f.envFor("run-capability");
+    await f.git(env, "fetch", "origin");
+    await f.git(env, "commit", "--allow-empty", "-m", "cached identity");
+    expect(f.requests).toEqual(["run-capability"]);
+    expect((await f.git(env, "log", "-1", "--format=%an")).stdout.trim()).toBe("Managed");
+    const cacheDirectory = path.join(f.bin, "credential-cache");
+    const [entry] = await readdir(cacheDirectory);
+    expect((await stat(cacheDirectory)).mode & 0o777).toBe(0o700);
+    expect((await stat(path.join(cacheDirectory, entry))).mode & 0o777).toBe(0o600);
+    const sealed = await readFile(path.join(cacheDirectory, entry), "utf8");
+    expect(sealed).not.toMatch(/credential-secret-value|Managed|run-capability/);
+    // Another capability cannot open this run's entry and captures its own.
+    await f.git(f.envFor("other-capability"), "fetch", "origin");
+    expect(f.requests).toEqual(["run-capability", "other-capability"]);
+    // A tampered entry is ignored rather than trusted.
+    const tampered = JSON.parse(sealed) as { tag: string };
+    const tag = Buffer.from(tampered.tag, "base64");
+    tag[0] ^= 1;
+    await writeFile(path.join(cacheDirectory, entry), JSON.stringify({ ...tampered, tag: tag.toString("base64") }));
+    await f.git(env, "fetch", "origin");
+    expect(f.requests).toHaveLength(3);
+    const shortLived = f.envFor("short-capability", { PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS: "1" });
+    await f.git(shortLived, "fetch", "origin");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await f.git(shortLived, "fetch", "origin");
+    expect(f.requests.filter(request => request === "short-capability")).toHaveLength(2);
+  }, 30_000);
 });
