@@ -281,6 +281,16 @@ vi.mock("../services/index.js", () => ({
   decisionService: vi.fn(() => ({
     sweepExpired: vi.fn(async () => ({ expired: 0 })),
   })),
+  createDecisionRetentionSweep: vi.fn((input: {
+    archiveIdleItems: () => Promise<number>;
+    deliverNotifications: () => Promise<unknown>;
+  }) => ({
+    run: vi.fn(async () => {
+      await input.archiveIdleItems();
+      await input.deliverNotifications();
+      return null;
+    }),
+  })),
   decisionRetentionService: vi.fn(() => ({
     autoArchive: vi.fn(async () => 0),
     deliverNotifications: vi.fn(async () => ({ notifiedAgents: 0, delivered: 0 })),

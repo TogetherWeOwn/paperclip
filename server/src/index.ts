@@ -70,6 +70,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
   decisionService,
+  createDecisionRetentionSweep,
   decisionRetentionService,
   externalObjectService,
   executionWorkspaceService,
@@ -1617,23 +1618,26 @@ async function startServerWithDatabaseTeardown(
     // restart, so a leaked sandbox does not stay allocated across the restart.
     await runEnvironmentLeaseCleanupSweep(0);
 
-    const runRetentionSweep = async () => {
-      const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
-      let archived = 0;
-      for (const company of activeCompanies) {
-        // Cursor pagination rebuilds the whole feed for every page; one
-        // unscoped all-items build keeps this sweep at a single feed build
-        // per company per tick.
-        const page = await attentionService(db as any).list(company.id, {
-          includeDismissed: true,
-          all: true,
-          allowUnscopedAll: true,
-        });
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
-      }
-      const notifications = await retentionExecutor.deliverNotifications();
-      return { archived, ...notifications };
-    };
+    const retentionSweep = createDecisionRetentionSweep({
+      archiveIdleItems: async () => {
+        const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+        let archived = 0;
+        for (const company of activeCompanies) {
+          // Cursor pagination rebuilds the whole feed for every page; one
+          // unscoped all-items build keeps this sweep at a single feed build
+          // per company per sweep.
+          const page = await attentionService(db as any).list(company.id, {
+            includeDismissed: true,
+            all: true,
+            allowUnscopedAll: true,
+          });
+          archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
+        }
+        return archived;
+      },
+      deliverNotifications: () => retentionExecutor.deliverNotifications(),
+    });
+    const runRetentionSweep = () => retentionSweep.run() ?? Promise.resolve(null);
     await runRetentionSweep();
 
     startHeartbeatSchedulerInterval(() => {
