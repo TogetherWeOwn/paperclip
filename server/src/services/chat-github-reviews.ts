@@ -31,10 +31,7 @@ import {
   type GitHubReviewPolicy,
 } from "@paperclipai/shared";
 import { HttpError, conflict, forbidden, notFound } from "../errors.js";
-import {
-  githubBotRepositoryToken,
-  githubBotRequest,
-} from "./chat-github-client.js";
+import { githubBotRepositoryRequest } from "./chat-github-client.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import {
   effectiveGitHubReviewPolicy,
@@ -307,21 +304,22 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     source: Awaited<ReturnType<typeof scope>>,
     requestFetch = fetchImpl,
   ) {
-    const token = await githubBotRepositoryToken(
-      db,
-      source.endpoint.companyId,
-      source.endpoint.id,
-      source.repositoryId,
-      requestFetch,
-    );
     const prefix = `/repos/${source.repository.split("/").map(encodeURIComponent).join("/")}`;
     return {
       prefix,
       request: <T>(
         path: string,
-        options?: Parameters<typeof githubBotRequest>[3],
+        options?: Parameters<typeof githubBotRepositoryRequest>[5],
       ) =>
-        githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options),
+        githubBotRepositoryRequest<T>(
+          db,
+          source.endpoint.companyId,
+          source.endpoint.id,
+          source.repositoryId,
+          `${prefix}${path}`,
+          options,
+          requestFetch,
+        ),
     };
   }
   async function reviewForHead(

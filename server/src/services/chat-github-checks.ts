@@ -17,10 +17,7 @@ import {
 } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
-import {
-  githubBotRepositoryToken,
-  githubBotRequest,
-} from "./chat-github-client.js";
+import { githubBotRepositoryRequest } from "./chat-github-client.js";
 
 /** Check status follows the ordinary chat delivery/task/run. This outbox never
  * schedules an agent. Assessments are published by the governed review tool. */
@@ -250,23 +247,19 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   : state === "running"
                     ? "Agent is reviewing this commit"
                     : "Waiting for the assigned agent";
-          const token = await githubBotRepositoryToken(
-            db,
-            action.companyId,
-            action.endpointId,
-            event.repositoryId,
-            lease.fetch,
-          );
           const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
           const request = <T>(
             path: string,
-            options?: Parameters<typeof githubBotRequest>[3],
+            options?: Parameters<typeof githubBotRepositoryRequest>[5],
           ) =>
-            githubBotRequest<T>(
-              lease.fetch,
-              token,
+            githubBotRepositoryRequest<T>(
+              db,
+              action.companyId,
+              action.endpointId,
+              event.repositoryId,
               `${prefix}${path}`,
               options,
+              lease.fetch,
             );
           const current = await request<{ head: { sha: string } }>(
             `/pulls/${event.pullNumber}`,
