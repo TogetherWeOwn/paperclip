@@ -2,12 +2,16 @@ import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
 } from "./chat-github-publication-lease.js";
-import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import {
+  projectSafeChatPublicationText,
+  scrubInternalReferences,
+} from "./chat-publication-projection.js";
 import {
   githubPullPermalink,
   renderInlineFinding,
   renderReviewSummary,
 } from "./chat-github-review-template.js";
+import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
@@ -1030,6 +1034,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           throw forbidden("Invalid GitHub publication binding");
         try {
           const source = await scope(session, true);
+          const egressScope = await githubEgressReferenceScope(
+            db,
+            source.endpoint.companyId,
+            null,
+          );
+          const publicReviewText = (text: string) =>
+            scrubInternalReferences(
+              projectSafeChatPublicationText(text),
+              egressScope,
+            );
           if (
             source.endpoint.id !== action.endpointId ||
             source.conversation.id !== action.conversationId ||
@@ -1095,7 +1109,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           const operation = action.payload.operation;
           let receipt: Record<string, unknown>;
           if (operation === "comment") {
-            const body = `${projectSafeChatPublicationText(String(action.payload.body))}\n\n${publicationMarker}`;
+            const body = `${publicReviewText(String(action.payload.body))}\n\n${publicationMarker}`;
             const route = source.replyId
               ? `/pulls/${source.number}/comments`
               : `/issues/${source.number}/comments`;
@@ -1135,7 +1149,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                   body: {
                     commit_id: parsed.reviewedCommit,
                     event: parsed.event,
-                    body: `${projectSafeChatPublicationText(parsed.body)}\n\n${publicationMarker}`,
+                    body: `${publicReviewText(parsed.body)}\n\n${publicationMarker}`,
                   },
                 },
               ));
@@ -1180,13 +1194,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             );
             // Internal Task/Run/history links are omitted; check runs use the
             // public PR permalink as their Details URL.
-            const summary = projectSafeChatPublicationText(
+            const summary = publicReviewText(
               renderReviewSummary({
                 assessment,
                 repository: source.repository,
                 pullNumber: source.number,
                 headSha: review.headSha,
                 baseSha: evidenceBase,
+                scope: egressScope,
               }),
             );
             const summaryMarker = marker(
@@ -1256,7 +1271,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                     {
                       method: "POST",
                       body: {
-                        body: `${projectSafeChatPublicationText(
+                        body: `${publicReviewText(
                           renderInlineFinding({
                             finding,
                             score: assessment.score,
@@ -1264,6 +1279,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                             repository: source.repository,
                             headSha: review.headSha,
                             baseSha: evidenceBase,
+                            scope: egressScope,
                           }),
                         )}\n\n${findingMarker}`,
                         commit_id: review.headSha,
