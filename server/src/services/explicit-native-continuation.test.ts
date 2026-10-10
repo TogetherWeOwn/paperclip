@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   approvals, issueApprovals, issueThreadInteractions,
@@ -18,6 +18,7 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
@@ -374,6 +375,265 @@ const support = await getEmbeddedPostgresTestSupport();
       agentId: f.agentId, status: "queued", contextSnapshot: { issueId: f.issueId, previousRunId: result.previousRunId, forceFreshSession: true } });
     return result;
   });
+
+  async function seedNeverStartedLegacy(recoveryCount = 1, cancel: { reason?: string; eventMessage?: string; eventPayload?: Record<string, unknown> } = {}) {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null,
+      status: "queued", processPid: null, finishedAt: null }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    // Exercise the real cancel-before-launch writer, including its lifecycle event.
+    await heartbeatService(db).cancelRun(f.sourceRunId, cancel.reason, { eventMessage: cancel.eventMessage, eventPayload: cancel.eventPayload });
+    // Historical cancellations predate server-owned conversation adapter evidence.
+    await db.update(heartbeatRuns).set({ resultJson: null, finishedAt: new Date("2026-09-11T10:00:00Z") })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [action] = await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId)).returning();
+    for (let index = 1; index < recoveryCount; index++) await db.insert(issueRecoveryActions).values({
+      companyId: f.companyId, sourceIssueId: f.issueId, kind: action.kind, cause: action.cause,
+      fingerprint: `${f.sourceRunId}:${index}`, status: action.status, outcome: action.outcome,
+      nextAction: action.nextAction, evidence: action.evidence,
+    });
+    return f;
+  }
+
+  it("admits a historical legacy cancellation before launch once without a native stop receipt", async () => {
+    const f = await seedNeverStartedLegacy();
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, lastOutputSeq: 0 });
+    expect(await hasNativeLocalProcessStop(db, f.companyId, f.sourceRunId)).toBe(false);
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await admit(f)).toBeNull();
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(after).toEqual(before);
+  });
+
+  it("admits a never-started legacy hold after the real settler records its replay block", async () => {
+    const f = await seedNeverStartedLegacy();
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, returnOwnerAgentId: f.agentId,
+      evidence: { runId: f.sourceRunId } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await settleUnrecoverableExecutions(db);
+    const events = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+    expect(events.map(event => event.payload)).toContainEqual(expect.objectContaining({
+      automaticRecovery: "preserve_without_replay_v1", replay: "blocked",
+    }));
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("admits a never-started legacy run cancelled with a caller-supplied cancellation note", async () => {
+    const f = await seedNeverStartedLegacy(1, { reason: "Stopped from the bound Slack agent session",
+      eventMessage: "run cancelled from Slack", eventPayload: { endpointId: randomUUID() } });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
+  it.each([
+    "run cancelled before issue reassignment", "run cancelled before issue terminalization",
+    "run interrupted by board comment", "source run cancelled for isolated external-chat answer continuation",
+  ])("admits a never-started legacy run cancelled with the server note %s", async eventMessage => {
+    const f = await seedNeverStartedLegacy(1, { eventMessage });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
+  it("does not treat a cancellation note that carries a launch status as cancelled before launch", async () => {
+    const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled", eventPayload: { status: "running" } });
+    expect(await admit(f)).toBeNull();
+  });
+
+  it.each(["done", "cancelled"])("admits a never-started legacy run cancelled for issue terminalization with the writer's %s status echo", async status => {
+    // routes/issues.ts echoes the closed issue's status beside the cancel note.
+    const f = await seedNeverStartedLegacy(1, { eventMessage: "run cancelled before issue terminalization",
+      eventPayload: { issueId: randomUUID(), status } });
+    const events = await db.select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.sourceRunId));
+    expect(events).toContainEqual({ message: "run cancelled before issue terminalization",
+      payload: expect.objectContaining({ status }) });
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+  });
+
+  it("redelivers a deferred never-started message on the periodic resume scan", async () => {
+    const f = await seedNeverStartedLegacy();
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [f.commentId] },
+        executionWait: { reason: "process_identity_missing", message: "Waiting for execution recovery. Your message is saved." } },
+      updatedAt: new Date(0) });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) })
+        .where(eq(agentWakeupRequests.id, queueId));
+      await heartbeatService(db).resumeExecutionWaitComments();
+    }
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    expect(receipt.status).toBe("coalesced");
+    // The agent slot is free (the source run is cancelled), so ordinary admission
+    // dispatches the successor immediately instead of leaving it queued. The
+    // second scan must not deliver twice: exactly one successor run exists.
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      ne(heartbeatRuns.id, f.sourceRunId)));
+    expect(successors).toHaveLength(1);
+    expect(successors[0].contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.sourceRunId,
+      explicitUserContinuation: { commentId: f.commentId } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("retains a never-started hold while its local environment lease is pending cleanup", async () => {
+    const f = await seedNeverStartedLegacy();
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, heartbeatRunId: f.sourceRunId,
+      provider: "local", status: "pending_cleanup", leasePolicy: "ephemeral", releasedAt: new Date(), cleanupStatus: null });
+    try {
+      expect(await admit(f)).toBeNull();
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    }
+  });
+
+  it.each([{ recoveryCount: 1 }, { recoveryCount: 5 }])(
+    "delivers one new user turn after cancel-before-launch with $recoveryCount resolved holds", async ({ recoveryCount }) => {
+      const f = await seedNeverStartedLegacy(recoveryCount);
+      const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, processGroupId: null,
+        logRef: null, runnerInstanceId: null, nativeSessionId: null, lastOutputSeq: 0 });
+      const originalActions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(originalActions).toHaveLength(recoveryCount);
+      for (const action of originalActions) expect(action).toMatchObject({ status: "resolved",
+        cause: "legacy_execution_requires_reconciliation", evidence: {
+          runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" },
+        } });
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      const heartbeat = heartbeatService(db);
+      const wake = () => heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+        reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+        payload: { issueId: f.issueId, commentId: f.commentId },
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+      const first = await wake();
+      expect(first).toMatchObject({ status: "queued", contextSnapshot: {
+        forceFreshSession: true, previousRunId: f.sourceRunId,
+        explicitUserContinuation: { commentId: f.commentId },
+      } });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      const settled = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(settled.map(action => action.id).sort()).toEqual(originalActions.map(action => action.id).sort());
+      for (const action of settled) expect(action.evidence).toMatchObject({ runId: f.sourceRunId,
+        automaticRecovery: { replay: "explicit_user_continuation", actionOutcome: "unknown" },
+        explicitUserContinuation: { runId: first!.id, previousRunId: f.sourceRunId, commentId: f.commentId },
+      });
+      await wake();
+      const successors = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+      expect(successors).toHaveLength(1);
+      const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      expect(after).toEqual(before);
+    });
+
+  it("delivers one reviewer-CHANGES turn after never-started waiting_on_review park", async () => {
+    const f = await seedNeverStartedLegacy(1);
+    await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
+      error: "Continuation parked: issue is waiting on review/approval" })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(before).toMatchObject({ status: "cancelled", startedAt: null, processPid: null, processGroupId: null,
+      logRef: null, runnerInstanceId: null, nativeSessionId: null, lastOutputSeq: 0,
+      errorCode: "issue_continuation_waiting_on_review" });
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(hold).toMatchObject({ status: "resolved", cause: "legacy_execution_requires_reconciliation",
+      evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const heartbeat = heartbeatService(db);
+    const wake = () => heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const first = await wake();
+    expect(first).toMatchObject({ status: "queued", contextSnapshot: {
+      forceFreshSession: true, previousRunId: f.sourceRunId,
+      explicitUserContinuation: { commentId: f.commentId },
+    } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(settled.evidence).toMatchObject({ runId: f.sourceRunId,
+      automaticRecovery: { replay: "explicit_user_continuation", actionOutcome: "unknown" },
+      explicitUserContinuation: { runId: first!.id, previousRunId: f.sourceRunId, commentId: f.commentId },
+    });
+    await wake();
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(successors).toHaveLength(1);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    expect(after).toEqual(before);
+  });
+
+  it("an active pause hold still defers the never-started waiting_on_review turn", async () => {
+    const f = await seedNeverStartedLegacy(1);
+    await db.update(heartbeatRuns).set({ errorCode: "issue_continuation_waiting_on_review",
+      error: "Continuation parked: issue is waiting on review/approval" })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const holdId = randomUUID();
+    await db.insert(issueTreeHolds).values({ id: holdId, companyId: f.companyId, rootIssueId: f.issueId, mode: "pause", status: "active" });
+    await db.insert(issueTreeHoldMembers).values({ companyId: f.companyId, holdId, issueId: f.issueId, depth: 0, issueTitle: "Deploy", issueStatus: "in_progress" });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [f.commentId] } },
+    });
+    await heartbeatService(db).wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+  });
+
+  it("five repeated holds do not waive another source's missing stop evidence", async () => {
+    const f = await seedNeverStartedLegacy(5), otherId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: otherId, companyId: f.companyId, agentId: f.agentId,
+      runtimeMode: "legacy", status: "failed", contextSnapshot: { issueId: f.issueId },
+      startedAt: new Date("2026-09-11T09:00:00Z"), finishedAt: new Date("2026-09-11T10:00:00Z") });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: otherId,
+      status: "resolved", outcome: "blocked", nextAction: "Verify the independent provider stopped.",
+      evidence: { runId: otherId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    const before = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)).orderBy(issueRecoveryActions.id);
+    expect(before).toHaveLength(6);
+    expect(await admit(f)).toBeNull();
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)).orderBy(issueRecoveryActions.id);
+    expect(after).toEqual(before);
+  });
+
+  it.each(["start", "process_time", "output", "log", "controller", "stage", "session", "launch", "provider", "running_event", "unknown_event", "null_lifecycle", "cleanup", "remote"])(
+    "retains the never-started hold with contradictory evidence (%s)", async evidence => {
+      const f = await seedNeverStartedLegacy();
+      const metadata: Record<string, Partial<typeof heartbeatRuns.$inferInsert>> = {
+        start: { startedAt: new Date() }, process_time: { processStartedAt: new Date() },
+        output: { lastOutputSeq: 1 }, log: { logRef: "retained.log" },
+        controller: { controllerBootId: randomUUID() }, stage: { executionStage: "preparing" },
+        session: { sessionIdAfter: "provider-session" },
+      };
+      if (metadata[evidence]) await db.update(heartbeatRuns).set(metadata[evidence])
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+      if (["launch", "provider", "running_event", "unknown_event", "null_lifecycle"].includes(evidence)) {
+        await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.sourceRunId, agentId: f.agentId,
+          eventType: evidence === "launch" ? PROCESS_START_REQUESTED : evidence === "provider" ? "provider.event" : "lifecycle",
+          stream: "system", payload: evidence === "running_event" ? { status: "running" } : undefined,
+          message: evidence === "unknown_event" ? "preparing provider" : undefined });
+      }
+      if (evidence === "cleanup" || evidence === "remote") await db.insert(environmentLeases).values({
+        companyId: f.companyId, heartbeatRunId: f.sourceRunId, provider: evidence === "remote" ? "daytona" : "local",
+        status: "pending_cleanup", leasePolicy: "ephemeral", releasedAt: new Date(), cleanupStatus: "failed",
+      });
+      expect(await admit(f)).toBeNull();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId));
+    });
 
   it.each(["verified", "unproven", "changed", "dry_run", "retry", "duplicate"])(
     "requires exact local cleanup for a new turn after worker loss (%s)", async mode => {
