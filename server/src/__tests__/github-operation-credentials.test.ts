@@ -861,6 +861,9 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(a.status).toBe(200);
       expect(a.body.login).toBe("A");
       expect(a.headers["cache-control"]).toBe("no-store");
+      // A run-bound capability lets the launcher reuse its capture briefly.
+      expect(a.body.cacheTtlMs).toBeGreaterThan(0);
+      expect(a.body.cacheTtlMs).toBeLessThanOrEqual(10 * 60 * 1000);
       for (const [header, value] of [
         ["Origin", "http://127.0.0.1"],
         ["Cookie", "session=test"],

@@ -480,3 +480,52 @@ export function decisionRetentionService(
     deliverNotifications,
   };
 }
+
+// Idle-TTL archival works on a scale of days, so a full attention-feed build
+// per company every scheduler tick buys nothing and, on large companies, takes
+// longer than the tick itself.
+export const DECISION_RETENTION_FEED_SWEEP_INTERVAL_MS = 5 * 60_000;
+
+export type DecisionRetentionSweepResult = {
+  feedSwept: boolean;
+  archived: number;
+  notifiedAgents: number;
+  delivered: number;
+};
+
+/**
+ * Single-flight driver for the scheduler's retention sweep. A tick that lands
+ * while a sweep is still running is skipped instead of starting an overlapping
+ * one. The feed build and idle-TTL archive run at most once per interval;
+ * outbox delivery runs on every sweep so accepted archive proposals still
+ * notify promptly.
+ */
+export function createDecisionRetentionSweep(input: {
+  archiveIdleItems: () => Promise<number>;
+  deliverNotifications: () => Promise<{ notifiedAgents: number; delivered: number }>;
+  feedSweepIntervalMs?: number;
+  now?: () => number;
+}) {
+  const feedSweepIntervalMs = input.feedSweepIntervalMs ?? DECISION_RETENTION_FEED_SWEEP_INTERVAL_MS;
+  const now = input.now ?? Date.now;
+  let running: Promise<DecisionRetentionSweepResult> | null = null;
+  let lastFeedSweepStartedAt: number | null = null;
+
+  function run(): Promise<DecisionRetentionSweepResult> | null {
+    if (running) return null;
+    const startedAt = now();
+    const feedDue = lastFeedSweepStartedAt === null || startedAt - lastFeedSweepStartedAt >= feedSweepIntervalMs;
+    if (feedDue) lastFeedSweepStartedAt = startedAt;
+    const current = (async () => {
+      const archived = feedDue ? await input.archiveIdleItems() : 0;
+      const notifications = await input.deliverNotifications();
+      return { feedSwept: feedDue, archived, ...notifications };
+    })().finally(() => {
+      if (running === current) running = null;
+    });
+    running = current;
+    return current;
+  }
+
+  return { run };
+}

@@ -39,6 +39,8 @@ function resultContent(value: unknown) {
 export { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../services/connection-tool-definitions.js";
 import { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../services/connection-tool-definitions.js";
 
+const GITHUB_CREDENTIAL_CACHE_MAX_TTL_MS = 10 * 60 * 1000;
+
 /** Public, token-authenticated routes mounted before the general actor middleware. */
 export function runtimeConnectionIntentRoutes(db: Db) {
   const router = Router();
@@ -52,9 +54,14 @@ export function runtimeConnectionIntentRoutes(db: Db) {
       ? req.headers["x-paperclip-github-capability"] : bearer(req), "github_credentials");
     if (!claims) throw unauthorized("Invalid GitHub runtime capability");
     res.setHeader("Cache-Control", "no-store");
-    res.json(await resolveGitHubOperationCredentials(db, {
+    const credentials = await resolveGitHubOperationCredentials(db, {
       companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
-    }));
+    });
+    // This capability names exactly one run, so the launcher may reuse the
+    // capture for operations under the same capability, never past its expiry.
+    // Session-lifetime brokers that rebind runs must not send this field.
+    const cacheTtlMs = Math.max(0, Math.min(GITHUB_CREDENTIAL_CACHE_MAX_TTL_MS, claims.exp * 1000 - Date.now() - 60_000));
+    res.json({ ...credentials, cacheTtlMs });
   });
 
   router.get("/mcp/runtime-tools", async (req, res) => {

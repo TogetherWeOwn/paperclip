@@ -149,7 +149,14 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                 eq(chatGitHubReviews.headSha, event.headSha),
               ),
             )
-            .orderBy(desc(chatGitHubReviews.createdAt))
+            // A duplicate delivery or mention can add a newer row for the same
+            // head. Once any row for this head holds an assessment, that
+            // assessment owns the check; reading the newest row instead would
+            // overwrite a completed score with "incomplete".
+            .orderBy(
+              sql`${chatGitHubReviews.assessment} is null`,
+              desc(chatGitHubReviews.createdAt),
+            )
             .limit(1);
           if (review?.assessment) {
             // The assessment outbox owns the terminal score and its retries.
@@ -422,18 +429,26 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
         and(
           inArray(chatGitHubReviews.state, ["queued", "running"]),
           isNull(chatGitHubReviews.assessment),
+          // Resolve the review's own delivery by primary key first, then probe
+          // for its cancellation receipt. Joining every cancelled check action
+          // per review row and comparing delivery ids as text scans both tables.
           sql`exists (
-        select 1 from ${chatActions} action
-        join ${chatDeliveries} delivery
-          on delivery.id::text = ${chatGitHubReviews.deliveryId}
-        where action.company_id = ${chatGitHubReviews.companyId}
-          and action.endpoint_id = ${chatGitHubReviews.endpointId}
-          and delivery.endpoint_id = action.endpoint_id
-          and action.kind = 'github_review_check'
-          and action.status = 'cancelled'
-          and action.result->>'code' = 'stale_head'
-          and action.payload->'event'->>'deliveryId' =
-            delivery.normalized_event->'githubAutomatic'->'context'->>'deliveryId'
+        select 1 from ${chatDeliveries} delivery
+        where delivery.id = case
+            when ${chatGitHubReviews.deliveryId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              then ${chatGitHubReviews.deliveryId}::uuid
+          end
+          and delivery.endpoint_id = ${chatGitHubReviews.endpointId}
+          and exists (
+            select 1 from ${chatActions} action
+            where action.company_id = ${chatGitHubReviews.companyId}
+              and action.endpoint_id = delivery.endpoint_id
+              and action.kind = 'github_review_check'
+              and action.status = 'cancelled'
+              and action.result->>'code' = 'stale_head'
+              and action.payload->'event'->>'deliveryId' =
+                delivery.normalized_event->'githubAutomatic'->'context'->>'deliveryId'
+          )
       )`,
         ),
       );
