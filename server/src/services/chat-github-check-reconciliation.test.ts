@@ -78,6 +78,28 @@ describe("GitHub review check reconciliation", () => {
     expect(requests).toBe(1);
   });
 
+  it("fails closed when the pagination limit is exhausted", async () => {
+    let requests = 0;
+    await expect(
+      findGitHubReviewChecks(
+        async () => {
+          requests += 1;
+          return {
+            check_runs: Array.from({ length: 100 }, (_, index) =>
+              checkRun(index + 1, `unrelated:${index}`, 42),
+            ),
+          };
+        },
+        "c".repeat(40),
+        "endpoint:pull:head",
+        "42",
+      ),
+    ).rejects.toThrow(
+      "GitHub review check history exceeded the pagination limit",
+    );
+    expect(requests).toBe(100);
+  });
+
   it("caches verified URLs by app and external id with a bounded LRU", () => {
     const url = "https://github.com/owner/repo/pull/1";
     rememberGitHubCheckUrl("known", "42", url);
