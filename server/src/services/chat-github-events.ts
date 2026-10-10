@@ -223,9 +223,21 @@ export function githubPullThreadKey(threadId: string): string | null {
 }
 
 /**
+ * Every non-terminal card is reusable: a blocked or in-review card is still
+ * the PR's one card, and a new event must land on it rather than beside it.
+ */
+export const GITHUB_PULL_REUSABLE_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const;
+
+/**
  * One live card per repo:PR. When a PR-level thread has no bound conversation
  * (e.g. an earlier card was opened under a differently-cased thread id),
- * reuse the newest active conversation whose issue is still open instead of
+ * reuse the newest active conversation whose issue is not done or cancelled instead of
  * spawning a duplicate card. Returns null when no open card exists.
  */
 export async function reuseOpenGitHubPullConversation(
@@ -253,7 +265,7 @@ export async function reuseOpenGitHubPullConversation(
         eq(chatConversations.endpointId, input.endpointId),
         sql`lower(${chatConversations.externalThreadId}) = ${key}`,
         inArray(chatConversations.state, ["active", "waiting"]),
-        inArray(issues.status, ["todo", "in_progress"]),
+        inArray(issues.status, [...GITHUB_PULL_REUSABLE_ISSUE_STATUSES]),
       ),
     )
     .orderBy(desc(chatConversations.createdAt))
