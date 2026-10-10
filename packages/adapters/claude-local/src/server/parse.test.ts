@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { appendWithCap, MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
@@ -144,6 +145,245 @@ describe("detectClaudeLoginRequired", () => {
         stderr: "",
       }).requiresLogin,
     ).toBe(false);
+  });
+});
+
+const ECHOED_HARNESS_INSTRUCTION =
+  "For that case, explicitly address their exact Paperclip user ID, including any prefix. The server rejects unknown or unauthorized recipients. Do not guess IDs or infer authority from a title.";
+
+const SUCCESSFUL_RESULT = {
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  result: "Done.",
+  terminal_reason: "completed",
+  stop_reason: "end_turn",
+};
+
+function streamEvent(event: Record<string, unknown>): string {
+  return JSON.stringify(event);
+}
+
+describe("detectClaudeLoginRequired login prompt scope", () => {
+  it("does not classify an echoed harness instruction in a user event on a successful run", () => {
+    const stdout = [
+      streamEvent({ type: "system", subtype: "init", session_id: "session-1" }),
+      streamEvent({ type: "user", message: { content: [{ type: "text", text: ECHOED_HARNESS_INSTRUCTION }] } }),
+      streamEvent({ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } }),
+      streamEvent(SUCCESSFUL_RESULT),
+    ].join("\n");
+    expect(
+      detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("does not classify ordinary assistant prose that repeats a login phrase", () => {
+    const stdout = [
+      streamEvent({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Recipients that are unauthorized are rejected." }] },
+      }),
+      streamEvent(SUCCESSFUL_RESULT),
+    ].join("\n");
+    expect(
+      detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("does not classify a tool result that repeats a login phrase", () => {
+    const stdout = [
+      streamEvent({
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tool-1", content: "GET /recipients returned 403 unauthorized" }],
+        },
+      }),
+      streamEvent(SUCCESSFUL_RESULT),
+    ].join("\n");
+    expect(
+      detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("does not classify a successful result whose answer repeats a login prompt", () => {
+    const parsed = { ...SUCCESSFUL_RESULT, result: "Please run /login to switch accounts." };
+    expect(
+      detectClaudeLoginRequired({ parsed, stdout: streamEvent(parsed), stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("keeps a transient failure with an echoed harness instruction on the transient lane", () => {
+    const parsed = {
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      result: "API Error: 503 service unavailable",
+    };
+    const input = {
+      parsed,
+      stdout: [
+        streamEvent({ type: "user", message: { content: [{ type: "text", text: ECHOED_HARNESS_INSTRUCTION }] } }),
+        streamEvent(parsed),
+      ].join("\n"),
+      stderr: "",
+    };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(true);
+  });
+
+  it("classifies the plain-text login prompt printed on stdout", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "Invalid API key · Please run /login",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies the structured not-logged-in stream as login required", () => {
+    // Captured from the Claude CLI run with no credentials: an init event, an
+    // assistant message flagged authentication_failed, then a failed result.
+    const failedResult = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    };
+    const stdout = [
+      streamEvent({ type: "system", subtype: "init", session_id: "session-1" }),
+      streamEvent({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+        error: "authentication_failed",
+      }),
+      streamEvent(failedResult),
+    ].join("\n");
+    expect(
+      detectClaudeLoginRequired({ parsed: failedResult, stdout, stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies an authentication_failed assistant message when no terminal result arrived", () => {
+    const stdout = streamEvent({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+      error: "authentication_failed",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("classifies a failed result whose text carries the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { is_error: true, result: "Not logged in · Please run /login" },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies an error-typed stream event that carries the login prompt", () => {
+    const stdout = streamEvent({
+      type: "error",
+      error: { type: "authentication_error", message: "Invalid API key · Please run /login" },
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("classifies a failed result line on stdout when no parsed result is passed", () => {
+    const stdout = streamEvent({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("does not take the login URL from an echoed user event", () => {
+    const stdout = [
+      streamEvent({
+        type: "user",
+        message: { content: [{ type: "text", text: "Open https://claude.ai/login to switch accounts." }] },
+      }),
+      streamEvent(SUCCESSFUL_RESULT),
+    ].join("\n");
+    expect(detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" })).toEqual({
+      requiresLogin: false,
+      loginUrl: null,
+    });
+  });
+
+  it("takes the login URL from an authentication_failed message", () => {
+    const stdout = streamEvent({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Not logged in · Please run /login: https://claude.ai/login" }] },
+      error: "authentication_failed",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" })).toEqual({
+      requiresLogin: true,
+      loginUrl: "https://claude.ai/login",
+    });
+  });
+
+  it("does not classify a success result whose error field is set and whose answer repeats a login phrase", () => {
+    const parsed = { ...SUCCESSFUL_RESULT, error: "none", result: "Recipients that are unauthorized are rejected." };
+    expect(detectClaudeLoginRequired({ parsed, stdout: streamEvent(parsed), stderr: "" }).requiresLogin).toBe(false);
+  });
+
+  it("classifies a login prompt that spans lines inside one authentication_failed message", () => {
+    const stdout = streamEvent({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Invalid API key\n\nRun `claude login` to continue." }] },
+      error: "authentication_failed",
+    });
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("does not classify a login phrase in the cut first line of a full capture", () => {
+    const toolResult = `${"x".repeat(MAX_CAPTURE_BYTES)} unauthorized https://docs.example.com/unauthorized`;
+    const stdout = appendWithCap(
+      "",
+      [
+        streamEvent({ type: "system", subtype: "init", session_id: "session-1" }),
+        streamEvent({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: toolResult }] },
+        }),
+        streamEvent(SUCCESSFUL_RESULT),
+      ].join("\n"),
+    );
+    expect(detectClaudeLoginRequired({ parsed: SUCCESSFUL_RESULT, stdout, stderr: "" })).toEqual({
+      requiresLogin: false,
+      loginUrl: null,
+    });
+  });
+
+  it("still classifies a structured auth failure that follows a cut first line", () => {
+    const bigToolResult = "x".repeat(MAX_CAPTURE_BYTES);
+    const failedResult = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    };
+    const stdout = appendWithCap(
+      "",
+      [
+        streamEvent({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: bigToolResult }] },
+        }),
+        streamEvent({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+          error: "authentication_failed",
+        }),
+        streamEvent(failedResult),
+      ].join("\n"),
+    );
+    expect(detectClaudeLoginRequired({ parsed: failedResult, stdout, stderr: "" }).requiresLogin).toBe(true);
   });
 });
 
