@@ -8693,6 +8693,130 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   }, 60_000);
 
+  describe("GitHub webhook lease-free probe guards", () => {
+    // The lease-free path accepts a callback only when its repository row is
+    // already current. The provider webhook hook observes the database after
+    // ingress preflight and before native adapter processing, so these tests
+    // see exactly what the preflight did (or skipped).
+    async function probeFixture(input: {
+      fullName: string;
+      id: number;
+      availability: "available" | "removed";
+      conversationState: "active" | "unavailable";
+    }) {
+      const fixture = await seedCompany();
+      const context = await configuredGitHubEndpoint(fixture);
+      const { endpoint, runtime, service, webhookSecret } = context;
+      const repository = {
+        id: input.id,
+        full_name: input.fullName,
+        html_url: `https://github.com/${input.fullName}`,
+        owner: { id: 1357, login: input.fullName.split("/")[0] },
+        private: false,
+      };
+      context.setRepositories([repository]);
+      const [resource] = await db
+        .insert(chatEndpointResources)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          type: "repository",
+          providerResourceId: input.fullName.toLowerCase(),
+          parentProviderResourceId: "1357",
+          label: input.fullName,
+          providerUrl: repository.html_url,
+          availability: input.availability,
+          enabled: true,
+          metadata: {
+            providerRepositoryId: String(input.id),
+            fullName: input.fullName,
+            owner: repository.owner.login,
+            private: false,
+            source: "provider_webhook",
+          },
+        })
+        .returning();
+      const [issue] = await db
+        .insert(issues)
+        .values({ companyId: fixture.companyId, title: "Probe guard task", status: "todo" })
+        .returning();
+      const [conversation] = await db
+        .insert(chatConversations)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          resourceId: resource!.id,
+          issueId: issue!.id,
+          externalConversationId: input.fullName.toLowerCase(),
+          externalThreadId: `github:${input.fullName.toLowerCase()}:9`,
+          externalLabel: `${input.fullName}#9`,
+          state: input.conversationState,
+        })
+        .returning();
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected GitHub provider runtime");
+      let observed: { availability: string; conversationState: string } | null = null;
+      providerRuntime.webhookHook = async () => {
+        if (observed) return;
+        const [row] = await db
+          .select({ availability: chatEndpointResources.availability })
+          .from(chatEndpointResources)
+          .where(eq(chatEndpointResources.id, resource!.id));
+        const [thread] = await db
+          .select({ state: chatConversations.state })
+          .from(chatConversations)
+          .where(eq(chatConversations.id, conversation!.id));
+        observed = { availability: row!.availability, conversationState: thread!.state };
+      };
+      const send = (delivery: string, event: string, payload: Record<string, unknown>) =>
+        service.handleWebhook(
+          endpoint.publicId,
+          "github",
+          signedGitHubWebhookRequest({
+            delivery,
+            event,
+            payload: { installation: { id: 2468 }, repository, sender: { id: 42, login: "octocat" }, ...payload },
+            webhookSecret,
+          }),
+        );
+      return { send, observedAfterPreflight: () => observed };
+    }
+
+    it("takes the leased upsert path for a repository marked removed", async () => {
+      // What reconcileProviderResourceRows leaves behind when inventory drops a
+      // repository; its conversations are not quarantined here, so only the
+      // availability guard can route this callback to the leased upsert.
+      const probe = await probeFixture({
+        fullName: "paperclipai/probe-removed",
+        id: 97701,
+        availability: "removed",
+        conversationState: "active",
+      });
+      await probe.send("probe-guard-removed", "installation_repositories", {
+        action: "added",
+      });
+      await expect.poll(() => probe.observedAfterPreflight(), { timeout: 10_000 })
+        .toEqual({ availability: "available", conversationState: "active" });
+    }, 60_000);
+
+    it("does not take the lease-free path while a conversation is quarantined", async () => {
+      // The repository row itself is current; only its conversation is quarantined.
+      const probe = await probeFixture({
+        fullName: "paperclipai/probe-quarantined",
+        id: 97702,
+        availability: "available",
+        conversationState: "unavailable",
+      });
+      await probe.send("probe-guard-quarantined", "issue_comment", {
+        action: "created",
+        issue: { number: 9 },
+        comment: { id: 7201, body: "probe guard callback" },
+      });
+      await expect.poll(() => probe.observedAfterPreflight(), { timeout: 10_000 })
+        .toEqual({ availability: "available", conversationState: "active" });
+    }, 60_000);
+  });
+
   it("acknowledges GitHub lifecycle callbacks without changing a paused endpoint", async () => {
     const fixture = await seedCompany();
     const { endpoint, service } = await configuredGitHubEndpoint(fixture);
