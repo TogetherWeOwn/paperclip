@@ -424,6 +424,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
       evidence: expect.objectContaining({
         routingPolicy: "board_escalation_no_takeover_v1",
+        // TOG-20700: canonical failed-run pointer for the chat recovery gate.
+        runId: latestRun.id,
+        latestRunId: latestRun.id,
+        sourceRunId: null,
       }),
     });
 

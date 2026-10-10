@@ -2292,6 +2292,90 @@ describe("agent issue mutation checkout ownership", () => {
       },
     );
 
+    it("retries legacy stranded evidence that stores only latestRunId (TOG-20700)", async () => {
+      // Producer/consumer mismatch: stranded actions created before the
+      // canonical evidence.runId stored the failed run as latestRunId with
+      // sourceRunId null. The route must resolve that single-source fallback
+      // server-side and let prepareFailedChatRunRetry prove chat provenance.
+      const { db } = setupChatRecovery({
+        evidence: { latestRunId: ownerRunId, sourceRunId: null },
+      });
+      const res = await request(
+        await createApp(boardActor(), db, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+      )
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(retryRequest);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(
+        mockChatRunRetries.prepareFailedChatRunRetry,
+      ).toHaveBeenCalledExactlyOnceWith(db, {
+        companyId,
+        issueId,
+        agentId: ownerAgentId,
+        failedRunId: ownerRunId,
+        initiatedByUserId: "board-user",
+      });
+    });
+
+    it("prefers canonical evidence.runId over legacy latestRunId (TOG-20700)", async () => {
+      const { db } = setupChatRecovery({
+        evidence: {
+          runId: ownerRunId,
+          latestRunId: peerAgentId,
+          sourceRunId: peerAgentId,
+        },
+      });
+      const res = await request(
+        await createApp(boardActor(), db, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+      )
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(retryRequest);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(
+        mockChatRunRetries.prepareFailedChatRunRetry,
+      ).toHaveBeenCalledExactlyOnceWith(db, {
+        companyId,
+        issueId,
+        agentId: ownerAgentId,
+        failedRunId: ownerRunId,
+        initiatedByUserId: "board-user",
+      });
+    });
+
+    it.each([
+      { latestRunId: ownerRunId, sourceRunId: peerAgentId },
+      { latestRunId: "not-a-run-id", sourceRunId: null },
+      { latestRunId: null, sourceRunId: null },
+    ])(
+      "rejects ambiguous or invalid legacy recovery evidence without staging: %j",
+      async (evidence) => {
+        const { db } = setupChatRecovery({ evidence });
+        const res = await request(
+          await createApp(boardActor(), db, {
+            chatRunRetries: mockChatRunRetries,
+          }),
+        )
+          .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+          .send(retryRequest);
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.details?.code).toBe(
+          "chat_recovery_requires_authorized_context",
+        );
+        expect(
+          mockChatRunRetries.prepareFailedChatRunRetry,
+        ).not.toHaveBeenCalled();
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(
+          mockIssueRecoveryActionService.resolveActiveForIssue,
+        ).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      },
+    );
+
     it.each([
       { failedRunId: peerAgentId },
       {

@@ -2450,6 +2450,11 @@ export function recoveryService(
       sourceIdentifier: input.issue.identifier,
       previousStatus: input.previousStatus,
       latestIssueStatus: input.issue.status,
+      // Canonical failed-run pointer for the chat recovery gate
+      // (issues.ts resolves evidence.runId). Kept alongside latestRunId for
+      // read-model compatibility; prepareFailedChatRunRetry still proves exact
+      // chat provenance server-side before any mutation.
+      runId: input.latestRun?.id ?? null,
       latestRunId: input.latestRun?.id ?? null,
       latestRunStatus: input.latestRun?.status ?? null,
       latestRunErrorCode: input.latestRun?.errorCode ?? null,
