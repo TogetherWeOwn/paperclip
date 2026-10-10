@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -12,7 +12,9 @@ import {
   authUsers,
   agentWakeupRequests,
   activityLog,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   environmentLeases,
   environments,
@@ -148,6 +150,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(workspaceOperations);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
@@ -582,6 +586,289 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recoveryIssues).toHaveLength(0);
     expect(updatedIssue?.assigneeAgentId).toBe(coderId);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // A stale tick holding a pre-completion snapshot must not reopen an
+  // explicitly completed source or mint a new active recovery from the same
+  // stale failed run. Models the observed recurrence where a delayed
+  // reconcile_stranded_assigned_issue reblocked a done source after an
+  // owner_completed resolution, referencing the same failed run twice.
+  async function seedStaleFailedRunAfterExplicitCompletion() {
+    const { companyId, coderId, sourceIssueId, sourceIssue } = await seedCompany();
+    const failedRunId = randomUUID();
+    const runCreatedAt = new Date("2026-09-01T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      startedAt: runCreatedAt,
+      finishedAt: new Date("2026-09-01T12:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const staleRun = {
+      id: failedRunId,
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId: sourceIssueId, retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      startedAt: runCreatedAt,
+      createdAt: runCreatedAt,
+    } as const;
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+
+    // Explicit owner completion, mirroring POST
+    // /issues/:id/recovery-actions/resolve with outcome=restored and
+    // sourceIssueStatus=done (recorded as owner_completed).
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+    const resolved = await recoveryActionSvc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      actionId: active!.id,
+      status: "resolved",
+      outcome: "owner_completed",
+      resolutionNote: "Operator confirmed the source issue is complete.",
+    });
+    expect(resolved).toMatchObject({ status: "resolved", outcome: "owner_completed" });
+
+    return { companyId, coderId, sourceIssueId, staleIssue: sourceIssue, staleRun, recovery, recoveryActionSvc, enqueueWakeup, firstActionId: active!.id };
+  }
+
+  it("does not reblock an explicitly completed source from a stale snapshot", async () => {
+    const { companyId, sourceIssueId, staleIssue, staleRun, recovery, recoveryActionSvc, enqueueWakeup, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    const delayed = await recovery.escalateStrandedAssignedIssue({
+      issue: staleIssue,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(delayed).toBeNull();
+    const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(current).toMatchObject({ status: "done" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ id: firstActionId, status: "resolved", outcome: "owner_completed" });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("leaves an explicitly completed source alone during delayed reconciliation", async () => {
+    const { companyId, sourceIssueId, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(current).toMatchObject({ status: "done" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ id: firstActionId, status: "resolved", outcome: "owner_completed" });
+  });
+
+  it("does not treat a pre-completion failed run as new evidence after an explicit reopen", async () => {
+    const { companyId, sourceIssueId, staleRun, recovery, recoveryActionSvc } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const delayed = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(delayed).toBeNull();
+    const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(current).toMatchObject({ status: "in_progress" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("still recovers a genuinely new failure after an explicit reopen", async () => {
+    const { companyId, coderId, sourceIssueId, staleRun, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    const newRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: newRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "adapter failed again",
+      errorCode: "adapter_failed",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const newRun = { ...staleRun, id: newRunId, error: "adapter failed again", startedAt: new Date(), createdAt: new Date() };
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: newRun,
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
+  // A consumed failed run must not suppress an escalation driven by live
+  // source state. Reopen after owner_completed with a paused assignee: the
+  // sweep's "assignee not invokable" branch must still reach the board even
+  // though the latestRun pointer still names the adjudicated run.
+  it("still escalates a reopened source whose assignee is no longer invokable", async () => {
+    const { companyId, coderId, sourceIssueId, staleRun, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
+  // A consumed failed run must not suppress a budget-driven escalation for an
+  // invokable assignee. The assignee stays idle (invokable) but its lifetime
+  // budget hard-stop is exceeded, so the board must still see the reopened
+  // source even though the latestRun pointer names the adjudicated run.
+  // Guards the budget leg of the consumed-run bypass independently of the
+  // invokable leg above.
+  it("still escalates a reopened source whose assignee is over budget but invokable", async () => {
+    const { companyId, coderId, sourceIssueId, staleRun, recovery, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssueId));
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: coderId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId: coderId,
+      provider: "openai",
+      model: "test-model",
+      costCents: 125,
+      occurredAt: new Date(),
+    });
+    const [reopened] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: reopened!,
+      previousStatus: "in_progress",
+      latestRun: staleRun,
+    });
+
+    expect(updated).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
+  });
+
+  // For an in_review issue with a pending execution stage the sweep escalates
+  // the review participant, not the source assignee. A consumed failed run
+  // must not suppress that lane when the participant is over budget: reopen
+  // after owner_completed to in_review (manager participant, coder return
+  // assignee), pause the manager for budget, and run the sweep. Base
+  // escalates to blocked; the assignee-only bypass skipped with no action.
+  it("still escalates a reopened in_review source whose review participant is over budget", async () => {
+    const { companyId, coderId, sourceIssueId, recoveryActionSvc, firstActionId } =
+      await seedStaleFailedRunAfterExplicitCompletion();
+    // The seed helper models a two-agent company (manager + coder); the
+    // reviewer is the agent that is not the source assignee.
+    const [manager] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), ne(agents.id, coderId)))
+      .limit(1);
+    const managerId = manager!.id;
+
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, managerId));
+    const sweep = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+
+    const result = await sweep.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(current).toMatchObject({ status: "blocked" });
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).not.toBeNull();
+    expect(active!.id).not.toBe(firstActionId);
   });
 
   // Model the production payload: `requestedRef` keeps the operator spelling,
