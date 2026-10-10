@@ -155,7 +155,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
-  async function brokerFixture(prefix: string) {
+  async function brokerFixture(prefix: string, cacheTtlMs?: number) {
     const root = await mkdtemp(path.join(os.tmpdir(), prefix));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed"), repo = path.join(root, "repo"), upstream = path.join(root, "upstream");
@@ -165,7 +165,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     const server = createServer((req, res) => {
       requests.push(String(req.headers["x-paperclip-github-capability"]));
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ status: "available", env: {
+      res.end(JSON.stringify({ status: "available", ...(cacheTtlMs === undefined ? {} : { cacheTtlMs }), env: {
         GH_TOKEN: "credential-secret-value", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
         GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
       } }));
@@ -215,7 +215,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
   }, 30_000);
 
   it("reuses a sealed per-run credential capture until it expires", async () => {
-    const f = await brokerFixture("paperclip-github-cache-");
+    const f = await brokerFixture("paperclip-github-cache-", 10 * 60 * 1000);
     const env = f.envFor("run-capability");
     await f.git(env, "fetch", "origin");
     await f.git(env, "commit", "--allow-empty", "-m", "cached identity");
@@ -242,5 +242,15 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     await new Promise(resolve => setTimeout(resolve, 20));
     await f.git(shortLived, "fetch", "origin");
     expect(f.requests.filter(request => request === "short-capability")).toHaveLength(2);
+  }, 30_000);
+
+  it("never caches a capture the broker did not offer for reuse", async () => {
+    // A session broker rebinds one capability to successive runs, so it omits cacheTtlMs.
+    const f = await brokerFixture("paperclip-github-session-");
+    const env = f.envFor("session-capability");
+    await f.git(env, "fetch", "origin");
+    await f.git(env, "fetch", "origin");
+    expect(f.requests).toEqual(["session-capability", "session-capability"]);
+    await expect(readdir(path.join(f.bin, "credential-cache"))).rejects.toThrow();
   }, 30_000);
 });

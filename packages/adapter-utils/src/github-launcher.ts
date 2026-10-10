@@ -1,5 +1,6 @@
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No plaintext secrets in files:
- * the optional credential cache is sealed with a key derived from the run's broker capability. */
+ * the optional credential cache is sealed with a key derived from the run's broker capability, and is used
+ * only when the broker opts in with cacheTtlMs (a run-bound capability, not a session that rebinds runs). */
 export function githubLauncherSource(): string {
   return String.raw`#!/usr/bin/env node
 const fs = require('node:fs');
@@ -58,9 +59,9 @@ const CACHE_MAX_TTL_MS = 10 * 60 * 1000;
 const CACHE_NEGATIVE_TTL_MS = 60 * 1000;
 function credentialCache(env, url, capability, bridgeToken) {
   const requested = Number(env.PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS);
-  const ttl = Number.isFinite(requested) && env.PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS !== ''
+  const ceiling = Number.isFinite(requested) && env.PAPERCLIP_GITHUB_CREDENTIAL_CACHE_TTL_MS !== ''
     ? Math.max(0, Math.min(CACHE_MAX_TTL_MS, requested)) : CACHE_MAX_TTL_MS;
-  if (ttl === 0) return null;
+  if (ceiling === 0) return null;
   // Only a holder of this run's broker capability can open the entry, and that
   // holder could call the broker directly, so the sealed file grants nothing new.
   const key = crypto.createHash('sha256').update(['paperclip-github-credential-cache-v1', url, capability, bridgeToken].join('\0')).digest();
@@ -77,6 +78,11 @@ function credentialCache(env, url, capability, bridgeToken) {
       } catch { return null; }
     },
     write(result) {
+      // The broker decides whether its capture may be reused: a capability bound
+      // to one run opts in; a session broker that rebinds runs does not.
+      const offered = typeof result.cacheTtlMs === 'number' && Number.isFinite(result.cacheTtlMs) ? result.cacheTtlMs : 0;
+      const ttl = Math.max(0, Math.min(ceiling, offered));
+      if (ttl === 0) return;
       try {
         const lifetime = result.status === 'available' ? ttl : Math.min(ttl, CACHE_NEGATIVE_TTL_MS);
         const iv = crypto.randomBytes(12);
