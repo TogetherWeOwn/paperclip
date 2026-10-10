@@ -1555,6 +1555,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/chat-endpoints/{endpointId}/conversations",
   "GET /api/chat-endpoints/{endpointId}/activity",
   "POST /api/chat-endpoints/{endpointId}/deliveries/{deliveryId}/replay",
+  "POST /api/chat-endpoints/{endpointId}/github/review-on-green",
   "POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/replay",
   "POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve",
   "POST /api/chat-endpoints/{endpointId}/actions/{actionId}/resolve",
@@ -2651,6 +2652,57 @@ registry.registerPath({
   },
   responses: {
     204: r.noContent,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/chat-endpoints/{endpointId}/github/review-on-green",
+  tags: ["chat-channels"],
+  summary: "Request a GitHub review once required checks are green",
+  description:
+    "Requests one automatic review for an open, non-draft pull request head whose required checks all finished green. The server reads the pull request and checks with the endpoint's App token and applies the same author-based admission as a pull_request webhook; the configuration must enable the `checks_green` event. Idempotent per head.",
+  request: {
+    params: z.object({ endpointId: z.string().uuid() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+            pullNumber: z.number().int().positive(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description:
+        "Outcome: requested, pending, red, draft, closed, already_reviewed, or not_admitted.",
+      content: {
+        "application/json": {
+          schema: z.object({
+            status: z.enum([
+              "requested",
+              "pending",
+              "red",
+              "draft",
+              "closed",
+              "already_reviewed",
+              "not_admitted",
+            ]),
+            headSha: z.string().optional(),
+            reason: z.string().optional(),
+          }),
+        },
+      },
+    },
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,

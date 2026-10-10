@@ -458,6 +458,7 @@ describe("openapi routes", () => {
         "post",
         "/api/chat-endpoints/{endpointId}/deliveries/{deliveryId}/replay",
       ],
+      ["post", "/api/chat-endpoints/{endpointId}/github/review-on-green"],
       [
         "post",
         "/api/chat-endpoints/{endpointId}/publications/{publicationId}/replay",
