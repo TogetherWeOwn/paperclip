@@ -4,6 +4,8 @@ import {
   projectSafeChatPublication,
   projectSafeChatPublicationText,
   sanitizeExternalChatUrl,
+  scrubExternalChatCard,
+  scrubInternalReferences,
 } from "./chat-publication-projection.js";
 
 describe("chat publication projection", () => {
@@ -218,5 +220,242 @@ describe("chat publication projection", () => {
     expect(() => projectSafeChatPublicationText("a".repeat(1_000_001))).toThrow(
       UnsafeChatPublicationError,
     );
+  });
+});
+
+describe("scrubInternalReferences", () => {
+  const scope = {
+    internalOrigins: ["https://board.example.invalid"],
+    trackerPrefixes: ["ACME"],
+  };
+
+  it("keeps the label of a markdown link to an internal origin", () => {
+    expect(
+      scrubInternalReferences(
+        "Review [the change](https://board.example.invalid/issues/abc?token=1#top) now.",
+        scope,
+      ),
+    ).toBe("Review the change now.");
+  });
+
+  it("keeps the label when the internal target is wrapped in angle brackets", () => {
+    expect(
+      scrubInternalReferences("[docs](<https://board.example.invalid/x>)", scope),
+    ).toBe("docs");
+  });
+
+  it("replaces autolinks and bare internal URLs and keeps trailing punctuation", () => {
+    expect(
+      scrubInternalReferences(
+        "See <https://board.example.invalid/x> and HTTPS://BOARD.example.invalid:8443/y, then stop.",
+        scope,
+      ),
+    ).toBe(
+      "See [internal link removed] and [internal link removed], then stop.",
+    );
+  });
+
+  it("treats a trailing-dot hostname as the same internal host", () => {
+    expect(
+      scrubInternalReferences("Open https://board.example.invalid./x", scope),
+    ).toBe("Open [internal link removed]");
+  });
+
+  it("accepts an internal origin configured without a scheme", () => {
+    expect(
+      scrubInternalReferences("Open https://board.example.invalid/x now.", {
+        internalOrigins: ["board.example.invalid"],
+        trackerPrefixes: [],
+      }),
+    ).toBe("Open [internal link removed] now.");
+  });
+
+  it("scans a long trailing punctuation run in linear time", () => {
+    const text = `https://board.example.invalid/x${"!".repeat(200_000)}x`;
+    expect(scrubInternalReferences(text, scope)).toBe(
+      "[internal link removed]",
+    );
+  });
+
+  it("rescans link labels for internal URLs and tracker ids", () => {
+    expect(
+      scrubInternalReferences(
+        "[ACME-123](https://example.com/status) [https://board.example.invalid/x](https://board.example.invalid/x)",
+        scope,
+      ),
+    ).toBe(
+      "[[internal reference]](https://example.com/status) [internal link removed]",
+    );
+  });
+
+  it("removes uppercase tracker ids of the company's own prefix only", () => {
+    expect(scrubInternalReferences("Fixed ACME-123 and acme-7.", scope)).toBe(
+      "Fixed [internal reference] and acme-7.",
+    );
+  });
+
+  it("removes schemeless internal hosts with their paths and markdown targets", () => {
+    expect(
+      scrubInternalReferences(
+        "See board.example.invalid/ACME/issues/abc. Also [board](board.example.invalid/x). Open BOARD.EXAMPLE.INVALID/y.",
+        scope,
+      ),
+    ).toBe(
+      "See [internal link removed]. Also board. Open [internal link removed].",
+    );
+  });
+
+  it("removes a schemeless internal host with its query or fragment", () => {
+    expect(
+      scrubInternalReferences(
+        "Open board.example.invalid?issue=abc#top now.",
+        scope,
+      ),
+    ).toBe("Open [internal link removed] now.");
+  });
+
+  it("leaves subdomains and look-alike hosts of an internal origin unchanged", () => {
+    const text =
+      "sub.board.example.invalid and board.example.invalid.test and board.example.invalidx";
+    expect(scrubInternalReferences(text, scope)).toBe(text);
+  });
+
+  it("leaves loopback addresses in ordinary technical text unchanged", () => {
+    const text =
+      "Postgres listens on 127.0.0.1:5432, `curl localhost:3000/health`, and [::1]:3100 is IPv6 loopback.";
+    expect(
+      scrubInternalReferences(text, {
+        internalOrigins: [
+          "http://127.0.0.1:3100",
+          "http://localhost:3000",
+          "http://[::1]:3100",
+        ],
+        trackerPrefixes: [],
+      }),
+    ).toBe(text);
+  });
+
+  it("keeps an internal host that is a path segment of an external link", () => {
+    const text =
+      "See https://github.com/o/r/blob/main/board.example.invalid/x.md and [the file](https://github.com/o/r/blob/main/board.example.invalid/x.md).";
+    expect(scrubInternalReferences(text, scope)).toBe(text);
+  });
+
+  it("removes an internal host after a word and slash when no URL scheme precedes it", () => {
+    expect(
+      scrubInternalReferences(
+        "see docs/board.example.invalid/ACME/issues/42, ops/board.example.invalid and /data/board.example.invalid/logs",
+        scope,
+      ),
+    ).toBe(
+      "see docs/[internal link removed], ops/[internal link removed] and /data/[internal link removed]",
+    );
+  });
+
+  it("removes an internal host after a scheme-less URL token but keeps it after a schemed one", () => {
+    expect(
+      scrubInternalReferences(
+        "a.example.com/board.example.invalid and (https://example.com/p/board.example.invalid/x)",
+        scope,
+      ),
+    ).toBe(
+      "a.example.com/[internal link removed] and (https://example.com/p/board.example.invalid/x)",
+    );
+  });
+
+  it("removes an internal host written after a leading or space-separated slash", () => {
+    expect(
+      scrubInternalReferences("see /board.example.invalid/x and /board.example.invalid", scope),
+    ).toBe("see /[internal link removed] and /[internal link removed]");
+  });
+
+  it("still removes internal hosts after an email sign, an ssh remote, or a protocol-relative slash", () => {
+    expect(
+      scrubInternalReferences(
+        "Mail ops@board.example.invalid, clone git@board.example.invalid:o/r.git, or open //board.example.invalid/x",
+        scope,
+      ),
+    ).toBe(
+      "Mail ops@[internal link removed], clone git@[internal link removed]:o/r.git, or open //[internal link removed]",
+    );
+  });
+
+  it("matches the company prefix case-sensitively", () => {
+    expect(
+      scrubInternalReferences("utf-8 UTF-8", {
+        internalOrigins: [],
+        trackerPrefixes: ["UTF"],
+      }),
+    ).toBe("utf-8 [internal reference]");
+  });
+
+  it("leaves other identifiers, lookalike hosts, and embedded prefixes untouched", () => {
+    const text = [
+      "SHA-256 CVE-2026-1234 UTF-8 XACME-123",
+      "https://board.example.invalid.evil.example/x",
+      "https://evilboard.example.invalid/x",
+      "https://other.example.invalid/x",
+    ].join(" ");
+    expect(scrubInternalReferences(text, scope)).toBe(text);
+  });
+
+  it("escapes prefix characters and never treats an empty prefix as a wildcard", () => {
+    expect(
+      scrubInternalReferences("A.B-1 AxB-1 step-2", {
+        internalOrigins: [],
+        trackerPrefixes: ["A.B", ""],
+      }),
+    ).toBe("[internal reference] AxB-1 step-2");
+  });
+
+  it("is a no-op without internal origins or tracker prefixes", () => {
+    const text = "ACME-123 at https://board.example.invalid/x";
+    expect(
+      scrubInternalReferences(text, {
+        internalOrigins: [],
+        trackerPrefixes: [],
+      }),
+    ).toBe(text);
+  });
+});
+
+describe("scrubExternalChatCard", () => {
+  it("scrubs title and body and drops link actions to internal origins", () => {
+    expect(
+      scrubExternalChatCard(
+        {
+          schema: "paperclip.chat.card.v1",
+          kind: "question",
+          title: "ACME-123 needs input",
+          body: "Open https://board.example.invalid/issues/1 to respond.",
+          actions: [
+            {
+              type: "link",
+              label: "Open ACME-123",
+              url: "https://board.example.invalid/issues/1",
+            },
+            { type: "link", label: "Docs", url: "https://example.com/docs" },
+            { type: "callback", actionId: "approve", label: "Approve ACME-5" },
+          ],
+        },
+        {
+          internalOrigins: ["https://board.example.invalid"],
+          trackerPrefixes: ["ACME"],
+        },
+      ),
+    ).toEqual({
+      schema: "paperclip.chat.card.v1",
+      kind: "question",
+      title: "[internal reference] needs input",
+      body: "Open [internal link removed] to respond.",
+      actions: [
+        { type: "link", label: "Docs", url: "https://example.com/docs" },
+        {
+          type: "callback",
+          actionId: "approve",
+          label: "Approve [internal reference]",
+        },
+      ],
+    });
   });
 });

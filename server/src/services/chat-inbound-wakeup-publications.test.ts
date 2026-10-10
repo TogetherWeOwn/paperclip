@@ -80,13 +80,16 @@ describe("durable inbound queue notice", () => {
       runId: null,
     });
     expect(resolveInboundWakeReceipt(action, null, receipt)).toBeNull();
-    expect(inboundWakePublicationText("queued")).toBe(
+    expect(inboundWakePublicationText("queued", "slack")).toBe(
       "Your follow-up is queued.",
     );
-    expect(inboundWakePublicationText("not_started")).toBe(
+    expect(inboundWakePublicationText("not_started", "slack")).toBe(
       "This follow-up was not started. Open the task in Paperclip for details.",
     );
-    expect(inboundWakePublicationText("removed")).toBe(
+    expect(inboundWakePublicationText("not_started", "github")).toBe(
+      "This follow-up was not started.",
+    );
+    expect(inboundWakePublicationText("removed", "github")).toBe(
       "This queued message was removed.",
     );
   });
