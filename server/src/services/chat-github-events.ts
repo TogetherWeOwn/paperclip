@@ -225,8 +225,8 @@ export function githubPullThreadKey(threadId: string): string | null {
 /**
  * One live card per repo:PR. When a PR-level thread has no bound conversation
  * (e.g. an earlier card was opened under a differently-cased thread id),
- * reuse the newest conversation whose issue is still open instead of spawning
- * a duplicate card. Returns null when no open card exists.
+ * reuse the newest active conversation whose issue is still open instead of
+ * spawning a duplicate card. Returns null when no open card exists.
  */
 export async function reuseOpenGitHubPullConversation(
   database: DbOrTransaction,
@@ -252,6 +252,7 @@ export async function reuseOpenGitHubPullConversation(
         eq(chatConversations.companyId, input.companyId),
         eq(chatConversations.endpointId, input.endpointId),
         sql`lower(${chatConversations.externalThreadId}) = ${key}`,
+        inArray(chatConversations.state, ["active", "waiting"]),
         inArray(issues.status, ["todo", "in_progress"]),
       ),
     )
