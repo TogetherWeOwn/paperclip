@@ -4569,11 +4569,17 @@ it.each(["held-ack", "rejected-attach"] as const)(
   30_000,
 );
 
-// Quarantined: the lost-ack case lets the redelivered run.attached commit race
-// command completion on the reconnected runner, so the rotation snapshot
-// intermittently misses the event (TypeError reading logicalEffectCount) and
-// fails CI on unrelated PRs. Re-enable this case after the commit/result
-// ordering is root-caused and made deterministic; held-ack and
+// Quarantined: the lost-ack case flakes in CI on unrelated PRs (TypeError
+// reading logicalEffectCount — the rotation snapshot misses the redelivered
+// run.attached event). The mechanism looks like a test-observation race, not
+// a product durability bug: the runner withholds the warm-attach result until
+// the old outbox is ACKed, and the controller commits each event before it
+// ACKs, so the redelivered event cannot lose a commit race with command
+// completion. Instead the new authority can activate and reset core state
+// before attachRun's 10 ms command poll observes the completed attach, and
+// the rotation spy then snapshots an empty log. Re-enable after the rotation
+// snapshot is gated on the confirmed handoff (or taken while the old run
+// state is still in place); held-ack shares the same window. Held-ack and
 // rejected-attach keep running above.
 it.skip(
   "preserves old warm-attach authority and event ownership across lost-ack",
