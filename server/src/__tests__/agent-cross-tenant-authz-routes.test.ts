@@ -508,7 +508,7 @@ describe("agent cross-tenant route authorization", () => {
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "agent_config:update",
       resource: { type: "agent", companyId, agentId },
-      scope: { requiresChangeGrant: true },
+      scope: { requiresChangeGrant: true, targetAgentId: agentId },
     }));
     expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
   });
