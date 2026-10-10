@@ -1,4 +1,4 @@
-import { and, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { chatDeliveries, chatGitHubReviews, type Db } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
@@ -66,7 +66,6 @@ export type GitHubGreenRequestOutcome =
         | "red"
         | "already_reviewed"
         | "already_requested"
-        | "retries_exhausted"
         | "not_admitted";
       headSha?: string;
       reason?: string;
@@ -108,6 +107,7 @@ export async function githubGreenReviewContext(input: {
     input.endpointId,
     input.repositoryId,
     input.fetchImpl,
+    "read",
   );
   const prefix = `/repos/${input.repository.split("/").map(encodeURIComponent).join("/")}`;
   const get = <T>(path: string) =>
@@ -124,7 +124,13 @@ export async function githubGreenReviewContext(input: {
     headSha,
   });
   if (attempt.kind !== "ready")
-    return { ready: false, outcome: { status: attempt.kind, headSha } };
+    return {
+      ready: false,
+      outcome: {
+        status: attempt.kind === "retries_exhausted" ? "already_reviewed" : attempt.kind,
+        headSha,
+      },
+    };
   const rules = await get<
     Array<{
       type: string;
@@ -255,7 +261,8 @@ const DEAD_DELIVERY = new Set(["failed", "filtered"]);
 /**
  * A queued review that never started is dead once its head moves or the pull
  * request closes; mark it superseded so queues and checks reflect real work.
- * Started, assessed, or terminal reviews are never touched.
+ * Synchronize matches only the payload's previous head, so a late event cannot
+ * supersede a newer head. Started, assessed, or terminal reviews are never touched.
  */
 export async function supersedeQueuedGitHubReviews(
   db: Db,
@@ -265,7 +272,7 @@ export async function supersedeQueuedGitHubReviews(
     repositoryId: string;
     pullNumber: number;
     /** null when the pull request closed: every queued review is stale. */
-    currentHeadSha: string | null;
+    beforeHeadSha: string | null;
   },
 ): Promise<number> {
   const rows = await db
@@ -280,8 +287,8 @@ export async function supersedeQueuedGitHubReviews(
         eq(chatGitHubReviews.state, "queued"),
         isNull(chatGitHubReviews.assessment),
         isNull(chatGitHubReviews.runId),
-        ...(input.currentHeadSha
-          ? [ne(chatGitHubReviews.headSha, input.currentHeadSha.toLowerCase())]
+        ...(input.beforeHeadSha !== null
+          ? [eq(chatGitHubReviews.headSha, input.beforeHeadSha.toLowerCase())]
           : []),
       ),
     )
@@ -293,10 +300,11 @@ export async function supersedeQueuedGitHubReviews(
 export function githubHeadTransition(payload: unknown): {
   repositoryId: string;
   pullNumber: number;
-  currentHeadSha: string | null;
+  beforeHeadSha: string | null;
 } | null {
   const data = payload as {
     action?: unknown;
+    before?: unknown;
     repository?: { id?: unknown };
     pull_request?: { number?: unknown; head?: { sha?: unknown } };
   } | null;
@@ -314,11 +322,18 @@ export function githubHeadTransition(payload: unknown): {
   )
     return null;
   if (action === "closed")
-    return { repositoryId: String(repositoryId), pullNumber, currentHeadSha: null };
-  if (typeof head !== "string" || !/^[a-f0-9]{40}$/i.test(head)) return null;
+    return { repositoryId: String(repositoryId), pullNumber, beforeHeadSha: null };
+  const before = data?.before;
+  if (
+    typeof head !== "string" ||
+    !/^[a-f0-9]{40}$/i.test(head) ||
+    typeof before !== "string" ||
+    !/^[a-f0-9]{40}$/i.test(before)
+  )
+    return null;
   return {
     repositoryId: String(repositoryId),
     pullNumber,
-    currentHeadSha: head.toLowerCase(),
+    beforeHeadSha: before.toLowerCase(),
   };
 }

@@ -2683,7 +2683,7 @@ registry.registerPath({
   responses: {
     200: {
       description:
-        "Outcome: requested, pending, red, draft, closed, already_reviewed, already_requested (a request for this head and attempt is in flight), retries_exhausted (three failed attempts), or not_admitted.",
+        "Outcome: requested, pending, red, draft, closed, already_reviewed (a live/completed review or three spent automatic attempts), already_requested (a request for this head and attempt is in flight), or not_admitted.",
       content: {
         "application/json": {
           schema: z.object({
@@ -2695,7 +2695,6 @@ registry.registerPath({
               "closed",
               "already_reviewed",
               "already_requested",
-              "retries_exhausted",
               "not_admitted",
             ]),
             headSha: z.string().optional(),

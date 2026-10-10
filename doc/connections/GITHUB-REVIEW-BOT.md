@@ -115,6 +115,26 @@ where supported. Paperclip does not change repository rules. GitHub account and
 repository plan restrictions may limit required-check enforcement. If automatic
 execution is disallowed, a gated head requests an authorized manual review.
 
+## Review requests after green checks
+
+The `POST /api/chat-endpoints/:endpointId/github/review-on-green` endpoint checks
+GitHub's current PR, branch rules, and check runs before it requests a review.
+It uses a single-repository installation token with only `metadata`,
+`pull_requests`, and `checks` read permissions. Review and check publishers
+keep their separate write-capable tokens.
+
+Each head has at most three automatic attempts: the first review and two retries.
+An incomplete or failed attempt spends one slot. Repeated requests do not reset
+this limit. A live or completed review, or an exhausted attempt budget, returns
+`already_reviewed`. A delivery still in flight returns `already_requested`.
+A new head has its own attempt budget.
+
+A `pull_request.synchronize` event supersedes only never-started queued reviews
+for its `before` SHA. A late event for an older head cannot supersede the current
+head. Missing or malformed `before` values do not supersede reviews. A closed PR
+supersedes all its never-started queued reviews. Started, assessed, and terminal
+reviews remain unchanged.
+
 ## Hosted ingress
 
 Cloud proxies only `POST /api/chat-webhooks/:publicId/github` and the narrow
