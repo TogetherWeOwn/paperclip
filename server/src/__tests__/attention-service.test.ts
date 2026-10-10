@@ -1027,6 +1027,67 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 
+  it("matches newer runs by agent and issue key, including the taskId fallback and issue-less runs", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATK");
+    const taskFallbackIssueId = await insertIssue({ companyId, identifier: "ATK-1", title: "Task id only", status: "in_progress" });
+    const otherAgentIssueId = await insertIssue({ companyId, identifier: "ATK-2", title: "Other agent retried", status: "in_progress" });
+    const olderOnlyIssueId = await insertIssue({ companyId, identifier: "ATK-3", title: "Only older runs", status: "in_progress" });
+    const at = (minute: number) => new Date(Date.UTC(2026, 6, 9, 12, minute));
+    const failed = {
+      taskFallback: randomUUID(),
+      otherAgent: randomUUID(),
+      olderOnly: randomUUID(),
+      issueLessSuperseded: randomUUID(),
+      issueLessOpen: randomUUID(),
+    };
+    const run = (input: {
+      id?: string;
+      agentId: string;
+      status: string;
+      contextSnapshot: Record<string, unknown>;
+      minute: number;
+    }) => ({
+      id: input.id ?? randomUUID(),
+      companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      status: input.status,
+      error: input.status === "failed" ? "adapter failed" : null,
+      contextSnapshot: input.contextSnapshot,
+      createdAt: at(input.minute),
+      updatedAt: at(input.minute),
+      finishedAt: at(input.minute),
+    });
+
+    await db.insert(heartbeatRuns).values([
+      run({ id: failed.taskFallback, agentId: workerId, status: "failed", contextSnapshot: { issueId: taskFallbackIssueId }, minute: 0 }),
+      run({ agentId: workerId, status: "succeeded", contextSnapshot: { taskId: taskFallbackIssueId }, minute: 1 }),
+      run({ id: failed.otherAgent, agentId: workerId, status: "failed", contextSnapshot: { issueId: otherAgentIssueId }, minute: 0 }),
+      run({ agentId: reviewerId, status: "succeeded", contextSnapshot: { issueId: otherAgentIssueId }, minute: 1 }),
+      run({ agentId: workerId, status: "succeeded", contextSnapshot: { issueId: olderOnlyIssueId }, minute: 0 }),
+      run({ id: failed.olderOnly, agentId: workerId, status: "timed_out", contextSnapshot: { issueId: olderOnlyIssueId }, minute: 1 }),
+      run({ id: failed.issueLessSuperseded, agentId: reviewerId, status: "failed", contextSnapshot: {}, minute: 2 }),
+      run({ agentId: reviewerId, status: "succeeded", contextSnapshot: { issueId: "" }, minute: 3 }),
+      run({ id: failed.issueLessOpen, agentId: workerId, status: "failed", contextSnapshot: {}, minute: 4 }),
+      run({ agentId: workerId, status: "succeeded", contextSnapshot: { issueId: taskFallbackIssueId }, minute: 5 }),
+    ]);
+    await db.insert(heartbeatRunEvents).values(Object.values(failed).map((runId) => ({
+      companyId,
+      runId,
+      agentId: runId === failed.issueLessSuperseded ? reviewerId : workerId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+      createdAt: at(10),
+    })));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(
+      feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort(),
+    ).toEqual([failed.otherAgent, failed.olderOnly, failed.issueLessOpen].sort());
+  });
+
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
     const { companyId, workerId } = await seedCompany("ATE");
     const projectId = randomUUID();
