@@ -47,6 +47,7 @@ import {
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { withDeadlockRetry } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -1184,28 +1185,42 @@ export function secretService(db: Db | DbTransaction) {
     errorCode?: string | null;
   }) {
     if (!input.context) return;
-    await db.insert(secretAccessEvents).values({
-      companyId: input.companyId,
-      secretId: input.secretId,
-      userSecretDefinitionId: input.userSecretDefinitionId ?? null,
-      secretScope: input.secretScope ?? "company",
-      version: input.version,
-      provider: input.provider,
-      responsibleUserId: input.context.responsibleUserId ?? null,
-      credentialOwnerUserId: input.credentialOwnerUserId ?? null,
-      credentialSubjectType: input.credentialSubjectType ?? null,
-      credentialSubjectId: input.credentialSubjectId ?? null,
-      actorType: input.context.actorType ?? "system",
-      actorId: input.context.actorId ?? null,
-      consumerType: input.context.consumerType,
-      consumerId: input.context.consumerId,
-      configPath: input.context.configPath ?? null,
-      issueId: input.context.issueId ?? null,
-      heartbeatRunId: input.context.heartbeatRunId ?? null,
-      pluginId: input.context.pluginId ?? null,
-      outcome: input.outcome,
-      errorCode: input.errorCode ?? null,
-    });
+    const context = input.context;
+    // The issue_id/heartbeat_run_id FK checks take FOR KEY SHARE on rows the
+    // runtime identity path locks FOR UPDATE in the opposite order. Retry a
+    // lost deadlock race so the audit record survives instead of being
+    // dropped by the callers' best-effort catch. The insert runs in its own
+    // nested transaction so that when secretService is bound to a caller-held
+    // transaction (e.g. the broker token-mint path) a deadlock abort rolls
+    // back only to the savepoint instead of aborting the whole outer
+    // transaction with 25P02. Drizzle runs this as SAVEPOINT when db is
+    // already a transaction.
+    await withDeadlockRetry(() =>
+      (db as Db).transaction(async (t) => {
+        await t.insert(secretAccessEvents).values({
+          companyId: input.companyId,
+          secretId: input.secretId,
+          userSecretDefinitionId: input.userSecretDefinitionId ?? null,
+          secretScope: input.secretScope ?? "company",
+          version: input.version,
+          provider: input.provider,
+          responsibleUserId: context.responsibleUserId ?? null,
+          credentialOwnerUserId: input.credentialOwnerUserId ?? null,
+          credentialSubjectType: input.credentialSubjectType ?? null,
+          credentialSubjectId: input.credentialSubjectId ?? null,
+          actorType: context.actorType ?? "system",
+          actorId: context.actorId ?? null,
+          consumerType: context.consumerType,
+          consumerId: context.consumerId,
+          configPath: context.configPath ?? null,
+          issueId: context.issueId ?? null,
+          heartbeatRunId: context.heartbeatRunId ?? null,
+          pluginId: context.pluginId ?? null,
+          outcome: input.outcome,
+          errorCode: input.errorCode ?? null,
+        });
+      }),
+    );
   }
 
   async function assertSecretInCompany(
