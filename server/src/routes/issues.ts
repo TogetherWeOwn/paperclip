@@ -9374,7 +9374,44 @@ export function issueRoutes(
             // Admit the exact server-owned recovery evidence before resolving
             // either record. The durable worker, not a best-effort generic wake,
             // owns execution after commit and rechecks current chat access.
-            const failedRunId = activeRecoveryAction.evidence?.runId;
+            //
+            // Canonical evidence carries runId (see
+            // buildStrandedRecoveryActionEvidence). Legacy stranded actions
+            // stored only latestRunId with sourceRunId null, so resolve that
+            // single-source fallback here and let prepareFailedChatRunRetry
+            // prove exact chat provenance server-side. Ambiguous legacy
+            // handoff evidence (latest and source differ, no canonical runId)
+            // stays rejected: the caller must send a fresh authorized request.
+            const evidence = (activeRecoveryAction.evidence ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const canonicalRunId =
+              typeof evidence.runId === "string" ? evidence.runId : undefined;
+            const legacyLatestRunId =
+              typeof evidence.latestRunId === "string"
+                ? evidence.latestRunId
+                : undefined;
+            const legacySourceRunId =
+              typeof evidence.sourceRunId === "string"
+                ? evidence.sourceRunId
+                : undefined;
+            let failedRunId: string | undefined = canonicalRunId;
+            if (!failedRunId) {
+              const latestValid =
+                legacyLatestRunId && isUuidLike(legacyLatestRunId)
+                  ? legacyLatestRunId
+                  : undefined;
+              const sourceValid =
+                legacySourceRunId && isUuidLike(legacySourceRunId)
+                  ? legacySourceRunId
+                  : undefined;
+              if (latestValid && (!sourceValid || sourceValid === latestValid)) {
+                failedRunId = latestValid;
+              } else if (!latestValid && sourceValid) {
+                failedRunId = sourceValid;
+              }
+            }
             if (
               !opts.chatRunRetries ||
               req.actor.type !== "board" ||
