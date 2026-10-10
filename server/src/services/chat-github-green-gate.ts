@@ -1,5 +1,5 @@
-import { and, eq, inArray, isNull, ne } from "drizzle-orm";
-import { chatGitHubReviews, type Db } from "@paperclipai/db";
+import { and, eq, isNull, ne, sql } from "drizzle-orm";
+import { chatDeliveries, chatGitHubReviews, type Db } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 
@@ -65,6 +65,8 @@ export type GitHubGreenRequestOutcome =
         | "pending"
         | "red"
         | "already_reviewed"
+        | "already_requested"
+        | "retries_exhausted"
         | "not_admitted";
       headSha?: string;
       reason?: string;
@@ -114,22 +116,15 @@ export async function githubGreenReviewContext(input: {
   const headSha = pr.head.sha.toLowerCase();
   if (pr.state !== "open") return { ready: false, outcome: { status: "closed", headSha } };
   if (pr.draft) return { ready: false, outcome: { status: "draft", headSha } };
-  const [existing] = await input.db
-    .select({ id: chatGitHubReviews.id })
-    .from(chatGitHubReviews)
-    .where(
-      and(
-        eq(chatGitHubReviews.companyId, input.companyId),
-        eq(chatGitHubReviews.endpointId, input.endpointId),
-        eq(chatGitHubReviews.repositoryId, input.repositoryId),
-        eq(chatGitHubReviews.pullNumber, input.pullNumber),
-        eq(chatGitHubReviews.headSha, headSha),
-        inArray(chatGitHubReviews.state, ["queued", "running", "completed"]),
-      ),
-    )
-    .limit(1);
-  if (existing)
-    return { ready: false, outcome: { status: "already_reviewed", headSha } };
+  const attempt = await githubGreenReviewAttempt(input.db, {
+    companyId: input.companyId,
+    endpointId: input.endpointId,
+    repositoryId: input.repositoryId,
+    pullNumber: input.pullNumber,
+    headSha,
+  });
+  if (attempt.kind !== "ready")
+    return { ready: false, outcome: { status: attempt.kind, headSha } };
   const rules = await get<
     Array<{
       type: string;
@@ -159,7 +154,7 @@ export async function githubGreenReviewContext(input: {
     ready: true,
     context: {
       event: "checks_green",
-      deliveryId: `checks-green:${input.repositoryId}:${input.pullNumber}:${headSha}`,
+      deliveryId: attempt.deliveryId,
       repositoryId: input.repositoryId,
       repository: input.repository.toLowerCase(),
       pullNumber: pr.number,
@@ -180,6 +175,67 @@ export async function githubGreenReviewContext(input: {
       labels: pr.labels.map((label) => label.name),
     },
   };
+}
+
+/** First review plus two retries per head. */
+export const GITHUB_GREEN_REVIEW_MAX_ATTEMPTS = 3;
+
+/**
+ * Decides whether a head may get a (re)review and under which delivery id.
+ * Review rows and deliveries are unique per delivery id, so a retry after a
+ * failed attempt needs a fresh id: attempt N>1 is suffixed with `:attempt-N`.
+ * A delivery already recorded under the chosen id means a request is in
+ * flight (or was dropped before any review row existed); that is reported,
+ * never silently repeated.
+ */
+export async function githubGreenReviewAttempt(
+  db: Db,
+  input: {
+    companyId: string;
+    endpointId: string;
+    repositoryId: string;
+    pullNumber: number;
+    headSha: string;
+  },
+): Promise<
+  | { kind: "already_reviewed" | "already_requested" | "retries_exhausted" }
+  | { kind: "ready"; deliveryId: string; attempt: number }
+> {
+  const rows = await db
+    .select({ state: chatGitHubReviews.state })
+    .from(chatGitHubReviews)
+    .where(
+      and(
+        eq(chatGitHubReviews.companyId, input.companyId),
+        eq(chatGitHubReviews.endpointId, input.endpointId),
+        eq(chatGitHubReviews.repositoryId, input.repositoryId),
+        eq(chatGitHubReviews.pullNumber, input.pullNumber),
+        eq(chatGitHubReviews.headSha, input.headSha),
+      ),
+    );
+  if (rows.some((row) => ["queued", "running", "completed"].includes(row.state)))
+    return { kind: "already_reviewed" };
+  const failed = rows.filter((row) =>
+    ["incomplete", "error", "superseded"].includes(row.state),
+  ).length;
+  if (failed >= GITHUB_GREEN_REVIEW_MAX_ATTEMPTS)
+    return { kind: "retries_exhausted" };
+  const attempt = failed + 1;
+  const base = `checks-green:${input.repositoryId}:${input.pullNumber}:${input.headSha}`;
+  const deliveryId = attempt === 1 ? base : `${base}:attempt-${attempt}`;
+  const [pending] = await db
+    .select({ id: chatDeliveries.id })
+    .from(chatDeliveries)
+    .where(
+      and(
+        eq(chatDeliveries.companyId, input.companyId),
+        eq(chatDeliveries.endpointId, input.endpointId),
+        sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' = ${deliveryId}`,
+      ),
+    )
+    .limit(1);
+  if (pending) return { kind: "already_requested" };
+  return { kind: "ready", deliveryId, attempt };
 }
 
 /**

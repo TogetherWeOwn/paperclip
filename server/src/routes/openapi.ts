@@ -2666,7 +2666,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "Request a GitHub review once required checks are green",
   description:
-    "Requests one automatic review for an open, non-draft pull request head whose required checks all finished green. The server reads the pull request and checks with the endpoint's App token and applies the same author-based admission as a pull_request webhook; the configuration must enable the `checks_green` event. Idempotent per head.",
+    "Requests one automatic review for an open, non-draft pull request head whose required checks all finished green. The server reads the pull request and checks with the endpoint's App token and applies the same author-based admission as a pull_request webhook; the configuration must enable the `checks_green` event. Idempotent per head and attempt: a failed, incomplete, or superseded review may be retried twice under a new delivery id.",
   request: {
     params: z.object({ endpointId: z.string().uuid() }),
     body: {
@@ -2683,7 +2683,7 @@ registry.registerPath({
   responses: {
     200: {
       description:
-        "Outcome: requested, pending, red, draft, closed, already_reviewed, or not_admitted.",
+        "Outcome: requested, pending, red, draft, closed, already_reviewed, already_requested (a request for this head and attempt is in flight), retries_exhausted (three failed attempts), or not_admitted.",
       content: {
         "application/json": {
           schema: z.object({
@@ -2694,6 +2694,8 @@ registry.registerPath({
               "draft",
               "closed",
               "already_reviewed",
+              "already_requested",
+              "retries_exhausted",
               "not_admitted",
             ]),
             headSha: z.string().optional(),
