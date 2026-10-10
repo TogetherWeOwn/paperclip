@@ -2589,13 +2589,18 @@ async function githubLifecycleEventFromRequest(
     (typeof messageId !== "string" && typeof messageId !== "number")
   )
     return null;
+  // GitHub owner and repository names are case-insensitive. Mint lifecycle
+  // thread ids in the same lowercase form as automatic pull_request
+  // deliveries so edits and deletes land on the existing thread.
+  const canonicalOwner = owner.toLowerCase();
+  const canonicalRepo = repo.toLowerCase();
   let threadId: string;
   if (eventType === "issue_comment") {
     const number = payload.issue?.number;
     if (typeof number !== "number") return null;
     threadId = payload.issue?.pull_request
-      ? `github:${owner}/${repo}:${number}`
-      : `github:${owner}/${repo}:issue:${number}`;
+      ? `github:${canonicalOwner}/${canonicalRepo}:${number}`
+      : `github:${canonicalOwner}/${canonicalRepo}:issue:${number}`;
   } else {
     const number = payload.pull_request?.number;
     const rootCommentId =
@@ -2605,7 +2610,7 @@ async function githubLifecycleEventFromRequest(
       (typeof rootCommentId !== "string" && typeof rootCommentId !== "number")
     )
       return null;
-    threadId = `github:${owner}/${repo}:${number}:rc:${rootCommentId}`;
+    threadId = `github:${canonicalOwner}/${canonicalRepo}:${number}:rc:${rootCommentId}`;
   }
   const eventKind =
     payload.action === "edited" ? "message_updated" : "message_deleted";
