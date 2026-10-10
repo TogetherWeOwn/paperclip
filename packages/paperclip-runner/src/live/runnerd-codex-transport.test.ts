@@ -4400,6 +4400,27 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
           return rotate(identity, template);
         },
       );
+      // Rotation wipes the event log (initialCoreState), and the controller
+      // can activate the new epoch before attachRun observes the result, so a
+      // rotation-time snapshot is inherently racy. Record commit history and
+      // assert convergence instead.
+      const commitHistory: (typeof core.store.state)[] = [
+        structuredClone(core.store.state),
+      ];
+      const durableStore = core.store as unknown as {
+        commit: (candidate: typeof core.store.state) => void;
+        save: () => void;
+      };
+      const origCommit = durableStore.commit.bind(durableStore);
+      const origSave = durableStore.save.bind(durableStore);
+      vi.spyOn(durableStore, "commit").mockImplementation((candidate) => {
+        origCommit(candidate);
+        commitHistory.push(structuredClone(core.store.state));
+      });
+      vi.spyOn(durableStore, "save").mockImplementation(() => {
+        origSave();
+        commitHistory.push(structuredClone(core.store.state));
+      });
       if (mode === "rejected-attach") {
         const queue = core.queueCommand.bind(core);
         vi.spyOn(core, "queueCommand").mockImplementation(
@@ -4466,16 +4487,26 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         releaseCommit();
         await within("warm attach after old ACK", attachment, 10_000);
         expect(rotations).toHaveLength(1);
-        const retired = rotations[0]!;
-        const attachedEvent = retired.committedEvents.find(
+        // Convergence, not the rotation-time snapshot: the controller can
+        // activate the new epoch (initialCoreState, empty committedEvents)
+        // before attachRun observes the run.attach result, so rotations[0]
+        // may already be the new epoch. The durable effect must have been
+        // committed exactly once under the old authority at some point.
+        const attachedSnapshot = commitHistory.find((snapshot) =>
+          snapshot.committedEvents.some(
+            (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
+          ),
+        );
+        expect(attachedSnapshot).toBeDefined();
+        const attachedEvent = attachedSnapshot!.committedEvents.find(
           (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
         )!;
         expect(attachedEvent.logicalEffectCount).toBe(1);
-        expect(retired.ackedSourceSeq).toBeGreaterThanOrEqual(
+        expect(attachedSnapshot!.ackedSourceSeq).toBeGreaterThanOrEqual(
           attachedEvent.sourceSeq,
         );
         expect(
-          retired.committedEvents.slice(-4).map((entry) => entry.eventType),
+          attachedSnapshot!.committedEvents.slice(-4).map((entry) => entry.eventType),
         ).toEqual([
           "session.resumed",
           "session.capabilities.updated",
@@ -4483,12 +4514,16 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
           "run.attached",
         ]);
         expect(
-          retired.committedEvents.every(
+          attachedSnapshot!.committedEvents.every(
             (entry) => entry.envelope.runId === oldIdentity.runId,
           ),
         ).toBe(true);
         if (mode === "lost-ack") {
-          expect(retired.connectionCount).toBeGreaterThanOrEqual(2);
+          expect(
+            commitHistory.some(
+              (snapshot) => snapshot.connectionCount >= 2,
+            ),
+          ).toBe(true);
           expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(2);
         } else {
           expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
