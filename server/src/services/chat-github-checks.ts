@@ -11,12 +11,17 @@ import {
   chatGitHubConfigurations,
   chatGitHubReviews,
   chatMessageLinks,
-  companies,
   heartbeatRuns,
   type Db,
 } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
-import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { githubPullPermalink } from "./chat-github-review-template.js";
+import {
+  findGitHubReviewChecks,
+  hasReconciledGitHubCheckUrl,
+  rememberGitHubCheckUrl,
+  type GitHubReviewCheckResponse,
+} from "./chat-github-check-reconciliation.js";
 import {
   githubBotRepositoryToken,
   githubBotRequest,
@@ -96,10 +101,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               endpoint: chatEndpoints,
               resource: chatEndpointResources,
               configuration: chatGitHubConfigurations.configuration,
-              companyPrefix: companies.issuePrefix,
             })
             .from(chatEndpoints)
-            .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
             .innerJoin(
               chatGitHubConfigurations,
               eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
@@ -303,30 +306,33 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          if (fresh.result?.state !== state) {
-            const origin = runtimePublicOrigin();
-            const detailsPath = review
-              ? `issues/${review.issueId}`
-              : `apps/chat/${source.endpoint.id}/reviews`;
-            const detailsUrl = origin
-              ? `${origin}/${encodeURIComponent(source.companyPrefix)}/${detailsPath}`
-              : null;
-            const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
-            const checks = await request<{
-              check_runs: Array<{
-                id: number;
-                status?: string;
-                external_id?: string;
-                app?: { id?: number };
-              }>;
-            }>(
-              `/commits/${event.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
-            );
-            const check = checks.check_runs.find(
-              (check) =>
-                check.external_id === externalId &&
-                String(check.app?.id) === source.endpoint.botExternalId,
-            );
+          const detailsUrl = githubPullPermalink(event.repository, event.pullNumber);
+          const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
+          const appId = source.endpoint.botExternalId;
+          if (!appId) throw new Error("GitHub bot app identity is unavailable.");
+          const stateChanged = fresh.result?.state !== state;
+          const checks =
+            stateChanged ||
+            !hasReconciledGitHubCheckUrl(externalId, appId, detailsUrl)
+              ? await findGitHubReviewChecks(
+                  (path) => request<GitHubReviewCheckResponse>(path),
+                  event.headSha,
+                  externalId,
+                  appId,
+                )
+              : [];
+          const check = checks[0];
+          const staleChecks = checks.filter(
+            (candidate) => candidate.details_url !== detailsUrl,
+          );
+          for (const staleCheck of staleChecks)
+            await request(`/check-runs/${staleCheck.id}`, {
+              method: "PATCH",
+              body: { details_url: detailsUrl },
+            });
+          if (checks.length > 0 && staleChecks.length === 0)
+            rememberGitHubCheckUrl(externalId, appId, detailsUrl);
+          if (stateChanged) {
             // GitHub retains a completed check's conclusion when PATCHed back to
             // queued/in_progress. A fresh attempt needs a new check run with the
             // same stable name; otherwise a prior success still looks passing.
@@ -341,7 +347,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   name: "Paperclip Review",
                   head_sha: event.headSha,
                   external_id: externalId,
-                  ...(detailsUrl ? { details_url: detailsUrl } : {}),
+                  details_url: detailsUrl,
                   status,
                   ...(status === "completed"
                     ? { conclusion: "action_required" }
