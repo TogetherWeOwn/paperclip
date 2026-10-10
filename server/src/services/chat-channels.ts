@@ -2671,6 +2671,19 @@ async function githubLifecycleEventFromRequest(
   };
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`,
+      )
+      .join(",")}}`;
+  return JSON.stringify(value ?? null);
+}
+
 function githubRepositoryInventoryItemFromPayload(
   payload: unknown,
 ): ChatProviderResourceInventoryItem | null {
@@ -7456,6 +7469,52 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       })
       .returning({ id: chatEndpointResources.id });
     return resource ?? null;
+  }
+
+  // Read-only probe: would reconcileGitHubWebhookRepository change anything?
+  // Most signed callbacks come from an already-current repository, and taking
+  // the endpoint-wide credential mutation lease for them serializes every
+  // webhook behind long lease holders (publications, delivery recovery).
+  async function githubWebhookRepositoryIsCurrent(
+    endpoint: EndpointRow,
+    item: ChatProviderResourceInventoryItem,
+  ): Promise<boolean> {
+    const resource = await db
+      .select()
+      .from(chatEndpointResources)
+      .where(
+        and(
+          eq(chatEndpointResources.companyId, endpoint.companyId),
+          eq(chatEndpointResources.endpointId, endpoint.id),
+          eq(chatEndpointResources.type, "repository"),
+          eq(chatEndpointResources.providerResourceId, item.providerResourceId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (
+      !resource ||
+      resource.availability !== "available" ||
+      resource.parentProviderResourceId !==
+        (item.parentProviderResourceId ?? null) ||
+      resource.label !== item.label ||
+      resource.providerUrl !== (item.providerUrl ?? null) ||
+      stableJson(resource.metadata ?? {}) !== stableJson(item.metadata ?? {})
+    )
+      return false;
+    const quarantined = await db
+      .select({ id: chatConversations.id })
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.resourceId, resource.id),
+          eq(chatConversations.state, "unavailable"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return !quarantined;
   }
 
   async function reconcileGitHubWebhookRepository(
@@ -27157,79 +27216,107 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ? new Response("pong", { status: 200 })
           : new Response("Invalid signature", { status: 401 });
       }
-      const preflightTask = withCredentialMutationLease(
-        endpoint,
-        async (
-          credentialLease,
-        ): Promise<"accepted" | "ignored" | "invalid_signature"> => {
-          // The repository upsert below is a Paperclip mutation derived from
-          // the webhook credential. Re-read and authenticate while holding the
-          // same lease as rotation/reconnect/removal so a callback signed with
-          // an obsolete secret cannot reopen a quarantined repository in the
-          // resolve-secret -> persist-resource race window.
-          const current = await endpointRecord(endpoint.id);
-          if (
-            !current ||
-            current.endpoint.provider !== "github" ||
-            !matchesGitHubIngressFence(runtimeContextForRecord(current)) ||
-            current.endpoint.status === "archived" ||
-            current.endpoint.status === "paused" ||
-            (current.endpoint.status === "revoked" &&
-              eventType !== "installation")
-          ) {
-            return "ignored";
-          }
-          const credentials = await resolveCredentials(current.endpoint);
-          const expected = `sha256=${createHmac("sha256", credentials.webhookSecret).update(body).digest("hex")}`;
-          let signatureValid = false;
-          try {
-            signatureValid =
-              typeof signature === "string" &&
-              timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-          } catch {
-            signatureValid = false;
-          }
-          if (!signatureValid) return "invalid_signature";
-
-          let payload: {
-            installation?: { id?: unknown };
-            repository?: unknown;
-          } | null = null;
-          try {
-            payload = JSON.parse(body) as {
+      type GitHubIngressPreflight =
+        | { kind: "ignored" | "invalid_signature" }
+        | {
+            kind: "accepted";
+            endpoint: EndpointRow;
+            payload: {
               installation?: { id?: unknown };
               repository?: unknown;
-            };
-          } catch {
-            // Let the native adapter return its normal invalid-JSON response.
+            } | null;
+          };
+      const authenticateIngress = async (): Promise<GitHubIngressPreflight> => {
+        const current = await endpointRecord(endpoint.id);
+        if (
+          !current ||
+          current.endpoint.provider !== "github" ||
+          !matchesGitHubIngressFence(runtimeContextForRecord(current)) ||
+          current.endpoint.status === "archived" ||
+          current.endpoint.status === "paused" ||
+          (current.endpoint.status === "revoked" &&
+            eventType !== "installation")
+        ) {
+          return { kind: "ignored" };
+        }
+        const credentials = await resolveCredentials(current.endpoint);
+        const expected = `sha256=${createHmac("sha256", credentials.webhookSecret).update(body).digest("hex")}`;
+        let signatureValid = false;
+        try {
+          signatureValid =
+            typeof signature === "string" &&
+            timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+        } catch {
+          signatureValid = false;
+        }
+        if (!signatureValid) return { kind: "invalid_signature" };
+
+        let payload: {
+          installation?: { id?: unknown };
+          repository?: unknown;
+        } | null = null;
+        try {
+          payload = JSON.parse(body) as {
+            installation?: { id?: unknown };
+            repository?: unknown;
+          };
+        } catch {
+          // Let the native adapter return its normal invalid-JSON response.
+        }
+        if (payload) {
+          const incomingInstallationId = payload.installation?.id;
+          if (
+            incomingInstallationId !== undefined &&
+            String(incomingInstallationId) !== credentials.installationId &&
+            eventType !== "installation"
+          ) {
+            // A dedicated endpoint represents exactly one GitHub App
+            // installation. GitHub sends every installation's events to the
+            // App webhook, so acknowledge foreign signed traffic without
+            // admitting it to Paperclip or prompting endless redelivery.
+            // Installation lifecycle events are the one exception: even when
+            // their id differs, canonical App inventory under the lifecycle
+            // lease must decide whether this is a valid sole-installation
+            // replacement or a second active installation that quarantines
+            // the endpoint.
+            return { kind: "ignored" };
           }
-          if (payload) {
-            const incomingInstallationId = payload.installation?.id;
-            if (
-              incomingInstallationId !== undefined &&
-              String(incomingInstallationId) !== credentials.installationId &&
-              eventType !== "installation"
-            ) {
-              // A dedicated endpoint represents exactly one GitHub App
-              // installation. GitHub sends every installation's events to the
-              // App webhook, so acknowledge foreign signed traffic without
-              // admitting it to Paperclip or prompting endless redelivery.
-              // Installation lifecycle events are the one exception: even when
-              // their id differs, canonical App inventory under the lifecycle
-              // lease must decide whether this is a valid sole-installation
-              // replacement or a second active installation that quarantines
-              // the endpoint.
-              return "ignored";
-            }
+        }
+        return { kind: "accepted", endpoint: current.endpoint, payload };
+      };
+      const preflightTask = (async (): Promise<
+        "accepted" | "ignored" | "invalid_signature"
+      > => {
+        // Authentication itself is read-only and fenced like
+        // stageGitHubWebhookIngress (ref set + generation). Only the repository
+        // upsert is a Paperclip mutation derived from the webhook credential, so
+        // only that path takes the credential mutation lease.
+        const unfenced = await authenticateIngress();
+        if (unfenced.kind !== "accepted") return unfenced.kind;
+        const item = unfenced.payload
+          ? githubRepositoryInventoryItemFromPayload(unfenced.payload)
+          : null;
+        if (
+          !item ||
+          (await githubWebhookRepositoryIsCurrent(unfenced.endpoint, item))
+        )
+          return "accepted";
+        return withCredentialMutationLease(endpoint, async (credentialLease) => {
+          // Re-read and authenticate while holding the same lease as
+          // rotation/reconnect/removal so a callback signed with an obsolete
+          // secret cannot reopen a quarantined repository in the
+          // resolve-secret -> persist-resource race window.
+          const fenced = await authenticateIngress();
+          if (fenced.kind !== "accepted") return fenced.kind;
+          if (fenced.payload)
             await reconcileGitHubWebhookRepository(
-              current.endpoint,
-              payload,
+              fenced.endpoint,
+              fenced.payload,
               credentialLease,
             );
-          }
           return "accepted";
-        },
-      );
+        });
+      })();
       let preflightAttempt:
         | {
             completed: true;

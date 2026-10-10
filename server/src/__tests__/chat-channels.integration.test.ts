@@ -8581,6 +8581,118 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
+  it("authenticates GitHub callbacks for a current repository without waiting on the credential mutation lease", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, service, webhookSecret } =
+      await configuredGitHubEndpoint(fixture);
+    const repository = (fullName: string, id: number) => ({
+      id,
+      full_name: fullName,
+      html_url: `https://github.com/${fullName}`,
+      owner: { id: 1357, login: fullName.split("/")[0] },
+      private: false,
+    });
+    const callback = (delivery: string, repo: Record<string, unknown>) =>
+      service.handleWebhook(
+        endpoint.publicId,
+        "github",
+        signedGitHubWebhookRequest({
+          delivery,
+          event: "issue_comment",
+          payload: {
+            action: "created",
+            installation: { id: 2468 },
+            repository: repo,
+            issue: { number: 7 },
+            comment: { id: 7101, body: "lease-independent callback" },
+            sender: { id: 42, login: "octocat" },
+          },
+          webhookSecret,
+        }),
+      );
+    const ingress = async (delivery: string) =>
+      db
+        .select({ status: chatActions.status, result: chatActions.result })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "github_webhook_ingress"),
+            eq(
+              chatActions.providerActionId,
+              `github_webhook_ingress:${delivery}`,
+            ),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+    const current = repository("paperclipai/lease-free-repository", 97531);
+
+    // First callback makes the repository row current (takes the lease).
+    await callback("github-lease-free-first", current);
+    await expect
+      .poll(async () => (await ingress("github-lease-free-first"))?.status, {
+        timeout: 10_000,
+      })
+      .not.toMatch(/^(received|processing)$/);
+    const settled = await ingress("github-lease-free-first");
+    await expect(service.listResources(endpoint.id)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          providerResourceId: "paperclipai/lease-free-repository",
+        }),
+      ]),
+    );
+
+    // Another owner holds the endpoint-wide credential mutation lease (a slow
+    // publication, delivery recovery, ...). Before the fix every callback
+    // waited 10 s behind it and failed with chat_endpoint_credentials_busy.
+    await db.insert(chatEndpointLeases).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      leaseKey: "credentials",
+      token: "slow-lease-holder",
+      expiresAt: new Date(Date.now() + 90_000),
+    });
+    try {
+      const startedAt = Date.now();
+      const response = await callback("github-lease-free-second", current);
+      expect(response.status).not.toBe(503);
+      await expect
+        .poll(async () => (await ingress("github-lease-free-second"))?.status, {
+          timeout: 5_000,
+        })
+        .toBe(settled!.status);
+      expect(Date.now() - startedAt).toBeLessThan(8_000);
+      expect((await ingress("github-lease-free-second"))?.result).not.toMatchObject({
+        httpStatus: 503,
+      });
+
+      // A callback that would change inventory still needs the lease, so it
+      // cannot create the new repository while another owner holds it.
+      void callback(
+        "github-lease-held-new-repository",
+        repository("paperclipai/needs-lease-repository", 97532),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      await expect(service.listResources(endpoint.id)).resolves.not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            providerResourceId: "paperclipai/needs-lease-repository",
+          }),
+        ]),
+      );
+    } finally {
+      await db
+        .delete(chatEndpointLeases)
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.token, "slow-lease-holder"),
+          ),
+        );
+    }
+  }, 60_000);
+
   it("acknowledges GitHub lifecycle callbacks without changing a paused endpoint", async () => {
     const fixture = await seedCompany();
     const { endpoint, service } = await configuredGitHubEndpoint(fixture);
@@ -9109,7 +9221,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       signedGitHubWebhookRequest({
         delivery: "github-authentication-lane-budget",
         event: "installation_repositories",
-        payload: { installation: { id: 2468 } },
+        // A not-yet-known repository makes processing a credential-derived
+        // inventory mutation, which still waits for the mutation lease.
+        // Callbacks for an already-current repository do not wait (see
+        // "authenticates GitHub callbacks for a current repository ...").
+        payload: {
+          installation: { id: 2468 },
+          repository: {
+            id: 97601,
+            full_name: "paperclipai/lease-wait-repository",
+            html_url: "https://github.com/paperclipai/lease-wait-repository",
+            owner: { id: 1357, login: "paperclipai" },
+            private: false,
+          },
+        },
         webhookSecret,
       }),
     );
