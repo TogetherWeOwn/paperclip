@@ -5,11 +5,12 @@ import {
   asBoolean,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// asks the user to log in. The detector matches them only against login
+// evidence, see collectClaudeLoginEvidence.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -203,23 +204,87 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+// The CLI reports a login prompt as plain text, as an error-typed or is_error
+// stream event, or as an assistant message marked with the structured
+// authentication_failed error. Other stream-json events carry model, user, and
+// tool prose, so the prompt markers never read them.
+const CLAUDE_STRUCTURED_AUTH_FAILURE = "authentication_failed";
+
+function claudeStreamEventReportsFailure(event: Record<string, unknown>): boolean {
+  return event.type === "error" || event.is_error === true || event.error === CLAUDE_STRUCTURED_AUTH_FAILURE;
+}
+
+function claudeFailureEventTexts(event: Record<string, unknown>): string[] {
+  const message = parseObject(event.message);
+  const content = Array.isArray(message.content) ? message.content : [];
+  const blockTexts = content.flatMap((entry) => {
+    const block = parseObject(entry);
+    return asString(block.type, "") === "text" ? [asString(block.text, "")] : [];
+  });
+  return [
+    asString(event.result, ""),
+    asString(event.message, ""),
+    ...extractClaudeErrorMessages({ errors: [event.error] }),
+    ...extractClaudeErrorMessages(event),
+    ...blockTexts,
+  ];
+}
+
+// A terminal result reports a failure when it says so. Error fields on a
+// success result are not failure evidence, so its answer text never matches.
+function claudeResultReportsFailure(parsed: Record<string, unknown>): boolean {
+  if (asBoolean(parsed.is_error, false)) return true;
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  if (subtype.startsWith("error")) return true;
+  const status = asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0);
+  return (
+    status === 401 ||
+    status === 403 ||
+    asString(parsed.error, "").trim() === CLAUDE_STRUCTURED_AUTH_FAILURE
+  );
+}
+
+// appendWithCap keeps only the tail of a full capture, so its first line may be cut mid-event.
+function claudeStdoutLines(stdout: string): string[] {
+  const [first = "", ...rest] = stdout.split(/\r?\n/);
+  const captureMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
+  return captureMayBeCut && parseJson(first.trim()) === null ? rest : [first, ...rest];
+}
+
+// One event's text is one evidence unit, so a login phrase may span its lines.
+function collectClaudeLoginEvidence(input: {
+  parsed: Record<string, unknown> | null;
+  stdout: string;
+  stderr: string;
+}): string[] {
+  const units: string[] = [];
+  for (const rawLine of claudeStdoutLines(input.stdout)) {
+    const event = parseObject(parseJson(rawLine.trim()));
+    if (typeof event.type !== "string") {
+      units.push(rawLine);
+    } else if (claudeStreamEventReportsFailure(event)) {
+      units.push(...claudeFailureEventTexts(event));
+    }
+  }
+  units.push(...input.stderr.split(/\r?\n/));
+  if (input.parsed && claudeResultReportsFailure(input.parsed)) {
+    units.push(...claudeFailureEventTexts(input.parsed));
+  }
+  return units.map((unit) => unit.trim()).filter(Boolean);
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
-
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
+  const evidence = collectClaudeLoginEvidence({
+    parsed,
+    stdout: input.stdout,
+    stderr: input.stderr,
+  });
+  const loginPrompt = evidence.some((unit) => CLAUDE_LOGIN_PROMPT_RE.test(unit));
 
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
@@ -231,7 +296,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl: extractClaudeLoginUrl(evidence.join("\n")),
   };
 }
 
