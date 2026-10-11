@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { authSessionSchema, currentUserProfileSchema } from "./access.js";
+import {
+  authSessionSchema,
+  currentUserProfileSchema,
+  updateMemberPermissionSchema,
+} from "./access.js";
 
 describe("currentUserProfileSchema", () => {
   it("coerces empty-string name to null", () => {
@@ -181,5 +185,27 @@ describe("authSessionSchema", () => {
     });
     expect(result.success).toBe(true);
     expect(result.success && result.data.sentryDsn).toBe("https://public@o0.ingest.sentry.io/1");
+  });
+});
+
+describe("updateMemberPermissionSchema", () => {
+  it("accepts an enable or disable with no scope", () => {
+    const enable = updateMemberPermissionSchema.safeParse({ enabled: true });
+    const disable = updateMemberPermissionSchema.safeParse({ enabled: false, scope: null });
+    expect(enable.success).toBe(true);
+    expect(disable.success).toBe(true);
+  });
+
+  it("accepts a subtree scope", () => {
+    const result = updateMemberPermissionSchema.safeParse({
+      enabled: true,
+      scope: { managedSubtreeAgentIds: ["manager-agent-id"] },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a missing or non-boolean enabled flag", () => {
+    expect(updateMemberPermissionSchema.safeParse({}).success).toBe(false);
+    expect(updateMemberPermissionSchema.safeParse({ enabled: "yes" }).success).toBe(false);
   });
 });

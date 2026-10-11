@@ -45,6 +45,7 @@ import {
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateMemberPermissionSchema,
   updateUserCompanyAccessSchema,
   PERMISSION_KEYS,
   isUuidLike,
@@ -4624,6 +4625,231 @@ export function accessRoutes(
         reassignedIssueCount: result.reassignedIssueCount,
       });
     }
+  );
+
+  router.patch(
+    "/companies/:companyId/members/:memberId/permissions/:permissionKey",
+    validate(updateMemberPermissionSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const memberId = req.params.memberId as string;
+      const permissionKey = req.params.permissionKey;
+      if (permissionKey !== "agents:suggest-changes") {
+        throw badRequest("Only agents:suggest-changes can be managed for agent memberships");
+      }
+      await assertCompanyPermission(req, companyId, "users:manage_permissions");
+      const memberToUpdate = await access.getMemberById(companyId, memberId);
+      if (!memberToUpdate) throw notFound("Member not found");
+      if (memberToUpdate.principalType !== "agent") {
+        throw badRequest("This route only manages existing agent memberships");
+      }
+      if (memberToUpdate.status === "archived") {
+        throw conflict("Archived agent memberships cannot receive permission changes");
+      }
+      if (req.actor.type === "agent") {
+        // An agent steward may delegate narrowly but never widen access:
+        // enable requires a validated scope rooted inside its own reporting
+        // subtree, and both enable and revoke are refused when the target
+        // already holds a board-issued or company-wide grant. The enable
+        // side must be guarded too: overwriting such a grant would relabel
+        // it as agent-issued and make a follow-up revoke succeed.
+        const callerAgentId = req.actor.agentId;
+        if (!callerAgentId) throw forbidden("Agent authentication required");
+        if (memberToUpdate.principalId === callerAgentId) {
+          throw forbidden("Agents cannot change their own permissions");
+        }
+        const companyAgents = await agents.list(companyId, { includeTerminated: true });
+        const reportsById = new Map<string, string | null>(
+          companyAgents.map((entry) => [entry.id as string, (entry.reportsTo as string | null) ?? null]),
+        );
+        const isInSubtree = (rootId: string, targetId: string): boolean => {
+          if (rootId === targetId) return true;
+          let cursor: string | null = targetId;
+          for (let depth = 0; cursor && depth < 50; depth += 1) {
+            const parent = reportsById.get(cursor);
+            if (parent === undefined) return false;
+            if (parent === rootId) return true;
+            cursor = parent;
+          }
+          return false;
+        };
+        const narrowScopeRoots = (scope: unknown): string[] | null => {
+          if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+          const keys = Object.keys(scope as Record<string, unknown>);
+          if (keys.length !== 1 || keys[0] !== "managedSubtreeAgentIds") return null;
+          const raw = (scope as Record<string, unknown>).managedSubtreeAgentIds;
+          if (!Array.isArray(raw) || raw.length === 0 || raw.length > 50) return null;
+          const normalized: string[] = [];
+          for (const entry of raw) {
+            if (typeof entry !== "string") return null;
+            const trimmed = entry.trim();
+            if (!isUuidLike(trimmed)) return null;
+            if (!reportsById.has(trimmed)) return null;
+            if (!normalized.includes(trimmed)) normalized.push(trimmed);
+          }
+          return normalized.length > 0 ? normalized : null;
+        };
+        if (req.body.enabled) {
+          const normalized = narrowScopeRoots(req.body.scope);
+          if (!normalized) {
+            throw forbidden("Agent callers must grant agents:suggest-changes with a validated managedSubtreeAgentIds scope of company agents");
+          }
+          for (const rootId of normalized) {
+            if (!isInSubtree(callerAgentId, rootId)) {
+              throw forbidden("Agent callers may only grant subtrees inside their own reporting subtree");
+            }
+          }
+          req.body.scope = { managedSubtreeAgentIds: normalized };
+        }
+        // Both directions share one existing-grant guard. Without it on
+        // enable, a steward could narrow a board-issued company-wide grant
+        // (relabeling it as agent-issued) and then revoke it outright.
+        const existing = await access.listPrincipalGrants(companyId, "agent", memberToUpdate.principalId);
+        const current = existing.find((grant) => grant.permissionKey === "agents:suggest-changes");
+        if (current) {
+          if (current.grantedByUserId !== null && current.grantedByUserId !== undefined) {
+            throw forbidden("Agents cannot change grants issued by the board");
+          }
+          const stored = narrowScopeRoots(current.scope);
+          if (!stored) {
+            throw forbidden("Agents cannot change company-wide or unscoped grants");
+          }
+          for (const rootId of stored) {
+            if (!isInSubtree(callerAgentId, rootId)) {
+              throw forbidden("Agents cannot change grants outside their own reporting subtree");
+            }
+          }
+        }
+        // Re-check existing grants under a row lock. If no row exists, an
+        // insert must refuse conflicts: a grant that arrives after the read
+        // has not passed the provenance and subtree checks below.
+        await db.transaction(async (tx) => {
+          const locked = await tx
+            .select()
+            .from(principalPermissionGrants)
+            .where(
+              and(
+                eq(principalPermissionGrants.companyId, companyId),
+                eq(principalPermissionGrants.principalType, "agent"),
+                eq(principalPermissionGrants.principalId, memberToUpdate.principalId),
+                eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"),
+              ),
+            )
+            .for("update");
+          const lockedCurrent = locked[0];
+          if (lockedCurrent) {
+            if (lockedCurrent.grantedByUserId !== null && lockedCurrent.grantedByUserId !== undefined) {
+              throw forbidden("Agents cannot change grants issued by the board");
+            }
+            const stored = narrowScopeRoots(lockedCurrent.scope);
+            if (!stored) {
+              throw forbidden("Agents cannot change company-wide or unscoped grants");
+            }
+            for (const rootId of stored) {
+              if (!isInSubtree(callerAgentId, rootId)) {
+                throw forbidden("Agents cannot change grants outside their own reporting subtree");
+              }
+            }
+          }
+          if (req.body.enabled) {
+            const now = new Date();
+            const writeScope = (req.body.scope ?? null) as Record<string, unknown> | null;
+            if (lockedCurrent) {
+              await tx
+                .update(principalPermissionGrants)
+                .set({ scope: writeScope, grantedByUserId: null, updatedAt: now })
+                .where(eq(principalPermissionGrants.id, lockedCurrent.id));
+            } else {
+              const rows = await tx
+                .insert(principalPermissionGrants)
+                .values({
+                  companyId,
+                  principalType: "agent",
+                  principalId: memberToUpdate.principalId,
+                  permissionKey: "agents:suggest-changes",
+                  scope: writeScope,
+                  grantedByUserId: null,
+                  createdAt: now,
+                  updatedAt: now,
+                })
+                .onConflictDoNothing({
+                  target: [
+                    principalPermissionGrants.companyId,
+                    principalPermissionGrants.principalType,
+                    principalPermissionGrants.principalId,
+                    principalPermissionGrants.permissionKey,
+                  ],
+                })
+                .returning({ id: principalPermissionGrants.id });
+              if (rows.length === 0) {
+                throw conflict("Grant changed concurrently; retry");
+              }
+            }
+          } else {
+            if (!lockedCurrent) return;
+            // The SELECT ... FOR UPDATE above holds a row lock on the
+            // guarded grant, so no concurrent board (or peer steward) write
+            // can land between the guard and this delete. The delete stays
+            // unconditional on purpose: a provenance condition here could
+            // never fail while the lock is held, so it would be dead code
+            // with no covering test.
+            await tx
+              .delete(principalPermissionGrants)
+              .where(
+                and(
+                  eq(principalPermissionGrants.companyId, companyId),
+                  eq(principalPermissionGrants.principalType, "agent"),
+                  eq(principalPermissionGrants.principalId, memberToUpdate.principalId),
+                  eq(principalPermissionGrants.permissionKey, "agents:suggest-changes"),
+                ),
+              );
+          }
+        });
+      }
+
+      const updated = req.actor.type === "agent"
+        ? memberToUpdate
+        : await access.setMemberPermission(
+          companyId,
+          memberId,
+          permissionKey,
+          req.body.enabled,
+          req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+          req.body.scope ?? null,
+        );
+      if (!updated) throw notFound("Member not found");
+
+      const grants = await access.listPrincipalGrants(
+        companyId,
+        "agent",
+        updated.principalId,
+      );
+      const actor = req.actor.type === "agent"
+        ? { actorType: "agent" as const, actorId: req.actor.agentId ?? "unknown-agent" }
+        : { actorType: "user" as const, actorId: req.actor.userId ?? "board" };
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
+        runId: req.actor.type === "agent" ? (req.actor.runId ?? null) : null,
+        agentApiKeyId: req.actor.type === "agent" ? (req.actor.keyId ?? null) : null,
+        action: req.body.enabled ? "company_agent.permission_granted" : "company_agent.permission_revoked",
+        entityType: "company_membership",
+        entityId: memberId,
+        details: {
+          principalId: updated.principalId,
+          permissionKey,
+          scoped: Boolean(req.body.scope && Object.keys(req.body.scope).length > 0),
+        },
+      });
+
+      res.json({
+        ...updated,
+        principalType: "agent" as const,
+        grants,
+      });
+    },
   );
 
   router.patch(
