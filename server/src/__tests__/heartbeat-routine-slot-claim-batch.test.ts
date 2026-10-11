@@ -245,7 +245,12 @@ describeEmbeddedPostgres(
 
       await waitFor(() => startedRunIds.length >= 1);
       // maxConcurrentRuns is 2: the first routine run and the plain run start.
-      await waitFor(() => startedRunIds.includes(fixture.runIds[2]!));
+      // Wait for both adapters before asserting because their setup is concurrent.
+      await waitFor(
+        () =>
+          startedRunIds.includes(fixture.runIds[0]!) &&
+          startedRunIds.includes(fixture.runIds[2]!),
+      );
       expect(new Set(startedRunIds)).toEqual(
         new Set([fixture.runIds[0], fixture.runIds[2]]),
       );
