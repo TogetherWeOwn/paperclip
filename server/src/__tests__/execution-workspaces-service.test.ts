@@ -385,7 +385,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     pullRequestDetailsByKey.set(`${companyId}:10624`, {
       state: "merged",
       headRef: "unrelated-delivery",
-      headSha,
+      // A different branch carries a different commit. Delivery matches by
+      // head SHA (same repo), so this must not equal the workspace HEAD —
+      // otherwise it would (correctly) count as delivery. Card-free publish
+      // refs reuse the workspace HEAD and are covered separately.
+      headSha: "0000000000000000000000000000000000000000",
     });
     pullRequestDetailsByKey.set(`${companyId}:10625`, {
       state: "merged",
