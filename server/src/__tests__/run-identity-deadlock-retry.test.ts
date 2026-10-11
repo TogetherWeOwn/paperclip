@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -409,6 +409,73 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
         });
         expect(txValue).toBe("runtime-secret");
       });
+    } finally {
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousKey;
+      await temporary.cleanup();
+    }
+  }, 120_000);
+
+  it("root-bound secret audit inserts without opening an extra transaction", async () => {
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = "0123456789abcdef0123456789abcdef";
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-resolve-audit-root-");
+    const db = createDb(temporary.connectionString);
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Root audit", issuePrefix: "RA" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Root agent" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Root issue" });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `audit-root-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "runtime-secret",
+      });
+      await svc.createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "system",
+        targetId: "system",
+        configPath: "env.API_KEY",
+      });
+
+      // The root-bound audit must stay a bare insert. An extra
+      // db.transaction here shifts transaction-counting spies in unrelated
+      // suites (tool-access rollback, chat lifecycle) and regressed CI.
+      const transactionSpy = vi.spyOn(db, "transaction");
+      try {
+        const value = await svc.resolveSecretValue(companyId, secret.id, "latest", {
+          consumerType: "system",
+          consumerId: "system",
+          configPath: "env.API_KEY",
+          actorType: "system",
+          issueId,
+          heartbeatRunId: runId,
+        });
+        expect(value).toBe("runtime-secret");
+        expect(transactionSpy).not.toHaveBeenCalled();
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      const events = await db
+        .select()
+        .from(secretAccessEvents)
+        .where(eq(secretAccessEvents.secretId, secret.id));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ issueId, heartbeatRunId: runId, outcome: "success" });
     } finally {
       if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
       else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousKey;
