@@ -37,10 +37,12 @@ export function parseInboundWakePublicationKey(key: string) {
  * model output, input text, or the scheduler's internal error/reason. */
 export function inboundWakePublicationText(
   state: "queued" | "not_started" | "removed",
+  provider: string,
 ) {
   if (state === "removed") return "This queued message was removed.";
-  return state === "queued"
-    ? "Your follow-up is queued."
+  if (state === "queued") return "Your follow-up is queued.";
+  return provider === "github"
+    ? "This follow-up was not started."
     : "This follow-up was not started. Open the task in Paperclip for details.";
 }
 

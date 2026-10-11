@@ -4790,18 +4790,19 @@ export async function runChildProcess(
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
-        const spawnPersistPromise =
-          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts
-                .onSpawn({ pid: child.pid, processGroupId, startedAt })
-                .catch((err) => {
-                  onLogError(
-                    err,
-                    runId,
-                    "failed to record child process metadata",
-                  );
-                })
-            : Promise.resolve();
+        // Run onSpawn metadata persistence concurrently: never gate prompt
+        // delivery on it (see the stdin block below).
+        if (typeof child.pid === "number" && child.pid > 0 && opts.onSpawn) {
+          void opts
+            .onSpawn({ pid: child.pid, processGroupId, startedAt })
+            .catch((err) => {
+              onLogError(
+                err,
+                runId,
+                "failed to record child process metadata",
+              );
+            });
+        }
 
         runningProcesses.set(runId, {
           child,
@@ -4955,18 +4956,26 @@ export async function runChildProcess(
             if (code === "EPIPE" || code === "ECONNRESET") return;
             onLogError(stdinErr, runId, "child stdin stream error");
           });
-          void spawnPersistPromise.finally(() => {
-            try {
-              if (child.killed || stdin.destroyed) return;
+          // Deliver stdin immediately on spawn, independent of onSpawn
+          // metadata persistence. The CLI's stdin deadline starts at process
+          // start; gating this write on async post-spawn work (e.g. the DB
+          // persist in onSpawn) lets the deadline fire before the prompt
+          // arrives (production incident: review runs exited on the CLI's
+          // 3-second stdin timeout). Prompt bytes go out first; metadata
+          // persistence runs concurrently and never blocks delivery. Prompt
+          // transport is unchanged: still piped stdin, never process
+          // arguments or logs.
+          try {
+            if (!child.killed && !stdin.destroyed) {
               stdin.write(opts.stdin as string);
               stdin.end();
-            } catch (err) {
-              // A synchronous write failure must not reject this chain:
-              // the derived promise has no rejection handler, and an
-              // unhandled rejection would take down the controller too.
-              onLogError(err, runId, "failed to write child stdin");
             }
-          });
+          } catch (err) {
+            // A synchronous write failure must not throw out of the spawn
+            // handler and take down the controller: report it and let the
+            // child run its course.
+            onLogError(err, runId, "failed to write child stdin");
+          }
         }
 
         child.on("error", (err: Error) => {

@@ -99,11 +99,11 @@ threshold is 5/5; choose 1–5 or report-only as needed.
 Incomplete coverage cannot pass. Filtering which findings become inline comments
 does not remove them from the assessment. A new head requires a new assessment;
 old runs cannot publish over the latest head. One current summary is updated in
-place, with history and task/run links retained. Stable finding keys prevent
-duplicate inline comments on repeated reviews.
+place. The summary's own links point to GitHub: the reviewed commit, the pull
+request, and finding locations. Stable finding keys prevent duplicate inline
+comments on repeated reviews.
 
-The check's **Details** link opens its Paperclip task on the current instance
-hostname, or the connector's Reviews page when no task has been created yet.
+The check's **Details** link opens the pull request on GitHub.
 
 Formal **APPROVE** and **REQUEST_CHANGES** are separate governed tools, each off
 by default. Enabling either does not automatically perform it. A score of 5/5

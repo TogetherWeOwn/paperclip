@@ -102,7 +102,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -11620,11 +11620,29 @@ export function issueService(db: Db) {
           return { ownership: sameRunOwnership, latest: null };
 
         if (canAdoptUnownedCheckout(candidate)) {
-          const adopted = await adoptUnownedCheckoutRun({
-            issueId: id,
-            actorAgentId,
-            actorRunId: actorRunId!,
-          });
+          let adopted: Awaited<ReturnType<typeof adoptUnownedCheckoutRun>>;
+          try {
+            adopted = await adoptUnownedCheckoutRun({
+              issueId: id,
+              actorAgentId,
+              actorRunId: actorRunId!,
+            });
+          } catch (error) {
+            if (
+              isUniqueViolation(error, "issues_open_routine_execution_uq")
+            ) {
+              throw conflict(
+                "Another execution for this routine is already in progress",
+                {
+                  code: "routine_execution_slot_held",
+                  issueId: id,
+                  actorAgentId,
+                  actorRunId,
+                },
+              );
+            }
+            throw error;
+          }
 
           if (adopted) {
             return {
@@ -11645,12 +11663,30 @@ export function issueService(db: Db) {
           candidate.checkoutRunId !== actorRunId
         ) {
           const previousCheckoutRunId = candidate.checkoutRunId;
-          const staleAdoption = await adoptStaleCheckoutRun({
-            issueId: id,
-            actorAgentId,
-            actorRunId,
-            expectedCheckoutRunId: previousCheckoutRunId,
-          });
+          let staleAdoption: Awaited<ReturnType<typeof adoptStaleCheckoutRun>>;
+          try {
+            staleAdoption = await adoptStaleCheckoutRun({
+              issueId: id,
+              actorAgentId,
+              actorRunId,
+              expectedCheckoutRunId: previousCheckoutRunId,
+            });
+          } catch (error) {
+            if (
+              isUniqueViolation(error, "issues_open_routine_execution_uq")
+            ) {
+              throw conflict(
+                "Another execution for this routine is already in progress",
+                {
+                  code: "routine_execution_slot_held",
+                  issueId: id,
+                  actorAgentId,
+                  actorRunId,
+                },
+              );
+            }
+            throw error;
+          }
 
           if (staleAdoption.adopted) {
             return {
