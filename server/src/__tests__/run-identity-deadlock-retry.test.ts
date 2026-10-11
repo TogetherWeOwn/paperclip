@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
-import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -10,6 +8,8 @@ import {
   issues,
   secretAccessEvents,
 } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { describe, expect, it, vi } from "vitest";
 import { isDeadlockFailure, withDeadlockRetry } from "../db-errors.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { secretService } from "../services/secrets.js";
@@ -21,10 +21,13 @@ describe("isDeadlockFailure", () => {
   });
 
   it("matches the error Drizzle wraps around the driver failure", () => {
-    const wrapped = new Error('Failed query: select "id" from "heartbeat_runs" for update');
+    const wrapped = new Error(
+      'Failed query: select "id" from "heartbeat_runs" for update',
+    );
     (wrapped as { cause?: unknown }).cause = {
       code: "40P01",
-      message: 'deadlock detected: Process 1 waits for ShareLock on transaction 2; blocked by process 2',
+      message:
+        "deadlock detected: Process 1 waits for ShareLock on transaction 2; blocked by process 2",
     };
     expect(isDeadlockFailure(wrapped)).toBe(true);
   });
@@ -54,7 +57,10 @@ describe("withDeadlockRetry", () => {
     const result = await withDeadlockRetry(
       async () => {
         calls += 1;
-        if (calls < 3) throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+        if (calls < 3)
+          throw Object.assign(new Error("deadlock detected"), {
+            code: "40P01",
+          });
         return "recovered";
       },
       { maxAttempts: 4, baseDelayMs: 1 },
@@ -80,7 +86,9 @@ describe("withDeadlockRetry", () => {
       withDeadlockRetry(
         async () => {
           calls += 1;
-          throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+          throw Object.assign(new Error("deadlock detected"), {
+            code: "40P01",
+          });
         },
         { maxAttempts: 2, baseDelayMs: 1 },
       ),
@@ -148,7 +156,8 @@ async function waitForLockWaiter(observer: Db) {
       where datname = current_database() and wait_event_type = 'Lock'
     `)) as unknown as Array<{ waiting: number }>;
     if (row && row.waiting > 0) return;
-    if (Date.now() > deadline) throw new Error("no session started waiting on a row lock");
+    if (Date.now() > deadline)
+      throw new Error("no session started waiting on a row lock");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
@@ -183,9 +192,15 @@ async function seedRuntimeRun(db: Db, prefix: string) {
   const agentId = randomUUID();
   const issueId = randomUUID();
   const runId = randomUUID();
-  await db.insert(companies).values({ id: companyId, name: `${prefix} fixture`, issuePrefix: prefix });
-  await db.insert(agents).values({ id: agentId, companyId, name: `${prefix} agent` });
-  await db.insert(issues).values({ id: issueId, companyId, title: `${prefix} issue` });
+  await db
+    .insert(companies)
+    .values({ id: companyId, name: `${prefix} fixture`, issuePrefix: prefix });
+  await db
+    .insert(agents)
+    .values({ id: agentId, companyId, name: `${prefix} agent` });
+  await db
+    .insert(issues)
+    .values({ id: issueId, companyId, title: `${prefix} issue` });
   await db.insert(heartbeatRuns).values({
     id: runId,
     companyId,
@@ -230,14 +245,17 @@ async function withMasterKey<T>(fn: () => Promise<T>) {
   try {
     return await fn();
   } finally {
-    if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    if (previousKey === undefined)
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousKey;
   }
 }
 
 describe("runtime run-lock vs secret-access audit deadlock", () => {
   it("deadlocks the real audit insert against the run lock in the production FK order", async () => {
-    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-run-lock-deadlock-");
+    const temporary = await startEmbeddedPostgresTestDatabase(
+      "paperclip-run-lock-deadlock-",
+    );
     const db = createDb(temporary.connectionString);
     const otherDb = createDb(temporary.connectionString);
     try {
@@ -264,13 +282,20 @@ describe("runtime run-lock vs secret-access audit deadlock", () => {
         unguardedIssueLocked.gate.then(auditInsert),
       ]);
       expect(unguarded[0].status).toBe("fulfilled");
-      expect(unguarded[1].status, "expected the audit insert to lose the deadlock").toBe("rejected");
-      expect(isDeadlockFailure((unguarded[1] as PromiseRejectedResult).reason)).toBe(true);
+      expect(
+        unguarded[1].status,
+        "expected the audit insert to lose the deadlock",
+      ).toBe("rejected");
+      expect(
+        isDeadlockFailure((unguarded[1] as PromiseRejectedResult).reason),
+      ).toBe(true);
 
       const guardedIssueLocked = latch();
       await Promise.all([
         lockIssueThenRun(db, ids, guardedIssueLocked.release),
-        guardedIssueLocked.gate.then(() => withDeadlockRetry(auditInsert, { baseDelayMs: 1 })),
+        guardedIssueLocked.gate.then(() =>
+          withDeadlockRetry(auditInsert, { baseDelayMs: 1 }),
+        ),
       ]);
       const audits = await db
         .select({ id: secretAccessEvents.id })
@@ -285,12 +310,17 @@ describe("runtime run-lock vs secret-access audit deadlock", () => {
 
 describe("production wiring: captureRunIdentity vs secret audit", () => {
   it("drives captureRunIdentity itself into the run-lock/audit deadlock and survives", async () => {
-    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-run-identity-prod-");
+    const temporary = await startEmbeddedPostgresTestDatabase(
+      "paperclip-run-identity-prod-",
+    );
     const db = createDb(temporary.connectionString);
     const otherDb = createDb(temporary.connectionString);
     try {
       await matchProductionAuditFkOrder(db);
-      const { companyId, agentId, issueId, runId } = await seedRuntimeRun(db, "PW");
+      const { companyId, agentId, issueId, runId } = await seedRuntimeRun(
+        db,
+        "PW",
+      );
 
       // The audit side in the production FK order. Its first statement is the
       // KEY SHARE on the run row that the insert's first FK check takes;
@@ -298,7 +328,9 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
       // captureRunIdentity cannot be paused between its issue and run locks.
       const rawAuditInsert = async () =>
         otherDb.transaction(async (tx) => {
-          await tx.execute(sql`select id from heartbeat_runs where id = ${runId} for key share`);
+          await tx.execute(
+            sql`select id from heartbeat_runs where id = ${runId} for key share`,
+          );
           await tx.insert(secretAccessEvents).values({
             companyId,
             provider: "test",
@@ -340,7 +372,9 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
 
   it("root-bound resolveSecretValue keeps the audit row when its insert loses the deadlock", async () => {
     await withMasterKey(async () => {
-      const temporary = await startEmbeddedPostgresTestDatabase("paperclip-secret-root-deadlock-");
+      const temporary = await startEmbeddedPostgresTestDatabase(
+        "paperclip-secret-root-deadlock-",
+      );
       const db = createDb(temporary.connectionString);
       const otherDb = createDb(temporary.connectionString);
       try {
@@ -352,7 +386,12 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
         const [, value] = await Promise.all([
           lockIssueThenRun(db, ids, issueLocked.release),
           issueLocked.gate.then(() =>
-            secretService(otherDb).resolveSecretValue(ids.companyId, secret.id, "latest", runtimeAccess(ids)),
+            secretService(otherDb).resolveSecretValue(
+              ids.companyId,
+              secret.id,
+              "latest",
+              runtimeAccess(ids),
+            ),
           ),
         ]);
         expect(value).toBe("runtime-secret");
@@ -364,7 +403,11 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
           .from(secretAccessEvents)
           .where(eq(secretAccessEvents.secretId, secret.id));
         expect(events).toHaveLength(1);
-        expect(events[0]).toMatchObject({ issueId: ids.issueId, heartbeatRunId: ids.runId, outcome: "success" });
+        expect(events[0]).toMatchObject({
+          issueId: ids.issueId,
+          heartbeatRunId: ids.runId,
+          outcome: "success",
+        });
       } finally {
         await temporary.cleanup();
       }
@@ -373,7 +416,9 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
 
   it("transaction-bound resolveSecretValue retries in a savepoint so the caller's transaction survives", async () => {
     await withMasterKey(async () => {
-      const temporary = await startEmbeddedPostgresTestDatabase("paperclip-secret-savepoint-");
+      const temporary = await startEmbeddedPostgresTestDatabase(
+        "paperclip-secret-savepoint-",
+      );
       const db = createDb(temporary.connectionString);
       const otherDb = createDb(temporary.connectionString);
       try {
@@ -392,7 +437,9 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
           issueLocked.gate.then(() =>
             otherDb.transaction(async (tx) => {
               const savepointSpy = vi.spyOn(tx, "transaction");
-              const resolved = await secretService(tx as unknown as Db).resolveSecretValue(
+              const resolved = await secretService(
+                tx as unknown as Db,
+              ).resolveSecretValue(
                 ids.companyId,
                 secret.id,
                 "latest",
@@ -413,7 +460,11 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
           .from(secretAccessEvents)
           .where(eq(secretAccessEvents.secretId, secret.id));
         expect(events).toHaveLength(1);
-        expect(events[0]).toMatchObject({ issueId: ids.issueId, heartbeatRunId: ids.runId, outcome: "success" });
+        expect(events[0]).toMatchObject({
+          issueId: ids.issueId,
+          heartbeatRunId: ids.runId,
+          outcome: "success",
+        });
       } finally {
         await temporary.cleanup();
       }
@@ -422,14 +473,21 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
 
   it("resolveSecretValue records the audit row with issue/heartbeat context", async () => {
     await withMasterKey(async () => {
-      const temporary = await startEmbeddedPostgresTestDatabase("paperclip-resolve-audit-");
+      const temporary = await startEmbeddedPostgresTestDatabase(
+        "paperclip-resolve-audit-",
+      );
       const db = createDb(temporary.connectionString);
       try {
         const ids = await seedRuntimeRun(db, "RA");
         const secret = await seedBoundSecret(db, ids.companyId);
         const svc = secretService(db);
 
-        const value = await svc.resolveSecretValue(ids.companyId, secret.id, "latest", runtimeAccess(ids));
+        const value = await svc.resolveSecretValue(
+          ids.companyId,
+          secret.id,
+          "latest",
+          runtimeAccess(ids),
+        );
         expect(value).toBe("runtime-secret");
 
         const events = await db
@@ -437,14 +495,20 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
           .from(secretAccessEvents)
           .where(eq(secretAccessEvents.secretId, secret.id));
         expect(events).toHaveLength(1);
-        expect(events[0]).toMatchObject({ issueId: ids.issueId, heartbeatRunId: ids.runId, outcome: "success" });
+        expect(events[0]).toMatchObject({
+          issueId: ids.issueId,
+          heartbeatRunId: ids.runId,
+          outcome: "success",
+        });
 
         // Same production path bound to a caller-held transaction, as in the
         // broker mint: exactly one savepoint for the audit insert, and the
         // outer transaction stays usable.
         await db.transaction(async (tx) => {
           const savepointSpy = vi.spyOn(tx, "transaction");
-          const txValue = await secretService(tx as unknown as Db).resolveSecretValue(
+          const txValue = await secretService(
+            tx as unknown as Db,
+          ).resolveSecretValue(
             ids.companyId,
             secret.id,
             "latest",
@@ -462,7 +526,9 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
 
   it("root-bound secret audit inserts without opening an extra transaction", async () => {
     await withMasterKey(async () => {
-      const temporary = await startEmbeddedPostgresTestDatabase("paperclip-resolve-audit-root-");
+      const temporary = await startEmbeddedPostgresTestDatabase(
+        "paperclip-resolve-audit-root-",
+      );
       const db = createDb(temporary.connectionString);
       try {
         const ids = await seedRuntimeRun(db, "RR");
@@ -474,7 +540,12 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
         // suites (tool-access rollback, chat lifecycle) and regressed CI.
         const transactionSpy = vi.spyOn(db, "transaction");
         try {
-          const value = await svc.resolveSecretValue(ids.companyId, secret.id, "latest", runtimeAccess(ids));
+          const value = await svc.resolveSecretValue(
+            ids.companyId,
+            secret.id,
+            "latest",
+            runtimeAccess(ids),
+          );
           expect(value).toBe("runtime-secret");
           expect(transactionSpy).not.toHaveBeenCalled();
         } finally {
@@ -486,7 +557,11 @@ describe("production wiring: captureRunIdentity vs secret audit", () => {
           .from(secretAccessEvents)
           .where(eq(secretAccessEvents.secretId, secret.id));
         expect(events).toHaveLength(1);
-        expect(events[0]).toMatchObject({ issueId: ids.issueId, heartbeatRunId: ids.runId, outcome: "success" });
+        expect(events[0]).toMatchObject({
+          issueId: ids.issueId,
+          heartbeatRunId: ids.runId,
+          outcome: "success",
+        });
       } finally {
         await temporary.cleanup();
       }
