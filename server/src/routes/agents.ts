@@ -85,6 +85,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { handleObserverHeartbeatRuns, handleObserverLiveRuns, isObserverRequest } from "./observer.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -6640,8 +6641,86 @@ export function agentRoutes(
     }
   });
 
+  /**
+   * Observer live-run rows ([TOG-21648](/TOG/issues/TOG-21648)). A minimal
+   * column set selected for the observer projection: status/time/retry
+   * metadata plus the sanitized issue reference. Log stores/refs, session
+   * ids, usage, result JSON, stdout/stderr excerpts and process details are
+   * never selected here, so they cannot leak through the projection even if
+   * the JSON allowlist drifts. Pure selects only.
+   */
+  async function queryObserverLiveRunRows(
+    companyId: string,
+    filters: { limit: number; minCount: number },
+  ) {
+    const columns = {
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+      invocationSource: heartbeatRuns.invocationSource,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      errorCode: heartbeatRuns.errorCode,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
+      processLossRetryCount: heartbeatRuns.processLossRetryCount,
+      scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      continuationAttempt: heartbeatRuns.continuationAttempt,
+      livenessState: heartbeatRuns.livenessState,
+      livenessReason: heartbeatRuns.livenessReason,
+      lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+      lastOutputAt: heartbeatRuns.lastOutputAt,
+      startedAt: heartbeatRuns.startedAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      createdAt: heartbeatRuns.createdAt,
+      updatedAt: heartbeatRuns.updatedAt,
+      issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
+    };
+    const liveRows = await db
+      .select(columns)
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(filters.limit);
+    const targetRowCount = Math.min(filters.minCount, filters.limit);
+    if (targetRowCount > 0 && liveRows.length < targetRowCount) {
+      const activeIds = liveRows.map((row) => row.id);
+      const recentRows = await db
+        .select(columns)
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            not(inArray(heartbeatRuns.status, ["queued", "running"])),
+            ...(activeIds.length > 0 ? [not(inArray(heartbeatRuns.id, activeIds))] : []),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(targetRowCount - liveRows.length);
+      return [...liveRows, ...recentRows];
+    }
+    return liveRows;
+  }
+
   router.get("/companies/:companyId/heartbeat-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Bounded observer projection ([TOG-21648](/TOG/issues/TOG-21648)): before
+    // generic actor permissions. Pure heartbeat list reads plus the observer
+    // projection; run redactions and telemetry gates below are not entered.
+    if (isObserverRequest(req)) {
+      await handleObserverHeartbeatRuns(req, res, companyId, {
+        listHeartbeatRuns: (cid, agentId, limit, options) =>
+          heartbeat.list(cid, agentId, limit, options),
+      });
+      return;
+    }
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     const agentId = req.query.agentId as string | undefined;
@@ -6683,6 +6762,18 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Bounded observer projection ([TOG-21648](/TOG/issues/TOG-21648)): before
+    // generic actor permissions. Minimal observer columns plus the sanitized
+    // execution safety join; agent display fields, output silence and run
+    // redactions below are not entered.
+    if (isObserverRequest(req)) {
+      await handleObserverLiveRuns(req, res, companyId, {
+        queryLiveRuns: (cid, filters) => queryObserverLiveRunRows(cid, filters),
+        getExecutionProjections: (cid, runIds) =>
+          executionProjectionsForRuns(db, cid, runIds),
+      });
+      return;
+    }
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
 

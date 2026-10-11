@@ -1872,6 +1872,18 @@ export function authorizationService(db: Db | DbTransaction) {
       });
     }
 
+    // Observer credentials hold no generic permissions at all: their only
+    // authority is the HTTP-level observer ceiling plus the three pure
+    // observer projections, which never consult this service. Deny here so a
+    // future caller cannot mistake observer scope for standard visibility.
+    if (input.actor.keyScope?.kind === "observer") {
+      return deny({
+        action: input.action,
+        reason: "deny_scope",
+        explanation: "Observer keys carry no generic API permissions.",
+      });
+    }
+
     if (input.actor.keyScope?.kind === "skill_test") {
       const skillTestDecision = decideSkillTestAccess({
         action: input.action,
