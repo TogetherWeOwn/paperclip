@@ -71,6 +71,8 @@ pnpm dev
 
 ## 5. Core Engineering Rules
 
+Read `CONSTRAINTS.md` before writing code. Do not weaken it to make a change pass.
+
 1. Keep changes company-scoped.
 Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
 

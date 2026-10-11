@@ -45,6 +45,7 @@
     "lint:biome": "biome check .",
     "lint:biome:changed": "node scripts/quality-gates/biome-changed.mjs",
     "coverage:changed": "node scripts/quality-gates/coverage-changed.mjs",
+    "guard:floor": "node scripts/quality-gates/floor-guard.mjs",
     "test:quality-gates": "node --test scripts/quality-gates/*.test.mjs",
     "check:node-version": "node scripts/check-node-version-policy.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",

@@ -66,8 +66,12 @@ Actions minutes):
   vulnerable dependencies and leaked secrets.
 - Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
   gate scripts break.
+- Floor guard (`pnpm guard:floor`): HARD. It fails the pull request when the
+  diff adds suppressions, skips or deletes tests, strips assertions, leaves
+  stubs, or lowers a `CONSTRAINTS.md` threshold. See `CONSTRAINTS.md` (repo
+  root) for the full bar and `.constraintsignore` for tracked exemptions.
 
-Run `pnpm lint:biome:changed` before push. New checks add about 4-6 minutes of
+Run `pnpm lint:biome:changed` and `pnpm guard:floor` before push. New checks add about 4-6 minutes of
 CI on one runner. Record measured values in the pull request description.
 
 Workflow changes take effect after merge: `pr.yml` pins
