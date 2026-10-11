@@ -1,3 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 const {
@@ -200,5 +205,140 @@ describe("public push hygiene gate", () => {
     // that. The scanner must keep headroom and still fail closed on real git
     // failures (covered above).
     expect(EXEC_MAX_BUFFER).toBeGreaterThanOrEqual(64 * 1024 * 1024);
+  });
+
+  it("exercises the real git exec path on a >1MiB clean delta (kills the ENOBUFS mutant)", () => {
+    // Mutant: delete `maxBuffer: EXEC_MAX_BUFFER` from defaultExec. The
+    // constant assertion above stays green, but this test runs the real
+    // execSync path (no execFn) over a >1MiB delta and would exit 2 ENOBUFS.
+    const root = mkdtempSync(
+      join(
+        process.env.PAPERCLIP_RUN_SCRATCH_DIR ??
+          process.env.PAPERCLIP_SCRATCH_DIR ??
+          tmpdir(),
+        "public-push-hygiene-large-",
+      ),
+    );
+    const prevCwd = process.cwd();
+    try {
+      const git = (...args: string[]) =>
+        execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=CI Fixture",
+            "-c",
+            "user.email=ci-fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            ...args,
+          ],
+          { cwd: root, env: { PATH: process.env.PATH }, encoding: "utf8" },
+        ).trim();
+      git("init", "-q");
+      writeFileSync(join(root, "base.txt"), "base fixture\n");
+      git("add", ".");
+      git("commit", "-qm", "fixture base");
+      const base = git("rev-parse", "HEAD");
+      const lines = Array.from(
+        { length: 40000 },
+        (_, i) => `clean fixture line ${i} with no references`,
+      ).join("\n");
+      writeFileSync(join(root, "large.txt"), `${lines}\n`);
+      expect(lines.length).toBeGreaterThan(1024 * 1024);
+      git("add", ".");
+      git("commit", "-qm", "fixture large clean delta");
+      const head = git("rev-parse", "HEAD");
+      process.chdir(root);
+      const { log, error } = quiet();
+      const exitCode = runPublicPushHygieneCheck({
+        base,
+        head,
+        prefixes: PREFIXES,
+        log,
+        error,
+      });
+      expect(exitCode).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the whole-branch scan: a dirty commit followed by a clean commit still flags", () => {
+    // Guards the merge-base full-delta contract at the script level: only the
+    // last delta is clean, so a delta-scoped scan would exit 0 and hide the
+    // earlier dirty commit.
+    const root = mkdtempSync(
+      join(
+        process.env.PAPERCLIP_RUN_SCRATCH_DIR ??
+          process.env.PAPERCLIP_SCRATCH_DIR ??
+          tmpdir(),
+        "public-push-hygiene-delta-",
+      ),
+    );
+    const prevCwd = process.cwd();
+    try {
+      const git = (...args: string[]) =>
+        execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=CI Fixture",
+            "-c",
+            "user.email=ci-fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            ...args,
+          ],
+          { cwd: root, env: { PATH: process.env.PATH }, encoding: "utf8" },
+        ).trim();
+      git("init", "-q");
+      writeFileSync(join(root, "base.txt"), "base fixture\n");
+      git("add", ".");
+      git("commit", "-qm", "fixture base");
+      const base = git("rev-parse", "HEAD");
+      writeFileSync(join(root, "zz1.md"), `row cites ${DIRTY_ID}\n`);
+      git("add", ".");
+      git("commit", "-qm", `dirty fixture message Refs ${DIRTY_ID}`);
+      writeFileSync(join(root, "clean.txt"), "clean follow-up\n");
+      git("add", ".");
+      git("commit", "-qm", "clean follow-up");
+      const head = git("rev-parse", "HEAD");
+      process.chdir(root);
+      const { log, error } = quiet();
+      const exitCode = runPublicPushHygieneCheck({
+        base,
+        head,
+        prefixes: PREFIXES,
+        log: log as (...args: unknown[]) => void,
+        error: error as (...args: unknown[]) => void,
+      });
+      expect(exitCode).toBe(1);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("message references"),
+      );
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("zz1.md"));
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("push workflow scans from merge-base and never uses the dangling event.before", () => {
+    const workflow = readFileSync(
+      fileURLToPath(
+        new URL(
+          "../../../.github/workflows/public-push-hygiene.yml",
+          import.meta.url,
+        ),
+      ),
+      "utf8",
+    );
+    expect(workflow).toContain("git merge-base origin/master");
+    // The workflow comment explains why event.before is ignored; only an
+    // actual `${{ ... }}` interpolation would wire the dangling delta back in.
+    expect(workflow).not.toMatch(/\$\{\{\s*github\.event\.before/);
   });
 });
