@@ -28359,6 +28359,35 @@ export function heartbeatService(
             }
           }
 
+          if (
+            reason === "issue_continuation_needed" &&
+            ["done", "cancelled"].includes(issue.status)
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_continuation_issue_closed",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  code: "issue_continuation_issue_closed",
+                  reason: "Issue closed before the continuation run was created.",
+                  issueId: issue.id,
+                  actualStatus: issue.status,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
           const dependencyReadiness = await issuesSvc
             .listDependencyReadiness(issue.companyId, [issue.id], tx)
             .then((rows) => rows.get(issue.id) ?? null);
