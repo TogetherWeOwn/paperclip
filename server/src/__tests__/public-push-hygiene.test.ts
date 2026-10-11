@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 const {
   DEFAULT_PREFIXES,
+  EXEC_MAX_BUFFER,
   findInternalRefs,
   parseCommitRecords,
   resolvePrefixes,
@@ -192,5 +193,12 @@ describe("public push hygiene gate", () => {
       "PAPA",
       "ZED",
     ]);
+  });
+
+  it("raises the git exec buffer so large branch deltas do not ENOBUFS (exit 2)", () => {
+    // execSync defaults to 1 MiB; a two-week-old branch delta already nears
+    // that. The scanner must keep headroom and still fail closed on real git
+    // failures (covered above).
+    expect(EXEC_MAX_BUFFER).toBeGreaterThanOrEqual(64 * 1024 * 1024);
   });
 });

@@ -3,11 +3,12 @@ run-name: Public push hygiene ${{ github.sha }}
 
 # Branch-push coverage for CONTRIBUTING.md "No Internal Issue References".
 # PR workflows never see branch-only pushes, so this runs on every branch push
-# and scans exactly the pushed delta: new commit messages plus added tracked
-# lines. Master is excluded: merges land there already reviewed, and a
-# post-merge flag would have no recourse (history is never rewritten). This
-# assumes direct-to-master pushes stay disabled by branch protection; making
-# this check required is a repo-admin step owned by the Operator route.
+# and scans the whole branch delta from merge-base with origin/master: new
+# commit messages plus added tracked lines. Master is excluded: merges land
+# there already reviewed, and a post-merge flag would have no recourse
+# (history is never rewritten). This assumes direct-to-master pushes stay
+# disabled by branch protection; making this check required is a repo-admin
+# step owned by the Operator route.
 on:
   push:
     branches-ignore: [master]
@@ -35,26 +36,17 @@ jobs:
           node-version: 24
       - name: Scan pushed messages and added lines for internal tracker ids
         env:
-          PUSH_BEFORE: ${{ github.event.before }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
-          # PUSH_BEFORE is the previous head, but after a force-push/amend it is
-          # dangling (not on any ref) so a full fetch never brings it locally.
-          # Reusing it would fail closed on every amended push. Prefer it only
-          # when it resolves locally AND is an ancestor; otherwise fall back to
-          # merge-base, which scans a superset (whole branch delta) and stays
-          # fail-closed without false reds on rewritten history.
-          BASE=""
-          if [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
-            && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null \
-            && git merge-base --is-ancestor "$PUSH_BEFORE" "$PUSH_HEAD" 2>/dev/null; then
-            BASE="$PUSH_BEFORE"
-          else
-            echo "PUSH_BEFORE is new, missing, or not an ancestor (rewritten history); scanning from merge-base with origin/master." >&2
-          fi
-          if [ -z "$BASE" ]; then
-            BASE="$(git merge-base origin/master "$PUSH_HEAD")" \
-              || { echo "ERROR: could not resolve merge-base with origin/master; refusing to pass." >&2; exit 2; }
-          fi
+          # Always scan from merge-base with origin/master so the head status
+          # covers the whole branch delta:
+          # - merging master flags no master-owned commits/lines,
+          # - a clean follow-up push cannot hide an earlier dirty commit,
+          # - rewritten history and new branches need no special case
+          #   (github.event.before dangles after amend/force-push and only
+          #   covers the last delta, so it is ignored on purpose).
+          # cancel-in-progress stays safe because every run scans the full delta.
+          BASE="$(git merge-base origin/master "$PUSH_HEAD")" \
+            || { echo "ERROR: could not resolve merge-base with origin/master; refusing to pass." >&2; exit 2; }
           [ -n "$BASE" ] || { echo "ERROR: could not resolve scan base; refusing to pass." >&2; exit 2; }
           node scripts/check-public-push-hygiene.mjs --base "$BASE" --head "$PUSH_HEAD"

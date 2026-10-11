@@ -43,6 +43,10 @@ export const EXIT_CLEAN = 0;
 export const EXIT_FINDINGS = 1;
 export const EXIT_SCANNER_ERROR = 2;
 
+// execSync caps stdout at 1 MiB by default (ENOBUFS). Branch deltas that merge
+// master or cover weeks of history exceed that, so the scanner needs headroom.
+export const EXEC_MAX_BUFFER = 256 * 1024 * 1024;
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -132,7 +136,11 @@ export function scanDiffForRefs(diffOutput, prefixes = DEFAULT_PREFIXES) {
 }
 
 function defaultExec(cmd) {
-  return execSync(cmd, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+  return execSync(cmd, {
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: EXEC_MAX_BUFFER,
+  });
 }
 
 export function verifyRef(ref, execFn) {
