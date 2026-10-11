@@ -42,6 +42,12 @@
     "release:bootstrap-package": "node scripts/bootstrap-npm-package.mjs",
     "check:tokens": "node scripts/check-forbidden-tokens.mjs",
     "check:token-gates": "node scripts/check-token-gates.mjs && node scripts/sync-agent-palette-tokens.mjs --check && node scripts/sync-cliplab-character.mjs --check",
+    "lint:biome": "biome check .",
+    "lint:biome:changed": "node scripts/quality-gates/biome-changed.mjs",
+    "lint:ast-grep": "node scripts/quality-gates/ast-grep-changed.mjs",
+    "coverage:changed": "node scripts/quality-gates/coverage-changed.mjs",
+    "guard:floor": "node scripts/quality-gates/floor-guard.mjs",
+    "test:quality-gates": "node --test scripts/quality-gates/*.test.mjs",
     "check:node-version": "node scripts/check-node-version-policy.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "check:module-boundaries": "node scripts/check-module-boundaries.mjs",
@@ -92,7 +98,9 @@
     "test:lifecycle-baseline:typecheck": "tsc -p tests/lifecycle-baseline/tsconfig.json"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
     "@playwright/test": "^1.62.1",
+    "@vitest/coverage-v8": "^4.1.11",
     "agentmail": "^0.5.14",
     "cross-env": "^10.1.0",
     "esbuild": "^0.28.2",

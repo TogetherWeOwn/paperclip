@@ -1,0 +1,16 @@
+id: bash-source-env-export
+language: Bash
+severity: warning
+message: 'Export sourced .env assignments before invoking a child process.'
+rule:
+  all:
+  - pattern: $CMD $ENV
+  - not:
+      follows:
+        pattern: set -a
+        stopBy: end
+constraints:
+  CMD:
+    regex: ^(source|\.)$
+  ENV:
+    regex: \.env["']?$

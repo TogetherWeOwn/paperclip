@@ -1,0 +1,8 @@
+id: bash-gh-first-page-only
+snapshots:
+  gh api "repos/org/repo/issues/1/comments?per_page=100":
+    labels:
+    - source: gh api "repos/org/repo/issues/1/comments?per_page=100"
+      style: primary
+      start: 0
+      end: 54

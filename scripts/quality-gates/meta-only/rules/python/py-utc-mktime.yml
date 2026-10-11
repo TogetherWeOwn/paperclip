@@ -1,0 +1,6 @@
+id: py-utc-mktime
+language: Python
+severity: warning
+message: 'Do not convert a UTC timestamp through local mktime minus time.timezone.'
+rule:
+  pattern: time.mktime($STAMP) - time.timezone

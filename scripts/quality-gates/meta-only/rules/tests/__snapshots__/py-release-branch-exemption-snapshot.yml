@@ -1,0 +1,8 @@
+id: py-release-branch-exemption
+snapshots:
+  generated = head_ref.startswith("release-please--"):
+    labels:
+    - source: head_ref.startswith("release-please--")
+      style: primary
+      start: 12
+      end: 51

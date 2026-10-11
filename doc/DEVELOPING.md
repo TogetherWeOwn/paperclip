@@ -41,6 +41,55 @@ When changing the workflow path or branch, authorize the new reference before
 updating the caller. Retain older authorized SHA references while queued runs or
 supported reruns still use them.
 
+### Required checks and quality gates
+
+The required checks `ci / verify` and `ci / e2e` are the aggregate jobs `verify`
+and `e2e` in `.github/workflows/pr-trusted.yml`. The caller
+`.github/workflows/pr.yml` invokes that workflow on each pull request. `verify`
+aggregates the policy, typecheck, test, runner, build, Docker, and quality-gate
+lanes. `e2e` aggregates the sharded Playwright lanes. The serialized server
+suites and the canary dry run execute in the same workflow but do not gate
+`verify`.
+
+Phase-1 quality gates (job `quality_gates`, existing runners only, no paid
+Actions minutes):
+
+- Biome full scan (`pnpm lint:biome`): WARN. Reports on all code. It stays
+  report-only until existing code is clean.
+- Biome changed files (`pnpm lint:biome:changed`): HARD for newly added files;
+  findings on modified existing files are WARN until the repository baseline is
+  clean. Fix with `pnpm exec biome check --write <file>` (run it twice if
+  findings remain after the first pass).
+- Changed-test coverage report (`pnpm coverage:changed`): WARN. It runs coverage
+  for changed tests handled by the configured Vitest projects, else lists changed
+  source files without a colocated test. It does not compute changed-line coverage.
+- Supply chain (`pnpm audit`, Trivy `fs`, gitleaks `detect`): WARN. It reports
+  vulnerable dependencies and leaked secrets.
+- Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
+  gate scripts break.
+- Floor guard (`pnpm guard:floor`): WARN during calibration. It reports added
+  suppressions, skip calls in tests, deleted test files, net assertion-call
+  reductions, explicit not-implemented stubs, and lowered `CONSTRAINTS.md`
+  thresholds. See `CONSTRAINTS.md` (repo root) and `.constraintsignore` for the
+  current bar and tracked exemptions.
+- Shared ast-grep rules (`pnpm lint:ast-grep`): WARN. It scans changed files
+  with the vendored meta-only rule pack (26 rules with fixtures from the
+  ops-tooling `quality/meta-only-assets` branch) and verifies the fixtures
+  with `ast-grep test` in the same run. Resync procedure lives in
+  `scripts/quality-gates/meta-only/PROVENANCE.md`.
+- Review checklist (`scripts/quality-gates/meta-only/checklists/paperclip.yaml`):
+  the shared Muse one-question-per-request review protocol. It is manual
+  (layer 3), not a CI job: quote file, head SHA, lines, and exact excerpt
+  per answer.
+
+Run `pnpm lint:biome:changed` and `pnpm guard:floor` before push. New checks add about 5-8 minutes of
+CI on one runner. Record measured values in the pull request description.
+
+Workflow changes take effect after merge: `pr.yml` pins
+`pr-trusted.yml@master`, so a workflow pull request is validated by the
+previous master version. The new job first runs on pull requests opened after
+merge.
+
 ## Start Dev
 
 From repo root:

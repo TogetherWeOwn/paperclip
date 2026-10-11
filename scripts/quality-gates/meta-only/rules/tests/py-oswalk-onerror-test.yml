@@ -1,0 +1,5 @@
+id: py-oswalk-onerror
+valid:
+- "for root, dirs, files in os.walk(path, onerror=raise_error):\n    inspect(root)"
+invalid:
+- "for root, dirs, files in os.walk(path):\n    inspect(root)"

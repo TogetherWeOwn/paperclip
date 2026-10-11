@@ -1,0 +1,8 @@
+id: ts-probe-unbounded-buffer
+language: TypeScript
+severity: warning
+message: 'Use a bounded stream reader before allocating a probe response body.'
+rule:
+  pattern: $RESPONSE.arrayBuffer()
+files:
+- wrangler/src/**/*.ts

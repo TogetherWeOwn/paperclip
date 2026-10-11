@@ -1,0 +1,7 @@
+# Paths exempt from floor-guard code-pattern rules (suppressions, stubs, skips).
+# One glob per line; `#` comments and blanks are ignored.
+# These files necessarily contain the forbidden pattern strings themselves:
+# the guard's own implementation and its fixture-as-string unit tests.
+# CONSTRAINTS.md threshold/exception checks always apply and are never exempt.
+scripts/quality-gates/floor-guard.mjs
+scripts/quality-gates/floor-guard.test.mjs

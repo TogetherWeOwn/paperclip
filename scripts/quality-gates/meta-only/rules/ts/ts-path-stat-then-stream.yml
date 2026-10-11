@@ -1,0 +1,15 @@
+id: ts-path-stat-then-stream
+language: TypeScript
+severity: warning
+message: 'Open once, fstat the descriptor, and stream that same descriptor across atomic replacement.'
+rule:
+  kind: statement_block
+  all:
+  - has:
+      pattern: fs.statSync($PATH)
+      stopBy: end
+  - has:
+      any:
+      - pattern: fs.createReadStream($PATH)
+      - pattern: fs.createReadStream($PATH, $$$OPTIONS)
+      stopBy: end

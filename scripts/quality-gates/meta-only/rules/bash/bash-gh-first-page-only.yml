@@ -1,0 +1,11 @@
+id: bash-gh-first-page-only
+language: Bash
+severity: warning
+message: 'Explicit per_page=100 is not pagination; follow all pages or use a bounded cursor loop.'
+rule:
+  kind: command
+  all:
+  - regex: \bgh\s+api\b
+  - regex: per_page=100
+  - not:
+      regex: --paginate

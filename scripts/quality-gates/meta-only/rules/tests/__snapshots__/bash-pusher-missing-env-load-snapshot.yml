@@ -1,0 +1,14 @@
+id: bash-pusher-missing-env-load
+snapshots:
+  /opt/ops/push-db-backup-freshness.sh:
+    labels:
+    - source: /opt/ops/push-db-backup-freshness.sh
+      style: primary
+      start: 0
+      end: 36
+  /opt/ops/push-fleet-run-stall.sh:
+    labels:
+    - source: /opt/ops/push-fleet-run-stall.sh
+      style: primary
+      start: 0
+      end: 32

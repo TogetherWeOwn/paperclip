@@ -1,0 +1,10 @@
+id: bash-json-stderr-merge
+valid:
+- 'payload=$(python3 probe.py 2>probe.stderr)
+
+  parse_json "$payload"'
+- python3 probe.py >/dev/null 2>&1
+invalid:
+- 'payload=$(python3 probe.py 2>&1)
+
+  parse_json "$payload"'

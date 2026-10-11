@@ -1,0 +1,5 @@
+id: bash-gh-first-page-only
+valid:
+- gh api --paginate "repos/org/repo/issues/1/comments?per_page=100"
+invalid:
+- gh api "repos/org/repo/issues/1/comments?per_page=100"

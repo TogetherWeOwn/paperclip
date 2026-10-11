@@ -1,0 +1,6 @@
+id: ts-vacuous-literal-expect
+language: TypeScript
+severity: warning
+message: 'A literal-true assertion cannot observe production behavior.'
+rule:
+  pattern: expect(true).toBe(true)

@@ -1,0 +1,10 @@
+id: py-oswalk-onerror
+snapshots:
+  ? |-
+    for root, dirs, files in os.walk(path):
+        inspect(root)
+  : labels:
+    - source: os.walk(path)
+      style: primary
+      start: 25
+      end: 38

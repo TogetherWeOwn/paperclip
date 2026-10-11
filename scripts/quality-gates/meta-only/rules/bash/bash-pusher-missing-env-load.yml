@@ -1,0 +1,13 @@
+id: bash-pusher-missing-env-load
+language: Bash
+severity: warning
+message: 'Cron pusher recipes must load their documented env file before launching the child.'
+rule:
+  kind: command
+  all:
+  - regex: (?:^|/)(?:push-db-backup-freshness|push-fleet-run-stall|push-queue-forecast|push-operator-runs-disk)\.sh(?:\s|$)
+  - not:
+      follows:
+        kind: command
+        regex: ^(?:\.|source)\s+.*\.env
+        stopBy: end

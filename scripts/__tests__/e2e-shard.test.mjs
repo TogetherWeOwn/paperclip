@@ -225,6 +225,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     "verify_serialized_server",
     "canary_dry_run",
     "e2e_shards",
+    "quality_gates",
   ]) {
     assert.match(
       jobs.get(jobId),
@@ -242,7 +243,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity\]$/m,
+    /^ {4}needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, quality_gates\]$/m,
   );
   assert.match(verify, /POLICY_RESULT: \$\{\{ needs\.policy\.result \}\}/);
   assert.match(verify, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"/);
@@ -259,6 +260,12 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(verify, /DOCKER_CONTEXT_INTEGRITY_RESULT: \$\{\{ needs\.docker_context_integrity\.result \}\}/);
   assert.match(verify, /test "\$DOCKER_CONTEXT_INTEGRITY_RESULT" = "success"/);
   assert.match(verify, /test "\$DOCKER_CONTEXT_INTEGRITY_RESULT" = "skipped"/);
+  // Both halves of the quality-gates lane's gating: the result must be
+  // wired into the aggregate's env AND asserted successful on full CI —
+  // dropping either would let `verify` pass after the lane fails.
+  assert.match(verify, /QUALITY_GATES_RESULT: \$\{\{ needs\.quality_gates\.result \}\}/);
+  assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "success"/);
+  assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "skipped"/);
 
   const e2e = jobs.get("e2e");
   assert.match(e2e, /^ {4}needs: \[gate, policy, e2e_shards\]$/m);
@@ -325,12 +332,14 @@ test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
   // Test lanes no longer wait on a policy-job artifact: each install step
   // resolves a stale lockfile inline, so a manifest-changing or stacked PR
   // still installs while the policy job validates resolution in parallel.
+  // The quality_gates lane follows the same inline-resolution pattern, so it
+  // is the 8th counted install (was 7 before the phase-1 gates lane).
   const fallbackInstalls = workflow.match(
     /if ! pnpm install --frozen-lockfile; then\n[\s\S]{0,240}?pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile\n\s+pnpm install --frozen-lockfile\n\s+fi/g,
   ) ?? [];
   assert.equal(
     fallbackInstalls.length,
-    7,
+    8,
     "every downstream install job must resolve a stale lockfile inline",
   );
   assert.doesNotMatch(

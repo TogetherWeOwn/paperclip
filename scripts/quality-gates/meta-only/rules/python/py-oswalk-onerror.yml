@@ -1,0 +1,13 @@
+id: py-oswalk-onerror
+language: Python
+severity: warning
+message: 'A fail-closed tree scan must surface os.walk permission errors.'
+rule:
+  all:
+  - pattern: os.walk($$$ARGS)
+  - not:
+      has:
+        kind: argument_list
+        has:
+          kind: keyword_argument
+          regex: ^onerror\s*=

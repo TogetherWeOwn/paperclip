@@ -1,0 +1,7 @@
+id: py-redos-yaml-indent
+language: Python
+severity: warning
+message: 'Do not parse an indented YAML block with overlapping repeated whitespace matches.'
+rule:
+  kind: string
+  regex: \[\ \\t\]\+\.\*\\n

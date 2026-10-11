@@ -1,0 +1,8 @@
+id: bash-unquoted-db-url-ampersand
+snapshots:
+  DATABASE_URL=postgresql://example.invalid/db?sslmode=require&channel_binding=require:
+    labels:
+    - source: DATABASE_URL=postgresql://example.invalid/db?sslmode=require&channel_binding=require
+      style: primary
+      start: 0
+      end: 84
