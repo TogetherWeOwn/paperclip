@@ -8,8 +8,11 @@
  * acceptance is a separate downstream gate.
  *
  * Ceiling, in one place:
- * - one company (`OBSERVER_SCOPE_COMPANY_ID`), one purpose
- *   (`held-cap-zero-observation`), non-sliding validity of at most 35 minutes;
+ * - the key's company, one purpose (`held-cap-zero-observation`),
+ *   non-sliding validity of at most 35 minutes: the scope's `companyId` must
+ *   equal both the key's company and the route company on every request, so
+ *   no company id is pinned in shared code and the scope works on any
+ *   deployment once an authorized issuance act exists;
  * - ONLY `GET /api/companies/{companyId}/issues`,
  *   `GET /api/companies/{companyId}/heartbeat-runs` and
  *   `GET /api/companies/{companyId}/live-runs`, with the bounded query
@@ -38,9 +41,6 @@ import {
   observerAgentKeyScopeSchema,
   type ObserverAgentKeyScope,
 } from "@paperclipai/shared";
-
-/** The single admitted company for the held cap-zero observation. */
-export const OBSERVER_SCOPE_COMPANY_ID = "ef993a7e-5ea7-445f-ba88-27a6a2690c3a";
 
 /** Observer query bounds. */
 export const OBSERVER_ISSUES_LIMIT_DEFAULT = 500;
@@ -106,8 +106,10 @@ export type ObserverScopeCheck =
 
 /**
  * Validate an observer scope: shape (including the at-most-35-minute total
- * window), the fixed admitted company, and the non-sliding validity window
- * against `now`. Call on every request; never cache the result.
+ * window) and the non-sliding validity window against `now`. Call on every
+ * request; never cache the result. Company binding happens in
+ * `checkObserverCeiling`, which requires the scope company to equal both the
+ * key company and the route company.
  */
 export function validateObserverScope(
   scope: unknown,
@@ -122,13 +124,6 @@ export function validateObserverScope(
     };
   }
   const valid = parsed.data;
-  if (valid.companyId !== OBSERVER_SCOPE_COMPANY_ID) {
-    return {
-      ok: false,
-      code: "INVALID_OBSERVER_SCOPE",
-      error: "Observer scope company is outside this admission",
-    };
-  }
   const nowMs = now.getTime();
   const issuedMs = Date.parse(valid.issuedAt);
   const expiresMs = Date.parse(valid.expiresAt);
@@ -186,8 +181,7 @@ export function checkObserverCeiling(input: {
   if (!scopeCheck.ok) return scopeCheck;
   if (
     route.companyId !== scopeCheck.scope.companyId ||
-    route.companyId !== observer.companyId ||
-    route.companyId !== OBSERVER_SCOPE_COMPANY_ID
+    route.companyId !== observer.companyId
   ) {
     return {
       ok: false,

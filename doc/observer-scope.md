@@ -7,8 +7,11 @@ deployment or security acceptance.
 
 ## What it is
 
-- One company, one purpose (`held-cap-zero-observation`), non-sliding
-  validity of at most 35 minutes.
+- The key's company, one purpose (`held-cap-zero-observation`), non-sliding
+  validity of at most 35 minutes. The scope's `companyId` must equal both the
+  key's company and the URL company on every request; no company id is pinned
+  in code, so the scope works on any deployment once an authorized issuance
+  act exists.
 - ONLY `GET /api/companies/{companyId}/issues`,
   `GET /api/companies/{companyId}/heartbeat-runs` and
   `GET /api/companies/{companyId}/live-runs`, with bounded query allowlists

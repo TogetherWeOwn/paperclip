@@ -572,8 +572,8 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
-  // Observer deny-by-default ceiling ([TOG-21648](/TOG/issues/TOG-21648)):
-  // after actor resolution on purpose, before every route, so observer
+  // Observer deny-by-default ceiling: after actor resolution on purpose,
+  // before every route, so observer
   // credentials can never reach generic permissions or mutation handlers.
   app.use(observerCeiling());
   app.use("/api/auth", authRoutes(db));

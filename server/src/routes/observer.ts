@@ -15,7 +15,8 @@ import {
  *
  * Pure projections from read services — never the recovery-revalidating issue
  * GET handler. Each handler re-validates the observer ceiling (scope shape,
- * admitted company, non-sliding expiry) on the request, validates the bounded
+ * scope/key/route company binding, non-sliding expiry) on the request,
+ * validates the bounded
  * query allowlist, calls ONLY the injected pure read deps, and returns the
  * allowlisted projection. There are no write-capable deps by construction:
  * recovery revalidation, scheduling and business-state writes cannot be

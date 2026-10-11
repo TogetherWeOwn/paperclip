@@ -755,7 +755,8 @@ describe.sequential("agent cross-tenant route authorization", () => {
     const now = Date.now();
     const observerScope = {
       kind: "observer",
-      companyId: "ef993a7e-5ea7-445f-ba88-27a6a2690c3a",
+      // Synthetic fixture company (never a real instance id).
+      companyId: "c0ffee00-1234-4abc-8def-000000000001",
       purpose: "held-cap-zero-observation",
       issuedAt: new Date(now - 60_000).toISOString(),
       expiresAt: new Date(now + 10 * 60_000).toISOString(),

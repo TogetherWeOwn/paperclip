@@ -6,7 +6,8 @@ import { checkObserverCeiling } from "../services/observer-scope.js";
  *
  * Mount immediately after actor resolution (after `cloudControlMiddleware`)
  * and before every route: an observer actor may reach ONLY its three GET
- * read paths with a live, in-window scope for the admitted company. All other
+ * read paths with a live, in-window scope for the key's company (scope, key
+ * and route companies must all match). All other
  * verbs (including HEAD/OPTIONS), paths, companies, expired/revoked scopes
  * and malformed scopes end here with 403/400 and never reach generic actor
  * permissions, mutation handlers or cached elevated authority. Revocation is

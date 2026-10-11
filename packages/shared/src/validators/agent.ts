@@ -189,16 +189,15 @@ export const skillTestAgentKeyScopeSchema = z.object({
 }).strict();
 
 /**
- * Bounded native observation scope for the held cap-zero observation
- * ([TOG-21648](/TOG/issues/TOG-21648), CISO boundary `a983eaa4-...`).
+ * Bounded native observation scope for one short-lived, read-only
+ * observation (no issuance endpoint; scopes exist only as synthetic test
+ * fixtures until a later authorized issuance act).
  *
- * Immutable deny-by-default ceiling: one company, one purpose, non-sliding
- * validity of at most 35 minutes. The schema only bounds the shape and the
- * total window length; the server enforces the fixed admitted company,
- * per-request expiry/revocation, the three permitted GET route templates and
- * the bounded query allowlist. There is no issuance endpoint in this
- * admission: scope rows only appear as synthetic test fixtures until a later
- * authorized issuance act.
+ * Immutable deny-by-default ceiling: the key's company, one purpose,
+ * non-sliding validity of at most 35 minutes. The schema only bounds the
+ * shape and the total window length; the server enforces the scope/key/route
+ * company binding, per-request expiry/revocation, the three permitted GET
+ * route templates and the bounded query allowlist.
  */
 export const OBSERVER_SCOPE_PURPOSE = "held-cap-zero-observation" as const;
 export const OBSERVER_SCOPE_MAX_TTL_MS = 35 * 60 * 1000;

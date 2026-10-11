@@ -184,7 +184,8 @@ describe("setupLiveEventsWebSocketServer", () => {
 });
 
 describe("live-events websocket agent-key scopes", () => {
-  const OBSERVER_COMPANY = "ef993a7e-5ea7-445f-ba88-27a6a2690c3a";
+  // Synthetic fixture company (never a real instance id).
+  const OBSERVER_COMPANY = "c0ffee00-1234-4abc-8def-000000000001";
 
   function observerScopeFixture() {
     const now = Date.now();

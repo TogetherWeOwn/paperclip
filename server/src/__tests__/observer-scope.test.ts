@@ -3,7 +3,8 @@
  * for the held cap-zero flow.
  *
  * No production, no live issuance, no real credentials: every scope under test
- * is a synthetic fixture for the single admitted company. Positive controls
+ * is a synthetic fixture for a fixture company (never a real instance id).
+ * Positive controls
  * cover all three permitted read paths with consumer-shaped queries;
  * negative controls cover writes, unused reads, cross-company access,
  * invalid scopes, expiry, revocation-shaped denial and role-elevation bypass.
@@ -34,7 +35,6 @@ import {
 import {
   asObserverActor,
   checkObserverCeiling,
-  OBSERVER_SCOPE_COMPANY_ID,
   parseObserverHeartbeatQuery,
   parseObserverIssuesQuery,
   parseObserverLiveQuery,
@@ -44,7 +44,10 @@ import {
   validateObserverScope,
 } from "../services/observer-scope.js";
 
-const COMPANY = OBSERVER_SCOPE_COMPANY_ID;
+// Synthetic fixture companies (never a real instance id). The ceiling binds
+// the scope company to the key company and the route company on every
+// request; no company is pinned in shared code.
+const COMPANY = "c0ffee00-1234-4abc-8def-000000000001";
 const OTHER_COMPANY = "11111111-2222-4333-8444-555555555555";
 
 function validScope(overrides: Record<string, unknown> = {}) {
@@ -76,9 +79,9 @@ describe("validateObserverScope", () => {
     expect(check.ok).toBe(true);
   });
 
-  it("denies a scope for another company", () => {
+  it("accepts any well-formed company id; the ceiling binds it to the key and route", () => {
     const check = validateObserverScope(validScope({ companyId: OTHER_COMPANY }));
-    expect(check.ok).toBe(false);
+    expect(check.ok).toBe(true);
   });
 
   it("denies malformed scopes without falling back to standard", () => {
