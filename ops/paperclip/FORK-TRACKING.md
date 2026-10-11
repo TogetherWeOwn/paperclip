@@ -8,7 +8,7 @@ Range: `75970755a8` (`origin/deploy/tog6` tip at audit time) .. `origin/master`
 (`9986806907`) — 41 master-only commits. Fork PR #84 was never merged to
 master; deploy already carries it via `ba1461caeb` (port #106), so it has no row.
 
-Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkouts that lost `.git`) + supplemental `9c0a032b` (#109, port of #102 `b29df24e`, stranded-evidence runId fallback; outside the 41-commit audit range so the audit count stays frozen).
+Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkouts that lost `.git`) + supplemental `9c0a032b` (#109, port of #102 `b29df24e`, stranded-evidence runId fallback; outside the 41-commit audit range so the audit count stays frozen) + supplemental `e4dcdade` (#110, wake-prompt rule that keeps tracker-id branch names off public repos plus merged-PR delivery by head SHA; also outside the audit range; ported from `fix/card-free-publish-warning-tog6`, merge SHA recorded here once merged).
 
 | SHA | Subject | Verdict | Reason |
 |-----|---------|---------|--------|
@@ -39,6 +39,7 @@ Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkou
 | ca25997c | fix(ssh): exclude agent-local scratch from sync, cap sync-back size (#56) | keep-for-tog.9 | Follow-up port: ENOSPC via /tmp staging. |
 | e54004b9 | fix(issues): low-trust assignee may close its own blocked card (#66) | keep-for-tog.9 | Follow-up port: blocked-card close behavior fix. |
 | b3aad750 | fix(sync): tolerate nested checkouts that lost .git (#61) | keep-for-tog.9 (ported via #108) | Ported on the deploy line via `877a4a0ffff2b9420575e6a041fd606172259a75` (#108); fixes the nested-toolkit setup failure on the deploy line. Supplemental #102 ported via `9c0a032bb9d31b67c5140fc1a9cd6d3fa1855057` (#109, outside audit range). |
+| e4dcdade | fix(adapter-utils): warn against publishing card-named branches on public repos (#110) | supplemental (ported via fork PR from `fix/card-free-publish-warning-tog6`) | Outside the audit range, so no audit count. Deploy `server-utils.ts:2673` still ended at "keep all commits on it." and `execution-workspaces.ts` still matched the PR head ref to the workspace branch name. The port adds the public-repo publish rule (push HEAD to a card-free ref) and treats a merged PR whose head SHA equals the workspace HEAD as delivered, so card-free refs do not leave workspaces unmerged. Applied cleanly (4 files, +58/-5). |
 | 7d7871b5 | fix(adapter-utils): prevent managed GitHub launcher recursion | keep-for-tog.9 | Follow-up port: launcher recursion bug; no deploy equivalent. |
 | f2f1bad2 | fix(adapter-utils): match managed launchers by exact SHA-256 (#74) | keep-for-tog.9 | Follow-up port: legacy fingerprint accepted forged launchers. |
 | 37964f2b | feat(connections): server-mediated GET-only GitHub Actions diagnostics (#75) | keep-for-tog.9 | Follow-up port: additive read-only review-bot diagnostics parity. |
@@ -54,4 +55,4 @@ Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkou
 | 1c470343 | fix(chat-github): search all check runs before replacement (#100) | keep-for-tog.9 | Follow-up port: latest-only lookup caused duplicate POSTs. Deploy-tip #105 does not cover it (different change). |
 | 99868069 | ci(workflows): repair validation and prevent fork publication (#40) | not-needed | CI-only validation + publication guard. |
 
-Counts: keep-for-tog.9: 29 (1 ported here, 28 as follow-up small PRs) · already-equivalent: 5 · not-needed: 7.
+Counts (audit range only; the supplemental #109 and #110 rows are outside it): keep-for-tog.9: 29 (1 ported here, 28 as follow-up small PRs) · already-equivalent: 5 · not-needed: 7.
