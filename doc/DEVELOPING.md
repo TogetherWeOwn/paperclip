@@ -58,7 +58,8 @@ Actions minutes):
   report-only until existing code is clean.
 - Biome changed files (`pnpm lint:biome:changed`): HARD for newly added files;
   findings on modified existing files are WARN until the repository baseline is
-  clean. Fix with `pnpm exec biome check --write <file>`.
+  clean. Fix with `pnpm exec biome check --write <file>` (run it twice if
+  findings remain after the first pass).
 - Changed-test coverage report (`pnpm coverage:changed`): WARN. It runs coverage
   for changed tests handled by the configured Vitest projects, else lists changed
   source files without a colocated test. It does not compute changed-line coverage.

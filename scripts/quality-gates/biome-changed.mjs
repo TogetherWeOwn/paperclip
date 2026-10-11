@@ -18,11 +18,16 @@ import {
   resolveRange,
 } from "./changed.mjs";
 
-const { base, head } = resolveRange();
-const changed = getChangedFiles(base, head).filter(isBiomeFile);
-const addedSet = new Set(getAddedFiles(base, head));
-const added = changed.filter((file) => addedSet.has(file));
-const modified = changed.filter((file) => !addedSet.has(file));
+/**
+ * Build the `pnpm exec biome check` args for a file set.
+ *
+ * `--no-errors-on-unmatched` keeps the HARD gate green when every added file
+ * is skipped by Biome (oversized snapshots over `files.maxSize`, or VCS-ignored
+ * files): without it Biome exits 1 with "No files were processed".
+ */
+export function buildBiomeCheckArgs(files) {
+  return ["exec", "biome", "check", "--no-errors-on-unmatched", ...files];
+}
 
 function check(files, severity) {
   if (files.length === 0) {
@@ -32,7 +37,7 @@ function check(files, severity) {
   for (const file of files) {
     console.log(`  ${file}`);
   }
-  const result = spawnSync("pnpm", ["exec", "biome", "check", ...files], {
+  const result = spawnSync("pnpm", buildBiomeCheckArgs(files), {
     stdio: "inherit",
   });
   if (result.error) {
@@ -54,12 +59,26 @@ function check(files, severity) {
   }
 }
 
-check(modified, "WARN");
-check(added, "HARD");
-if (changed.length === 0) {
-  console.log(
-    `biome-changed: no Biome-handled files changed (${base}...${head}).`,
-  );
-} else {
-  console.log("biome-changed: PASS. New files satisfy Biome.");
+function main() {
+  const { base, head } = resolveRange();
+  const changed = getChangedFiles(base, head).filter(isBiomeFile);
+  const addedSet = new Set(getAddedFiles(base, head));
+  const added = changed.filter((file) => addedSet.has(file));
+  const modified = changed.filter((file) => !addedSet.has(file));
+
+  check(modified, "WARN");
+  check(added, "HARD");
+  if (changed.length === 0) {
+    console.log(
+      `biome-changed: no Biome-handled files changed (${base}...${head}).`,
+    );
+  } else {
+    console.log("biome-changed: PASS. New files satisfy Biome.");
+  }
+}
+
+// When imported by the test, only the args builder is used; the gate runs
+// solely when executed directly (same guard as floor-guard.mjs).
+if (process.argv[1]?.endsWith("biome-changed.mjs")) {
+  main();
 }

@@ -2,8 +2,8 @@
 /**
  * floor-guard.mjs
  *
- * HARD gate: fail the change when the diff lowers the quality bar instead of
- * meeting it. Adapted from the constraint-driven-development skill reference
+ * WARN gate during calibration: report the change when the diff lowers the
+ * quality bar instead of meeting it. Adapted from the constraint-driven-development skill reference
  * (references/floor-guard.md); the diff plumbing and exit-code contract are
  * unchanged, the patterns are adapted to this repo's stack.
  *
