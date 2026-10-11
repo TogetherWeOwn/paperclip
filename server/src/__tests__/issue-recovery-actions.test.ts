@@ -39,6 +39,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { executionProjectionsForRuns } from "../services/execution-projection.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -579,8 +580,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
       evidence: expect.objectContaining({
         routingPolicy: "board_escalation_no_takeover_v1",
+        latestRunId: latestRun.id,
+        sourceRunId: null,
       }),
     });
+    // execution-projection matches evidence.runId to the run id: a stranded
+    // action must not carry it, or the failed run flips to recovery_needed
+    // and hides the chat "Try again" and run Retry controls.
+    expect(actionRows[0].evidence).not.toHaveProperty("runId");
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(updatedIssue).toMatchObject({
@@ -876,6 +883,43 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
     expect(active).not.toBeNull();
     expect(active!.id).not.toBe(firstActionId);
+  });
+
+  it("leaves a fresh stranded failed run projected as failed, not recovery_needed", async () => {
+    // Regression guard: execution-projection attaches any active action whose
+    // evidence.runId or evidence.sourceRunId equals the run id. A stranded
+    // action must not link its failed run that way, or the chat "Try again"
+    // and run Retry controls disappear behind a recovery_needed phase.
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId,
+      issueId: sourceIssue.id,
+      status: "failed",
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: async () => null });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: runId,
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      } as const,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const projections = await executionProjectionsForRuns(db, companyId, [runId]);
+    expect(projections.get(runId)).toMatchObject({
+      phase: "failed",
+      recoveryOwner: null,
+    });
   });
 
   // Model the production payload: `requestedRef` keeps the operator spelling,
