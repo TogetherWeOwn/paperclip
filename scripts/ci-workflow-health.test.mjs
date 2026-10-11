@@ -141,7 +141,7 @@ test("forks reject every publishing job even with otherwise successful prerequis
   }
 });
 
-test("changes gates omit unrelated PR work but run full master/nightly and dependency changes", () => {
+test("PR selection runs all non-docs work while master, nightly and explicit calls always run", () => {
   for (const scope of ["docker", "smoke", "release", "workflows"]) {
     assert.equal(affectedWork("pull_request", scope, ["doc/PRODUCT.md"]), false);
     for (const event of ["push", "schedule", "workflow_dispatch", "workflow_call"]) assert.equal(affectedWork(event, scope, []), true);
@@ -172,7 +172,7 @@ test("only docs-only paths are unaffected; every other path fails closed", () =>
   }
 });
 
-test("a PR that edits the classifier is decided by the trusted base copy, not its own", () => {
+test("a PR that edits the classifier is affected under the base copy, while its own edited copy would skip", () => {
   const trusted = readFileSync(fileURLToPath(new URL("./ci-affected-work.mjs", import.meta.url)), "utf8");
   const edited = 'import { appendFileSync } from "node:fs";\nappendFileSync(process.env.GITHUB_OUTPUT, "affected=false\\n");\n';
   const scratch = process.env.PAPERCLIP_RUN_SCRATCH_DIR || process.env.PAPERCLIP_SCRATCH_DIR || process.env.RUNNER_TEMP || tmpdir();
@@ -223,6 +223,7 @@ test("ci-changes runs the classifier from the trusted base and fetches the PR he
   assert.match(setup, /fetch-depth: 0/);
   assert.match(setup, /persist-credentials: false/);
   assert.doesNotMatch(changes, /ref: \$\{\{ github\.event\.pull_request\.head/);
+  assert.equal(changes.match(/uses: actions\/checkout/g).length, 1, "the only checkout is the base checkout");
 });
 
 test("PR selection includes removed and added paths in real Git renames", () => {
