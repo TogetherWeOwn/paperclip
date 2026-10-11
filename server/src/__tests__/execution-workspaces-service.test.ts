@@ -1033,7 +1033,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   });
 
-  it("does not trust directly linked merged products for a different repository or branch", async () => {
+  it("does not trust directly linked merged products for a different repository or a different head commit", async () => {
     const seeded = await seedTerminalWorkspace();
     await db.insert(issueWorkProducts).values([
       {
