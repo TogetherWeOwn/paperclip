@@ -48,20 +48,31 @@ on:
 permissions: {}
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+    permissions:
+      contents: read
+    with:
+      scope: smoke
+
   smoke_source:
+    needs: changes
+    if: needs.changes.outputs.affected == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
 
-    # Fixed here rather than read back out of the harness, so the `always()`
-    # diagnostics steps below still know the log path when the boot step is
-    # the thing that failed. Reading it back was why a failing smoke once
-    # uploaded no logs at all.
-    env:
-      SMOKE_LOG_FILE: ${{ runner.temp }}/source-onboard-smoke.log
-
     steps:
+      # runner.temp is available in step env, not job env. Initialize before
+      # checkout/install so diagnostics survive even a failure before boot.
+      - name: Initialize failed-boot diagnostics
+        env:
+          SMOKE_LOG_FILE: ${{ runner.temp }}/source-onboard-smoke.log
+        run: |
+          echo "SMOKE_LOG_FILE=$SMOKE_LOG_FILE" >> "$GITHUB_ENV"
+          printf 'Source smoke has not reached boot.\n' > "$SMOKE_LOG_FILE"
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

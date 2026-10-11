@@ -45,7 +45,7 @@ test("canary reuses exact-source proof while stable keeps full verification", ()
   assert.match(canary, /SOURCE_SHA: \$\{\{ github\.sha \}\}/);
   assert.match(canary, /run: node scripts\/cloud-source-verification\.mjs "\$SOURCE_SHA"/);
   assert.doesNotMatch(canary, /release-verify\.yml|continue-on-error|always\(\)/);
-  assert.match(releaseWorkflow, /publish_canary:\n\s+if: github\.event_name == 'push'\n\s+needs: verify_canary/);
+  assert.match(releaseWorkflow, /publish_canary:\n\s+if: github\.repository == 'paperclipai\/paperclip' && github\.event_name == 'push'\n\s+needs: verify_canary/);
   // The stable lane is gated on the stable channel since the nightly lane
   // was added; a `needs:` line (for example a preflight job) may sit between
   // the gate and the delegation.
