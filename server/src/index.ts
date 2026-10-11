@@ -11,6 +11,7 @@ import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
+import { sweepWorkspaceValidationRecoveries } from "./services/workspace-validation-sweep.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
@@ -1357,6 +1358,40 @@ async function startServerWithDatabaseTeardown(
         }));
     };
 
+    let workspaceValidationSweepInFlight = false;
+    let lastWorkspaceValidationSkipLogAt = 0;
+    const scheduleWorkspaceValidationRecoverySweep = () => {
+      if (heartbeatSchedulerStopped || workspaceValidationSweepInFlight) return;
+      workspaceValidationSweepInFlight = true;
+      trackHeartbeatSchedulerWork(sweepWorkspaceValidationRecoveries(db, {
+        limit: 5,
+        wakeup: heartbeat.wakeup,
+      })
+        .then((result) => {
+          if (result.restored > 0 || result.refused > 0) {
+            logger.info(
+              { restored: result.restored, refused: result.refused, skipped: result.skipped },
+              "workspace validation recovery sweep changed workspace state",
+            );
+          }
+          const skipped = Object.values(result.skipped).reduce((total, count) => total + count, 0);
+          const nowMs = Date.now();
+          if (skipped > 0 && nowMs - lastWorkspaceValidationSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
+            lastWorkspaceValidationSkipLogAt = nowMs;
+            logger.info(
+              { skipped: result.skipped, deferred: result.deferred },
+              "workspace validation recovery sweep skipped candidates",
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "workspace validation recovery sweep failed");
+        })
+        .finally(() => {
+          workspaceValidationSweepInFlight = false;
+        }));
+    };
+
     // The restart-safe cleanup backstop for adapter login sessions. The
     // in-process five-minute timer stays the primary control. This reaper runs
     // on startup and on the scheduler interval. It deletes the login sandbox for
@@ -1664,6 +1699,7 @@ async function startServerWithDatabaseTeardown(
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleWorkspaceValidationRecoverySweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
