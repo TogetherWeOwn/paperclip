@@ -20610,6 +20610,26 @@ export function heartbeatService(
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (claimed) claimedRuns.push(claimed);
         } catch (error) {
+          // claimQueuedRun also does work after its claim transaction commits
+          // (events, wake status, issue lock stamp). If the throw came from
+          // there, the run is already `running`: dispatch it rather than leave
+          // it without an executor.
+          const committed = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, queuedRun.id))
+            .then((rows) => rows[0] ?? null)
+            .catch(() => null);
+          if (committed?.status === "running") {
+            claimedRuns.push(committed);
+            logger.error(
+              { err: error, runId: queuedRun.id, agentId },
+              "queued run claim threw after commit; dispatching the committed claim",
+            );
+            if (isUniqueViolation(error, "issues_open_routine_execution_uq")) continue;
+            claimFailure = { error };
+            break;
+          }
           if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
             // Another run already holds this routine's execution slot. The
             // claim transaction rolled back, so the run is still queued and

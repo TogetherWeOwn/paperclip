@@ -81,7 +81,9 @@ describeEmbeddedPostgres("dispatch claim batch with a conflicting routine slot",
       .where(eq(heartbeatRuns.status, "running"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await db.execute(sql`drop trigger if exists claim_batch_test_explode on issues`);
+    await db.execute(sql`drop trigger if exists claim_batch_test_explode on agent_wakeup_requests`);
     await db.execute(sql`drop function if exists claim_batch_test_explode()`);
+    await db.execute(sql`drop sequence if exists claim_batch_test_fired`);
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(issueRelations);
@@ -241,13 +243,54 @@ describeEmbeddedPostgres("dispatch claim batch with a conflicting routine slot",
       for each row execute function claim_batch_test_explode()
     `);
 
-    // Nothing was committed before the failure surfaced only if the first
-    // claim is abandoned; the committed first claim must still start.
+    // The second claim throws. The first claim already committed and must
+    // still start.
     await heartbeat.resumeQueuedRuns().catch(() => undefined);
 
     await waitFor(() => startedRunIds.includes(fixture.runIds[0]!));
     expect(startedRunIds).toEqual([fixture.runIds[0]]);
     expect((await runStatus(fixture.runIds[0]!))?.status).toBe("running");
     expect((await runStatus(fixture.runIds[1]!))?.status).toBe("queued");
+  });
+
+  it("dispatches a run whose claim threw after its transaction committed", async () => {
+    const fixture = await seed([{ routine: false, title: "postcommit" }]);
+    const wakeupId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      status: "queued",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ wakeupRequestId: wakeupId })
+      .where(eq(heartbeatRuns.id, fixture.runIds[0]!));
+    // The claim marks the wake `claimed` after its transaction commits. Fail
+    // that step once; a sequence is non-transactional, so the count survives
+    // the rollback.
+    await db.execute(sql`create sequence claim_batch_test_fired`);
+    await db.execute(sql`
+      create function claim_batch_test_explode() returns trigger as $$
+      begin
+        if new.status = 'claimed' and nextval('claim_batch_test_fired') = 1 then
+          raise exception 'post-commit claim step failure';
+        end if;
+        return new;
+      end;
+      $$ language plpgsql
+    `);
+    await db.execute(sql`
+      create trigger claim_batch_test_explode before update on agent_wakeup_requests
+      for each row execute function claim_batch_test_explode()
+    `);
+
+    await heartbeat.resumeQueuedRuns().catch(() => undefined);
+
+    await waitFor(() => startedRunIds.includes(fixture.runIds[0]!));
+    expect(startedRunIds).toEqual([fixture.runIds[0]]);
   });
 });
