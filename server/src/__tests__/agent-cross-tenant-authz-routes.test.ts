@@ -748,4 +748,44 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(res.body.error).toBe("Only agents in error status can have their error cleared");
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
+
+  it("denies observer scope issuance while standard minting still works", async () => {
+    // [TOG-21648](/TOG/issues/TOG-21648): no issuance in this admission.
+    // Synthetic fixture only; minting stays a separate later authorized act.
+    const now = Date.now();
+    const observerScope = {
+      kind: "observer",
+      companyId: "ef993a7e-5ea7-445f-ba88-27a6a2690c3a",
+      purpose: "held-cap-zero-observation",
+      issuedAt: new Date(now - 60_000).toISOString(),
+      expiresAt: new Date(now + 10 * 60_000).toISOString(),
+    };
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      companyIds: [companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    };
+
+    resetMockDefaults();
+    // Grant agents:create so the request reaches the issuance guard itself.
+    currentAccessCanUser = true;
+    const deniedApp = await createApp(boardActor);
+    const denied = await requestApp(deniedApp, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/keys`).send({ name: "observer", scope: observerScope }),
+    );
+    expect(denied.status).toBe(403);
+    expect(denied.body.code).toBe("OBSERVER_ISSUANCE_DENIED");
+    expect(mockAgentService.createApiKey).not.toHaveBeenCalled();
+
+    resetMockDefaults();
+    currentAccessCanUser = true;
+    const allowedApp = await createApp(boardActor);
+    const allowed = await requestApp(allowedApp, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/keys`).send({ name: "standard", scope: { kind: "standard" } }),
+    );
+    expect(allowed.status).toBe(201);
+    expect(mockAgentService.createApiKey).toHaveBeenCalledTimes(1);
+  });
 });

@@ -5687,6 +5687,16 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
+    // No observer issuance in this admission ([TOG-21648](/TOG/issues/TOG-21648)):
+    // minting/placement is a separate later authorized act. Observer scopes
+    // exist only as synthetic test fixtures until then.
+    if (req.body.scope?.kind === "observer") {
+      res.status(403).json({
+        error: "Observer scope issuance is not authorized",
+        code: "OBSERVER_ISSUANCE_DENIED",
+      });
+      return;
+    }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
       responsibleUserId: req.actor.userId ?? null,
     });
