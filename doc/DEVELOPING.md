@@ -41,6 +41,40 @@ When changing the workflow path or branch, authorize the new reference before
 updating the caller. Retain older authorized SHA references while queued runs or
 supported reruns still use them.
 
+### Required checks and quality gates
+
+The required checks `ci / verify` and `ci / e2e` are the aggregate jobs `verify`
+and `e2e` in `.github/workflows/pr-trusted.yml`. The caller
+`.github/workflows/pr.yml` invokes that workflow on each pull request. `verify`
+aggregates the policy, typecheck, test, runner, build, Docker, and quality-gate
+lanes. `e2e` aggregates the sharded Playwright lanes. The serialized server
+suites and the canary dry run execute in the same workflow but do not gate
+`verify`.
+
+Phase-1 quality gates (job `quality_gates`, existing runners only, no paid
+Actions minutes):
+
+- Biome full scan (`pnpm lint:biome`): WARN. Reports on all code. It stays
+  report-only until existing code is clean.
+- Biome changed files (`pnpm lint:biome:changed`): HARD. It fails the pull
+  request when a changed file breaks Biome. Fix with
+  `pnpm exec biome check --write <file>`.
+- Vitest changed-lines coverage (`pnpm coverage:changed`): WARN. It runs
+  coverage for changed test files, else it lists changed source files without
+  a colocated test.
+- Supply chain (`pnpm audit`, Trivy `fs`, gitleaks `detect`): WARN. It reports
+  vulnerable dependencies and leaked secrets.
+- Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
+  gate scripts break.
+
+Run `pnpm lint:biome:changed` before push. New checks add about 4-6 minutes of
+CI on one runner. Record measured values in the pull request description.
+
+Workflow changes take effect after merge: `pr.yml` pins
+`pr-trusted.yml@master`, so a workflow pull request is validated by the
+previous master version. The new job first runs on pull requests opened after
+merge.
+
 ## Start Dev
 
 From repo root:
