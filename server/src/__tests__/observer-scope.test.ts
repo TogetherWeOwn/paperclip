@@ -243,6 +243,16 @@ describe("checkObserverCeiling", () => {
     expect(check?.ok).toBe(false);
   });
 
+  it("denies when the scope company drifts from the key and route company", () => {
+    const check = checkObserverCeiling({
+      actor: observerActor(validScope({ companyId: OTHER_COMPANY })),
+      method: "GET",
+      path: `/api/companies/${COMPANY}/issues`,
+    });
+    expect(check?.ok).toBe(false);
+    if (check && !check.ok) expect(check.code).toBe("OBSERVER_COMPANY_DENIED");
+  });
+
   it("denies expired scopes and never elevates instance admins", () => {
     const now = Date.now();
     const expired = validScope({
