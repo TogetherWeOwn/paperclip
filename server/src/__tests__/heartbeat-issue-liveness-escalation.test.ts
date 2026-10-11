@@ -12,10 +12,12 @@ import {
   companySkills,
   costEvents,
   createDb,
+  documents,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
   issueRelations,
   issueRecoveryActions,
   issueTreeHoldMembers,
@@ -75,6 +77,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
 } from "../services/issue-dependency-wakeups.ts";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "../services/issue-continuation-summary.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -559,6 +562,83 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     }).returning();
     return { ...fixture, action: action! };
   }
+
+  async function requestStaleContinuation(agentId: string, blockedIssueId: string, idempotencyKey: string) {
+    await heartbeatService(db).wakeup(agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
+      requestedByActorType: "system", requestedByActorId: null, idempotencyKey,
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed" },
+    });
+  }
+
+  it("rejects a review-parked continuation before creating a heartbeat run", async () => {
+    const { companyId, coderId, blockedIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+    const [document] = await db.insert(documents).values({
+      companyId,
+      title: "Continuation Summary",
+      latestBody: "# Continuation Summary\n\n## Next Action\n\n- Wait for reviewer feedback before doing more work.",
+    }).returning();
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId: blockedIssueId,
+      documentId: document!.id,
+      key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+    });
+
+    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-before-run");
+
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_waiting_on_review" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a continuation for an issue reassigned before a heartbeat run is created", async () => {
+    const { companyId, managerId, coderId, blockedIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: managerId }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+
+    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-reassigned");
+
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_ownership_changed" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a continuation for a closed issue before a heartbeat run is created", async () => {
+    const { companyId, coderId, blockedIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+
+    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-closed");
+
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_ownership_changed" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("queues a continuation run once a reopened issue is back in progress for its assignee", async () => {
+    const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+    await heartbeatService(db).wakeup(coderId, {
+      source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
+      requestedByActorType: "system", requestedByActorId: null, idempotencyKey: "reopened-continuation",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", responsibleUserId: "responsible-user" },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([
+      expect.objectContaining({ status: "queued", reason: "issue_continuation_needed" }),
+    ]);
+  });
 
   it.each(["active", "resolved"] as const)("keeps repeated wakes behind a %s execution hold run-free, then resumes once", async (status) => {
     const { companyId, agentId, blockedIssueId, action } = await seedExecutionWait(status);

@@ -28082,6 +28082,80 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          const continuationOwnerChanged =
+            reason === "issue_continuation_needed" &&
+            (issue.assigneeAgentId !== agentId ||
+              ["done", "cancelled"].includes(issue.status));
+          if (continuationOwnerChanged) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_continuation_ownership_changed",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  code: "issue_continuation_ownership_changed",
+                  reason: "Issue owner or status changed before the continuation run was created.",
+                  issueId: issue.id,
+                  actualStatus: issue.status,
+                  actualAssigneeAgentId: issue.assigneeAgentId,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
+          const interactionResolvedAt = readNonEmptyString(
+            enrichedContextSnapshot.interactionResolvedAt,
+          );
+          const hasResolvedInteractionEvidence =
+            interactionResolvedAt !== null &&
+            !Number.isNaN(Date.parse(interactionResolvedAt));
+          const continuationSummaryWake =
+            source === "automation" &&
+            reason === "issue_continuation_needed" &&
+            issue.status === "in_progress" &&
+            !wakeCommentId &&
+            !hasResolvedInteractionEvidence;
+          if (continuationSummaryWake) {
+            const currentContinuationSummary =
+              await getIssueContinuationSummaryDocument(tx as unknown as Db, issue.id);
+            if (continuationSummaryParksExecutor(currentContinuationSummary?.body)) {
+              const nextAction = currentContinuationSummary?.body ?? null;
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_continuation_waiting_on_review",
+                payload: {
+                  ...(payload ?? {}),
+                  issueId: issue.id,
+                  heartbeatSkip: {
+                    code: "issue_continuation_waiting_on_review",
+                    reason: "The current continuation summary parks the executor pending review or approval.",
+                    nextAction,
+                  },
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                finishedAt: new Date(),
+              });
+              return { kind: "skipped" as const };
+            }
+          }
+
           if (
             worktreeExecutionCutoff &&
             issue.createdAt < worktreeExecutionCutoff
