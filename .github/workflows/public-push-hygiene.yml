@@ -38,10 +38,23 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
-          if [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            BASE="$(git merge-base origin/master "$PUSH_HEAD")"
-          else
+          # PUSH_BEFORE is the previous head, but after a force-push/amend it is
+          # dangling (not on any ref) so a full fetch never brings it locally.
+          # Reusing it would fail closed on every amended push. Prefer it only
+          # when it resolves locally AND is an ancestor; otherwise fall back to
+          # merge-base, which scans a superset (whole branch delta) and stays
+          # fail-closed without false reds on rewritten history.
+          BASE=""
+          if [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$PUSH_BEFORE" "$PUSH_HEAD" 2>/dev/null; then
             BASE="$PUSH_BEFORE"
+          else
+            echo "PUSH_BEFORE is new, missing, or not an ancestor (rewritten history); scanning from merge-base with origin/master." >&2
+          fi
+          if [ -z "$BASE" ]; then
+            BASE="$(git merge-base origin/master "$PUSH_HEAD")" \
+              || { echo "ERROR: could not resolve merge-base with origin/master; refusing to pass." >&2; exit 2; }
           fi
           [ -n "$BASE" ] || { echo "ERROR: could not resolve scan base; refusing to pass." >&2; exit 2; }
           node scripts/check-public-push-hygiene.mjs --base "$BASE" --head "$PUSH_HEAD"
