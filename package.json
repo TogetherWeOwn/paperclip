@@ -44,6 +44,7 @@
     "check:token-gates": "node scripts/check-token-gates.mjs && node scripts/sync-agent-palette-tokens.mjs --check && node scripts/sync-cliplab-character.mjs --check",
     "lint:biome": "biome check .",
     "lint:biome:changed": "node scripts/quality-gates/biome-changed.mjs",
+    "lint:ast-grep": "node scripts/quality-gates/ast-grep-changed.mjs",
     "coverage:changed": "node scripts/quality-gates/coverage-changed.mjs",
     "guard:floor": "node scripts/quality-gates/floor-guard.mjs",
     "test:quality-gates": "node --test scripts/quality-gates/*.test.mjs",

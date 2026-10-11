@@ -1,0 +1,30 @@
+id: ts-path-stat-then-stream
+snapshots:
+  function scan(full) { const st = fs.statSync(full); return fs.createReadStream(full); }:
+    labels:
+    - source: '{ const st = fs.statSync(full); return fs.createReadStream(full); }'
+      style: primary
+      start: 20
+      end: 87
+    - source: fs.statSync(full)
+      style: secondary
+      start: 33
+      end: 50
+    - source: fs.createReadStream(full)
+      style: secondary
+      start: 59
+      end: 84
+  ? 'function scan(full) { let st; try { st = fs.statSync(full); } catch { return; } return fs.createReadStream(full, {encoding: "utf8"}); }'
+  : labels:
+    - source: '{ let st; try { st = fs.statSync(full); } catch { return; } return fs.createReadStream(full, {encoding: "utf8"}); }'
+      style: primary
+      start: 20
+      end: 135
+    - source: fs.statSync(full)
+      style: secondary
+      start: 41
+      end: 58
+    - source: 'fs.createReadStream(full, {encoding: "utf8"})'
+      style: secondary
+      start: 87
+      end: 132

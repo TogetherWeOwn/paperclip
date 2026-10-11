@@ -70,8 +70,17 @@ Actions minutes):
   diff adds suppressions, skips or deletes tests, strips assertions, leaves
   stubs, or lowers a `CONSTRAINTS.md` threshold. See `CONSTRAINTS.md` (repo
   root) for the full bar and `.constraintsignore` for tracked exemptions.
+- Shared ast-grep rules (`pnpm lint:ast-grep`): WARN. It scans changed files
+  with the vendored meta-only rule pack (26 rules with fixtures from the
+  ops-tooling `quality/meta-only-assets` branch) and verifies the fixtures
+  with `ast-grep test` in the same run. Resync procedure lives in
+  `scripts/quality-gates/meta-only/PROVENANCE.md`.
+- Review checklist (`scripts/quality-gates/meta-only/checklists/paperclip.yaml`):
+  the shared Muse one-question-per-request review protocol. It is manual
+  (layer 3), not a CI job: quote file, head SHA, lines, and exact excerpt
+  per answer.
 
-Run `pnpm lint:biome:changed` and `pnpm guard:floor` before push. New checks add about 4-6 minutes of
+Run `pnpm lint:biome:changed` and `pnpm guard:floor` before push. New checks add about 5-8 minutes of
 CI on one runner. Record measured values in the pull request description.
 
 Workflow changes take effect after merge: `pr.yml` pins

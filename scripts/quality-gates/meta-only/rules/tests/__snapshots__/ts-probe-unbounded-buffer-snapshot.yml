@@ -1,0 +1,8 @@
+id: ts-probe-unbounded-buffer
+snapshots:
+  async function probe(res) { const body = await res.arrayBuffer(); return parse(body); }:
+    labels:
+    - source: res.arrayBuffer()
+      style: primary
+      start: 47
+      end: 64

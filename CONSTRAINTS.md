@@ -25,6 +25,7 @@ HARD in CI and at task end. Exemptions live in the tracked
 | Dimension | Rule | Checked by | Runs at |
 |-----------|------|-----------|---------|
 | Floor | Zero floor-guard violations | `pnpm guard:floor` | task end, CI (HARD) |
+| Shared pattern rules | No new shared-rule findings left unaddressed | `pnpm lint:ast-grep` (vendored meta-only pack, fixtures verified in-run) | CI (WARN in phase 1; promotes to HARD in phase 2). Reason: rules are owned outside this repo; WARN first while the baseline is measured |
 | Gate tooling | Gate scripts self-test green | `pnpm test:quality-gates` | CI (HARD) |
 | Lint (changed) | Zero Biome errors on changed files | `pnpm lint:biome:changed` | task end, CI (HARD). Full scan `pnpm lint:biome` is WARN until existing code is clean |
 | Types | Zero type errors | `pnpm -r typecheck` | CI (HARD). Reason: the monorepo has no single `tsc -p .`; per-package typecheck is the real gate |

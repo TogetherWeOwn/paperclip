@@ -1,0 +1,7 @@
+id: py-redos-assert-token
+language: Python
+severity: warning
+message: 'Avoid the ambiguous repeated assert-token regex; use a bounded or lookahead form Example: paperclip-ops-tooling#797.'
+rule:
+  kind: string
+  regex: \\b\\w\*assert\\w\*!

@@ -724,6 +724,13 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node scripts/quality-gates/floor-guard.mjs
 
+      - name: ast-grep shared rules (WARN, report only)
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/quality-gates/ast-grep-changed.mjs
+
       - name: Coverage changed lines (WARN, report only)
         continue-on-error: true
         env:

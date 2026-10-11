@@ -1,0 +1,6 @@
+id: gha-branch-name-trust
+valid:
+- "jobs:\n  gate:\n    if: github.head_ref != 'release-please--branches--main' || github.actor != 'release-bot'\n\
+  \    runs-on: ubuntu-latest"
+invalid:
+- "jobs:\n  gate:\n    if: github.head_ref != 'release-please--branches--main'\n    runs-on: ubuntu-latest"

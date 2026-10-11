@@ -1,0 +1,28 @@
+id: py-subprocess-timeout
+snapshots:
+  subprocess.check_output(argv, timeout=None):
+    labels:
+    - source: subprocess.check_output(argv, timeout=None)
+      style: primary
+      start: 0
+      end: 43
+    - source: timeout=None
+      style: secondary
+      start: 30
+      end: 42
+    - source: (argv, timeout=None)
+      style: secondary
+      start: 23
+      end: 43
+  subprocess.run(["gh", "api", endpoint], check=True):
+    labels:
+    - source: subprocess.run(["gh", "api", endpoint], check=True)
+      style: primary
+      start: 0
+      end: 51
+  subprocess.run(argv, env=dict(timeout=30)):
+    labels:
+    - source: subprocess.run(argv, env=dict(timeout=30))
+      style: primary
+      start: 0
+      end: 42

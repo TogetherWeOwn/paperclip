@@ -1,0 +1,10 @@
+id: py-subprocess-timeout
+valid:
+- subprocess.run(argv, timeout=30, check=True)
+- subprocess.check_output(argv, timeout=30)
+- subprocess.Popen(argv)
+- client.run(argv)
+invalid:
+- subprocess.run(["gh", "api", endpoint], check=True)
+- subprocess.check_output(argv, timeout=None)
+- subprocess.run(argv, env=dict(timeout=30))

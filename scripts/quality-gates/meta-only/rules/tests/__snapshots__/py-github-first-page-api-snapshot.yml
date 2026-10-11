@@ -1,0 +1,14 @@
+id: py-github-first-page-api
+snapshots:
+  checks = api("/commits/%s/check-runs?per_page=100" % sha):
+    labels:
+    - source: api("/commits/%s/check-runs?per_page=100" % sha)
+      style: primary
+      start: 9
+      end: 57
+  comments = api("/issues/%d/comments?per_page=100" % number) or []:
+    labels:
+    - source: api("/issues/%d/comments?per_page=100" % number)
+      style: primary
+      start: 11
+      end: 59

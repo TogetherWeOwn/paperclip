@@ -1,0 +1,13 @@
+id: gha-branch-name-trust
+language: Yaml
+severity: warning
+message: 'A release/lockfile exemption must not trust a spoofable PR branch name alone Example: paperclip#39, two-web-next#630.'
+rule:
+  kind: block_mapping_pair
+  all:
+  - regex: (?s)if:.*github\.head_ref.*(?:release-please|lockfile|refresh)
+  - not:
+      regex: github\.actor|head\.repo
+files:
+- .github/workflows/*.yml
+- .github/workflows/*.yaml

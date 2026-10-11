@@ -1,0 +1,22 @@
+id: py-subprocess-timeout
+language: Python
+severity: warning
+message: 'Bound synchronous subprocess waits with a finite timeout Example: paperclip-ops-tooling#868, paperclip-ops-tooling#859.'
+rule:
+  all:
+  - pattern: subprocess.$F($$$ARGS)
+  - any:
+    - not:
+        has:
+          kind: argument_list
+          has:
+            kind: keyword_argument
+            regex: ^timeout\s*=
+    - has:
+        kind: argument_list
+        has:
+          kind: keyword_argument
+          regex: ^timeout\s*=\s*None$
+constraints:
+  F:
+    regex: ^(run|call|check_call|check_output)$

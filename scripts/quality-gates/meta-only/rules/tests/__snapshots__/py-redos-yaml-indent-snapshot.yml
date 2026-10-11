@@ -1,0 +1,8 @@
+id: py-redos-yaml-indent
+snapshots:
+  pattern = re.compile(r"^\s+suites:\s*\n(?:^[ \t]+.*\n)*?^\s+timeout-minutes:\s*(\d+)", re.M):
+    labels:
+    - source: r"^\s+suites:\s*\n(?:^[ \t]+.*\n)*?^\s+timeout-minutes:\s*(\d+)"
+      style: primary
+      start: 21
+      end: 85

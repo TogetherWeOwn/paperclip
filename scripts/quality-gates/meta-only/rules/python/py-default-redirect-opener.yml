@@ -1,0 +1,11 @@
+id: py-default-redirect-opener
+language: Python
+severity: warning
+message: 'Use an explicit refuse-redirect opener for credentialed or body-capped probes Example: two-bot-next#776,
+  two-bot-next#835.'
+rule:
+  any:
+  - pattern: urllib.request.urlopen($$$ARGS)
+  - pattern: urlopen($$$ARGS)
+files:
+- scripts/**/*.py

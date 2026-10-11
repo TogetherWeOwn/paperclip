@@ -1,0 +1,9 @@
+id: ts-path-stat-then-stream
+valid:
+- function scan(full) { const fd = fs.openSync(full, "r"); const st = fs.fstatSync(fd); return fs.createReadStream(null,
+  {fd}); }
+- function scan(a, b) { fs.statSync(a); return fs.createReadStream(b); }
+invalid:
+- function scan(full) { const st = fs.statSync(full); return fs.createReadStream(full); }
+- 'function scan(full) { let st; try { st = fs.statSync(full); } catch { return; } return fs.createReadStream(full,
+  {encoding: "utf8"}); }'

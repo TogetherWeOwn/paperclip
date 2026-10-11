@@ -1,0 +1,7 @@
+id: bash-pusher-missing-env-load
+valid:
+- set -a; . ./service.env; /opt/ops/push-fleet-run-stall.sh
+- ./other-script.sh
+invalid:
+- /opt/ops/push-fleet-run-stall.sh
+- /opt/ops/push-db-backup-freshness.sh

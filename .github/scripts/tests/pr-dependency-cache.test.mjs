@@ -7,7 +7,10 @@ const jobs = [...workflow.matchAll(/^  ([a-z_][a-z_0-9]*):\n([\s\S]*?)(?=^  [a-z
 const installers = jobs.filter(([, , body]) => body.includes("pnpm install --frozen-lockfile"));
 
 test("PR workflows restore dependency stores without creating branch copies", () => {
-  assert.equal(installers.length, 7);
+  // Eight installer jobs: the seven historical lanes plus quality_gates,
+  // which follows the same read-only master-key pattern (checked per job
+  // below). Bump deliberately when adding a lane, never to silence this.
+  assert.equal(installers.length, 8);
   assert.doesNotMatch(workflow, /^ +cache: pnpm$/m);
   assert.doesNotMatch(workflow, /uses: actions\/cache(?:@|\/save@)/);
   for (const [, job, body] of jobs) {

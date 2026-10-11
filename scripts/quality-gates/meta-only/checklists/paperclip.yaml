@@ -1,0 +1,1076 @@
+schema_version: 1
+stack: paperclip
+technology: TypeScript server and adapters
+protocol:
+  one_question_per_request: true
+  answer_schema:
+    answer: yes|no|unknown
+    evidence:
+    - file: path
+      head_sha: sha
+      lines: start-end
+      quote: exact source text
+  acceptance: Only pass_answer with all requested excerpts. Unknown, missing context, or unquoted assertions fail.
+    No model answer alone authorizes merge.
+  context_limit: Include the changed function and the named caller/callee/test excerpt. If the answer needs whole-system
+    reasoning, classify residual judgment.
+questions:
+- id: paperclip.test-production-call
+  question: Does the cited test execute the changed production entry point rather than a replacement implementation
+    or stub of that entry point?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapter-utils/src/*
+    - server/src/__tests__/*
+    - server/src/routes/*
+    - server/src/services/*
+    - server/src/services/recovery/*
+    diff_patterns:
+    - new or changed test
+    - mock, stub, fixture, spy, assertion
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the production entry-point declaration, the test call site, and every mock replacing that entry
+      point. A source-string match or copied algorithm is not execution.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0014
+    repo: togetherweown/paperclip
+    pr: 47
+    head_sha: 67155e6dcb57bfbd84bfac2bfe5d79fb83e7fcfd
+    file: server/src/services/chat-channels.ts
+    line: 16239
+    named_file_excerpts:
+    - server/src/services/chat-channels.ts
+    - server/src/__tests__/chat-channels.integration.test.ts
+    anchor_excerpt:
+      file: server/src/services/chat-channels.ts
+      start_line: 16224
+      end_line: 16269
+    rationale_source: golden-findings.jsonl:F0014
+  - finding_id: F0032
+    repo: togetherweown/paperclip
+    pr: 59
+    head_sha: f5db1fc6ab6f000fe64897fa92a64d4a9253cdb4
+    file: server/src/services/recovery/service.ts
+    line: 3739
+    named_file_excerpts:
+    - server/src/services/recovery/service.ts
+    - server/src/__tests__/heartbeat-process-recovery.test.ts
+    anchor_excerpt:
+      file: server/src/services/recovery/service.ts
+      start_line: 3724
+      end_line: 3769
+    rationale_source: golden-findings.jsonl:F0032
+  - finding_id: F0034
+    repo: togetherweown/paperclip
+    pr: 59
+    head_sha: 38f8bf1a6f735c3bed7b1f9c0b0a5a34b86d7065
+    file: server/src/services/recovery/parent-child-blocks-cycle.test.ts
+    line: 111
+    named_file_excerpts:
+    - server/src/services/recovery/parent-child-blocks-cycle.test.ts
+    - server/src/__tests__/heartbeat-process-recovery.test.ts
+    anchor_excerpt:
+      file: server/src/services/recovery/parent-child-blocks-cycle.test.ts
+      start_line: 96
+      end_line: 141
+    rationale_source: golden-findings.jsonl:F0034
+  - finding_id: F0037
+    repo: togetherweown/paperclip
+    pr: 60
+    head_sha: e15a17e64a09a95eb1841c7a7a650590110a4059
+    file: server/src/__tests__/run-identity-deadlock-retry.test.ts
+    line: 167
+    named_file_excerpts:
+    - server/src/__tests__/run-identity-deadlock-retry.test.ts
+    - server/src/services/run-identity.ts
+    - server/src/services/secrets.ts
+    - src/__tests__/run-identity-deadlock-retry.test.ts
+    anchor_excerpt:
+      file: server/src/__tests__/run-identity-deadlock-retry.test.ts
+      start_line: 152
+      end_line: 197
+    rationale_source: golden-findings.jsonl:F0037
+  - finding_id: F0038
+    repo: togetherweown/paperclip
+    pr: 60
+    head_sha: 747bbfdbebb565fb143286cced3c8c2f8889a845
+    file: server/src/__tests__/run-identity-deadlock-retry.test.ts
+    line: 287
+    named_file_excerpts:
+    - server/src/__tests__/run-identity-deadlock-retry.test.ts
+    - drizzle-orm/pg-core/session.js
+    anchor_excerpt:
+      file: server/src/__tests__/run-identity-deadlock-retry.test.ts
+      start_line: 272
+      end_line: 317
+    rationale_source: golden-findings.jsonl:F0038
+  - finding_id: F0045
+    repo: togetherweown/paperclip
+    pr: 68
+    head_sha: 9544acb031ab99fded8e479c65216878b3f36fb6
+    file: server/src/services/heartbeat.ts
+    line: 5161
+    named_file_excerpts:
+    - server/src/services/heartbeat.ts
+    anchor_excerpt:
+      file: server/src/services/heartbeat.ts
+      start_line: 5146
+      end_line: 5191
+    rationale_source: golden-findings.jsonl:F0045
+  - finding_id: F0058
+    repo: togetherweown/paperclip
+    pr: 81
+    head_sha: 2eefdaafaae8f720a24d838b99f1ee91fdacc1af
+    file: server/src/__tests__/access-routes-permissions-upgrade.test.ts
+    line: 380
+    named_file_excerpts:
+    - server/src/__tests__/access-routes-permissions-upgrade.test.ts
+    - server/src/routes/access.ts
+    anchor_excerpt:
+      file: server/src/__tests__/access-routes-permissions-upgrade.test.ts
+      start_line: 365
+      end_line: 410
+    rationale_source: golden-findings.jsonl:F0058
+  - finding_id: F0062
+    repo: togetherweown/paperclip
+    pr: 81
+    head_sha: 2eefdaafaae8f720a24d838b99f1ee91fdacc1af
+    file: server/src/__tests__/access-routes-permissions-upgrade.test.ts
+    line: 422
+    named_file_excerpts:
+    - server/src/__tests__/access-routes-permissions-upgrade.test.ts
+    anchor_excerpt:
+      file: server/src/__tests__/access-routes-permissions-upgrade.test.ts
+      start_line: 407
+      end_line: 452
+    rationale_source: golden-findings.jsonl:F0062
+  - finding_id: F0064
+    repo: togetherweown/paperclip
+    pr: 82
+    head_sha: a84a5a32993384df2bc9535150b1da95214a2ef9
+    file: packages/adapter-utils/src/remote-managed-runtime.ts
+    line: 179
+    named_file_excerpts:
+    - packages/adapter-utils/src/remote-managed-runtime.ts
+    anchor_excerpt:
+      file: packages/adapter-utils/src/remote-managed-runtime.ts
+      start_line: 164
+      end_line: 209
+    rationale_source: golden-findings.jsonl:F0064
+  - finding_id: F0069
+    repo: togetherweown/paperclip
+    pr: 82
+    head_sha: a84a5a32993384df2bc9535150b1da95214a2ef9
+    file: packages/adapter-utils/src/remote-managed-runtime.ts
+    line: 179
+    named_file_excerpts:
+    - packages/adapter-utils/src/remote-managed-runtime.ts
+    anchor_excerpt:
+      file: packages/adapter-utils/src/remote-managed-runtime.ts
+      start_line: 164
+      end_line: 209
+    rationale_source: golden-findings.jsonl:F0069
+  - finding_id: F0074
+    repo: togetherweown/paperclip
+    pr: 98
+    head_sha: 0603cf53686e1802ecc7421eb0b71017f329d210
+    file: server/src/services/chat-channels.ts
+    line: 7496
+    named_file_excerpts:
+    - server/src/services/chat-channels.ts
+    - src/__tests__/chat-channels.integration.test.ts
+    anchor_excerpt:
+      file: server/src/services/chat-channels.ts
+      start_line: 7481
+      end_line: 7526
+    rationale_source: golden-findings.jsonl:F0074
+  - finding_id: F0077
+    repo: togetherweown/paperclip
+    pr: 101
+    head_sha: 3bf7b5f2e6a890f9671b0d4ef1eb7216c33e3cb9
+    file: server/src/routes/access.ts
+    line: 4738
+    named_file_excerpts:
+    - server/src/routes/access.ts
+    anchor_excerpt:
+      file: server/src/routes/access.ts
+      start_line: 4723
+      end_line: 4768
+    rationale_source: golden-findings.jsonl:F0077
+  - finding_id: F0078
+    repo: togetherweown/paperclip
+    pr: 101
+    head_sha: 81ed7f5dd6ec5809e958d7219676b2b998151bd9
+    file: server/src/routes/access.ts
+    line: 4742
+    named_file_excerpts:
+    - server/src/routes/access.ts
+    anchor_excerpt:
+      file: server/src/routes/access.ts
+      start_line: 4727
+      end_line: 4772
+    rationale_source: golden-findings.jsonl:F0078
+  - finding_id: F0083
+    repo: togetherweown/paperclip
+    pr: 105
+    head_sha: cef9a9e4e1e11e4efa28735b314573ef19a5e397
+    file: server/src/services/chat-github-green-gate.pg.test.ts
+    line: 196
+    named_file_excerpts:
+    - server/src/services/chat-github-green-gate.pg.test.ts
+    anchor_excerpt:
+      file: server/src/services/chat-github-green-gate.pg.test.ts
+      start_line: 181
+      end_line: 226
+    rationale_source: golden-findings.jsonl:F0083
+- id: paperclip.test-case-variants
+  question: Does the test input set include the case, quoting, or formatting variant that the changed parser contract
+    says it accepts?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - server/src/services/*
+    diff_patterns:
+    - parser or regex changes
+    - case-insensitive matching
+    - formatted source scan
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the accepted grammar or case-insensitivity contract, the parser branch, and one test input using
+      the variant. Do not infer semantic equivalence from a regex alone.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0054
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6e28f89d6add0278c8f0125b0332c7b34ca6361a
+    file: server/src/services/chat-publication-projection.ts
+    line: 337
+    named_file_excerpts:
+    - server/src/services/chat-publication-projection.ts
+    anchor_excerpt:
+      file: server/src/services/chat-publication-projection.ts
+      start_line: 322
+      end_line: 367
+    rationale_source: golden-findings.jsonl:F0054
+- id: paperclip.doc-code-claim
+  question: Does this one changed behavior claim agree with the named implementation excerpt?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - doc/*
+    - packages/adapters/claude-local/src/*
+    diff_patterns:
+    - documentation, runbook, comment, acceptance claim changes
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote ONE exact changed claim and the lines of the named implementation or authoritative contract that
+      establish it. Answer only that claim; a different behavior or a PR description is not evidence.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0010
+    repo: togetherweown/paperclip
+    pr: 45
+    head_sha: f987b0a5006df686f7d7458bcd407e7300d89e3f
+    file: doc/DEVELOPING.md
+    line: 1321
+    named_file_excerpts:
+    - doc/DEVELOPING.md
+    - packages/db/src/backup.ts
+    - cli/src/commands/db-backup.ts
+    anchor_excerpt:
+      file: doc/DEVELOPING.md
+      start_line: 1306
+      end_line: 1351
+    rationale_source: golden-findings.jsonl:F0010
+  - finding_id: F0022
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/index.ts
+    line: 77
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/index.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/index.ts
+      start_line: 62
+      end_line: 107
+    rationale_source: golden-findings.jsonl:F0022
+  - finding_id: F0043
+    repo: togetherweown/paperclip
+    pr: 64
+    head_sha: b20089fe66e770fa9a8f4986f8c4f69d27e4af00
+    file: doc/LOW-TRUST-PRESETS.md
+    line: 96
+    named_file_excerpts:
+    - doc/LOW-TRUST-PRESETS.md
+    - server/src/services/low-trust-sandbox-environment.ts
+    anchor_excerpt:
+      file: doc/LOW-TRUST-PRESETS.md
+      start_line: 81
+      end_line: 126
+    rationale_source: golden-findings.jsonl:F0043
+- id: paperclip.empty-input-not-clean
+  question: Does the changed branch return refusal or unknown rather than clean when its required input is empty
+    or unreadable?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapters/claude-local/src/server/*
+    diff_patterns:
+    - empty response, absent file, malformed JSON, unknown input, scan failure
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the input validation, the empty/error branch, and its returned status. Limit the question to the
+      named missing-input condition.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0055
+    repo: togetherweown/paperclip
+    pr: 80
+    head_sha: 127693956b154989902514267ac379a365b3ad76
+    file: packages/adapters/claude-local/src/server/parse.ts
+    line: 255
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/parse.ts
+    - packages/adapter-utils/src/server-utils.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/parse.ts
+      start_line: 240
+      end_line: 285
+    rationale_source: golden-findings.jsonl:F0055
+- id: paperclip.finite-scan-budget
+  question: Is the named list or scan bounded before materialization by a page, byte, time, or record budget?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapter-utils/src/*
+    diff_patterns:
+    - list, pagination, scan, read, capture, recursion, materialize
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote where the budget is checked and the call that consumes input. Slicing the completed result is not
+      a pre-read bound.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0015
+    repo: togetherweown/paperclip
+    pr: 49
+    head_sha: a53668916c6b9363b798f418fb9dfc5747883dee
+    file: packages/adapter-utils/src/secret-env-redaction.ts
+    line: 229
+    named_file_excerpts:
+    - packages/adapter-utils/src/secret-env-redaction.ts
+    anchor_excerpt:
+      file: packages/adapter-utils/src/secret-env-redaction.ts
+      start_line: 214
+      end_line: 259
+    rationale_source: golden-findings.jsonl:F0015
+  - finding_id: F0016
+    repo: togetherweown/paperclip
+    pr: 49
+    head_sha: a53668916c6b9363b798f418fb9dfc5747883dee
+    file: packages/adapter-utils/src/server-utils.ts
+    line: 4860
+    named_file_excerpts:
+    - packages/adapter-utils/src/server-utils.ts
+    - claude-local/src/server/execute.ts
+    anchor_excerpt:
+      file: packages/adapter-utils/src/server-utils.ts
+      start_line: 4845
+      end_line: 4890
+    rationale_source: golden-findings.jsonl:F0016
+- id: paperclip.shared-enum-contract
+  question: Is the changed status, origin, reason, or payload field spelled exactly as in the named producer schema?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapters/claude-local/src/server/*
+    - packages/adapters/opencode-local/src/server/*
+    - server/src/services/*
+    diff_patterns:
+    - status/origin literals, API response fields, payload schema, enum changes
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the consumer literal/key and the named producer enum or response-construction line. Similar names
+      and API list/detail assumptions do not count.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0002
+    repo: togetherweown/paperclip
+    pr: 21
+    head_sha: 0789fccbebb5d6bdf48583cc43823f06c81d46d6
+    file: server/src/services/cancelled-native-startup.ts
+    line: 24
+    named_file_excerpts:
+    - server/src/services/cancelled-native-startup.ts
+    anchor_excerpt:
+      file: server/src/services/cancelled-native-startup.ts
+      start_line: 9
+      end_line: 54
+    rationale_source: golden-findings.jsonl:F0002
+  - finding_id: F0004
+    repo: togetherweown/paperclip
+    pr: 21
+    head_sha: d0f518d64234429ba797ba7926692d9de96c3fcf
+    file: server/src/services/cancelled-native-startup.ts
+    line: 40
+    named_file_excerpts:
+    - server/src/services/cancelled-native-startup.ts
+    - routes/issues.ts
+    anchor_excerpt:
+      file: server/src/services/cancelled-native-startup.ts
+      start_line: 25
+      end_line: 70
+    rationale_source: golden-findings.jsonl:F0004
+  - finding_id: F0013
+    repo: togetherweown/paperclip
+    pr: 46
+    head_sha: dcbd5ad266ed78081819d2a465bb231b94c0d967
+    file: server/src/services/heartbeat.ts
+    line: 25513
+    named_file_excerpts:
+    - server/src/services/heartbeat.ts
+    - routes/issues.ts
+    - native-runtime/paperclip-runner-tool-authority.ts
+    anchor_excerpt:
+      file: server/src/services/heartbeat.ts
+      start_line: 25498
+      end_line: 25543
+    rationale_source: golden-findings.jsonl:F0013
+  - finding_id: F0018
+    repo: togetherweown/paperclip
+    pr: 54
+    head_sha: 3a919a8952d312997074209e31d7b2266e5509cb
+    file: server/src/services/budget-receipt.ts
+    line: 64
+    named_file_excerpts:
+    - server/src/services/budget-receipt.ts
+    - src/worker.ts
+    - packages/plugins/sdk/src/worker-rpc-host.ts
+    anchor_excerpt:
+      file: server/src/services/budget-receipt.ts
+      start_line: 49
+      end_line: 94
+    rationale_source: golden-findings.jsonl:F0018
+  - finding_id: F0021
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/execute.ts
+    line: 763
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/execute.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/execute.ts
+      start_line: 748
+      end_line: 793
+    rationale_source: golden-findings.jsonl:F0021
+  - finding_id: F0023
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+    line: 47
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/isolated-runtime.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+      start_line: 32
+      end_line: 77
+    rationale_source: golden-findings.jsonl:F0023
+  - finding_id: F0028
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: b1f4fba3b507ec09ca760bc5c01fade6f6f02875
+    file: packages/adapters/opencode-local/src/server/execute.ts
+    line: 691
+    named_file_excerpts:
+    - packages/adapters/opencode-local/src/server/execute.ts
+    anchor_excerpt:
+      file: packages/adapters/opencode-local/src/server/execute.ts
+      start_line: 676
+      end_line: 721
+    rationale_source: golden-findings.jsonl:F0028
+- id: paperclip.guards-before-side-effects
+  question: Does this specific hold, permission, or protected-path guard run before the first side effect it is
+    supposed to prevent?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - server/src/services/*
+    diff_patterns:
+    - guard, authorization, hold, dry-run, protected path, state mutation
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the named guard predicate and the first write/send/activation in execution order. Verify just the
+      specified guard, not the whole authorization design.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0042
+    repo: togetherweown/paperclip
+    pr: 63
+    head_sha: d9f072be1cefd7876fb1fad95df493705e50f381
+    file: server/src/services/execution-workspace-policy.ts
+    line: 326
+    named_file_excerpts:
+    - server/src/services/execution-workspace-policy.ts
+    - server/src/services/chat-github-management.ts
+    - ui/src/pages/apps/chat/GitHubChatSetup.tsx
+    anchor_excerpt:
+      file: server/src/services/execution-workspace-policy.ts
+      start_line: 311
+      end_line: 356
+    rationale_source: golden-findings.jsonl:F0042
+- id: paperclip.secret-inventory-redaction
+  question: Is this newly injected credential name included in the redactor input inventory used on the changed
+    output path?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapter-utils/src/*
+    diff_patterns:
+    - credential environment name, redaction inventory, captured output
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote credential variable NAMES only from the injector and the matching redaction inventory/output call.
+      Never quote credential VALUES.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0030
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: 6407a403f0eba0ec99aa34de2a1d1c0af5e0bfdd
+    file: packages/adapter-utils/src/secret-env-redaction.ts
+    line: 57
+    named_file_excerpts:
+    - packages/adapter-utils/src/secret-env-redaction.ts
+    - server/src/services/ai-provider-routing.ts
+    - doc/run-log-events.md
+    anchor_excerpt:
+      file: packages/adapter-utils/src/secret-env-redaction.ts
+      start_line: 42
+      end_line: 87
+    rationale_source: golden-findings.jsonl:F0030
+- id: paperclip.scrub-before-format
+  question: Is the named sensitive value scrubbed before escaping or formatting can change its matchable representation?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - server/src/services/*
+    diff_patterns:
+    - redact, scrub, escape, render, argv, log output
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the transform-call order and the relevant escaped-quote input fixture. Use synthetic sentinel values
+      only.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0050
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6b997ffd23b1ab6a277b0603558aabcf19f46978
+    file: server/src/services/chat-publication-projection.ts
+    line: 339
+    named_file_excerpts:
+    - server/src/services/chat-publication-projection.ts
+    - com/o/r/blob/main/board.example.invalid/x.md
+    anchor_excerpt:
+      file: server/src/services/chat-publication-projection.ts
+      start_line: 324
+      end_line: 369
+    rationale_source: golden-findings.jsonl:F0050
+  - finding_id: F0051
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 3038873cbaf15d757516e4efcbe7756b212aed40
+    file: server/src/services/chat-github-reviews.ts
+    line: 1225
+    named_file_excerpts:
+    - server/src/services/chat-github-reviews.ts
+    anchor_excerpt:
+      file: server/src/services/chat-github-reviews.ts
+      start_line: 1210
+      end_line: 1255
+    rationale_source: golden-findings.jsonl:F0051
+  - finding_id: F0052
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6e28f89d6add0278c8f0125b0332c7b34ca6361a
+    file: server/src/services/chat-github-reviews.ts
+    line: 1173
+    named_file_excerpts:
+    - server/src/services/chat-github-reviews.ts
+    anchor_excerpt:
+      file: server/src/services/chat-github-reviews.ts
+      start_line: 1158
+      end_line: 1203
+    rationale_source: golden-findings.jsonl:F0052
+  - finding_id: F0053
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 3038873cbaf15d757516e4efcbe7756b212aed40
+    file: server/src/services/chat-github-reviews.ts
+    line: 1301
+    named_file_excerpts:
+    - server/src/services/chat-github-reviews.ts
+    anchor_excerpt:
+      file: server/src/services/chat-github-reviews.ts
+      start_line: 1286
+      end_line: 1331
+    rationale_source: golden-findings.jsonl:F0053
+  - finding_id: F0054
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6e28f89d6add0278c8f0125b0332c7b34ca6361a
+    file: server/src/services/chat-publication-projection.ts
+    line: 337
+    named_file_excerpts:
+    - server/src/services/chat-publication-projection.ts
+    anchor_excerpt:
+      file: server/src/services/chat-publication-projection.ts
+      start_line: 322
+      end_line: 367
+    rationale_source: golden-findings.jsonl:F0054
+- id: paperclip.global-test-serialization
+  question: Do all tests named in this change that touch the same process-global state share one serialization mechanism?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - server/src/routes/*
+    diff_patterns:
+    - global metrics, environment mutation, shared test lock
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the global state accesses and serialization attributes/locks for every named conflicting test.
+      Different per-feature locks do not serialize shared state.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0063
+    repo: togetherweown/paperclip
+    pr: 81
+    head_sha: e988abe8d31d01a0ae16e937b7bacf3204585541
+    file: server/src/routes/access.ts
+    line: 4773
+    named_file_excerpts:
+    - server/src/routes/access.ts
+    anchor_excerpt:
+      file: server/src/routes/access.ts
+      start_line: 4758
+      end_line: 4803
+    rationale_source: golden-findings.jsonl:F0063
+- id: paperclip.pr-base-ancestry
+  question: Does this changed-lines or ratchet comparison resolve the PR head merge-base rather than using the current
+    base-branch tip?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - .github/workflows/*
+    diff_patterns:
+    - git diff, ratchet, base.sha, HEAD, merge-base, lockfile proof
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the base/head resolution and the diff invocation. Require refusal on a missing merge-base; a raw
+      base.sha is not ancestry resolution.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0005
+    repo: togetherweown/paperclip
+    pr: 39
+    head_sha: 1f042c5b5fbd5de1b438c14144e397b670f2de4f
+    file: .github/workflows/pr-trusted.yml
+    line: 320
+    named_file_excerpts:
+    - .github/workflows/pr-trusted.yml
+    - packages/a/package.js
+    anchor_excerpt:
+      file: .github/workflows/pr-trusted.yml
+      start_line: 305
+      end_line: 350
+    rationale_source: golden-findings.jsonl:F0005
+  - finding_id: F0007
+    repo: togetherweown/paperclip
+    pr: 39
+    head_sha: 1f042c5b5fbd5de1b438c14144e397b670f2de4f
+    file: .github/workflows/pr-trusted.yml
+    line: 321
+    named_file_excerpts:
+    - .github/workflows/pr-trusted.yml
+    anchor_excerpt:
+      file: .github/workflows/pr-trusted.yml
+      start_line: 306
+      end_line: 351
+    rationale_source: golden-findings.jsonl:F0007
+- id: paperclip.ci-step-not-parse-only
+  question: Does the named suite appear in an executable CI job invocation rather than only in a parse-only/local
+    list?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - tests/*
+    diff_patterns:
+    - new test file, verify-fast, ci workflow, --parse-only
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the test filename, workflow job run step, and expanded runner command that executes it. Merely
+      naming/importing/parsing the file is no.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0029
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: 225b2bb18803b6dac563992e35afd52a77663cce
+    file: tests/adapter-capture-boundaries.test.ts
+    line: 1
+    named_file_excerpts:
+    - tests/adapter-capture-boundaries.test.ts
+    anchor_excerpt:
+      file: tests/adapter-capture-boundaries.test.ts
+      start_line: 1
+      end_line: 31
+    rationale_source: golden-findings.jsonl:F0029
+  - finding_id: F0031
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: b1f4fba3b507ec09ca760bc5c01fade6f6f02875
+    file: tests/adapter-capture-boundaries.test.ts
+    line: 1
+    named_file_excerpts:
+    - tests/adapter-capture-boundaries.test.ts
+    anchor_excerpt:
+      file: tests/adapter-capture-boundaries.test.ts
+      start_line: 1
+      end_line: 31
+    rationale_source: golden-findings.jsonl:F0031
+- id: paperclip.ci-scope-selects-job
+  question: Does the changed path select the CI job that executes this suite?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - .github/workflows/*
+    - tests/*
+    diff_patterns:
+    - workflow paths, if, change selector, suite partition, concurrency
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the changed path, its selector rule, and the job/step condition. Include reusable-workflow caller
+      conditions; a listed but skipped test is no.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0029
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: 225b2bb18803b6dac563992e35afd52a77663cce
+    file: tests/adapter-capture-boundaries.test.ts
+    line: 1
+    named_file_excerpts:
+    - tests/adapter-capture-boundaries.test.ts
+    anchor_excerpt:
+      file: tests/adapter-capture-boundaries.test.ts
+      start_line: 1
+      end_line: 31
+    rationale_source: golden-findings.jsonl:F0029
+  - finding_id: F0031
+    repo: togetherweown/paperclip
+    pr: 58
+    head_sha: b1f4fba3b507ec09ca760bc5c01fade6f6f02875
+    file: tests/adapter-capture-boundaries.test.ts
+    line: 1
+    named_file_excerpts:
+    - tests/adapter-capture-boundaries.test.ts
+    anchor_excerpt:
+      file: tests/adapter-capture-boundaries.test.ts
+      start_line: 1
+      end_line: 31
+    rationale_source: golden-findings.jsonl:F0031
+  - finding_id: F0046
+    repo: togetherweown/paperclip
+    pr: 69
+    head_sha: 8c3705eea4646f9eae01a0598122b532b27e2c76
+    file: .github/workflows/pr.yml
+    line: 37
+    named_file_excerpts:
+    - .github/workflows/pr.yml
+    anchor_excerpt:
+      file: .github/workflows/pr.yml
+      start_line: 22
+      end_line: 67
+    rationale_source: golden-findings.jsonl:F0046
+- id: paperclip.field-unit-and-sentinel
+  question: Is the named API value converted using the producer units and sentinel definition before comparison
+    or display?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapter-utils/src/*
+    - packages/adapters/claude-local/src/server/*
+    - server/src/services/*
+    diff_patterns:
+    - numeric field, timestamp, rounding, -1 sentinel, microseconds, milliseconds
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the producer field definition, conversion, and comparison/display. Explicitly show how the named
+      sentinel is rejected.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: false
+  corpus_examples:
+  - finding_id: F0017
+    repo: togetherweown/paperclip
+    pr: 53
+    head_sha: 80fd7d9a16b4d124f7ccbd93e697f6e94b287953
+    file: server/src/services/heartbeat.ts
+    line: 4489
+    named_file_excerpts:
+    - server/src/services/heartbeat.ts
+    anchor_excerpt:
+      file: server/src/services/heartbeat.ts
+      start_line: 4474
+      end_line: 4519
+    rationale_source: golden-findings.jsonl:F0017
+  - finding_id: F0019
+    repo: togetherweown/paperclip
+    pr: 54
+    head_sha: 3a919a8952d312997074209e31d7b2266e5509cb
+    file: server/src/services/tool-gateway.ts
+    line: 10264
+    named_file_excerpts:
+    - server/src/services/tool-gateway.ts
+    - routes/plugins.ts
+    - src/engine/select.ts
+    anchor_excerpt:
+      file: server/src/services/tool-gateway.ts
+      start_line: 10249
+      end_line: 10294
+    rationale_source: golden-findings.jsonl:F0019
+  - finding_id: F0020
+    repo: togetherweown/paperclip
+    pr: 54
+    head_sha: 3a919a8952d312997074209e31d7b2266e5509cb
+    file: server/src/services/budget-receipt.ts
+    line: 24
+    named_file_excerpts:
+    - server/src/services/budget-receipt.ts
+    - src/engine/select.ts
+    anchor_excerpt:
+      file: server/src/services/budget-receipt.ts
+      start_line: 9
+      end_line: 54
+    rationale_source: golden-findings.jsonl:F0020
+  - finding_id: F0021
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/execute.ts
+    line: 763
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/execute.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/execute.ts
+      start_line: 748
+      end_line: 793
+    rationale_source: golden-findings.jsonl:F0021
+  - finding_id: F0023
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+    line: 47
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/isolated-runtime.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+      start_line: 32
+      end_line: 77
+    rationale_source: golden-findings.jsonl:F0023
+  - finding_id: F0065
+    repo: togetherweown/paperclip
+    pr: 82
+    head_sha: 3eb6e84368ac152ca3ca13591d840ab15a03f6e4
+    file: packages/adapter-utils/src/ssh.ts
+    line: 1903
+    named_file_excerpts:
+    - packages/adapter-utils/src/ssh.ts
+    anchor_excerpt:
+      file: packages/adapter-utils/src/ssh.ts
+      start_line: 1888
+      end_line: 1933
+    rationale_source: golden-findings.jsonl:F0065
+- id: paperclip.path-boundary
+  question: Does the path or identifier match require the exact intended component rather than an unanchored substring?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - server/src/services/*
+    diff_patterns:
+    - path match, host match, URL match, ID match, regex, CLI abbreviation
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote the input grammar and the exact delimiter/boundary check. Compare only the named counterexample;
+      do not certify the whole parser.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0050
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6b997ffd23b1ab6a277b0603558aabcf19f46978
+    file: server/src/services/chat-publication-projection.ts
+    line: 339
+    named_file_excerpts:
+    - server/src/services/chat-publication-projection.ts
+    - com/o/r/blob/main/board.example.invalid/x.md
+    anchor_excerpt:
+      file: server/src/services/chat-publication-projection.ts
+      start_line: 324
+      end_line: 369
+    rationale_source: golden-findings.jsonl:F0050
+  - finding_id: F0054
+    repo: togetherweown/paperclip
+    pr: 78
+    head_sha: 6e28f89d6add0278c8f0125b0332c7b34ca6361a
+    file: server/src/services/chat-publication-projection.ts
+    line: 337
+    named_file_excerpts:
+    - server/src/services/chat-publication-projection.ts
+    anchor_excerpt:
+      file: server/src/services/chat-publication-projection.ts
+      start_line: 322
+      end_line: 367
+    rationale_source: golden-findings.jsonl:F0054
+- id: paperclip.configuration-override-used
+  question: Does the effective runtime value come from the newly documented configuration override rather than an
+    earlier cached or inherited value?
+  pass_answer: 'yes'
+  when:
+    file_globs:
+    - packages/adapters/claude-local/src/server/*
+    - packages/db/src/*
+    - server/src/services/*
+    diff_patterns:
+    - env override, default, setting, boot cache, configuration change
+    selection: Apply when a changed hunk instantiates this specific concern; do not ask about absent features.
+  evidence_required:
+    quote: Quote override parsing, precedence, and the named runtime read. A value stored but never read by that
+      path is no.
+    format: 'For each quotation: repository-relative path, reviewed head SHA, line range, exact excerpt.'
+    context: One diff hunk plus the named files/functions in the example. Ask for the missing excerpt; never guess.
+    missing_or_ambiguous: fail_unknown
+  calibration_status: not calibrated on Muse/Gemini; applicability mapping only
+  mapping_uncertain: true
+  corpus_examples:
+  - finding_id: F0011
+    repo: togetherweown/paperclip
+    pr: 45
+    head_sha: f987b0a5006df686f7d7458bcd407e7300d89e3f
+    file: packages/db/src/backup.ts
+    line: 51
+    named_file_excerpts:
+    - packages/db/src/backup.ts
+    - server/src/index.ts
+    - cli/src/commands/db-backup.ts
+    - cli/src/commands/update.ts
+    anchor_excerpt:
+      file: packages/db/src/backup.ts
+      start_line: 36
+      end_line: 81
+    rationale_source: golden-findings.jsonl:F0011
+  - finding_id: F0017
+    repo: togetherweown/paperclip
+    pr: 53
+    head_sha: 80fd7d9a16b4d124f7ccbd93e697f6e94b287953
+    file: server/src/services/heartbeat.ts
+    line: 4489
+    named_file_excerpts:
+    - server/src/services/heartbeat.ts
+    anchor_excerpt:
+      file: server/src/services/heartbeat.ts
+      start_line: 4474
+      end_line: 4519
+    rationale_source: golden-findings.jsonl:F0017
+  - finding_id: F0021
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/execute.ts
+    line: 763
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/execute.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/execute.ts
+      start_line: 748
+      end_line: 793
+    rationale_source: golden-findings.jsonl:F0021
+  - finding_id: F0023
+    repo: togetherweown/paperclip
+    pr: 55
+    head_sha: 9651058c3ff9a528556b24240d3ecc4b6b74b785
+    file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+    line: 47
+    named_file_excerpts:
+    - packages/adapters/claude-local/src/server/isolated-runtime.ts
+    anchor_excerpt:
+      file: packages/adapters/claude-local/src/server/isolated-runtime.ts
+      start_line: 32
+      end_line: 77
+    rationale_source: golden-findings.jsonl:F0023

@@ -11,7 +11,9 @@
  *   1. silenced-checker  - new suppression comments (@ts-ignore,
  *                          eslint-disable, biome-ignore, istanbul ignore, ...)
  *   2. test-made-easier  - new skips (.skip), deleted test files
- *   3. assertion-removed - assertions stripped from a surviving test
+ *   3. assertion-removed - assertions stripped from a surviving test (a
+ *                          same-shape replacement in the same file whose
+ *                          numbers only rose is a tightening: silent)
  *   4. unfinished-work   - not-implemented stubs, empty catch blocks
  *   5. threshold-lowered / new-exception - CONSTRAINTS.md weakened or a new
  *                          Exceptions row added without discussion
@@ -120,11 +122,31 @@ export function scanAddedLines(lines, { ignored = [] } = {}) {
   return findings;
 }
 
-/** Scan removed lines for assertions stripped from surviving tests. */
-export function scanRemovedLines(lines) {
+/**
+ * Scan removed lines for assertions stripped from surviving tests.
+ * A removed assertion paired with a same-shape, same-file replacement whose
+ * numbers only went up is a modification (tightening), not a strip: silent.
+ * Anything else (no replacement, different subject, a number lowered) is
+ * loud, mirroring checkConstraintThresholds below.
+ */
+export function scanRemovedLines(lines, { added = [] } = {}) {
+  const normalized = (text) => text.replace(/\d+(\.\d+)?/g, "#");
   const findings = [];
   for (const { file, text } of lines) {
-    if (TEST_PATH.test(file) && ASSERTIONS.test(text)) {
+    if (!TEST_PATH.test(file) || !ASSERTIONS.test(text)) {
+      continue;
+    }
+    const replacement = added.find(
+      (candidate) =>
+        candidate.file === file &&
+        ASSERTIONS.test(candidate.text) &&
+        normalized(candidate.text) === normalized(text) &&
+        numbersIn(candidate.text).length === numbersIn(text).length &&
+        numbersIn(candidate.text).every(
+          (value, index) => value >= numbersIn(text)[index],
+        ),
+    );
+    if (!replacement) {
       flag(findings, "assertion-removed", file, text);
     }
   }
@@ -184,7 +206,7 @@ export function checkConstraintThresholds(removed, added) {
 export function scanDiff(diff, { ignored = [] } = {}) {
   return [
     ...scanAddedLines(diff.added, { ignored }),
-    ...scanRemovedLines(diff.removed),
+    ...scanRemovedLines(diff.removed, { added: diff.added }),
     ...scanStatuses(diff.statuses ?? [], { ignored }),
     ...checkConstraintThresholds(diff.removed, diff.added),
   ];

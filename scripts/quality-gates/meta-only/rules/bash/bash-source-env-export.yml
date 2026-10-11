@@ -1,0 +1,17 @@
+id: bash-source-env-export
+language: Bash
+severity: warning
+message: 'Export sourced .env assignments before invoking a child process Example: paperclip-ops-tooling#565, paperclip-ops-tooling#660,
+  paperclip-ops-tooling#668, paperclip-ops-tooling#793.'
+rule:
+  all:
+  - pattern: $CMD $ENV
+  - not:
+      follows:
+        pattern: set -a
+        stopBy: end
+constraints:
+  CMD:
+    regex: ^(source|\.)$
+  ENV:
+    regex: \.env["']?$

@@ -1,0 +1,9 @@
+id: gha-artifact-always-unscrubbed
+valid:
+- "- uses: actions/upload-artifact@v4\n  if: ${{ !cancelled() && steps.scrub.outputs.swept == 'true' }}\n  with:\n\
+  \    path: test-results/"
+- "- uses: actions/checkout@v4\n  if: always()"
+invalid:
+- "jobs:\n  test:\n    steps:\n      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n \
+  \         path: test-results/"
+- "- uses: actions/upload-artifact@v4\n  if: ${{ always() }}\n  with:\n    path: test-results/"

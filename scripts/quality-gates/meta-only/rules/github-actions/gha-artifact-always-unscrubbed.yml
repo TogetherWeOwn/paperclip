@@ -1,0 +1,19 @@
+id: gha-artifact-always-unscrubbed
+language: Yaml
+severity: warning
+message: 'Do not upload failure artifacts unconditionally when a scrub receipt is required Example: two-web-next#533.'
+rule:
+  kind: block_mapping
+  all:
+  - has:
+      kind: block_mapping_pair
+      regex: uses:\s*[\x22\x27]?actions/upload-artifact@
+  - has:
+      kind: block_mapping_pair
+      all:
+      - regex: if:.*always\(\)
+      - not:
+          regex: swept
+files:
+- .github/workflows/*.yml
+- .github/workflows/*.yaml

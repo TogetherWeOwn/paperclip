@@ -1,0 +1,101 @@
+[
+  {
+    "id": "N-exact-head",
+    "examples": [
+      "F0027",
+      "F0070",
+      "F0128",
+      "F0145",
+      "F0165",
+      "F0182",
+      "F0185",
+      "F0198",
+      "F0215",
+      "F0216",
+      "F0219",
+      "F0222",
+      "F0223",
+      "F0270",
+      "F0272",
+      "F0291",
+      "F0337",
+      "F0360",
+      "F0367",
+      "F0368",
+      "F0370",
+      "F0376",
+      "F0377",
+      "F0378",
+      "F0397",
+      "F0440",
+      "F0475",
+      "F0478",
+      "F0481",
+      "F0486",
+      "F0487",
+      "F0527",
+      "F0539",
+      "F0540",
+      "F0541",
+      "F0542",
+      "F0580",
+      "F0598",
+      "F0604",
+      "F0606",
+      "F0609",
+      "F0617",
+      "F0636",
+      "F0638",
+      "F0668",
+      "F0669",
+      "F0678",
+      "F0718",
+      "F0808",
+      "F0917",
+      "F0921",
+      "F0922"
+    ],
+    "command_reference": "rules/NON-AST.md#n-exact-head--buildlinttest-failures-recurring",
+    "implemented": "receipt validator, not CI changes",
+    "uncertain": false
+  },
+  {
+    "id": "N-regen-diff",
+    "examples": [
+      "F0162",
+      "F0588"
+    ],
+    "command_reference": "rules/NON-AST.md#n-regen-diff--generated-docs-catalogs-and-snapshots-recurring",
+    "implemented": "exact existing generator/diff command recipes",
+    "uncertain": false
+  },
+  {
+    "id": "N-migration-lock",
+    "examples": [
+      "F0592"
+    ],
+    "command_reference": "rules/NON-AST.md#n-migration-lock--migration-inventory-and-ordering",
+    "implemented": "existing check-migrations.py plus tested supplemental inventory validator",
+    "uncertain": false
+  },
+  {
+    "id": "N-text-nul",
+    "examples": [
+      "F0938"
+    ],
+    "command_reference": "rules/NON-AST.md#n-text-nul--text-must-remain-reviewable",
+    "implemented": "tested tracked-text byte scanner",
+    "uncertain": false
+  },
+  {
+    "id": "N-lockfiles",
+    "examples": [
+      "F0685",
+      "F0686",
+      "F0795"
+    ],
+    "command_reference": "rules/NON-AST.md#n-lockfiles--all-lockfiles-and-frozen-installs-recurring-family",
+    "implemented": "tested lock inventory plus audit/frozen-install recipes; not executed on historical trees",
+    "uncertain": true
+  }
+]

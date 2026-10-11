@@ -1,0 +1,6 @@
+id: py-release-branch-exemption
+language: Python
+severity: warning
+message: 'Do not derive trusted/generated PR status solely from the branch prefix Example: two-web-next#630.'
+rule:
+  pattern: head_ref.startswith("release-please--")

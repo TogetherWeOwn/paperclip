@@ -120,6 +120,66 @@ describe("scanRemovedLines and statuses", () => {
     assert.equal(findings[0].rule, "assertion-removed");
   });
 
+  it("stays silent when an assertion is tightened, not stripped", () => {
+    const findings = scanRemovedLines(
+      removed(
+        ".github/scripts/tests/pr-dependency-cache.test.mjs",
+        "  assert.equal(installers.length, 7);",
+      ),
+      {
+        added: added(
+          ".github/scripts/tests/pr-dependency-cache.test.mjs",
+          "  assert.equal(installers.length, 8);",
+        ),
+      },
+    );
+    assert.deepEqual(findings, []);
+  });
+
+  it("flags a lowered numeric assertion despite a same-shape replacement", () => {
+    const findings = scanRemovedLines(
+      removed(
+        "server/src/routes/issues.test.ts",
+        "    assert.equal(covered, 80);",
+      ),
+      {
+        added: added(
+          "server/src/routes/issues.test.ts",
+          "    assert.equal(covered, 60);",
+        ),
+      },
+    );
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].rule, "assertion-removed");
+  });
+
+  it("flags a replacement assertion on a different subject", () => {
+    const findings = scanRemovedLines(
+      removed("server/src/routes/issues.test.ts", "    assert.equal(a, 1);"),
+      {
+        added: added(
+          "server/src/routes/issues.test.ts",
+          "    assert.equal(b, 1);",
+        ),
+      },
+    );
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].rule, "assertion-removed");
+  });
+
+  it("pairs through scanDiff the way main() runs it", () => {
+    const file = ".github/scripts/tests/pr-dependency-cache.test.mjs";
+    const findings = scanDiff(
+      {
+        added: added(file, "  assert.equal(installers.length, 8);"),
+        removed: removed(file, "  assert.equal(installers.length, 7);"),
+        statuses: [],
+      },
+      { ignored: [] },
+    );
+    assert.deepEqual(findings, []);
+  });
+
   it("flags deleted test files", () => {
     const findings = scanDiff(
       {
