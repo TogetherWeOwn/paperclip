@@ -11,6 +11,7 @@ const {
   findInternalRefs,
   parseCommitRecords,
   resolvePrefixes,
+  resolvePublicBase,
   runPublicPushHygieneCheck,
   scanDiffForRefs,
 } = await import("../../../scripts/check-public-push-hygiene.mjs");
@@ -326,7 +327,7 @@ describe("public push hygiene gate", () => {
     }
   });
 
-  it("push workflow scans from merge-base and never uses the dangling event.before", () => {
+  it("push workflow scopes by public frontier and never uses the dangling event.before", () => {
     const workflow = readFileSync(
       fileURLToPath(
         new URL(
@@ -336,9 +337,133 @@ describe("public push hygiene gate", () => {
       ),
       "utf8",
     );
-    expect(workflow).toContain("git merge-base origin/master");
+    expect(workflow).toContain("--self-ref");
+    expect(workflow).not.toContain("git merge-base origin/master");
     // The workflow comment explains why event.before is ignored; only an
     // actual `${{ ... }}` interpolation would wire the dangling delta back in.
     expect(workflow).not.toMatch(/\$\{\{\s*github\.event\.before/);
+  });
+});
+
+function withFixtureRepo(run: (git: (...args: string[]) => string, root: string) => void) {
+  const root = mkdtempSync(
+    join(
+      process.env.PAPERCLIP_RUN_SCRATCH_DIR ??
+        process.env.PAPERCLIP_SCRATCH_DIR ??
+        tmpdir(),
+      "public-push-hygiene-line-",
+    ),
+  );
+  const prevCwd = process.cwd();
+  try {
+    const git = (...args: string[]) =>
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=CI Fixture",
+          "-c",
+          "user.email=ci-fixture@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          ...args,
+        ],
+        { cwd: root, env: { PATH: process.env.PATH }, encoding: "utf8" },
+      ).trim();
+    git("init", "-q");
+    process.chdir(root);
+    run(git, root);
+  } finally {
+    process.chdir(prevCwd);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function commitFixtureFile(
+  git: (...args: string[]) => string,
+  root: string,
+  file: string,
+  message: string,
+) {
+  writeFileSync(join(root, file), `${file} fixture\n`);
+  git("add", ".");
+  git("commit", "-qm", message);
+}
+
+describe("public push hygiene scope on non-master lines", () => {
+  it("scans only a branch's own commits when it is cut from an already-public line", () => {
+    withFixtureRepo((git, root) => {
+      commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", "HEAD");
+      commitFixtureFile(git, root, "legacy.md", `legacy public line Refs ${DIRTY_ID}`);
+      git("update-ref", "refs/remotes/origin/deploy/line", "HEAD");
+      const legacyLine = git("rev-parse", "HEAD");
+      commitFixtureFile(git, root, "port.txt", "clean port follow-up");
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      expect(resolvePublicBase({ head: "HEAD", selfRef })).toBe(legacyLine);
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("pins the regression: a master-only base would flag the already-public line", () => {
+    withFixtureRepo((git, root) => {
+      commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", "HEAD");
+      commitFixtureFile(git, root, "legacy.md", `legacy public line Refs ${DIRTY_ID}`);
+      git("update-ref", "refs/remotes/origin/deploy/line", "HEAD");
+      commitFixtureFile(git, root, "port.txt", "clean port follow-up");
+      git("update-ref", "refs/remotes/origin/port/x", "HEAD");
+      const masterBase = git("merge-base", "refs/remotes/origin/master", "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ base: masterBase, head: "HEAD", prefixes: PREFIXES, log, error }),
+      ).toBe(1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(`references: ${DIRTY_ID}`));
+    });
+  });
+
+  it("a dirty commit on top of an already-public line still fails", () => {
+    withFixtureRepo((git, root) => {
+      commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", "HEAD");
+      commitFixtureFile(git, root, "legacy.md", `legacy public line Refs ${DIRTY_ID}`);
+      git("update-ref", "refs/remotes/origin/deploy/line", "HEAD");
+      commitFixtureFile(git, root, "port.txt", "clean port follow-up");
+      git("update-ref", "refs/remotes/origin/port/x", "HEAD");
+      commitFixtureFile(git, root, "dirty.md", `new dirty follow-up Refs ${DIRTY_ID}`);
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("message references"));
+      expect(error).not.toHaveBeenCalledWith(expect.stringContaining("legacy.md"));
+    });
+  });
+
+  it("refuses to pass when the pushed history shares nothing with any other origin ref", () => {
+    withFixtureRepo((git, root) => {
+      commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", "HEAD");
+      const orphan = git("commit-tree", "HEAD^{tree}", "-m", "orphan fixture");
+      const selfRef = "refs/remotes/origin/orphan-line";
+      git("update-ref", selfRef, orphan);
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: orphan, selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(2);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("Refusing to pass an unscoped scan"));
+    });
   });
 });

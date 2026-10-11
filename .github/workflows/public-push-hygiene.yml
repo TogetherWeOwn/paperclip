@@ -3,9 +3,9 @@ run-name: Public push hygiene ${{ github.sha }}
 
 # Branch-push coverage for CONTRIBUTING.md "No Internal Issue References".
 # PR workflows never see branch-only pushes, so this runs on every branch push
-# and scans the whole branch delta from merge-base with origin/master: new
-# commit messages plus added tracked lines. Master is excluded: merges land
-# there already reviewed, and a post-merge flag would have no recourse
+# and scans the new publication population: commit messages plus added tracked
+# lines of commits not already reachable from another origin ref. Master is
+# excluded: merges land there already reviewed, and a post-merge flag would have no recourse
 # (history is never rewritten). This assumes direct-to-master pushes stay
 # disabled by branch protection; making this check required is a repo-admin
 # step owned by the Operator route.
@@ -37,16 +37,14 @@ jobs:
       - name: Scan pushed messages and added lines for internal tracker ids
         env:
           PUSH_HEAD: ${{ github.sha }}
+          PUSH_SELF_REF: refs/remotes/origin/${{ github.ref_name }}
         run: |
-          # Always scan from merge-base with origin/master so the head status
-          # covers the whole branch delta:
+          # The scanner picks the base from shared history with every other
+          # origin ref, so branches cut from deploy/* or port/* scan only their
+          # own commits. The branch's own unshared history stays in scope on
+          # every push:
           # - merging master flags no master-owned commits/lines,
           # - a clean follow-up push cannot hide an earlier dirty commit,
-          # - rewritten history and new branches need no special case
-          #   (github.event.before dangles after amend/force-push and only
-          #   covers the last delta, so it is ignored on purpose).
-          # cancel-in-progress stays safe because every run scans the full delta.
-          BASE="$(git merge-base origin/master "$PUSH_HEAD")" \
-            || { echo "ERROR: could not resolve merge-base with origin/master; refusing to pass." >&2; exit 2; }
-          [ -n "$BASE" ] || { echo "ERROR: could not resolve scan base; refusing to pass." >&2; exit 2; }
-          node scripts/check-public-push-hygiene.mjs --base "$BASE" --head "$PUSH_HEAD"
+          # - github.event.before dangles after amend/force-push, so it is not used.
+          # Exits 2 (refuses to pass) when no shared history can scope the range.
+          node scripts/check-public-push-hygiene.mjs --self-ref "$PUSH_SELF_REF" --head "$PUSH_HEAD"

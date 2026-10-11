@@ -17,7 +17,11 @@
  * Scope: only the NEW publication population is scanned --
  *   messages: `git log <base>..<head>`
  *   text:     added (`+`) lines of `git diff -U0 <base>..<head>`
- * Legacy debt already on `<base>` is never flagged and history is untouched.
+ * Without an explicit `--base`, `--self-ref` picks the base as the nearest
+ * commit shared with another origin ref (see resolvePublicBase), so branches
+ * cut from deploy/* or port/* are not scanned for history already public
+ * there. Legacy debt already on `<base>` is never flagged and history is
+ * untouched.
  *
  * Exit codes (fail-closed, mirroring the public-comment hygiene gate):
  *   0 = clean, 1 = internal reference(s) found (blocked), 2 = scanner error.
@@ -33,7 +37,7 @@
  * the proof cannot be bypassed by a PATH shim or an exported shell function.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -147,23 +151,80 @@ export function verifyRef(ref, execFn) {
   execFn(`git rev-parse --verify --quiet ${ref}^{commit}`);
 }
 
+function gitOutputLines(args, input) {
+  return execFileSync("git", args, {
+    encoding: "utf8",
+    input,
+    maxBuffer: EXEC_MAX_BUFFER,
+    stdio: ["pipe", "pipe", "pipe"],
+  })
+    .split("\n")
+    .filter(Boolean);
+}
+
+/**
+ * Base for the publication range of `head` pushed to `selfRef`: a commit on the
+ * frontier of shared history with every other origin ref. Anything reachable
+ * from another origin ref is already public, so `base..head` always covers the
+ * new commits (any frontier commit's ancestors are public). The frontier
+ * commit with the smallest range keeps public history on a parent line out of
+ * scope. Throws when nothing shares history, so the caller fails closed.
+ */
+export function resolvePublicBase({ head, selfRef }) {
+  const headSha = gitOutputLines(["rev-parse", "--verify", "--quiet", `${head}^{commit}`])[0];
+  const otherRefs = gitOutputLines(["for-each-ref", "--format=%(refname)", "refs/remotes/origin"]).filter(
+    (ref) => ref !== selfRef && ref !== "refs/remotes/origin/HEAD",
+  );
+  const revs = [headSha, ...otherRefs.map((ref) => `^${ref}`)].join("\n") + "\n";
+  if (gitOutputLines(["rev-list", "--stdin"], revs).length === 0) {
+    return headSha;
+  }
+  const frontier = gitOutputLines(["rev-list", "--boundary", "--stdin"], revs)
+    .filter((line) => line.startsWith("-"))
+    .map((line) => line.slice(1));
+  if (frontier.length === 0) {
+    throw new Error("pushed history shares no commit with any other origin ref");
+  }
+  let best = null;
+  for (const commit of frontier) {
+    const count = Number(gitOutputLines(["rev-list", "--count", `${commit}..${headSha}`])[0]);
+    if (best === null || count < best.count) {
+      best = { commit, count };
+    }
+  }
+  return best.commit;
+}
+
 export function runPublicPushHygieneCheck({
   base,
   head,
+  selfRef,
   prefixes = DEFAULT_PREFIXES,
   execFn = defaultExec,
   log = console.log,
   error = console.error,
 }) {
-  if (!base || !head) {
-    error("ERROR: --base and --head are both required (no resolvable default).");
+  if (!head || (!base && !selfRef)) {
+    error("ERROR: --head and one of --base or --self-ref are required (no resolvable default).");
     return EXIT_SCANNER_ERROR;
   }
 
+  let scanBase = base;
+  if (!scanBase) {
+    try {
+      scanBase = resolvePublicBase({ head, selfRef });
+    } catch (err) {
+      error(
+        `ERROR: cannot scope the publication range for ${selfRef}: ${err.message}. Refusing to pass an unscoped scan.`,
+      );
+      return EXIT_SCANNER_ERROR;
+    }
+  }
+
   try {
-    verifyRef(base, execFn);
+    verifyRef(scanBase, execFn);
   } catch {
-    error(`ERROR: cannot resolve --base '${base}'. Refusing to pass an unscoped scan.`);
+    error(`ERROR: cannot resolve scan base '${scanBase}'. Refusing to pass an unscoped scan.`);
     return EXIT_SCANNER_ERROR;
   }
 
@@ -177,10 +238,10 @@ export function runPublicPushHygieneCheck({
   let logOutput;
   let diffOutput;
   try {
-    logOutput = execFn(`git log --format=%H%x1f%B%x1e ${base}..${head} --`);
-    diffOutput = execFn(`git diff -U0 --no-color --no-ext-diff ${base}..${head} --`);
+    logOutput = execFn(`git log --format=%H%x1f%B%x1e ${scanBase}..${head} --`);
+    diffOutput = execFn(`git diff -U0 --no-color --no-ext-diff ${scanBase}..${head} --`);
   } catch (err) {
-    error(`ERROR: failed to read the publication range ${base}..${head}: ${err.message}`);
+    error(`ERROR: failed to read the publication range ${scanBase}..${head}: ${err.message}`);
     return EXIT_SCANNER_ERROR;
   }
 
@@ -195,7 +256,7 @@ export function runPublicPushHygieneCheck({
   const textFindings = scanDiffForRefs(diffOutput, prefixes);
 
   if (messageFindings.length === 0 && textFindings.length === 0) {
-    log(`  ✓  No internal tracker references in ${base}..${head}.`);
+    log(`  ✓  No internal tracker references in ${scanBase}..${head}.`);
     return EXIT_CLEAN;
   }
 
@@ -210,11 +271,13 @@ export function runPublicPushHygieneCheck({
 }
 
 function parseArgs(argv) {
-  const args = { base: "origin/master", head: "HEAD", extraPrefixes: [] };
+  const args = { base: undefined, selfRef: undefined, head: "HEAD", extraPrefixes: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--base" && argv[i + 1]) {
       args.base = argv[(i += 1)];
+    } else if (arg === "--self-ref" && argv[i + 1]) {
+      args.selfRef = argv[(i += 1)];
     } else if (arg === "--head" && argv[i + 1]) {
       args.head = argv[(i += 1)];
     } else if (arg === "--prefix" && argv[i + 1]) {
@@ -232,13 +295,14 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args.unknown) {
     const out = args.help ? console.log : console.error;
-    out("Usage: node scripts/check-public-push-hygiene.mjs [--base <ref>] [--head <ref>] [--prefix <PREFIX>]...");
-    out("Defaults: --base origin/master --head HEAD. Prefixes default to TOG,PAP,PAPA plus $PUBLIC_HYGIENE_PREFIXES.");
+    out("Usage: node scripts/check-public-push-hygiene.mjs [--self-ref <origin ref> | --base <ref>] [--head <ref>] [--prefix <PREFIX>]...");
+    out("Defaults: --head HEAD; with neither --self-ref nor --base, --base origin/master. Prefixes default to TOG,PAP,PAPA plus $PUBLIC_HYGIENE_PREFIXES.");
     process.exit(args.help ? EXIT_CLEAN : EXIT_SCANNER_ERROR);
   }
   process.exit(
     runPublicPushHygieneCheck({
-      base: args.base,
+      base: args.base ?? (args.selfRef ? undefined : "origin/master"),
+      selfRef: args.selfRef,
       head: args.head,
       prefixes: resolvePrefixes({ extra: args.extraPrefixes }),
     }),
