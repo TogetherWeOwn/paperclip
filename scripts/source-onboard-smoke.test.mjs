@@ -102,7 +102,13 @@ test("nightly promotion is gated on the source smoke; the stale published lane i
   // Informational, never blocking: the inherited stale canary fails nightly
   // while fork canary publication is absent, so its result is ignored.
   const published = releaseWorkflow.split("smoke_nightly_published:\n")[1].split("smoke_nightly_source:")[0];
-  assert.match(published, /continue-on-error: true/);
+  assert.doesNotMatch(published, /continue-on-error:/);
+  assert.match(published, /informational: true/);
+  const callee = readFileSync(join(repoRoot, ".github/workflows/release-smoke.yml"), "utf8");
+  assert.equal((callee.match(/continue-on-error: \$\{\{ inputs\.informational \|\| false \}\}/g) ?? []).length, 2,
+    "both published-smoke jobs opt into informational behavior; beta defaults remain blocking");
+  assert.match(callee, /Report published smoke outcome/);
+  assert.match(sourceWorkflow, /Initialize failed-boot diagnostics/);
   assert.match(releaseWorkflow, /smoke_nightly_source:\n\s+needs: select_nightly/);
   // Both nightly caller jobs carry the caller's least privilege explicitly:
   // `permissions` is a valid caller-job key beside `uses`, and the called

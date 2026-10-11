@@ -11,13 +11,19 @@ import {
   chatGitHubConfigurations,
   chatGitHubReviews,
   chatMessageLinks,
-  companies,
   heartbeatRuns,
   type Db,
 } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
-import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { githubPullPermalink } from "./chat-github-review-template.js";
 import {
+  findGitHubReviewChecks,
+  hasReconciledGitHubCheckUrl,
+  rememberGitHubCheckUrl,
+  type GitHubReviewCheckResponse,
+} from "./chat-github-check-reconciliation.js";
+import {
+  evictGithubBotRepositoryToken,
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
@@ -96,10 +102,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               endpoint: chatEndpoints,
               resource: chatEndpointResources,
               configuration: chatGitHubConfigurations.configuration,
-              companyPrefix: companies.issuePrefix,
             })
             .from(chatEndpoints)
-            .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
             .innerJoin(
               chatGitHubConfigurations,
               eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
@@ -250,24 +254,47 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   : state === "running"
                     ? "Agent is reviewing this commit"
                     : "Waiting for the assigned agent";
-          const token = await githubBotRepositoryToken(
+          const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
+          // One token per check action, reused across its GitHub calls; a 401
+          // evicts and retries once with a fresh token.
+          let token = await githubBotRepositoryToken(
             db,
             action.companyId,
             action.endpointId,
             event.repositoryId,
             lease.fetch,
           );
-          const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
-          const request = <T>(
+          const request = async <T>(
             path: string,
             options?: Parameters<typeof githubBotRequest>[3],
-          ) =>
-            githubBotRequest<T>(
-              lease.fetch,
-              token,
-              `${prefix}${path}`,
-              options,
-            );
+          ): Promise<T> => {
+            try {
+              return await githubBotRequest<T>(
+                lease.fetch,
+                token,
+                `${prefix}${path}`,
+                options,
+              );
+            } catch (error) {
+              const providerStatus = (
+                error as { details?: { providerStatus?: unknown } }
+              )?.details?.providerStatus;
+              if (providerStatus !== 401) throw error;
+              evictGithubBotRepositoryToken({
+                companyId: action.companyId,
+                endpointId: action.endpointId,
+                repositoryId: event.repositoryId,
+              });
+              token = await githubBotRepositoryToken(
+                db,
+                action.companyId,
+                action.endpointId,
+                event.repositoryId,
+                lease.fetch,
+              );
+              return githubBotRequest<T>(lease.fetch, token, `${prefix}${path}`, options);
+            }
+          };
           const current = await request<{ head: { sha: string } }>(
             `/pulls/${event.pullNumber}`,
           );
@@ -296,30 +323,33 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          if (fresh.result?.state !== state) {
-            const origin = runtimePublicOrigin();
-            const detailsPath = review
-              ? `issues/${review.issueId}`
-              : `apps/chat/${source.endpoint.id}/reviews`;
-            const detailsUrl = origin
-              ? `${origin}/${encodeURIComponent(source.companyPrefix)}/${detailsPath}`
-              : null;
-            const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
-            const checks = await request<{
-              check_runs: Array<{
-                id: number;
-                status?: string;
-                external_id?: string;
-                app?: { id?: number };
-              }>;
-            }>(
-              `/commits/${event.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
-            );
-            const check = checks.check_runs.find(
-              (check) =>
-                check.external_id === externalId &&
-                String(check.app?.id) === source.endpoint.botExternalId,
-            );
+          const detailsUrl = githubPullPermalink(event.repository, event.pullNumber);
+          const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
+          const appId = source.endpoint.botExternalId;
+          if (!appId) throw new Error("GitHub bot app identity is unavailable.");
+          const stateChanged = fresh.result?.state !== state;
+          const checks =
+            stateChanged ||
+            !hasReconciledGitHubCheckUrl(externalId, appId, detailsUrl)
+              ? await findGitHubReviewChecks(
+                  (path) => request<GitHubReviewCheckResponse>(path),
+                  event.headSha,
+                  externalId,
+                  appId,
+                )
+              : [];
+          const check = checks[0];
+          const staleChecks = checks.filter(
+            (candidate) => candidate.details_url !== detailsUrl,
+          );
+          for (const staleCheck of staleChecks)
+            await request(`/check-runs/${staleCheck.id}`, {
+              method: "PATCH",
+              body: { details_url: detailsUrl },
+            });
+          if (checks.length > 0 && staleChecks.length === 0)
+            rememberGitHubCheckUrl(externalId, appId, detailsUrl);
+          if (stateChanged) {
             // GitHub retains a completed check's conclusion when PATCHed back to
             // queued/in_progress. A fresh attempt needs a new check run with the
             // same stable name; otherwise a prior success still looks passing.
@@ -334,7 +364,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   name: "Paperclip Review",
                   head_sha: event.headSha,
                   external_id: externalId,
-                  ...(detailsUrl ? { details_url: detailsUrl } : {}),
+                  details_url: detailsUrl,
                   status,
                   ...(status === "completed"
                     ? { conclusion: "action_required" }

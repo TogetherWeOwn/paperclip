@@ -29,6 +29,28 @@ export type GitHubCredentialSummary = {
   authenticationMode?: "managed" | "host" | "anonymous";
 };
 
+/**
+ * Nonsecret stage breakdown for POST /runtime-tools/github/credentials.
+ * Buckets isolate local route/auth and DB work from downstream credential work
+ * so a slow wrapper (10s launcher deadline) can be attributed without secrets:
+ * - identityMs: captureRunIdentity transaction (pool acquisition + issues/
+ *   heartbeat_runs row-lock wait + pending-identity reconciliation).
+ * - policyMs: allowsGitHubCredentialExport policy re-reads (agent/issue/project).
+ * - credentialMs: managed identity selection + secret-store resolution +
+ *   GitHub OAuth refresh network when due (downstream of local DB/policy).
+ * - persistMs: nonsecret summary write to run_identity_contexts.
+ * Queue/file transfer and response delivery outside this resolver are NOT
+ * included; compare totalMs against the end-to-end launcher elapsed to
+ * isolate transport vs resolver latency. All values are integers >= 0.
+ */
+export type GitHubCredentialStageTiming = {
+  identityMs: number;
+  policyMs: number;
+  credentialMs: number;
+  persistMs: number;
+  totalMs: number;
+};
+
 /** A raw GitHub token cannot enforce the low-trust read-only tool boundary. */
 async function allowsGitHubCredentialExport(
   db: Db,
@@ -113,7 +135,22 @@ export async function resolveGitHubOperationCredentials(
     runId: string;
   },
 ) {
+  const startedAt = Date.now();
+  const elapsed = () => Math.max(0, Math.round(Date.now() - startedAt));
+  let identityMs = 0;
+  let policyMs = 0;
+  let credentialMs = 0;
+  let persistMs = 0;
+  const timingMs = (): GitHubCredentialStageTiming => ({
+    identityMs,
+    policyMs,
+    credentialMs,
+    persistMs,
+    totalMs: elapsed(),
+  });
+  const identityStartedAt = Date.now();
   const { run, context } = await captureRunIdentity(db, input);
+  identityMs = Math.max(0, Math.round(Date.now() - identityStartedAt));
   if (!context) throw forbidden("This run predates managed GitHub credentials");
   let summary: GitHubCredentialSummary;
   let env: Record<string, string> = {};
@@ -121,23 +158,30 @@ export async function resolveGitHubOperationCredentials(
   // not authorization to export that person's (or a dedicated bot's) token.
   // Re-read every policy source for each operation, including a run's retained
   // boundary after task policy edits. Deny before touching the credential store.
-  if (!(await allowsGitHubCredentialExport(db, run))) {
+  const policyStartedAt = Date.now();
+  const allowed = await allowsGitHubCredentialExport(db, run);
+  policyMs = Math.max(0, Math.round(Date.now() - policyStartedAt));
+  if (!allowed) {
     summary = {
       status: "unavailable",
       reason:
         "GitHub credentials are not available to low-trust or unverified executions; use authorized read-only tools.",
     };
+    const persistStartedAt = Date.now();
     await db
       .update(runIdentityContexts)
       .set({ github: summary })
       .where(eq(runIdentityContexts.id, context.id));
+    persistMs = Math.max(0, Math.round(Date.now() - persistStartedAt));
     return {
       identityContextId: context.id,
       revision: context.revision,
       ...summary,
       env,
+      timingMs: timingMs(),
     };
   }
+  const credentialStartedAt = Date.now();
   try {
     const resolved = await resolveManagedGitHubCredential(
       db,
@@ -180,17 +224,23 @@ export async function resolveGitHubOperationCredentials(
       status: "unavailable",
       reason: "GitHub credentials are temporarily unavailable",
     };
+  } finally {
+    credentialMs = Math.max(0, Math.round(Date.now() - credentialStartedAt));
   }
-  if (context)
+  if (context) {
+    const persistStartedAt = Date.now();
     await db
       .update(runIdentityContexts)
       .set({ github: summary })
       .where(eq(runIdentityContexts.id, context.id));
+    persistMs = Math.max(0, Math.round(Date.now() - persistStartedAt));
+  }
   return {
     identityContextId: context?.id ?? null,
     revision: context?.revision ?? null,
     ...summary,
     env,
+    timingMs: timingMs(),
   };
 }
 

@@ -55,7 +55,7 @@ export const GITHUB_BOT_TOOLS = [
     name: "read_file",
     title: "Read a pull request file",
     description:
-      "Read an allowed file at this task's PR head or base commit using the bot App. Ignored paths remain inaccessible.",
+      "Read an allowed file at this task's PR head or diff merge-base commit using the bot App. Ignored paths remain inaccessible.",
     risk: "read",
     schema: objectSchema({ path, revision: { enum: ["head", "base"] } }, [
       "path",
@@ -91,7 +91,7 @@ export const GITHUB_BOT_TOOLS = [
     name: "submit_review",
     title: "Submit a review assessment",
     description:
-      "Submit a structured assessment for this task's exact PR head. Use begin_review before starting an explicitly requested review. Paperclip validates coverage and score, publishes allowed summary/findings, and computes the Paperclip Review check. Coverage reviewedPaths and omittedPaths name only allowed changed files from read_pull_request(files); describe additional context in the rationale. Follow the schema length limits. Incomplete analysis cannot pass. This never formally approves a PR.",
+      "Submit a structured assessment for this task's exact PR head. Use begin_review before starting an explicitly requested review. Paperclip validates coverage and score, publishes allowed summary/findings, and computes the Paperclip Review check. Coverage reviewedPaths and omittedPaths name only allowed changed files from read_pull_request(files); describe additional context in the rationale. Follow the schema length limits. Incomplete analysis cannot pass. This never formally approves a PR. Fill fields concisely; never format markdown. The server renders the post. For every LEFT-side finding, set basePath to the filename at the pull-request base (use path when unchanged) and include it in coverage.reviewedPaths.",
     risk: "write",
     // Share the input contract with server validation so discovery includes every
     // length/array bound; hidden limits caused real agents to abandon publication.
@@ -276,22 +276,31 @@ export async function githubBotToolsForSession(
           (tool) => row.entry.name === `github_bot:${tool.name}`,
         ),
     )
-    .map(({ endpoint, connection, entry }) => ({
-      name: `github-bot.${endpoint.id}:${entry.toolName}`,
-      displayName: entry.title ?? entry.toolName,
-      description: entry.description ?? "",
-      parametersSchema: entry.inputSchema,
-      pluginId: `github-bot:${endpoint.id}`,
-      providerType: "paperclip_github_chat",
-      risk: entry.riskLevel === "read" ? "read" : "write",
-      applicationId: connection.applicationId,
-      applicationKey: "github-chat",
-      applicationDisplayName: "GitHub bot",
-      connectionId: connection.id,
-      catalogEntryId: entry.id,
-      upstreamToolName: entry.toolName,
-      providerMetadata: { endpointId: endpoint.id },
-    }));
+    .flatMap(({ endpoint, connection, entry }) => {
+      const tool = GITHUB_BOT_TOOLS.find(
+        (candidate) => entry.name === `github_bot:${candidate.name}` &&
+          entry.toolName === candidate.name,
+      );
+      if (!tool) return [];
+      // Catalog state still governs access. Built-in contracts come from the
+      // running server, not a snapshot last refreshed by a configuration save.
+      return [{
+        name: `github-bot.${endpoint.id}:${entry.toolName}`,
+        displayName: tool.title,
+        description: tool.description,
+        parametersSchema: tool.schema,
+        pluginId: `github-bot:${endpoint.id}`,
+        providerType: "paperclip_github_chat",
+        risk: entry.riskLevel === "read" ? "read" as const : "write" as const,
+        applicationId: connection.applicationId,
+        applicationKey: "github-chat",
+        applicationDisplayName: "GitHub bot",
+        connectionId: connection.id,
+        catalogEntryId: entry.id,
+        upstreamToolName: entry.toolName,
+        providerMetadata: { endpointId: endpoint.id },
+      }];
+    });
 }
 
 /** Only a run on the endpoint's bound task may realize its channel tools. */

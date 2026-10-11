@@ -4,6 +4,7 @@ import { TelegramAdapter } from "@chat-adapter/telegram";
 import { Actions, Button, Card, CardText } from "chat";
 import {
   createChatQuestionOptionActionToken,
+  genericInteractionText,
   nativeChatQuestion,
   TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
   telegramCallbackDataByteLength,
@@ -44,6 +45,22 @@ function closedQuestion(allowOther?: boolean): AskUserQuestionsInteraction {
     },
   };
 }
+
+describe("generic interaction text", () => {
+  const taskUrl = "https://board.example.invalid/ACME/issues/issue-1";
+
+  it("names no task and no Board link for GitHub", () => {
+    expect(genericInteractionText(taskUrl, true)).toBe(
+      "This request needs an authorized response.",
+    );
+  });
+
+  it("keeps the task sentence and link for other providers", () => {
+    expect(genericInteractionText(taskUrl, false)).toBe(
+      `This task needs an authorized response in Paperclip.\n\nOpen the task in Paperclip to respond: ${taskUrl}`,
+    );
+  });
+});
 
 describe("native chat question eligibility", () => {
   it("treats an omitted allowOther flag as a closed single-select question", () => {

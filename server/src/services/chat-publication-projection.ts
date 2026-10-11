@@ -270,6 +270,171 @@ export function projectSafeChatPublicationText(input: string): string {
   return output;
 }
 
+/** Neutral public actor for GitHub text; agent display names never reach GitHub. */
+export const GITHUB_PUBLIC_ACTOR_NAME = "The assistant";
+
+export interface InternalReferenceScope {
+  internalOrigins: readonly string[];
+  trackerPrefixes: readonly string[];
+}
+
+const INTERNAL_LINK_REMOVED = "[internal link removed]";
+const INTERNAL_REFERENCE = "[internal reference]";
+const TRAILING_URL_PUNCTUATION = new Set([
+  ".",
+  ",",
+  ";",
+  ":",
+  "!",
+  "?",
+  ")",
+  "]",
+]);
+
+function splitTrailingUrlPunctuation(match: string): [string, string] {
+  let end = match.length;
+  while (end > 0 && TRAILING_URL_PUNCTUATION.has(match.charAt(end - 1)))
+    end -= 1;
+  return [match.slice(0, end), match.slice(end)];
+}
+
+function hostnameOf(candidate: string): string | null {
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(candidate)
+      ? candidate
+      : candidate.startsWith("//")
+        ? `https:${candidate}`
+        : `https://${candidate}`;
+    const hostname = new URL(withScheme).hostname;
+    return hostname.toLowerCase().replace(/\.$/, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+function internalHostnames(origins: readonly string[]): Set<string> {
+  const hosts = new Set<string>();
+  for (const origin of origins) {
+    const value = origin.trim();
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+      ? value
+      : `https://${value}`;
+    const hostname = hostnameOf(withScheme);
+    if (hostname) hosts.add(hostname);
+  }
+  return hosts;
+}
+
+function isInternalUrl(candidate: string, hosts: ReadonlySet<string>): boolean {
+  const hostname = hostnameOf(candidate);
+  return hostname !== null && hosts.has(hostname);
+}
+
+// Text before a match that ends inside an external URL's path, such as
+// `https://example.com/a/`. Scanned over a bounded tail so long tokens stay linear.
+const INSIDE_URL_PATH_RE = /(?:^|[\s(<[])[a-z][a-z0-9+.-]*:\/\/[^\s<>()[\]]*\/$/i;
+const INSIDE_URL_LOOKBACK = 2048;
+
+/**
+ * An internal host that is a path segment of another URL is part of that link,
+ * not a link to this runtime. Only URLs with a scheme qualify: `docs/<host>` is
+ * prose and is still scrubbed.
+ */
+function isPathSegmentOfExternalUrl(text: string, offset: number): boolean {
+  return INSIDE_URL_PATH_RE.test(
+    text.slice(Math.max(0, offset - INSIDE_URL_LOOKBACK), offset),
+  );
+}
+
+const LOOPBACK_HOSTNAME_RE =
+  /^(?:localhost|[a-z0-9-]+\.localhost|127(?:\.\d{1,3}){3}|\[::1\])$/;
+
+function bareInternalHostPattern(hosts: ReadonlySet<string>): RegExp | null {
+  const alternatives = [...hosts]
+    .filter((host) => !LOOPBACK_HOSTNAME_RE.test(host))
+    .sort((a, b) => b.length - a.length)
+    .map((host) => host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return alternatives.length
+    ? new RegExp(
+        `(?<![A-Za-z0-9.-])(?:${alternatives.join("|")})(?::\\d{1,5})?(?![A-Za-z0-9-]|\\.[A-Za-z0-9-])(?:[/?#][^\\s<>"'\`]*)?`,
+        "gi",
+      )
+    : null;
+}
+
+function trackerIdPattern(prefixes: readonly string[]): RegExp | null {
+  const alternatives = [
+    ...new Set(prefixes.map((prefix) => prefix.trim()).filter(Boolean)),
+  ].map((prefix) => prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return alternatives.length
+    ? new RegExp(
+        `(?<![A-Za-z0-9_])(?:${alternatives.join("|")})-\\d+(?![A-Za-z0-9_])`,
+        "g",
+      )
+    : null;
+}
+
+/**
+ * Removes this runtime's own links and the company's own tracker ids. Other
+ * identifiers and hosts pass through unchanged.
+ */
+export function scrubInternalReferences(
+  text: string,
+  scope: InternalReferenceScope,
+): string {
+  const hosts = internalHostnames(scope.internalOrigins);
+  const trackers = trackerIdPattern(scope.trackerPrefixes);
+  let output = text.replace(
+    MARKDOWN_LINK_RE,
+    (match, label: string, href: string) => {
+      const [target = ""] = href.trim().replace(/^<|>$/g, "").split(/\s+/);
+      return isInternalUrl(target, hosts) ? label : match;
+    },
+  );
+  output = output.replace(AUTOLINK_RE, (match, href: string) =>
+    isInternalUrl(href, hosts) ? INTERNAL_LINK_REMOVED : match,
+  );
+  output = output.replace(PLAIN_HTTP_URL_RE, (match) => {
+    const [candidate, trailing] = splitTrailingUrlPunctuation(match);
+    return isInternalUrl(candidate, hosts)
+      ? `${INTERNAL_LINK_REMOVED}${trailing}`
+      : match;
+  });
+  const bareHosts = bareInternalHostPattern(hosts);
+  if (bareHosts)
+    output = output.replace(
+      bareHosts,
+      (match, ...rest: unknown[]) => {
+        const offset = rest[rest.length - 2] as number;
+        const whole = rest[rest.length - 1] as string;
+        if (isPathSegmentOfExternalUrl(whole, offset)) return match;
+        const [, trailing] = splitTrailingUrlPunctuation(match);
+        return `${INTERNAL_LINK_REMOVED}${trailing}`;
+      },
+    );
+  return trackers ? output.replace(trackers, INTERNAL_REFERENCE) : output;
+}
+
+export function scrubExternalChatCard(
+  card: SafeExternalChatCard,
+  scope: InternalReferenceScope,
+): SafeExternalChatCard {
+  const hosts = internalHostnames(scope.internalOrigins);
+  const scrub = (value: string) => scrubInternalReferences(value, scope);
+  const actions: SafeExternalChatCardAction[] = [];
+  for (const action of card.actions ?? []) {
+    if (action.type === "link" && isInternalUrl(action.url, hosts)) continue;
+    actions.push({ ...action, label: scrub(action.label) });
+  }
+  return {
+    schema: card.schema,
+    kind: card.kind,
+    title: scrub(card.title),
+    ...(card.body ? { body: scrub(card.body) } : {}),
+    ...(actions.length ? { actions } : {}),
+  };
+}
+
 function projectAttachmentIds(
   input: readonly string[] | null | undefined,
 ): string[] | undefined {

@@ -76,6 +76,56 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it("keeps GitHub milestone text free of the agent name, task links and task prompts", () => {
+    const errorCodes = [
+      null,
+      "low_trust_isolation_unavailable",
+      "native_provider_usage_limit",
+      "native_event_replay_conflict",
+      "native_session_cleanup_quarantined",
+      "slack_session_stopped",
+      "provider_secret_in_error_code",
+    ];
+    const milestones = [
+      "queued",
+      "working",
+      "completed",
+      "waiting_for_input",
+      "failed",
+    ] as const;
+    for (const milestone of milestones) {
+      for (const errorCode of errorCodes) {
+        const text = safeMilestoneText({
+          agentName: "Maya",
+          errorCode,
+          milestone,
+          issueId: "issue-1",
+          provider: "github",
+          publicBaseUrl: "https://paperclip.example",
+        });
+        expect(text).toMatch(/^The assistant /);
+        expect(text).not.toMatch(/Maya|https?:\/\/|Open the task/);
+      }
+    }
+  });
+
+  it("leaves non-GitHub milestone text byte-identical to the unlabelled path", () => {
+    const input = {
+      agentName: "Maya",
+      errorCode: "native_provider_usage_limit",
+      milestone: "failed" as const,
+      issueId: "issue-1",
+      publicBaseUrl: "https://paperclip.example",
+    };
+    const unlabelled = safeMilestoneText(input);
+    expect(unlabelled).toBe(
+      "Maya couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying. Open the task in Paperclip: https://paperclip.example/issues/issue-1",
+    );
+    for (const provider of ["slack", "discord", "microsoft-teams", "telegram"]) {
+      expect(safeMilestoneText({ ...input, provider })).toBe(unlabelled);
+    }
+  });
+
   it.each([
     [null, " Open the task in Paperclip for details."],
     [
