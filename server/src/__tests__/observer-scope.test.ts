@@ -25,7 +25,6 @@ import {
 } from "@paperclipai/db";
 import { normalizeAgentApiKeyScope } from "@paperclipai/shared";
 import { actorMiddleware } from "../middleware/auth.js";
-import { errorHandler } from "../middleware/error-handler.js";
 import { observerCeiling } from "../middleware/observer-ceiling.js";
 import {
   handleObserverHeartbeatRuns,
@@ -726,7 +725,7 @@ describe("auth middleware fail-closed scope parsing", () => {
   const agentId = "aaaaaaaa-1111-4111-8111-111111111111";
   const token = "malformed-scope-token";
 
-  function middlewareApp(scopeConfig: unknown) {
+  function storedKeyDb(scopeConfig: unknown) {
     const keyRow = {
       id: "key-1",
       agentId,
@@ -762,28 +761,38 @@ describe("auth middleware fail-closed scope parsing", () => {
         values: () => Promise.resolve([]),
       }),
     } as never;
-    const app = express();
-    app.use(express.json());
-    app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
-    app.get("/actor", (req, res) => {
-      res.json({ type: req.actor.type, scope: (req.actor as { keyScope?: unknown }).keyScope ?? null });
+    return db;
+  }
+
+  async function runActorMiddleware(scopeConfig: unknown) {
+    const req: {
+      method: string;
+      path: string;
+      actor?: unknown;
+      header(name: string): string | undefined;
+    } = {
+      method: "GET",
+      path: "/actor",
+      header: (name) => (name.toLowerCase() === "authorization" ? `Bearer ${token}` : undefined),
+    };
+    const next = await new Promise<unknown>((resolve) => {
+      actorMiddleware(storedKeyDb(scopeConfig), { deploymentMode: "authenticated" })(
+        req as never,
+        {} as never,
+        (err?: unknown) => resolve(err),
+      );
     });
-    app.use(errorHandler);
-    return app;
+    return { next, actor: req.actor };
   }
 
   it("denies a stored key with a malformed scope instead of standard", async () => {
-    const res = await request(middlewareApp({ kind: "nope" }))
-      .get("/actor")
-      .set("authorization", `Bearer ${token}`);
-    expect(res.status).toBe(403);
+    const { next } = await runActorMiddleware({ kind: "nope" });
+    expect(next).toMatchObject({ status: 403 });
   });
 
   it("authenticates a stored observer fixture scope", async () => {
-    const res = await request(middlewareApp(validScope()))
-      .get("/actor")
-      .set("authorization", `Bearer ${token}`);
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ type: "agent", scope: { kind: "observer" } });
+    const { next, actor } = await runActorMiddleware(validScope());
+    expect(next).toBeUndefined();
+    expect(actor).toMatchObject({ type: "agent", keyScope: { kind: "observer" } });
   });
 });
