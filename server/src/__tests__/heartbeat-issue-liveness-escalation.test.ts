@@ -565,16 +565,19 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
       requestedByActorType: "system", requestedByActorId: null, idempotencyKey,
       payload: { issueId: blockedIssueId },
-      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed" },
+      // responsibleUserId keeps the dependency gate and responsible-user resolution from
+      // masking the closed-issue guard: without the guard this wake would queue a run.
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed", responsibleUserId: "responsible-user" },
     });
   }
 
-  it("rejects a continuation for a closed issue before a heartbeat run is created", async () => {
-    const { companyId, coderId, blockedIssueId } = await seedBlockedChain();
-    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockedIssueId));
+  it.each(["done", "cancelled"] as const)("rejects a continuation for a %s issue before a heartbeat run is created", async (status) => {
+    const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    await db.update(issues).set({ status }).where(eq(issues.id, blockedIssueId));
     await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
 
-    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-closed");
+    await requestStaleContinuation(coderId, blockedIssueId, `stale-continuation-${status}`);
 
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
