@@ -11,7 +11,7 @@ import {
 } from "../services/observer-scope.js";
 
 /**
- * Observer read handlers ([TOG-21648](/TOG/issues/TOG-21648)).
+ * Bounded observer read handlers for the held cap-zero flow.
  *
  * Pure projections from read services — never the recovery-revalidating issue
  * GET handler. Each handler re-validates the observer ceiling (scope shape,
@@ -150,18 +150,7 @@ export async function handleObserverHeartbeatRuns(
   // Heartbeat list rows carry summarized context/result columns; the observer
   // projection keeps status/time/retry metadata plus the issue reference and
   // drops result summaries, usage, log and session fields.
-  res.json(
-    (rows as unknown[]).map((row) => {
-      const contextIssueId =
-        typeof row === "object" && row !== null
-          ? (row as Record<string, unknown>).contextIssueId
-          : null;
-      return projectObserverRun(
-        row,
-        typeof contextIssueId === "string" ? contextIssueId : null,
-      );
-    }),
-  );
+  res.json((rows as unknown[]).map((row) => projectObserverRun(row)));
 }
 
 export type ObserverLiveDeps = {

@@ -5687,7 +5687,7 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
-    // No observer issuance in this admission ([TOG-21648](/TOG/issues/TOG-21648)):
+    // No observer issuance in this admission:
     // minting/placement is a separate later authorized act. Observer scopes
     // exist only as synthetic test fixtures until then.
     if (req.body.scope?.kind === "observer") {
@@ -6652,7 +6652,7 @@ export function agentRoutes(
   });
 
   /**
-   * Observer live-run rows ([TOG-21648](/TOG/issues/TOG-21648)). A minimal
+   * Observer live-run rows for the held cap-zero flow. A minimal
    * column set selected for the observer projection: status/time/retry
    * metadata plus the sanitized issue reference. Log stores/refs, session
    * ids, usage, result JSON, stdout/stderr excerpts and process details are
@@ -6721,7 +6721,7 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/heartbeat-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
-    // Bounded observer projection ([TOG-21648](/TOG/issues/TOG-21648)): before
+    // Bounded observer projection: before
     // generic actor permissions. Pure heartbeat list reads plus the observer
     // projection; run redactions and telemetry gates below are not entered.
     if (isObserverRequest(req)) {
@@ -6772,7 +6772,7 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
-    // Bounded observer projection ([TOG-21648](/TOG/issues/TOG-21648)): before
+    // Bounded observer projection: before
     // generic actor permissions. Minimal observer columns plus the sanitized
     // execution safety join; agent display fields, output silence and run
     // redactions below are not entered.

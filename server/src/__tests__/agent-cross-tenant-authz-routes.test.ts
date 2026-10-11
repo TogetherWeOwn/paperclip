@@ -750,7 +750,7 @@ describe.sequential("agent cross-tenant route authorization", () => {
   });
 
   it("denies observer scope issuance while standard minting still works", async () => {
-    // [TOG-21648](/TOG/issues/TOG-21648): no issuance in this admission.
+    // No observer issuance in this admission.
     // Synthetic fixture only; minting stays a separate later authorized act.
     const now = Date.now();
     const observerScope = {

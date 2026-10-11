@@ -1,27 +1,23 @@
 # Bounded read-only observation scope (held cap-zero flow)
 
-Implementation card: [TOG-21648](/TOG/issues/TOG-21648). Mandatory security
-specification: CISO verdict `ciso-read-only-boundary` revision
-`a983eaa4-7311-4d05-b812-f532352858ad`. Admission: COO
-`admission-decision` revision `b7c8b124-7db1-4fac-b960-e9fc520215f4`.
-Independent acceptance is a separate downstream gate ([TOG-21649](/TOG/issues/TOG-21649));
-merge is NOT deployment or security acceptance.
+This document describes the native observer credential shape: one immutable,
+deny-by-default read-only scope for a single held zero-removal observation.
+Independent security acceptance is a separate downstream gate; merge is NOT
+deployment or security acceptance.
 
 ## What it is
 
-One native, immutable, deny-by-default observer credential shape for the held
-zero-removal observation in [TOG-20698](/TOG/issues/TOG-20698):
-
-- one company `ef993a7e-5ea7-445f-ba88-27a6a2690c3a`, one purpose
-  `held-cap-zero-observation`, non-sliding validity of at most 35 minutes;
+- One company, one purpose (`held-cap-zero-observation`), non-sliding
+  validity of at most 35 minutes.
 - ONLY `GET /api/companies/{companyId}/issues`,
-  `GET /api/companies/{companyId}/heartbeat-runs`,
+  `GET /api/companies/{companyId}/heartbeat-runs` and
   `GET /api/companies/{companyId}/live-runs`, with bounded query allowlists
-  (status/pagination/limits) that preserve complete pagination;
-- every other verb (including HEAD/OPTIONS), path, company, key-management,
+  (status/pagination/limits) that preserve complete pagination.
+- Every other verb (including HEAD/OPTIONS), path, company, key-management,
   secret, log, runtime, workspace and single-issue read is denied before
-  generic actor permissions, on direct access too. Headers and later role
-  elevation cannot widen it,
+  generic actor permissions, on direct access too. The live-events WebSocket
+  upgrade denies observer credentials as well. Headers and later role
+  elevation cannot widen the scope.
 
 ## How it is enforced
 
@@ -50,9 +46,12 @@ zero-removal observation in [TOG-20698](/TOG/issues/TOG-20698):
   `activeRecoveryAction` (no evidence/fingerprint/policies) and
   `successfulRunHandoff` (no free-text summary). No context snapshots.
 - Runs (heartbeat and live): status/time/retry metadata plus the sanitized
-  `issueId` reference and, for live runs, the sanitized `execution`
-  diagnostic join. No result summaries, usage, log/session fields, outputs or
-  environment values. The live SQL never selects those columns.
+  `issueId` reference (resolved from the summarized snapshot on heartbeat
+  rows, from the flat column on live rows) and, for live runs, the sanitized
+  `execution` diagnostic join (phase/label/retry/attempt signals only — no
+  free-text `cause`/`nextAction`, which can echo unredacted output). No
+  result summaries, usage, log/session fields, outputs or environment values.
+  The live SQL never selects those columns.
 
 ## Permitted bookkeeping (explicit)
 
@@ -63,21 +62,20 @@ with no authority-preserving cache.
 
 ## Compatibility
 
-Against the pinned cap-zero consumer (`3e8b35ebaea8dafbafcd7459cf3c9f0be43cf1d9`;
-CISO-verified 2/2 blob match — not re-read here): the allowlists accept the
-cited call shapes (`issues?status&limit&offset` across all seven statuses,
-`heartbeat-runs?limit=200`, default `live-runs`) and return the cited field
-families (issue identity/status, run status/time/retry, sanitized
-path/issue/workspace references, live/queued/retrying joins). Rejected source
-packet `a3c651be-8a79-4dc5-ac9e-9963d8276cb5` was not replayed.
+The allowlists accept the documented consumer call shapes
+(`issues?status&limit&offset` across all seven statuses,
+`heartbeat-runs?limit=200`, default `live-runs`) and return the documented
+field families (issue identity/status, run status/time/retry, sanitized
+path/issue/workspace references, live/queued/retrying joins).
 
 ## Verify
 
 ```sh
-pnpm --filter @paperclipai/server exec vitest run src/__tests__/observer-scope.test.ts src/__tests__/agent-cross-tenant-authz-routes.test.ts
+pnpm --filter @paperclipai/server exec vitest run src/__tests__/observer-scope.test.ts src/__tests__/agent-cross-tenant-authz-routes.test.ts src/__tests__/live-events-ws.test.ts
 ```
 
-35 isolated observer controls (positive reads on all three paths,
+Isolated observer controls (positive reads on all three paths,
 consumer-field/pagination compatibility; negative write/unused-read/
-cross-company/invalid-scope/expiry/role-elevation; deny-before-mutation
-spies; zero-write assertions) plus the neighboring auth suites.
+cross-company/invalid-scope/expiry/role-elevation/websocket-upgrade;
+deny-before-mutation spies; zero-write assertions) plus the neighboring auth
+suites.

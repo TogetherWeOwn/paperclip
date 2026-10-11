@@ -2,8 +2,7 @@ import type { RequestHandler } from "express";
 import { checkObserverCeiling } from "../services/observer-scope.js";
 
 /**
- * Global deny-by-default ceiling for observer credentials
- * ([TOG-21648](/TOG/issues/TOG-21648)).
+ * Global deny-by-default ceiling for observer credentials.
  *
  * Mount immediately after actor resolution (after `cloudControlMiddleware`)
  * and before every route: an observer actor may reach ONLY its three GET

@@ -1,13 +1,11 @@
 /**
- * Native bounded read-only observation scope for the held cap-zero flow
- * ([TOG-21648](/TOG/issues/TOG-21648)).
+ * Native bounded read-only observation scope for the held cap-zero flow.
  *
- * Mandatory security specification: CISO verdict
- * `ciso-read-only-boundary` revision `a983eaa4-7311-4d05-b812-f532352858ad`,
- * admitted by the COO in `admission-decision` revision
- * `b7c8b124-7db1-4fac-b960-e9fc520215f4`. This module is the immutable
- * deny-by-default ceiling; it is pure (no DB, no writes) so it can be
- * unit-tested in isolation.
+ * This module is the immutable deny-by-default ceiling; it is pure (no DB,
+ * no writes) so it can be unit-tested in isolation. It implements the
+ * admitted security determination for one held zero-removal observation:
+ * there is no issuance endpoint in this admission, and independent
+ * acceptance is a separate downstream gate.
  *
  * Ceiling, in one place:
  * - one company (`OBSERVER_SCOPE_COMPANY_ID`), one purpose
@@ -432,6 +430,20 @@ export const OBSERVER_RECOVERY_ACTION_FIELDS = [
   "updatedAt",
 ] as const;
 
+/** Execution safety join without free-text cause/next-action fields. */
+export const OBSERVER_EXECUTION_FIELDS = [
+  "phase",
+  "label",
+  "lastConfirmedActivityAt",
+  "retryAt",
+  "attempt",
+  "maxAttempts",
+  "recoveryOwner",
+  "permittedActions",
+  "predecessorRunId",
+  "successorRunId",
+] as const;
+
 /** Successful-run handoff join without the free-text progress summary. */
 export const OBSERVER_HANDOFF_FIELDS = [
   "state",
@@ -495,28 +507,51 @@ export function projectObserverIssue(row: unknown): Record<string, unknown> {
   return output;
 }
 
+/**
+ * The sanitized run-to-issue reference. `heartbeat.list` returns the issue id
+ * inside the summarized `contextSnapshot` object (`{ issueId, taskId, ... }`,
+ * never the raw snapshot); live observer rows carry it as a flat `issueId`
+ * column. Both shapes resolve here so neither route can silently drop the
+ * join the cap-zero consumer pages on.
+ */
+export function readObserverRunIssueId(row: unknown): string | null {
+  if (typeof row !== "object" || row === null) return null;
+  const source = row as Record<string, unknown>;
+  if (typeof source.issueId === "string" && source.issueId.length > 0) {
+    return source.issueId;
+  }
+  if (typeof source.contextIssueId === "string" && source.contextIssueId.length > 0) {
+    return source.contextIssueId;
+  }
+  const snapshot = source.contextSnapshot;
+  if (typeof snapshot === "object" && snapshot !== null) {
+    const issueId = (snapshot as Record<string, unknown>).issueId;
+    if (typeof issueId === "string" && issueId.length > 0) return issueId;
+  }
+  return null;
+}
+
 export function projectObserverRun(
   row: unknown,
   issueId: string | null = null,
 ): Record<string, unknown> {
   const run = pickPresent<Record<string, unknown>>(row, OBSERVER_RUN_FIELDS);
-  if (issueId) run.issueId = issueId;
-  else if (
-    typeof row === "object" &&
-    row !== null &&
-    typeof (row as Record<string, unknown>).contextIssueId === "string"
-  ) {
-    run.issueId = (row as Record<string, unknown>).contextIssueId;
-  }
-  // The execution projection is already a sanitized diagnostic join
-  // (phase/label/cause/retry/attempt); forward it, never raw snapshots.
-  if (
-    typeof row === "object" &&
-    row !== null &&
-    typeof (row as Record<string, unknown>).execution === "object" &&
-    (row as Record<string, unknown>).execution !== null
-  ) {
-    run.execution = (row as Record<string, unknown>).execution;
+  const resolvedIssueId = issueId ?? readObserverRunIssueId(row);
+  if (resolvedIssueId) run.issueId = resolvedIssueId;
+  // The execution projection is a diagnostic join, but two of its fields
+  // (`cause`, `nextAction`) can carry agent-authored free text derived from
+  // issue comments, result text and stdout/stderr excerpts — the standard
+  // path strips those via run redactions, which the observer branch bypasses.
+  // Forward only the enum/timestamp/id/count join signals, never raw
+  // snapshots and never free text (a secret echoed in a "Next action:" line
+  // must not reach the observer unredacted).
+  if (typeof row === "object" && row !== null) {
+    const execution = (row as Record<string, unknown>).execution;
+    if (typeof execution === "object" && execution !== null) {
+      run.execution = pickPresent(execution, OBSERVER_EXECUTION_FIELDS);
+    } else if (Object.hasOwn(row as Record<string, unknown>, "execution")) {
+      run.execution = null;
+    }
   }
   return run;
 }

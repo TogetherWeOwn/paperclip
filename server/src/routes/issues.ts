@@ -7915,7 +7915,7 @@ export function issueRoutes(
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
-    // Bounded observer projection ([TOG-21648](/TOG/issues/TOG-21648)): before
+    // Bounded observer projection for the held cap-zero flow: before
     // generic actor permissions and before the recovery-revalidating standard
     // path. Pure read services only; the standard handler below is never
     // entered for observer credentials.

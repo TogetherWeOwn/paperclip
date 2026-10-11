@@ -1,6 +1,6 @@
 /**
  * Isolated controls for the native bounded read-only observation scope
- * ([TOG-21648](/TOG/issues/TOG-21648)).
+ * for the held cap-zero flow.
  *
  * No production, no live issuance, no real credentials: every scope under test
  * is a synthetic fixture for the single admitted company. Positive controls
@@ -11,10 +11,20 @@
  * and permitted reads are asserted to issue zero recovery/business-state
  * writes (handlers expose only pure read deps).
  */
+import { createHash } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
+import {
+  agentApiKeys,
+  agents,
+  authUsers,
+  boardApiKeys,
+  companyMemberships,
+} from "@paperclipai/db";
 import { normalizeAgentApiKeyScope } from "@paperclipai/shared";
+import { actorMiddleware } from "../middleware/auth.js";
+import { errorHandler } from "../middleware/error-handler.js";
 import { observerCeiling } from "../middleware/observer-ceiling.js";
 import {
   handleObserverHeartbeatRuns,
@@ -30,6 +40,7 @@ import {
   parseObserverLiveQuery,
   projectObserverIssue,
   projectObserverRun,
+  readObserverRunIssueId,
   validateObserverScope,
 } from "../services/observer-scope.js";
 
@@ -337,7 +348,7 @@ describe("observer projections", () => {
   it("keeps issue identity/status and safety joins, drops snapshots and blobs", () => {
     const projected = projectObserverIssue({
       id: "issue-1",
-      identifier: "TOG-1",
+      identifier: "TEST-1",
       title: "t",
       status: "todo",
       priority: "high",
@@ -401,13 +412,21 @@ describe("observer projections", () => {
         logBytes: 10,
         sessionIdBefore: "drop",
         stdoutExcerpt: "drop",
-        execution: { phase: "working", label: "Working" },
+        execution: {
+          phase: "working",
+          label: "Working",
+          attempt: 2,
+          cause: "free text with sk-ant-secret",
+          nextAction: "free text with sk-ant-secret",
+        },
       },
       null,
     );
     expect(projected.issueId).toBe("issue-1");
     expect(projected.status).toBe("running");
-    expect(projected.execution).toMatchObject({ phase: "working" });
+    expect(projected.execution).toMatchObject({ phase: "working", attempt: 2 });
+    expect(projected.execution).not.toHaveProperty("cause");
+    expect(projected.execution).not.toHaveProperty("nextAction");
     for (const dropped of [
       "contextSnapshot",
       "resultJson",
@@ -420,6 +439,19 @@ describe("observer projections", () => {
     ]) {
       expect(projected).not.toHaveProperty(dropped);
     }
+  });
+
+  it("resolves the run issue reference from every served row shape", () => {
+    // heartbeat.list rows: summarized snapshot object.
+    expect(
+      readObserverRunIssueId({ id: "r", contextSnapshot: { issueId: "i-snap" } }),
+    ).toBe("i-snap");
+    // Observer live rows: flat column.
+    expect(readObserverRunIssueId({ id: "r", issueId: "i-flat" })).toBe("i-flat");
+    // Legacy flat column fallback.
+    expect(readObserverRunIssueId({ id: "r", contextIssueId: "i-legacy" })).toBe("i-legacy");
+    expect(readObserverRunIssueId({ id: "r" })).toBeNull();
+    expect(readObserverRunIssueId(null)).toBeNull();
   });
 });
 
@@ -582,8 +614,18 @@ describe("observer handlers with injected read deps", () => {
   });
 
   it("serves heartbeat runs with consumer pagination intact", async () => {
+    // Fixture mirrors the real heartbeat.list shape: the issue reference
+    // lives inside the summarized contextSnapshot object; there is no flat
+    // contextIssueId column on these rows.
     const listHeartbeatRuns = vi.fn(async () => [
-      { id: "r1", status: "running", contextIssueId: "i1", resultSummary: "drop" },
+      {
+        id: "r1",
+        status: "running",
+        startedAt: "2026-10-11T00:00:00.000Z",
+        contextSnapshot: { issueId: "i1", taskId: null, wakeReason: "x" },
+        resultSummary: "drop",
+        usageJson: { drop: true },
+      },
     ]);
     const { req, res, body } = fakeReqRes({ actor, query: { limit: "200" } });
     await handleObserverHeartbeatRuns(req, res, COMPANY, { listHeartbeatRuns });
@@ -591,7 +633,9 @@ describe("observer handlers with injected read deps", () => {
     expect(listHeartbeatRuns).toHaveBeenCalledWith(COMPANY, undefined, 200, { summary: false });
     const rows = body.payload as Array<Record<string, unknown>>;
     expect(rows[0]).toMatchObject({ id: "r1", issueId: "i1" });
+    expect(rows[0]).not.toHaveProperty("contextSnapshot");
     expect(rows[0]).not.toHaveProperty("resultSummary");
+    expect(rows[0]).not.toHaveProperty("usageJson");
   });
 
   it("rejects heartbeat overreach without reads", async () => {
@@ -607,7 +651,23 @@ describe("observer handlers with injected read deps", () => {
       { id: "r1", status: "running", issueId: "i1", agentName: "drop me" },
     ]);
     const getExecutionProjections = vi.fn(
-      async () => new Map([["r1", { phase: "working", label: "Working" }]]),
+      async () =>
+        new Map([
+          [
+            "r1",
+            {
+              phase: "working",
+              label: "Working",
+              attempt: 1,
+              maxAttempts: 3,
+              retryAt: null,
+              permittedActions: ["inspect_run"],
+              // Free text that may echo secrets or output: never forwarded.
+              cause: "Next action: use sk-ant-secret",
+              nextAction: "Next action: use sk-ant-secret",
+            },
+          ],
+        ]),
     );
     const { req, res, body } = fakeReqRes({ actor, query: {} });
     await handleObserverLiveRuns(req, res, COMPANY, {
@@ -621,9 +681,12 @@ describe("observer handlers with injected read deps", () => {
     expect(rows[0]).toMatchObject({
       id: "r1",
       issueId: "i1",
-      execution: { phase: "working" },
+      execution: { phase: "working", attempt: 1 },
     });
     expect(rows[0]).not.toHaveProperty("agentName");
+    const execution = rows[0].execution as Record<string, unknown>;
+    expect(execution).not.toHaveProperty("cause");
+    expect(execution).not.toHaveProperty("nextAction");
   });
 
   it("rejects live overreach without reads", async () => {
@@ -643,5 +706,71 @@ describe("observer handlers with injected read deps", () => {
     expect(asObserverActor({ type: "board" })).toBeNull();
     expect(asObserverActor(observerActor({ kind: "standard" }))).toBeNull();
     expect(asObserverActor(null)).toBeNull();
+  });
+});
+
+describe("auth middleware fail-closed scope parsing", () => {
+  const agentId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const token = "malformed-scope-token";
+
+  function middlewareApp(scopeConfig: unknown) {
+    const keyRow = {
+      id: "key-1",
+      agentId,
+      companyId: COMPANY,
+      keyHash: createHash("sha256").update(token).digest("hex"),
+      responsibleUserId: "user-1",
+      scopeConfig,
+      revokedAt: null,
+    };
+    const db = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => {
+            if (table === boardApiKeys) return Promise.resolve([]);
+            if (table === agentApiKeys) return Promise.resolve([keyRow]);
+            if (table === agents) {
+              return Promise.resolve([{ id: agentId, companyId: COMPANY, status: "active" }]);
+            }
+            if (table === authUsers) return Promise.resolve([{ id: "user-1" }]);
+            if (table === companyMemberships) {
+              return Promise.resolve([
+                { companyId: COMPANY, membershipRole: "owner", status: "active" },
+              ]);
+            }
+            return Promise.resolve([]);
+          },
+        }),
+      }),
+      update: () => ({
+        set: () => ({ where: () => Promise.resolve([]) }),
+      }),
+      insert: () => ({
+        values: () => Promise.resolve([]),
+      }),
+    } as never;
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+    app.get("/actor", (req, res) => {
+      res.json({ type: req.actor.type, scope: (req.actor as { keyScope?: unknown }).keyScope ?? null });
+    });
+    app.use(errorHandler);
+    return app;
+  }
+
+  it("denies a stored key with a malformed scope instead of standard", async () => {
+    const res = await request(middlewareApp({ kind: "nope" }))
+      .get("/actor")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("authenticates a stored observer fixture scope", async () => {
+    const res = await request(middlewareApp(validScope()))
+      .get("/actor")
+      .set("authorization", `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "agent", scope: { kind: "observer" } });
   });
 });
