@@ -20,9 +20,17 @@ export interface GitWorkspaceSnapshot {
   ignoredPaths: WorkspacePaths;
   /** Managed, editable repositories inside the task workspace. */
   repositories?: Array<{ path: string; snapshot: GitWorkspaceSnapshot }>;
+  /**
+   * Nested project repositories that could not be snapshotted (for example, a
+   * checkout whose `.git` was stripped in transit while its files survived).
+   * Skipped, never fatal; run setup re-provisions the checkout.
+   */
+  repositoryWarnings?: string[];
 }
 
 export const PROJECT_REPOSITORIES_DIR = ".paperclip-repositories";
+export const MAX_REPOSITORY_WARNINGS = 32;
+export const MAX_REPOSITORY_WARNING_LENGTH = 1000;
 
 export interface ExpensiveWorkspaceGitInput {
   localDir: string;
@@ -170,6 +178,8 @@ export function workspaceSnapshotTimeoutMs(): number {
 
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true, options: { signal?: AbortSignal } = {}): Promise<GitWorkspaceSnapshot | null> {
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
+  const repositoryWarnings: string[] = [];
+  const skippedRepositoryPaths: string[] = [];
   // Only repository discovery may report an ordinary directory. A failed
   // snapshot of a confirmed repository must never fall back to directory sync.
   let insideWorkTree: GitCommandResult;
@@ -213,12 +223,30 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
       });
       if (rootStat) {
         if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Invalid project repositories directory");
-        for await (const entry of await fs.opendir(root)) {
+        const entries = await fs.readdir(root, { withFileTypes: true });
+        entries.sort((a, b) => a.name.localeCompare(b.name));
+        for (const entry of entries) {
           if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) throw new Error("Invalid project repository directory");
           const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}`;
           const snapshot = await readGitWorkspaceSnapshot(path.join(localDir, relative), false, options);
-          if (!snapshot) throw new Error(`Project repository is not a Git checkout: ${relative}`);
+          if (!snapshot) {
+            // A nested checkout can lose its `.git` in transit (sync excludes
+            // match at every depth) while its files survive. Skipping keeps the
+            // enclosing workspace usable; run setup re-provisions the checkout.
+            // The skipped directory stays host-local via `ignoredPaths`: it is
+            // neither staged nor snapshotted, so restore must not read its
+            // absence in the sandbox as a deletion on the host.
+            if (repositoryWarnings.length < MAX_REPOSITORY_WARNINGS) {
+              repositoryWarnings.push(`Project repository is not a Git checkout: ${relative}`.slice(0, MAX_REPOSITORY_WARNING_LENGTH));
+            }
+            skippedRepositoryPaths.push(relative);
+            continue;
+          }
           repositories.push({ path: relative, snapshot });
+        }
+        if (skippedRepositoryPaths.length > MAX_REPOSITORY_WARNINGS) {
+          repositoryWarnings[MAX_REPOSITORY_WARNINGS - 1] =
+            `${skippedRepositoryPaths.length - MAX_REPOSITORY_WARNINGS + 1} additional project repositories are not Git checkouts; all skipped paths remain host-local.`;
         }
       }
     }
@@ -230,6 +258,9 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
         // Managed children have their own exact file selections. Never stage a
         // parent Git directory record that could admit files created later.
         if (repositories.some((repo) => relative === repo.path || relative.startsWith(`${repo.path}/`))) return;
+        // Skipped (non-Git) nested checkouts stay host-local: never stage them,
+        // so restore cannot read their sandbox absence as a host deletion.
+        if (skippedRepositoryPaths.some((skipped) => relative === skipped || relative.startsWith(`${skipped}/`))) return;
         writer.add(category, relative);
       });
       const result = await runExpensiveWorkspaceGit(localDir, args, operation, {
@@ -258,17 +289,30 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     })));
     if (firstError !== undefined) throw firstError;
     if (controller.signal.aborted) throw Object.assign(new Error("Workspace snapshot cancelled"), { code: "workspace_git_scan_cancelled" });
+    const head = (settled[0] as PromiseFulfilledResult<GitCommandResult>).value.stdout.trim();
+    if (skippedRepositoryPaths.length > 0) {
+      const trackedRepositories = await runLocalGit(localDir, ["ls-tree", "-r", "--name-only", "-z", head, "--", PROJECT_REPOSITORIES_DIR], {
+        timeout: 10_000,
+        maxBuffer: 16 * 1024,
+      });
+      // Ignore rules cannot remove skipped files from the captured Git commit.
+      if (trackedRepositories.stdout.split("\0").some((entry) =>
+        skippedRepositoryPaths.some((skipped) => entry.startsWith(`${skipped}/`)))) {
+        throw new Error("Anchor Git history contains managed project repository files");
+      }
+      for (const skipped of skippedRepositoryPaths) writer.add("ignored", skipped);
+    }
     for (const repo of repositories) {
       for (const [category, paths] of [["overlay", repo.snapshot.overlayPaths], ["deleted", repo.snapshot.deletedPaths], ["ignored", repo.snapshot.ignoredPaths]] as const) {
         for (const relative of workspacePaths(paths)) writer.add(category, `${repo.path}/${relative}`);
       }
     }
-    const head = (settled[0] as PromiseFulfilledResult<GitCommandResult>).value.stdout.trim();
     const branch = (settled[1] as PromiseFulfilledResult<GitCommandResult>).value.stdout.trim();
     const snapshot: GitWorkspaceSnapshot = {
       headCommit: head, branchName: branch && branch !== "HEAD" ? branch : null,
       overlayPaths: writer.paths("overlay"), deletedPaths: writer.paths("deleted"), ignoredPaths: writer.paths("ignored"),
       ...(repositories.length ? { repositories } : {}),
+      ...(repositoryWarnings.length > 0 ? { repositoryWarnings } : {}),
     };
     writer.close();
     ownedSnapshots.set(snapshot, path.dirname(writer.filePath));
