@@ -9375,13 +9375,16 @@ export function issueRoutes(
             // either record. The durable worker, not a best-effort generic wake,
             // owns execution after commit and rechecks current chat access.
             //
-            // Canonical evidence carries runId (see
-            // buildStrandedRecoveryActionEvidence). Legacy stranded actions
-            // stored only latestRunId with sourceRunId null, so resolve that
-            // single-source fallback here and let prepareFailedChatRunRetry
-            // prove exact chat provenance server-side. Ambiguous legacy
-            // handoff evidence (latest and source differ, no canonical runId)
-            // stays rejected: the caller must send a fresh authorized request.
+            // Stranded actions store the failed run as single-source
+            // latestRunId with sourceRunId null; resolve it here and let
+            // prepareFailedChatRunRetry prove exact chat provenance
+            // server-side. A canonical evidence.runId is also accepted first
+            // for compatibility, but stranded actions no longer write it:
+            // execution-projection matches evidence.runId to the run id and
+            // would flip the failed run to recovery_needed, hiding the chat
+            // "Try again" and run Retry controls. Ambiguous handoff evidence
+            // (latest and source differ, no canonical runId) stays rejected:
+            // the caller must send a fresh authorized request.
             const evidence = (activeRecoveryAction.evidence ?? {}) as Record<
               string,
               unknown
