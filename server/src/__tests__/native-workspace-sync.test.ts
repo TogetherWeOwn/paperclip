@@ -8,6 +8,8 @@ import {
   captureDirectorySnapshot,
   disposeDirectorySnapshot,
 } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { disposeGitWorkspaceSnapshot, readGitWorkspaceSnapshot, runLocalGit, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { workspacePaths } from "@paperclipai/adapter-utils/workspace-manifest";
 
 import {
   classifyNativeWorkspaceInbound,
@@ -201,13 +203,44 @@ describe("native workspace sync durable metadata", () => {
     await expect(stat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.each([false, true])("writes one immutable descriptor when the same state is replayed (multiple repositories: %s)", async (multipleRepositories) => {
+  it.each(["none", "multiple", "many-skipped"] as const)("writes one immutable descriptor when the same state is replayed (%s)", async (scenario) => {
     const paperclipHome = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-native-workspace-sync-"),
     );
     cleanupDirs.push(paperclipHome);
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = "descriptor-test";
+    let gitSnapshot: GitWorkspaceSnapshot | null = scenario === "multiple" ? {
+      headCommit: "a".repeat(40), branchName: "main", overlayPaths: [], deletedPaths: [], ignoredPaths: [],
+      repositories: [{ path: ".paperclip-repositories/backend", snapshot: {
+        headCommit: "b".repeat(40), branchName: "backend-work", overlayPaths: ["dirty.txt"], deletedPaths: [], ignoredPaths: ["secret.txt"],
+      } }],
+    } : null;
+    if (scenario === "many-skipped") {
+      const cwd = path.join(paperclipHome, "workspace");
+      await mkdir(cwd);
+      await runLocalGit(cwd, ["init"]);
+      await runLocalGit(cwd, ["-c", "user.name=Paperclip Test", "-c", "user.email=test@paperclip.dev", "commit", "--allow-empty", "-m", "base"]);
+      const skippedPaths = Array.from({ length: 40 }, (_, index) => `.paperclip-repositories/toolkit-${String(index).padStart(3, "0")}`);
+      await Promise.all(skippedPaths.map((relative) => mkdir(path.join(cwd, relative), { recursive: true })));
+      const probed = await readGitWorkspaceSnapshot(cwd);
+      expect(probed?.repositoryWarnings).toHaveLength(32);
+      expect([...workspacePaths(probed!.ignoredPaths)]).toEqual(expect.arrayContaining(skippedPaths));
+      // Deploy adaptation: descriptors only accept manifest files already
+      // persisted into the run's descriptor directory (callers persist via
+      // persistSnapshotManifests first), so round-trip the warning-carrying
+      // snapshot in array form. The manifest-backed warning path is covered by
+      // the adapter-utils and heartbeat setup tests.
+      gitSnapshot = {
+        headCommit: probed!.headCommit,
+        branchName: probed!.branchName,
+        overlayPaths: [],
+        deletedPaths: [],
+        ignoredPaths: [...workspacePaths(probed!.ignoredPaths)],
+        repositoryWarnings: probed!.repositoryWarnings,
+      };
+      await disposeGitWorkspaceSnapshot(probed);
+    }
     const baseline = {
       exclude: [".paperclip-runtime"],
       entries: new Map([
@@ -231,12 +264,7 @@ describe("native workspace sync durable metadata", () => {
       state: "prepared" as const,
       baselineSha256: directorySnapshotSha256(baseline),
       baseline: serializeDirectorySnapshot(baseline),
-      gitSnapshot: multipleRepositories ? {
-        headCommit: "a".repeat(40), branchName: "main", overlayPaths: [], deletedPaths: [], ignoredPaths: [],
-        repositories: [{ path: ".paperclip-repositories/backend", snapshot: {
-          headCommit: "b".repeat(40), branchName: "backend-work", overlayPaths: ["dirty.txt"], deletedPaths: [], ignoredPaths: ["secret.txt"],
-        } }],
-      } : null,
+      gitSnapshot,
       seed: null,
       createdAt: "2026-01-01T00:00:00.000Z",
       finalizedAt: null,
