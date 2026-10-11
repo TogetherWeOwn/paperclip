@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   getEmbeddedPostgresTestSupport,
+  heartbeatRuns,
   issues,
   startEmbeddedPostgresTestDatabase,
   toolApplications,
@@ -17,6 +18,7 @@ import {
 import {
   GITHUB_GREEN_REVIEW_MAX_ATTEMPTS,
   githubGreenReviewAttempt,
+  githubHeadTransition,
   supersedeQueuedGitHubReviews,
 } from "./chat-github-green-gate.js";
 
@@ -105,8 +107,12 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
     const review = async (
       headSha: string,
       state: NonNullable<(typeof chatGitHubReviews.$inferInsert)["state"]>,
-      extra: { assessed?: boolean; deliveryId?: string } = {},
+      extra: { assessed?: boolean; started?: boolean; deliveryId?: string } = {},
     ) => {
+      const runId = extra.started ? randomUUID() : null;
+      if (runId) {
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+      }
       const [row] = await db
         .insert(chatGitHubReviews)
         .values({
@@ -122,6 +128,7 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
           policySnapshot: {} as never,
           event: {} as never,
           state,
+          runId,
           ...(extra.assessed ? { assessment: { score: 5 } as never } : {}),
         })
         .returning();
@@ -161,6 +168,7 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
     const stale = await f.review(OLD, "queued");
     const current = await f.review(NEW, "queued");
     const assessed = await f.review(OLD, "queued", { assessed: true });
+    const started = await f.review(OLD, "queued", { started: true });
     const running = await f.review(OLD, "running");
     const done = await f.review(OLD, "completed", { assessed: true });
     const changed = await supersedeQueuedGitHubReviews(db, {
@@ -168,14 +176,46 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
       endpointId: f.endpointId,
       repositoryId: REPO,
       pullNumber: PR,
-      currentHeadSha: NEW,
+      beforeHeadSha: OLD.toUpperCase(),
     });
     expect(changed).toBe(1);
     expect(await f.stateOf(stale.id)).toBe("superseded");
     expect(await f.stateOf(current.id)).toBe("queued");
     expect(await f.stateOf(assessed.id)).toBe("queued");
+    expect(await f.stateOf(started.id)).toBe("queued");
     expect(await f.stateOf(running.id)).toBe("running");
     expect(await f.stateOf(done.id)).toBe("completed");
+  });
+
+  it("does not supersede the current head when an older synchronize arrives late", async () => {
+    const f = await fixture();
+    const third = "c".repeat(40);
+    const oldest = await f.review(OLD, "queued");
+    const middle = await f.review(NEW, "queued");
+    const current = await f.review(third, "queued");
+    const other = await fixture();
+    const unrelated = await other.review(OLD, "queued");
+    const apply = async (before: string, head: string) => {
+      const transition = githubHeadTransition({
+        action: "synchronize",
+        before,
+        repository: { id: REPO },
+        pull_request: { number: PR, head: { sha: head } },
+      });
+      expect(transition).not.toBeNull();
+      return supersedeQueuedGitHubReviews(db, {
+        companyId: f.companyId,
+        endpointId: f.endpointId,
+        ...transition!,
+      });
+    };
+    expect(await apply(NEW, third)).toBe(1);
+    expect(await apply(OLD, NEW)).toBe(1);
+    expect(await apply(OLD, NEW)).toBe(0);
+    expect(await f.stateOf(oldest.id)).toBe("superseded");
+    expect(await f.stateOf(middle.id)).toBe("superseded");
+    expect(await f.stateOf(current.id)).toBe("queued");
+    expect(await other.stateOf(unrelated.id)).toBe("queued");
   });
 
   it("supersedes every never-started queued row when the pull request closes", async () => {
@@ -189,7 +229,7 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
         endpointId: f.endpointId,
         repositoryId: REPO,
         pullNumber: PR,
-        currentHeadSha: null,
+        beforeHeadSha: null,
       }),
     ).toBe(2);
     expect(await f.stateOf(a.id)).toBe("superseded");
@@ -232,8 +272,15 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
         deliveryId: await f.delivery(`${base}:attempt-3`),
       });
       expect(GITHUB_GREEN_REVIEW_MAX_ATTEMPTS).toBe(3);
-      expect(await githubGreenReviewAttempt(db, scope)).toEqual({
-        kind: "retries_exhausted",
+      for (let repeat = 0; repeat < 3; repeat++) {
+        expect(await githubGreenReviewAttempt(db, scope)).toEqual({
+          kind: "retries_exhausted",
+        });
+      }
+      expect(await githubGreenReviewAttempt(db, { ...scope, headSha: OLD })).toEqual({
+        kind: "ready",
+        deliveryId: `checks-green:${REPO}:${PR}:${OLD}`,
+        attempt: 1,
       });
     },
   );

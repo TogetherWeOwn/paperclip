@@ -79,25 +79,41 @@ describe("githubHeadGreenState", () => {
 });
 
 describe("githubHeadTransition", () => {
-  const head = "a".repeat(40);
-  it("reports the new head on synchronize", () => {
+  const before = "a".repeat(40);
+  const head = "b".repeat(40);
+  it("reports the previous head on synchronize", () => {
     expect(
       githubHeadTransition({
         action: "synchronize",
+        before: before.toUpperCase(),
         repository: { id: 42 },
         pull_request: { number: 7, head: { sha: head.toUpperCase() } },
       }),
-    ).toEqual({ repositoryId: "42", pullNumber: 7, currentHeadSha: head });
+    ).toEqual({ repositoryId: "42", pullNumber: 7, beforeHeadSha: before });
   });
 
-  it("reports no current head on close", () => {
+  it.each([undefined, null, 42, "", "nope", "a".repeat(39), "g".repeat(40)])(
+    "ignores synchronize when the previous head is invalid: %s",
+    (invalidBefore) => {
+      expect(
+        githubHeadTransition({
+          action: "synchronize",
+          before: invalidBefore,
+          repository: { id: 42 },
+          pull_request: { number: 7, head: { sha: head } },
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("supersedes all eligible heads on close without requiring a previous head", () => {
     expect(
       githubHeadTransition({
         action: "closed",
         repository: { id: "42" },
         pull_request: { number: 7, head: { sha: head } },
       }),
-    ).toEqual({ repositoryId: "42", pullNumber: 7, currentHeadSha: null });
+    ).toEqual({ repositoryId: "42", pullNumber: 7, beforeHeadSha: null });
   });
 
   it("ignores other actions and malformed payloads", () => {
