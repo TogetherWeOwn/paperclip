@@ -62,6 +62,8 @@ export interface GitHubReviewEventContext {
   title: string;
   body: string;
   baseSha: string;
+  /** Pinned merge base for PR diff coordinates; absent on pre-template reviews. */
+  diffBaseSha?: string;
   headSha: string;
   baseBranch: string;
   author: { id: string; login: string; isBot: boolean };
@@ -81,7 +83,15 @@ export interface GitHubReviewFinding {
   side: "LEFT" | "RIGHT";
   severity: "info" | "warning" | "error";
   category: string;
+  /** LEFT-side filename at the pull-request base; required for new LEFT findings. */
+  basePath?: string;
+  /** Short human-readable finding title (\u2264120 chars). The server renders all markdown. */
+  title: string;
   body: string;
+  /** Optional permalink label or quoted evidence (\u2264500 chars). */
+  evidence?: string;
+  /** Optional replacement lines, rendered as a suggestion block. */
+  suggestion?: string;
 }
 
 export interface GitHubReviewAssessment {

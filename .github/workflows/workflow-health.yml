@@ -1,0 +1,61 @@
+name: Workflow Health
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions: {}
+
+jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+    permissions:
+      contents: read
+    with:
+      scope: workflows
+
+  validate:
+    needs: changes
+    if: needs.changes.outputs.affected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install actionlint 1.7.12 outside the checkout
+        env:
+          GOBIN: ${{ runner.temp }}/actionlint-bin
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Validate workflows, negative parser cases, and non-publishing fork routes
+        env:
+          ACTIONLINT: ${{ runner.temp }}/actionlint-bin/actionlint
+        run: node --test scripts/source-onboard-smoke.test.mjs scripts/ci-workflow-health.test.mjs
+
+  ci-ok:
+    if: always()
+    needs: [changes, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require successful affected checks (or a deliberate unaffected skip)
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          AFFECTED: ${{ needs.changes.outputs.affected }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          case "$AFFECTED" in
+            true) test "$VALIDATE_RESULT" = success ;;
+            false) test "$VALIDATE_RESULT" = skipped ;;
+            *) exit 1 ;;
+          esac

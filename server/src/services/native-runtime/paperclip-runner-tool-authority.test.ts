@@ -91,7 +91,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(27);
+    expect(authority.definitions()).toHaveLength(29);
     const questions = authority.definitions().find(tool => tool.name === "request_human_input")!;
     expect(questions.description).toContain("ask only the next unanswered question");
     expect(questions.description).toContain("Never infer answers");
@@ -102,7 +102,10 @@ describe("PaperclipRunnerToolAuthority", () => {
     expect(authority.definitions().map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
         "connections_search",
-        "connection_request", "create_project", "list_project_repositories", "list_projects",
+        "connection_request",
+        "github_actions_job_logs",
+        "github_repository_webhooks",
+        "create_project", "list_project_repositories", "list_projects",
         "get_task_context",
         "get_task_history",
         "search_tasks",
@@ -1265,6 +1268,37 @@ describe("PaperclipRunnerToolAuthority", () => {
     } });
     const interactions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
     expect(interactions.find((row) => row.title === "Approve continuation")?.sourceIdentityContextId).toBe(pending!.id);
+  });
+
+  it("routes the GitHub diagnostics through the strict schemas and the responsible-user check without any network call", async () => {
+    const issueId = "00000000-0000-4000-8000-000000000130";
+    const runId = "00000000-0000-4000-8000-000000000131";
+    await db.insert(issues).values({ id: issueId, companyId, title: "GitHub diagnostics dispatch",
+      status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: issueId,
+      invocationSource: "assignment", triggerDetail: "system", contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await initializeRunIdentity(db, { companyId, runId, issueId, responsibleUserId: "person-a", cause: "instruction" });
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
+    try {
+      for (const [tool, args] of [
+        ["github_actions_job_logs", { repositoryId: "1396224242", jobId: "42", owner: "attacker" }],
+        ["github_actions_job_logs", { repositoryId: "two-bot-next", jobId: "42" }],
+        ["github_repository_webhooks", { repositoryId: "1396224242", path: "/hooks/9/pings" }],
+        ["github_repository_webhooks", { repositoryId: "9999999999" }],
+      ] as const) {
+        await expect(authority.execute({ tool, callId: `bad-${tool}`, arguments: args })).rejects.toThrow();
+      }
+      // A valid call passes the schema, then stops at the responsible-user check before any credential use.
+      await expect(authority.execute({
+        tool: "github_repository_webhooks", callId: "good-hooks", arguments: { repositoryId: "1396224242" },
+      })).rejects.toThrow("Responsible user is no longer authorized");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("fails closed once the run is no longer active", async () => {

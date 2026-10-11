@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { readGitWorkspaceSnapshot, runLocalGit, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -149,13 +150,30 @@ describe("native workspace sync durable metadata", () => {
     ).toThrow("native_workspace_sync_descriptor_digest_invalid");
   });
 
-  it.each([false, true])("writes one immutable descriptor when the same state is replayed (multiple repositories: %s)", async (multipleRepositories) => {
+  it.each(["none", "multiple", "many-skipped"] as const)("writes one immutable descriptor when the same state is replayed (%s)", async (scenario) => {
     const paperclipHome = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-native-workspace-sync-"),
     );
     cleanupDirs.push(paperclipHome);
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = "descriptor-test";
+    let gitSnapshot: GitWorkspaceSnapshot | null = scenario === "multiple" ? {
+      headCommit: "a".repeat(40), branchName: "main", overlayPaths: [], deletedPaths: [], ignoredPaths: [],
+      repositories: [{ path: ".paperclip-repositories/backend", snapshot: {
+        headCommit: "b".repeat(40), branchName: "backend-work", overlayPaths: ["dirty.txt"], deletedPaths: [], ignoredPaths: ["secret.txt"],
+      } }],
+    } : null;
+    if (scenario === "many-skipped") {
+      const cwd = path.join(paperclipHome, "workspace");
+      await mkdir(cwd);
+      await runLocalGit(cwd, ["init"]);
+      await runLocalGit(cwd, ["-c", "user.name=Paperclip Test", "-c", "user.email=test@paperclip.dev", "commit", "--allow-empty", "-m", "base"]);
+      const skippedPaths = Array.from({ length: 40 }, (_, index) => `.paperclip-repositories/toolkit-${String(index).padStart(3, "0")}`);
+      await Promise.all(skippedPaths.map((relative) => mkdir(path.join(cwd, relative), { recursive: true })));
+      gitSnapshot = await readGitWorkspaceSnapshot(cwd);
+      expect(gitSnapshot?.repositoryWarnings).toHaveLength(32);
+      expect(gitSnapshot?.ignoredPaths).toEqual(expect.arrayContaining(skippedPaths));
+    }
     const baseline = {
       exclude: [".paperclip-runtime"],
       entries: new Map([
@@ -179,12 +197,7 @@ describe("native workspace sync durable metadata", () => {
       state: "prepared" as const,
       baselineSha256: directorySnapshotSha256(baseline),
       baseline: serializeDirectorySnapshot(baseline),
-      gitSnapshot: multipleRepositories ? {
-        headCommit: "a".repeat(40), branchName: "main", overlayPaths: [], deletedPaths: [], ignoredPaths: [],
-        repositories: [{ path: ".paperclip-repositories/backend", snapshot: {
-          headCommit: "b".repeat(40), branchName: "backend-work", overlayPaths: ["dirty.txt"], deletedPaths: [], ignoredPaths: ["secret.txt"],
-        } }],
-      } : null,
+      gitSnapshot,
       seed: null,
       createdAt: "2026-01-01T00:00:00.000Z",
       finalizedAt: null,

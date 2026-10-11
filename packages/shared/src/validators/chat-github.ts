@@ -98,7 +98,57 @@ export const updateGitHubChatConfigurationSchema = z
     configuration: githubChatConfigurationSchema,
   })
   .strict();
-export const githubReviewAssessmentSchema = z
+
+function validateGitHubReviewAssessmentShape(
+  value: {
+    complete: boolean;
+    coverage: { reviewedPaths: string[] };
+    findings: Array<{
+      key: string;
+      path: string;
+      side: "LEFT" | "RIGHT";
+      line: number;
+      basePath?: string;
+    }>;
+  },
+  ctx: z.RefinementCtx,
+  validateNewBasePath: boolean,
+) {
+  if (value.complete && value.coverage.reviewedPaths.length === 0)
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["coverage"],
+      message: "A complete assessment must identify reviewed files.",
+    });
+  const keys = value.findings.map(
+    (f) => `${f.key}:${f.path}:${f.side}:${f.line}`,
+  );
+  if (new Set(keys).size !== keys.length)
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["findings"],
+      message: "Duplicate findings are not allowed.",
+    });
+  value.findings.forEach((finding, index) => {
+    if (!validateNewBasePath || finding.side !== "LEFT") return;
+    if (!finding.basePath) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["findings", index, "basePath"],
+        message: "LEFT-side findings must include their base filename.",
+      });
+      return;
+    }
+    if (!value.coverage.reviewedPaths.includes(finding.basePath))
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["findings", index, "basePath"],
+        message: "LEFT-side basePath must be listed in reviewedPaths.",
+      });
+  });
+}
+
+const githubReviewAssessmentObjectSchema = z
   .object({
     reviewedCommit: githubCommitSchema,
     score: z.union([
@@ -110,7 +160,7 @@ export const githubReviewAssessmentSchema = z
       z.literal(5),
     ]),
     complete: z.boolean(),
-    summary: z.string().trim().min(1).max(24000),
+    summary: z.string().trim().min(1).max(2000),
     rationale: z.string().trim().min(1).max(12000),
     coverage: z
       .object({
@@ -129,27 +179,64 @@ export const githubReviewAssessmentSchema = z
             side: z.enum(["LEFT", "RIGHT"]),
             severity: z.enum(["info", "warning", "error"]),
             category: z.string().min(1).max(80),
+            basePath: z
+              .string()
+              .trim()
+              .min(1)
+              .max(500)
+              .regex(/^[^\r\n]+$/, "Base path must be a single line")
+              .optional(),
+            title: z
+              .string()
+              .trim()
+              .min(1)
+              .max(120)
+              // Titles render inside a GFM table cell, where `|` opens a
+              // column and a newline splits the row; the renderer escapes
+              // both as a second layer of defence.
+              .regex(/^[^|\r\n]*$/, "Title must be a single line without '|'"),
             body: z.string().trim().min(1).max(12000),
+            evidence: z.string().trim().min(1).max(500).optional(),
+            suggestion: z.string().min(1).max(4000).optional(),
           })
           .strict(),
       )
       .max(300),
   })
-  .strict()
-  .superRefine((value, ctx) => {
-    if (value.complete && value.coverage.reviewedPaths.length === 0)
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["coverage"],
-        message: "A complete assessment must identify reviewed files.",
-      });
-    const keys = value.findings.map(
-      (f) => `${f.key}:${f.path}:${f.side}:${f.line}`,
-    );
-    if (new Set(keys).size !== keys.length)
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["findings"],
-        message: "Duplicate findings are not allowed.",
-      });
+  .strict();
+export const githubReviewAssessmentSchema =
+  githubReviewAssessmentObjectSchema.superRefine((value, ctx) =>
+    validateGitHubReviewAssessmentShape(value, ctx, true),
+  );
+
+const persistedReviewAssessmentObjectSchema =
+  githubReviewAssessmentObjectSchema;
+const persistedReviewFindingSchema =
+  persistedReviewAssessmentObjectSchema.shape.findings.element.extend({
+    title:
+      persistedReviewAssessmentObjectSchema.shape.findings.element.shape.title.optional(),
   });
+
+/**
+ * Stored assessments are revalidated during publication and retries. Accept the
+ * previous 24,000-character summary bound and findings without a title or base
+ * filename. Normalize missing titles. A legacy LEFT finding without basePath is
+ * rendered without a file link rather than guessing a path at the base commit.
+ */
+export const githubPersistedReviewAssessmentSchema =
+  persistedReviewAssessmentObjectSchema
+    .extend({
+      summary: z.string().trim().min(1).max(24000),
+      findings: z.array(persistedReviewFindingSchema).max(300),
+    })
+    .strict()
+    .superRefine((value, ctx) =>
+      validateGitHubReviewAssessmentShape(value, ctx, false),
+    )
+    .transform((value) => ({
+      ...value,
+      findings: value.findings.map((finding) => ({
+        ...finding,
+        title: finding.title ?? finding.category,
+      })),
+    }));

@@ -301,7 +301,7 @@ async function seedBranchContainmentRun(
   db: Db,
   repoRoot: string,
   callSite: BranchContainmentCallSite,
-  opts: { enableWorkspaceBranchReconcileForward?: boolean } = {},
+  opts: { enableWorkspaceBranchReconcileForward?: boolean; freeRecordedBranch?: boolean } = {},
 ) {
   const companyId = randomUUID();
   const projectId = randomUUID();
@@ -390,6 +390,11 @@ async function seedBranchContainmentRun(
       actualBranch,
       divergeRecordedBranch: opts.enableWorkspaceBranchReconcileForward !== true,
     });
+    if (opts.freeRecordedBranch) {
+      // Leave the primary checkout detached so no other worktree holds the
+      // recorded branch and a restore can check it out.
+      await runGit(repoRoot, ["checkout", "--detach"]);
+    }
   }
 
   await db.insert(executionWorkspaces).values([
@@ -608,11 +613,14 @@ async function expectContainedWorkspaceBranchFailure(input: {
     expectedBranch: input.expectedBranch,
     actualBranch: input.actualBranch,
     cleanliness: "clean",
+    // A clean diverged worktree is restored to its recorded branch. This
+    // fixture keeps the recorded branch checked out in the primary repository,
+    // so git refuses the checkout and the run must still fail closed.
     safeRepair: expect.objectContaining({
-      eligible: false,
-      attempted: false,
+      eligible: true,
+      attempted: true,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
+      reason: expect.stringContaining("clean branch restore failed: git checkout"),
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {
@@ -1217,5 +1225,65 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       expectedResolvedRecoveryActionFingerprint,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it.each([
+    ["workspace-runtime fresh worktree reuse", "fresh_realize" as const],
+    ["workspace-runtime persisted restore", "persisted_restore" as const],
+    ["heartbeat finalization", "finalize" as const],
+  ])("restores the recorded branch at %s when the worktree is clean and diverged", async (_name, callSite) => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedBranchContainmentRun(db, repoRoot, callSite, { freeRecordedBranch: true });
+
+    adapterExecute.mockImplementationOnce(async (adapterInput) => {
+      if (callSite === "finalize") {
+        // The agent commits on the recorded branch, then leaves HEAD detached
+        // one commit behind it.
+        const workspace = readAdapterWorkspace(adapterInput);
+        await writeFile(path.join(workspace.cwd, "recorded-work.txt"), "recorded branch work\n", "utf8");
+        await runGit(workspace.cwd, ["add", "recorded-work.txt"]);
+        await runGit(workspace.cwd, ["commit", "-m", "Add recorded branch work"]);
+        await runGit(workspace.cwd, ["checkout", "--detach", "HEAD~1"]);
+      }
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          checkoutRunId: null,
+          executionRunId: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after the recorded branch was restored.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+
+    const finishedRun = await waitForRunToFinish(heartbeat, seeded.runId, 15_000);
+    expect(finishedRun).toMatchObject({ status: "succeeded" });
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+    await expect(readGit(seeded.worktreePath, ["branch", "--show-current"])).resolves.toBe(seeded.expectedBranch);
+    await expect(readGit(seeded.worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+    const restores = (await db.select().from(activityLog))
+      .filter((row) => row.action === "execution_workspace.branch_restored");
+    expect(restores).toHaveLength(1);
+    expect(restores[0]?.details).toMatchObject({
+      expectedBranch: seeded.expectedBranch,
+      worktreePath: seeded.worktreePath,
+    });
+    if (callSite !== "finalize") {
+      // The unrecorded branch keeps its commit.
+      await expect(readGit(seeded.worktreePath, ["rev-parse", seeded.actualBranch])).resolves.toEqual(expect.any(String));
+    }
   }, 30_000);
 });

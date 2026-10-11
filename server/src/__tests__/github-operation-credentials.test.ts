@@ -34,7 +34,10 @@ import {
   reserveSteeredIdentity,
   acceptSteeredIdentity,
 } from "../services/run-identity.js";
-import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import {
+  resolveGitHubOperationCredentials,
+  withGitHubOperationCredential,
+} from "../services/github-operation-credentials.js";
 import {
   filterResolvedGitHubConnectionsForRun,
   resolveManagedGitHubIdentitySelection,
@@ -338,6 +341,23 @@ const support = await getEmbeddedPostgresTestSupport();
         status: "available",
         grantId: older.id,
       });
+    });
+
+    it("does not try another grant when a diagnostics credential read fails", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      await grant(input, "A");
+      vault.resolveUserSecretValue.mockClear();
+      vault.resolveUserSecretValue.mockRejectedValueOnce(
+        new Error("secret provider failed"),
+      );
+      const operation = vi.fn(async () => "unreachable");
+
+      await expect(
+        withGitHubOperationCredential(db, input, operation),
+      ).rejects.toThrow();
+      expect(operation).not.toHaveBeenCalled();
+      expect(vault.resolveUserSecretValue).toHaveBeenCalledTimes(1);
     });
 
     it("uses one stable grant when the same person connects the same GitHub account twice", async () => {
@@ -907,6 +927,218 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(
         (await post().set("Authorization", `Bearer ${token}`)).status,
       ).toBe(403);
+    });
+
+    it("mediates only pinned GitHub GET reads and sanitizes fixture responses", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: input.agentId, status: "in_progress" })
+        .where(eq(issues.id, input.issueId));
+
+      const app = express();
+      app.use(express.json());
+      app.use(runtimeConnectionIntentRoutes(db));
+      app.use(errorHandler);
+      const token = createRuntimeToolsToken({
+        ...input,
+        responsibleUserId: "A",
+      })!.token;
+      const call = (name: string, args: unknown) =>
+        request(app)
+          .post("/mcp/runtime-tools")
+          .set("Authorization", `Bearer ${token}`)
+          .send({
+            jsonrpc: "2.0",
+            id: "fixture",
+            method: "tools/call",
+            params: { name, arguments: args },
+          });
+      const apiJobUrl = "https://api.github.com/repos/TogetherWeOwn/two-bot-next/actions/jobs/42/logs";
+      const safeDownloadUrl = "https://productionresultssa0.blob.core.windows.net/actions-results/job.txt?sig=fixture-signature";
+      let redirectLocation = safeDownloadUrl;
+      const requests: Array<{
+        url: string;
+        method: string;
+        authorization: string | null;
+        redirect: RequestRedirect | undefined;
+      }> = [];
+      const webhookFixture = [{
+        id: 9,
+        name: "build",
+        type: "Repository",
+        active: true,
+        events: ["push"],
+        config: {
+          url: "https://hooks.example.test/receive?secret=url-secret",
+          content_type: "json",
+          secret: "webhook-secret-fixture",
+          insecure_ssl: "0",
+        },
+        url: "https://api.github.com/repos/TogetherWeOwn/two-bot-next/hooks/9",
+        test_url: "https://api.github.com/repos/TogetherWeOwn/two-bot-next/hooks/9/test",
+        ping_url: "https://api.github.com/repos/TogetherWeOwn/two-bot-next/hooks/9/pings",
+        deliveries_url: "https://api.github.com/repos/TogetherWeOwn/two-bot-next/hooks/9/deliveries",
+        created_at: "2026-10-08T00:00:00Z",
+        updated_at: "2026-10-08T00:00:00Z",
+      }];
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (resource, init) => {
+        const url = resource instanceof Request
+          ? resource.url
+          : resource instanceof URL
+            ? resource.toString()
+            : resource;
+        const headers = new Headers(init?.headers);
+        requests.push({
+          url,
+          method: init?.method ?? "GET",
+          authorization: headers.get("authorization"),
+          redirect: init?.redirect,
+        });
+        if (url === apiJobUrl) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: redirectLocation },
+          });
+        }
+        if (url === safeDownloadUrl) {
+          return new Response(
+            "token=test-token-A\nGH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz123456\nhttps://example.test/log?access_token=url-secret\n",
+            { status: 200, headers: { "content-type": "text/plain" } },
+          );
+        }
+        if (url === "https://api.github.com/repos/TogetherWeOwn/two-bot-next/hooks?per_page=100&page=1") {
+          return new Response(JSON.stringify(webhookFixture), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new Error("Unexpected fixture request");
+      });
+
+      try {
+        const listedTools = await request(app)
+          .post("/mcp/runtime-tools")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ jsonrpc: "2.0", id: "list", method: "tools/list" });
+        expect(listedTools.status).toBe(200);
+        expect(listedTools.body.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+          "connections_search",
+          "connection_request",
+          "github_actions_job_logs",
+          "github_repository_webhooks",
+        ]);
+
+        const logs = await call("github_actions_job_logs", {
+          repositoryId: "1396224242",
+          jobId: "42",
+        });
+        expect(logs.status).toBe(200);
+        expect(logs.headers["cache-control"]).toBe("no-store");
+        expect(logs.body.result.structuredContent).toMatchObject({
+          repositoryId: "1396224242",
+          repository: "TogetherWeOwn/two-bot-next",
+          jobId: "42",
+          truncated: false,
+        });
+        const serializedLogs = JSON.stringify(logs.body.result.structuredContent);
+        expect(serializedLogs).not.toContain("test-token-A");
+        expect(serializedLogs).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456");
+        expect(serializedLogs).not.toContain("access_token=url-secret");
+        expect(requests.slice(0, 2)).toMatchObject([
+          {
+            url: apiJobUrl,
+            method: "GET",
+            authorization: "Bearer test-token-A",
+            redirect: "manual",
+          },
+          {
+            url: safeDownloadUrl,
+            method: "GET",
+            authorization: null,
+            redirect: "manual",
+          },
+        ]);
+
+        const webhooks = await call("github_repository_webhooks", {
+          repositoryId: "1396224242",
+        });
+        expect(webhooks.status).toBe(200);
+        const webhookResult = webhooks.body.result.structuredContent;
+        expect(webhookResult).toMatchObject({
+          repositoryId: "1396224242",
+          webhooks: [{
+            id: 9,
+            name: "build",
+            active: true,
+            events: ["push"],
+            config: { contentType: "json", insecureSsl: false },
+          }],
+        });
+        const serializedWebhooks = JSON.stringify(webhookResult);
+        for (const secretOrUrl of [
+          "webhook-secret-fixture",
+          "url-secret",
+          "hooks.example.test",
+          "ping_url",
+          "deliveries_url",
+        ]) expect(serializedWebhooks).not.toContain(secretOrUrl);
+
+        const requestCount = requests.length;
+        for (const [tool, args] of [
+          ["github_actions_job_logs", { repositoryId: "1396224242", jobId: "42", owner: "attacker" }],
+          ["github_actions_job_logs", { repositoryId: "9999999999", jobId: "42" }],
+          ["github_actions_job_logs", { repositoryId: "1396224242", jobId: "42", method: "POST", path: "/repos/TogetherWeOwn/two-bot-next/hooks/9/pings" }],
+          ["github_repository_webhooks", { repositoryId: "1396224242", repo: "attacker/repo", url: "https://attacker.example" }],
+          ["github_repository_webhooks", { repositoryId: "1396224242", path: "/repos/TogetherWeOwn/two-bot-next/hooks/9/tests" }],
+        ] as const) {
+          expect((await call(tool, args)).status).not.toBe(200);
+        }
+        expect(requests).toHaveLength(requestCount);
+        expect((await call("github_repository_webhook_ping", { repositoryId: "1396224242" })).status).toBe(404);
+        expect(requests).toHaveLength(requestCount);
+
+        redirectLocation = "https://attacker.example/log.txt?sig=must-not-be-fetched";
+        const beforeUnsafeRedirect = requests.length;
+        expect((await call("github_actions_job_logs", {
+          repositoryId: "1396224242",
+          jobId: "42",
+        })).status).toBe(403);
+        expect(requests).toHaveLength(beforeUnsafeRedirect + 1);
+        expect(requests.at(-1)?.url).toBe(apiJobUrl);
+        expect(requests.some((entry) => entry.url.includes("attacker.example"))).toBe(false);
+
+        await db
+          .update(issues)
+          .set({
+            sourceTrust: {
+              preset: LOW_TRUST_REVIEW_PRESET,
+              disposition: "quarantined",
+              sourceIssueId: input.issueId,
+            },
+          })
+          .where(eq(issues.id, input.issueId));
+        vault.resolveUserSecretValue.mockClear();
+        const beforeQuarantine = requests.length;
+        expect((await call("github_repository_webhooks", {
+          repositoryId: "1396224242",
+        })).status).toBe(403);
+        expect(requests).toHaveLength(beforeQuarantine);
+        expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+
+        await db
+          .update(heartbeatRuns)
+          .set({ status: "succeeded" })
+          .where(eq(heartbeatRuns.id, input.runId));
+        const beforeFinishedRun = requests.length;
+        expect((await call("github_repository_webhooks", {
+          repositoryId: "1396224242",
+        })).status).toBe(403);
+        expect(requests).toHaveLength(beforeFinishedRun);
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
   },
 );

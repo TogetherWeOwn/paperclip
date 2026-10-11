@@ -13,6 +13,8 @@ import {
   fetchGitBundleIntoLocalRef,
   integrateImportedGitHead,
   isMissingGitPrerequisiteError,
+  MAX_REPOSITORY_WARNINGS,
+  MAX_REPOSITORY_WARNING_LENGTH,
   readGitWorkspaceSnapshot,
   ReferencedSourceIgnoreScanLimitExceededError,
   readReferencedSourceGitIgnoredPaths,
@@ -221,6 +223,79 @@ describe("git workspace sync", () => {
       expect(await git(copied, ["status", "--porcelain"])).toBe("");
     });
     expect(await git(nested, ["status", "--porcelain"])).toBe("");
+  });
+
+  it("warns instead of failing when a nested checkout lost its .git", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-nested-stripped-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    // A nested checkout reconstituted from sync data: files survive, `.git` does not.
+    const stripped = path.join(repo, ".paperclip-repositories", "toolkit-abc123");
+    await mkdir(stripped, { recursive: true });
+    await writeFile(path.join(stripped, "runbook.md"), "surviving files\n", "utf8");
+    // A healthy sibling keeps snapshotting normally.
+    const healthy = path.join(repo, ".paperclip-repositories", "healthy-def456");
+    await mkdir(healthy, { recursive: true });
+    await git(healthy, ["init"]);
+    await git(healthy, ["config", "user.name", "Paperclip Test"]);
+    await git(healthy, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(healthy, "ok.txt"), "ok\n", "utf8");
+    await git(healthy, ["add", "ok.txt"]);
+    await git(healthy, ["commit", "-m", "ok"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    expect(snapshot?.headCommit).toBe(await git(repo, ["rev-parse", "HEAD"]));
+    expect(snapshot?.repositories?.map((entry) => entry.path)).toEqual([
+      ".paperclip-repositories/healthy-def456",
+    ]);
+    expect(snapshot?.repositoryWarnings).toEqual([
+      "Project repository is not a Git checkout: .paperclip-repositories/toolkit-abc123",
+    ]);
+    // The skipped directory must stay host-local: restore treats anything
+    // missing from the sandbox and not ignored as a deletion.
+    expect(snapshot?.ignoredPaths).toContain(".paperclip-repositories/toolkit-abc123");
+
+    // The warning-carrying snapshot still restores: healthy history lands, the
+    // stripped entry is simply absent until setup re-provisions it.
+    await withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async (cloneDir) => {
+      expect(await readFile(path.join(cloneDir, "tracked.txt"), "utf8")).toBe("base\n");
+      expect((await lstat(path.join(cloneDir, ".paperclip-repositories", "healthy-def456", ".git"))).isDirectory()).toBe(true);
+    });
+  });
+
+  it("fails closed when the anchor history tracks a skipped managed repository", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-tracked-stripped-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    const stripped = ".paperclip-repositories/toolkit-stripped";
+    await mkdir(path.join(repo, stripped), { recursive: true });
+    await writeFile(path.join(repo, stripped, "survivor.txt"), "host-only\n");
+    await git(repo, ["add", "-f", stripped]);
+    await git(repo, ["commit", "-m", "track invalid nested checkout"]);
+    await expect(readGitWorkspaceSnapshot(repo)).rejects.toThrow("Anchor Git history contains managed project repository files");
+    expect(await readFile(path.join(repo, stripped, "survivor.txt"), "utf8")).toBe("host-only\n");
+  });
+
+  it.each([31, 32, 33, 40])("bounds warnings while retaining all %i skipped repositories", async (count) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-many-stripped-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    const paths = Array.from({ length: count }, (_, i) => `.paperclip-repositories/toolkit-${String(i).padStart(3, "0")}`);
+    await Promise.all(paths.map((relative) => mkdir(path.join(repo, relative), { recursive: true })));
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    expect(snapshot?.ignoredPaths).toEqual(expect.arrayContaining(paths));
+    expect(snapshot?.repositoryWarnings).toHaveLength(Math.min(count, MAX_REPOSITORY_WARNINGS));
+    expect(snapshot?.repositoryWarnings?.every((warning) => warning.length <= MAX_REPOSITORY_WARNING_LENGTH)).toBe(true);
+    const detailedCount = count > MAX_REPOSITORY_WARNINGS ? MAX_REPOSITORY_WARNINGS - 1 : count;
+    expect(snapshot?.repositoryWarnings?.slice(0, detailedCount)).toEqual(
+      paths.slice(0, detailedCount).map((relative) => `Project repository is not a Git checkout: ${relative}`),
+    );
+    if (count > MAX_REPOSITORY_WARNINGS) {
+      expect(snapshot?.repositoryWarnings?.at(-1)).toBe(
+        `${count - detailedCount} additional project repositories are not Git checkouts; all skipped paths remain host-local.`,
+      );
+    }
   });
 
   it("copies the workspace origin remote into the shallow clone", async () => {

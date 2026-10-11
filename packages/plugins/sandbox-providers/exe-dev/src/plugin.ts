@@ -284,6 +284,49 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function filterStringEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  return Object.entries(env ?? {})
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+}
+
+function assertValidExeDevEnvKeys(entries: Array<[string, string]>): void {
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid exe.dev environment variable key: ${key}`);
+    }
+  }
+}
+
+// Env values must never ride the ssh argv: local `ps` and the remote host's
+// `ps`/audit trail would expose every resolved agent secret. Stage env as an
+// `export KEY='value'` fragment piped over the encrypted ssh stdin channel
+// into a remote 0600 file, source it inside the remote script (after the login
+// profiles so identity overrides keep winning), and remove it in the same
+// remote shell invocation that runs the payload. The removal is a chained
+// `rm` after the payload — not a `trap ... EXIT` before a terminal `exec`,
+// which POSIX shells skip across `exec` and would leave the secret-bearing
+// file behind on success.
+function buildRemoteEnvFileContents(entries: Array<[string, string]>): string {
+  return entries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join("\n") + "\n";
+}
+
+function remoteTempFilenameForEnvFile(): string {
+  const nonce = randomUUID().replace(/-/g, "");
+  return `.paperclip-exe-dev-env-${nonce}.sh`;
+}
+
+// Sources the staged env file, then runs the payload with a chained `rm -f`
+// of the env file so the secret-bearing file is removed on both success and
+// failure paths. `payloadScript` must not end in a terminal `exec`: a shell
+// that `exec`s the payload never returns to run the chained `rm`.
+function envSourcingScriptLines(remotePath: string, payloadScript: string): string[] {
+  const quoted = shellQuote(remotePath);
+  return [
+    `if [ -f ${quoted} ]; then . ${quoted}; fi`,
+    `${payloadScript}; rc=$?; rm -f ${quoted}; exit $rc`,
+  ];
+}
+
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -524,21 +567,12 @@ function buildLoginShellScript(input: {
   command: string;
   args: string[];
   cwd?: string;
-  env?: Record<string, string>;
+  // Fully-expanded absolute path of the staged remote env file (0600),
+  // or null when no env is staged. Env values never enter this script —
+  // they ride the staged file, sourced below after the login profiles.
+  remoteEnvPath?: string | null;
 }): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid exe.dev environment variable key: ${key}`);
-    }
-  }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const finalLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
   // Source the common login profiles before exec so the command runs with the
   // interactive-shell PATH. The wrapper sources no `nvm.sh`; the sandbox image
   // supplies node on the PATH.
@@ -551,7 +585,13 @@ function buildLoginShellScript(input: {
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  lines.push(finalLine);
+  if (input.remoteEnvPath != null) {
+    // No terminal `exec` here: the payload must return so the chained `rm -f`
+    // removes the secret-bearing env file on both success and failure paths.
+    lines.push(...envSourcingScriptLines(input.remoteEnvPath, commandParts));
+  } else {
+    lines.push(`exec ${commandParts}`);
+  }
   return lines.join(" && ");
 }
 
@@ -926,11 +966,41 @@ const plugin = definePlugin({
       };
     }
 
+    const envEntries = filterStringEnvEntries(params.env);
+    assertValidExeDevEnvKeys(envEntries);
+    const timeoutMs = params.timeoutMs ?? config.timeoutMs;
+    const effectiveCwd = params.cwd ?? parseOptionalString(params.lease.metadata?.remoteCwd) ?? undefined;
+
+    // Env values must never ride the ssh argv (local `ps` and the remote
+    // host's `ps`/audit trail would expose every resolved agent secret).
+    // Stage them as an `export KEY='value'` fragment in a remote 0600 file:
+    // secret values travel over the encrypted ssh stdin pipe, never argv.
+    let remoteEnvPath: string | null = null;
+    if (envEntries.length > 0) {
+      const stagingDir = effectiveCwd ?? (await detectRemoteContext(config, vm)).homeDir;
+      remoteEnvPath = `${stagingDir.replace(/\/+$/, "")}/${remoteTempFilenameForEnvFile()}`;
+      const stageResult = await runSshCommand(
+        config,
+        vm,
+        `mkdir -p ${shellQuote(stagingDir)} && umask 077 && cat > ${shellQuote(remoteEnvPath)} && chmod 600 ${shellQuote(remoteEnvPath)}`,
+        { stdin: buildRemoteEnvFileContents(envEntries), timeoutMs },
+      );
+      if (stageResult.timedOut || stageResult.exitCode !== 0) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: stageResult.timedOut,
+          stdout: "",
+          stderr: formatSshFailure("stage environment for", vm.name, stageResult),
+        };
+      }
+    }
+
     const command = buildLoginShellScript({
       command: params.command,
       args: params.args ?? [],
-      cwd: params.cwd ?? parseOptionalString(params.lease.metadata?.remoteCwd) ?? undefined,
-      env: params.env,
+      cwd: effectiveCwd,
+      remoteEnvPath,
     });
     // `buildLoginShellScript` already explicitly sources `/etc/profile`,
     // `~/.profile`, `~/.bash_profile`/`~/.bashrc`, and `~/.zprofile`. Wrapping
@@ -942,7 +1012,7 @@ const plugin = definePlugin({
       config,
       vm,
       `sh -c ${shellQuote(command)}`,
-      { stdin: params.stdin, timeoutMs: params.timeoutMs ?? config.timeoutMs },
+      { stdin: params.stdin, timeoutMs },
     );
 
     return {

@@ -17,6 +17,7 @@ import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { githubReadOperationsService } from "../services/github-read-operations.js";
 
 function bearer(req: Request) {
   const value = req.header("authorization") ?? "";
@@ -43,6 +44,7 @@ import { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../services/connection-tool
 export function runtimeConnectionIntentRoutes(db: Db) {
   const router = Router();
   const service = connectionIntentService(db);
+  const githubReads = githubReadOperationsService(db);
 
   router.post("/runtime-tools/github/credentials", async (req, res) => {
     // This capability is never accepted as board/session authentication.
@@ -64,6 +66,7 @@ export function runtimeConnectionIntentRoutes(db: Db) {
 
   router.post("/mcp/runtime-tools", async (req, res) => {
     const claims = runtimeClaims(req);
+    res.setHeader("Cache-Control", "no-store");
     // Streamable HTTP lifecycle calls are token uses too. Revalidate the bound
     // run before initialize/list as well as before an actual tool call so an
     // ended heartbeat cannot keep probing the endpoint with a once-valid token.
@@ -110,6 +113,16 @@ export function runtimeConnectionIntentRoutes(db: Db) {
       if (name === "connection_request") {
         const input = connectionRequestInputSchema.parse(params.arguments ?? {});
         const result = await service.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService });
+        res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
+        return;
+      }
+      if (name === "github_actions_job_logs") {
+        const result = await githubReads.actionsJobLogs(claims, params.arguments ?? {});
+        res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
+        return;
+      }
+      if (name === "github_repository_webhooks") {
+        const result = await githubReads.repositoryWebhooks(claims, params.arguments ?? {});
         res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
         return;
       }

@@ -148,6 +148,7 @@ Core fields:
 - filesystemExtraPaths (array, optional): additional absolute host paths exposed inside the workspace sandbox. String entries are read-only; object entries use { path: "/absolute/path", access: "ro" | "rw" }.
 - filesystemSandboxCommand (string, optional): Bubblewrap executable name or absolute path; defaults to "bwrap". Linux only.
 - networkScope (string, optional): "deny" blocks all network egress; "allowlist" permits only networkAllowlist targets through Paperclip's HTTP(S) proxy. Off by default.
+- isolateRuntime (boolean, optional): for an agent that reads untrusted input. The Codex child starts from an empty environment and receives only CODEX_HOME, OPENAI_API_KEY, PATH/HOME/temp/locale basics and the run, task, agent and company ids; it inherits nothing from the server or from project, routine or environment env, and gets no PAPERCLIP_API_KEY. No MCP gateway is written to CODEX_HOME/config.toml (a block left by an earlier run is stripped) and the heartbeat mints no gateway token. Off by default. Requires engine="cli" and a local execution target; ACP and remote targets are refused.
 - networkAllowlist (string[], optional): exact hostnames, hostname:port entries, or origin URLs. Include the configured Codex provider origin, such as "api.openai.com" or a custom model provider gateway.
 
 Operational fields:

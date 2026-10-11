@@ -130,6 +130,8 @@ export async function reconcileSafeNativeReplacements(
       const safeControlReads = new Set([
         "connections_search",
         "connection_request",
+        "github_actions_job_logs",
+        "github_repository_webhooks",
         "paperclip_get_agent",
         "paperclip_get_issue",
         "paperclip_list_issues",

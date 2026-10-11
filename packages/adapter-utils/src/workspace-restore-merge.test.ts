@@ -103,6 +103,32 @@ describe("workspace restore merge", () => {
     ).resolves.toBe("ssh codex\n");
   });
 
+  it.each(["file", "symlink"] as const)("refuses %s replacement of an excluded path's ancestor before any restore writes", async (kind) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-protected-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    const skipped = ".paperclip-repositories/toolkit-stripped";
+    await mkdir(path.join(targetDir, skipped), { recursive: true });
+    await mkdir(sourceDir);
+    await writeFile(path.join(targetDir, skipped, "survivor.txt"), "kept\n");
+    await writeFile(path.join(targetDir, "a.txt"), "original\n");
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [skipped] });
+    await writeFile(path.join(sourceDir, "a.txt"), "changed\n");
+    if (kind === "file") {
+      await writeFile(path.join(sourceDir, ".paperclip-repositories"), "replacement\n");
+    } else {
+      await mkdir(path.join(sourceDir, "moved-repositories"));
+      await symlink("moved-repositories", path.join(sourceDir, ".paperclip-repositories"));
+    }
+    const beforeApply = vi.fn();
+    await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, beforeApply }))
+      .rejects.toMatchObject({ code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
+    expect(beforeApply).not.toHaveBeenCalled();
+    expect(await readFile(path.join(targetDir, skipped, "survivor.txt"), "utf8")).toBe("kept\n");
+    expect(await readFile(path.join(targetDir, "a.txt"), "utf8")).toBe("original\n");
+  });
+
   it("ignores non-file entries when capturing snapshots", async () => {
     if (process.platform === "win32") return;
 

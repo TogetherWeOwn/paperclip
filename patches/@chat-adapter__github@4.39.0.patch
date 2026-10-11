@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index 32d5ca33adadd3928983ae76d78949190320cdab..056ab06ceb047e4bb08c2b0dacfd8b2a41540ec1 100644
+index 32d5ca33adadd3928983ae76d78949190320cdab..76648881ab1abefae156cc7960f843af4327486a 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -8,7 +8,7 @@ import {
@@ -8,13 +8,13 @@ index 32d5ca33adadd3928983ae76d78949190320cdab..056ab06ceb047e4bb08c2b0dacfd8b2a
  import { Octokit } from "@octokit/rest";
 -import { ConsoleLogger, convertEmojiPlaceholders, Message } from "chat";
 +import { ConsoleLogger, convertEmojiPlaceholders, Message, toPlainText } from "chat";
-
+ 
  // src/cards.ts
  import { renderGfmTable } from "@chat-adapter/shared";
 @@ -144,6 +144,55 @@ var GitHubFormatConverter = class extends BaseFormatConverter {
    }
  };
-
+ 
 +// GitHub comments commonly represent uploaded files as Markdown images. The
 +// shared plain-text converter preserves their label but drops the destination,
 +// which makes the uploaded artifact impossible to recover downstream. Append
@@ -67,7 +67,19 @@ index 32d5ca33adadd3928983ae76d78949190320cdab..056ab06ceb047e4bb08c2b0dacfd8b2a
  // src/index.ts
  var REVIEW_COMMENT_THREAD_PATTERN = /^([^/]+)\/([^:]+):(\d+):rc:(\d+)$/;
  var ISSUE_THREAD_PATTERN = /^([^/]+)\/([^:]+):issue:(\d+)$/;
-@@ -677,11 +726,12 @@ var GitHubAdapter = class {
+@@ -444,7 +493,10 @@ var GitHubAdapter = class {
+    * Get the state key for storing installation ID for a repository.
+    */
+   getInstallationKey(owner, repo) {
+-    return `github:install:${owner}/${repo}`;
++    // GitHub owner and repository names are case-insensitive. Canonicalize
++    // so installation ids stored from raw webhook payloads match lookups
++    // made from lowercased thread ids.
++    return `github:install:${owner.toLowerCase()}/${repo.toLowerCase()}`;
+   }
+   /**
+    * Store the installation ID for a repository (for multi-tenant mode).
+@@ -677,11 +729,12 @@ var GitHubAdapter = class {
     */
    parseIssueComment(comment, repository, prNumber, threadId, threadType = "pr") {
      const author = this.parseAuthor(comment.user);
@@ -82,7 +94,7 @@ index 32d5ca33adadd3928983ae76d78949190320cdab..056ab06ceb047e4bb08c2b0dacfd8b2a
        raw: {
          type: "issue_comment",
          comment,
-@@ -709,11 +759,12 @@ var GitHubAdapter = class {
+@@ -709,11 +762,12 @@ var GitHubAdapter = class {
     */
    parseReviewComment(comment, repository, prNumber, threadId) {
      const author = this.parseAuthor(comment.user);
@@ -97,3 +109,31 @@ index 32d5ca33adadd3928983ae76d78949190320cdab..056ab06ceb047e4bb08c2b0dacfd8b2a
        raw: {
          type: "review_comment",
          comment,
+@@ -1136,6 +1190,11 @@ var GitHubAdapter = class {
+    */
+   encodeThreadId(platformData) {
+     const { owner, repo, prNumber, type, reviewCommentId } = platformData;
++    // GitHub owner and repository names are case-insensitive. Mint every
++    // thread id in lowercase so comment deliveries resolve to the same
++    // thread as automatic pull_request deliveries (which arrive lowercased).
++    const canonicalOwner = owner.toLowerCase();
++    const canonicalRepo = repo.toLowerCase();
+     if (type === "issue" && reviewCommentId) {
+       throw new ValidationError(
+         "github",
+@@ -1143,12 +1202,12 @@ var GitHubAdapter = class {
+       );
+     }
+     if (type === "issue") {
+-      return `github:${owner}/${repo}:issue:${prNumber}`;
++      return `github:${canonicalOwner}/${canonicalRepo}:issue:${prNumber}`;
+     }
+     if (reviewCommentId) {
+-      return `github:${owner}/${repo}:${prNumber}:rc:${reviewCommentId}`;
++      return `github:${canonicalOwner}/${canonicalRepo}:${prNumber}:rc:${reviewCommentId}`;
+     }
+-    return `github:${owner}/${repo}:${prNumber}`;
++    return `github:${canonicalOwner}/${canonicalRepo}:${prNumber}`;
+   }
+   /**
+    * Decode thread ID string back to platform data.

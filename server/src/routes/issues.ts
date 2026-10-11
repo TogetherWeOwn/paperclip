@@ -235,6 +235,7 @@ import {
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { isAssigneeTerminalCloseOfBlockedCard } from "./issues-low-trust-terminal-close.js";
 import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
@@ -6537,9 +6538,16 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: {
+      resumeIntent?: boolean;
+      allowLowTrustTerminalClose?: boolean;
+    } = {},
   ) {
-    if (
+    if (options.allowLowTrustTerminalClose === true) {
+      // Waives only the low-trust 403; an invalid or conflicting trust policy
+      // still throws (fail closed).
+      await actorIsLowTrustReview(req, issue.companyId, issue);
+    } else if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
     )
       return false;
@@ -9366,7 +9374,47 @@ export function issueRoutes(
             // Admit the exact server-owned recovery evidence before resolving
             // either record. The durable worker, not a best-effort generic wake,
             // owns execution after commit and rechecks current chat access.
-            const failedRunId = activeRecoveryAction.evidence?.runId;
+            //
+            // Stranded actions store the failed run as single-source
+            // latestRunId with sourceRunId null; resolve it here and let
+            // prepareFailedChatRunRetry prove exact chat provenance
+            // server-side. A canonical evidence.runId is also accepted first
+            // for compatibility, but stranded actions no longer write it:
+            // execution-projection matches evidence.runId to the run id and
+            // would flip the failed run to recovery_needed, hiding the chat
+            // "Try again" and run Retry controls. Ambiguous handoff evidence
+            // (latest and source differ, no canonical runId) stays rejected:
+            // the caller must send a fresh authorized request.
+            const evidence = (activeRecoveryAction.evidence ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const canonicalRunId =
+              typeof evidence.runId === "string" ? evidence.runId : undefined;
+            const legacyLatestRunId =
+              typeof evidence.latestRunId === "string"
+                ? evidence.latestRunId
+                : undefined;
+            const legacySourceRunId =
+              typeof evidence.sourceRunId === "string"
+                ? evidence.sourceRunId
+                : undefined;
+            let failedRunId: string | undefined = canonicalRunId;
+            if (!failedRunId) {
+              const latestValid =
+                legacyLatestRunId && isUuidLike(legacyLatestRunId)
+                  ? legacyLatestRunId
+                  : undefined;
+              const sourceValid =
+                legacySourceRunId && isUuidLike(legacySourceRunId)
+                  ? legacySourceRunId
+                  : undefined;
+              if (latestValid && (!sourceValid || sourceValid === latestValid)) {
+                failedRunId = latestValid;
+              } else if (!latestValid && sourceValid) {
+                failedRunId = sourceValid;
+              }
+            }
             if (
               !opts.chatRunRetries ||
               req.actor.type !== "board" ||
@@ -13020,10 +13068,24 @@ export function issueRoutes(
           await requireRecoverySourceMutationAuthority(req, existing);
         }
       }
+      // A low-trust assignee may close its own blocked card (recovery parks
+      // failed review cards there); reopen/resume/blockers stay denied above.
+      const allowLowTrustTerminalClose = isAssigneeTerminalCloseOfBlockedCard({
+        actorType: req.actor.type,
+        actorAgentId: req.actor.type === "agent" ? (req.actor.agentId ?? null) : null,
+        issueStatus: existing.status,
+        assigneeAgentId: existing.assigneeAgentId,
+        targetStatus: updateFields.status,
+        resumeRequested: resumeRequested === true,
+        reopenRequested: reopenRequested === true,
+        setsBlockers: Array.isArray(req.body.blockedByIssueIds),
+      });
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(req, res, existing, {
+          allowLowTrustTerminalClose,
+        }))
       ) {
         return;
       }

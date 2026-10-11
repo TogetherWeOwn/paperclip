@@ -26,7 +26,7 @@ import { logActivity } from "./activity-log.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
+import { selectLowTrustReviewEnvironment } from "./low-trust-sandbox-environment.js";
 
 export function githubChatManagementService(db: Db, fetchImpl = fetch) {
   async function endpoint(id: string) {
@@ -492,23 +492,13 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
       ) {
         const settings = instanceSettingsService(db);
         const experimental = await settings.getExperimental();
-        const environments = environmentService(db);
-        const local = await environments.ensureLocalEnvironment(bot.companyId);
-        const managed = experimental.enableManagedSandboxOnly
-          ? await environments.findManagedSandboxEnvironment(bot.companyId)
-          : null;
-        const selected = resolveExecutionWorkspaceEnvironmentId({
+        const { environment, owners } = await selectLowTrustReviewEnvironment({
+          companyId: bot.companyId,
           agentDefaultEnvironmentId: agent.defaultEnvironmentId,
-          instanceDefaultEnvironmentId:
-            (await settings.get()).defaultEnvironmentId ?? null,
-          localDefaultEnvironmentId: local.id,
           managedSandboxOnly: experimental.enableManagedSandboxOnly,
-          managedSandboxEnvironmentId: managed?.id,
+          instanceSettings: await settings.get(),
+          environments: environmentService(db),
         });
-        const environment = await environments.getById(selected.environmentId);
-        const owners = environment
-          ? await environments.listBoundCompanyIds(environment.id)
-          : [];
         const sandboxOk =
           experimental.enableIsolatedWorkspaces &&
           environment?.driver === "sandbox" &&

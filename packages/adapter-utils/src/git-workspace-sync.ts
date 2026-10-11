@@ -17,9 +17,17 @@ export interface GitWorkspaceSnapshot {
   ignoredPaths: string[];
   /** Managed, editable repositories inside the task workspace. */
   repositories?: Array<{ path: string; snapshot: GitWorkspaceSnapshot }>;
+  /**
+   * Nested project repositories that could not be snapshotted (for example, a
+   * checkout whose `.git` was stripped in transit while its files survived).
+   * Skipped, never fatal; run setup re-provisions the checkout.
+   */
+  repositoryWarnings?: string[];
 }
 
 export const PROJECT_REPOSITORIES_DIR = ".paperclip-repositories";
+export const MAX_REPOSITORY_WARNINGS = 32;
+export const MAX_REPOSITORY_WARNING_LENGTH = 1000;
 
 export interface ExpensiveWorkspaceGitInput {
   localDir: string;
@@ -142,6 +150,8 @@ async function runExpensiveWorkspaceGit(
 
 export async function readGitWorkspaceSnapshot(localDir: string, includeRepositories = true): Promise<GitWorkspaceSnapshot | null> {
   const repositories: NonNullable<GitWorkspaceSnapshot["repositories"]> = [];
+  const repositoryWarnings: string[] = [];
+  const skippedRepositoryPaths: string[] = [];
   if (includeRepositories) {
     const root = path.join(localDir, PROJECT_REPOSITORIES_DIR);
     const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
@@ -154,10 +164,26 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
         if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) throw new Error("Invalid project repository directory");
         const relative = `${PROJECT_REPOSITORIES_DIR}/${entry.name}`;
         const snapshot = await readGitWorkspaceSnapshot(path.join(localDir, relative), false);
-        if (!snapshot) throw new Error(`Project repository is not a Git checkout: ${relative}`);
+        if (!snapshot) {
+          // A nested checkout can lose its `.git` in transit (sync excludes
+          // match at every depth) while its files survive. Skipping keeps the
+          // enclosing workspace usable; run setup re-provisions the checkout.
+          // The skipped directory stays host-local via `ignoredPaths`: it is
+          // neither staged nor snapshotted, so restore must not read its
+          // absence in the sandbox as a deletion on the host.
+          if (repositoryWarnings.length < MAX_REPOSITORY_WARNINGS) {
+            repositoryWarnings.push(`Project repository is not a Git checkout: ${relative}`.slice(0, MAX_REPOSITORY_WARNING_LENGTH));
+          }
+          skippedRepositoryPaths.push(relative);
+          continue;
+        }
         repositories.push({ path: relative, snapshot });
       }
     }
+  }
+  if (skippedRepositoryPaths.length > MAX_REPOSITORY_WARNINGS) {
+    repositoryWarnings[MAX_REPOSITORY_WARNINGS - 1] =
+      `${skippedRepositoryPaths.length - MAX_REPOSITORY_WARNINGS + 1} additional project repositories are not Git checkouts; all skipped paths remain host-local.`;
   }
   // Only repository discovery may report an ordinary directory. A failed
   // snapshot of a confirmed repository must never fall back to directory sync.
@@ -187,7 +213,6 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     fs.realpath(toplevelResult.stdout.trim()),
   ]);
   if (workspacePath !== repositoryPath) return null;
-
   const [headCommitResult, branchResult, overlayDiffResult, untrackedResult, deletedResult, ignoredResult] = await Promise.all([
     runLocalGit(localDir, ["rev-parse", "HEAD"], {
       timeout: 10_000,
@@ -218,6 +243,17 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
   ]);
 
   const branchName = branchResult.stdout.trim();
+  if (skippedRepositoryPaths.length > 0) {
+    const trackedRepositories = await runLocalGit(localDir, ["ls-tree", "-r", "--name-only", "-z", headCommitResult.stdout.trim(), "--", PROJECT_REPOSITORIES_DIR], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    // Ignore rules cannot remove skipped files from the captured Git commit.
+    if (trackedRepositories.stdout.split("\0").some((entry) =>
+      skippedRepositoryPaths.some((skipped) => entry.startsWith(`${skipped}/`)))) {
+      throw new Error("Anchor Git history contains managed project repository files");
+    }
+  }
   // `-z` already delimits each record with a NUL byte, so a leading or
   // trailing space in a record is part of the path itself, not padding to
   // remove — trimming it would resolve to a path that does not exist. A
@@ -237,12 +273,14 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     deletedPaths: [...new Set([...splitNul(deletedResult.stdout),
       ...repositories.flatMap((repo) => repo.snapshot.deletedPaths.map((entry) => `${repo.path}/${entry}`))])]
       .sort((left, right) => left.localeCompare(right)),
-    ignoredPaths: [...splitNul(ignoredResult.stdout)
+    ignoredPaths: [...new Set([...splitNul(ignoredResult.stdout)
       .map((entry) => entry.replace(/\/+$/, ""))
       .filter((entry) => Boolean(entry) && !(repositories.length > 0 && entry === PROJECT_REPOSITORIES_DIR)),
-      ...repositories.flatMap((repo) => repo.snapshot.ignoredPaths.map((entry) => `${repo.path}/${entry}`))]
+      ...skippedRepositoryPaths,
+      ...repositories.flatMap((repo) => repo.snapshot.ignoredPaths.map((entry) => `${repo.path}/${entry}`))])]
       .sort((left, right) => left.localeCompare(right)),
     ...(repositories.length > 0 ? { repositories } : {}),
+    ...(repositoryWarnings.length > 0 ? { repositoryWarnings } : {}),
   };
 }
 

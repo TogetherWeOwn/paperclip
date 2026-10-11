@@ -898,6 +898,131 @@ describe("resolveHeartbeatRunResponse", () => {
   });
 });
 
+describe("resolveHeartbeatRunResponse no-progress no-event wakes", () => {
+  it("publishes nothing on a no-op monitor wake", () => {
+    for (const wakeReason of [
+      "issue_monitor_due",
+      "issue_continuation_needed",
+      "issue_graph_liveness_backstop",
+      "heartbeat_timer",
+      null,
+    ]) {
+      expect(
+        resolveHeartbeatRunResponse({
+          resultJson: { summary: "No-op wake handled quietly" },
+          wakeReason,
+          runMadeIssueProgress: false,
+        }),
+      ).toMatchObject({
+        text: null,
+        decision: {
+          chosenSource: "none",
+          commentAction: "none",
+          reasonCodes: ["no_progress_no_event_wake"],
+        },
+      });
+    }
+  });
+
+  it("still publishes when the run made issue progress", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Changed status this run" },
+        wakeReason: "issue_monitor_due",
+        runMadeIssueProgress: true,
+      }),
+    ).toMatchObject({
+      text: "Changed status this run",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("still publishes on a fresh assignment wake without run progress", () => {
+    // An assignment is a new event for the agent, and the missing-comment
+    // policy requires assigned runs to leave a comment. Suppressing them
+    // would starve disposition repair of its trigger.
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "First run notes" },
+        wakeReason: "issue_assigned",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "First run notes",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("still publishes on an assignment-recovery wake without run progress", () => {
+    // A recovery re-wake is the agent's chance to report back after an
+    // assignment loss. Suppressing its prose-only answer would stall the
+    // issue silently in `todo` with nothing visible on the thread.
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Recovery notes" },
+        wakeReason: "issue_assignment_recovery",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "Recovery notes",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("still reuses an explicit run comment on a no-event wake", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "New final text" },
+        existingComment: { id: "comment-1", body: "Posted reply" },
+        wakeReason: "issue_monitor_due",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "Posted reply",
+      decision: {
+        chosenSource: "existing_issue_comment",
+        commentAction: "reuse",
+      },
+    });
+  });
+
+  it("still publishes on a comment wake without run progress", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Reply to the new comment" },
+        wakeReason: "issue_monitor_due",
+        wakeCommentId: "comment-9",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "Reply to the new comment",
+      decision: { commentAction: "create" },
+    });
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Reply to the new comment" },
+        wakeReason: "issue_commented",
+        runMadeIssueProgress: false,
+      }),
+    ).toMatchObject({
+      text: "Reply to the new comment",
+      decision: { commentAction: "create" },
+    });
+  });
+
+  it("preserves legacy behavior when progress is unknown", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "Legacy text" },
+        wakeReason: "issue_monitor_due",
+      }),
+    ).toMatchObject({
+      text: "Legacy text",
+      decision: { commentAction: "create" },
+    });
+  });
+});
+
 describe("projectHistoricalHeartbeatRunComment", () => {
   it("projects the accepted semantic response over the known placeholder", () => {
     const summary = "# Full recipe\n\n" + "ribs ".repeat(400);

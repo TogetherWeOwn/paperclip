@@ -1177,6 +1177,142 @@ describeEmbeddedPostgres(
       );
     });
 
+    describe("assignee close of a blocked low-trust card", () => {
+      const LOW_TRUST_DENIAL = "Low-trust actors cannot use this control-plane surface";
+
+      async function parkBlocked(issueId: string) {
+        await db.delete(issueApprovals).where(eq(issueApprovals.issueId, issueId));
+        await db
+          .update(issues)
+          .set({ status: "blocked", checkoutRunId: null, executionRunId: null })
+          .where(eq(issues.id, issueId));
+      }
+
+      async function statusOf(issueId: string) {
+        const [row] = await db
+          .select({ status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        return row?.status;
+      }
+
+      it.each(["done", "cancelled"] as const)(
+        "lets the low-trust assignee move its own blocked card to %s",
+        async (status) => {
+          const fixture = await seedLowTrustFixture(db);
+          const issueId = fixture.issues.assignedReview.id;
+          await parkBlocked(issueId);
+
+          const res = await request(createApp(db, agentActor(fixture)))
+            .patch(`/api/issues/${issueId}`)
+            .send({ status });
+
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(await statusOf(issueId)).toBe(status);
+        },
+      );
+
+      it("lets a standard-trust assignee close a card that only carries the low-trust policy", async () => {
+        const fixture = await seedLowTrustFixture(db);
+        const issueId = fixture.issues.standardChild.id;
+        await db
+          .update(issues)
+          .set({
+            executionPolicy: {
+              authorizationPolicy: {
+                trustPreset: LOW_TRUST_REVIEW_PRESET,
+                trustBoundary: {
+                  mode: LOW_TRUST_REVIEW_PRESET,
+                  companyId: fixture.company.id,
+                  projectIds: [fixture.projects.allowed.id],
+                  issueIds: [issueId],
+                },
+              },
+            },
+          })
+          .where(eq(issues.id, issueId));
+        await parkBlocked(issueId);
+        const app = createApp(db, standardReportActor(fixture));
+
+        // The card policy alone makes the Reviewer low-trust: moving out of
+        // blocked to anything but done/cancelled stays denied.
+        const reopened = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "in_progress" });
+        expect(reopened.status).toBe(403);
+        expect(reopened.body.error).toBe(LOW_TRUST_DENIAL);
+        expect(await statusOf(issueId)).toBe("blocked");
+
+        const closed = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "done" });
+        expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+        expect(await statusOf(issueId)).toBe("done");
+      });
+
+      it("keeps every other transition out of blocked denied for the low-trust assignee", async () => {
+        const fixture = await seedLowTrustFixture(db);
+        const issueId = fixture.issues.assignedReview.id;
+        await parkBlocked(issueId);
+        const app = createApp(db, agentActor(fixture));
+
+        const attempts: Array<[string, Record<string, unknown>]> = [
+          ["blocked -> in_progress", { status: "in_progress" }],
+          ["blocked -> todo", { status: "todo" }],
+          ["blocked -> in_review", { status: "in_review" }],
+          ["reopen", { reopen: true, comment: "reopen" }],
+          ["reopen with a terminal status", { status: "done", reopen: true, comment: "reopen" }],
+          ["resume", { resume: true, comment: "resume" }],
+          ["resume with a terminal status", { status: "done", resume: true, comment: "resume" }],
+          [
+            "blockedByIssueIds with a terminal status",
+            { status: "done", blockedByIssueIds: [fixture.issues.sameBoundaryChild.id] },
+          ],
+        ];
+        for (const [label, body] of attempts) {
+          const res = await request(app).patch(`/api/issues/${issueId}`).send(body);
+          expect(res.status, label).toBe(403);
+          expect(res.body.error, label).toBe(LOW_TRUST_DENIAL);
+          expect(await statusOf(issueId), label).toBe("blocked");
+        }
+      });
+
+      it("denies a non-assignee actor closing the blocked low-trust card", async () => {
+        const fixture = await seedLowTrustFixture(db);
+        const issueId = fixture.issues.assignedReview.id;
+        await parkBlocked(issueId);
+
+        for (const agentId of [
+          fixture.agents.collaborator.id,
+          fixture.agents.standard.id,
+        ]) {
+          const res = await request(createApp(db, agentActor(fixture, agentId)))
+            .patch(`/api/issues/${issueId}`)
+            .send({ status: "done" });
+          expect(res.status, agentId).toBe(403);
+          expect(await statusOf(issueId), agentId).toBe("blocked");
+        }
+      });
+
+      it("keeps the standard-trust blocked transitions unchanged", async () => {
+        const fixture = await seedLowTrustFixture(db);
+        const issueId = fixture.issues.standardChild.id;
+        await parkBlocked(issueId);
+        const app = createApp(db, standardReportActor(fixture));
+
+        await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "todo" })
+          .expect(200);
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+        await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ status: "done" })
+          .expect(200);
+        expect(await statusOf(issueId)).toBe("done");
+      });
+    });
+
     it("allows mentioned low-trust agents to comment on out-of-bound assigned issues", async () => {
       const fixture = await seedLowTrustFixture(db);
       const [targetIssue] = await db

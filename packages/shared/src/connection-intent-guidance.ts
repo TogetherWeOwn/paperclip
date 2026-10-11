@@ -21,3 +21,13 @@ export const CONNECTION_RUNTIME_TOOL_NAMES = [
   "connections_search",
   "connection_request",
 ] as const;
+
+export const GITHUB_DIAGNOSTIC_RUNTIME_TOOL_NAMES = [
+  "github_actions_job_logs",
+  "github_repository_webhooks",
+] as const;
+
+export const RUNTIME_TOOL_NAMES = [
+  ...CONNECTION_RUNTIME_TOOL_NAMES,
+  ...GITHUB_DIAGNOSTIC_RUNTIME_TOOL_NAMES,
+] as const;

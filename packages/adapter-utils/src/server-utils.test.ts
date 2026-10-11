@@ -586,10 +586,15 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
-  it("waits for onSpawn before sending stdin to the child", async () => {
-    const spawnDelayMs = 150;
+  it("sends stdin immediately without waiting for onSpawn metadata persistence", async () => {
+    // stdin delivery must not gate on onSpawn (which persists run
+    // process metadata to the DB). Under host pressure that persist can exceed
+    // the CLI's 3-second stdin deadline, so the prompt must already be in
+    // flight while persistence runs concurrently.
+    const spawnDelayMs = 500;
     const startedAt = Date.now();
     let onSpawnCompletedAt = 0;
+    let onSpawnCalled = false;
 
     const result = await runChildProcess(
       randomUUID(),
@@ -606,6 +611,7 @@ describe("runChildProcess", () => {
         graceSec: 1,
         onLog: async () => {},
         onSpawn: async () => {
+          onSpawnCalled = true;
           await new Promise((resolve) => setTimeout(resolve, spawnDelayMs));
           onSpawnCompletedAt = Date.now();
         },
@@ -615,8 +621,61 @@ describe("runChildProcess", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("hello from stdin");
-    expect(onSpawnCompletedAt).toBeGreaterThanOrEqual(startedAt + spawnDelayMs);
-    expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
+    expect(onSpawnCalled).toBe(true);
+    // The run completes on stdin delivery, well before the slow metadata
+    // persist finishes. The old gated code took >= spawnDelayMs here.
+    expect(finishedAt - startedAt).toBeLessThan(spawnDelayMs);
+    // The background persist still runs to completion (fire-and-forget with
+    // error logging); give it a beat to land, then assert it ran.
+    await new Promise((resolve) => setTimeout(resolve, spawnDelayMs + 200));
+    expect(onSpawnCompletedAt).toBeGreaterThan(0);
+  });
+
+  it("delivers the prompt before a synthetic CLI stdin deadline even when onSpawn is slow", async () => {
+    // Synthetic delayed-start fixture for failed review runs that exited with
+    // exit 1, "no stdin data received in 3s ... Input must be provided
+    // either through stdin or as a prompt argument when using --print".
+    // The fake CLI enforces a short stdin deadline like the real CLI's 3s
+    // timer; onSpawn simulates a slow DB metadata persist under host load.
+    // Prompt transport stays piped stdin in both lanes — never argv/logs.
+    const stdinDeadlineMs = 300;
+    const spawnDelayMs = 1_500;
+    const fakeCliScript = [
+      `const deadlineMs=${stdinDeadlineMs};`,
+      "let gotData=false;",
+      "const timer=setTimeout(()=>{",
+      "if(!gotData){",
+      `process.stderr.write('Warning: no stdin data received in ${stdinDeadlineMs}ms, proceeding without it.\\n');`,
+      "process.stderr.write('Error: Input must be provided either through stdin or as a prompt argument when using --print.\\n');",
+      "process.exit(1);",
+      "}",
+      "},deadlineMs);",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',()=>{gotData=true;});",
+      "process.stdin.on('end',()=>{clearTimeout(timer);if(gotData){process.stdout.write('prompt-received');process.exit(0);}});",
+    ].join("");
+
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", fakeCliScript],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "confidential review prompt bytes",
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, spawnDelayMs));
+        },
+      },
+    );
+
+    expect(result.stderr).not.toContain("no stdin data received");
+    expect(result.stderr).not.toContain("Input must be provided either through stdin");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("prompt-received");
   });
 
   it.skipIf(process.platform === "win32")(
@@ -3720,6 +3779,55 @@ describe("shapePaperclipWorkspaceEnvForExecution", () => {
       workspaceWorktreePath: "/tmp/worktree",
       workspaceHints,
     });
+  });
+});
+
+describe("runChildProcess inheritServerEnv", () => {
+  const PRINT_KEYS = "process.stdout.write(JSON.stringify(Object.keys(process.env).sort()))";
+
+  async function childEnvKeys(input: { env: Record<string, string>; inheritServerEnv?: boolean }) {
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", PRINT_KEYS], {
+      cwd: process.cwd(),
+      env: input.env,
+      timeoutSec: 0,
+      graceSec: 1,
+      onLog: async () => {},
+      ...(input.inheritServerEnv === undefined ? {} : { inheritServerEnv: input.inheritServerEnv }),
+    });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as string[];
+  }
+
+  it("inherits the server env by default", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "visible";
+    try {
+      const keys = await childEnvKeys({ env: { EXPLICIT_ONE: "1" } });
+      expect(keys).toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
+  });
+
+  it("starts from an empty env when inheritServerEnv is false", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "hidden";
+    try {
+      const keys = await childEnvKeys({
+        env: { EXPLICIT_ONE: "1", PATH: process.env.PATH ?? "" },
+        inheritServerEnv: false,
+      });
+      expect(keys).not.toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+      // Nothing from the server survives by name: only what was passed (the
+      // runtime may add a few of its own, such as locale or cwd hints).
+      expect(keys.filter((key) => !["EXPLICIT_ONE", "PATH", "PWD", "SHLVL", "_", "LC_CTYPE", "OLDPWD"].includes(key))).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
   });
 });
 
