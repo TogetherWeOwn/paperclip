@@ -156,6 +156,7 @@ export async function githubBotRepositoryToken(
   endpointId: string,
   repositoryId: string,
   fetchImpl = fetch,
+  access: "read" | "write" = "write",
 ) {
   const result = await githubBotCredentials(db, companyId, endpointId);
   if (
@@ -178,13 +179,15 @@ export async function githubBotRepositoryToken(
       method: "POST",
       body: {
         repository_ids: [Number(repositoryId)],
-        permissions: {
-          contents: "read",
-          metadata: "read",
-          issues: "write",
-          pull_requests: "write",
-          checks: "write",
-        },
+        permissions: access === "read"
+          ? { metadata: "read", pull_requests: "read", checks: "read" }
+          : {
+              contents: "read",
+              metadata: "read",
+              issues: "write",
+              pull_requests: "write",
+              checks: "write",
+            },
       },
     },
   );
