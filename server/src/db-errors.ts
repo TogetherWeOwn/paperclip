@@ -56,10 +56,12 @@ export function isForeignKeyViolation(error: unknown): boolean {
  * Recognizes a Postgres deadlock abort (SQLSTATE 40P01).
  *
  * The runtime-tools and MCP paths lock `issues` then `heartbeat_runs` while
- * the secret-access audit insert takes `FOR KEY SHARE` on the same rows in
- * the opposite order, so either side can lose a deadlock race and surface as
- * a 500. Like the helpers above, this walks the `cause` chain because
- * Drizzle wraps the driver failure.
+ * the secret-access audit insert's FK checks take `FOR KEY SHARE` on the same
+ * rows. Postgres runs those checks in trigger-name (constraint creation)
+ * order; where the constraints exist in name order, as in production,
+ * `heartbeat_runs` is checked first, the opposite order, so either side can
+ * lose a deadlock race and surface as a 500. Like the helpers above, this
+ * walks the `cause` chain because Drizzle wraps the driver failure.
  */
 export function isDeadlockFailure(error: unknown): boolean {
   let current: unknown = error;

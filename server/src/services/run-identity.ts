@@ -433,8 +433,9 @@ export async function captureRunIdentity(
 ) {
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
   // The issues-then-run lock order races the secret-access audit insert's FK
-  // checks in the opposite order; a lost race aborts with 40P01, so retry the
-  // whole transaction instead of surfacing a 500 to the runtime caller.
+  // checks, which take the run row first wherever the constraints exist in
+  // name order (as in production); a lost race aborts with 40P01, so retry
+  // the whole transaction instead of surfacing a 500 to the runtime caller.
   return withDeadlockRetry(() =>
     db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);

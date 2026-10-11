@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, is, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -315,15 +316,12 @@ type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
 type SavepointDb = DbTransaction & Pick<Db, "transaction">;
 
 function asSavepointDb(candidate: Db | DbTransaction): SavepointDb | null {
-  // Drizzle's PgTransaction (every driver) sets `nestedIndex`; the root
-  // database never does. Only a caller-held transaction needs the SAVEPOINT.
-  // On the root path the audit stays a bare insert: no extra BEGIN/COMMIT
-  // and no extra db.transaction call for transaction-counting callers and
-  // tests to observe.
-  if (!!candidate && typeof candidate === "object" && "nestedIndex" in candidate) {
-    return candidate as SavepointDb;
-  }
-  return null;
+  // Only a caller-held transaction needs the SAVEPOINT. drizzle's public `is`
+  // matches every driver's transaction subclass by entity kind; the root
+  // database is never a PgTransaction. On the root path the audit stays a
+  // bare insert: no extra BEGIN/COMMIT and no extra db.transaction call for
+  // transaction-counting callers and tests to observe.
+  return is(candidate, PgTransaction) ? (candidate as SavepointDb) : null;
 }
 
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
@@ -1201,10 +1199,13 @@ export function secretService(db: Db | DbTransaction) {
   }) {
     if (!input.context) return;
     const context = input.context;
-    // The issue_id/heartbeat_run_id FK checks take FOR KEY SHARE on rows the
-    // runtime identity path locks FOR UPDATE in the opposite order. Retry a
-    // lost deadlock race so the audit record survives instead of being
-    // dropped by the callers' best-effort catch.
+    // The heartbeat_run_id and issue_id FK checks take FOR KEY SHARE on rows
+    // the runtime identity path locks FOR UPDATE (issues, then
+    // heartbeat_runs). Postgres runs FK checks in trigger-name order, i.e.
+    // constraint creation order: with the constraints in name order, as in
+    // production, the run row is checked first, the reverse order, and either
+    // side can lose a deadlock. Retry a lost race so the audit record survives
+    // instead of being dropped by the callers' best-effort catch.
     const values = {
       companyId: input.companyId,
       secretId: input.secretId,
