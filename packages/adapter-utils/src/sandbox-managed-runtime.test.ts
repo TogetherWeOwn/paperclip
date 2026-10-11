@@ -407,6 +407,40 @@ describe("sandbox managed runtime", () => {
     }
   }, 30_000);
 
+  it("keeps a nested checkout that lost its .git on the host across restore", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-stripped-nested-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local");
+    const remote = path.join(root, "remote");
+    const healthyPath = ".paperclip-repositories/healthy-abc";
+    const strippedPath = ".paperclip-repositories/toolkit-def";
+    for (const [relative, contents] of [["", "root"], [healthyPath, "healthy"]]) {
+      const cwd = path.join(local, relative!);
+      await mkdir(cwd, { recursive: true });
+      await git(cwd, ["init", "-b", "main"]);
+      await git(cwd, ["config", "user.name", "Test"]);
+      await git(cwd, ["config", "user.email", "test@example.com"]);
+      await writeFile(path.join(cwd, "README.md"), contents!);
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-m", contents!]);
+    }
+    await writeFile(path.join(local, ".git/info/exclude"), ".paperclip-repositories/\n");
+    // Reconstituted from sync data: files survive, `.git` does not.
+    await mkdir(path.join(local, strippedPath), { recursive: true });
+    await writeFile(path.join(local, strippedPath, "work.md"), "only copy of the agent's work");
+
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: { transport: "sandbox", provider: "test", sandboxId: "stripped-nested", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+      client: makeFilesystemClient(), adapterKey: "test", workspaceLocalDir: local,
+    });
+    expect(prepared.workspaceSyncSnapshot?.gitSnapshot?.repositoryWarnings).toEqual([
+      `Project repository is not a Git checkout: ${strippedPath}`,
+    ]);
+    await prepared.restoreWorkspace();
+
+    expect(await readFile(path.join(local, strippedPath, "work.md"), "utf8")).toBe("only copy of the agent's work");
+  }, 30_000);
+
   afterEach(async () => {
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
