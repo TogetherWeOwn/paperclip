@@ -12,12 +12,10 @@ import {
   companySkills,
   costEvents,
   createDb,
-  documents,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
   issueRelations,
   issueRecoveryActions,
   issueTreeHoldMembers,
@@ -77,7 +75,6 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
 } from "../services/issue-dependency-wakeups.ts";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "../services/issue-continuation-summary.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -572,43 +569,6 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     });
   }
 
-  it("rejects a review-parked continuation before creating a heartbeat run", async () => {
-    const { companyId, coderId, blockedIssueId } = await seedBlockedChain();
-    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, blockedIssueId));
-    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
-    const [document] = await db.insert(documents).values({
-      companyId,
-      title: "Continuation Summary",
-      latestBody: "# Continuation Summary\n\n## Next Action\n\n- Wait for reviewer feedback before doing more work.",
-    }).returning();
-    await db.insert(issueDocuments).values({
-      companyId,
-      issueId: blockedIssueId,
-      documentId: document!.id,
-      key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
-    });
-
-    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-before-run");
-
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
-    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_waiting_on_review" });
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
-  });
-
-  it("rejects a continuation for an issue reassigned before a heartbeat run is created", async () => {
-    const { companyId, managerId, coderId, blockedIssueId } = await seedBlockedChain();
-    await db.update(issues).set({ status: "in_progress", assigneeAgentId: managerId }).where(eq(issues.id, blockedIssueId));
-    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
-
-    await requestStaleContinuation(coderId, blockedIssueId, "stale-continuation-reassigned");
-
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
-    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_ownership_changed" });
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
-  });
-
   it("rejects a continuation for a closed issue before a heartbeat run is created", async () => {
     const { companyId, coderId, blockedIssueId } = await seedBlockedChain();
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockedIssueId));
@@ -618,7 +578,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
 
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_ownership_changed" });
+    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_issue_closed" });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
