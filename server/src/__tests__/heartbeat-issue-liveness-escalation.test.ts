@@ -698,6 +698,41 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(wakes.some((wake) => ["queued", "claimed", "completed"].includes(wake.status))).toBe(true);
   });
 
+  it.each([
+    { errorCode: "agent_not_invokable", healed: 0, existingWakeSkipped: 1 },
+    { errorCode: "provider_quota", healed: 1, existingWakeSkipped: 0 },
+  ])("uses linked cancellation class for $errorCode dependency wakes", async ({ errorCode, healed, existingWakeSkipped }) => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerIssueId],
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "cancelled",
+      errorCode,
+    }).returning({ id: heartbeatRuns.id });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, blockerIssueIds: [blockerIssueId] },
+      status: "cancelled",
+      runId: run!.id,
+      finishedAt: new Date(),
+      idempotencyKey,
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(healed);
+    expect(result.existingWakeSkipped).toBe(existingWakeSkipped);
+  });
+
   it("waits for workspace finalize before healing a resolved blocked dependent", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });

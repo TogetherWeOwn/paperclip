@@ -18,6 +18,7 @@ type WakeRow = {
   status: string;
   idempotencyKey: string | null;
   requestedAt: Date;
+  runErrorCode?: string | null;
 };
 
 function dbWithWakes(rows: WakeRow[]): Db {
@@ -26,8 +27,12 @@ function dbWithWakes(rows: WakeRow[]): Db {
       return {
         from() {
           return {
-            where() {
-              return Promise.resolve(rows);
+            leftJoin() {
+              return {
+                where() {
+                  return Promise.resolve(rows);
+                },
+              };
             },
           };
         },
@@ -227,5 +232,38 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
       readyState,
     );
     expect(completed).toBeNull();
+  });
+
+  it("suppresses only cancelled wakes explicitly classified as non-retryable", async () => {
+    const cycleKey = buildIssueBlockersResolvedWakeStateKey(readyState);
+    const cancelledWake = {
+      id: "wake-cancelled",
+      status: "cancelled",
+      idempotencyKey: cycleKey,
+      requestedAt: secondCycle,
+      runErrorCode: "agent_not_invokable",
+    };
+    const classifyCancelledRun = (errorCode: string | null) =>
+      errorCode === "agent_not_invokable";
+
+    const fenced = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([cancelledWake]),
+      readyState,
+      { isCancelledRunNonRetryable: classifyCancelledRun },
+    );
+    const transient = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([{ ...cancelledWake, runErrorCode: "provider_quota" }]),
+      readyState,
+      { isCancelledRunNonRetryable: classifyCancelledRun },
+    );
+    const unknown = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([{ ...cancelledWake, runErrorCode: null }]),
+      readyState,
+      { isCancelledRunNonRetryable: classifyCancelledRun },
+    );
+
+    expect(fenced?.id).toBe("wake-cancelled");
+    expect(transient).toBeNull();
+    expect(unknown).toBeNull();
   });
 });

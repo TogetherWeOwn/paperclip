@@ -5694,6 +5694,11 @@ export function recoveryService(
             dependentIssueId: candidate.id,
             blockerIssueIds: readiness.blockerIssueIds,
             blockedTransitionAt: candidate.blockedTransitionAt,
+          }, {
+            isCancelledRunNonRetryable: (errorCode) =>
+              classifyContinuationFailure(
+                errorCode ? { errorCode } as NonNullable<LatestIssueRun> : null,
+              ).kind === "non_retryable",
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;

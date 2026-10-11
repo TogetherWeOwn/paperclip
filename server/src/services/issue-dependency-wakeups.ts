@@ -1,7 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
@@ -142,6 +142,7 @@ function wakeCoversIssueBlockersResolvedReadyState(
     status: string;
     idempotencyKey: string | null;
     requestedAt: Date;
+    runErrorCode: string | null;
   },
   keys: {
     cycleKey: string;
@@ -149,11 +150,15 @@ function wakeCoversIssueBlockersResolvedReadyState(
     legacyKeys: Set<string>;
     blockedTransitionAt: Date | null;
   },
+  isCancelledRunNonRetryable: ((errorCode: string | null) => boolean) | undefined,
 ): boolean {
   const idempotencyKey = wake.idempotencyKey;
   if (!idempotencyKey) return false;
 
   if (idempotencyKey === keys.cycleKey) {
+    if (wake.status === "cancelled") {
+      return isCancelledRunNonRetryable?.(wake.runErrorCode) ?? false;
+    }
     return IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status);
   }
 
@@ -176,8 +181,9 @@ function wakeCoversIssueBlockersResolvedReadyState(
  * dependent issue. The check is level-triggered and cycle-aware:
  *
  * - The cycle-aware state key matches a wake in any idempotent status
- *   (including `completed`). This suppresses a duplicate for the SAME ready
- *   state, including the current blocked cycle.
+ *   (including `completed`). For callers that supply a cancellation classifier,
+ *   a cancelled wake also suppresses only when its linked run is non-retryable.
+ *   This keeps transient/provider cancellations eligible for bounded recovery.
  * - The old no-cycle state key matches in-flight statuses (deploy overlap),
  *   or a `completed` wake whose `requestedAt` is at or after the current
  *   `blockedTransitionAt` (same cycle). A completed old-key wake from a
@@ -194,6 +200,9 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     blockerIssueIds: string[];
     blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
   },
+  options: {
+    isCancelledRunNonRetryable?: (errorCode: string | null) => boolean;
+  } = {},
 ) {
   const cycleKey = buildIssueBlockersResolvedWakeStateKey(input);
   const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
@@ -218,8 +227,16 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       status: agentWakeupRequests.status,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
       requestedAt: agentWakeupRequests.requestedAt,
+      runErrorCode: heartbeatRuns.errorCode,
     })
     .from(agentWakeupRequests)
+    .leftJoin(
+      heartbeatRuns,
+      and(
+        eq(heartbeatRuns.id, agentWakeupRequests.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ),
+    )
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
@@ -233,7 +250,7 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),
       blockedTransitionAt,
-    }),
+    }, options.isCancelledRunNonRetryable),
   );
   return covering ?? null;
 }
