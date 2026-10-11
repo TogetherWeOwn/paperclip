@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { parseAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -209,6 +209,20 @@ async function authorizeUpgrade(
     .then((rows) => rows[0] ?? null);
 
   if (!key || key.companyId !== companyId) {
+    return null;
+  }
+
+  // Bounded observer credentials never upgrade: the observer scope is
+  // HTTP-GET-only (three read templates with per-request expiry), and
+  // WebSocket upgrades bypass the Express ceiling. Unparseable scopes fail
+  // closed here too instead of inheriting standard visibility.
+  let keyScope;
+  try {
+    keyScope = parseAgentApiKeyScope(key.scopeConfig);
+  } catch {
+    return null;
+  }
+  if (keyScope.kind === "observer") {
     return null;
   }
 

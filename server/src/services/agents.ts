@@ -23,7 +23,7 @@ import {
   agentRuntimeConfigSchema,
   getAgentWorkEligibility,
   isUuidLike,
-  normalizeAgentApiKeyScope,
+  normalizeAgentApiKeyScopeForDisplay,
   normalizeAgentUrlKey,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
@@ -1262,7 +1262,7 @@ export function agentService(db: Db) {
       return {
         id: created.id,
         name: created.name,
-        scope: normalizeAgentApiKeyScope(created.scopeConfig),
+        scope: normalizeAgentApiKeyScopeForDisplay(created.scopeConfig),
         responsibleUserId: created.responsibleUserId,
         token,
         createdAt: created.createdAt,
@@ -1284,7 +1284,7 @@ export function agentService(db: Db) {
         .then((rows) => rows.map((row) => ({
           id: row.id,
           name: row.name,
-          scope: normalizeAgentApiKeyScope(row.scopeConfig),
+          scope: normalizeAgentApiKeyScopeForDisplay(row.scopeConfig),
           responsibleUserId: row.responsibleUserId,
           createdAt: row.createdAt,
           revokedAt: row.revokedAt,
@@ -1309,7 +1309,7 @@ export function agentService(db: Db) {
           return row
             ? {
               ...row,
-              scope: normalizeAgentApiKeyScope(row.scopeConfig),
+              scope: normalizeAgentApiKeyScopeForDisplay(row.scopeConfig),
             }
             : null;
         }),

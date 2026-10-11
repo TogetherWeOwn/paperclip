@@ -188,17 +188,90 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+/**
+ * Bounded native observation scope for one short-lived, read-only
+ * observation (no issuance endpoint; scopes exist only as synthetic test
+ * fixtures until a later authorized issuance act).
+ *
+ * Immutable deny-by-default ceiling: the key's company, one purpose,
+ * non-sliding validity of at most 35 minutes. The schema only bounds the
+ * shape and the total window length; the server enforces the scope/key/route
+ * company binding, per-request expiry/revocation, the three permitted GET
+ * route templates and the bounded query allowlist.
+ */
+export const OBSERVER_SCOPE_PURPOSE = "held-cap-zero-observation" as const;
+export const OBSERVER_SCOPE_MAX_TTL_MS = 35 * 60 * 1000;
+
+export const observerAgentKeyScopeSchema = z.object({
+  kind: z.literal("observer"),
+  companyId: z.string().guid(),
+  purpose: z.literal(OBSERVER_SCOPE_PURPOSE),
+  issuedAt: z.string().datetime({ offset: true }),
+  expiresAt: z.string().datetime({ offset: true }),
+}).strict().superRefine((value, ctx) => {
+  const issuedMs = Date.parse(value.issuedAt);
+  const expiresMs = Date.parse(value.expiresAt);
+  if (!Number.isFinite(issuedMs) || !Number.isFinite(expiresMs)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "observer scope issuedAt/expiresAt must be valid timestamps",
+      path: ["expiresAt"],
+    });
+    return;
+  }
+  if (expiresMs < issuedMs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "observer scope expiresAt must not precede issuedAt",
+      path: ["expiresAt"],
+    });
+  }
+  if (expiresMs - issuedMs > OBSERVER_SCOPE_MAX_TTL_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "observer scope validity must not exceed 35 minutes",
+      path: ["expiresAt"],
+    });
+  }
+});
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  observerAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type ObserverAgentKeyScope = z.infer<typeof observerAgentKeyScopeSchema>;
+
+/**
+ * Strict scope parse for enforcement paths. Returns the parsed scope, or
+ * throws. Enforcement callers (auth middleware, JWT verification) must catch
+ * the throw and deny: unknown/malformed scopes never normalize to `standard`.
+ */
+export function parseAgentApiKeyScope(value: unknown): AgentApiKeyScope {
+  if (value === undefined || value === null) return { kind: "standard" };
+  const parsed = agentApiKeyScopeSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  throw new Error("Invalid agent API key scope; refusing to normalize to standard");
+}
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
+  return parseAgentApiKeyScope(value);
+}
+
+/**
+ * Display-only scope normalization for non-enforcement read paths (key
+ * listings). Corrupt stored scopes render as `standard` here so a single bad
+ * row cannot break key management views; access decisions never use this
+ * helper. Enforcement paths must use {@link parseAgentApiKeyScope} and deny
+ * on throw.
+ */
+export function normalizeAgentApiKeyScopeForDisplay(value: unknown): AgentApiKeyScope {
+  if (value === undefined || value === null) return { kind: "standard" };
   const parsed = agentApiKeyScopeSchema.safeParse(value);
   return parsed.success ? parsed.data : { kind: "standard" };
 }

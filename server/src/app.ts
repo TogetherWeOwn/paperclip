@@ -25,6 +25,7 @@ import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { observerCeiling } from "./middleware/observer-ceiling.js";
 import {
   privateHostnameGuard,
   resolvePrivateHostnameAllowSet,
@@ -571,6 +572,10 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // Observer deny-by-default ceiling: after actor resolution on purpose,
+  // before every route, so observer
+  // credentials can never reach generic permissions or mutation handlers.
+  app.use(observerCeiling());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
