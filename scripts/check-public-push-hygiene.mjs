@@ -14,14 +14,15 @@
  * runs on branch pushes. A branch-only push therefore had zero automated
  * coverage on this path.
  *
- * Scope: only the NEW publication population is scanned --
- *   messages: `git log <base>..<head>`
- *   text:     added (`+`) lines of `git diff -U0 <base>..<head>`
- * Without an explicit `--base`, `--self-ref` picks the base as the nearest
- * commit shared with another origin ref (see resolvePublicBase), so branches
- * cut from deploy/* or port/* are not scanned for history already public
- * there. Legacy debt already on `<base>` is never flagged and history is
- * untouched.
+ * Scope: the NEW publication population of a push is every commit reachable
+ * from <head> and from no public line:
+ *   messages: `git log <head> --not <public lines>`
+ *   text:     added lines of each of those commits (`git log -p -m`)
+ * Public lines are origin/master and origin/deploy/* (PUBLIC_LINE_REFS and
+ * PUBLIC_LINE_PREFIXES). Their history is already public and is never flagged.
+ * A branch's own unshared history is always scanned, including commits that
+ * another feature branch already carries. Per-commit diffs mean a line added
+ * and removed within the push is still flagged. History is never rewritten.
  *
  * Exit codes (fail-closed, mirroring the public-comment hygiene gate):
  *   0 = clean, 1 = internal reference(s) found (blocked), 2 = scanner error.
@@ -42,6 +43,12 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_PREFIXES = ["TOG", "PAP", "PAPA"];
+
+// Long-lived lines whose history is already public. A push never scans their
+// commits. Feature branches are deliberately not listed: a flagged commit on a
+// feature branch must stay flagged for every branch that carries it.
+export const PUBLIC_LINE_REFS = ["refs/remotes/origin/master"];
+export const PUBLIC_LINE_PREFIXES = ["refs/remotes/origin/deploy/"];
 
 export const EXIT_CLEAN = 0;
 export const EXIT_FINDINGS = 1;
@@ -98,7 +105,7 @@ export function parseCommitRecords(logOutput) {
 }
 
 /**
- * Parse `git diff -U0 --no-color` output, returning findings for added lines:
+ * Parse `git log -p -U0 --no-color` output, returning findings for added lines:
  * [{ file, line, refs }]. Pure function over command output.
  */
 export function scanDiffForRefs(diffOutput, prefixes = DEFAULT_PREFIXES) {
@@ -147,14 +154,17 @@ function defaultExec(cmd) {
   });
 }
 
-export function verifyRef(ref, execFn) {
-  execFn(`git rev-parse --verify --quiet ${ref}^{commit}`);
+function shellQuote(value) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function gitOutputLines(args, input) {
+export function verifyRef(ref, execFn) {
+  execFn(`git rev-parse --verify --quiet ${shellQuote(`${ref}^{commit}`)}`);
+}
+
+function gitOutputLines(args) {
   return execFileSync("git", args, {
     encoding: "utf8",
-    input,
     maxBuffer: EXEC_MAX_BUFFER,
     stdio: ["pipe", "pipe", "pipe"],
   })
@@ -162,37 +172,14 @@ function gitOutputLines(args, input) {
     .filter(Boolean);
 }
 
-/**
- * Base for the publication range of `head` pushed to `selfRef`: a commit on the
- * frontier of shared history with every other origin ref. Anything reachable
- * from another origin ref is already public, so `base..head` always covers the
- * new commits (any frontier commit's ancestors are public). The frontier
- * commit with the smallest range keeps public history on a parent line out of
- * scope. Throws when nothing shares history, so the caller fails closed.
- */
-export function resolvePublicBase({ head, selfRef }) {
-  const headSha = gitOutputLines(["rev-parse", "--verify", "--quiet", `${head}^{commit}`])[0];
-  const otherRefs = gitOutputLines(["for-each-ref", "--format=%(refname)", "refs/remotes/origin"]).filter(
-    (ref) => ref !== selfRef && ref !== "refs/remotes/origin/HEAD",
-  );
-  const revs = [headSha, ...otherRefs.map((ref) => `^${ref}`)].join("\n") + "\n";
-  if (gitOutputLines(["rev-list", "--stdin"], revs).length === 0) {
-    return headSha;
-  }
-  const frontier = gitOutputLines(["rev-list", "--boundary", "--stdin"], revs)
-    .filter((line) => line.startsWith("-"))
-    .map((line) => line.slice(1));
-  if (frontier.length === 0) {
-    throw new Error("pushed history shares no commit with any other origin ref");
-  }
-  let best = null;
-  for (const commit of frontier) {
-    const count = Number(gitOutputLines(["rev-list", "--count", `${commit}..${headSha}`])[0]);
-    if (best === null || count < best.count) {
-      best = { commit, count };
-    }
-  }
-  return best.commit;
+/** Public-line refs to exclude for a push to `selfRef` (the pushed branch's own origin ref). */
+export function resolvePublicLineRefs({ selfRef }) {
+  return gitOutputLines([
+    "for-each-ref",
+    "--format=%(refname)",
+    ...PUBLIC_LINE_REFS,
+    ...PUBLIC_LINE_PREFIXES,
+  ]).filter((ref) => ref !== selfRef);
 }
 
 export function runPublicPushHygieneCheck({
@@ -209,22 +196,22 @@ export function runPublicPushHygieneCheck({
     return EXIT_SCANNER_ERROR;
   }
 
-  let scanBase = base;
-  if (!scanBase) {
-    try {
-      scanBase = resolvePublicBase({ head, selfRef });
-    } catch (err) {
-      error(
-        `ERROR: cannot scope the publication range for ${selfRef}: ${err.message}. Refusing to pass an unscoped scan.`,
-      );
-      return EXIT_SCANNER_ERROR;
-    }
+  if (selfRef !== undefined && !selfRef.startsWith("refs/remotes/origin/")) {
+    error(`ERROR: --self-ref '${selfRef}' must be a refs/remotes/origin/ ref. Refusing to pass an unscoped scan.`);
+    return EXIT_SCANNER_ERROR;
   }
 
+  let exclusions;
   try {
-    verifyRef(scanBase, execFn);
-  } catch {
-    error(`ERROR: cannot resolve scan base '${scanBase}'. Refusing to pass an unscoped scan.`);
+    if (base) {
+      verifyRef(base, execFn);
+      exclusions = [base];
+    } else {
+      verifyRef(selfRef, execFn);
+      exclusions = resolvePublicLineRefs({ selfRef });
+    }
+  } catch (err) {
+    error(`ERROR: cannot scope the publication range (${err.message}). Refusing to pass an unscoped scan.`);
     return EXIT_SCANNER_ERROR;
   }
 
@@ -235,13 +222,16 @@ export function runPublicPushHygieneCheck({
     return EXIT_SCANNER_ERROR;
   }
 
+  const excludeClause =
+    exclusions.length > 0 ? ` --not ${exclusions.map(shellQuote).join(" ")}` : "";
+  const range = `${shellQuote(head)}${excludeClause} --`;
   let logOutput;
   let diffOutput;
   try {
-    logOutput = execFn(`git log --format=%H%x1f%B%x1e ${scanBase}..${head} --`);
-    diffOutput = execFn(`git diff -U0 --no-color --no-ext-diff ${scanBase}..${head} --`);
+    logOutput = execFn(`git log --format=%H%x1f%B%x1e ${range}`);
+    diffOutput = execFn(`git log -p -U0 -m --no-color --no-ext-diff --format= ${range}`);
   } catch (err) {
-    error(`ERROR: failed to read the publication range ${scanBase}..${head}: ${err.message}`);
+    error(`ERROR: failed to read the publication range for ${head}: ${err.message}`);
     return EXIT_SCANNER_ERROR;
   }
 
@@ -256,7 +246,7 @@ export function runPublicPushHygieneCheck({
   const textFindings = scanDiffForRefs(diffOutput, prefixes);
 
   if (messageFindings.length === 0 && textFindings.length === 0) {
-    log(`  ✓  No internal tracker references in ${scanBase}..${head}.`);
+    log(`  ✓  No internal tracker references in ${head} (${exclusions.length} public ref(s) excluded).`);
     return EXIT_CLEAN;
   }
 

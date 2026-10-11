@@ -3,12 +3,12 @@ run-name: Public push hygiene ${{ github.sha }}
 
 # Branch-push coverage for CONTRIBUTING.md "No Internal Issue References".
 # PR workflows never see branch-only pushes, so this runs on every branch push
-# and scans the new publication population: commit messages plus added tracked
-# lines of commits not already reachable from another origin ref. Master is
-# excluded: merges land there already reviewed, and a post-merge flag would have no recourse
-# (history is never rewritten). This assumes direct-to-master pushes stay
-# disabled by branch protection; making this check required is a repo-admin
-# step owned by the Operator route.
+# and scans the new publication population: commit messages plus added lines
+# of commits reachable from the pushed head but from no public line (origin
+# master and origin deploy/*). Feature branches are never public lines, so a
+# flagged commit stays flagged on every branch that carries it. History is
+# never rewritten. Direct pushes to master stay disabled by branch protection;
+# making this check required is a repo-admin step owned by the Operator route.
 on:
   push:
     branches-ignore: [master]
@@ -39,12 +39,9 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           PUSH_SELF_REF: refs/remotes/origin/${{ github.ref_name }}
         run: |
-          # The scanner picks the base from shared history with every other
-          # origin ref, so branches cut from deploy/* or port/* scan only their
-          # own commits. The branch's own unshared history stays in scope on
-          # every push:
-          # - merging master flags no master-owned commits/lines,
-          # - a clean follow-up push cannot hide an earlier dirty commit,
-          # - github.event.before dangles after amend/force-push, so it is not used.
-          # Exits 2 (refuses to pass) when no shared history can scope the range.
+          # The scanner excludes only public lines (origin master and deploy/*),
+          # minus this branch's own ref. A clean follow-up push cannot hide an
+          # earlier dirty commit, and merging master flags no master-owned
+          # commits. github.event.before dangles after amend/force-push, so it
+          # is not used.
           node scripts/check-public-push-hygiene.mjs --self-ref "$PUSH_SELF_REF" --head "$PUSH_HEAD"
