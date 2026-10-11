@@ -8,14 +8,13 @@ Range: `75970755a8` (`origin/deploy/tog6` tip at audit time) .. `origin/master`
 (`9986806907`) — 41 master-only commits. Fork PR #84 was never merged to
 master; deploy already carries it via `ba1461caeb` (port #106), so it has no row.
 
-Ported in this release: `b3aad750` (#61, nested checkouts that lost `.git`) —
-this PR (cherry-pick + adapt onto the tog6 line; the merge commit is recorded here on merge).
+Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkouts that lost `.git`) + supplemental `9c0a032b` (#109, port of #102 `b29df24e`, stranded-evidence runId fallback; outside the 41-commit audit range so the audit count stays frozen).
 
 | SHA | Subject | Verdict | Reason |
 |-----|---------|---------|--------|
 | b2dad8da | feat(plugins): inject host-computed budgetSpentFraction (#14) | keep-for-tog.9 | Follow-up port: host stamps spend fraction so plugins cannot spoof budget state. |
 | b293a48d | fix(adapter-utils): strip server secrets from agent child env (#16) | keep-for-tog.9 | Follow-up port: child inherited DATABASE_URL and wiped prod schema; fail-closed denylist. |
-| a931e8b6 | security(child-env): harden agent child env (#17) | keep-for-tog.9 | Follow-up port: extends #16 (token-suffix rule, pointer vars, sibling spawns). |
+| a931e8b6 | security(child-env): harden agent child env (#17) | already-equivalent | Deploy already carries the full #17 hardening via `863bacdd71` (tog.5 release #62, ancestor of deploy tip): `server-utils.ts:3566-3567` enterprise tokens, `:3583-3590` pointer vars, `:3603` `_TOKEN` suffix rule, plus sibling-spawn sanitize at `board-chat.ts:260`, `execution-workspaces.ts:706`, `native-codex-runner.ts:405`, `smoke-lab.ts:995-997`; all 3 source regression tests present in `server-utils-env.test.ts:49-79`, 9/9 pass. No duplicate port. |
 | d777b8b6 | fix(wake-queue): preserve completed native reviews across deferred wakes (#22) | keep-for-tog.9 | Follow-up port: deferred wakes could drop completed native reviews. |
 | 6d94dea6 | fix(heartbeat): merge issue override env per key (#23) | keep-for-tog.9 | Follow-up port: pins copied secret_refs that fail binding after reassignment. |
 | 9b85ab13 | fix(server): survive closed child stdin without crashing controller (#24) | keep-for-tog.9 | Follow-up port: EPIPE-tolerant stdin handling. |
@@ -39,7 +38,7 @@ this PR (cherry-pick + adapt onto the tog6 line; the merge commit is recorded he
 | 4a1ef147 | fix(workspaces): restore recorded branch when HEAD drifted (#65) | already-equivalent | Deploy `c6799b3f52`; identical 7-file stat and hunk sizes. |
 | ca25997c | fix(ssh): exclude agent-local scratch from sync, cap sync-back size (#56) | keep-for-tog.9 | Follow-up port: ENOSPC via /tmp staging. |
 | e54004b9 | fix(issues): low-trust assignee may close its own blocked card (#66) | keep-for-tog.9 | Follow-up port: blocked-card close behavior fix. |
-| b3aad750 | fix(sync): tolerate nested checkouts that lost .git (#61) | keep-for-tog.9 (ported here) | Ported in this release (this PR); fixes the nested-toolkit setup failure on the deploy line. |
+| b3aad750 | fix(sync): tolerate nested checkouts that lost .git (#61) | keep-for-tog.9 (ported via #108) | Ported on the deploy line via `877a4a0ffff2b9420575e6a041fd606172259a75` (#108); fixes the nested-toolkit setup failure on the deploy line. Supplemental #102 ported via `9c0a032bb9d31b67c5140fc1a9cd6d3fa1855057` (#109, outside audit range). |
 | 7d7871b5 | fix(adapter-utils): prevent managed GitHub launcher recursion | keep-for-tog.9 | Follow-up port: launcher recursion bug; no deploy equivalent. |
 | f2f1bad2 | fix(adapter-utils): match managed launchers by exact SHA-256 (#74) | keep-for-tog.9 | Follow-up port: legacy fingerprint accepted forged launchers. |
 | 37964f2b | feat(connections): server-mediated GET-only GitHub Actions diagnostics (#75) | keep-for-tog.9 | Follow-up port: additive read-only review-bot diagnostics parity. |
@@ -55,4 +54,4 @@ this PR (cherry-pick + adapt onto the tog6 line; the merge commit is recorded he
 | 1c470343 | fix(chat-github): search all check runs before replacement (#100) | keep-for-tog.9 | Follow-up port: latest-only lookup caused duplicate POSTs. Deploy-tip #105 does not cover it (different change). |
 | 99868069 | ci(workflows): repair validation and prevent fork publication (#40) | not-needed | CI-only validation + publication guard. |
 
-Counts: keep-for-tog.9: 30 (1 ported here, 29 as follow-up small PRs) · already-equivalent: 4 · not-needed: 7.
+Counts: keep-for-tog.9: 29 (1 ported here, 28 as follow-up small PRs) · already-equivalent: 5 · not-needed: 7.
