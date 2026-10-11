@@ -239,6 +239,21 @@ vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
   reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
 }));
 
+// Sweep decisions are exercised by the DB-backed workspace validation sweep suite.
+vi.mock("../services/workspace-validation-sweep.js", () => ({
+  sweepWorkspaceValidationRecoveries: vi.fn(async () => ({
+    enabled: false,
+    dryRun: false,
+    scanned: 0,
+    deferred: 0,
+    restored: 0,
+    wouldRestore: 0,
+    refused: 0,
+    skipped: {},
+    items: [],
+  })),
+}));
+
 vi.mock("../config.js", () => ({
   loadConfig: loadConfigMock,
 }));

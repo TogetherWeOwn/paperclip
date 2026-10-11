@@ -8048,7 +8048,7 @@ registry.registerPath({
   summary: "Dry-run the workspace validation recovery sweep for a company",
   description:
     "Board only. Reports, per parked branch-incoherence recovery, whether the scheduled sweep " +
-    "would restore the recorded branch or skip it and why. Requires dryRun=true and changes nothing.",
+    "would restore the recorded branch or skip it and why. Requires dryRun=true and makes no changes.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({ dryRun: z.literal("true") }),
