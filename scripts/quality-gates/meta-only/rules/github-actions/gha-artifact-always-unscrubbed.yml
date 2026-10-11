@@ -1,7 +1,7 @@
 id: gha-artifact-always-unscrubbed
 language: Yaml
 severity: warning
-message: 'Do not upload failure artifacts unconditionally when a scrub receipt is required Example: two-web-next#533.'
+message: 'Do not upload failure artifacts unconditionally when a scrub receipt is required.'
 rule:
   kind: block_mapping
   all:

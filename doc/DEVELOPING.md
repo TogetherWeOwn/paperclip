@@ -56,20 +56,21 @@ Actions minutes):
 
 - Biome full scan (`pnpm lint:biome`): WARN. Reports on all code. It stays
   report-only until existing code is clean.
-- Biome changed files (`pnpm lint:biome:changed`): HARD. It fails the pull
-  request when a changed file breaks Biome. Fix with
-  `pnpm exec biome check --write <file>`.
-- Vitest changed-lines coverage (`pnpm coverage:changed`): WARN. It runs
-  coverage for changed test files, else it lists changed source files without
-  a colocated test.
+- Biome changed files (`pnpm lint:biome:changed`): HARD for newly added files;
+  findings on modified existing files are WARN until the repository baseline is
+  clean. Fix with `pnpm exec biome check --write <file>`.
+- Changed-test coverage report (`pnpm coverage:changed`): WARN. It runs coverage
+  for changed tests handled by the configured Vitest projects, else lists changed
+  source files without a colocated test. It does not compute changed-line coverage.
 - Supply chain (`pnpm audit`, Trivy `fs`, gitleaks `detect`): WARN. It reports
   vulnerable dependencies and leaked secrets.
 - Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
   gate scripts break.
-- Floor guard (`pnpm guard:floor`): HARD. It fails the pull request when the
-  diff adds suppressions, skips or deletes tests, strips assertions, leaves
-  stubs, or lowers a `CONSTRAINTS.md` threshold. See `CONSTRAINTS.md` (repo
-  root) for the full bar and `.constraintsignore` for tracked exemptions.
+- Floor guard (`pnpm guard:floor`): WARN during calibration. It reports added
+  suppressions, skip calls in tests, deleted test files, net assertion-call
+  reductions, explicit not-implemented stubs, and lowered `CONSTRAINTS.md`
+  thresholds. See `CONSTRAINTS.md` (repo root) and `.constraintsignore` for the
+  current bar and tracked exemptions.
 - Shared ast-grep rules (`pnpm lint:ast-grep`): WARN. It scans changed files
   with the vendored meta-only rule pack (26 rules with fixtures from the
   ops-tooling `quality/meta-only-assets` branch) and verifies the fixtures

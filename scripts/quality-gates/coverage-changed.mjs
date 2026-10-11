@@ -3,10 +3,9 @@
 /**
  * coverage-changed.mjs
  *
- * WARN gate (phase 1): report vitest coverage for changed lines.
- * This gate never fails. It runs coverage for changed test files when the
- * pull request touches tests, else it lists changed source files without a
- * colocated test so the author can add coverage before phase 2 enforces it.
+ * WARN gate (phase 1): report coverage for changed Vitest test files.
+ * This gate never fails. It runs Vitest only for test files in configured
+ * Vitest projects; other runners (such as node:test under scripts/) are skipped.
  *
  * Usage: node scripts/quality-gates/coverage-changed.mjs [--base <sha>] [--head <sha>]
  */
@@ -18,7 +17,7 @@ import process from "node:process";
 import {
   getChangedFiles,
   isSourceFile,
-  isTestFile,
+  isVitestTestFile,
   resolveRange,
 } from "./changed.mjs";
 
@@ -30,7 +29,7 @@ function summarize(lines) {
     try {
       appendFileSync(
         summaryFile,
-        `### Coverage changed-lines (WARN)\n\n${body}\n`,
+        `### Changed-test coverage report (WARN)\n\n${body}\n`,
       );
     } catch {
       // Step summaries are best effort. The console log carries the report.
@@ -54,9 +53,7 @@ function siblingTestExists(sourceFile) {
 
 const { base, head } = resolveRange();
 const changed = getChangedFiles(base, head);
-const testFiles = changed.filter(
-  (file) => isTestFile(file) && /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file),
-);
+const testFiles = changed.filter(isVitestTestFile);
 const sourceFiles = changed.filter(isSourceFile);
 
 if (testFiles.length > 0) {
@@ -102,7 +99,7 @@ if (sourceFiles.length > 0) {
       ? "Every changed source file has a colocated test. Good."
       : `WARN: ${missing.length} changed source file(s) have no colocated test:`,
     ...missing.map((file) => `- ${file}`),
-    "Phase 2 will enforce a changed-lines coverage floor. Add tests now.",
+    "Changed-line coverage is not measured by this report; add tests for changed source now.",
   ]);
   process.exit(0);
 }

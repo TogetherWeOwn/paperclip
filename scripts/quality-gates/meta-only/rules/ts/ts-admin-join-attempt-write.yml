@@ -1,7 +1,7 @@
 id: ts-admin-join-attempt-write
 language: TypeScript
 severity: warning
-message: 'Admin store leaves must not mutate join-attempt history Example: two-web-next#676.'
+message: 'Admin store leaves must not mutate join-attempt history.'
 rule:
   kind: template_string
   regex: (?i)\b(?:insert\s+into|delete\s+from|update)\s+join_attempts\b

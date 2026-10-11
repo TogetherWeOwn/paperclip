@@ -7,7 +7,7 @@
     "@ast-grep/cli@0.50.0",
     "ast-grep"
   ],
-  "scratch": "/home/ubuntu/tmp/meta-quality-validation",
+  "scratch": "temporary-validation-directory",
   "version": "ast-grep 0.50.0",
   "ast_fixture_exit_code": 0,
   "non_ast_unit_exit_code": 0,

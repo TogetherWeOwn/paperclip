@@ -1,7 +1,7 @@
 id: rust-wildcard-access-denied
 language: Rust
 severity: warning
-message: 'Do not collapse rate-limit and revoked-token failures into AccessDenied Example: two-bot-next#819.'
+message: 'Do not collapse rate-limit and revoked-token failures into AccessDenied.'
 rule:
   kind: match_arm
   regex: (?s)^Err\(_\)\s*=>.*\bAccessDenied\b

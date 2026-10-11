@@ -1,7 +1,7 @@
 id: gha-branch-name-trust
 language: Yaml
 severity: warning
-message: 'A release/lockfile exemption must not trust a spoofable PR branch name alone Example: paperclip#39, two-web-next#630.'
+message: 'A release/lockfile exemption must not trust a spoofable PR branch name alone.'
 rule:
   kind: block_mapping_pair
   all:

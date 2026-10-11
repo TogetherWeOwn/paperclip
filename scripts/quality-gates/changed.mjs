@@ -92,3 +92,24 @@ export function getChangedFiles(base, head) {
     .map((line) => line.trim())
     .filter(Boolean);
 }
+
+export function getAddedFiles(
+  base,
+  head,
+  runGit = (args) => execFileSync("git", args, { encoding: "utf8" }),
+) {
+  return runGit(["diff", "--name-only", "--diff-filter=A", `${base}...${head}`])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+const VITEST_PROJECT_ROOTS = ["packages/", "server/", "ui/", "cli/"];
+
+export function isVitestTestFile(filePath) {
+  return (
+    VITEST_PROJECT_ROOTS.some((root) => filePath.startsWith(root)) &&
+    isTestFile(filePath) &&
+    /\.(test|spec)\.(ts|tsx|js|jsx)$/.test(filePath)
+  );
+}

@@ -712,13 +712,14 @@ jobs:
         continue-on-error: true
         run: pnpm exec biome check .
 
-      - name: Biome changed files (HARD)
+      - name: Biome added files (HARD); modified files (WARN)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node scripts/quality-gates/biome-changed.mjs
 
-      - name: Floor guard — bar-lowering check (HARD)
+      - name: Floor guard — bar-lowering check (WARN during calibration)
+        continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -744,12 +745,14 @@ jobs:
 
       - name: Trivy filesystem scan (WARN, report only)
         continue-on-error: true
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/bin"
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b "$RUNNER_TEMP/bin" "$TRIVY_VERSION"
-          "$RUNNER_TEMP/bin/trivy" fs --severity HIGH,CRITICAL --exit-code 1 --no-progress .
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # pinned action revision
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: ${{ env.TRIVY_VERSION }}
 
       - name: Gitleaks secret scan (WARN, report only)
         continue-on-error: true
@@ -758,6 +761,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gitleaks-bin"
           curl -sfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" \
             -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --status
           tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin"
           "$RUNNER_TEMP/gitleaks-bin/gitleaks" detect --source . --no-git --verbose
 

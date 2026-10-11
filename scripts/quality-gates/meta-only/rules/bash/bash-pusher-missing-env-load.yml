@@ -1,8 +1,7 @@
 id: bash-pusher-missing-env-load
 language: Bash
 severity: warning
-message: 'Cron pusher recipes must load their documented env file before launching the child Example: paperclip-ops-tooling#660,
-  paperclip-ops-tooling#793.'
+message: 'Cron pusher recipes must load their documented env file before launching the child.'
 rule:
   kind: command
   all:

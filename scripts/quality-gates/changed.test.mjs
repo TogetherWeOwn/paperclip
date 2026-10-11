@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  getAddedFiles,
   isBiomeFile,
   isSourceFile,
   isTestFile,
+  isVitestTestFile,
   resolveRange,
 } from "./changed.mjs";
 
@@ -23,6 +25,21 @@ describe("isBiomeFile", () => {
   });
 });
 
+describe("getAddedFiles", () => {
+  it("returns only added files from a range", () => {
+    const files = getAddedFiles("base", "head", (args) => {
+      assert.deepEqual(args, [
+        "diff",
+        "--name-only",
+        "--diff-filter=A",
+        "base...head",
+      ]);
+      return "added.ts\n";
+    });
+    assert.deepEqual(files, ["added.ts"]);
+  });
+});
+
 describe("isTestFile / isSourceFile", () => {
   it("flags test paths", () => {
     assert.equal(isTestFile("server/src/routes/issues.test.ts"), true);
@@ -34,6 +51,19 @@ describe("isTestFile / isSourceFile", () => {
     assert.equal(isSourceFile("server/src/routes/issues.ts"), true);
     assert.equal(isSourceFile("server/src/routes/issues.test.ts"), false);
     assert.equal(isSourceFile("doc/DEVELOPING.md"), false);
+  });
+
+  it("selects only test files handled by the configured Vitest projects", () => {
+    assert.equal(isVitestTestFile("server/src/routes/issues.test.ts"), true);
+    assert.equal(
+      isVitestTestFile("scripts/quality-gates/floor-guard.test.mjs"),
+      false,
+    );
+    assert.equal(
+      isVitestTestFile(".github/scripts/tests/policy.test.mjs"),
+      false,
+    );
+    assert.equal(isVitestTestFile("scripts/unit.test.ts"), false);
   });
 });
 

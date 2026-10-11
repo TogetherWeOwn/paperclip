@@ -49,9 +49,7 @@
     "findings": 52,
     "distinct_prs": 34,
     "recurring_at_least_twice": true,
-    "assets": [
-      "N-exact-head"
-    ],
+    "assets": ["N-exact-head"],
     "implementation": "receipt validator, not CI changes",
     "examples": [
       "F0027",
@@ -113,96 +111,63 @@
     "findings": 3,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "N-lockfiles"
-    ],
+    "assets": ["N-lockfiles"],
     "implementation": "tested lock inventory plus audit/frozen-install recipes; not executed on historical trees",
-    "examples": [
-      "F0685",
-      "F0686",
-      "F0795"
-    ]
+    "examples": ["F0685", "F0686", "F0795"]
   },
   {
     "family": "N-migration-lock",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "N-migration-lock"
-    ],
+    "assets": ["N-migration-lock"],
     "implementation": "existing check-migrations.py plus tested supplemental inventory validator",
-    "examples": [
-      "F0592"
-    ]
+    "examples": ["F0592"]
   },
   {
     "family": "N-regen-diff",
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "N-regen-diff"
-    ],
+    "assets": ["N-regen-diff"],
     "implementation": "exact existing generator/diff command recipes",
-    "examples": [
-      "F0162",
-      "F0588"
-    ]
+    "examples": ["F0162", "F0588"]
   },
   {
     "family": "N-text-nul",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "N-text-nul"
-    ],
+    "assets": ["N-text-nul"],
     "implementation": "tested tracked-text byte scanner",
-    "examples": [
-      "F0938"
-    ]
+    "examples": ["F0938"]
   },
   {
     "family": "ambiguous-regex",
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "py-redos-assert-token",
-      "py-redos-yaml-indent"
-    ],
+    "assets": ["py-redos-assert-token", "py-redos-yaml-indent"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0292",
-      "F0433"
-    ]
+    "examples": ["F0292", "F0433"]
   },
   {
     "family": "bash-json-stderr-merge",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "bash-json-stderr-merge"
-    ],
+    "assets": ["bash-json-stderr-merge"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0235"
-    ]
+    "examples": ["F0235"]
   },
   {
     "family": "bash-unquoted-url-ampersand",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "bash-unquoted-url-ampersand"
-    ],
+    "assets": ["bash-unquoted-url-ampersand"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0094"
-    ]
+    "examples": ["F0094"]
   },
   {
     "family": "catalog-literal-contract",
@@ -262,14 +227,9 @@
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "py-default-redirect-opener"
-    ],
+    "assets": ["py-default-redirect-opener"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0731",
-      "F0784"
-    ]
+    "examples": ["F0731", "F0784"]
   },
   {
     "family": "diff-ancestry",
@@ -305,15 +265,9 @@
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "rust-erased-map-err",
-      "rust-wildcard-access-denied"
-    ],
+    "assets": ["rust-erased-map-err", "rust-wildcard-access-denied"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0499",
-      "F0765"
-    ]
+    "examples": ["F0499", "F0765"]
   },
   {
     "family": "generated-evidence-drift",
@@ -408,15 +362,9 @@
     "findings": 2,
     "distinct_prs": 1,
     "recurring_at_least_twice": true,
-    "assets": [
-      "py-github-first-page-api",
-      "bash-gh-first-page-only"
-    ],
+    "assets": ["py-github-first-page-api", "bash-gh-first-page-only"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0384",
-      "F0385"
-    ]
+    "examples": ["F0384", "F0385"]
   },
   {
     "family": "guard-input-inventory",
@@ -551,134 +499,88 @@
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "rust-test-global-env",
-      "rust-test-global-metrics"
-    ],
+    "assets": ["rust-test-global-env", "rust-test-global-metrics"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0600",
-      "F0615"
-    ]
+    "examples": ["F0600", "F0615"]
   },
   {
     "family": "path-stat-reopen",
     "findings": 2,
     "distinct_prs": 1,
     "recurring_at_least_twice": true,
-    "assets": [
-      "ts-path-stat-then-stream"
-    ],
+    "assets": ["ts-path-stat-then-stream"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0348",
-      "F0349"
-    ]
+    "examples": ["F0348", "F0349"]
   },
   {
     "family": "pusher-env-not-loaded",
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "bash-pusher-missing-env-load"
-    ],
+    "assets": ["bash-pusher-missing-env-load"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0118",
-      "F0282"
-    ]
+    "examples": ["F0118", "F0282"]
   },
   {
     "family": "py-oswalk-onerror",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "py-oswalk-onerror"
-    ],
+    "assets": ["py-oswalk-onerror"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0473"
-    ]
+    "examples": ["F0473"]
   },
   {
     "family": "py-subprocess-timeout",
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "py-subprocess-timeout"
-    ],
+    "assets": ["py-subprocess-timeout"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0447",
-      "F0449"
-    ]
+    "examples": ["F0447", "F0449"]
   },
   {
     "family": "py-utc-mktime",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "py-utc-mktime"
-    ],
+    "assets": ["py-utc-mktime"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0298"
-    ]
+    "examples": ["F0298"]
   },
   {
     "family": "rust-byte-split-offset",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "rust-byte-split-offset"
-    ],
+    "assets": ["rust-byte-split-offset"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0750"
-    ]
+    "examples": ["F0750"]
   },
   {
     "family": "rust-dropped-wait-for-future",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "rust-dropped-wait-for-future"
-    ],
+    "assets": ["rust-dropped-wait-for-future"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0609"
-    ]
+    "examples": ["F0609"]
   },
   {
     "family": "spoofable-branch-exemption",
     "findings": 2,
     "distinct_prs": 2,
     "recurring_at_least_twice": true,
-    "assets": [
-      "py-release-branch-exemption",
-      "gha-branch-name-trust"
-    ],
+    "assets": ["py-release-branch-exemption", "gha-branch-name-trust"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0006",
-      "F0891"
-    ]
+    "examples": ["F0006", "F0891"]
   },
   {
     "family": "timeout-cadence-contract",
     "findings": 17,
     "distinct_prs": 13,
     "recurring_at_least_twice": true,
-    "assets": [
-      "rust-bot.timeout-nesting",
-      "ops.timeout-nesting"
-    ],
+    "assets": ["rust-bot.timeout-nesting", "ops.timeout-nesting"],
     "implementation": "Quoted-bound arithmetic question; no universal cross-file AST proof",
     "examples": [
       "F0095",
@@ -705,81 +607,53 @@
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "ts-admin-join-attempt-write"
-    ],
+    "assets": ["ts-admin-join-attempt-write"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0928"
-    ]
+    "examples": ["F0928"]
   },
   {
     "family": "ts-probe-unbounded-buffer",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "ts-probe-unbounded-buffer"
-    ],
+    "assets": ["ts-probe-unbounded-buffer"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0754"
-    ]
+    "examples": ["F0754"]
   },
   {
     "family": "ts-vacuous-literal-expect",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "ts-vacuous-literal-expect"
-    ],
+    "assets": ["ts-vacuous-literal-expect"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0906"
-    ]
+    "examples": ["F0906"]
   },
   {
     "family": "unexported-sourced-env",
     "findings": 4,
     "distinct_prs": 4,
     "recurring_at_least_twice": true,
-    "assets": [
-      "bash-source-env-export"
-    ],
+    "assets": ["bash-source-env-export"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0091",
-      "F0117",
-      "F0122",
-      "F0282"
-    ]
+    "examples": ["F0091", "F0117", "F0122", "F0282"]
   },
   {
     "family": "unquoted-url-ampersand",
     "findings": 1,
     "distinct_prs": 1,
     "recurring_at_least_twice": false,
-    "assets": [
-      "bash-unquoted-db-url-ampersand"
-    ],
+    "assets": ["bash-unquoted-db-url-ampersand"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0094"
-    ]
+    "examples": ["F0094"]
   },
   {
     "family": "unscrubbed-artifact-upload",
     "findings": 2,
     "distinct_prs": 1,
     "recurring_at_least_twice": true,
-    "assets": [
-      "gha-artifact-always-unscrubbed"
-    ],
+    "assets": ["gha-artifact-always-unscrubbed"],
     "implementation": "ast-grep warning/error detector",
-    "examples": [
-      "F0788",
-      "F0789"
-    ]
+    "examples": ["F0788", "F0789"]
   }
 ]

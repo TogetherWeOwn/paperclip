@@ -61,39 +61,28 @@
   },
   {
     "id": "N-regen-diff",
-    "examples": [
-      "F0162",
-      "F0588"
-    ],
+    "examples": ["F0162", "F0588"],
     "command_reference": "rules/NON-AST.md#n-regen-diff--generated-docs-catalogs-and-snapshots-recurring",
     "implemented": "exact existing generator/diff command recipes",
     "uncertain": false
   },
   {
     "id": "N-migration-lock",
-    "examples": [
-      "F0592"
-    ],
+    "examples": ["F0592"],
     "command_reference": "rules/NON-AST.md#n-migration-lock--migration-inventory-and-ordering",
     "implemented": "existing check-migrations.py plus tested supplemental inventory validator",
     "uncertain": false
   },
   {
     "id": "N-text-nul",
-    "examples": [
-      "F0938"
-    ],
+    "examples": ["F0938"],
     "command_reference": "rules/NON-AST.md#n-text-nul--text-must-remain-reviewable",
     "implemented": "tested tracked-text byte scanner",
     "uncertain": false
   },
   {
     "id": "N-lockfiles",
-    "examples": [
-      "F0685",
-      "F0686",
-      "F0795"
-    ],
+    "examples": ["F0685", "F0686", "F0795"],
     "command_reference": "rules/NON-AST.md#n-lockfiles--all-lockfiles-and-frozen-installs-recurring-family",
     "implemented": "tested lock inventory plus audit/frozen-install recipes; not executed on historical trees",
     "uncertain": true

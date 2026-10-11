@@ -1,7 +1,7 @@
 id: bash-gh-first-page-only
 language: Bash
 severity: warning
-message: 'Explicit per_page=100 is not pagination; follow all pages or use a bounded cursor loop Example: paperclip-ops-tooling#827.'
+message: 'Explicit per_page=100 is not pagination; follow all pages or use a bounded cursor loop.'
 rule:
   kind: command
   all:

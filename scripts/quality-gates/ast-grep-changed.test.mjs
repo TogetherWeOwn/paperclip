@@ -4,11 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import {
-  configDir,
-  resolveAstGrep,
-  scanChanged,
-} from "./ast-grep-changed.mjs";
+import { configDir, resolveAstGrep, scanChanged } from "./ast-grep-changed.mjs";
 
 const VACUOUS_LINE = ["expect", "(true).toBe(true);"].join("");
 

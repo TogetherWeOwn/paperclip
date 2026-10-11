@@ -1,8 +1,7 @@
 id: py-github-first-page-api
 language: Python
 severity: warning
-message: 'Use a paginated GitHub helper for comments and check-runs, not a single per_page=100 request Example:
-  paperclip-ops-tooling#827.'
+message: 'Use a paginated GitHub helper for comments and check-runs, not a single per_page=100 request.'
 rule:
   pattern: api($URL)
 constraints:

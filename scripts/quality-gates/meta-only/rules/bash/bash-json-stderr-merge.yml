@@ -1,7 +1,7 @@
 id: bash-json-stderr-merge
 language: Bash
 severity: warning
-message: 'Keep stderr separate from command-substitution stdout used as structured data Example: paperclip-ops-tooling#771.'
+message: 'Keep stderr separate from command-substitution stdout used as structured data.'
 rule:
   kind: command_substitution
   regex: 2\s*>\s*&\s*1

@@ -1,7 +1,7 @@
 id: bash-unquoted-db-url-ampersand
 language: Bash
 severity: warning
-message: 'Quote PostgreSQL URL assignments containing ampersands Example: paperclip-ops-tooling#565.'
+message: 'Quote PostgreSQL URL assignments containing ampersands.'
 rule:
   kind: program
   regex: (?m)^[A-Z][A-Z0-9_]*=postgres(?:ql)?://[^\s\x22\x27]+&

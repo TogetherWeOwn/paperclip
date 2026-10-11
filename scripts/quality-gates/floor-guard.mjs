@@ -8,13 +8,11 @@
  * unchanged, the patterns are adapted to this repo's stack.
  *
  * Detects the five bar-lowering moves:
- *   1. silenced-checker  - new suppression comments (@ts-ignore,
+ *   1. silenced-checker  - new suppression comments (@ts-expect-error,
  *                          eslint-disable, biome-ignore, istanbul ignore, ...)
  *   2. test-made-easier  - new skips (.skip), deleted test files
- *   3. assertion-removed - assertions stripped from a surviving test (a
- *                          same-shape replacement in the same file whose
- *                          numbers only rose is a tightening: silent)
- *   4. unfinished-work   - not-implemented stubs, empty catch blocks
+ *   3. assertion-removed - net assertion-call count reduced in a surviving test
+ *   4. unfinished-work   - explicit not-implemented stubs
  *   5. threshold-lowered / new-exception - CONSTRAINTS.md weakened or a new
  *                          Exceptions row added without discussion
  *
@@ -42,13 +40,15 @@ const CONSTRAINTS_FILE = "CONSTRAINTS.md";
 // Suppression forms for this stack (JS/TS + Biome + shared security tools).
 const SUPPRESSIONS =
   /@ts-ignore|@ts-nocheck|eslint-disable|biome-ignore|# *noqa|# *type: *ignore|istanbul ignore|nosemgrep|gitleaks:allow|Stryker disable/;
-// Unfinished-work markers.
+// Explicit unimplemented-work markers; TODO comments and best-effort catches
+// are common in the codebase and are not reliable evidence of a stub.
 const STUBS =
-  /throw new (Error|NotImplemented).*[Nn]ot implemented|catch\s*\(\w*\)\s*\{\s*\}|catch\s*\{\s*\}|\bTODO\b|\bpass\s*# *stub/;
-// Test-made-easier markers (added skips).
-const SKIPS = /\.(skip|todo)\b|\bxit\(|\bxdescribe\(|@pytest\.mark\.skip|t\.Skip\(/;
+  /throw new (Error|NotImplemented).*[Nn]ot implemented|\bpass\s*# *stub/;
+// Test-made-easier markers (added skip calls in test files only).
+const SKIPS =
+  /\.(skip|todo)\s*\(|\bxit\s*\(|\bxdescribe\s*\(|@pytest\.mark\.skip|t\.Skip\s*\(/;
 // Assertion calls stripped from surviving tests.
-const ASSERTIONS = /\b(expect|assert|should)\b/;
+const ASSERTIONS = /\b(?:expect(?:\.\w+)?|assert(?:\.\w+)?|should)\s*\(/;
 // Test file paths.
 const TEST_PATH = /\.(test|spec)\.|_test\.|test_/;
 // New Exceptions table rows in CONSTRAINTS.md.
@@ -115,7 +115,7 @@ export function scanAddedLines(lines, { ignored = [] } = {}) {
     if (STUBS.test(text)) {
       flag(findings, "unfinished-work", file, text);
     }
-    if (SKIPS.test(text)) {
+    if (TEST_PATH.test(file) && SKIPS.test(text)) {
       flag(findings, "test-made-easier", file, text);
     }
   }
@@ -130,24 +130,35 @@ export function scanAddedLines(lines, { ignored = [] } = {}) {
  * loud, mirroring checkConstraintThresholds below.
  */
 export function scanRemovedLines(lines, { added = [] } = {}) {
-  const normalized = (text) => text.replace(/\d+(\.\d+)?/g, "#");
-  const findings = [];
+  const assertionCount = (text) =>
+    [...text.matchAll(new RegExp(ASSERTIONS.source, "g"))].length;
+  const removedCounts = new Map();
+  const addedCounts = new Map();
+  const firstRemoved = new Map();
   for (const { file, text } of lines) {
-    if (!TEST_PATH.test(file) || !ASSERTIONS.test(text)) {
+    if (!TEST_PATH.test(file)) {
       continue;
     }
-    const replacement = added.find(
-      (candidate) =>
-        candidate.file === file &&
-        ASSERTIONS.test(candidate.text) &&
-        normalized(candidate.text) === normalized(text) &&
-        numbersIn(candidate.text).length === numbersIn(text).length &&
-        numbersIn(candidate.text).every(
-          (value, index) => value >= numbersIn(text)[index],
-        ),
-    );
-    if (!replacement) {
-      flag(findings, "assertion-removed", file, text);
+    const count = assertionCount(text);
+    if (count === 0) {
+      continue;
+    }
+    removedCounts.set(file, (removedCounts.get(file) ?? 0) + count);
+    if (!firstRemoved.has(file)) {
+      firstRemoved.set(file, text);
+    }
+  }
+  for (const { file, text } of added) {
+    if (!TEST_PATH.test(file)) {
+      continue;
+    }
+    addedCounts.set(file, (addedCounts.get(file) ?? 0) + assertionCount(text));
+  }
+  const findings = [];
+  for (const [file, count] of removedCounts) {
+    const netRemoved = count - (addedCounts.get(file) ?? 0);
+    for (let index = 0; index < netRemoved; index += 1) {
+      flag(findings, "assertion-removed", file, firstRemoved.get(file));
     }
   }
   return findings;

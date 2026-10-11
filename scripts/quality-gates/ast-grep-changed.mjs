@@ -18,9 +18,9 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { resolveRange } from "./changed.mjs";
 
 /** Pinned CLI. Matches the upstream validation receipt (0.50.0). */
@@ -62,11 +62,15 @@ export function configDir() {
 
 function runAstGrep(resolved, args, options = {}) {
   try {
-    const result = spawnSync(resolved.command, [...resolved.prefixArgs, ...args], {
-      encoding: "utf8",
-      timeout: 300000,
-      ...options,
-    });
+    const result = spawnSync(
+      resolved.command,
+      [...resolved.prefixArgs, ...args],
+      {
+        encoding: "utf8",
+        timeout: 300000,
+        ...options,
+      },
+    );
     return {
       ok: !result.error && result.status === 0,
       status: result.status,

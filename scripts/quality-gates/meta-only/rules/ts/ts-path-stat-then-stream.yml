@@ -1,7 +1,7 @@
 id: ts-path-stat-then-stream
 language: TypeScript
 severity: warning
-message: 'Open once, fstat the descriptor, and stream that same descriptor across atomic replacement Example: paperclip-ops-tooling#819.'
+message: 'Open once, fstat the descriptor, and stream that same descriptor across atomic replacement.'
 rule:
   kind: statement_block
   all:

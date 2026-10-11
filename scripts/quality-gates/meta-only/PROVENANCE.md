@@ -1,36 +1,30 @@
 # Provenance: shared meta-only quality pack
 
-The `rules/` tree and `checklists/paperclip.yaml` here are wired from the
-shared asset branch instead of rewritten (owner directive 2026-10-11).
+The rules and Paperclip checklist are a curated snapshot of a shared quality
+asset set imported on 2026-10-11. Rule semantics and fixture structure are
+preserved; explanatory examples and imported validation metadata were
+sanitized for this public repository. Source repository names, private issue
+and pull-request references, commit identifiers, and host paths are omitted.
 
-- Source: `TogetherWeOwn/paperclip-ops-tooling`, branch
-  `quality/meta-only-assets` at `a10103b5f8c9846b8d12cc2d19c7bc2246d12349`
-  (ops-tooling PR #882, `quality/meta-only/`).
-- `rules/` is a byte-for-byte copy of the upstream `rules/` directory at
-  that SHA (verified with `diff -r`). Do not hand-edit it.
-- `checklists/paperclip.yaml` is a byte-for-byte copy of the upstream
-  paperclip review checklist (Muse one-question-per-request protocol).
-- `rules/tests/__snapshots__/` is the only generated content on our side:
-  produced with the pinned CLI (`npx --package @ast-grep/cli@0.50.0
-  ast-grep test -c sgconfig.yml --update-all`). It locks the fixture
-  behavior so `ast-grep test` stays a real regression check.
+- Rule definitions and the checklist were imported as a shared asset snapshot.
+- Validation snapshots under `rules/tests/__snapshots__/` were generated here
+  with the pinned CLI (`npx --package @ast-grep/cli@0.50.0 ast-grep test
+  -c sgconfig.yml --update-all`). They lock fixture behavior so
+  `ast-grep test` remains a regression check.
 
-## Resync procedure (when the asset branch merges or updates)
+## Resync procedure
 
-1. Copy the new upstream `rules/` and `checklists/paperclip.yaml` over
-   this directory, then `diff -r` the shared files.
-2. Regenerate snapshots: `ast-grep test -c sgconfig.yml --update-all`
-   with the pinned CLI, from inside `rules/`.
-3. Run `pnpm test:quality-gates` and `pnpm lint:ast-grep`. A resync that
-   changes findings is a loud change: name it in the PR.
+1. Import the reviewed shared `rules/` and `checklists/paperclip.yaml` snapshot;
+   preserve its rule semantics and remove source-private metadata before commit.
+2. Regenerate snapshots with `ast-grep test -c sgconfig.yml --update-all`
+   using the pinned CLI, from inside `rules/`.
+3. Run `pnpm test:quality-gates` and `pnpm lint:ast-grep`. A resync that changes
+   findings is a loud change and should be named in the PR.
 
-## Known upstream gaps (flagged, not forked)
+## Known upstream gaps
 
-- The asset branch ships no `tests/__snapshots__/`, so a plain
-  `ast-grep test -c rules/sgconfig.yml` fails there (26/26 snapshot
-  mismatches). Their validator must be generating snapshots first.
-- `golden-findings.jsonl` (cited as `rationale_source` in the checklist)
-  and `non_ast.py` (cited by `rules/NON-AST.md`) are not on the branch,
-  so only the ast-grep rules and the checklist are wired here. The
-  NON-AST recipes that already exist in this repo (lockfile inventory,
-  migration ordering) keep running under their own gates.
+- The original asset bundle did not include `tests/__snapshots__/`, so its
+  fixtures required snapshot generation before they could be verified locally.
+- `golden-findings.jsonl` and `non_ast.py` were referenced but not present in
+  the bundle. Only the AST rules and checklist are included here. The
+  repository's own lockfile and migration checks remain separate gates.
