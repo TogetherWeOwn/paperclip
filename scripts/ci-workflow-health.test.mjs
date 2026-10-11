@@ -223,7 +223,8 @@ test("ci-changes runs the classifier from the trusted base and fetches the PR he
   assert.match(setup, /fetch-depth: 0/);
   assert.match(setup, /persist-credentials: false/);
   assert.doesNotMatch(changes, /ref: \$\{\{ github\.event\.pull_request\.head/);
-  assert.equal(changes.match(/uses: actions\/checkout/g).length, 1, "the only checkout is the base checkout");
+  assert.equal(changes.match(/uses:\s*["']?actions\/checkout/g).length, 1, "the only checkout is the base checkout");
+  assert.deepEqual(changes.match(/\bgit [a-z-]+/g), ["git fetch"], "the only git command fetches the head as diff data");
 });
 
 test("PR selection includes removed and added paths in real Git renames", () => {
