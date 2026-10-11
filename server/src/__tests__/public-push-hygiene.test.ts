@@ -397,7 +397,7 @@ function publicLayout(git: (...args: string[]) => string, root: string) {
   const master = commitFixtureFile(git, root, "base.txt", "fixture base");
   git("update-ref", "refs/remotes/origin/master", master);
   const legacy = commitFixtureFile(git, root, "legacy.md", `legacy public line Refs ${DIRTY_ID}`);
-  git("update-ref", "refs/remotes/origin/deploy/line", legacy);
+  git("update-ref", "refs/remotes/origin/deploy/tog6", legacy);
   return { master, legacy };
 }
 
@@ -495,7 +495,7 @@ describe("public push hygiene scope on non-master lines", () => {
   it("scans the deploy line's own history against master on a push to the deploy line", () => {
     withFixtureRepo((git, root) => {
       const { legacy } = publicLayout(git, root);
-      const selfRef = "refs/remotes/origin/deploy/line";
+      const selfRef = "refs/remotes/origin/deploy/tog6";
 
       const { log, error } = quiet();
       expect(
@@ -538,6 +538,113 @@ describe("public push hygiene scope on non-master lines", () => {
         runPublicPushHygieneCheck({ head: orphan, selfRef, prefixes: PREFIXES, log, error }),
       ).toBe(1);
       expect(error).toHaveBeenCalledWith(expect.stringContaining(`commit ${orphan.slice(0, 12)} message references`));
+    });
+  });
+
+  it("does not flag master-owned content brought in by merging master", () => {
+    withFixtureRepo((git, root) => {
+      const { master } = publicLayout(git, root);
+      const port = commitFixtureFile(git, root, "port.txt", "clean port follow-up");
+      git("checkout", "-q", "--detach", master);
+      commitFixtureFile(git, root, "master-note.md", "master note", `master-owned note Refs ${DIRTY_ID}\n`);
+      const masterTip = git("rev-parse", "HEAD");
+      git("update-ref", "refs/remotes/origin/master", masterTip);
+      git("checkout", "-q", "--detach", port);
+      git("merge", "-q", "--no-edit", masterTip);
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not flag legacy content on the deploy line brought in by merging master", () => {
+    withFixtureRepo((git, root) => {
+      const { master } = publicLayout(git, root);
+      git("checkout", "-q", "--detach", master);
+      const deployBody = commitFixtureFile(git, root, "legacy-body.md", "legacy body", `legacy body Refs ${DIRTY_ID}\n`);
+      git("update-ref", "refs/remotes/origin/deploy/tog6", deployBody);
+      const port = commitFixtureFile(git, root, "port.txt", "clean port follow-up");
+      git("checkout", "-q", "--detach", master);
+      commitFixtureFile(git, root, "master-next.txt", "master follow-up");
+      const masterTip = git("rev-parse", "HEAD");
+      git("update-ref", "refs/remotes/origin/master", masterTip);
+      git("checkout", "-q", "--detach", port);
+      git("merge", "-q", "--no-edit", masterTip);
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(0);
+    });
+  });
+
+  it("flags a tracker id written into a merge conflict resolution", () => {
+    withFixtureRepo((git, root) => {
+      commitFixtureFile(git, root, "shared.txt", "shared base", "one\n");
+      const base = git("rev-parse", "HEAD");
+      git("update-ref", "refs/remotes/origin/master", base);
+      git("checkout", "-q", "--detach", base);
+      commitFixtureFile(git, root, "shared.txt", "master edit", "two\n");
+      const masterTip = git("rev-parse", "HEAD");
+      git("update-ref", "refs/remotes/origin/master", masterTip);
+      git("checkout", "-q", "--detach", base);
+      commitFixtureFile(git, root, "shared.txt", "port edit", "three\n");
+      try {
+        git("merge", "-q", "--no-edit", masterTip);
+      } catch {
+        // expected conflict; resolved below
+      }
+      writeFileSync(join(root, "shared.txt"), `resolved ${DIRTY_ID}\n`);
+      git("add", "shared.txt");
+      git("commit", "-qm", "resolve merge conflict");
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(`shared.txt (merge resolution) references: ${DIRTY_ID}`));
+    });
+  });
+
+  it("does not exempt a commit merely because a branch named like a deploy line carries it", () => {
+    withFixtureRepo((git, root) => {
+      publicLayout(git, root);
+      const dirty = commitFixtureFile(git, root, "dirty.md", `throwaway deploy carries Refs ${DIRTY_ID}`);
+      git("update-ref", "refs/remotes/origin/deploy/throwaway", dirty);
+      commitFixtureFile(git, root, "port.txt", "clean follow-up on feature");
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef, prefixes: PREFIXES, log, error }),
+      ).toBe(1);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(`commit ${dirty.slice(0, 12)} message references`));
+    });
+  });
+
+  it("refuses revision expressions and negations that would otherwise produce an empty range", () => {
+    withFixtureRepo((git, root) => {
+      publicLayout(git, root);
+      commitFixtureFile(git, root, "dirty.md", `new dirty follow-up Refs ${DIRTY_ID}`);
+      git("update-ref", "refs/remotes/origin/port/x", "HEAD");
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({ head: "^HEAD", selfRef: "refs/remotes/origin/port/x", prefixes: PREFIXES, log, error }),
+      ).toBe(2);
+      expect(
+        runPublicPushHygieneCheck({ head: "HEAD", selfRef: "refs/remotes/origin/port/x^", prefixes: PREFIXES, log, error }),
+      ).toBe(2);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("Refusing to pass an unscoped scan"));
     });
   });
 

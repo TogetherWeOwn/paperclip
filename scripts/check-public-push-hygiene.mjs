@@ -17,12 +17,14 @@
  * Scope: the NEW publication population of a push is every commit reachable
  * from <head> and from no public line:
  *   messages: `git log <head> --not <public lines>`
- *   text:     added lines of each of those commits (`git log -p -m`)
- * Public lines are origin/master and origin/deploy/* (PUBLIC_LINE_REFS and
- * PUBLIC_LINE_PREFIXES). Their history is already public and is never flagged.
- * A branch's own unshared history is always scanned, including commits that
- * another feature branch already carries. Per-commit diffs mean a line added
- * and removed within the push is still flagged. History is never rewritten.
+ *   text:     lines added by each of those commits (`git log -p --cc`): for a
+ *             merge, only lines new relative to every parent (conflict
+ *             resolutions), never content brought in from a parent
+ * Public lines are PUBLIC_LINE_REFS, matched by exact name. Their history is
+ * already public and is never flagged. A branch's own unshared history is
+ * always scanned, including commits that another feature branch already
+ * carries. Per-commit diffs mean a line added and removed within the push is
+ * still flagged. History is never rewritten.
  *
  * Exit codes (fail-closed, mirroring the public-comment hygiene gate):
  *   0 = clean, 1 = internal reference(s) found (blocked), 2 = scanner error.
@@ -45,10 +47,11 @@ import { fileURLToPath } from "node:url";
 export const DEFAULT_PREFIXES = ["TOG", "PAP", "PAPA"];
 
 // Long-lived lines whose history is already public. A push never scans their
-// commits. Feature branches are deliberately not listed: a flagged commit on a
-// feature branch must stay flagged for every branch that carries it.
-export const PUBLIC_LINE_REFS = ["refs/remotes/origin/master"];
-export const PUBLIC_LINE_PREFIXES = ["refs/remotes/origin/deploy/"];
+// commits. Matched by exact name: a prefix would let any pusher who can create a
+// branch make content public-by-name. Feature branches are deliberately not
+// listed: a flagged commit on a feature branch must stay flagged for every
+// branch that carries it. Adding a line is a reviewed change here.
+export const PUBLIC_LINE_REFS = ["refs/remotes/origin/master", "refs/remotes/origin/deploy/tog6"];
 
 export const EXIT_CLEAN = 0;
 export const EXIT_FINDINGS = 1;
@@ -105,18 +108,23 @@ export function parseCommitRecords(logOutput) {
 }
 
 /**
- * Parse `git log -p -U0 --no-color` output, returning findings for added lines:
- * [{ file, line, refs }]. Pure function over command output.
+ * Parse `git log -p -U0 --cc --no-color` output, returning findings for lines
+ * added relative to every parent: [{ file, line, refs }], or
+ * [{ file, line: null, merge: true, refs }] for merge resolutions.
+ * Pure function over command output.
  */
 export function scanDiffForRefs(diffOutput, prefixes = DEFAULT_PREFIXES) {
   const findings = [];
   let file = null;
   let inHunk = false;
   let newLine = 0;
+  let parents = 1;
+  let merge = false;
   for (const line of diffOutput.split("\n")) {
-    if (line.startsWith("diff --git")) {
+    if (line.startsWith("diff --git ") || line.startsWith("diff --cc ")) {
       file = null;
       inHunk = false;
+      merge = line.startsWith("diff --cc ");
       continue;
     }
     // File headers only occur before the first hunk. Once inside a hunk, a
@@ -129,16 +137,19 @@ export function scanDiffForRefs(diffOutput, prefixes = DEFAULT_PREFIXES) {
     if (!inHunk && line.startsWith("--- ")) {
       continue;
     }
-    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    // Combined (merge) hunks use one extra "@" per parent and one marker column
+    // per parent, so "@@@ ... @@@" has two marker columns.
+    const hunk = line.match(/^(@@+) (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? @@+/);
     if (hunk) {
       inHunk = true;
-      newLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      parents = hunk[1].length - 1;
       continue;
     }
-    if (inHunk && file !== null && line.startsWith("+")) {
-      const refs = findInternalRefs(line.slice(1), prefixes);
+    if (inHunk && file !== null && line.startsWith("+".repeat(parents))) {
+      const refs = findInternalRefs(line.slice(parents), prefixes);
       if (refs.length > 0) {
-        findings.push({ file, line: newLine, refs });
+        findings.push(merge ? { file, line: null, merge: true, refs } : { file, line: newLine, refs });
       }
       newLine += 1;
     }
@@ -174,12 +185,17 @@ function gitOutputLines(args) {
 
 /** Public-line refs to exclude for a push to `selfRef` (the pushed branch's own origin ref). */
 export function resolvePublicLineRefs({ selfRef }) {
-  return gitOutputLines([
-    "for-each-ref",
-    "--format=%(refname)",
-    ...PUBLIC_LINE_REFS,
-    ...PUBLIC_LINE_PREFIXES,
-  ]).filter((ref) => ref !== selfRef);
+  return gitOutputLines(["for-each-ref", "--format=%(refname)", ...PUBLIC_LINE_REFS]).filter(
+    (ref) => ref !== selfRef,
+  );
+}
+
+// Plain ref names and SHAs only: revision syntax (^, ~, .., @{...}) and option-like
+// values would otherwise produce empty or unscoped ranges that still exit 0.
+const PLAIN_REVISION = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+function isPlainRevision(value) {
+  return PLAIN_REVISION.test(value) && !value.includes("..");
 }
 
 export function runPublicPushHygieneCheck({
@@ -194,6 +210,14 @@ export function runPublicPushHygieneCheck({
   if (!head || (!base && !selfRef)) {
     error("ERROR: --head and one of --base or --self-ref are required (no resolvable default).");
     return EXIT_SCANNER_ERROR;
+  }
+
+  const inputs = [["--head", head], ["--base", base], ["--self-ref", selfRef]];
+  for (const [flag, value] of inputs) {
+    if (value !== undefined && !isPlainRevision(value)) {
+      error(`ERROR: ${flag} '${value}' is not a plain ref or SHA. Refusing to pass an unscoped scan.`);
+      return EXIT_SCANNER_ERROR;
+    }
   }
 
   if (selfRef !== undefined && !selfRef.startsWith("refs/remotes/origin/")) {
@@ -229,7 +253,7 @@ export function runPublicPushHygieneCheck({
   let diffOutput;
   try {
     logOutput = execFn(`git log --format=%H%x1f%B%x1e ${range}`);
-    diffOutput = execFn(`git log -p -U0 -m --no-color --no-ext-diff --format= ${range}`);
+    diffOutput = execFn(`git log -p -U0 --cc --no-color --no-ext-diff --format= ${range}`);
   } catch (err) {
     error(`ERROR: failed to read the publication range for ${head}: ${err.message}`);
     return EXIT_SCANNER_ERROR;
@@ -253,8 +277,9 @@ export function runPublicPushHygieneCheck({
   for (const { sha, refs } of messageFindings) {
     error(`  commit ${sha.slice(0, 12)} message references: ${refs.join(", ")}`);
   }
-  for (const { file, line, refs } of textFindings) {
-    error(`  ${file}:${line} references: ${refs.join(", ")}`);
+  for (const { file, line, merge, refs } of textFindings) {
+    const where = merge ? `${file} (merge resolution)` : `${file}:${line}`;
+    error(`  ${where} references: ${refs.join(", ")}`);
   }
   error("\nBlocked: restate internal context in plain English and remove the reference(s).");
   return EXIT_FINDINGS;

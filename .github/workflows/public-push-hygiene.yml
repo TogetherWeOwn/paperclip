@@ -5,7 +5,7 @@ run-name: Public push hygiene ${{ github.sha }}
 # PR workflows never see branch-only pushes, so this runs on every branch push
 # and scans the new publication population: commit messages plus added lines
 # of commits reachable from the pushed head but from no public line (origin
-# master and origin deploy/*). Feature branches are never public lines, so a
+# master and origin deploy/tog6). Feature branches are never public lines, so a
 # flagged commit stays flagged on every branch that carries it. History is
 # never rewritten. Direct pushes to master stay disabled by branch protection;
 # making this check required is a repo-admin step owned by the Operator route.
@@ -39,7 +39,7 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           PUSH_SELF_REF: refs/remotes/origin/${{ github.ref_name }}
         run: |
-          # The scanner excludes only public lines (origin master and deploy/*),
+          # The scanner excludes only public lines (origin master and deploy/tog6),
           # minus this branch's own ref. A clean follow-up push cannot hide an
           # earlier dirty commit, and merging master flags no master-owned
           # commits. github.event.before dangles after amend/force-push, so it
