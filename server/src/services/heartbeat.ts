@@ -167,6 +167,7 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { isUniqueViolation } from "../db-errors.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -20597,13 +20598,40 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // Each claim commits on its own. A later claim that throws must never
+      // abandon claims already committed in this batch: those runs are
+      // `running` with no executor, and nothing renews their lease until the
+      // orphan reaper fails them as process_lost.
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let claimFailure: { error: unknown } | null = null;
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
+        try {
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed) claimedRuns.push(claimed);
+        } catch (error) {
+          if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+            // Another run already holds this routine's execution slot. The
+            // claim transaction rolled back, so the run is still queued and
+            // is retried once the holder releases the slot.
+            logger.info(
+              { runId: queuedRun.id, agentId },
+              "queued run deferred: routine execution slot is held",
+            );
+            continue;
+          }
+          claimFailure = { error };
+          logger.error(
+            { err: error, runId: queuedRun.id, agentId },
+            "queued run claim failed; dispatching claims already committed",
+          );
+          break;
+        }
       }
-      if (claimedRuns.length === 0) return [];
+      if (claimedRuns.length === 0) {
+        if (claimFailure) throw claimFailure.error;
+        return [];
+      }
 
       for (const claimedRun of claimedRuns) {
         const execution = executeRun(claimedRun.id).catch((err) => {
