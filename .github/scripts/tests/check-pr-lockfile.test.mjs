@@ -31,3 +31,27 @@ test('fails when lockfile changed by bot on wrong branch', () => {
   );
   assert.equal(result.passed, false);
 });
+
+test('passes when lockfile changed alongside a workspace manifest', () => {
+  const result = checkLockfile(
+    makeFiles(['pnpm-lock.yaml', 'cli/package.json']),
+    'someuser',
+    'feat/add-dep'
+  );
+  assert.equal(result.passed, true);
+});
+
+test('passes when lockfile changed alongside the root manifest', () => {
+  const result = checkLockfile(
+    makeFiles(['pnpm-lock.yaml', 'package.json']),
+    'someuser',
+    'feat/add-dep'
+  );
+  assert.equal(result.passed, true);
+});
+
+test('fails when lockfile changed with no manifest (guidance mentions regen gate)', () => {
+  const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'fix/bug');
+  assert.equal(result.passed, false);
+  assert.ok(result.failures[0].includes('Block unregenerable lockfile edits'));
+});

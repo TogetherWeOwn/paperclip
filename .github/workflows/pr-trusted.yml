@@ -265,19 +265,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Block manual lockfile edits
-        if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
-        run: |
-          # Diff the PR branch against its merge base so recent base-branch commits
-          # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
-          if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
-            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
-            exit 1
-          fi
-
       - name: Setup Node.js for pnpm bootstrap
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -293,6 +280,52 @@ jobs:
         with:
           version: 9.15.4
           run_install: false
+
+      - name: Block unregenerable lockfile edits
+        if: >-
+          github.head_ref != 'chore/refresh-lockfile' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Diff against the merge base so recent base commits do not appear
+          # as changes made by the PR itself.
+          changed_paths="$(mktemp "$RUNNER_TEMP/pr-changed-paths.XXXXXX")"
+          trap 'rm -f "$changed_paths"' EXIT
+          git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$changed_paths"
+          lockfile_changed=false
+          manifest_changed=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              pnpm-lock.yaml) lockfile_changed=true ;;
+              package.json|*/package.json) manifest_changed=true ;;
+            esac
+          done < "$changed_paths"
+          if [[ "$lockfile_changed" != true ]]; then
+            exit 0
+          fi
+          if [[ "$manifest_changed" != true ]]; then
+            echo "Do not commit pnpm-lock.yaml without a package.json change in the same PR."
+            echo "The lockfile is regenerated automatically by the refresh bot on a schedule."
+            exit 1
+          fi
+          # Resolve the base lockfile with the PR manifests. Only an identical
+          # result is admitted; restore the PR tree even if resolution fails.
+          saved_lockfile="$(mktemp "$RUNNER_TEMP/pr-pnpm-lock.XXXXXX")"
+          cp pnpm-lock.yaml "$saved_lockfile"
+          trap 'cp "$saved_lockfile" pnpm-lock.yaml; rm -f "$saved_lockfile" "$changed_paths"' EXIT
+          git show "$BASE_SHA:pnpm-lock.yaml" > pnpm-lock.yaml
+          pnpm install --resolution-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile
+          if ! cmp -s pnpm-lock.yaml "$saved_lockfile"; then
+            echo "The committed pnpm-lock.yaml does not match what 'pnpm install' regenerates"
+            echo "from this PR's package.json manifests. Commit the regenerated lockfile instead"
+            echo "of hand-editing it (or drop the lockfile hunk; the refresh bot owns master)."
+            exit 1
+          fi
+          echo "Lockfile hunk verified: regenerable from this PR's manifests."
 
       - name: Validate migration ordering against target branch
         run: >-
