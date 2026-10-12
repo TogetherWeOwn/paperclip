@@ -632,6 +632,7 @@ import {
   applyRunModelDecisionToAdapterConfig,
   isRepeatModelDecisionDeferral,
   isRunModelDecisionDeferral,
+  modelDecisionCardRevision,
   parseModelDecisionDeferralFingerprint,
   readPreviousRunModelDecision,
   resolveRunModelDecision,
@@ -16220,7 +16221,17 @@ export function heartbeatService(
           // requeues per card per day. Human/board wakes keep working: this
           // only stops automatic requeues.
           const [lockedIssue] = await tx
-            .select({ status: issues.status, updatedAt: issues.updatedAt })
+            .select({
+              status: issues.status,
+              title: issues.title,
+              description: issues.description,
+              priority: issues.priority,
+              assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              projectId: issues.projectId,
+              goalId: issues.goalId,
+              parentId: issues.parentId,
+            })
             .from(issues)
             .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
           const [latestComment] = await tx
@@ -16240,7 +16251,7 @@ export function heartbeatService(
           const currentFingerprint: RunModelDecisionDeferralFingerprint = {
             reason: readNonEmptyString(decisionRecord.reason) ?? "",
             issueStatus: lockedIssue?.status ?? null,
-            issueUpdatedAt: lockedIssue?.updatedAt?.toISOString() ?? null,
+            cardRevision: lockedIssue ? modelDecisionCardRevision(lockedIssue) : null,
             lastCommentAt: latestComment?.createdAt?.toISOString() ?? null,
           };
           const previousFingerprint = parseModelDecisionDeferralFingerprint(

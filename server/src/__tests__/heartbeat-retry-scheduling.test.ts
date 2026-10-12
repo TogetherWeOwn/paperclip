@@ -28,6 +28,7 @@ import {
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { modelDecisionCardRevision } from "../services/run-model-decision.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentTaskRun = vi.hoisted(() => vi.fn());
@@ -700,7 +701,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       identifier: `${issuePrefix}-1`,
     });
     const issueRow = await db
-      .select({ status: issues.status, updatedAt: issues.updatedAt })
+      .select({
+        status: issues.status,
+        title: issues.title,
+        description: issues.description,
+        priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        projectId: issues.projectId,
+        goalId: issues.goalId,
+        parentId: issues.parentId,
+      })
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]!);
@@ -748,7 +759,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const currentFingerprint = {
       reason: "no account has headroom",
       issueStatus: f.issueRow.status,
-      issueUpdatedAt: f.issueRow.updatedAt!.toISOString(),
+      cardRevision: modelDecisionCardRevision(f.issueRow),
       lastCommentAt: null,
     };
     await db
@@ -781,12 +792,48 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(retries).toHaveLength(0);
   });
 
+  it("drops the next model-decision retry after the successor claims the unchanged card", async () => {
+    const f = await seedModelDecisionFixture();
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const first = await scheduleModelDecisionRetry(f);
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") return;
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        errorCode: "model_decision_pending",
+        resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+        finishedAt: f.now,
+      })
+      .where(eq(heartbeatRuns.id, first.run.id));
+    // Claiming the successor's execution lock bumps issues.updatedAt without changing the card.
+    await db
+      .update(issues)
+      .set({ executionRunId: first.run.id, updatedAt: new Date("2026-04-20T12:05:00.000Z") })
+      .where(eq(issues.id, f.issueId));
+
+    const second = await heartbeat.scheduleBoundedRetry(first.run.id, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+    });
+
+    expect(second).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_issue_unchanged",
+    });
+  });
+
   it("schedules a model-decision retry with a fresh fingerprint when the card changed", async () => {
     const f = await seedModelDecisionFixture({
       fingerprint: {
         reason: "no account has headroom",
         issueStatus: "in_progress",
-        issueUpdatedAt: "2026-04-19T12:00:00.000Z",
+        cardRevision: "stale-card-revision",
         lastCommentAt: null,
       },
     });
@@ -801,7 +848,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(stamped).toMatchObject({
       reason: "no account has headroom",
       issueStatus: "in_progress",
-      issueUpdatedAt: f.issueRow.updatedAt!.toISOString(),
+      cardRevision: modelDecisionCardRevision(f.issueRow),
     });
   });
 

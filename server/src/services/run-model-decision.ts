@@ -9,6 +9,7 @@
  * module is pure so the §9.2 cases run as unit tests.
  */
 
+import { createHash } from "node:crypto";
 import type {
   ResolveRunModelParams,
   ResolveRunModelResult,
@@ -373,6 +374,39 @@ export function resolveRunModelDecisionNoDecision(input: {
   };
 }
 
+export interface ModelDecisionCardContent {
+  title: string;
+  description: string | null;
+  priority: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  projectId: string | null;
+  goalId: string | null;
+  parentId: string | null;
+}
+
+/**
+ * Digest of the card's content and ownership. Execution-lock, checkout and
+ * monitor writes leave it unchanged, so retry scheduling cannot reset the
+ * repeat guard by touching the row.
+ */
+export function modelDecisionCardRevision(card: ModelDecisionCardContent): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        card.title,
+        card.description,
+        card.priority,
+        card.assigneeAgentId,
+        card.assigneeUserId,
+        card.projectId,
+        card.goalId,
+        card.parentId,
+      ]),
+    )
+    .digest("hex");
+}
+
 /**
  * Card-state fingerprint stamped when a `model_decision_pending` retry is
  * scheduled. A retry whose fingerprint matches the previous
@@ -383,7 +417,7 @@ export interface RunModelDecisionDeferralFingerprint {
   /** Deferral reason (e.g. which headroom/account signal parked the run). */
   reason: string;
   issueStatus: string | null;
-  issueUpdatedAt: string | null;
+  cardRevision: string | null;
   lastCommentAt: string | null;
 }
 
@@ -407,7 +441,7 @@ export function parseModelDecisionDeferralFingerprint(
   return {
     reason: record.reason,
     issueStatus: readFingerprintString(record.issueStatus),
-    issueUpdatedAt: readFingerprintString(record.issueUpdatedAt),
+    cardRevision: readFingerprintString(record.cardRevision),
     lastCommentAt: readFingerprintString(record.lastCommentAt),
   };
 }
@@ -426,7 +460,7 @@ export function isRepeatModelDecisionDeferral(
   return (
     previous.reason === current.reason &&
     previous.issueStatus === current.issueStatus &&
-    previous.issueUpdatedAt === current.issueUpdatedAt &&
+    previous.cardRevision === current.cardRevision &&
     previous.lastCommentAt === current.lastCommentAt
   );
 }

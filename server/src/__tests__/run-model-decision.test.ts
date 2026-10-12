@@ -12,6 +12,7 @@ import {
   isRepeatModelDecisionDeferral,
   isRunModelDecisionDeferral,
   isSecretEnvBinding,
+  modelDecisionCardRevision,
   readPreviousRunModelDecision,
   resolveRunModelDecision,
   resolveRunModelDecisionNoDecision,
@@ -295,12 +296,15 @@ describe("run model decision hook (TOG-11792, design §9.2)", () => {
     const fingerprint = {
       reason: "no account has headroom",
       issueStatus: "in_progress",
-      issueUpdatedAt: "2026-04-20T11:00:00.000Z",
+      cardRevision: "rev-1",
       lastCommentAt: null,
     };
     expect(isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint })).toBe(true);
     expect(
       isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint, issueStatus: "done" }),
+    ).toBe(false);
+    expect(
+      isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint, cardRevision: "rev-2" }),
     ).toBe(false);
     expect(
       isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint, reason: "timed out" }),
@@ -313,6 +317,24 @@ describe("run model decision hook (TOG-11792, design §9.2)", () => {
     ).toBe(false);
     expect(isRepeatModelDecisionDeferral(null, fingerprint)).toBe(false);
     expect(isRepeatModelDecisionDeferral(undefined, fingerprint)).toBe(false);
+  });
+
+  it("digests only card content and ownership into the revision", () => {
+    const card = {
+      title: "Ship the fix",
+      description: null,
+      priority: "medium",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      projectId: null,
+      goalId: null,
+      parentId: null,
+    };
+    const revision = modelDecisionCardRevision(card);
+    expect(modelDecisionCardRevision({ ...card })).toBe(revision);
+    expect(modelDecisionCardRevision({ ...card, title: "Ship the fix now" })).not.toBe(revision);
+    expect(modelDecisionCardRevision({ ...card, description: "" })).not.toBe(revision);
+    expect(modelDecisionCardRevision({ ...card, assigneeAgentId: "agent-2" })).not.toBe(revision);
   });
 
   // 6. user wake exempt
