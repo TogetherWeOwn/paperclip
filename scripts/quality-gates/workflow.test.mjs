@@ -125,14 +125,6 @@ const TOOLING = JSON.stringify({
 });
 const NO_TOOLING = JSON.stringify({ scripts: { test: "vitest" } });
 
-function mergePrIntoMain(repo, baseBody, prWork) {
-  commitPackageJson(repo, baseBody);
-  runGit(repo, "checkout", "-q", "-b", "pr");
-  prWork();
-  runGit(repo, "checkout", "-q", "main");
-  return runGit(repo, "rev-parse", "HEAD");
-}
-
 test("policy decides gate availability from the merge base parent and fails closed", () => {
   assert.match(
     policy,
@@ -239,7 +231,11 @@ test("detection fails closed for non-merge checkouts and unreadable base data", 
     commitPackageJson(repo, TOOLING);
     const linear = runDetection(repo);
     assert.notEqual(linear.status, 0, "linear checkout must fail policy");
-    assert.equal(linear.output, "", "linear checkout must not publish a decision");
+    assert.equal(
+      linear.output,
+      "",
+      "linear checkout must not publish a decision",
+    );
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -254,7 +250,11 @@ test("detection fails closed for non-merge checkouts and unreadable base data", 
     runGit(repo2, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
     const result = runDetection(repo2);
     assert.notEqual(result.status, 0, "invalid package JSON must fail policy");
-    assert.equal(result.output, "", "invalid package JSON must not publish a decision");
+    assert.equal(
+      result.output,
+      "",
+      "invalid package JSON must not publish a decision",
+    );
   } finally {
     rmSync(badJson.scratch, { recursive: true, force: true });
   }
@@ -271,7 +271,11 @@ test("detection fails closed for non-merge checkouts and unreadable base data", 
     runGit(repo3, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
     const result = runDetection(repo3);
     assert.notEqual(result.status, 0, "missing package.json must fail policy");
-    assert.equal(result.output, "", "missing package.json must not publish a decision");
+    assert.equal(
+      result.output,
+      "",
+      "missing package.json must not publish a decision",
+    );
   } finally {
     rmSync(missing.scratch, { recursive: true, force: true });
   }
