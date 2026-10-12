@@ -316,6 +316,59 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
+  it("does not restore a blocked issue held by a denial descriptor when its blocker resolves", async () => {
+    const parentIssueId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const childIssueId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const heldDescriptor = {
+      owner: "board" as const,
+      action: "Reassess the denial after the retention scope is supplied.",
+      kind: "denial" as const,
+    };
+    const heldIssue = {
+      id: parentIssueId,
+      companyId: "company-1",
+      identifier: "PAP-201",
+      title: "Held by security denial",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-2",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+      unblockDescriptor: heldDescriptor,
+    };
+    mockIssueService.getById.mockResolvedValue(heldIssue);
+    mockIssueService.update.mockResolvedValue(heldIssue);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: parentIssueId,
+      blockerIssueIds: [childIssueId],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${parentIssueId}`)
+      .send({
+        status: "blocked",
+        blockedByIssueIds: [childIssueId],
+        unblockDescriptor: heldDescriptor,
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
   it("wakes the parent when all direct children become terminal", async () => {
     mockIssueService.getById.mockResolvedValue({
       id: "child-1",

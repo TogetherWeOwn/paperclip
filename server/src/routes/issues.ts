@@ -262,6 +262,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  holdsIssueAgainstAutoRelease,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -14975,6 +14976,7 @@ export function issueRoutes(
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
+          !holdsIssueAgainstAutoRelease(issue.unblockDescriptor) &&
           (existing.status !== "blocked" ||
             Array.isArray(req.body.blockedByIssueIds) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);
