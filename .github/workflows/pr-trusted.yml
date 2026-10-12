@@ -269,7 +269,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: master
-          path: ${{ runner.temp }}/trusted-ci
+          path: .trusted-ci
           sparse-checkout: .github/scripts
           persist-credentials: false
 
@@ -352,7 +352,7 @@ jobs:
       - name: Test general test group resolver
         run: node --test "$TRUSTED_CI/.github/scripts/tests/resolve-general-group.test.mjs"
         env:
-          TRUSTED_CI: ${{ runner.temp }}/trusted-ci
+          TRUSTED_CI: ${{ github.workspace }}/.trusted-ci
 
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs
@@ -603,7 +603,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: master
-          path: ${{ runner.temp }}/trusted-ci
+          path: .trusted-ci
           sparse-checkout: .github/scripts
           persist-credentials: false
 
@@ -613,7 +613,7 @@ jobs:
       - name: Resolve group against PR head
         id: group_support
         env:
-          TRUSTED_CI: ${{ runner.temp }}/trusted-ci
+          TRUSTED_CI: ${{ github.workspace }}/.trusted-ci
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           GROUP: ${{ matrix.group }}
         run: node "$TRUSTED_CI/.github/scripts/resolve-general-group.mjs" --base-ref "$BASE_REF" --group "$GROUP" --head-root .
