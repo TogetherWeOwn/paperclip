@@ -330,13 +330,15 @@ export function activityRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    // Stamp request provenance like persistActivity does: `details.audit` is
-    // reserved and a caller-supplied value is stripped, then the merged block
-    // is redacted before storage.
+    // Stamp request provenance from the request itself, not the body-claimed
+    // actor: actorType/actorId are caller-controlled, so gating the stamp on
+    // them would let a caller erase their own provenance by naming any other
+    // actor. `details.audit` is reserved and a caller-supplied value is
+    // stripped, then the merged block is redacted before storage.
     const event = await svc.create({
       companyId,
       ...req.body,
-      details: await redactActivityDetails(db, withRequestAuditDetails(req.body.details ?? null, { actorType: req.body.actorType, actorId: req.body.actorId })),
+      details: await redactActivityDetails(db, withRequestAuditDetails(req.body.details ?? null)),
     });
     res.status(201).json(event);
   });
