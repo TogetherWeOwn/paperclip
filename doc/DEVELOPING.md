@@ -23,6 +23,18 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+## Affected PR CI
+
+The reusable `changes` job (`ci-changes.yml`, scope `pr`) selects work with
+`scripts/ci-affected-work.mjs`. Documentation-only PRs skip the heavy lanes,
+but policy always runs. Manifest, lockfile, pnpm configuration, patches, and
+`.github` changes run all lanes. Non-PR invocations select full work.
+
+`ci-ok` requires successful classification, policy, the existing `verify` and
+`e2e` aggregates, serialized-server suites, and canary verification. Only an
+explicit unaffected decision admits skipped heavy lanes. Adding `ci-ok` does
+not change repository protection settings; that switch is a repo-admin step.
+
 ## Trusted PR Workflow
 
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.

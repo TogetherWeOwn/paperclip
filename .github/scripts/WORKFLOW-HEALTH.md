@@ -33,9 +33,14 @@ paths, `skills/`, `announcements/`, `.npmrc`, and `.pnpmfile.*`. An empty diff
 also runs them. The selector script `scripts/ci-affected-work.mjs` runs from the
 base commit, and the pull request head is fetched only as diff data. The
 workflow files that gate a pull request still come from its merge commit;
-pinning that gate to master belongs to the follow-up `pr-trusted` wiring.
+`pr.yml` pins the trusted workflow to master, so trusted-workflow wiring takes
+effect on PRs only after it merges.
 Master pushes and nightly schedules always run all scoped checks. Its single `ci-ok` job rejects scope errors, failed validation,
-and unexpected skips. Existing repository-required checks remain unchanged.
+and unexpected skips. The trusted PR workflow mirrors this with a `pr`-scoped
+`changes` job gating every heavy lane at job level and a single `ci-ok` check;
+`verify` and `e2e` stay as legacy aggregates underneath it. Switching
+repository protection to `ci-ok` is a repo-admin step tracked separately and
+does not happen in a workflow change. Existing repository-required checks remain unchanged.
 The other repaired workflows use the same scoped changes job; their explicit
 release/source selections run their full existing verification lanes.
 
