@@ -52,7 +52,13 @@ suites and the canary dry run execute in the same workflow but do not gate
 `verify`.
 
 Phase-1 quality gates (job `quality_gates`, existing runners only, no paid
-Actions minutes):
+Actions minutes). The lane runs on every full-CI pull request. The one
+exception is a pull request whose base commit has no `test:quality-gates`
+script in `package.json`, such as the `deploy/tog6` line. The `policy` job reads
+that script from the base commit, never from the pull request, so a pull
+request cannot switch the lane off. For such a base the lane is skipped, and
+`verify` accepts the skip only then. If the base commit cannot be read, `policy`
+fails and so does `verify`.
 
 - Biome full scan (`pnpm lint:biome`): WARN. Reports on all code. It stays
   report-only until existing code is clean.

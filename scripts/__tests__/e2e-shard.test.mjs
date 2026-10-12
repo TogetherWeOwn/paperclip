@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +51,75 @@ function readWorkflowJobs(workflow) {
   }
   for (const [id, lines] of jobs) jobs.set(id, lines.join("\n"));
   return jobs;
+}
+
+// Pull a step's `run: |` body out of the trusted workflow so the test executes
+// the exact script CI runs.
+function extractStepScript(stepName) {
+  const lines = readFileSync(trustedPrWorkflow, "utf8").split("\n");
+  const start = lines.findIndex((line) => line === `      - name: ${stepName}`);
+  assert.notEqual(start, -1, `trusted workflow must define the step "${stepName}"`);
+  const runAt = lines.findIndex((line, index) => index > start && line === "        run: |");
+  assert.notEqual(runAt, -1, `step "${stepName}" must have a multi-line run script`);
+  const body = [];
+  for (const line of lines.slice(runAt + 1)) {
+    if (line !== "" && !line.startsWith("          ")) break;
+    body.push(line.slice(10));
+  }
+  return body.join("\n");
+}
+
+const QUALITY_GATE_TOOLING_STEP = "Detect phase-1 quality-gate tooling on the base commit";
+
+function git(cwd, ...args) {
+  const result = spawnSync(
+    "git",
+    ["-c", "user.name=ci-test", "-c", "user.email=ci-test@example.invalid", "-c", "commit.gpgsign=false", ...args],
+    { cwd, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+// Commit each package.json body in order; returns the commit SHAs.
+function commitPackageJsons(repo, bodies) {
+  return bodies.map((body) => {
+    writeFileSync(path.join(repo, "package.json"), body);
+    git(repo, "add", "package.json");
+    git(repo, "commit", "-q", "-m", "package.json");
+    return git(repo, "rev-parse", "HEAD");
+  });
+}
+
+function runQualityGateToolingDetection(repo, baseSha) {
+  const output = path.join(repo, "..", `github-output-${path.basename(repo)}`);
+  writeFileSync(output, "");
+  const result = spawnSync("bash", ["-e", "-c", extractStepScript(QUALITY_GATE_TOOLING_STEP)], {
+    cwd: repo,
+    encoding: "utf8",
+    env: { ...process.env, BASE_SHA: baseSha, GITHUB_OUTPUT: output },
+  });
+  return { status: result.status, stderr: result.stderr, output: readFileSync(output, "utf8").trim() };
+}
+
+function runVerifyAggregate(overrides) {
+  const result = spawnSync("bash", ["-e", "-c", extractStepScript("Fail if any split verify lane failed")], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FULL_CI: "true",
+      POLICY_RESULT: "success",
+      TYPECHECK_RELEASE_REGISTRY_RESULT: "success",
+      GENERAL_TESTS_RESULT: "success",
+      RUNNER_VERIFICATION_RESULT: "success",
+      BUILD_RESULT: "success",
+      DOCKER_CONTEXT_INTEGRITY_RESULT: "success",
+      QUALITY_GATES_RESULT: "success",
+      QUALITY_GATE_TOOLING: "true",
+      ...overrides,
+    },
+  });
+  return result.status;
 }
 
 function runStackScope(stack, prBaseRef) {
@@ -225,7 +294,6 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     "verify_serialized_server",
     "canary_dry_run",
     "e2e_shards",
-    "quality_gates",
   ]) {
     assert.match(
       jobs.get(jobId),
@@ -233,6 +301,14 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
       `${jobId} must run only when the gate selects full CI`,
     );
   }
+
+  // The quality-gates lane also requires the base commit to carry the phase-1
+  // tooling. The decision comes from the policy job's base-commit detection.
+  assert.match(
+    jobs.get("quality_gates"),
+    /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
+    "quality_gates must run when full CI is selected and the base commit has the phase-1 tooling",
+  );
 
   assert.doesNotMatch(
     jobs.get("policy"),
@@ -266,11 +342,121 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(verify, /QUALITY_GATES_RESULT: \$\{\{ needs\.quality_gates\.result \}\}/);
   assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "success"/);
   assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "skipped"/);
+  assert.match(verify, /QUALITY_GATE_TOOLING: \$\{\{ needs\.policy\.outputs\.quality_gate_tooling \}\}/);
 
   const e2e = jobs.get("e2e");
   assert.match(e2e, /^ {4}needs: \[gate, policy, e2e_shards\]$/m);
   assert.match(e2e, /POLICY_RESULT: \$\{\{ needs\.policy\.result \}\}/);
   assert.match(e2e, /false\) test "\$E2E_SHARDS_RESULT" = "skipped"/);
+});
+
+test("master carries the phase-1 quality-gate tooling its own gate depends on", () => {
+  // The lane is skipped on base lines whose package.json lacks this script. If
+  // master lost it, every later PR would skip the gate without a failing check.
+  const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  assert.equal(typeof pkg.scripts["test:quality-gates"], "string");
+  assert.ok(existsSync(path.join(repoRoot, "scripts", "quality-gates")));
+});
+
+test("the quality-gates lane is skipped only for a base commit without the tooling", () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), "paperclip-quality-gate-tooling-"));
+  try {
+    const repo = path.join(scratch, "repo");
+    mkdirSync(repo);
+    git(repo, "init", "-q", "-b", "main");
+    const withScript = JSON.stringify({ scripts: { "test:quality-gates": "node --test" } });
+    const withoutScript = JSON.stringify({ scripts: { test: "vitest" } });
+    const [baseWith, headWithout] = commitPackageJsons(repo, [withScript, withoutScript]);
+
+    // A PR that deletes the tooling is still judged by its base, which has it.
+    assert.deepEqual(runQualityGateToolingDetection(repo, baseWith), {
+      status: 0,
+      stderr: "",
+      output: "available=true",
+    });
+
+    // A base line that predates the tooling skips the lane, even when the PR
+    // head adds the script back.
+    commitPackageJsons(repo, [withScript]);
+    const detection = runQualityGateToolingDetection(repo, headWithout);
+    assert.equal(detection.status, 0, detection.stderr);
+    assert.equal(detection.output, "available=false");
+
+    const [noScripts] = commitPackageJsons(repo, [JSON.stringify({ name: "no-scripts" })]);
+    assert.equal(runQualityGateToolingDetection(repo, noScripts).output, "available=false");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("quality-gate tooling detection fails closed on any doubt", () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), "paperclip-quality-gate-tooling-"));
+  try {
+    const repo = path.join(scratch, "repo");
+    mkdirSync(repo);
+    git(repo, "init", "-q", "-b", "main");
+    const [broken] = commitPackageJsons(repo, ["{ not json"]);
+    git(repo, "rm", "-q", "package.json");
+    git(repo, "commit", "-q", "-m", "drop package.json");
+    const noPackageJson = git(repo, "rev-parse", "HEAD");
+
+    for (const [label, baseSha] of [
+      ["unreadable package.json", broken],
+      ["package.json absent at the base commit", noPackageJson],
+      ["malformed SHA", "not-a-sha"],
+      ["unknown SHA", "0".repeat(40)],
+    ]) {
+      const detection = runQualityGateToolingDetection(repo, baseSha);
+      assert.notEqual(detection.status, 0, `${label} must fail the policy job`);
+      assert.equal(detection.output, "", `${label} must not publish a tooling decision`);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("verify accepts a skipped quality-gates lane only when the base has no tooling", () => {
+  // Tooling present: the lane must have run and passed.
+  assert.equal(runVerifyAggregate({}), 0);
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATES_RESULT: "failure" }), 0);
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATES_RESULT: "cancelled" }), 0);
+  assert.notEqual(
+    runVerifyAggregate({ QUALITY_GATES_RESULT: "skipped" }),
+    0,
+    "a skipped lane must not satisfy verify on a base that has the tooling",
+  );
+
+  // No tooling on the base: the lane is skipped, and anything else is wrong.
+  assert.equal(runVerifyAggregate({ QUALITY_GATE_TOOLING: "false", QUALITY_GATES_RESULT: "skipped" }), 0);
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATE_TOOLING: "false", QUALITY_GATES_RESULT: "success" }), 0);
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATE_TOOLING: "false", QUALITY_GATES_RESULT: "failure" }), 0);
+
+  // No decision (detection did not publish one): fail rather than guess.
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATE_TOOLING: "", QUALITY_GATES_RESULT: "skipped" }), 0);
+  assert.notEqual(runVerifyAggregate({ QUALITY_GATE_TOOLING: "", QUALITY_GATES_RESULT: "success" }), 0);
+
+  // The skip never relaxes any other lane.
+  assert.notEqual(
+    runVerifyAggregate({ QUALITY_GATE_TOOLING: "false", QUALITY_GATES_RESULT: "skipped", BUILD_RESULT: "failure" }),
+    0,
+  );
+  assert.notEqual(
+    runVerifyAggregate({ QUALITY_GATE_TOOLING: "false", QUALITY_GATES_RESULT: "skipped", POLICY_RESULT: "failure" }),
+    0,
+  );
+
+  // Stacked middle layers still skip every lane, whatever the tooling decision.
+  const middleLayer = {
+    FULL_CI: "false",
+    TYPECHECK_RELEASE_REGISTRY_RESULT: "skipped",
+    GENERAL_TESTS_RESULT: "skipped",
+    RUNNER_VERIFICATION_RESULT: "skipped",
+    BUILD_RESULT: "skipped",
+    DOCKER_CONTEXT_INTEGRITY_RESULT: "skipped",
+    QUALITY_GATES_RESULT: "skipped",
+  };
+  assert.equal(runVerifyAggregate(middleLayer), 0);
+  assert.notEqual(runVerifyAggregate({ ...middleLayer, QUALITY_GATES_RESULT: "success" }), 0);
 });
 
 test("the stacked PR scope selector runs full CI only where intended", () => {
