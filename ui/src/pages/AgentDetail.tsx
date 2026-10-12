@@ -3547,11 +3547,6 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}
               </div>
             )}
-            {retryRun.isError && (
-              <div className="text-xs text-destructive">
-                {retryRun.error instanceof Error ? retryRun.error.message : "Failed to retry run"}
-              </div>
-            )}
             {startTime && (
               <div className="space-y-0.5">
                 <div className="text-sm font-mono">
