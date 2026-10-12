@@ -1,8 +1,8 @@
-import { readFile } from 'node:fs/promises';
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
 
-const WORKFLOW = '.github/workflows/pr-trusted.yml';
+const WORKFLOW = ".github/workflows/pr-trusted.yml";
 
 // actions/checkout resolves `path` against GITHUB_WORKSPACE and rejects any
 // location outside it, so every checkout path must stay workspace-relative.
@@ -10,7 +10,7 @@ const WORKFLOW = '.github/workflows/pr-trusted.yml';
 // `${{ runner.temp }}/trusted-ci` (a sibling of the workspace), which would
 // have failed the policy job and every General tests entry on every PR.
 function checkoutPaths(workflowText) {
-  const lines = workflowText.split('\n');
+  const lines = workflowText.split("\n");
   const paths = [];
   for (let i = 0; i < lines.length; i++) {
     if (!/uses:\s*actions\/checkout@/.test(lines[i])) continue;
@@ -29,8 +29,8 @@ function checkoutPaths(workflowText) {
   return paths;
 }
 
-test('actions/checkout paths in pr-trusted.yml are workspace-relative', async () => {
-  const contents = await readFile(WORKFLOW, 'utf8');
+test("actions/checkout paths in pr-trusted.yml are workspace-relative", async () => {
+  const contents = await readFile(WORKFLOW, "utf8");
   const paths = checkoutPaths(contents);
 
   assert.ok(
