@@ -19,6 +19,7 @@ vi.setConfig({ testTimeout: 30000 });
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
 const mockIssueService = vi.hoisted(() => ({
+  addStopRelayCommentIfNeeded: vi.fn(async () => null),
   getAncestors: vi.fn(),
   getById: vi.fn(),
   getByIdForUpdate: vi.fn(),
@@ -181,6 +182,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.addStopRelayCommentIfNeeded.mockResolvedValue(null);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -314,6 +316,59 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  it("does not restore a blocked issue held by a denial descriptor when its blocker resolves", async () => {
+    const parentIssueId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const childIssueId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const heldDescriptor = {
+      owner: "board" as const,
+      action: "Reassess the denial after the retention scope is supplied.",
+      kind: "denial" as const,
+    };
+    const heldIssue = {
+      id: parentIssueId,
+      companyId: "company-1",
+      identifier: "PAP-201",
+      title: "Held by security denial",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-2",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+      unblockDescriptor: heldDescriptor,
+    };
+    mockIssueService.getById.mockResolvedValue(heldIssue);
+    mockIssueService.update.mockResolvedValue(heldIssue);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: parentIssueId,
+      blockerIssueIds: [childIssueId],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${parentIssueId}`)
+      .send({
+        status: "blocked",
+        blockedByIssueIds: [childIssueId],
+        unblockDescriptor: heldDescriptor,
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
   });
 
   it("wakes the parent when all direct children become terminal", async () => {
@@ -680,5 +735,97 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(res.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake a denial-held blocked parent after a low-trust child stop relay", async () => {
+    const childId = "44444444-4444-4444-8444-444444444444";
+    const parentId = "55555555-5555-4555-8555-555555555555";
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: childId,
+      identifier: "PAP-300",
+      title: "Low-trust child",
+      status: "in_progress",
+      parentId,
+      assigneeAgentId: null,
+      executionPolicy: { trustPreset: "low_trust_review" },
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: childId,
+      identifier: "PAP-300",
+      title: "Low-trust child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: null,
+      executionPolicy: { trustPreset: "low_trust_review" },
+    }));
+    mockIssueService.addStopRelayCommentIfNeeded.mockResolvedValue({
+      comment: { id: "comment-relay-held" },
+      parent: {
+        id: parentId,
+        companyId: "company-1",
+        assigneeAgentId: "agent-parent",
+        status: "blocked",
+        unblockDescriptor: {
+          owner: "board",
+          action: "Reassess the denial.",
+          kind: "denial",
+        },
+      },
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${childId}`)
+      .send({ status: "cancelled" });
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addStopRelayCommentIfNeeded).toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-parent",
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
+  });
+
+  it("still wakes an unheld blocked parent after a low-trust child stop relay", async () => {
+    const childId = "66666666-6666-4666-8666-666666666666";
+    const parentId = "77777777-7777-4777-8777-777777777777";
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: childId,
+      identifier: "PAP-301",
+      title: "Low-trust child",
+      status: "in_progress",
+      parentId,
+      assigneeAgentId: null,
+      executionPolicy: { trustPreset: "low_trust_review" },
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: childId,
+      identifier: "PAP-301",
+      title: "Low-trust child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: null,
+      executionPolicy: { trustPreset: "low_trust_review" },
+    }));
+    mockIssueService.addStopRelayCommentIfNeeded.mockResolvedValue({
+      comment: { id: "comment-relay-open" },
+      parent: {
+        id: parentId,
+        companyId: "company-1",
+        assigneeAgentId: "agent-parent",
+        status: "blocked",
+        unblockDescriptor: null,
+      },
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${childId}`)
+      .send({ status: "cancelled" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-parent",
+        expect.objectContaining({ reason: "issue_commented" }),
+      );
+    });
   });
 });

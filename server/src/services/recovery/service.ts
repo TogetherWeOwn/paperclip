@@ -110,6 +110,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  holdsIssueAgainstAutoRelease,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
@@ -5537,6 +5538,7 @@ export function recoveryService(
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
+      holdSkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
@@ -5578,6 +5580,7 @@ export function recoveryService(
             identifier: issues.identifier,
             assigneeAgentId: issues.assigneeAgentId,
             blockedTransitionAt: issues.blockedTransitionAt,
+            unblockDescriptor: issues.unblockDescriptor,
             totalCount: sql<number>`count(*) over()::int`,
           })
           .from(issueRelations)
@@ -5594,6 +5597,7 @@ export function recoveryService(
           identifier: issues.identifier,
           assigneeAgentId: issues.assigneeAgentId,
           blockedTransitionAt: issues.blockedTransitionAt,
+          unblockDescriptor: issues.unblockDescriptor,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -5665,6 +5669,10 @@ export function recoveryService(
       for (const candidate of companyCandidates) {
         const agentId = candidate.assigneeAgentId;
         if (!agentId) continue;
+        if (holdsIssueAgainstAutoRelease(candidate.unblockDescriptor, "blocked")) {
+          result.holdSkipped += 1;
+          continue;
+        }
 
         const readiness = readinessMap.get(candidate.id);
         const resolvedBlockerIssueId = readiness?.blockerIssueIds[0] ?? null;
