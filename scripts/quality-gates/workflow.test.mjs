@@ -121,7 +121,10 @@ function runVerify(overrides = {}) {
 }
 
 test("policy decides gate availability from base commit and fails closed", () => {
-  assert.match(policy, /^ {4}outputs:\n {6}quality_gate_tooling:/m);
+  assert.match(
+    policy,
+    /^ {4}outputs:\n {6}quality_gate_tooling: \$\{\{ steps\.quality_gate_tooling\.outputs\.available \}\}$/m,
+  );
   assert.match(policy, /id: quality_gate_tooling/);
   assert.match(
     policy,

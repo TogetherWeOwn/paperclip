@@ -96,7 +96,8 @@ example, the pre-gates `deploy/tog6` line). Detection errors fail policy closed,
 and `verify` accepts the lane's skipped result only when that explicit base
 commit decision is false. A pull request cannot skip the lane by removing gate
 tooling from its own head. `scripts/quality-gates/workflow.test.mjs` pins this
-base-commit decision and the aggregate result handling.
+base-commit decision wiring (policy `outputs.quality_gate_tooling` value,
+detect step id, lane `if`, and verify env) and the aggregate result handling.
 
 ## Start Dev
 
