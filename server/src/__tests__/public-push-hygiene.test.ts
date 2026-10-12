@@ -360,6 +360,18 @@ describe("public push hygiene gate", () => {
     expect(workflow).toContain("refs/remotes/upstream/master");
     // Pushes to either fork public line are out of scope (master already was).
     expect(workflow).toContain("deploy/tog6");
+    // The fork's active cut/release/tog lines are public lines too, so pushes
+    // to them and branches cut from them do not scan already-public history.
+    for (const line of [
+      "cut/tog.5-13142",
+      "release/v2026.1001.0",
+      "release/v2026.1001.0-tog.4",
+      "release/tog.2-epipe",
+      "release/tog.5-build-preparation",
+      "tog/v2026.916.1-e2big-14092",
+    ]) {
+      expect(workflow).toContain(line);
+    }
     // The workflow comment explains why event.before is ignored; only an
     // actual `${{ ... }}` interpolation would wire the dangling delta back in.
     expect(workflow).not.toMatch(/\$\{\{\s*github\.event\.before/);
@@ -417,11 +429,22 @@ function commitFixtureFile(
 
 // master at the base commit; the deploy line carries an already-public dirty
 // commit on top of it; upstream/master tracks the same base (clean) unless a
-// test moves it. HEAD is left at the deploy tip.
+// test moves it. The active fork cut/release/tog public lines track the base
+// (clean) unless a test moves one of them. HEAD is left at the deploy tip.
 function publicLayout(git: (...args: string[]) => string, root: string) {
   const master = commitFixtureFile(git, root, "base.txt", "fixture base");
   git("update-ref", "refs/remotes/origin/master", master);
   git("update-ref", "refs/remotes/upstream/master", master);
+  for (const ref of [
+    "refs/remotes/origin/cut/tog.5-13142",
+    "refs/remotes/origin/release/v2026.1001.0",
+    "refs/remotes/origin/release/v2026.1001.0-tog.4",
+    "refs/remotes/origin/release/tog.2-epipe",
+    "refs/remotes/origin/release/tog.5-build-preparation",
+    "refs/remotes/origin/tog/v2026.916.1-e2big-14092",
+  ]) {
+    git("update-ref", ref, master);
+  }
   const legacy = commitFixtureFile(
     git,
     root,
@@ -637,6 +660,16 @@ describe("public push hygiene scope on non-master lines", () => {
       );
       git("update-ref", "refs/remotes/upstream/master", upstreamDirty);
       git("update-ref", "refs/remotes/origin/deploy/tog6", master);
+      for (const ref of [
+        "refs/remotes/origin/cut/tog.5-13142",
+        "refs/remotes/origin/release/v2026.1001.0",
+        "refs/remotes/origin/release/v2026.1001.0-tog.4",
+        "refs/remotes/origin/release/tog.2-epipe",
+        "refs/remotes/origin/release/tog.5-build-preparation",
+        "refs/remotes/origin/tog/v2026.916.1-e2big-14092",
+      ]) {
+        git("update-ref", ref, master);
+      }
       commitFixtureFile(git, root, "port.txt", "clean upstream-cut follow-up");
       const selfRef = "refs/remotes/origin/fix/upstream-cut";
       git("update-ref", selfRef, "HEAD");
@@ -667,6 +700,16 @@ describe("public push hygiene scope on non-master lines", () => {
       );
       git("update-ref", "refs/remotes/upstream/master", upstreamDirty);
       git("update-ref", "refs/remotes/origin/deploy/tog6", master);
+      for (const ref of [
+        "refs/remotes/origin/cut/tog.5-13142",
+        "refs/remotes/origin/release/v2026.1001.0",
+        "refs/remotes/origin/release/v2026.1001.0-tog.4",
+        "refs/remotes/origin/release/tog.2-epipe",
+        "refs/remotes/origin/release/tog.5-build-preparation",
+        "refs/remotes/origin/tog/v2026.916.1-e2big-14092",
+      ]) {
+        git("update-ref", ref, master);
+      }
       const dirty = commitFixtureFile(
         git,
         root,
@@ -867,6 +910,16 @@ describe("public push hygiene scope on non-master lines", () => {
       git("update-ref", "refs/remotes/origin/master", base);
       git("update-ref", "refs/remotes/origin/deploy/tog6", base);
       git("update-ref", "refs/remotes/upstream/master", base);
+      for (const ref of [
+        "refs/remotes/origin/cut/tog.5-13142",
+        "refs/remotes/origin/release/v2026.1001.0",
+        "refs/remotes/origin/release/v2026.1001.0-tog.4",
+        "refs/remotes/origin/release/tog.2-epipe",
+        "refs/remotes/origin/release/tog.5-build-preparation",
+        "refs/remotes/origin/tog/v2026.916.1-e2big-14092",
+      ]) {
+        git("update-ref", ref, base);
+      }
       git("checkout", "-q", "--detach", base);
       commitFixtureFile(git, root, "shared.txt", "master edit", "two\n");
       const masterTip = git("rev-parse", "HEAD");
@@ -993,6 +1046,108 @@ describe("public push hygiene scope on non-master lines", () => {
       expect(error).toHaveBeenCalledWith(
         expect.stringContaining(`references: ${DIRTY_ID}`),
       );
+    });
+  });
+
+  it("treats cut-line history as public: clean commit on a cut-child branch exits 0", () => {
+    withFixtureRepo((git, root) => {
+      const { master } = publicLayout(git, root);
+      git("checkout", "-q", "--detach", master);
+      const cutDirty = commitFixtureFile(
+        git,
+        root,
+        "cut.md",
+        `cut already-public Refs ${DIRTY_ID}`,
+      );
+      git("update-ref", "refs/remotes/origin/cut/tog.5-13142", cutDirty);
+      commitFixtureFile(git, root, "port.txt", "clean cut-child follow-up");
+      const selfRef = "refs/remotes/origin/feat/cut-child";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("flags only the branch's own dirty commit on top of cut-line history", () => {
+    withFixtureRepo((git, root) => {
+      const { master, legacy } = publicLayout(git, root);
+      git("checkout", "-q", "--detach", master);
+      const cutDirty = commitFixtureFile(
+        git,
+        root,
+        "cut.md",
+        `cut already-public Refs ${DIRTY_ID}`,
+      );
+      git("update-ref", "refs/remotes/origin/cut/tog.5-13142", cutDirty);
+      commitFixtureFile(git, root, "port.txt", "clean cut-child follow-up");
+      const dirty = commitFixtureFile(
+        git,
+        root,
+        "dirty.md",
+        `new dirty follow-up Refs ${DIRTY_ID}`,
+      );
+      const selfRef = "refs/remotes/origin/feat/cut-child";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(1);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `commit ${dirty.slice(0, 12)} message references`,
+        ),
+      );
+      expect(error).not.toHaveBeenCalledWith(
+        expect.stringContaining(cutDirty.slice(0, 12)),
+      );
+      expect(error).not.toHaveBeenCalledWith(
+        expect.stringContaining(legacy.slice(0, 12)),
+      );
+    });
+  });
+
+  it("does not flag history on a push to a cut line itself (workflow ignores those pushes)", () => {
+    withFixtureRepo((git, root) => {
+      const { master } = publicLayout(git, root);
+      git("checkout", "-q", "--detach", master);
+      const cutDirty = commitFixtureFile(
+        git,
+        root,
+        "cut.md",
+        `cut already-public Refs ${DIRTY_ID}`,
+      );
+      git("update-ref", "refs/remotes/origin/cut/tog.5-13142", cutDirty);
+      git("checkout", "-q", "--detach", cutDirty);
+      const selfRef = "refs/remotes/origin/cut/tog.5-13142";
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
     });
   });
 });

@@ -5,16 +5,20 @@ run-name: Public push hygiene ${{ github.sha }}
 # PR workflows never see branch-only pushes, so this runs on every branch push
 # and scans the new publication population: commit messages plus added lines
 # of commits reachable from the pushed head but from no public line (origin
-# master, origin deploy/tog6, upstream paperclipai/paperclip master). Feature
-# branches are never public lines, so a flagged commit stays flagged on every
-# branch that carries it. History is never rewritten. Pushes to master and
-# deploy/tog6 are ignored like master: each merge there would otherwise flag
-# the line's whole already-public divergence with no recourse, and merges land
-# reviewed. Direct pushes to master stay disabled by branch protection;
-# making this check required is a repo-admin step owned by the Operator route.
+# master, origin deploy/tog6, the active fork cut/release/tog lines, upstream
+# paperclipai/paperclip master). Feature branches are never public lines, so
+# a flagged commit stays flagged on every branch that carries it. History is
+# never rewritten. Pushes to a public line itself are ignored like master:
+# each merge there would otherwise flag the line's whole already-public
+# divergence with no recourse, and merges land reviewed. Direct pushes to
+# master stay disabled by branch protection; making this check required is a
+# repo-admin step owned by the Operator route.
 on:
   push:
-    branches-ignore: [master, deploy/tog6]
+    branches-ignore:
+      [master, deploy/tog6, cut/tog.5-13142, release/v2026.1001.0,
+        release/v2026.1001.0-tog.4, release/tog.2-epipe,
+        release/tog.5-build-preparation, tog/v2026.916.1-e2big-14092]
 
 permissions: {}
 
@@ -49,7 +53,8 @@ jobs:
           PUSH_SELF_REF: refs/remotes/origin/${{ github.ref_name }}
         run: |
           # The scanner excludes only public lines (origin master, deploy/tog6,
-          # upstream master), minus this branch's own ref. A clean follow-up
+          # the active cut/release/tog lines, upstream master), minus this
+          # branch's own ref. A clean follow-up
           # push cannot hide an earlier dirty commit, and merging a public line
           # flags no line-owned commits. github.event.before dangles after
           # amend/force-push, so it is not used.
