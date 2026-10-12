@@ -10,6 +10,7 @@ import {
   applyRunModelDecisionToAdapterConfig,
   evaluateRunModelDecisionSkip,
   isRepeatModelDecisionDeferral,
+  isRunModelDecisionBackoffExhausted,
   isRunModelDecisionDeferral,
   isSecretEnvBinding,
   modelDecisionCardRevision,
@@ -549,5 +550,10 @@ describe("run model decision helpers", () => {
     expect(isRunModelDecisionDeferral(deferral)).toBe(true);
     expect(isRunModelDecisionDeferral(new Error("x"))).toBe(false);
     expect(deferral).toMatchObject({ code: "model_decision_pending", retryAfterMs: 30_000, record });
+  });
+
+  it("reports the backoff exhausted only once the grown delay reaches its ceiling", () => {
+    expect(isRunModelDecisionBackoffExhausted(8)).toBe(false);
+    expect(isRunModelDecisionBackoffExhausted(9)).toBe(true);
   });
 });

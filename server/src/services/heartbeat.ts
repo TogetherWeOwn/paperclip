@@ -631,6 +631,7 @@ import {
   RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
   isRepeatModelDecisionDeferral,
+  isRunModelDecisionBackoffExhausted,
   isRunModelDecisionDeferral,
   modelDecisionCardRevision,
   parseModelDecisionDeferralFingerprint,
@@ -7502,7 +7503,7 @@ export function mergeCoalescedContextSnapshot(
   ) {
     clearInteractionContinuationWakeContext(merged);
   }
-  return merged;
+  return capWakeContextSnapshotBytes(merged).snapshot;
 }
 
 // This is a prompt optimization, not an authorization grant. Verify the durable
@@ -16215,11 +16216,10 @@ export function heartbeatService(
         }
 
         if (retryReason === RUN_MODEL_DECISION_RETRY_REASON && issueId) {
-          // Cool the model-decision hot loop. Retries keep demand
-          // hot while headroom is zero, so drop (don't requeue) when the
-          // card state hasn't changed since the last attempt, and cap
-          // requeues per card per day. Human/board wakes keep working: this
-          // only stops automatic requeues.
+          // The backoff ladder runs first. Once it reaches its ceiling, drop
+          // (don't requeue) a retry whose card state hasn't changed since the
+          // last attempt, and cap requeues per card per day. Human/board wakes
+          // keep working: this only stops automatic requeues.
           const [lockedIssue] = await tx
             .select({
               status: issues.status,
@@ -16259,14 +16259,15 @@ export function heartbeatService(
           );
           if (
             lockedIssue &&
-            isRepeatModelDecisionDeferral(previousFingerprint, currentFingerprint)
+            isRepeatModelDecisionDeferral(previousFingerprint, currentFingerprint) &&
+            isRunModelDecisionBackoffExhausted(consumedAttempts)
           ) {
             return {
               outcome: "not_scheduled",
               issueId,
               errorCode: "model_decision_retry_issue_unchanged",
               reason:
-                "Model-decision retry dropped because the card state has not changed since the last attempt",
+                "Model-decision retry dropped because the card state has not changed since the last attempt and the backoff reached its ceiling",
               details: { issueId, retryReason, fingerprint: currentFingerprint },
             };
           }

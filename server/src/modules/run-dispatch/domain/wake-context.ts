@@ -137,12 +137,13 @@ function wakeContextSnapshotBytes(value: Record<string, unknown>): number {
 
 /**
  * Caps an enriched wake context snapshot to `maxBytes` serialized bytes.
- * Order of sacrifice: the `debug` object first, then the oldest wake comment
- * ids (the oldest kept id remains the fetchable thread pointer and the drop
- * count is recorded), then the largest unprotected string values. Queued
- * comment ids and every protected routing key are never touched: dropping
- * pending input would silently lose work, and rewriting an id or reason
- * would change what the run does.
+ * The `debug` object goes first. Unprotected strings then shrink, if that
+ * alone reaches the budget. Oldest wake comment ids drop only when dropping
+ * them (with strings shrunk to fit) reaches the budget, because an id drop
+ * that cannot reach it loses thread pointers for no byte gain. Queued comment
+ * ids and every protected routing key are never touched: dropping pending
+ * input would silently lose work, and rewriting an id or reason would change
+ * what the run does.
  */
 export function capWakeContextSnapshotBytes(
   input: Record<string, unknown>,
@@ -152,23 +153,51 @@ export function capWakeContextSnapshotBytes(
   if (originalBytes <= maxBytes) {
     return { snapshot: input, truncated: false, droppedWakeCommentIds: 0, bytes: originalBytes };
   }
-  const snapshot: Record<string, unknown> = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
-  let droppedWakeCommentIds = 0;
-
-  if (snapshot.debug !== undefined) {
-    delete snapshot.debug;
+  const base: Record<string, unknown> = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
+  delete base.debug;
+  // Queryable marker, set before measuring so it counts against the budget.
+  base.snapshotTruncated = true;
+  if (wakeContextSnapshotBytes(base) <= maxBytes) {
+    return finishWakeContextCap(base, 0);
   }
 
-  const ids = extractWakeCommentIds(snapshot);
-  if (ids.length > WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS) {
-    const kept = ids.slice(-WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
-    droppedWakeCommentIds = ids.length - kept.length;
-    snapshot[WAKE_COMMENT_IDS_KEY] = kept;
-    snapshot.wakeCommentIdsDroppedFromFront = droppedWakeCommentIds;
+  const ids = extractWakeCommentIds(base);
+  const dropCount = Math.max(0, ids.length - WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+  const shrunkKeepingIds = shrinkUnprotectedStrings({ ...base }, maxBytes);
+  if (dropCount === 0 || wakeContextSnapshotBytes(shrunkKeepingIds) <= maxBytes) {
+    return finishWakeContextCap(shrunkKeepingIds, 0);
   }
-  // Queryable marker (set before the shrink loop so it stays inside budget).
-  snapshot.snapshotTruncated = true;
 
+  const shrunkWithTrimmedIds = shrinkUnprotectedStrings(
+    withTrimmedWakeCommentIds(base, ids, dropCount),
+    maxBytes,
+  );
+  if (wakeContextSnapshotBytes(shrunkWithTrimmedIds) <= maxBytes) {
+    return finishWakeContextCap(shrunkWithTrimmedIds, dropCount);
+  }
+  return finishWakeContextCap(shrunkKeepingIds, 0);
+}
+
+function withTrimmedWakeCommentIds(
+  snapshot: Record<string, unknown>,
+  ids: string[],
+  dropped: number,
+): Record<string, unknown> {
+  const priorDropped =
+    typeof snapshot.wakeCommentIdsDroppedFromFront === "number"
+      ? snapshot.wakeCommentIdsDroppedFromFront
+      : 0;
+  return {
+    ...snapshot,
+    [WAKE_COMMENT_IDS_KEY]: ids.slice(-WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS),
+    wakeCommentIdsDroppedFromFront: priorDropped + dropped,
+  };
+}
+
+function shrinkUnprotectedStrings(
+  snapshot: Record<string, unknown>,
+  maxBytes: number,
+): Record<string, unknown> {
   let bytes = wakeContextSnapshotBytes(snapshot);
   while (bytes > maxBytes) {
     let largestKey: string | null = null;
@@ -193,8 +222,19 @@ export function capWakeContextSnapshotBytes(
     if (nextBytes >= bytes) break;
     bytes = nextBytes;
   }
+  return snapshot;
+}
 
-  return { snapshot, truncated: true, droppedWakeCommentIds, bytes };
+function finishWakeContextCap(
+  snapshot: Record<string, unknown>,
+  droppedWakeCommentIds: number,
+): CappedWakeContextSnapshot {
+  return {
+    snapshot,
+    truncated: true,
+    droppedWakeCommentIds,
+    bytes: wakeContextSnapshotBytes(snapshot),
+  };
 }
 
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {

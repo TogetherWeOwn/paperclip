@@ -351,6 +351,10 @@ export function resolveRunModelDecisionRetryDelayMs(
   return Math.max(grown, hint);
 }
 
+export function isRunModelDecisionBackoffExhausted(consumedAttempts: number): boolean {
+  return resolveRunModelDecisionRetryDelayMs(consumedAttempts) >= RUN_MODEL_DECISION_BACKOFF_MAX_MS;
+}
+
 export function resolveRunModelDecisionNoDecision(input: {
   consumedAttempts: number;
   maxAttempts?: number;

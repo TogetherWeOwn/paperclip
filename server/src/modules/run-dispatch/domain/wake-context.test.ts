@@ -109,21 +109,20 @@ describe("capWakeContextSnapshotBytes", () => {
     expect(result.droppedWakeCommentIds).toBe(0);
   });
 
-  it("trims the oldest wake comment ids first and keeps a thread pointer", () => {
-    const ids = Array.from({ length: 30 }, (_, i) => `comment-${i}`);
-    const padding = "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  it("trims the oldest wake comment ids when the ids are the overage and keeps a thread pointer", () => {
+    const ids = Array.from({ length: 1000 }, (_, i) => `comment-${String(i).padStart(4, "0")}-${"0".repeat(32)}`);
     const result = capWakeContextSnapshotBytes({
       issueId: "issue-1",
       taskId: "issue-1",
       taskKey: "task-key-1",
       wakeReason: "issue_commented",
       wakeCommentIds: ids,
-      note: padding,
     });
     const kept = result.snapshot.wakeCommentIds as string[];
-    expect(kept.length).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
-    expect(kept.at(-1)).toBe("comment-29");
-    expect(result.droppedWakeCommentIds).toBeGreaterThan(0);
+    expect(kept).toHaveLength(WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+    expect(kept.at(-1)).toBe(ids.at(-1));
+    expect(result.droppedWakeCommentIds).toBe(ids.length - WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+    expect(result.snapshot.wakeCommentIdsDroppedFromFront).toBe(result.droppedWakeCommentIds);
     expect(result.snapshot.issueId).toBe("issue-1");
     expect(result.snapshot.taskKey).toBe("task-key-1");
     expect(result.snapshot.wakeReason).toBe("issue_commented");
@@ -131,6 +130,64 @@ describe("capWakeContextSnapshotBytes", () => {
     expect(
       Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
     ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("keeps every wake comment id when shrinking one string alone reaches the budget", () => {
+    const ids = Array.from({ length: 30 }, (_, i) => `comment-${i}`);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ids,
+      note: "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES),
+    });
+    expect(result.snapshot.wakeCommentIds).toEqual(ids);
+    expect(result.droppedWakeCommentIds).toBe(0);
+    expect(result.truncated).toBe(true);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("keeps every wake comment id when removing debug alone reaches the budget", () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `comment-${i}-${"0".repeat(32)}`);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ids,
+      debug: { providerTrace: "raw", blob: "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES) },
+    });
+    expect(result.snapshot.debug).toBeUndefined();
+    expect(result.snapshot.wakeCommentIds).toEqual(ids);
+    expect(result.droppedWakeCommentIds).toBe(0);
+  });
+
+  it("keeps every wake comment id when a non-string field is the overage", () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `comment-${i}-${"0".repeat(32)}`);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ids,
+      checkboxSelection: { items: { payload: "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES * 2) } },
+    });
+    expect(result.snapshot.wakeCommentIds).toEqual(ids);
+    expect(result.droppedWakeCommentIds).toBe(0);
+  });
+
+  it("accumulates the dropped id count across repeated caps", () => {
+    const first = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeCommentIds: Array.from({ length: 1000 }, (_, i) => `first-${i}-${"0".repeat(32)}`),
+    });
+    const second = capWakeContextSnapshotBytes({
+      ...first.snapshot,
+      wakeCommentIds: [
+        ...(first.snapshot.wakeCommentIds as string[]),
+        ...Array.from({ length: 1000 }, (_, i) => `second-${i}-${"0".repeat(32)}`),
+      ],
+    });
+    expect(second.snapshot.wakeCommentIdsDroppedFromFront).toBe(
+      first.droppedWakeCommentIds + second.droppedWakeCommentIds,
+    );
   });
 
   it("drops debug payload before touching routing input", () => {

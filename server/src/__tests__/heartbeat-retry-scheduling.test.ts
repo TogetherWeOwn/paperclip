@@ -754,7 +754,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   }
 
-  it("drops a model-decision retry when the card has not changed since the last attempt", async () => {
+  it("drops a model-decision retry at the backoff ceiling when the card has not changed since the last attempt", async () => {
     const f = await seedModelDecisionFixture();
     const currentFingerprint = {
       reason: "no account has headroom",
@@ -765,6 +765,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db
       .update(heartbeatRuns)
       .set({
+        scheduledRetryReason: "model_decision_pending",
+        scheduledRetryAttempt: 9,
         contextSnapshot: {
           issueId: f.issueId,
           wakeReason: "issue_assigned",
@@ -774,7 +776,14 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       })
       .where(eq(heartbeatRuns.id, f.runId));
 
-    const result = await scheduleModelDecisionRetry(f);
+    const result = await heartbeat.scheduleBoundedRetry(f.runId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_800_000,
+    });
 
     expect(result).toMatchObject({
       outcome: "not_scheduled",
@@ -792,10 +801,21 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(retries).toHaveLength(0);
   });
 
-  it("drops the next model-decision retry after the successor claims the unchanged card", async () => {
+  it("drops the next model-decision retry after the successor claims the unchanged card at the backoff ceiling", async () => {
     const f = await seedModelDecisionFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryReason: "model_decision_pending", scheduledRetryAttempt: 8 })
+      .where(eq(heartbeatRuns.id, f.runId));
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
-    const first = await scheduleModelDecisionRetry(f);
+    const first = await heartbeat.scheduleBoundedRetry(f.runId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_280_000,
+    });
     expect(first.outcome).toBe("scheduled");
     if (first.outcome !== "scheduled") return;
 
@@ -820,9 +840,59 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       retryReason: "model_decision_pending",
       wakeReason: "model_decision_pending_retry",
       maxAttempts: 12,
+      delayMs: 1_800_000,
     });
 
     expect(second).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_issue_unchanged",
+    });
+  });
+
+  it("retries an unchanged card on the growing backoff before dropping it at the ceiling", async () => {
+    const f = await seedModelDecisionFixture();
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const backoffMs = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 1_280_000];
+    let deferredRunId = f.runId;
+    for (const [index, delayMs] of backoffMs.entries()) {
+      const retry = await heartbeat.scheduleBoundedRetry(deferredRunId, {
+        now: f.now,
+        random: () => 0.5,
+        retryReason: "model_decision_pending",
+        wakeReason: "model_decision_pending_retry",
+        maxAttempts: 12,
+        delayMs,
+      });
+      expect(retry).toMatchObject({ outcome: "scheduled" });
+      if (retry.outcome !== "scheduled") return;
+      expect(retry.run.scheduledRetryAttempt).toBe(index + 1);
+      expect(retry.run.scheduledRetryAt?.getTime()).toBe(f.now.getTime() + delayMs);
+      deferredRunId = retry.run.id;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          errorCode: "model_decision_pending",
+          resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+          finishedAt: f.now,
+        })
+        .where(eq(heartbeatRuns.id, deferredRunId));
+      // Claiming the successor's execution lock bumps issues.updatedAt without changing the card.
+      await db
+        .update(issues)
+        .set({ executionRunId: deferredRunId, updatedAt: new Date("2026-04-20T12:05:00.000Z") })
+        .where(eq(issues.id, f.issueId));
+    }
+
+    const atCeiling = await heartbeat.scheduleBoundedRetry(deferredRunId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_800_000,
+    });
+    expect(atCeiling).toMatchObject({
       outcome: "not_scheduled",
       errorCode: "model_decision_retry_issue_unchanged",
     });
