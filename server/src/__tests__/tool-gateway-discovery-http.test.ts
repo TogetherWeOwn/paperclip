@@ -19,6 +19,30 @@ suite("MCP discovery over HTTP", () => {
   });
   afterAll(async () => { await temp?.cleanup(); });
 
+  it("advertises wrappers from the real token's current allowed actions", async () => {
+    const fixture = await createListingFixture(db, 6);
+    const gateway = createToolGatewayService(db);
+    const app = express().use(express.json()).use(mcpGatewayProtocolRoutes(gateway));
+    const listWrappers = async () => {
+      const response = await request(app)
+        .post(`/mcp/gateways/${fixture.namedGateway.gatewayPublicId}`)
+        .set("Authorization", `Bearer ${fixture.token.token}`)
+        .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+        .expect(200);
+      return response.body.result.tools.map((tool: { name: string }) => tool.name)
+        .filter((name: string) => name.startsWith("paperclip_")).sort();
+    };
+    expect(await listWrappers()).toEqual([
+      "paperclip_get_prompt", "paperclip_list_prompts", "paperclip_list_resources", "paperclip_read_resource",
+    ]);
+    await db.update(toolMcpGatewayTokens).set({ allowedActions: ["tools/list", "tools/call"] })
+      .where(eq(toolMcpGatewayTokens.id, fixture.token.id));
+    expect(await listWrappers()).toEqual([]);
+    await db.update(toolMcpGatewayTokens).set({ allowedActions: ["tools/list", "resources/list"] })
+      .where(eq(toolMcpGatewayTokens.id, fixture.token.id));
+    expect(await listWrappers()).toEqual(["paperclip_list_resources"]);
+  });
+
   it("finishes an admitted provider call when token cleanup runs during dispatch", async () => {
     const fixture = await createListingFixture(db, 6);
     await db.insert(connectionGrants).values({ companyId: fixture.company.id, connectionId: fixture.connection.id,

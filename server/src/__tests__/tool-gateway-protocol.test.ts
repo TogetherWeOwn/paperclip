@@ -69,12 +69,14 @@ describe("named gateway MCP protocol context-tool advertisement", () => {
     expect(names).toContain("paperclip_get_prompt");
   });
 
-  it("advertises only the context wrappers covered by a partial scope", async () => {
+  it.each([
+    { action: "resources/list", wrapper: "paperclip_list_resources" },
+    { action: "resources/read", wrapper: "paperclip_read_resource" },
+    { action: "prompts/list", wrapper: "paperclip_list_prompts" },
+    { action: "prompts/get", wrapper: "paperclip_get_prompt" },
+  ] as const)("advertises only $wrapper for the single $action scope", async ({ action, wrapper }) => {
     const app = createProtocolApp({
-      listResult: {
-        tools: [],
-        allowedActions: ["tools/list", "tools/call", "resources/list", "resources/read"],
-      },
+      listResult: { tools: [], allowedActions: ["tools/list", action] },
     });
     const response = await request(app)
       .post("/mcp/gateways/gw_test")
@@ -82,9 +84,6 @@ describe("named gateway MCP protocol context-tool advertisement", () => {
       .send({ jsonrpc: "2.0", id: 1, method: "tools/list" })
       .expect(200);
     const names = response.body.result.tools.map((tool: { name: string }) => tool.name);
-    expect(names).toContain("paperclip_list_resources");
-    expect(names).toContain("paperclip_read_resource");
-    expect(names).not.toContain("paperclip_list_prompts");
-    expect(names).not.toContain("paperclip_get_prompt");
+    expect(names).toEqual([wrapper]);
   });
 });
