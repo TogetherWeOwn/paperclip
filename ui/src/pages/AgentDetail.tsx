@@ -3318,6 +3318,13 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
         navigate(`/agents/${agentRouteId}/runs/${newRun.runId}`);
       else if (newRun.issueId) navigate(`/issues/${newRun.issueId}`);
     },
+    onError: (error) => {
+      pushToast({
+        title: "Run retry failed",
+        body: error instanceof Error ? error.message : "Unable to retry run",
+        tone: "error",
+      });
+    },
   });
 
   const rerunWithTrace = useMutation({
