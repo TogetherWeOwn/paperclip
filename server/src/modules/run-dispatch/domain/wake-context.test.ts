@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   allowsIssueInteractionWake,
+  capWakeContextSnapshotBytes,
   deriveCommentId,
   extractWakeCommentIds,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
+  WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
   WORKSPACE_BUSY_RETRY_REASON,
 } from "./wake-context.js";
 
@@ -90,4 +93,85 @@ describe("wake context", () => {
       expect(isResolvedInteractionContinuationWakeContext(null)).toBe(false);
     },
   );
+});
+
+describe("capWakeContextSnapshotBytes", () => {
+  it("returns small snapshots untouched", () => {
+    const snapshot = {
+      issueId: "issue-1",
+      taskId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1"],
+    };
+    const result = capWakeContextSnapshotBytes(snapshot);
+    expect(result.snapshot).toBe(snapshot);
+    expect(result.truncated).toBe(false);
+    expect(result.droppedWakeCommentIds).toBe(0);
+  });
+
+  it("trims the oldest wake comment ids first and keeps a thread pointer", () => {
+    const ids = Array.from({ length: 30 }, (_, i) => `comment-${i}`);
+    const padding = "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      taskId: "issue-1",
+      taskKey: "task-key-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ids,
+      note: padding,
+    });
+    const kept = result.snapshot.wakeCommentIds as string[];
+    expect(kept.length).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+    expect(kept.at(-1)).toBe("comment-29");
+    expect(result.droppedWakeCommentIds).toBeGreaterThan(0);
+    expect(result.snapshot.issueId).toBe("issue-1");
+    expect(result.snapshot.taskKey).toBe("task-key-1");
+    expect(result.snapshot.wakeReason).toBe("issue_commented");
+    expect(result.truncated).toBe(true);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("drops debug payload before touching routing input", () => {
+    const padding = "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1"],
+      debug: { providerTrace: "raw", blob: padding },
+    });
+    expect(result.snapshot.debug).toBeUndefined();
+    expect(result.snapshot.issueId).toBe("issue-1");
+    expect(result.snapshot.wakeCommentIds).toEqual(["comment-1"]);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("never drops queued comment ids that carry pending input", () => {
+    const queued = Array.from({ length: 12 }, (_, i) => `queued-${i}`);
+    const padding = "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1"],
+      queuedCommentIds: queued,
+      filler: padding,
+    });
+    expect(result.snapshot.queuedCommentIds).toEqual(queued);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("is deterministic for the same input", () => {
+    const input = {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: Array.from({ length: 30 }, (_, i) => `comment-${i}`),
+      filler: "x".repeat(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES),
+    };
+    expect(capWakeContextSnapshotBytes(input)).toEqual(
+      capWakeContextSnapshotBytes(input),
+    );
+  });
 });

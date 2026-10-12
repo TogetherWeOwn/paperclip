@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  RUN_MODEL_DECISION_BACKOFF_MAX_MS,
   RUN_MODEL_DECISION_CAPABILITY,
   RUN_MODEL_DECISION_DEFAULT_DELAY_MS,
   RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
@@ -8,11 +9,13 @@ import {
   RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
   evaluateRunModelDecisionSkip,
+  isRepeatModelDecisionDeferral,
   isRunModelDecisionDeferral,
   isSecretEnvBinding,
   readPreviousRunModelDecision,
   resolveRunModelDecision,
   resolveRunModelDecisionNoDecision,
+  resolveRunModelDecisionRetryDelayMs,
   runModelDecisionChangesModel,
   selectRunModelDecisionHolder,
   validateRunModelDecisionAnswer,
@@ -256,6 +259,60 @@ describe("run model decision hook (TOG-11792, design §9.2)", () => {
       }),
     ).toEqual({ action: "surface", reason: "pacer closed" });
     expect(RUN_MODEL_DECISION_RETRY_REASON).toBe("model_decision_pending");
+  });
+
+  // 5b. Exponential backoff on model-decision retries. The
+  // router's hint stays a floor (it knows account reset times); the grown
+  // backoff only fills in when the hint is small or missing, and it caps.
+  it("backs off model-decision retries exponentially", () => {
+    expect(
+      resolveRunModelDecisionNoDecision({ consumedAttempts: 0, reason: "pacer closed" }),
+    ).toMatchObject({ action: "retry", retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS });
+    expect(
+      resolveRunModelDecisionNoDecision({ consumedAttempts: 1, reason: "pacer closed" }),
+    ).toMatchObject({ action: "retry", retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS * 2 });
+    expect(
+      resolveRunModelDecisionNoDecision({ consumedAttempts: 2, reason: "pacer closed" }),
+    ).toMatchObject({ action: "retry", retryAfterMs: RUN_MODEL_DECISION_DEFAULT_DELAY_MS * 4 });
+    expect(
+      resolveRunModelDecisionRetryDelayMs(20, undefined),
+    ).toBe(RUN_MODEL_DECISION_BACKOFF_MAX_MS);
+  });
+
+  it("keeps the router hint as a floor instead of shortening it", () => {
+    expect(
+      resolveRunModelDecisionNoDecision({
+        consumedAttempts: 2,
+        retryAfterMs: 3_600_000,
+        reason: "pacer closed",
+      }),
+    ).toMatchObject({ action: "retry", retryAfterMs: 3_600_000 });
+  });
+
+  // 5c. Drop (don't requeue) when the card state has not changed
+  // since the last attempt.
+  it("detects a repeat deferral on an unchanged card", () => {
+    const fingerprint = {
+      reason: "no account has headroom",
+      issueStatus: "in_progress",
+      issueUpdatedAt: "2026-04-20T11:00:00.000Z",
+      lastCommentAt: null,
+    };
+    expect(isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint })).toBe(true);
+    expect(
+      isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint, issueStatus: "done" }),
+    ).toBe(false);
+    expect(
+      isRepeatModelDecisionDeferral(fingerprint, { ...fingerprint, reason: "timed out" }),
+    ).toBe(false);
+    expect(
+      isRepeatModelDecisionDeferral(fingerprint, {
+        ...fingerprint,
+        lastCommentAt: "2026-04-20T11:30:00.000Z",
+      }),
+    ).toBe(false);
+    expect(isRepeatModelDecisionDeferral(null, fingerprint)).toBe(false);
+    expect(isRepeatModelDecisionDeferral(undefined, fingerprint)).toBe(false);
   });
 
   // 6. user wake exempt

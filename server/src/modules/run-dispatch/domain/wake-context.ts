@@ -21,6 +21,38 @@ export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
+/**
+ * Byte budget for the context snapshot injected into every run request.
+ * The snapshot is a routing envelope, not the thread itself: ids trimmed
+ * here stay fetchable through the issue-comments API, and the prompt-time
+ * inline tail (`MAX_INLINE_WAKE_COMMENTS`) renders from the kept ids.
+ */
+export const WAKE_CONTEXT_SNAPSHOT_MAX_BYTES = 24_000;
+/** Newest wake comment ids kept when a snapshot exceeds its byte budget. */
+export const WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS = 8;
+/**
+ * Snapshot keys that must survive capping byte-for-byte. Routing,
+ * continuation identity, and pending input live here; trimming any of them
+ * changes what the run does, while everything else is diagnostic context.
+ */
+const WAKE_CONTEXT_SNAPSHOT_PROTECTED_KEYS = new Set([
+  "issueId",
+  "taskId",
+  "taskKey",
+  "commentId",
+  "wakeCommentId",
+  WAKE_COMMENT_IDS_KEY,
+  "queuedCommentIds",
+  "wakeReason",
+  "retryReason",
+  "source",
+  "wakeSource",
+  "mutation",
+  "interactionId",
+  "forceFreshSession",
+  "previousRunId",
+  "retryOfRunId",
+]);
 export const RESOLVED_INTERACTION_CONTINUATION_STATUSES = new Set([
   "accepted",
   "answered",
@@ -87,6 +119,82 @@ export function allowsIssueInteractionWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (!wakeReason || !allowedWakeReasons.has(wakeReason)) return false;
   return Boolean(deriveCommentId(contextSnapshot));
+}
+
+export interface CappedWakeContextSnapshot {
+  snapshot: Record<string, unknown>;
+  /** True when any byte was removed or rewritten to fit the budget. */
+  truncated: boolean;
+  /** Oldest-first wake comment ids dropped; the oldest kept id stays the thread pointer. */
+  droppedWakeCommentIds: number;
+  /** Serialized byte size of the returned snapshot. */
+  bytes: number;
+}
+
+function wakeContextSnapshotBytes(value: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/**
+ * Caps an enriched wake context snapshot to `maxBytes` serialized bytes.
+ * Order of sacrifice: the `debug` object first, then the oldest wake comment
+ * ids (the oldest kept id remains the fetchable thread pointer and the drop
+ * count is recorded), then the largest unprotected string values. Queued
+ * comment ids and every protected routing key are never touched: dropping
+ * pending input would silently lose work, and rewriting an id or reason
+ * would change what the run does.
+ */
+export function capWakeContextSnapshotBytes(
+  input: Record<string, unknown>,
+  maxBytes: number = WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+): CappedWakeContextSnapshot {
+  const originalBytes = wakeContextSnapshotBytes(input);
+  if (originalBytes <= maxBytes) {
+    return { snapshot: input, truncated: false, droppedWakeCommentIds: 0, bytes: originalBytes };
+  }
+  const snapshot: Record<string, unknown> = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
+  let droppedWakeCommentIds = 0;
+
+  if (snapshot.debug !== undefined) {
+    delete snapshot.debug;
+  }
+
+  const ids = extractWakeCommentIds(snapshot);
+  if (ids.length > WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS) {
+    const kept = ids.slice(-WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+    droppedWakeCommentIds = ids.length - kept.length;
+    snapshot[WAKE_COMMENT_IDS_KEY] = kept;
+    snapshot.wakeCommentIdsDroppedFromFront = droppedWakeCommentIds;
+  }
+  // Queryable marker (set before the shrink loop so it stays inside budget).
+  snapshot.snapshotTruncated = true;
+
+  let bytes = wakeContextSnapshotBytes(snapshot);
+  while (bytes > maxBytes) {
+    let largestKey: string | null = null;
+    let largestBytes = 0;
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (WAKE_CONTEXT_SNAPSHOT_PROTECTED_KEYS.has(key)) continue;
+      if (typeof value !== "string") continue;
+      const size = Buffer.byteLength(value, "utf8");
+      if (size > largestBytes) {
+        largestBytes = size;
+        largestKey = key;
+      }
+    }
+    if (largestKey === null || largestBytes <= 0) break;
+    const value = snapshot[largestKey] as string;
+    const keepChars = Math.max(0, Math.floor(value.length * (maxBytes / bytes)) - 64);
+    snapshot[largestKey] =
+      value.length > keepChars
+        ? `${value.slice(0, Math.max(0, keepChars))}…[truncated ${value.length - Math.max(0, keepChars)} chars]`
+        : value;
+    const nextBytes = wakeContextSnapshotBytes(snapshot);
+    if (nextBytes >= bytes) break;
+    bytes = nextBytes;
+  }
+
+  return { snapshot, truncated: true, droppedWakeCommentIds, bytes };
 }
 
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {

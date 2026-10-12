@@ -16,13 +16,17 @@ export {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
+  WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+  WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
   RESOLVED_INTERACTION_CONTINUATION_STATUSES,
   isNonAssigneeWorkspaceBusyRetry,
   extractWakeCommentIds,
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  capWakeContextSnapshotBytes,
 } from "./domain/wake-context.js";
+export type { CappedWakeContextSnapshot } from "./domain/wake-context.js";
 export type {
   RetryReasonKind,
   BudgetBlockFacts,
