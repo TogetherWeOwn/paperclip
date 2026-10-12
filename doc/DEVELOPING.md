@@ -90,12 +90,13 @@ Workflow changes take effect after merge: `pr.yml` pins
 previous master version. The new job first runs on pull requests opened after
 merge.
 
-The gate scripts come from the pull request's own checkout, not from master. A
-pull request whose base branch has no `scripts/quality-gates` (for example
-`deploy/tog6`) cannot run them, so step `detect_gates` skips every later step
-and the job passes with a notice. Back-port the gate files to that base branch
-to turn the gates on there. `scripts/quality-gates/workflow.test.mjs` pins
-the guard on every step.
+The quality-gate lane is skipped only when the policy job confirms from the
+pull request's base commit that `package.json` lacks `test:quality-gates` (for
+example, the pre-gates `deploy/tog6` line). Detection errors fail policy closed,
+and `verify` accepts the lane's skipped result only when that explicit base
+commit decision is false. A pull request cannot skip the lane by removing gate
+tooling from its own head. `scripts/quality-gates/workflow.test.mjs` pins this
+base-commit decision and the aggregate result handling.
 
 ## Start Dev
 

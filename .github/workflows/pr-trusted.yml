@@ -257,6 +257,8 @@ jobs:
     needs: [gate]
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 10
+    outputs:
+      quality_gate_tooling: ${{ steps.quality_gate_tooling.outputs.available }}
 
     steps:
       - name: Checkout repository
@@ -264,6 +266,38 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Detect phase-1 quality-gate tooling on the base commit
+        id: quality_gate_tooling
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # Decide from the base commit, never from the PR merge tree: a PR must
+          # not be able to switch the lane off by deleting the tooling. A base
+          # line that predates the phase-1 gates (the deploy/tog6 line) has no
+          # `test:quality-gates` script, so the lane can only fail there. Every
+          # error below fails this step, which fails `verify`: any doubt keeps
+          # the gate on. Base commits on master always carry the script.
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::malformed base commit SHA' >&2; exit 1; }
+          git cat-file -e "${BASE_SHA}^{commit}"
+          base_package_json="$(git show "${BASE_SHA}:package.json")"
+          available="$(printf '%s' "$base_package_json" | node -e '
+            let raw = "";
+            process.stdin.on("data", (chunk) => { raw += chunk; });
+            process.stdin.on("end", () => {
+              const scripts = JSON.parse(raw).scripts ?? {};
+              console.log(typeof scripts["test:quality-gates"] === "string" ? "true" : "false");
+            });
+          ')"
+          [[ "$available" == 'true' || "$available" == 'false' ]] || { echo '::error::unreadable base package.json' >&2; exit 1; }
+
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+          if [[ "$available" == 'false' ]]; then
+            echo "::notice title=Quality gates::base commit $BASE_SHA has no test:quality-gates script; the phase-1 lane is skipped for this base line"
+          fi
 
       - name: Block manual lockfile edits
         if: >-
@@ -648,14 +682,11 @@ jobs:
     # Phase-1 deterministic quality gates. New checks start in WARN mode
     # (continue-on-error: report, do not fail) unless marked HARD. Runs on the
     # existing PR runners only. No paid Actions minutes.
-    #
-    # This job is defined on master but its scripts come from the PR's own
-    # checkout. A PR whose base branch predates the gates (deploy/tog6) has none
-    # of them, so detect_gates skips every later step and the job passes without
-    # running anything. Back-port the gate files to such a base to turn them on.
     name: Quality gates (phase 1)
     needs: [gate, policy]
-    if: ${{ needs.gate.outputs.full_ci == 'true' }}
+    # Skip only when the base commit predates phase-1 tooling; the policy job
+    # detects from the base rather than trusting the PR's checked-out tree.
+    if: ${{ needs.gate.outputs.full_ci == 'true' && needs.policy.outputs.quality_gate_tooling == 'true' }}
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 15
     env:
@@ -669,25 +700,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Detect gate scripts in this tree
-        id: detect_gates
-        run: |
-          if [ -f scripts/quality-gates/biome-changed.mjs ] && grep -q '"test:quality-gates"' package.json; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Quality gates skipped::this PR's base branch has no scripts/quality-gates; gates do not run until the base carries them"
-          fi
-
       - name: Setup Node.js for pnpm bootstrap
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           package-manager-cache: false
 
       - name: Setup pnpm
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         env:
           NPM_CONFIG_AUDIT: "false"
@@ -700,14 +719,12 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Locate pnpm store
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         id: pnpm_store
         run: |
           echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
@@ -715,7 +732,6 @@ jobs:
           restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
 
       - name: Install dependencies
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         # Same inline-resolution pattern as the test lanes: a stale lockfile
         # for the merge tree resolves locally without waiting on artifacts.
         run: |
@@ -726,23 +742,19 @@ jobs:
           fi
 
       - name: Test quality-gate scripts
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         run: pnpm test:quality-gates
 
       - name: Biome full scan (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: pnpm exec biome check .
 
       - name: Biome added files (HARD); modified files (WARN)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node scripts/quality-gates/biome-changed.mjs
 
       - name: Floor guard — bar-lowering check (WARN during calibration)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -750,7 +762,6 @@ jobs:
         run: node scripts/quality-gates/floor-guard.mjs
 
       - name: ast-grep shared rules (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -758,7 +769,6 @@ jobs:
         run: node scripts/quality-gates/ast-grep-changed.mjs
 
       - name: Coverage changed lines (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -766,12 +776,10 @@ jobs:
         run: node scripts/quality-gates/coverage-changed.mjs
 
       - name: pnpm audit (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: pnpm audit --audit-level=moderate
 
       - name: Trivy filesystem scan (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # pinned action revision
         with:
@@ -783,7 +791,6 @@ jobs:
           version: ${{ env.TRIVY_VERSION }}
 
       - name: Gitleaks secret scan (WARN, report only)
-        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -815,6 +822,7 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           DOCKER_CONTEXT_INTEGRITY_RESULT: ${{ needs.docker_context_integrity.result }}
           QUALITY_GATES_RESULT: ${{ needs.quality_gates.result }}
+          QUALITY_GATE_TOOLING: ${{ needs.policy.outputs.quality_gate_tooling }}
         run: |
           test "$POLICY_RESULT" = "success"
           case "$FULL_CI" in
@@ -824,7 +832,15 @@ jobs:
               test "$RUNNER_VERIFICATION_RESULT" = "success"
               test "$BUILD_RESULT" = "success"
               test "$DOCKER_CONTEXT_INTEGRITY_RESULT" = "success"
-              test "$QUALITY_GATES_RESULT" = "success"
+              # Skip the lane only when policy proved the base has no tooling.
+              case "$QUALITY_GATE_TOOLING" in
+                true) test "$QUALITY_GATES_RESULT" = "success" ;;
+                false) test "$QUALITY_GATES_RESULT" = "skipped" ;;
+                *)
+                  echo "Invalid quality-gate tooling decision: $QUALITY_GATE_TOOLING" >&2
+                  exit 1
+                  ;;
+              esac
               ;;
             false)
               test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"
