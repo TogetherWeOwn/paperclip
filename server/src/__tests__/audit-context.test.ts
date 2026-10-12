@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { Db } from "@paperclipai/db";
 import type { Request } from "express";
 import { describe, expect, it, vi } from "vitest";
@@ -12,9 +13,11 @@ import { persistActivity } from "../services/activity-log.js";
 import type { RequestAuditContext } from "../services/audit-context.js";
 import {
   buildRequestAuditContext,
+  getRequestAuditContext,
   hashJsonValue,
   runOutsideRequestAuditContext,
   runWithRequestAuditContext,
+  withRequestAuditDetails,
 } from "../services/audit-context.js";
 
 function fakeReq(
@@ -119,7 +122,9 @@ describe("request audit context on activity rows", () => {
 
   it("overwrites a caller-supplied audit key with the real provenance", async () => {
     const rows: Array<Record<string, unknown>> = [];
-    const ctx = mustBuildContext(fakeReq({ type: "board", source: "session" }));
+    const ctx = mustBuildContext(
+      fakeReq({ type: "board", userId: "board-user", source: "session" }),
+    );
     await runWithRequestAuditContext(ctx, () =>
       persistActivity(fakeDb(rows), {
         ...baseInput,
@@ -143,7 +148,12 @@ describe("request audit context on activity rows", () => {
     const secret = "mysecrettoken123";
     const ctx = mustBuildContext(
       fakeReq(
-        { type: "board", source: "board_key", keyId: "key-1" },
+        {
+          type: "board",
+          userId: "board-user",
+          source: "board_key",
+          keyId: "key-1",
+        },
         {
           "X-Paperclip-Change-Reason": `rotate Authorization: Bearer ${secret}`,
         },
@@ -178,6 +188,105 @@ describe("request audit context on activity rows", () => {
       );
     });
     expect(rows[0].details).toEqual({ a: 1 });
+  });
+
+  it("does not stamp plugin or agent rows with the requesting human's provenance", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    const ctx = mustBuildContext(
+      fakeReq(
+        {
+          type: "board",
+          userId: "board-user",
+          source: "board_key",
+          keyId: "key-7",
+        },
+        { "X-Paperclip-Change-Reason": "enable plugin" },
+      ),
+    );
+    await runWithRequestAuditContext(ctx, async () => {
+      await persistActivity(fakeDb(rows), {
+        ...baseInput,
+        actorType: "plugin",
+        actorId: "plugin-1",
+        details: { a: 1 },
+      });
+      await persistActivity(fakeDb(rows), {
+        ...baseInput,
+        actorType: "agent",
+        actorId: "agent-1",
+        details: { b: 2 },
+      });
+    });
+    expect(rows[0].details).toEqual({ a: 1 });
+    expect(rows[1].details).toEqual({ b: 2 });
+  });
+
+  it("redacts a secret-bearing reason at the source for direct inserts", async () => {
+    const secret = "mysecrettoken123";
+    const ctx = mustBuildContext(
+      fakeReq(
+        {
+          type: "board",
+          userId: "board-user",
+          source: "board_key",
+          keyId: "key-1",
+        },
+        {
+          "X-Paperclip-Change-Reason": `rotate Authorization: Bearer ${secret}`,
+        },
+      ),
+    );
+    expect(ctx.reason ?? "").not.toContain(secret);
+    await runWithRequestAuditContext(ctx, async () => {
+      const stamped = withRequestAuditDetails(
+        { source: "manual_routine_run" },
+        { actorType: "user", actorId: "board-user" },
+      );
+      expect(JSON.stringify(stamped)).not.toContain(secret);
+    });
+  });
+
+  it("worker handlers registered outside the request see no audit context", async () => {
+    const ctx = mustBuildContext(
+      fakeReq({
+        type: "board",
+        userId: "board-user",
+        source: "board_key",
+        keyId: "key-7",
+      }),
+    );
+    await runWithRequestAuditContext(ctx, async () => {
+      const seen = runOutsideRequestAuditContext(() =>
+        getRequestAuditContext(),
+      );
+      expect(seen).toBeUndefined();
+      const rows: Array<Record<string, unknown>> = [];
+      await runOutsideRequestAuditContext(() =>
+        persistActivity(fakeDb(rows), {
+          ...baseInput,
+          actorType: "plugin",
+          actorId: "plugin-1",
+          details: { a: 1 },
+        }),
+      );
+      expect(rows[0].details).toEqual({ a: 1 });
+    });
+  });
+
+  it("keeps every heartbeat executeRun launch outside the request audit context", () => {
+    const source = readFileSync(
+      new URL("../services/heartbeat.ts", import.meta.url),
+      "utf8",
+    );
+    const launches = source.match(/executeRun\(/g) ?? [];
+    const wrapped =
+      source.match(/runOutsideRequestAuditContext\(\(\) => executeRun\(/g) ??
+      [];
+    // One occurrence is the `async function executeRun(` definition; every
+    // other call site must be wrapped so detached agent rows never inherit the
+    // waking human's provenance.
+    expect(launches.length - 1).toBeGreaterThan(0);
+    expect(wrapped.length).toBe(launches.length - 1);
   });
 
   it("bounds and sanitizes caller-supplied reason and correlation id", () => {

@@ -336,7 +336,7 @@ export function activityRoutes(db: Db) {
     const event = await svc.create({
       companyId,
       ...req.body,
-      details: await redactActivityDetails(db, withRequestAuditDetails(req.body.details ?? null)),
+      details: await redactActivityDetails(db, withRequestAuditDetails(req.body.details ?? null, { actorType: req.body.actorType, actorId: req.body.actorId })),
     });
     res.status(201).json(event);
   });

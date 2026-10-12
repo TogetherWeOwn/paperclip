@@ -1695,7 +1695,7 @@ export function routineService(
       entityType: "issue",
       entityId: input.issueId,
       responsibleUserId: input.userId,
-      details: withRequestAuditDetails({ source: "manual_routine_run" }),
+      details: withRequestAuditDetails({ source: "manual_routine_run" }, { actorType: "user", actorId: input.userId }),
       createdAt: input.touchedAt,
     });
 

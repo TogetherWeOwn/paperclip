@@ -152,7 +152,7 @@ export async function observeCrossIssueInfluence(
         mode: decision.mode,
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
-      }),
+      }, { actorType: "agent", actorId: input.agentId }),
     });
 
     const logContext = {

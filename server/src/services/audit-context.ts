@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
+import { redactSensitiveText } from "../redaction.js";
 
 /**
  * Request-scoped provenance for activity rows. `actor_id` alone cannot tell a
@@ -14,6 +15,8 @@ export interface RequestAuditContext {
   keyId: string | null;
   reason: string | null;
   correlationId: string | null;
+  actorType: "user" | "agent";
+  actorId: string;
 }
 
 export const CHANGE_REASON_HEADER = "x-paperclip-change-reason";
@@ -49,7 +52,11 @@ function readReason(req: Request): string | null {
   const raw = req.header(CHANGE_REASON_HEADER);
   if (!raw) return null;
   const cleaned = stripControlChars(raw).trim().slice(0, MAX_REASON_LENGTH);
-  return cleaned.length > 0 ? cleaned : null;
+  if (cleaned.length === 0) return null;
+  // Redact at the source so every consumer (persistActivity and direct
+  // inserts via withRequestAuditDetails) stores a redacted value even when
+  // the row bypasses redactActivityDetails. Downstream redaction is idempotent.
+  return redactSensitiveText(cleaned);
 }
 
 function readCorrelationId(req: Request): string | null {
@@ -68,11 +75,36 @@ export function buildRequestAuditContext(
 ): RequestAuditContext | null {
   const actor = req.actor;
   if (!actor || actor.type === "none") return null;
+  const record = actor as unknown as Record<string, unknown>;
+  const source = typeof record.source === "string" ? record.source : "unknown";
+  const keyId = typeof record.keyId === "string" ? record.keyId : null;
+  const reason = readReason(req);
+  const correlationId = readCorrelationId(req);
+  if (actor.type === "agent") {
+    const agentId =
+      typeof record.agentId === "string" && record.agentId.length > 0
+        ? record.agentId
+        : "unknown-agent";
+    return {
+      actorSource: source,
+      keyId,
+      reason,
+      correlationId,
+      actorType: "agent",
+      actorId: agentId,
+    };
+  }
+  const userId =
+    typeof record.userId === "string" && record.userId.length > 0
+      ? record.userId
+      : "board";
   return {
-    actorSource: actor.source ?? "unknown",
-    keyId: actor.keyId ?? null,
-    reason: readReason(req),
-    correlationId: readCorrelationId(req),
+    actorSource: source,
+    keyId,
+    reason,
+    correlationId,
+    actorType: "user",
+    actorId: userId,
   };
 }
 
@@ -95,17 +127,29 @@ export const AUDIT_DETAILS_KEY = "audit";
  * Merge request provenance into activity details. `details.audit` is a reserved
  * key: any caller-supplied value is stripped and replaced with the current
  * request context, or removed when there is no context, so callers can never
- * forge provenance. The merged block is redacted downstream by
- * `redactActivityDetails` together with the rest of `details`, because the
- * free-text reason is caller data and may contain secrets.
+ * forge provenance. The stamp applies only to rows that belong to the
+ * requesting actor: plugin, agent and system rows written from detached
+ * resources (plugin workers, restarted timers, fire-and-forget runs) never
+ * inherit the waking human's block, even when their handlers were created
+ * inside the request. The merged block is redacted downstream by
+ * `redactActivityDetails` together with the rest of `details`, and the reason
+ * is already redacted at the source because the free-text reason is caller
+ * data and may contain secrets.
  */
 export function withRequestAuditDetails(
   details: Record<string, unknown> | null,
+  actor?: { actorType: string; actorId: string } | null,
 ): Record<string, unknown> | null {
   const context = storage.getStore();
   const base: Record<string, unknown> = details ? { ...details } : {};
   if (AUDIT_DETAILS_KEY in base) delete base[AUDIT_DETAILS_KEY];
   if (!context) return details ? base : details;
+  if (
+    actor &&
+    (actor.actorType !== context.actorType || actor.actorId !== context.actorId)
+  ) {
+    return details ? base : details;
+  }
   const audit: Record<string, string> = { actorSource: context.actorSource };
   if (context.keyId) audit.keyId = context.keyId;
   if (context.reason) audit.reason = context.reason;
