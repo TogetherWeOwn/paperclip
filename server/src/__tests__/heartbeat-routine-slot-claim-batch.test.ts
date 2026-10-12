@@ -288,6 +288,38 @@ describeEmbeddedPostgres(
       expect((await runStatus(fixture.runIds[1]!))?.status).toBe("queued");
     });
 
+    it("rethrows and stops when the first claim fails unexpectedly", async () => {
+      const fixture = await seed([
+        { routine: false, title: "explode" },
+        { routine: false, title: "Second issue" },
+        { routine: false, title: "Third issue" },
+      ]);
+      await db.execute(sql`
+      create function claim_batch_test_explode() returns trigger as $$
+      begin
+        if new.title = 'explode' and new.execution_run_id is not null
+           and old.execution_run_id is distinct from new.execution_run_id then
+          raise exception 'claim batch test failure';
+        end if;
+        return new;
+      end;
+      $$ language plpgsql
+    `);
+      await db.execute(sql`
+      create trigger claim_batch_test_explode before update on issues
+      for each row execute function claim_batch_test_explode()
+    `);
+
+      // Nothing was claimed before the failure, so the error must propagate
+      // and later runs must not be claimed in the same batch.
+      await expect(heartbeat.resumeQueuedRuns()).rejects.toThrow();
+
+      expect(startedRunIds).toEqual([]);
+      expect((await runStatus(fixture.runIds[0]!))?.status).toBe("queued");
+      expect((await runStatus(fixture.runIds[1]!))?.status).toBe("queued");
+      expect((await runStatus(fixture.runIds[2]!))?.status).toBe("queued");
+    });
+
     it("dispatches a run whose claim threw after its transaction committed", async () => {
       const fixture = await seed([{ routine: false, title: "postcommit" }]);
       const wakeupId = randomUUID();
