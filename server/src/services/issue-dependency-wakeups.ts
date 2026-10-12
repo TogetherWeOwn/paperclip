@@ -9,8 +9,19 @@ export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 // A denial or hold descriptor is an explicit owner decision; blocker resolution must not release it.
 export function holdsIssueAgainstAutoRelease(
   descriptor: Pick<IssueUnblockDescriptor, "kind"> | null | undefined,
+  status: string,
 ): boolean {
-  return descriptor?.kind != null;
+  return status === "blocked" && descriptor?.kind != null;
+}
+
+export function shouldWakeAfterStopRelay(parent: {
+  assigneeAgentId: string | null;
+  status: string;
+  unblockDescriptor: Pick<IssueUnblockDescriptor, "kind"> | null | undefined;
+}): boolean {
+  return Boolean(parent.assigneeAgentId) &&
+    !["done", "cancelled"].includes(parent.status) &&
+    !holdsIssueAgainstAutoRelease(parent.unblockDescriptor, parent.status);
 }
 
 // A wake counts as "already delivered or in flight for the current ready state"

@@ -5,6 +5,8 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  holdsIssueAgainstAutoRelease,
+  shouldWakeAfterStopRelay,
 } from "./issue-dependency-wakeups.js";
 
 const dependentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -12,6 +14,45 @@ const blockerIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const companyId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const firstCycle = new Date("2026-04-01T12:00:00.000Z");
 const secondCycle = new Date("2026-08-01T09:30:00.000Z");
+
+describe("holdsIssueAgainstAutoRelease", () => {
+  it("holds denied blocked issues but not issues that have left blocked", () => {
+    const denial = { kind: "denial" as const };
+
+    expect(holdsIssueAgainstAutoRelease(denial, "blocked")).toBe(true);
+    expect(holdsIssueAgainstAutoRelease(denial, "in_progress")).toBe(false);
+    expect(holdsIssueAgainstAutoRelease(denial, "cancelled")).toBe(false);
+    expect(holdsIssueAgainstAutoRelease(null, "blocked")).toBe(false);
+  });
+});
+
+describe("shouldWakeAfterStopRelay", () => {
+  it("keeps relay comments without waking a denial-held blocked parent", () => {
+    expect(shouldWakeAfterStopRelay({
+      assigneeAgentId: "agent-parent",
+      status: "blocked",
+      unblockDescriptor: { kind: "denial" },
+    })).toBe(false);
+  });
+
+  it("still wakes an assigned parent that is not held or closed", () => {
+    expect(shouldWakeAfterStopRelay({
+      assigneeAgentId: "agent-parent",
+      status: "blocked",
+      unblockDescriptor: null,
+    })).toBe(true);
+    expect(shouldWakeAfterStopRelay({
+      assigneeAgentId: null,
+      status: "blocked",
+      unblockDescriptor: null,
+    })).toBe(false);
+    expect(shouldWakeAfterStopRelay({
+      assigneeAgentId: "agent-parent",
+      status: "cancelled",
+      unblockDescriptor: null,
+    })).toBe(false);
+  });
+});
 
 type WakeRow = {
   id: string;

@@ -59,11 +59,12 @@ export class NativeStatusRaceError extends Error {
 
 // A denial or hold survives a native rewrite while the issue stays blocked; only its owner releases it.
 function carryHeldUnblockDescriptor(
+  currentStatus: string,
   current: IssueUnblockDescriptor | null | undefined,
   next: IssueUnblockDescriptor | null,
   toStatus: NativeStatusDecision["toStatus"],
 ): IssueUnblockDescriptor | null {
-  if (toStatus !== "blocked" || current?.kind == null) return next;
+  if (currentStatus !== "blocked" || toStatus !== "blocked" || current?.kind == null) return next;
   if (next == null) return current;
   return { ...next, kind: current.kind };
 }
@@ -761,7 +762,7 @@ async function materializeDecisionEffect(input: {
   if (effect.kind === "bind_blocker") {
     failAt("blocker_materialization", input.failpoint);
     const [current] = await input.tx
-      .select({ unblockDescriptor: issues.unblockDescriptor })
+      .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
       .from(issues)
       .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId)))
       .limit(1);
@@ -769,6 +770,7 @@ async function materializeDecisionEffect(input: {
       .update(issues)
       .set({
         unblockDescriptor: carryHeldUnblockDescriptor(
+          current?.status ?? "",
           current?.unblockDescriptor,
           { owner: effect.owner, action: effect.action },
           "blocked",
@@ -1894,7 +1896,7 @@ export async function commitNativeStatusDecision(input: {
     } else {
       failAt("status_projection", input.failpoint);
       const [heldRow] = await tx
-        .select({ unblockDescriptor: issues.unblockDescriptor })
+        .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
         .from(issues)
         .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
         .limit(1);
@@ -1905,6 +1907,7 @@ export async function commitNativeStatusDecision(input: {
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
           unblockDescriptor: carryHeldUnblockDescriptor(
+            heldRow?.status ?? "",
             heldRow?.unblockDescriptor,
             input.decision.unblockDescriptor,
             input.decision.toStatus,

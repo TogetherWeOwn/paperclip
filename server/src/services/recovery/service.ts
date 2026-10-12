@@ -5669,7 +5669,7 @@ export function recoveryService(
       for (const candidate of companyCandidates) {
         const agentId = candidate.assigneeAgentId;
         if (!agentId) continue;
-        if (holdsIssueAgainstAutoRelease(candidate.unblockDescriptor)) {
+        if (holdsIssueAgainstAutoRelease(candidate.unblockDescriptor, "blocked")) {
           result.holdSkipped += 1;
           continue;
         }

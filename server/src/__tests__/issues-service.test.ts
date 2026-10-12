@@ -7348,4 +7348,41 @@ describeEmbeddedPostgres("issueService wakes skip denial- and hold-held issues",
     expect(await svc.getWakeableParentAfterChildCompletion(heldParentId)).toBeNull();
     expect((await svc.getWakeableParentAfterChildCompletion(ordinaryParentId))?.id).toBe(ordinaryParentId);
   });
+
+  it("clears a held descriptor on checkout so a later blocked cycle can auto-release", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const firstBlockerId = randomUUID();
+    const nextBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: firstBlockerId, companyId, title: "Resolved blocker", status: "done", priority: "medium" },
+      { id: nextBlockerId, companyId, title: "Next blocker", status: "todo", priority: "medium" },
+      {
+        id: dependentId,
+        companyId,
+        title: "Previously denied dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: firstBlockerId,
+      relatedIssueId: dependentId,
+      type: "blocks",
+    });
+
+    const checkedOut = await svc.checkout(dependentId, agentId, ["blocked"], null);
+
+    expect(checkedOut).toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    await svc.update(dependentId, {
+      status: "blocked",
+      blockedByIssueIds: [nextBlockerId],
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, nextBlockerId));
+
+    expect((await svc.listWakeableBlockedDependents(nextBlockerId)).map((row) => row.id)).toContain(dependentId);
+  });
 });
