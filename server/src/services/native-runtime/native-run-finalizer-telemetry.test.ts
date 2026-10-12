@@ -628,9 +628,15 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
 
   it("keeps a held descriptor's kind when a native run rebinds its blocker", async () => {
     const fixture = await seedNativeRun();
+    // Within a blocked cycle: the hold survives a native rewrite. Stale
+    // in_progress rows with a kind must not re-attach (see stale-kind test
+    // in issues-service.test.ts); checkout clears those.
     await db
       .update(issues)
-      .set({ unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" } })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      })
       .where(eq(issues.id, fixture.issueId));
     const resultId = randomUUID();
     await db.insert(nativeRunResults).values({
@@ -654,8 +660,8 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
       resultId,
       triggerKind: "native_result",
       triggerActorCompanyId: companyId,
-      priorIssueStatus: "in_progress",
-      priorStatusVersion: 0,
+      priorIssueStatus: "blocked",
+      priorStatusVersion: 1,
       policyVersion: "telemetry-v1",
       assessmentJson: {},
       inputDigest: `digest-${assessmentId}`,
@@ -683,8 +689,10 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
       issueId: fixture.issueId,
       runId: fixture.runId,
       assessmentId,
-      priorStatus: "in_progress",
-      priorStatusVersion: 0,
+      priorStatus: "blocked",
+      // Raw status update above bumps status_version via
+      // paperclip_issue_status_version_trigger (0 -> 1).
+      priorStatusVersion: 1,
       priorDecisionId: null,
       decision,
     });
