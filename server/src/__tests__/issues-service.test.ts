@@ -7385,4 +7385,38 @@ describeEmbeddedPostgres("issueService wakes skip denial- and hold-held issues",
 
     expect((await svc.listWakeableBlockedDependents(nextBlockerId)).map((row) => row.id)).toContain(dependentId);
   });
+
+  it("returns the held parent descriptor from the stop-relay path", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Denial-held parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Low-trust child",
+        status: "cancelled",
+        priority: "medium",
+      },
+    ]);
+
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    const relay = await svc.addStopRelayCommentIfNeeded(child);
+
+    expect(relay).not.toBeNull();
+    expect(relay?.parent.unblockDescriptor).toMatchObject({ kind: "denial" });
+    expect(relay?.comment.issueId).toBe(parentId);
+    // The relay comment is idempotent for the same child status.
+    await expect(svc.addStopRelayCommentIfNeeded(child)).resolves.toBeNull();
+  });
 });
