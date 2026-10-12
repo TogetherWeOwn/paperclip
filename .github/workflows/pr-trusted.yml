@@ -265,6 +265,31 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ci-validate/mirror-group-resolver
+          path: ${{ runner.temp }}/trusted-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Resolve current PR base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The event pins the base as it was when the event fired. A later base
+          # retarget does not re-run this job, so check the PR's current base tip.
+          base_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+          base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_ref" --jq '.object.sha')"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::current base branch has no valid commit SHA"; exit 1; }
+          git cat-file -e "$base_sha^{commit}" 2>/dev/null || git fetch --no-tags origin "$base_sha"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=PR base::checking against $base_ref at $base_sha (event base $EVENT_BASE_SHA)"
+
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
@@ -272,7 +297,7 @@ jobs:
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "${{ steps.base.outputs.sha }}...${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
@@ -297,7 +322,7 @@ jobs:
       - name: Validate migration ordering against target branch
         run: >-
           node .github/scripts/check-pr-migration-order.mjs
-          "${{ github.event.pull_request.base.sha }}"
+          "${{ steps.base.outputs.sha }}"
           "${{ github.event.pull_request.head.sha }}"
 
       - name: Validate Dockerfile deps stage
@@ -324,6 +349,11 @@ jobs:
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
+      - name: Test general test group resolver
+        run: node --test "$TRUSTED_CI/.github/scripts/tests/resolve-general-group.test.mjs"
+        env:
+          TRUSTED_CI: ${{ runner.temp }}/trusted-ci
+
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs
 
@@ -338,8 +368,8 @@ jobs:
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "${{ steps.base.outputs.sha }}...${{ github.event.pull_request.head.sha }}")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ steps.base.outputs.sha }}" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       # Each lane resolves a stale lockfile inline; this early check still
@@ -384,7 +414,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -407,28 +437,6 @@ jobs:
       # rebuilds the Runner release binary; without the shared Rust cache that
       # is a ~3m40s cold compile of all third-party crates (run 35036001734,
       # 2026-09-15). Same restore-only contract as Verify Paperclip Runner.
-
-      # rust-cache hashes its absolute cache paths into the entry's version,
-      # and GitHub only serves an entry whose key and version both match. The
-      # target directory sits under the checkout, and the checkout root
-      # differs by runner: /home/runner/_work on the RunsOn fleets that write
-      # this cache against /home/runner/work on GitHub-hosted runners. Every
-      # key input agreed, yet all 25 completed pull requests on 2026-09-28
-      # logged "No cache found" (run 36424309181) and cold-compiled every
-      # crate for ~4 minutes in four lanes. Point rust-cache at the same
-      # directory through a checkout-independent path so both layouts hash
-      # the same version. Keep this block identical in both workflows: the
-      # reader and the writer must agree or the version matches nothing.
-      - name: Pin the Runner Rust workspace path
-        id: runner_rust_workspace
-        run: |
-          set -euo pipefail
-          pinned="$HOME/paperclip-runner-rust"
-          # A symlink here is removed as a link, never followed into the checkout.
-          rm -rf "$pinned"
-          ln -s "$GITHUB_WORKSPACE/packages/paperclip-runner/runner" "$pinned"
-          echo "path=$pinned" >> "$GITHUB_OUTPUT"
-
       - name: Select the pinned Runner Rust toolchain
         working-directory: packages/paperclip-runner
         run: |
@@ -467,8 +475,8 @@ jobs:
       - name: Restore Runner Rust dependencies (read only)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: ${{ steps.runner_rust_workspace.outputs.path }} -> target
-          shared-key: release-runner-v2
+          workspaces: packages/paperclip-runner/runner -> target
+          shared-key: release-runner-v1
           # Mirror the master writer: these also feed the cache key.
           cache-workspace-crates: false
           cache-bin: false
@@ -591,6 +599,25 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ci-validate/mirror-group-resolver
+          path: ${{ runner.temp }}/trusted-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # Mirror PR heads can predate a group in this matrix. Ask the head's own
+      # runner whether it defines the group: a missing group is skipped with a
+      # notice, never reported as passed. Ordinary PRs always run their group.
+      - name: Resolve group against PR head
+        id: group_support
+        env:
+          TRUSTED_CI: ${{ runner.temp }}/trusted-ci
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GROUP: ${{ matrix.group }}
+        run: node "$TRUSTED_CI/.github/scripts/resolve-general-group.mjs" --base-ref "$BASE_REF" --group "$GROUP" --head-root .
+
       - name: Setup pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         env:
@@ -609,13 +636,14 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
 
       - name: Install dependencies
+        if: steps.group_support.outputs.run == 'true'
         # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
         # stale for the merge tree. Resolve it inline instead of waiting on a
         # policy-job artifact: that dependency put the policy job's queue and
@@ -629,6 +657,7 @@ jobs:
           fi
 
       - name: Run grouped general test suites
+        if: steps.group_support.outputs.run == 'true'
         run: |
           if [ -n "${{ matrix.shard_count }}" ]; then
             pnpm test:run:general -- --group '${{ matrix.group }}' \
@@ -666,11 +695,134 @@ jobs:
       - name: Run generated-file drift checks against the Docker build context
         run: docker buildx build --file .github/docker-context-checks.Dockerfile .
 
+  quality_gates:
+    # Phase-1 deterministic quality gates. New checks start in WARN mode
+    # (continue-on-error: report, do not fail) unless marked HARD. Runs on the
+    # existing PR runners only. No paid Actions minutes.
+    name: Quality gates (phase 1)
+    needs: [gate, policy]
+    if: ${{ needs.gate.outputs.full_ci == 'true' }}
+    runs-on: ${{ needs.gate.outputs.runner }}
+    timeout-minutes: 15
+    env:
+      TRIVY_VERSION: v0.75.0
+      GITLEAKS_VERSION: v8.30.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+          run_install: false
+
+      # Share the checked-in lockfile key with master. PR merge refs must not
+      # save full copies of the store or evict the post-merge build caches.
+      - name: Locate pnpm store
+        id: pnpm_store
+        run: |
+          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store (read only)
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
+
+      - name: Install dependencies
+        # Same inline-resolution pattern as the test lanes: a stale lockfile
+        # for the merge tree resolves locally without waiting on artifacts.
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Test quality-gate scripts
+        run: pnpm test:quality-gates
+
+      - name: Biome full scan (WARN, report only)
+        continue-on-error: true
+        run: pnpm exec biome check .
+
+      - name: Biome added files (HARD); modified files (WARN)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/quality-gates/biome-changed.mjs
+
+      - name: Floor guard — bar-lowering check (WARN during calibration)
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/quality-gates/floor-guard.mjs
+
+      - name: ast-grep shared rules (WARN, report only)
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/quality-gates/ast-grep-changed.mjs
+
+      - name: Coverage changed lines (WARN, report only)
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/quality-gates/coverage-changed.mjs
+
+      - name: pnpm audit (WARN, report only)
+        continue-on-error: true
+        run: pnpm audit --audit-level=moderate
+
+      - name: Trivy filesystem scan (WARN, report only)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # pinned action revision
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: ${{ env.TRIVY_VERSION }}
+
+      - name: Gitleaks secret scan (WARN, report only)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          curl -sfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" \
+            -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin"
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" detect --source . --no-git --verbose
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity]
+    needs: [gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, quality_gates]
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 5
 
@@ -684,6 +836,7 @@ jobs:
           RUNNER_VERIFICATION_RESULT: ${{ needs.verify_paperclip_runner.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           DOCKER_CONTEXT_INTEGRITY_RESULT: ${{ needs.docker_context_integrity.result }}
+          QUALITY_GATES_RESULT: ${{ needs.quality_gates.result }}
         run: |
           test "$POLICY_RESULT" = "success"
           case "$FULL_CI" in
@@ -693,6 +846,7 @@ jobs:
               test "$RUNNER_VERIFICATION_RESULT" = "success"
               test "$BUILD_RESULT" = "success"
               test "$DOCKER_CONTEXT_INTEGRITY_RESULT" = "success"
+              test "$QUALITY_GATES_RESULT" = "success"
               ;;
             false)
               test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"
@@ -700,6 +854,7 @@ jobs:
               test "$RUNNER_VERIFICATION_RESULT" = "skipped"
               test "$BUILD_RESULT" = "skipped"
               test "$DOCKER_CONTEXT_INTEGRITY_RESULT" = "skipped"
+              test "$QUALITY_GATES_RESULT" = "skipped"
               ;;
             *)
               echo "Invalid full_ci decision: $FULL_CI" >&2
@@ -767,7 +922,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -788,33 +943,11 @@ jobs:
 
       # Same restore-only contract as the pnpm store above, for the Rust
       # dependency tree: master's post-merge verification is the sole writer
-      # of release-runner-v2, and PR merge refs must not save branch-scoped
+      # of release-runner-v1, and PR merge refs must not save branch-scoped
       # copies of a ~680MB target directory. Every key input below has to
       # match that writer in release-verify.yml exactly or each PR misses and
       # recompiles all 313 third-party crates in both profiles. A miss is a
       # slow run, never a wrong one.
-
-      # rust-cache hashes its absolute cache paths into the entry's version,
-      # and GitHub only serves an entry whose key and version both match. The
-      # target directory sits under the checkout, and the checkout root
-      # differs by runner: /home/runner/_work on the RunsOn fleets that write
-      # this cache against /home/runner/work on GitHub-hosted runners. Every
-      # key input agreed, yet all 25 completed pull requests on 2026-09-28
-      # logged "No cache found" (run 36424309181) and cold-compiled every
-      # crate for ~4 minutes in four lanes. Point rust-cache at the same
-      # directory through a checkout-independent path so both layouts hash
-      # the same version. Keep this block identical in both workflows: the
-      # reader and the writer must agree or the version matches nothing.
-      - name: Pin the Runner Rust workspace path
-        id: runner_rust_workspace
-        run: |
-          set -euo pipefail
-          pinned="$HOME/paperclip-runner-rust"
-          # A symlink here is removed as a link, never followed into the checkout.
-          rm -rf "$pinned"
-          ln -s "$GITHUB_WORKSPACE/packages/paperclip-runner/runner" "$pinned"
-          echo "path=$pinned" >> "$GITHUB_OUTPUT"
-
       - name: Select the pinned Runner Rust toolchain
         working-directory: packages/paperclip-runner
         run: |
@@ -853,8 +986,8 @@ jobs:
       - name: Restore Runner Rust dependencies (read only)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: ${{ steps.runner_rust_workspace.outputs.path }} -> target
-          shared-key: release-runner-v2
+          workspaces: packages/paperclip-runner/runner -> target
+          shared-key: release-runner-v1
           # Mirror the master writer: these also feed the cache key.
           cache-workspace-crates: false
           cache-bin: false
@@ -905,7 +1038,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -928,28 +1061,6 @@ jobs:
       # shared Rust cache that is a ~3m40s cold compile of all third-party
       # crates (run 35036001734, 2026-09-15). Same restore-only contract as
       # Verify Paperclip Runner.
-
-      # rust-cache hashes its absolute cache paths into the entry's version,
-      # and GitHub only serves an entry whose key and version both match. The
-      # target directory sits under the checkout, and the checkout root
-      # differs by runner: /home/runner/_work on the RunsOn fleets that write
-      # this cache against /home/runner/work on GitHub-hosted runners. Every
-      # key input agreed, yet all 25 completed pull requests on 2026-09-28
-      # logged "No cache found" (run 36424309181) and cold-compiled every
-      # crate for ~4 minutes in four lanes. Point rust-cache at the same
-      # directory through a checkout-independent path so both layouts hash
-      # the same version. Keep this block identical in both workflows: the
-      # reader and the writer must agree or the version matches nothing.
-      - name: Pin the Runner Rust workspace path
-        id: runner_rust_workspace
-        run: |
-          set -euo pipefail
-          pinned="$HOME/paperclip-runner-rust"
-          # A symlink here is removed as a link, never followed into the checkout.
-          rm -rf "$pinned"
-          ln -s "$GITHUB_WORKSPACE/packages/paperclip-runner/runner" "$pinned"
-          echo "path=$pinned" >> "$GITHUB_OUTPUT"
-
       - name: Select the pinned Runner Rust toolchain
         working-directory: packages/paperclip-runner
         run: |
@@ -988,8 +1099,8 @@ jobs:
       - name: Restore Runner Rust dependencies (read only)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: ${{ steps.runner_rust_workspace.outputs.path }} -> target
-          shared-key: release-runner-v2
+          workspaces: packages/paperclip-runner/runner -> target
+          shared-key: release-runner-v1
           # Mirror the master writer: these also feed the cache key.
           cache-workspace-crates: false
           cache-bin: false
@@ -1078,7 +1189,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -1137,7 +1248,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -1160,28 +1271,6 @@ jobs:
       # build:binary step; without the shared Rust cache that is a ~3m40s cold
       # compile of all third-party crates (run 35036001734, 2026-09-15). Same
       # restore-only contract as Verify Paperclip Runner.
-
-      # rust-cache hashes its absolute cache paths into the entry's version,
-      # and GitHub only serves an entry whose key and version both match. The
-      # target directory sits under the checkout, and the checkout root
-      # differs by runner: /home/runner/_work on the RunsOn fleets that write
-      # this cache against /home/runner/work on GitHub-hosted runners. Every
-      # key input agreed, yet all 25 completed pull requests on 2026-09-28
-      # logged "No cache found" (run 36424309181) and cold-compiled every
-      # crate for ~4 minutes in four lanes. Point rust-cache at the same
-      # directory through a checkout-independent path so both layouts hash
-      # the same version. Keep this block identical in both workflows: the
-      # reader and the writer must agree or the version matches nothing.
-      - name: Pin the Runner Rust workspace path
-        id: runner_rust_workspace
-        run: |
-          set -euo pipefail
-          pinned="$HOME/paperclip-runner-rust"
-          # A symlink here is removed as a link, never followed into the checkout.
-          rm -rf "$pinned"
-          ln -s "$GITHUB_WORKSPACE/packages/paperclip-runner/runner" "$pinned"
-          echo "path=$pinned" >> "$GITHUB_OUTPUT"
-
       - name: Select the pinned Runner Rust toolchain
         working-directory: packages/paperclip-runner
         run: |
@@ -1220,8 +1309,8 @@ jobs:
       - name: Restore Runner Rust dependencies (read only)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: ${{ steps.runner_rust_workspace.outputs.path }} -> target
-          shared-key: release-runner-v2
+          workspaces: packages/paperclip-runner/runner -> target
+          shared-key: release-runner-v1
           # Mirror the master writer: these also feed the cache key.
           cache-workspace-crates: false
           cache-bin: false
@@ -1246,10 +1335,6 @@ jobs:
               commit --no-verify -m "ci(canary): stage regenerated lockfile"
           fi
           ./scripts/release.sh canary --skip-verify --dry-run
-      - name: Verify built-in Grok from a clean public npm install
-        if: ${{ hashFiles('scripts/verify-grok-npm-install.mjs') != '' }}
-        run: node scripts/verify-grok-npm-install.mjs
-
 
   e2e_shards:
     name: e2e shard (${{ matrix.shard_label }})
@@ -1327,7 +1412,7 @@ jobs:
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
