@@ -267,6 +267,31 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: master
+          path: .trusted-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Resolve current PR base
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The event pins the base as it was when the event fired. A later base
+          # retarget does not re-run this job, so check the PR's current base tip.
+          base_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+          base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_ref" --jq '.object.sha')"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::current base branch has no valid commit SHA"; exit 1; }
+          git cat-file -e "$base_sha^{commit}" 2>/dev/null || git fetch --no-tags origin "$base_sha"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=PR base::checking against $base_ref at $base_sha (event base $EVENT_BASE_SHA)"
+
       - name: Detect phase-1 quality-gate tooling on the merge commit's base parent
         id: quality_gate_tooling
         shell: bash
@@ -309,7 +334,7 @@ jobs:
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "${{ steps.base.outputs.sha }}...${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
@@ -334,7 +359,7 @@ jobs:
       - name: Validate migration ordering against target branch
         run: >-
           node .github/scripts/check-pr-migration-order.mjs
-          "${{ github.event.pull_request.base.sha }}"
+          "${{ steps.base.outputs.sha }}"
           "${{ github.event.pull_request.head.sha }}"
 
       - name: Validate Dockerfile deps stage
@@ -361,6 +386,11 @@ jobs:
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
+      - name: Test general test group resolver
+        run: node --test "$TRUSTED_CI/.github/scripts/tests/resolve-general-group.test.mjs"
+        env:
+          TRUSTED_CI: ${{ github.workspace }}/.trusted-ci
+
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs
 
@@ -375,8 +405,8 @@ jobs:
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "${{ steps.base.outputs.sha }}...${{ github.event.pull_request.head.sha }}")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ steps.base.outputs.sha }}" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       # Each lane resolves a stale lockfile inline; this early check still
@@ -606,6 +636,25 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: master
+          path: .trusted-ci
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # Mirror PR heads can predate a group in this matrix. Ask the head's own
+      # runner whether it defines the group: a missing group is skipped with a
+      # notice, never reported as passed. Ordinary PRs always run their group.
+      - name: Resolve group against PR head
+        id: group_support
+        env:
+          TRUSTED_CI: ${{ github.workspace }}/.trusted-ci
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GROUP: ${{ matrix.group }}
+        run: node "$TRUSTED_CI/.github/scripts/resolve-general-group.mjs" --base-ref "$BASE_REF" --group "$GROUP" --head-root .
+
       - name: Setup pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         env:
@@ -631,6 +680,7 @@ jobs:
           restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
 
       - name: Install dependencies
+        if: steps.group_support.outputs.run == 'true'
         # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
         # stale for the merge tree. Resolve it inline instead of waiting on a
         # policy-job artifact: that dependency put the policy job's queue and
@@ -644,6 +694,7 @@ jobs:
           fi
 
       - name: Run grouped general test suites
+        if: steps.group_support.outputs.run == 'true'
         run: |
           if [ -n "${{ matrix.shard_count }}" ]; then
             pnpm test:run:general -- --group '${{ matrix.group }}' \
