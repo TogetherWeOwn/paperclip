@@ -1,0 +1,16 @@
+name: PR branch proof (temporary)
+
+# Temporary pre-merge proof for the pr-trusted changes/ci-ok wiring.
+# Calls the candidate branch's trusted workflow on a real pull_request event.
+# Delete this file and close the proof pull request after recording the run link.
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  ci-branch:
+    uses: TogetherWeOwn/paperclip/.github/workflows/pr-trusted.yml@ci/pr-trusted-changes-ci-ok
