@@ -1116,11 +1116,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           };
           const currentHead = async (expected: string) => {
             const currentSource = await publicationScope();
+            // The repository slug is intentionally not pinned here: renames and
+            // canonical-case syncs change providerResourceId in place while the
+            // numeric repositoryId (pinned below) stays stable, and scope()
+            // already rejects thread/resource disagreement case-insensitively.
             if (
               currentSource.endpoint.connectionId !== source.endpoint.connectionId ||
               currentSource.resource.id !== source.resource.id ||
               currentSource.repositoryId !== source.repositoryId ||
-              currentSource.repository !== source.repository ||
               currentSource.number !== source.number ||
               currentSource.isIssue !== source.isIssue ||
               currentSource.replyId !== source.replyId

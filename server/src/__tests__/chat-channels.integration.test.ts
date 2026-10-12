@@ -85,6 +85,8 @@ import {
   environmentLeases,
   principalPermissionGrants,
   toolConnections,
+  toolConnectionInstalls,
+  toolProfileEntries,
   environments,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
@@ -3050,6 +3052,82 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
       expect(await f.request("APPROVE")).toMatchObject({ status: "cancelled", receipt: { code: "authorization_changed", retryable: false } });
       expect(f.posts).toHaveLength(0);
+    });
+
+    it.each(["endpoint connection", "repository resource", "repository identity", "reply thread"] as const)("refuses formal publication when the %s binding changes during history retrieval", async (binding) => {
+      const f = await formalReviewPublicationFixture();
+      // Pointer-swap bindings need a second valid target in the same company
+      // so that only the pinned currentHead() comparison blocks the retry.
+      // Pre-create it before the request; the history hook only flips the pointer.
+      let secondConnectionId: string | undefined;
+      let secondResourceId: string | undefined;
+      if (binding === "endpoint connection") {
+        // Clone the endpoint's tool connection (same app, credentials, catalog
+        // entries, installs and profile selectors under a new id/uid) so the
+        // swapped connection stays fully authorized and only the
+        // connectionId pin can block the retry.
+        const [conn] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.endpoint.connectionId!));
+        secondConnectionId = randomUUID();
+        await db.insert(toolConnections).values({ ...conn, id: secondConnectionId, uid: `${conn.uid}-binding-swap` });
+        const entries = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, conn.id));
+        for (const entry of entries) {
+          await db.insert(toolCatalogEntries).values({ ...entry, id: randomUUID(), connectionId: secondConnectionId });
+        }
+        const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, conn.id));
+        for (const install of installs) {
+          await db.insert(toolConnectionInstalls).values({ ...install, id: randomUUID(), connectionId: secondConnectionId });
+        }
+        const selectors = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.connectionId, conn.id));
+        for (const selector of selectors) {
+          await db.insert(toolProfileEntries).values({ ...selector, id: randomUUID(), connectionId: secondConnectionId });
+        }
+      } else if (binding === "repository resource") {
+        // Second resource row for the same repository. The per-endpoint unique
+        // key needs a distinct providerResourceId, so use the canonical-case
+        // variant; scope() still agrees case-insensitively, leaving only the
+        // resource.id pin to block the retry.
+        const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.issueId, f.session.issueId!));
+        const [resource] = await db.select().from(chatEndpointResources).where(eq(chatEndpointResources.id, conversation.resourceId!));
+        secondResourceId = randomUUID();
+        await db.insert(chatEndpointResources).values({
+          ...resource,
+          id: secondResourceId,
+          providerResourceId: resource.providerResourceId.toUpperCase(),
+        });
+      }
+      f.setHistoryHook(async () => {
+        if (binding === "endpoint connection") {
+          await db.update(chatEndpoints).set({ connectionId: secondConnectionId! }).where(eq(chatEndpoints.id, f.endpoint.id));
+        } else if (binding === "repository resource") {
+          await db.update(chatConversations).set({ resourceId: secondResourceId! }).where(eq(chatConversations.issueId, f.session.issueId!));
+        } else if (binding === "repository identity") {
+          const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.issueId, f.session.issueId!));
+          const [resource] = await db.select().from(chatEndpointResources).where(eq(chatEndpointResources.id, conversation.resourceId!));
+          const metadata = (resource.metadata ?? {}) as Record<string, unknown>;
+          await db.update(chatEndpointResources).set({
+            metadata: { ...metadata, providerRepositoryId: "97532" },
+          }).where(eq(chatEndpointResources.id, resource.id));
+        } else {
+          await db.update(chatConversations).set({
+            externalThreadId: "github:paperclipai/paperclip:91:rc:456",
+          }).where(eq(chatConversations.issueId, f.session.issueId!));
+        }
+      });
+      expect(await f.request("APPROVE")).toMatchObject({ status: "cancelled", receipt: { code: "authorization_changed", retryable: false } });
+      expect(f.posts).toHaveLength(0);
+    });
+
+    it("allows formal publication when only the repository slug case changes during history retrieval", async () => {
+      const f = await formalReviewPublicationFixture();
+      f.setHistoryHook(async () => {
+        const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.issueId, f.session.issueId!));
+        const [resource] = await db.select().from(chatEndpointResources).where(eq(chatEndpointResources.id, conversation.resourceId!));
+        await db.update(chatEndpointResources).set({
+          providerResourceId: resource.providerResourceId.toUpperCase(),
+        }).where(eq(chatEndpointResources.id, resource.id));
+      });
+      expect(await f.request("APPROVE")).toMatchObject({ status: "processed" });
+      expect(f.posts).toHaveLength(1);
     });
 
     it.each(["APPROVE", "REQUEST_CHANGES"] as const)("posts exactly one eligible %s after a final head check", async (event) => {
