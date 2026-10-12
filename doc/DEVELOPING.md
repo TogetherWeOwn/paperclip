@@ -1199,7 +1199,7 @@ npx paperclipai worktree reseed \
   --seed-mode full
 ```
 
-Managed workspace repair uses this same verified full-reseed contract through `POST /api/execution-workspaces/:id/runtime-commands/repair`. The exclusive, audited operation stops managed services, writes a recoverable pre-repair database backup under the isolated instance's backup directory, performs the full seed/migration/quarantine/rebinding sequence, and restarts only after terminal manifest and service-health validation. It preserves the worktree filesystem. On failure, services remain stopped while the database backup, seed manifest, bounded phase diagnostics, and operation log are retained for inspection; repair never retries itself in a loop.
+Managed workspace repair uses this same verified full-reseed contract through `POST /api/execution-workspaces/:id/runtime-commands/repair`. The exclusive, audited operation stops managed services, writes a recoverable pre-repair database backup under the isolated instance's backup directory, performs the full seed/migration/quarantine/rebinding sequence, and restarts only after terminal manifest and service-health validation. It preserves the worktree filesystem. On failure, services remain stopped while the database backup, seed manifest, bounded phase diagnostics, and operation log are retained for inspection; repair never retries itself in a loop. Pre-repair archives have unique filenames and are excluded from automatic tier pruning. A later repair cannot delete or overwrite an earlier pre-repair snapshot. These safety copies accumulate in the `repair` subdirectory until an operator explicitly removes them after checking that they are no longer needed; ordinary seed and scheduled backups still use tiered retention.
 
 **`npx paperclipai worktree:make <name> [options]`** — Create `~/NAME` as a git worktree, then initialize an isolated Paperclip instance inside it. This combines `git worktree add` with `worktree init` in a single step.
 
@@ -1811,7 +1811,8 @@ schemas. Defaults:
 
 - enabled
 - every 60 minutes
-- retain 30 days
+- keep the newest backup per hour for 24 hours
+- then keep the newest backup per day for 7 days, per week for 4 weeks, and per month for 1 month
 - backup dir: `~/.paperclip/instances/default/data/backups`
 
 Automatic backups are disabled for isolated worktree instances created with
@@ -1819,13 +1820,16 @@ Automatic backups are disabled for isolated worktree instances created with
 configs are migrated to the disabled setting when their server next starts. The
 main/default instance keeps the normal enabled-by-default behavior.
 
-Configure these in:
+Configure the backup schedule and directory with:
 
 ```sh
 pnpm paperclipai configure --section database
 ```
 
-Run a one-off backup manually:
+Configure automatic retention tiers in **Instance Settings → General → Backup retention**.
+Changes take effect on the next backup without a server restart.
+
+Run a one-off backup manually. One-off backups share the scheduled backup directory and prune with the widest preset windows, `48 hourly / 14 daily / 4 weekly / 6 monthly`. A retired retentionDays value or PAPERCLIP_DB_BACKUP_RETENTION_DAYS can extend the monthly window; a valid environment value takes precedence over the raw config-file value. The effective policy is printed before pruning. Wider windows are not a guarantee that every scheduled-policy file survives: different tier boundaries can select different daily, weekly or monthly representatives. Use a separate backup directory when every existing restore point must remain unchanged:
 
 ```sh
 pnpm paperclipai db:backup
@@ -1840,7 +1844,6 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED=1` enables verified final backups
   for owned idle sleep, with restart catch-up. Off by default; see
   [idle sleep safety](idle-sleep-safety.md) for the hosting and storage contract.
-- `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=<days>`
 - `PAPERCLIP_DB_BACKUP_DIR=/absolute/or/~/path`
 - `PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS=<hours>` controls the `/api/health`
   stale-backup warning threshold
