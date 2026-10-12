@@ -30,10 +30,13 @@ The reusable `changes` job (`ci-changes.yml`, scope `pr`) selects work with
 but policy always runs. Manifest, lockfile, pnpm configuration, patches, and
 `.github` changes run all lanes. Non-PR invocations select full work.
 
-`ci-ok` requires successful classification, policy, the existing `verify` and
-`e2e` aggregates, serialized-server suites, and canary verification. Only an
-explicit unaffected decision admits skipped heavy lanes. Adding `ci-ok` does
-not change repository protection settings; that switch is a repo-admin step.
+The `ci / ci-ok` check (the `ci-ok` job in `pr-trusted.yml`, reported through
+the `ci` caller job in `pr.yml`) requires successful classification, policy,
+the existing `verify` and `e2e` aggregates, serialized-server suites, and
+canary verification. Only an explicit unaffected decision admits skipped heavy
+lanes. Adding `ci / ci-ok` does not change repository protection settings;
+that switch is a repo-admin step. It is distinct from Workflow Health's bare
+`ci-ok` check, which only aggregates `changes` and `validate`.
 
 ## Trusted PR Workflow
 

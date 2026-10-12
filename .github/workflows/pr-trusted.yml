@@ -1474,6 +1474,8 @@ jobs:
               ;;
           esac
 
+  # Required check reports as `ci / ci-ok` through the `ci` caller job in
+  # pr.yml. Distinct from Workflow Health's bare `ci-ok` (changes+validate).
   ci-ok:
     name: ci-ok
     if: ${{ always() }}
