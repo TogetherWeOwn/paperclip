@@ -132,9 +132,9 @@ test("policy decides gate availability from the merge base parent and fails clos
   );
   assert.match(policy, /id: quality_gate_tooling/);
   assert.doesNotMatch(
-    policy,
-    /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/,
-    "detection must not read the stale event base.sha",
+    detectScript,
+    /\$\{\{\s*github\.event\.pull_request\.base\.sha/,
+    "detection must not read the stale event base.sha (it decides from HEAD^1)",
   );
   assert.match(detectScript, /git rev-parse HEAD\^1/);
   assert.match(detectScript, /rev-list --parents/);
