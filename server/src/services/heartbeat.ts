@@ -522,6 +522,7 @@ import {
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  capWakeContextSnapshotBytes,
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
@@ -624,16 +625,22 @@ import {
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import {
+  RUN_MODEL_DECISION_DAILY_CAP_PER_ISSUE,
   RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
   RUN_MODEL_DECISION_RETRY_REASON,
   RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
+  isRepeatModelDecisionDeferral,
+  isRunModelDecisionBackoffExhausted,
   isRunModelDecisionDeferral,
+  modelDecisionCardRevision,
+  parseModelDecisionDeferralFingerprint,
   readPreviousRunModelDecision,
   resolveRunModelDecision,
   resolveRunModelDecisionNoDecision,
   selectRunModelDecisionHolder,
   type RunModelDecideAnswer,
+  type RunModelDecisionDeferralFingerprint,
   type RunModelDecisionHolderSelection,
   type RunModelDecisionPrevious,
 } from "./run-model-decision.js";
@@ -7287,9 +7294,14 @@ function enrichWakeContextSnapshot(input: {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
   }
   normalizeInteractionContinuationWakeContext(contextSnapshot, payload);
+  // Cap the injected snapshot so long card threads cannot inflate
+  // every request of the run. Trimmed comment ids stay fetchable through the
+  // issue-comments API, and the prompt-time inline tail renders from the ids
+  // that survive here. Routing and pending-input keys are never touched.
+  const capped = capWakeContextSnapshotBytes(contextSnapshot);
 
   return {
-    contextSnapshot,
+    contextSnapshot: capped.snapshot,
     issueIdFromPayload,
     commentIdFromPayload,
     taskKey,
@@ -7491,7 +7503,7 @@ export function mergeCoalescedContextSnapshot(
   ) {
     clearInteractionContinuationWakeContext(merged);
   }
-  return merged;
+  return capWakeContextSnapshotBytes(merged).snapshot;
 }
 
 // This is a prompt optimization, not an authorization grant. Verify the durable
@@ -15924,7 +15936,9 @@ export function heartbeatService(
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
-            | "issue_execution_lock_changed";
+            | "issue_execution_lock_changed"
+            | "model_decision_retry_issue_unchanged"
+            | "model_decision_retry_daily_cap";
           issueId: string | null;
           details: Record<string, unknown>;
         };
@@ -16199,6 +16213,94 @@ export function heartbeatService(
               details: { issueId, expectedExecutionRunId: run.id, currentExecutionRunId: lockedIssue?.executionRunId ?? null },
             };
           }
+        }
+
+        if (retryReason === RUN_MODEL_DECISION_RETRY_REASON && issueId) {
+          // The backoff ladder runs first. Once it reaches its ceiling, drop
+          // (don't requeue) a retry whose card state hasn't changed since the
+          // last attempt, and cap requeues per card per day. Human/board wakes
+          // keep working: this only stops automatic requeues.
+          const [lockedIssue] = await tx
+            .select({
+              status: issues.status,
+              title: issues.title,
+              description: issues.description,
+              priority: issues.priority,
+              assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              projectId: issues.projectId,
+              goalId: issues.goalId,
+              parentId: issues.parentId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+          const [latestComment] = await tx
+            .select({ createdAt: issueComments.createdAt })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, run.companyId),
+                eq(issueComments.issueId, issueId),
+                isNull(issueComments.deletedAt),
+              ),
+            )
+            .orderBy(desc(issueComments.createdAt))
+            .limit(1);
+          const runSnapshot = parseObject(run.contextSnapshot);
+          const decisionRecord = parseObject(runSnapshot.modelDecision);
+          const currentFingerprint: RunModelDecisionDeferralFingerprint = {
+            reason: readNonEmptyString(decisionRecord.reason) ?? "",
+            issueStatus: lockedIssue?.status ?? null,
+            cardRevision: lockedIssue ? modelDecisionCardRevision(lockedIssue) : null,
+            lastCommentAt: latestComment?.createdAt?.toISOString() ?? null,
+          };
+          const previousFingerprint = parseModelDecisionDeferralFingerprint(
+            runSnapshot.modelDecisionDeferralFingerprint,
+          );
+          if (
+            lockedIssue &&
+            isRepeatModelDecisionDeferral(previousFingerprint, currentFingerprint) &&
+            isRunModelDecisionBackoffExhausted(consumedAttempts)
+          ) {
+            return {
+              outcome: "not_scheduled",
+              issueId,
+              errorCode: "model_decision_retry_issue_unchanged",
+              reason:
+                "Model-decision retry dropped because the card state has not changed since the last attempt and the backoff reached its ceiling",
+              details: { issueId, retryReason, fingerprint: currentFingerprint },
+            };
+          }
+          const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          const [capRow] = await tx
+            .select({ count: sql<number>`count(*)` })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.scheduledRetryReason, retryReason),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                gte(heartbeatRuns.createdAt, dayStart),
+              ),
+            );
+          if (
+            Number(capRow?.count ?? 0) >= RUN_MODEL_DECISION_DAILY_CAP_PER_ISSUE
+          ) {
+            return {
+              outcome: "not_scheduled",
+              issueId,
+              errorCode: "model_decision_retry_daily_cap",
+              reason:
+                "Model-decision retry dropped because the card reached its daily retry cap",
+              details: {
+                issueId,
+                retryReason,
+                cap: RUN_MODEL_DECISION_DAILY_CAP_PER_ISSUE,
+              },
+            };
+          }
+          retryContextSnapshot.modelDecisionDeferralFingerprint =
+            currentFingerprint;
         }
 
         const wakeupRequest = await tx

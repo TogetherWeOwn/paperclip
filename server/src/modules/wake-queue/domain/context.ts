@@ -4,7 +4,11 @@
 // shape; this file holds only the small pieces that are specific to
 // building the release half's promoted-run snapshot.
 
-import { extractWakeCommentIds, WAKE_COMMENT_IDS_KEY } from "../../run-dispatch/index.js";
+import {
+  capWakeContextSnapshotBytes,
+  extractWakeCommentIds,
+  WAKE_COMMENT_IDS_KEY,
+} from "../../run-dispatch/index.js";
 import { readNonEmptyString } from "./values.js";
 
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -158,5 +162,5 @@ export function enrichPromotedWakeContext(
   }
   normalizeInteractionContinuationWakeContext(contextSnapshot, payload);
 
-  return { contextSnapshot, taskKey };
+  return { contextSnapshot: capWakeContextSnapshotBytes(contextSnapshot).snapshot, taskKey };
 }

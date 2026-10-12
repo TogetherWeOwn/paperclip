@@ -984,6 +984,52 @@ describe("admitWakeBehindIssueExecution", () => {
     expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
   });
 
+  it("preserves the trigger reason on the coalesced receipt", async () => {
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader: createFakeAdmissionReader(),
+      writer,
+      helpers: createFakeAdmissionHelpers(),
+    });
+
+    const result = await admit(
+      SCOPE,
+      admissionInput({ reason: "issue_commented" }),
+    );
+
+    expect(result).toEqual({ kind: "coalesced", run: { id: "merged-run-1" } });
+    expect(
+      writer.coalesceIntoActiveExecutionRun,
+    ).toHaveBeenCalledExactlyOnceWith(
+      SCOPE,
+      expect.objectContaining({ requestedReason: "issue_commented" }),
+    );
+  });
+
+  it("preserves the trigger reason on a new deferred wake", async () => {
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader: createFakeAdmissionReader({
+        isSameExecutionAgent: vi.fn(async () => false),
+      }),
+      writer,
+      helpers: createFakeAdmissionHelpers(),
+    });
+
+    const result = await admit(
+      SCOPE,
+      admissionInput({ reason: "issue_assigned" }),
+    );
+
+    expect(result).toEqual({ kind: "deferred" });
+    expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(
+      SCOPE,
+      expect.objectContaining({
+        payload: expect.objectContaining({ requestedReason: "issue_assigned" }),
+      }),
+    );
+  });
+
   it("retains an independent receipt when durable input merges into an existing deferred wake", async () => {
     const durableReceipt = {
       id: "merged-deferred-receipt",
@@ -1027,6 +1073,8 @@ describe("admitWakeBehindIssueExecution", () => {
         mergedPayload: {
           issueId: "issue-1",
           preserved: true,
+          // The deferred row carries the latest trigger reason.
+          requestedReason: "question_response",
           _paperclipWakeContext: {
             preservedContext: true,
             wakeReason: "issue_commented",

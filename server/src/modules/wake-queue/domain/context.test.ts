@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import {
+  WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
+  WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+} from "../../run-dispatch/index.js";
 import { enrichPromotedWakeContext } from "./context.js";
 
 describe("enrichPromotedWakeContext", () => {
@@ -120,5 +124,25 @@ describe("enrichPromotedWakeContext", () => {
     });
     expect(result.contextSnapshot.acceptedPlanWakeRouting).toEqual({ targetAgentId: "agent-1" });
     expect(result.contextSnapshot.workspaceRefreshReason).toBe("accepted_plan_confirmation");
+  });
+
+  it("caps the promoted run's wake comment ids to the snapshot budget", () => {
+    const result = enrichPromotedWakeContext({
+      contextSnapshot: {
+        issueId: "issue-1",
+        wakeCommentIds: Array.from({ length: 1000 }, (_, i) => `comment-${i}-${"0".repeat(32)}`),
+      },
+      reason: "issue_execution_promoted",
+      source: "automation",
+      triggerDetail: null,
+      payload: {},
+    });
+
+    expect(result.contextSnapshot.wakeCommentIds as string[]).toHaveLength(
+      WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
+    );
+    expect(Buffer.byteLength(JSON.stringify(result.contextSnapshot), "utf8")).toBeLessThanOrEqual(
+      WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+    );
   });
 });

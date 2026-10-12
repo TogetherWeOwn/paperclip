@@ -961,7 +961,15 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
         source: input.source,
         triggerDetail: input.triggerDetail,
         reason: "issue_execution_same_name",
-        payload: input.payload,
+        // The row reason names the mechanism; keep the trigger
+        // reason beside it so coalesced demand stays attributable. Omitted
+        // when unknown so the receipt payload shape is unchanged.
+        payload: {
+          ...(input.payload ?? {}),
+          ...(input.requestedReason
+            ? { requestedReason: input.requestedReason }
+            : {}),
+        },
         status: "coalesced",
         coalescedCount: 1,
         requestedByActorType: input.requestedByActorType,
