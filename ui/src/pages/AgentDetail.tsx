@@ -3308,6 +3308,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
     if (taskKey) payload.taskKey = taskKey;
     return payload;
   }, [run.contextSnapshot]);
+  const { pushToast } = useToastActions();
   const retryRun = useMutation({
     mutationFn: async () => {
       return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);

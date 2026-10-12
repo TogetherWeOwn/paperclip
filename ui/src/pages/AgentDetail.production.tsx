@@ -3311,6 +3311,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   });
 
   const canRetryRun = run.status === "failed" || run.status === "timed_out";
+  const { pushToast } = useToastActions();
   const retryRun = useMutation({
     mutationFn: async () => {
       return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);
