@@ -52,6 +52,14 @@ function fakeDb(captured: Array<Record<string, unknown>>): Db {
         return { returning: async () => [{ id: "activity-1" }] };
       },
     }),
+    // resolveResponsibleUserIdForActivity queries run/issue/key/company
+    // lookups via db.select(...).from(...).where(...); the unit fake has no
+    // such rows, so return an empty set (no responsible user found).
+    select: () => ({
+      from: () => ({
+        where: async () => [],
+      }),
+    }),
   } as unknown as Db;
 }
 
