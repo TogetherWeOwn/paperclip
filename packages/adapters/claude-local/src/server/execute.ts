@@ -977,13 +977,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const consumeAccounting = createClaudeStreamParser();
-    const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+    const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage ?? (async () => {}), stdout => {
       const parsed = consumeAccounting(stdout);
       return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
         provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
-    });
+    }, event => event.type === "result" || (event.type === "assistant" && Boolean(parseObject(event.message).usage)));
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -1005,7 +1005,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await accountingLog.flush();
 
     const { parsedStream, parsed } = parseClaudeProcessOutput(proc);
-    return { proc, parsedStream, parsed };
+    return { proc, parsedStream, parsed, accountingComplete: accountingLog.unreadRecords() === 0 };
   };
 
   const toAdapterResult = (
@@ -1013,6 +1013,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      accountingComplete: boolean;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
@@ -1034,7 +1035,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
-        usageComplete: parsedStream.resultJson !== null,
+        usageComplete: attempt.accountingComplete && parsedStream.resultJson !== null,
         usage: parsedStream.usage ?? undefined,
         usageBasis: "per_run",
         provider: "anthropic",
@@ -1104,7 +1105,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
-        usageComplete: parsedStream.resultJson !== null,
+        usageComplete: attempt.accountingComplete && parsedStream.resultJson !== null,
         usage: parsedStream.usage ?? undefined,
         usageBasis: "per_run",
         provider: "anthropic",
@@ -1282,7 +1283,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
-      usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
+      usageComplete: attempt.accountingComplete && (parsedStream.resultJson !== null || parsed.type === "result"),
       errorMessage,
       errorCode: resolvedErrorCode,
       errorFamily,
