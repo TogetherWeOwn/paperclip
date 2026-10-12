@@ -1,3 +1,4 @@
+import type { IssueUnblockDescriptorKind } from "../constants.js";
 import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
 import type {
   IssueCommentAuthorType,
@@ -535,6 +536,7 @@ export type IssueUnblockOwner = { agentId: string } | { userId: string } | "boar
 export interface IssueUnblockDescriptor {
   owner: IssueUnblockOwner;
   action: string;
+  kind?: IssueUnblockDescriptorKind;
 }
 
 export interface IssueRecoveryAction {

@@ -560,6 +560,49 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     return { ...fixture, action: action! };
   }
 
+  async function requestStaleContinuation(agentId: string, blockedIssueId: string, idempotencyKey: string) {
+    await heartbeatService(db).wakeup(agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
+      requestedByActorType: "system", requestedByActorId: null, idempotencyKey,
+      payload: { issueId: blockedIssueId },
+      // responsibleUserId keeps the dependency gate and responsible-user resolution from
+      // masking the closed-issue guard: without the guard this wake would queue a run.
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed", responsibleUserId: "responsible-user" },
+    });
+  }
+
+  it.each(["done", "cancelled"] as const)("rejects a continuation for a %s issue before a heartbeat run is created", async (status) => {
+    const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    await db.update(issues).set({ status }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+
+    await requestStaleContinuation(coderId, blockedIssueId, `stale-continuation-${status}`);
+
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wake).toMatchObject({ status: "skipped", runId: null, reason: "issue_continuation_issue_closed" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("queues a continuation run once a reopened issue is back in progress for its assignee", async () => {
+    const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, blockedIssueId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, coderId));
+    await heartbeatService(db).wakeup(coderId, {
+      source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
+      requestedByActorType: "system", requestedByActorId: null, idempotencyKey: "reopened-continuation",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_continuation_needed", responsibleUserId: "responsible-user" },
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([
+      expect.objectContaining({ status: "queued", reason: "issue_continuation_needed" }),
+    ]);
+  });
+
   it.each(["active", "resolved"] as const)("keeps repeated wakes behind a %s execution hold run-free, then resumes once", async (status) => {
     const { companyId, agentId, blockedIssueId, action } = await seedExecutionWait(status);
     const heartbeat = heartbeatService(db);
@@ -648,6 +691,25 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(resumed?.contextSnapshot?.wakeCommentIds).toEqual(commentIds);
     const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
     expect(receipts.filter((row) => row.status === "coalesced")).toHaveLength(2);
+  });
+
+  it("does not heal a resolved dependent that holds a denial descriptor", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" } })
+      .where(eq(issues.id, blockedIssueId));
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(0);
+    expect(result.holdSkipped).toBe(1);
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(wakes).toHaveLength(0);
   });
 
   it("retries a resolved dependency wake when the prior wake was skipped as stale", async () => {

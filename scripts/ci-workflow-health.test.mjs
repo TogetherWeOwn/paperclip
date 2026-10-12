@@ -141,7 +141,7 @@ test("forks reject every publishing job even with otherwise successful prerequis
   }
 });
 
-test("changes gates omit unrelated PR work but run full master/nightly and dependency changes", () => {
+test("PR selection runs all non-docs work while master, nightly and explicit calls always run", () => {
   for (const scope of ["docker", "smoke", "release", "workflows"]) {
     assert.equal(affectedWork("pull_request", scope, ["doc/PRODUCT.md"]), false);
     for (const event of ["push", "schedule", "workflow_dispatch", "workflow_call"]) assert.equal(affectedWork(event, scope, []), true);
@@ -151,8 +151,80 @@ test("changes gates omit unrelated PR work but run full master/nightly and depen
   }
   assert.equal(affectedWork("pull_request", "docker", ["Dockerfile"]), true);
   assert.equal(affectedWork("pull_request", "workflows", ["scripts/source-onboard-smoke.test.mjs"]), true);
-  assert.equal(affectedWork("pull_request", "workflows", ["ui/src/App.tsx"]), false);
+  assert.equal(affectedWork("pull_request", "workflows", ["ui/src/App.tsx"]), true);
   assert.throws(() => affectedWork("schedule", "unknown", []), /Unknown CI scope/);
+});
+
+test("only docs-only paths are unaffected; every other path fails closed", () => {
+  for (const scope of ["docker", "smoke", "release", "workflows", "pr"]) {
+    for (const files of [["doc/PRODUCT.md"], ["doc/plans/2026-10-11-note.md"], ["README.md"], ["CONTRIBUTING.md"], ["doc/PRODUCT.md", "README.md"]]) {
+      assert.equal(affectedWork("pull_request", scope, files), false, `${scope}: ${files.join(", ")}`);
+    }
+    for (const file of [
+      "skills/paperclip/SKILL.md", "announcements/2026-10-11.md", "unknown-top-level/notes.md", "LICENSE",
+      ".npmrc", ".pnpmfile.cjs", ".pnpmfile.mjs", ".pnpmfile.js",
+      "doc/tool.sh", "doc/diagram.png", "ui/src/App.tsx", ".github/CODEOWNERS", "scripts/ci-affected-work.mjs",
+    ]) {
+      assert.equal(affectedWork("pull_request", scope, [file]), true, `${scope}: ${file}`);
+    }
+    assert.equal(affectedWork("pull_request", scope, ["doc/PRODUCT.md", "skills/paperclip/SKILL.md"]), true, `${scope}: mixed`);
+    assert.equal(affectedWork("pull_request", scope, []), true, `${scope}: empty diff`);
+  }
+});
+
+test("a PR that edits the classifier is affected under the base copy, while its own edited copy would skip", () => {
+  const trusted = readFileSync(fileURLToPath(new URL("./ci-affected-work.mjs", import.meta.url)), "utf8");
+  const edited = 'import { appendFileSync } from "node:fs";\nappendFileSync(process.env.GITHUB_OUTPUT, "affected=false\\n");\n';
+  const scratch = process.env.PAPERCLIP_RUN_SCRATCH_DIR || process.env.PAPERCLIP_SCRATCH_DIR || process.env.RUNNER_TEMP || tmpdir();
+  const root = mkdtempSync(join(scratch, "ci-affected-work-trust-"));
+  const git = (...args) => execFileSync("git", ["-c", "user.name=CI Fixture", "-c", "user.email=ci-fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+    cwd: root, env: { PATH: process.env.PATH }, encoding: "utf8",
+  }).trim();
+  try {
+    git("init", "-q");
+    mkdirSync(join(root, "scripts"), { recursive: true });
+    mkdirSync(join(root, "doc"), { recursive: true });
+    writeFileSync(join(root, "scripts/ci-affected-work.mjs"), trusted);
+    writeFileSync(join(root, "doc/PRODUCT.md"), "unchanged fixture\n");
+    git("add", ".");
+    git("commit", "-qm", "fixture base");
+    const base = git("rev-parse", "HEAD");
+    writeFileSync(join(root, "scripts/ci-affected-work.mjs"), edited);
+    git("commit", "-qam", "fixture classifier edit");
+    const head = git("rev-parse", "HEAD");
+    mkdirSync(join(root, "selectors"));
+    writeFileSync(join(root, "selectors/trusted.mjs"), trusted);
+    writeFileSync(join(root, "selectors/edited.mjs"), edited);
+    const select = (selector) => {
+      const output = join(root, "output");
+      writeFileSync(output, "");
+      const result = spawnSync(process.execPath, [join(root, "selectors", selector)], {
+        cwd: root, encoding: "utf8",
+        env: { PATH: process.env.PATH, CI_EVENT: "pull_request", CI_SCOPE: "pr", CI_BASE_SHA: base, CI_HEAD_SHA: head, GITHUB_OUTPUT: output },
+      });
+      assert.equal(result.status, 0, result.error || result.stdout || result.stderr);
+      return readFileSync(output, "utf8");
+    };
+    assert.equal(select("trusted.mjs"), "affected=true\n");
+    assert.equal(select("edited.mjs"), "affected=false\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ci-changes runs the classifier from the trusted base and fetches the PR head only to diff", () => {
+  const changes = job(workflow("ci-changes"), "changes");
+  const checkout = changes.indexOf("uses: actions/checkout");
+  const fetchHead = changes.indexOf("git fetch --no-tags");
+  const select = changes.indexOf("run: node scripts/ci-affected-work.mjs");
+  assert.ok(checkout >= 0 && fetchHead > checkout && select > fetchHead, "checkout, then head fetch, then selection");
+  const setup = changes.slice(checkout, fetchHead);
+  assert.match(setup, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.sha \}\}/);
+  assert.match(setup, /fetch-depth: 0/);
+  assert.match(setup, /persist-credentials: false/);
+  assert.doesNotMatch(changes, /ref: \$\{\{ github\.event\.pull_request\.head/);
+  assert.equal(changes.match(/uses:\s*["']?actions\/checkout/g).length, 1, "the only checkout is the base checkout");
+  assert.deepEqual(changes.match(/\bgit [a-z-]+/g), ["git fetch"], "the only git command fetches the head as diff data");
 });
 
 test("PR selection includes removed and added paths in real Git renames", () => {
@@ -208,5 +280,35 @@ test("new CI aggregator fails on scope errors and affected failures, and accepts
       env: { CHANGES_RESULT: changes, AFFECTED: affected, VALIDATE_RESULT: validate }, encoding: "utf8",
     });
     assert.equal(result.status === 0, success);
+  }
+});
+
+test("pr-trusted ci-ok requires every affected lane and admits only deliberate skips", () => {
+  const block = job(workflow("pr-trusted"), "ci-ok");
+  assert.match(block, /if: \$\{\{ always\(\) \}\}/);
+  const script = block.split("        run: |\n")[1];
+  const cases = [
+    // [gate, changes, policy, verify, e2e, affected, serialized, canary, success]
+    ["success", "success", "success", "success", "success", "true", "success", "success", true],
+    ["success", "success", "success", "success", "success", "false", "skipped", "skipped", true],
+    ["success", "failure", "success", "failure", "success", "false", "skipped", "skipped", false],
+    ["failure", "success", "success", "success", "success", "true", "success", "success", false],
+    ["success", "success", "failure", "failure", "success", "true", "success", "success", false],
+    ["success", "success", "success", "failure", "success", "true", "success", "success", false],
+    ["success", "success", "success", "success", "failure", "true", "success", "success", false],
+    ["success", "success", "success", "success", "success", "true", "skipped", "success", false],
+    ["success", "success", "success", "success", "success", "true", "success", "failure", false],
+    ["success", "success", "success", "success", "success", "false", "success", "skipped", false],
+    ["success", "success", "success", "success", "success", "", "success", "success", false],
+  ];
+  for (const [gate, changes, policy, verify, e2e, affected, serialized, canary, success] of cases) {
+    const result = spawnSync("bash", ["-eu", "-c", script], {
+      env: {
+        GATE_RESULT: gate, CHANGES_RESULT: changes, POLICY_RESULT: policy, VERIFY_RESULT: verify,
+        E2E_RESULT: e2e, AFFECTED: affected, SERIALIZED_RESULT: serialized, CANARY_RESULT: canary,
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status === 0, success, `gate=${gate} changes=${changes} policy=${policy} verify=${verify} e2e=${e2e} affected=${affected} serialized=${serialized} canary=${canary}`);
   }
 });

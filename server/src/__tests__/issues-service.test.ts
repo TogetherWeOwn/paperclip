@@ -7223,3 +7223,200 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     expect(duplicates).toHaveLength(1);
   });
 });
+
+describeEmbeddedPostgres("issueService wakes skip denial- and hold-held issues", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-hold-wakes-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueRelations);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyWithAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Engineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("excludes denial- and hold-held dependents from blocker-resolution wakes", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const blockerId = randomUUID();
+    const deniedId = randomUUID();
+    const heldId = randomUUID();
+    const ordinaryId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "done", priority: "high" },
+      {
+        id: deniedId,
+        companyId,
+        title: "Denied dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess after the retention scope.", kind: "denial" },
+      },
+      {
+        id: heldId,
+        companyId,
+        title: "Held dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Confirm the custody hold is lifted.", kind: "hold" },
+      },
+      {
+        id: ordinaryId,
+        companyId,
+        title: "Ordinary dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Review the restored dependency." },
+      },
+    ]);
+    await db.insert(issueRelations).values(
+      [deniedId, heldId, ordinaryId].map((relatedIssueId) => ({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId,
+        type: "blocks" as const,
+      })),
+    );
+
+    const dependents = await svc.listWakeableBlockedDependents(blockerId);
+    expect(dependents.map((dependent) => dependent.id)).toEqual([ordinaryId]);
+  });
+
+  it("excludes a denial-held parent from child-completion wakes", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const heldParentId = randomUUID();
+    const ordinaryParentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: heldParentId,
+        companyId,
+        title: "Held parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      },
+      {
+        id: ordinaryParentId,
+        companyId,
+        title: "Ordinary parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+      { companyId, parentId: heldParentId, title: "Held child", status: "done", priority: "medium" },
+      { companyId, parentId: ordinaryParentId, title: "Ordinary child", status: "done", priority: "medium" },
+    ]);
+
+    expect(await svc.getWakeableParentAfterChildCompletion(heldParentId)).toBeNull();
+    expect((await svc.getWakeableParentAfterChildCompletion(ordinaryParentId))?.id).toBe(ordinaryParentId);
+  });
+
+  it("clears a held descriptor on checkout so a later blocked cycle can auto-release", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const firstBlockerId = randomUUID();
+    const nextBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: firstBlockerId, companyId, title: "Resolved blocker", status: "done", priority: "medium" },
+      { id: nextBlockerId, companyId, title: "Next blocker", status: "todo", priority: "medium" },
+      {
+        id: dependentId,
+        companyId,
+        title: "Previously denied dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: firstBlockerId,
+      relatedIssueId: dependentId,
+      type: "blocks",
+    });
+
+    const checkedOut = await svc.checkout(dependentId, agentId, ["blocked"], null);
+
+    expect(checkedOut).toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    await svc.update(dependentId, {
+      status: "blocked",
+      blockedByIssueIds: [nextBlockerId],
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, nextBlockerId));
+
+    expect((await svc.listWakeableBlockedDependents(nextBlockerId)).map((row) => row.id)).toContain(dependentId);
+  });
+
+  it("returns the held parent descriptor from the stop-relay path", async () => {
+    const { companyId, agentId } = await seedCompanyWithAgent();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Denial-held parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" },
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Low-trust child",
+        status: "cancelled",
+        priority: "medium",
+      },
+    ]);
+
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    const relay = await svc.addStopRelayCommentIfNeeded(child);
+
+    expect(relay).not.toBeNull();
+    expect(relay?.parent.unblockDescriptor).toMatchObject({ kind: "denial" });
+    expect(relay?.comment.issueId).toBe(parentId);
+    // The relay comment is idempotent for the same child status.
+    await expect(svc.addStopRelayCommentIfNeeded(child)).resolves.toBeNull();
+  });
+});

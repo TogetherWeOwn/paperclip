@@ -197,6 +197,9 @@ export const ISSUE_STATUSES = [
 ] as const;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
+export const ISSUE_UNBLOCK_DESCRIPTOR_KINDS = ["denial", "hold"] as const;
+export type IssueUnblockDescriptorKind = (typeof ISSUE_UNBLOCK_DESCRIPTOR_KINDS)[number];
+
 export const INBOX_MINE_ISSUE_STATUSES = [
   "backlog",
   "todo",

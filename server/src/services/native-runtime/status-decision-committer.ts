@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
+import type { CreateIssueThreadInteraction, IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
@@ -55,6 +55,18 @@ export class NativeStatusRaceError extends Error {
     super("native_status_race");
     this.name = "NativeStatusRaceError";
   }
+}
+
+// A denial or hold survives a native rewrite while the issue stays blocked; only its owner releases it.
+function carryHeldUnblockDescriptor(
+  currentStatus: string,
+  current: IssueUnblockDescriptor | null | undefined,
+  next: IssueUnblockDescriptor | null,
+  toStatus: NativeStatusDecision["toStatus"],
+): IssueUnblockDescriptor | null {
+  if (currentStatus !== "blocked" || toStatus !== "blocked" || current?.kind == null) return next;
+  if (next == null) return current;
+  return { ...next, kind: current.kind };
 }
 
 /** Reconciliation delivery resumes ledger work only; it never re-arbitrates. */
@@ -749,10 +761,20 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "bind_blocker") {
     failAt("blocker_materialization", input.failpoint);
+    const [current] = await input.tx
+      .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues)
+      .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId)))
+      .limit(1);
     const [bound] = await input.tx
       .update(issues)
       .set({
-        unblockDescriptor: { owner: effect.owner, action: effect.action },
+        unblockDescriptor: carryHeldUnblockDescriptor(
+          current?.status ?? "",
+          current?.unblockDescriptor,
+          { owner: effect.owner, action: effect.action },
+          "blocked",
+        ),
         updatedAt: new Date(),
       })
       .where(
@@ -1873,13 +1895,23 @@ export async function commitNativeStatusDecision(input: {
       if (!updated) throw new NativeStatusRaceError();
     } else {
       failAt("status_projection", input.failpoint);
+      const [heldRow] = await tx
+        .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .limit(1);
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
           status: input.decision.toStatus,
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
-          unblockDescriptor: input.decision.unblockDescriptor,
+          unblockDescriptor: carryHeldUnblockDescriptor(
+            heldRow?.status ?? "",
+            heldRow?.unblockDescriptor,
+            input.decision.unblockDescriptor,
+            input.decision.toStatus,
+          ),
           actorAgentId: null,
           actorUserId: null,
         },

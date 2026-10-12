@@ -360,7 +360,15 @@ export function aiConnectionService(db: Db) {
         (input.allowUninstalledShared && binding.mode === "shared" && grant.kind === "organization")
       )
     )
-      throw forbidden("This connection is not permitted for this agent");
+      // A responsible user's own uninstalled personal default is repairable:
+      // completing a purpose=ai intent installs the account on the agent
+      // before re-checking permission, so this failure stays reconnectable.
+      throw forbidden(
+        "This connection is not permitted for this agent",
+        binding.mode === "responsible_user"
+          ? { code: "ai_connection_not_installed" }
+          : undefined,
+      );
     return {
       ...row,
       attribution: {

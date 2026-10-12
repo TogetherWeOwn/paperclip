@@ -7,6 +7,7 @@ scripts/release*.sh @Rick7C2
 scripts/release-*.mjs @Rick7C2
 scripts/create-github-release.sh @Rick7C2
 scripts/rollback-latest.sh @Rick7C2
+scripts/ci-*.mjs @Rick7C2
 doc/RELEASING.md @Rick7C2
 doc/PUBLISHING.md @Rick7C2
 doc/RELEASE-AUTOMATION-SETUP.md @Rick7C2

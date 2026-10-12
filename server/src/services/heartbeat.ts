@@ -16,7 +16,7 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { isNeverStartedLegacyRun } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, shouldRequestAiConnectionIntentOnPrepareFailure, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -167,6 +167,7 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { isUniqueViolation } from "../db-errors.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -20600,13 +20601,60 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // Each claim commits on its own. A later claim that throws must never
+      // abandon claims already committed in this batch: those runs are
+      // `running` with no executor, and nothing renews their lease until the
+      // orphan reaper fails them as process_lost.
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let claimFailure: { error: unknown } | null = null;
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
+        try {
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed) claimedRuns.push(claimed);
+        } catch (error) {
+          // claimQueuedRun also does work after its claim transaction commits
+          // (events, wake status, issue lock stamp). If the throw came from
+          // there, the run is already `running`: dispatch it rather than leave
+          // it without an executor.
+          const committed = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, queuedRun.id))
+            .then((rows) => rows[0] ?? null)
+            .catch(() => null);
+          if (committed?.status === "running") {
+            claimedRuns.push(committed);
+            logger.error(
+              { err: error, runId: queuedRun.id, agentId },
+              "queued run claim threw after commit; dispatching the committed claim",
+            );
+            if (isUniqueViolation(error, "issues_open_routine_execution_uq")) continue;
+            claimFailure = { error };
+            break;
+          }
+          if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+            // Another run already holds this routine's execution slot. The
+            // claim transaction rolled back, so the run is still queued and
+            // is retried once the holder releases the slot.
+            logger.info(
+              { runId: queuedRun.id, agentId },
+              "queued run deferred: routine execution slot is held",
+            );
+            continue;
+          }
+          claimFailure = { error };
+          logger.error(
+            { err: error, runId: queuedRun.id, agentId },
+            "queued run claim failed; dispatching claims already committed",
+          );
+          break;
+        }
       }
-      if (claimedRuns.length === 0) return [];
+      if (claimedRuns.length === 0) {
+        if (claimFailure) throw claimFailure.error;
+        return [];
+      }
 
       for (const claimedRun of claimedRuns) {
         // Fire-and-forget runs execute after the response; keep the waking
@@ -22063,8 +22111,17 @@ export function heartbeatService(
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
             return;
           }
-          if (responsibleUserId && issueId && aiBinding.mode === "responsible_user") {
-            await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
+          // Only a genuinely missing credential warrants a purpose=ai card.
+          // Incompatible harness/model bindings, access denials, and
+          // transient races cannot be repaired by reconnecting, so they must
+          // not open spurious intents. A missing install on the agent stays
+          // reconnectable because completing the card adds it. The run still
+          // fails with the configuration-incomplete receipt below.
+          // Narrow first: the predicate also checks this, but only a non-null
+          // id can be sent with the request below.
+          const requestUserId = responsibleUserId;
+          if (requestUserId && shouldRequestAiConnectionIntentOnPrepareFailure({ responsibleUserId: requestUserId, issueId, bindingMode: aiBinding.mode, error })) {
+            await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: requestUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
               logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
             });
           }
@@ -28363,6 +28420,35 @@ export function heartbeatService(
                   .where(eq(issues.id, issue.id));
               }
             }
+          }
+
+          if (
+            reason === "issue_continuation_needed" &&
+            ["done", "cancelled"].includes(issue.status)
+          ) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_continuation_issue_closed",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  code: "issue_continuation_issue_closed",
+                  reason: "Issue closed before the continuation run was created.",
+                  issueId: issue.id,
+                  actualStatus: issue.status,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
           }
 
           const dependencyReadiness = await issuesSvc
