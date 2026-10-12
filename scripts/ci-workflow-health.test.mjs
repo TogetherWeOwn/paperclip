@@ -172,7 +172,7 @@ test("only docs-only paths are unaffected; every other path fails closed", () =>
   }
 });
 
-test("a PR that edits the classifier is affected under the base copy, while its own edited copy would skip", () => {
+test("a PR that edits the classifier is affected under the trusted copy, while its own edited copy would skip", () => {
   const trusted = readFileSync(fileURLToPath(new URL("./ci-affected-work.mjs", import.meta.url)), "utf8");
   const edited = 'import { appendFileSync } from "node:fs";\nappendFileSync(process.env.GITHUB_OUTPUT, "affected=false\\n");\n';
   const scratch = process.env.PAPERCLIP_RUN_SCRATCH_DIR || process.env.PAPERCLIP_SCRATCH_DIR || process.env.RUNNER_TEMP || tmpdir();
@@ -212,19 +212,83 @@ test("a PR that edits the classifier is affected under the base copy, while its 
   }
 });
 
-test("ci-changes runs the classifier from the trusted base and fetches the PR head only to diff", () => {
+test("ci-changes selects work with the classifier from trusted master, never from the PR base", () => {
   const changes = job(workflow("ci-changes"), "changes");
-  const checkout = changes.indexOf("uses: actions/checkout");
+  const baseCheckout = changes.indexOf("uses: actions/checkout");
+  const trustedStep = changes.indexOf("- name: Checkout trusted classifier");
   const fetchHead = changes.indexOf("git fetch --no-tags");
-  const select = changes.indexOf("run: node scripts/ci-affected-work.mjs");
-  assert.ok(checkout >= 0 && fetchHead > checkout && select > fetchHead, "checkout, then head fetch, then selection");
-  const setup = changes.slice(checkout, fetchHead);
-  assert.match(setup, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.sha \}\}/);
-  assert.match(setup, /fetch-depth: 0/);
-  assert.match(setup, /persist-credentials: false/);
+  const select = changes.indexOf("- name: Select affected work");
+  assert.ok(baseCheckout >= 0 && trustedStep > baseCheckout && fetchHead > trustedStep && select > fetchHead, "base checkout, trusted checkout, head fetch, then selection");
+  const base = changes.slice(baseCheckout, trustedStep);
+  assert.match(base, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.sha \}\}/);
+  assert.match(base, /fetch-depth: 0/);
+  assert.match(base, /persist-credentials: false/);
+  const trusted = changes.slice(trustedStep, fetchHead);
+  assert.match(trusted, /uses: actions\/checkout@[0-9a-f]{40}/);
+  assert.match(trusted, /ref: master\n/);
+  assert.match(trusted, /path: \.trusted-ci\n/);
+  assert.match(trusted, /sparse-checkout: scripts\/ci-affected-work\.mjs\n/);
+  assert.match(trusted, /sparse-checkout-cone-mode: false\n/);
+  assert.match(trusted, /persist-credentials: false/);
   assert.doesNotMatch(changes, /ref: \$\{\{ github\.event\.pull_request\.head/);
-  assert.equal(changes.match(/uses:\s*["']?actions\/checkout/g).length, 1, "the only checkout is the base checkout");
+  assert.equal(changes.match(/uses:\s*["']?actions\/checkout/g).length, 2, "base checkout plus the trusted master classifier only");
   assert.deepEqual(changes.match(/\bgit [a-z-]+/g), ["git fetch"], "the only git command fetches the head as diff data");
+  const run = changes.split("        run: |\n")[1] ?? "";
+  assert.match(run, /classifier=\.trusted-ci\/scripts\/ci-affected-work\.mjs/);
+  assert.doesNotMatch(run, /(?<![\w./-])scripts\/ci-affected-work\.mjs/, "no classifier path resolves in the PR base checkout");
+  assert.ok(run.indexOf('test -f "$classifier"') >= 0 && run.indexOf('test -f "$classifier"') < run.indexOf('node "$classifier"'), "a missing trusted classifier fails before node runs");
+});
+
+test("selection runs the trusted classifier when the PR base predates it, and fails closed without it", () => {
+  const run = job(workflow("ci-changes"), "changes").split("        run: |\n")[1] ?? "";
+  assert.notEqual(run, "", "the selection step has a multi-line run block");
+  const trusted = readFileSync(fileURLToPath(new URL("./ci-affected-work.mjs", import.meta.url)), "utf8");
+  const scratch = process.env.PAPERCLIP_RUN_SCRATCH_DIR || process.env.PAPERCLIP_SCRATCH_DIR || process.env.RUNNER_TEMP || tmpdir();
+  const root = mkdtempSync(join(scratch, "ci-changes-trusted-"));
+  const git = (...args) => execFileSync("git", ["-c", "user.name=CI Fixture", "-c", "user.email=ci-fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+    cwd: root, env: { PATH: process.env.PATH }, encoding: "utf8",
+  }).trim();
+  const select = (base, head) => {
+    const output = join(root, "output");
+    writeFileSync(output, "");
+    const result = spawnSync("bash", ["-eo", "pipefail", "-c", run], {
+      cwd: root, encoding: "utf8",
+      env: { PATH: process.env.PATH, CI_EVENT: "pull_request", CI_SCOPE: "pr", CI_BASE_SHA: base, CI_HEAD_SHA: head, GITHUB_OUTPUT: output },
+    });
+    return { status: result.status, log: `${result.stdout}${result.stderr}`, affected: readFileSync(output, "utf8") };
+  };
+  try {
+    git("init", "-q");
+    mkdirSync(join(root, "doc"), { recursive: true });
+    writeFileSync(join(root, "doc/PRODUCT.md"), "old base predates the classifier\n");
+    git("add", ".");
+    git("commit", "-qm", "old base");
+    const base = git("rev-parse", "HEAD");
+    writeFileSync(join(root, "doc/PRODUCT.md"), "docs-only change\n");
+    git("commit", "-qam", "docs-only pr");
+    const docsHead = git("rev-parse", "HEAD");
+    git("checkout", "-q", "--detach", base);
+    mkdirSync(join(root, "ui/src"), { recursive: true });
+    writeFileSync(join(root, "ui/src/App.tsx"), "export const App = 1;\n");
+    git("add", ".");
+    git("commit", "-qm", "code pr");
+    const codeHead = git("rev-parse", "HEAD");
+    assert.notEqual(spawnSync(process.execPath, ["scripts/ci-affected-work.mjs"], { cwd: root, encoding: "utf8" }).status, 0, "the old base cannot run its own classifier");
+    mkdirSync(join(root, ".trusted-ci/scripts"), { recursive: true });
+    writeFileSync(join(root, ".trusted-ci/scripts/ci-affected-work.mjs"), trusted);
+    const docs = select(base, docsHead);
+    assert.equal(docs.status, 0, docs.log);
+    assert.equal(docs.affected, "affected=false\n");
+    const code = select(base, codeHead);
+    assert.equal(code.status, 0, code.log);
+    assert.equal(code.affected, "affected=true\n");
+    rmSync(join(root, ".trusted-ci"), { recursive: true, force: true });
+    const missing = select(base, codeHead);
+    assert.notEqual(missing.status, 0, "a missing trusted classifier must not select work");
+    assert.match(missing.log, /Trusted CI classifier missing/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("PR selection includes removed and added paths in real Git renames", () => {
