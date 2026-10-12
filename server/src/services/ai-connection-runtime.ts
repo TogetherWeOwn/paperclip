@@ -21,6 +21,51 @@ export function isAiConnectionBusy(error: unknown): error is HttpError {
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_busy";
 }
 
+// Error codes where asking the responsible user to (re)connect this AI
+// provider can actually repair the run. Mirrors the hire-time allowlist in
+// routes/agents.ts validateManagedAgentBinding: compatibility and access
+// denials stay errors because reconnecting cannot fix them. Anything else —
+// an incompatible harness/model binding, a forbidden audience, a transient
+// default-changed race, or an infrastructure failure — must not open a
+// purpose=ai connection intent.
+const AI_CONNECTION_RECONNECT_CODES = new Set([
+  "ai_connection_default_missing",
+  "ai_connection_missing",
+  "ai_connection_unavailable",
+  "ai_connection_responsible_user_missing",
+  // Run-time only: the grant exists but its credential is gone, so only a
+  // reconnect repairs it. Hire-time validation cannot produce this code.
+  "ai_connection_credential_missing",
+  // Run-time only: the responsible user's personal default exists but has no
+  // install on this agent. Completing a purpose=ai intent adds the install
+  // before re-checking permission, so the card repairs this case.
+  "ai_connection_not_installed",
+]);
+
+export function isAiConnectionReconnectable(error: unknown): boolean {
+  return error instanceof HttpError &&
+    AI_CONNECTION_RECONNECT_CODES.has(
+      String((error.details as { code?: unknown } | undefined)?.code),
+    );
+}
+
+// The run-prepare branch in heartbeat.ts opens a purpose=ai card through this
+// predicate, so tests can exercise the exact gate decision without booting a
+// full heartbeat run.
+export function shouldRequestAiConnectionIntentOnPrepareFailure(input: {
+  responsibleUserId: string | null;
+  issueId: string | null | undefined;
+  bindingMode: AiConnectionBinding["mode"];
+  error: unknown;
+}): boolean {
+  return Boolean(
+    input.responsibleUserId &&
+      input.issueId &&
+      input.bindingMode === "responsible_user" &&
+      isAiConnectionReconnectable(input.error),
+  );
+}
+
 // Blank values intentionally override inherited credentials in CLI child environments.
 export const AI_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",

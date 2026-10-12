@@ -12,7 +12,8 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, isAiConnectionReconnectable, shouldRequestAiConnectionIntentOnPrepareFailure } from "../services/ai-connection-runtime.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -813,4 +814,106 @@ describe("AI connection recovery delivery", () => {
       }
     }, 30000,
   );
+});
+
+describe("AI connection intent gating on prepare failure", () => {
+  it("treats only genuine missing-credential failures as reconnectable", () => {
+    for (const code of [
+      "ai_connection_default_missing",
+      "ai_connection_missing",
+      "ai_connection_unavailable",
+      "ai_connection_responsible_user_missing",
+      "ai_connection_credential_missing",
+      "ai_connection_not_installed",
+    ]) {
+      expect(isAiConnectionReconnectable(unprocessable("fixture", { code })), code).toBe(true);
+    }
+    for (const code of ["ai_connection_incompatible", "ai_connection_busy"]) {
+      expect(isAiConnectionReconnectable(unprocessable("fixture", { code })), code).toBe(false);
+    }
+    expect(isAiConnectionReconnectable(forbidden("fixture"))).toBe(false);
+    expect(isAiConnectionReconnectable(unprocessable("fixture"))).toBe(false);
+    expect(isAiConnectionReconnectable(new Error("The selected default changed. Retry this execution."))).toBe(false);
+    expect(isAiConnectionReconnectable(null)).toBe(false);
+  });
+
+  it("grounds the gate in real select() errors: incompatible opens nothing, missing default still opens", async () => {
+    const incompatibleUser = `gate-incompatible-${randomUUID()}`;
+    const missingUser = `gate-missing-${randomUUID()}`;
+    await db.insert(companyMemberships).values([incompatibleUser, missingUser].map(principalId => ({ companyId, principalId, principalType: "user", status: "active", membershipRole: "member" })));
+    const incompatibleError = await service.select({ ...input, adapterType: "codex_local", userId: incompatibleUser }).then(() => null, (error: unknown) => error);
+    expect(incompatibleError).toBeInstanceOf(Error);
+    expect(String((incompatibleError as { details?: { code?: unknown } }).details?.code)).toBe("ai_connection_incompatible");
+    expect(isAiConnectionReconnectable(incompatibleError)).toBe(false);
+    const missingError = await service.select({ ...input, userId: missingUser }).then(() => null, (error: unknown) => error);
+    expect(String((missingError as { details?: { code?: unknown } }).details?.code)).toBe("ai_connection_default_missing");
+    expect(isAiConnectionReconnectable(missingError)).toBe(true);
+  });
+
+  it("treats an uninstalled personal default as reconnectable at prepare time", async () => {
+    const userId = `gate-uninstalled-prepare-${randomUUID()}`;
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
+    await service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Uninstalled default", apiKey: "fixture", agentIds: [], allAgents: false }, "fixture-uninstalled");
+    const error = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: userId, adapterType: "claude_local", binding, config: { model: "fixture-model", env: {} } }).then(() => null, (error: unknown) => error);
+    expect(String((error as { details?: { code?: unknown } } | null)?.details?.code)).toBe("ai_connection_not_installed");
+    expect(isAiConnectionReconnectable(error)).toBe(true);
+  });
+
+  it("opens the card only for responsible_user runs with an issue and a reconnectable error", () => {
+    const reconnectable = unprocessable("fixture", { code: "ai_connection_default_missing" });
+    const base = { responsibleUserId: "user-1", issueId: randomUUID(), bindingMode: "responsible_user" as const, error: reconnectable };
+    expect(shouldRequestAiConnectionIntentOnPrepareFailure(base)).toBe(true);
+    expect(shouldRequestAiConnectionIntentOnPrepareFailure({ ...base, responsibleUserId: null })).toBe(false);
+    expect(shouldRequestAiConnectionIntentOnPrepareFailure({ ...base, issueId: null })).toBe(false);
+    expect(shouldRequestAiConnectionIntentOnPrepareFailure({ ...base, bindingMode: "shared" as const })).toBe(false);
+    expect(shouldRequestAiConnectionIntentOnPrepareFailure({ ...base, error: forbidden("fixture") })).toBe(false);
+  });
+
+  it("requests the purpose=ai card exactly when the prepare gate allows it", async () => {
+    const runPrepareGate = async (opts: {
+      tag: string;
+      adapterType: string;
+      setup?: (userId: string) => Promise<unknown>;
+    }) => {
+      const userId = `gate-${opts.tag}-${randomUUID()}`;
+      const gatedAgentId = randomUUID();
+      const gatedIssueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
+      await opts.setup?.(userId);
+      await db.insert(agents).values({ id: gatedAgentId, companyId, name: `Gated agent ${opts.tag}`, status: "active", adapterType: "claude_local", runtimeConfig: { aiConnection: binding } });
+      await db.insert(issues).values({ id: gatedIssueId, companyId, title: `Gate ${opts.tag}`, status: "in_progress", assigneeAgentId: gatedAgentId });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: gatedAgentId, status: "running", responsibleUserId: userId, contextSnapshot: { issueId: gatedIssueId } });
+      // Mirror the heartbeat run-prepare branch: prepare, then open the card
+      // only through the shared gate predicate.
+      const error = await prepareManagedAiRuntime(db, {
+        companyId, agentId: gatedAgentId, responsibleUserId: userId,
+        adapterType: opts.adapterType, binding, config: { model: "fixture-model", env: {} },
+      }).then(() => null, (error: unknown) => error);
+      expect(error, `${opts.tag} prepare should fail`).toBeInstanceOf(Error);
+      if (shouldRequestAiConnectionIntentOnPrepareFailure({ responsibleUserId: userId, issueId: gatedIssueId, bindingMode: binding.mode, error })) {
+        const outcome = await connectionIntentService(db).request(
+          { sub: gatedAgentId, company_id: companyId, run_id: runId, responsible_user_id: userId },
+          "anthropic",
+          { purpose: "ai" },
+        );
+        expect(outcome.state).toBe("needs_user_action");
+      }
+      return db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, gatedIssueId));
+    };
+    const isAiCard = (row: { kind: string; payload: unknown }) => row.kind === "connection_intent" && (row.payload as { purpose?: string }).purpose === "ai";
+
+    const incompatibleRows = await runPrepareGate({ tag: "incompatible", adapterType: "codex_local" });
+    expect(incompatibleRows.filter(isAiCard), "incompatible binding must open no card").toHaveLength(0);
+
+    const missingRows = await runPrepareGate({ tag: "missing", adapterType: "claude_local" });
+    expect(missingRows.filter(isAiCard), "missing default must open exactly one card").toHaveLength(1);
+
+    const uninstalledRows = await runPrepareGate({
+      tag: "uninstalled",
+      adapterType: "claude_local",
+      setup: (userId) => service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Uninstalled default", apiKey: "fixture", agentIds: [], allAgents: false }, "fixture-uninstalled"),
+    });
+    expect(uninstalledRows.filter(isAiCard), "uninstalled personal default must open exactly one card").toHaveLength(1);
+  });
 });
