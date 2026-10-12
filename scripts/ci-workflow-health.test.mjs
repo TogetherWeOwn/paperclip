@@ -282,3 +282,33 @@ test("new CI aggregator fails on scope errors and affected failures, and accepts
     assert.equal(result.status === 0, success);
   }
 });
+
+test("pr-trusted ci-ok requires every affected lane and admits only deliberate skips", () => {
+  const block = job(workflow("pr-trusted"), "ci-ok");
+  assert.match(block, /if: \$\{\{ always\(\) \}\}/);
+  const script = block.split("        run: |\n")[1];
+  const cases = [
+    // [gate, changes, policy, verify, e2e, affected, serialized, canary, success]
+    ["success", "success", "success", "success", "success", "true", "success", "success", true],
+    ["success", "success", "success", "success", "success", "false", "skipped", "skipped", true],
+    ["success", "failure", "success", "failure", "success", "false", "skipped", "skipped", false],
+    ["failure", "success", "success", "success", "success", "true", "success", "success", false],
+    ["success", "success", "failure", "failure", "success", "true", "success", "success", false],
+    ["success", "success", "success", "failure", "success", "true", "success", "success", false],
+    ["success", "success", "success", "success", "failure", "true", "success", "success", false],
+    ["success", "success", "success", "success", "success", "true", "skipped", "success", false],
+    ["success", "success", "success", "success", "success", "true", "success", "failure", false],
+    ["success", "success", "success", "success", "success", "false", "success", "skipped", false],
+    ["success", "success", "success", "success", "success", "", "success", "success", false],
+  ];
+  for (const [gate, changes, policy, verify, e2e, affected, serialized, canary, success] of cases) {
+    const result = spawnSync("bash", ["-eu", "-c", script], {
+      env: {
+        GATE_RESULT: gate, CHANGES_RESULT: changes, POLICY_RESULT: policy, VERIFY_RESULT: verify,
+        E2E_RESULT: e2e, AFFECTED: affected, SERIALIZED_RESULT: serialized, CANARY_RESULT: canary,
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status === 0, success, `gate=${gate} changes=${changes} policy=${policy} verify=${verify} e2e=${e2e} affected=${affected} serialized=${serialized} canary=${canary}`);
+  }
+});
