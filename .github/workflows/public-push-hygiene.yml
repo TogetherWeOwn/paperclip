@@ -5,13 +5,16 @@ run-name: Public push hygiene ${{ github.sha }}
 # PR workflows never see branch-only pushes, so this runs on every branch push
 # and scans the new publication population: commit messages plus added lines
 # of commits reachable from the pushed head but from no public line (origin
-# master and origin deploy/tog6). Feature branches are never public lines, so a
-# flagged commit stays flagged on every branch that carries it. History is
-# never rewritten. Direct pushes to master stay disabled by branch protection;
+# master, origin deploy/tog6, upstream paperclipai/paperclip master). Feature
+# branches are never public lines, so a flagged commit stays flagged on every
+# branch that carries it. History is never rewritten. Pushes to master and
+# deploy/tog6 are ignored like master: each merge there would otherwise flag
+# the line's whole already-public divergence with no recourse, and merges land
+# reviewed. Direct pushes to master stay disabled by branch protection;
 # making this check required is a repo-admin step owned by the Operator route.
 on:
   push:
-    branches-ignore: [master]
+    branches-ignore: [master, deploy/tog6]
 
 permissions: {}
 
@@ -31,6 +34,12 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch upstream master as a public line
+        run: |
+          # Credential-free: public upstream snapshot for fix/* branches cut
+          # from paperclipai/paperclip. If this fetch fails, the scanner exits
+          # 2 on the missing public line rather than scanning upstream history.
+          git fetch --no-tags https://github.com/paperclipai/paperclip.git master:refs/remotes/upstream/master
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -39,9 +48,9 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           PUSH_SELF_REF: refs/remotes/origin/${{ github.ref_name }}
         run: |
-          # The scanner excludes only public lines (origin master and deploy/tog6),
-          # minus this branch's own ref. A clean follow-up push cannot hide an
-          # earlier dirty commit, and merging master flags no master-owned
-          # commits. github.event.before dangles after amend/force-push, so it
-          # is not used.
+          # The scanner excludes only public lines (origin master, deploy/tog6,
+          # upstream master), minus this branch's own ref. A clean follow-up
+          # push cannot hide an earlier dirty commit, and merging a public line
+          # flags no line-owned commits. github.event.before dangles after
+          # amend/force-push, so it is not used.
           node scripts/check-public-push-hygiene.mjs --self-ref "$PUSH_SELF_REF" --head "$PUSH_HEAD"

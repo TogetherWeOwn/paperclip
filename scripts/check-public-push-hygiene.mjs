@@ -20,11 +20,18 @@
  *   text:     lines added by each of those commits (`git log -p --cc`): for a
  *             merge, only lines new relative to every parent (conflict
  *             resolutions), never content brought in from a parent
- * Public lines are PUBLIC_LINE_REFS, matched by exact name. Their history is
- * already public and is never flagged. A branch's own unshared history is
- * always scanned, including commits that another feature branch already
- * carries. Per-commit diffs mean a line added and removed within the push is
- * still flagged. History is never rewritten.
+ * Public lines are PUBLIC_LINE_REFS, matched by exact name: origin/master and
+ * origin/deploy/tog6 (fork-owned) plus upstream/master (paperclipai/paperclip,
+ * fetched credential-free in CI). Their history is already public and is never
+ * flagged. Pushes to a public line itself are out of scope: the workflow
+ * ignores master and deploy/tog6, and the script returns clean for those refs.
+ * A branch's own unshared history is always scanned, including commits that
+ * another feature branch already carries. Per-commit diffs mean a line added
+ * and removed within the push is still flagged. History is never rewritten.
+ * Local note: bare `pnpm check:public-hygiene` scans origin/master..HEAD as a
+ * pre-push approximation; CI scans HEAD --not <all public lines> via
+ * --self-ref. For a branch cut from deploy/tog6, approximate CI locally with
+ * `--base origin/deploy/tog6` before pushing.
  *
  * Exit codes (fail-closed, mirroring the public-comment hygiene gate):
  *   0 = clean, 1 = internal reference(s) found (blocked), 2 = scanner error.
@@ -51,9 +58,13 @@ export const DEFAULT_PREFIXES = ["TOG", "PAP", "PAPA"];
 // branch make content public-by-name. Feature branches are deliberately not
 // listed: a flagged commit on a feature branch must stay flagged for every
 // branch that carries it. Adding a line is a reviewed change here.
+// upstream/master is the paperclipai/paperclip master fetched credential-free
+// in CI; without it, upstream-cut fix/* branches would scan hundreds of
+// already-public upstream commits.
 export const PUBLIC_LINE_REFS = [
   "refs/remotes/origin/master",
   "refs/remotes/origin/deploy/tog6",
+  "refs/remotes/upstream/master",
 ];
 
 export const EXIT_CLEAN = 0;
@@ -190,13 +201,30 @@ function gitOutputLines(args) {
     .filter(Boolean);
 }
 
-/** Public-line refs to exclude for a push to `selfRef` (the pushed branch's own origin ref). */
+/**
+ * Public-line refs to exclude for a push to `selfRef` (the pushed branch's own
+ * origin ref). Fail-closed: every expected public line except the pushed ref
+ * itself must resolve. A missing line means an incomplete fetch, and silently
+ * scoping to less would either false-red on already-public history or, worse,
+ * let a mis-scoped green look clean. Missing lines throw so the caller exits 2.
+ */
 export function resolvePublicLineRefs({ selfRef }) {
-  return gitOutputLines([
-    "for-each-ref",
-    "--format=%(refname)",
-    ...PUBLIC_LINE_REFS,
-  ]).filter((ref) => ref !== selfRef);
+  const existing = new Set(
+    gitOutputLines([
+      "for-each-ref",
+      "--format=%(refname)",
+      ...PUBLIC_LINE_REFS,
+    ]),
+  );
+  const missing = PUBLIC_LINE_REFS.filter(
+    (ref) => ref !== selfRef && !existing.has(ref),
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `missing public line ref(s): ${missing.join(", ")} (fetch all public lines first)`,
+    );
+  }
+  return [...existing].filter((ref) => ref !== selfRef);
 }
 
 // Plain ref names and SHAs only: revision syntax (^, ~, .., @{...}) and option-like
@@ -244,6 +272,17 @@ export function runPublicPushHygieneCheck({
     return EXIT_SCANNER_ERROR;
   }
 
+  // Pushes to a public line itself (master, deploy/tog6) carry that line's
+  // whole already-public history. The workflow ignores those pushes because a
+  // post-merge flag has no recourse; the script returns clean so a manual run
+  // matches CI instead of permanently flagging history.
+  if (selfRef !== undefined && PUBLIC_LINE_REFS.includes(selfRef)) {
+    log(
+      `  ✓  Push to public line ${selfRef}: history not scanned (public-line pushes are out of scope).`,
+    );
+    return EXIT_CLEAN;
+  }
+
   let exclusions;
   try {
     if (base) {
@@ -255,7 +294,7 @@ export function runPublicPushHygieneCheck({
     }
   } catch (err) {
     error(
-      `ERROR: cannot scope the publication range (${err.message}). Refusing to pass an unscoped scan.`,
+      `ERROR: cannot scope the publication range (${err.message}). Refusing to pass an unscoped scan. Push the branch or fetch origin first; to approximate CI before pushing, use --base <parent public line> (origin/master, or origin/deploy/tog6 for port branches).`,
     );
     return EXIT_SCANNER_ERROR;
   }
@@ -358,7 +397,7 @@ function main() {
       "Usage: node scripts/check-public-push-hygiene.mjs [--self-ref <origin ref> | --base <ref>] [--head <ref>] [--prefix <PREFIX>]...",
     );
     out(
-      "Defaults: --head HEAD; with neither --self-ref nor --base, --base origin/master. Prefixes default to TOG,PAP,PAPA plus $PUBLIC_HYGIENE_PREFIXES.",
+      "Defaults: --head HEAD; with neither --self-ref nor --base, --base origin/master. CI uses --self-ref (HEAD --not all public lines). Bare local runs approximate with origin/master..HEAD; for deploy-cut branches use --base origin/deploy/tog6 before pushing. Prefixes default to TOG,PAP,PAPA plus $PUBLIC_HYGIENE_PREFIXES.",
     );
     process.exit(args.help ? EXIT_CLEAN : EXIT_SCANNER_ERROR);
   }

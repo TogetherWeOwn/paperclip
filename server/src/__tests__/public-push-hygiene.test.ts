@@ -355,6 +355,11 @@ describe("public push hygiene gate", () => {
     );
     expect(workflow).toContain("--self-ref");
     expect(workflow).not.toContain("git merge-base origin/master");
+    // Upstream master is a public line for fix/* branches cut from upstream.
+    expect(workflow).toContain("paperclipai/paperclip.git");
+    expect(workflow).toContain("refs/remotes/upstream/master");
+    // Pushes to either fork public line are out of scope (master already was).
+    expect(workflow).toContain("deploy/tog6");
     // The workflow comment explains why event.before is ignored; only an
     // actual `${{ ... }}` interpolation would wire the dangling delta back in.
     expect(workflow).not.toMatch(/\$\{\{\s*github\.event\.before/);
@@ -411,10 +416,12 @@ function commitFixtureFile(
 }
 
 // master at the base commit; the deploy line carries an already-public dirty
-// commit on top of it. HEAD is left at the deploy tip.
+// commit on top of it; upstream/master tracks the same base (clean) unless a
+// test moves it. HEAD is left at the deploy tip.
 function publicLayout(git: (...args: string[]) => string, root: string) {
   const master = commitFixtureFile(git, root, "base.txt", "fixture base");
   git("update-ref", "refs/remotes/origin/master", master);
+  git("update-ref", "refs/remotes/upstream/master", master);
   const legacy = commitFixtureFile(
     git,
     root,
@@ -579,10 +586,95 @@ describe("public push hygiene scope on non-master lines", () => {
     });
   });
 
-  it("scans the deploy line's own history against master on a push to the deploy line", () => {
+  it("does not flag history on a push to a public line itself (workflow ignores those pushes)", () => {
     withFixtureRepo((git, root) => {
-      const { legacy } = publicLayout(git, root);
+      publicLayout(git, root);
       const selfRef = "refs/remotes/origin/deploy/tog6";
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not flag history on a push to origin/master itself", () => {
+    withFixtureRepo((git, root) => {
+      const { master } = publicLayout(git, root);
+      git("checkout", "-q", "--detach", master);
+      const selfRef = "refs/remotes/origin/master";
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("treats upstream-only history as public: clean commit on an upstream-cut branch exits 0", () => {
+    withFixtureRepo((git, root) => {
+      const master = commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", master);
+      const upstreamDirty = commitFixtureFile(
+        git,
+        root,
+        "upstream.md",
+        `upstream already-public Refs ${DIRTY_ID}`,
+      );
+      git("update-ref", "refs/remotes/upstream/master", upstreamDirty);
+      git("update-ref", "refs/remotes/origin/deploy/tog6", master);
+      commitFixtureFile(git, root, "port.txt", "clean upstream-cut follow-up");
+      const selfRef = "refs/remotes/origin/fix/upstream-cut";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(0);
+      expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("flags only the branch's own dirty commit on top of upstream history", () => {
+    withFixtureRepo((git, root) => {
+      const master = commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", master);
+      const upstreamDirty = commitFixtureFile(
+        git,
+        root,
+        "upstream.md",
+        `upstream already-public Refs ${DIRTY_ID}`,
+      );
+      git("update-ref", "refs/remotes/upstream/master", upstreamDirty);
+      git("update-ref", "refs/remotes/origin/deploy/tog6", master);
+      const dirty = commitFixtureFile(
+        git,
+        root,
+        "dirty.md",
+        `new dirty follow-up Refs ${DIRTY_ID}`,
+      );
+      const selfRef = "refs/remotes/origin/fix/upstream-cut";
+      git("update-ref", selfRef, "HEAD");
 
       const { log, error } = quiet();
       expect(
@@ -596,8 +688,37 @@ describe("public push hygiene scope on non-master lines", () => {
       ).toBe(1);
       expect(error).toHaveBeenCalledWith(
         expect.stringContaining(
-          `commit ${legacy.slice(0, 12)} message references`,
+          `commit ${dirty.slice(0, 12)} message references`,
         ),
+      );
+      expect(error).not.toHaveBeenCalledWith(
+        expect.stringContaining(upstreamDirty.slice(0, 12)),
+      );
+    });
+  });
+
+  it("exits 2 when a public line ref is missing instead of silently scoping to less", () => {
+    withFixtureRepo((git, root) => {
+      const master = commitFixtureFile(git, root, "base.txt", "fixture base");
+      git("update-ref", "refs/remotes/origin/master", master);
+      git("update-ref", "refs/remotes/origin/deploy/tog6", master);
+      // No refs/remotes/upstream/master on purpose.
+      commitFixtureFile(git, root, "port.txt", "clean follow-up");
+      const selfRef = "refs/remotes/origin/port/x";
+      git("update-ref", selfRef, "HEAD");
+
+      const { log, error } = quiet();
+      expect(
+        runPublicPushHygieneCheck({
+          head: "HEAD",
+          selfRef,
+          prefixes: PREFIXES,
+          log,
+          error,
+        }),
+      ).toBe(2);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("missing public line ref"),
       );
     });
   });
@@ -744,6 +865,8 @@ describe("public push hygiene scope on non-master lines", () => {
       commitFixtureFile(git, root, "shared.txt", "shared base", "one\n");
       const base = git("rev-parse", "HEAD");
       git("update-ref", "refs/remotes/origin/master", base);
+      git("update-ref", "refs/remotes/origin/deploy/tog6", base);
+      git("update-ref", "refs/remotes/upstream/master", base);
       git("checkout", "-q", "--detach", base);
       commitFixtureFile(git, root, "shared.txt", "master edit", "two\n");
       const masterTip = git("rev-parse", "HEAD");
