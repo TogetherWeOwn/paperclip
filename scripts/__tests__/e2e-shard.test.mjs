@@ -233,13 +233,14 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     );
   }
 
-  // The quality-gates lane also requires the base commit to carry the phase-1
-  // tooling. The decision comes from the policy job's base-commit detection,
-  // never from the PR head, so a PR cannot switch the lane off by deleting it.
+  // The quality-gates lane also requires the merge commit's base parent to
+  // carry the phase-1 tooling. The decision comes from the policy job's
+  // base-parent detection, never from the PR head or the stale event base.sha,
+  // so a PR cannot switch the lane off by deleting it.
   assert.match(
     jobs.get("quality_gates"),
     /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
-    "quality_gates must run when full CI is selected and the base commit has the phase-1 tooling",
+    "quality_gates must run when full CI is selected and the base parent has the phase-1 tooling",
   );
 
   assert.doesNotMatch(

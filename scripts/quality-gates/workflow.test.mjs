@@ -49,7 +49,7 @@ const qualityGates = jobBody("quality_gates");
 const verify = jobBody("verify");
 const detectScript = stepScript(
   policy,
-  "Detect phase-1 quality-gate tooling on the base commit",
+  "Detect phase-1 quality-gate tooling on the merge commit's base parent",
 );
 const verifyScript = stepScript(verify, "Fail if any split verify lane failed");
 
@@ -86,13 +86,13 @@ function commitPackageJson(repo, body) {
   return runGit(repo, "rev-parse", "HEAD");
 }
 
-function runDetection(repo, baseSha) {
+function runDetection(repo) {
   const output = path.join(repo, "..", "github-output");
   writeFileSync(output, "");
   const result = spawnSync("bash", ["-e", "-c", detectScript], {
     cwd: repo,
     encoding: "utf8",
-    env: { ...process.env, BASE_SHA: baseSha, GITHUB_OUTPUT: output },
+    env: { ...process.env, GITHUB_OUTPUT: output },
   });
   return {
     status: result.status,
@@ -120,16 +120,32 @@ function runVerify(overrides = {}) {
   }).status;
 }
 
-test("policy decides gate availability from base commit and fails closed", () => {
+const TOOLING = JSON.stringify({
+  scripts: { "test:quality-gates": "node --test" },
+});
+const NO_TOOLING = JSON.stringify({ scripts: { test: "vitest" } });
+
+function mergePrIntoMain(repo, baseBody, prWork) {
+  commitPackageJson(repo, baseBody);
+  runGit(repo, "checkout", "-q", "-b", "pr");
+  prWork();
+  runGit(repo, "checkout", "-q", "main");
+  return runGit(repo, "rev-parse", "HEAD");
+}
+
+test("policy decides gate availability from the merge base parent and fails closed", () => {
   assert.match(
     policy,
     /^ {4}outputs:\n {6}quality_gate_tooling: \$\{\{ steps\.quality_gate_tooling\.outputs\.available \}\}$/m,
   );
   assert.match(policy, /id: quality_gate_tooling/);
-  assert.match(
+  assert.doesNotMatch(
     policy,
     /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/,
+    "detection must not read the stale event base.sha",
   );
+  assert.match(detectScript, /git rev-parse HEAD\^1/);
+  assert.match(detectScript, /rev-list --parents/);
   assert.match(
     qualityGates,
     /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
@@ -141,26 +157,74 @@ test("policy decides gate availability from base commit and fails closed", () =>
   );
 });
 
-test("base commit controls the decision even when the PR head changes the tooling", () => {
+test("base parent controls the decision even when the PR head changes the tooling", () => {
   const { scratch, repo } = makeRepo();
   try {
-    const tooling = JSON.stringify({
-      scripts: { "test:quality-gates": "node --test" },
-    });
-    const noTooling = JSON.stringify({ scripts: { test: "vitest" } });
-    const baseWithTooling = commitPackageJson(repo, tooling);
-    commitPackageJson(repo, noTooling);
-    assert.deepEqual(runDetection(repo, baseWithTooling), {
+    // Base parent has the tooling; the PR head deletes it. The lane must run.
+    commitPackageJson(repo, TOOLING);
+    runGit(repo, "checkout", "-q", "-b", "pr");
+    commitPackageJson(repo, NO_TOOLING);
+    runGit(repo, "checkout", "-q", "main");
+    runGit(repo, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
+    assert.deepEqual(runDetection(repo), {
       status: 0,
       output: "available=true",
       stderr: "",
     });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 
-    const baseWithoutTooling = commitPackageJson(repo, noTooling);
-    commitPackageJson(repo, tooling);
-    assert.deepEqual(runDetection(repo, baseWithoutTooling), {
+  const second = makeRepo();
+  try {
+    const { repo: repo2 } = second;
+    // Base parent lacks the tooling; the PR head adds it. The lane must skip:
+    // a PR cannot switch the lane on or off from its own head.
+    commitPackageJson(repo2, NO_TOOLING);
+    runGit(repo2, "checkout", "-q", "-b", "pr");
+    commitPackageJson(repo2, TOOLING);
+    runGit(repo2, "checkout", "-q", "main");
+    runGit(repo2, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
+    assert.deepEqual(runDetection(repo2), {
       status: 0,
       output: "available=false",
+      stderr: "",
+    });
+  } finally {
+    rmSync(second.scratch, { recursive: true, force: true });
+  }
+});
+
+test("stale merge-base without tooling does not skip a lane the merge tree can run", () => {
+  const { scratch, repo } = makeRepo();
+  try {
+    // A: old base without tooling (the stale event base.sha merge-base).
+    commitPackageJson(repo, NO_TOOLING);
+    runGit(repo, "checkout", "-q", "-b", "pr");
+    runGit(repo, "commit", "-q", "--allow-empty", "-m", "pr work");
+    runGit(repo, "checkout", "-q", "main");
+    // B: current base tip with tooling.
+    commitPackageJson(repo, TOOLING);
+    runGit(repo, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
+    const mergeBase = runGit(repo, "merge-base", "HEAD^1", "HEAD^2");
+    const baseParentPkg = runGit(
+      repo,
+      "show",
+      `${runGit(repo, "rev-parse", "HEAD^1")}:package.json`,
+    );
+    assert.ok(
+      baseParentPkg.includes("test:quality-gates"),
+      "base parent must carry the tooling for this fixture",
+    );
+    const mergeBasePkg = runGit(repo, "show", `${mergeBase}:package.json`);
+    assert.ok(
+      !mergeBasePkg.includes("test:quality-gates"),
+      "merge-base must lack the tooling for this fixture",
+    );
+    // The merge tree carries the tooling, so the lane must run.
+    assert.deepEqual(runDetection(repo), {
+      status: 0,
+      output: "available=true",
       stderr: "",
     });
   } finally {
@@ -168,26 +232,48 @@ test("base commit controls the decision even when the PR head changes the toolin
   }
 });
 
-test("detection fails closed for malformed, missing, or unreadable base data", () => {
+test("detection fails closed for non-merge checkouts and unreadable base data", () => {
   const { scratch, repo } = makeRepo();
   try {
-    const malformedJson = commitPackageJson(repo, "{ not json");
-    runGit(repo, "rm", "-q", "package.json");
-    runGit(repo, "commit", "-q", "-m", "remove package.json");
-    const missingPackage = runGit(repo, "rev-parse", "HEAD");
-
-    for (const [label, baseSha] of [
-      ["malformed SHA", "not-a-sha"],
-      ["unknown commit", "0".repeat(40)],
-      ["invalid package JSON", malformedJson],
-      ["missing package.json", missingPackage],
-    ]) {
-      const result = runDetection(repo, baseSha);
-      assert.notEqual(result.status, 0, `${label} must fail policy`);
-      assert.equal(result.output, "", `${label} must not publish a decision`);
-    }
+    // A linear HEAD is not a PR merge commit: no decision may be published.
+    commitPackageJson(repo, TOOLING);
+    const linear = runDetection(repo);
+    assert.notEqual(linear.status, 0, "linear checkout must fail policy");
+    assert.equal(linear.output, "", "linear checkout must not publish a decision");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+
+  const badJson = makeRepo();
+  try {
+    const { repo: repo2 } = badJson;
+    commitPackageJson(repo2, "{ not json");
+    runGit(repo2, "checkout", "-q", "-b", "pr");
+    runGit(repo2, "commit", "-q", "--allow-empty", "-m", "pr work");
+    runGit(repo2, "checkout", "-q", "main");
+    runGit(repo2, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
+    const result = runDetection(repo2);
+    assert.notEqual(result.status, 0, "invalid package JSON must fail policy");
+    assert.equal(result.output, "", "invalid package JSON must not publish a decision");
+  } finally {
+    rmSync(badJson.scratch, { recursive: true, force: true });
+  }
+
+  const missing = makeRepo();
+  try {
+    const { repo: repo3 } = missing;
+    commitPackageJson(repo3, TOOLING);
+    runGit(repo3, "rm", "-q", "package.json");
+    runGit(repo3, "commit", "-q", "-m", "remove package.json");
+    runGit(repo3, "checkout", "-q", "-b", "pr");
+    runGit(repo3, "commit", "-q", "--allow-empty", "-m", "pr work");
+    runGit(repo3, "checkout", "-q", "main");
+    runGit(repo3, "merge", "-q", "--no-ff", "pr", "-m", "merge pr");
+    const result = runDetection(repo3);
+    assert.notEqual(result.status, 0, "missing package.json must fail policy");
+    assert.equal(result.output, "", "missing package.json must not publish a decision");
+  } finally {
+    rmSync(missing.scratch, { recursive: true, force: true });
   }
 });
 

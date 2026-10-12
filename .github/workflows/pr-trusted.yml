@@ -267,23 +267,26 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Detect phase-1 quality-gate tooling on the base commit
+      - name: Detect phase-1 quality-gate tooling on the merge commit's base parent
         id: quality_gate_tooling
         shell: bash
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
-          # Decide from the base commit, never from the PR merge tree: a PR must
-          # not be able to switch the lane off by deleting the tooling. A base
-          # line that predates the phase-1 gates (the deploy/tog6 line) has no
-          # `test:quality-gates` script, so the lane can only fail there. Every
-          # error below fails this step, which fails `verify`: any doubt keeps
-          # the gate on. Base commits on master always carry the script.
-          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::malformed base commit SHA' >&2; exit 1; }
-          git cat-file -e "${BASE_SHA}^{commit}"
-          base_package_json="$(git show "${BASE_SHA}:package.json")"
+          # Decide from the merge commit's base parent (HEAD^1), never from the
+          # PR head and never from github.event.pull_request.base.sha: that event
+          # value is the merge-base, which predates the base tip for branches
+          # rooted before the phase-1 gates. A PR must not be able to switch the
+          # lane off by deleting the tooling, and a stale merge-base must not
+          # skip a lane the merge tree can run. A base line that predates the
+          # phase-1 gates (the deploy/tog6 line) has no `test:quality-gates`
+          # script, so the lane can only fail there. Every error below fails this
+          # step, which fails `verify`: any doubt keeps the gate on.
+          [[ "$(git rev-list --parents -n 1 HEAD | wc -w)" == 3 ]] || { echo '::error::checkout is not a PR merge commit' >&2; exit 1; }
+          base_sha="$(git rev-parse HEAD^1)"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::malformed base parent SHA' >&2; exit 1; }
+          git cat-file -e "${base_sha}^{commit}"
+          base_package_json="$(git show "${base_sha}:package.json")"
           available="$(printf '%s' "$base_package_json" | node -e '
             let raw = "";
             process.stdin.on("data", (chunk) => { raw += chunk; });
@@ -296,7 +299,7 @@ jobs:
 
           echo "available=$available" >> "$GITHUB_OUTPUT"
           if [[ "$available" == 'false' ]]; then
-            echo "::notice title=Quality gates::base commit $BASE_SHA has no test:quality-gates script; the phase-1 lane is skipped for this base line"
+            echo "::notice title=Quality gates::base parent $base_sha has no test:quality-gates script; the phase-1 lane is skipped for this base line"
           fi
 
       - name: Block manual lockfile edits
@@ -684,8 +687,9 @@ jobs:
     # existing PR runners only. No paid Actions minutes.
     name: Quality gates (phase 1)
     needs: [gate, policy]
-    # Skip only when the base commit predates phase-1 tooling; the policy job
-    # detects from the base rather than trusting the PR's checked-out tree.
+    # Skip only when the merge commit's base parent predates phase-1 tooling;
+    # the policy job detects from HEAD^1 rather than the stale event base.sha
+    # or the PR head.
     if: ${{ needs.gate.outputs.full_ci == 'true' && needs.policy.outputs.quality_gate_tooling == 'true' }}
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 15
