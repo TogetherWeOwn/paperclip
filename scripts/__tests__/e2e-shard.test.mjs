@@ -267,13 +267,16 @@ test("the trusted PR workflow gates heavy CI on affected work", () => {
   assert.match(verify, /AFFECTED: \$\{\{ needs\.changes\.outputs\.affected \}\}/);
   assert.match(verify, /CHANGES_RESULT: \$\{\{ needs\.changes\.result \}\}/);
   assert.match(verify, /test "\$CHANGES_RESULT" = "success"/);
+  assert.match(verify, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"/);
   assert.match(verify, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"/);
+  assert.match(verify, /test "\$GENERAL_TESTS_RESULT" = "success"/);
   assert.match(verify, /test "\$GENERAL_TESTS_RESULT" = "skipped"/);
   // Runner verification must participate in the legacy aggregate required
   // check, or a runner regression could be merged while `verify` succeeds.
   assert.match(verify, /RUNNER_VERIFICATION_RESULT: \$\{\{ needs\.verify_paperclip_runner\.result \}\}/);
   assert.match(verify, /test "\$RUNNER_VERIFICATION_RESULT" = "success"/);
   assert.match(verify, /test "\$RUNNER_VERIFICATION_RESULT" = "skipped"/);
+  assert.match(verify, /test "\$BUILD_RESULT" = "success"/);
   assert.match(verify, /test "\$BUILD_RESULT" = "skipped"/);
   // Both halves of the docker-context lane's gating: the result must be
   // wired into the aggregate's env AND asserted successful on affected work —
