@@ -695,7 +695,7 @@ describe("durable Dot Runner integration", () => {
       const observed: Array<Record<string, any>> = [];
       const appCall = vi.fn().mockResolvedValue({ status: "completed", result: { content: [{ type: "text", text: "synthetic gateway result" }] } });
       const gatewayTools = [{ name: "fixture:read_status", displayName: "Read fixture status", description: "Read a synthetic app", parametersSchema: { type: "object", properties: {}, additionalProperties: false }, risk: "read" }];
-      registerAssignedMcpGateway(db, { listToolsForNamedGateway: vi.fn().mockResolvedValue(gatewayTools), executeTool: appCall } as unknown as ToolGatewayService);
+      registerAssignedMcpGateway(db, { listToolsForNamedGateway: vi.fn().mockResolvedValue({ tools: gatewayTools, allowedActions: ["tools/list", "tools/call"] }), executeTool: appCall } as unknown as ToolGatewayService);
       await db.update(agents).set({ adapterConfig: { ...f.agent.adapterConfig, dotWorkspaceAccess: true, dotAttachmentAccess: true } }).where(eq(agents.id, f.agent.id));
       vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "fixture-cloud");
       try {
