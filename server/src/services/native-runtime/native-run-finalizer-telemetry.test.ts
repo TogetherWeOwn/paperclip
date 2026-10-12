@@ -626,6 +626,82 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     ).resolves.toBe("blocked");
   });
 
+  it("keeps a held descriptor's kind when a native run rebinds its blocker", async () => {
+    const fixture = await seedNativeRun();
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" } })
+      .where(eq(issues.id, fixture.issueId));
+    const resultId = randomUUID();
+    await db.insert(nativeRunResults).values({
+      id: resultId,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      completionContractId: fixture.contractId,
+      serverFingerprint: `fp-${resultId}`,
+      schemaStatus: "accepted",
+      resultJson: {},
+      canonicalSha256: `sha-${resultId}`,
+    });
+    const assessmentId = randomUUID();
+    await db.insert(workAssessments).values({
+      id: assessmentId,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      contractId: fixture.contractId,
+      resultId,
+      triggerKind: "native_result",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: "in_progress",
+      priorStatusVersion: 0,
+      policyVersion: "telemetry-v1",
+      assessmentJson: {},
+      inputDigest: `digest-${assessmentId}`,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId: fixture.runId,
+      companyId,
+      issueId: fixture.issueId,
+      phase: "arbitrating",
+      attempt: 0,
+      resultId,
+    });
+
+    const decision: NativeStatusDecision = {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked",
+      toStatus: "blocked",
+      reasonCode: "current_track_blocker_waiting",
+      unblockDescriptor: { owner: "board", action: "Confirm the retention scope." },
+      effects: [{ kind: "bind_blocker", owner: "board", action: "Confirm the retention scope." }],
+    };
+    await commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      assessmentId,
+      priorStatus: "in_progress",
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision,
+    });
+
+    const issue = await db
+      .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.unblockDescriptor).toEqual({
+      owner: "board",
+      action: "Confirm the retention scope.",
+      kind: "denial",
+    });
+  });
+
   it("emits exactly one event for a cancel_continuations write (trap 2: :685/:518 overlap)", async () => {
     const fixture = await seedNativeRun();
     // Build the minimal real rows commitNativeStatusDecision's foreign keys
