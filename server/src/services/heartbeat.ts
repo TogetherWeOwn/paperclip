@@ -365,6 +365,7 @@ import {
   publishPluginDomainEvent,
   type LogActivityInput,
 } from "./activity-log.js";
+import { runOutsideRequestAuditContext } from "./audit-context.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -15395,10 +15396,11 @@ export function heartbeatService(
       }
     }
     for (const claim of claims) {
-      const execution = executeRun(claim.runId, {
+      // Detached recovery runs must not inherit the request audit context.
+      const execution = runOutsideRequestAuditContext(() => executeRun(claim.runId, {
         nativeLeaseOwner: claim.leaseOwner,
         nativeRestartRecovery: claim,
-      }).catch((error) => {
+      })).catch((error) => {
         logger.error(
           { err: error, runId: claim.runId, disposition: claim.kind },
           "native restart recovery execution failed",
@@ -19639,9 +19641,10 @@ export function heartbeatService(
             now,
             runIds: [...claimableNativeRunIds],
             dispatch: (claim) => {
-              const execution = executeRun(claim.runId, {
+              // Detached resume runs must not inherit the request audit context.
+              const execution = runOutsideRequestAuditContext(() => executeRun(claim.runId, {
                 nativeLeaseOwner: claim.leaseOwner,
-              }).catch((error) => {
+              })).catch((error) => {
                 logger.error(
                   { err: error, runId: claim.runId },
                   "persisted native session resume failed",
@@ -20606,7 +20609,9 @@ export function heartbeatService(
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
+        // Fire-and-forget runs execute after the response; keep the waking
+        // human's audit block off agent/system rows written inside the run.
+        const execution = runOutsideRequestAuditContext(() => executeRun(claimedRun.id)).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },
             "queued heartbeat execution failed",
@@ -20672,9 +20677,10 @@ export function heartbeatService(
             runtimeEnv.PAPERCLIP_INSTANCE_ID?.trim() || "paperclip-heartbeat",
           runIds: [runId],
           dispatch: (claim) => {
-            const execution = executeRun(claim.runId, {
+            // Detached resume runs must not inherit the request audit context.
+            const execution = runOutsideRequestAuditContext(() => executeRun(claim.runId, {
               nativeLeaseOwner: claim.leaseOwner,
-            }).catch((error) => {
+            })).catch((error) => {
               logger.error(
                 { err: error, runId: claim.runId },
                 "scheduled native session resume failed",

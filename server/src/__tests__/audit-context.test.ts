@@ -13,6 +13,7 @@ import type { RequestAuditContext } from "../services/audit-context.js";
 import {
   buildRequestAuditContext,
   hashJsonValue,
+  runOutsideRequestAuditContext,
   runWithRequestAuditContext,
 } from "../services/audit-context.js";
 
@@ -108,16 +109,67 @@ describe("request audit context on activity rows", () => {
     expect(rows[0].details).toEqual({ a: 1 });
   });
 
-  it("does not overwrite an explicit audit key set by the caller", async () => {
+  it("overwrites a caller-supplied audit key with the real provenance", async () => {
     const rows: Array<Record<string, unknown>> = [];
     const ctx = mustBuildContext(fakeReq({ type: "board", source: "session" }));
     await runWithRequestAuditContext(ctx, () =>
       persistActivity(fakeDb(rows), {
         ...baseInput,
-        details: { audit: { custom: true } },
+        details: { audit: { actorSource: "forged" } },
       }),
     );
-    expect(auditOf(rows[0])).toEqual({ custom: true });
+    expect(auditOf(rows[0])).toEqual({ actorSource: "session" });
+  });
+
+  it("strips a caller-supplied audit key when outside a request", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    await persistActivity(fakeDb(rows), {
+      ...baseInput,
+      details: { note: "hello", audit: { actorSource: "forged" } },
+    });
+    expect(rows[0].details).toEqual({ note: "hello" });
+  });
+
+  it("redacts secrets in the change reason together with details", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    const secret = "mysecrettoken123";
+    const ctx = mustBuildContext(
+      fakeReq(
+        { type: "board", source: "board_key", keyId: "key-1" },
+        {
+          "X-Paperclip-Change-Reason": `rotate Authorization: Bearer ${secret}`,
+        },
+      ),
+    );
+    await runWithRequestAuditContext(ctx, () =>
+      persistActivity(fakeDb(rows), {
+        ...baseInput,
+        details: { note: `deploy Bearer ${secret}` },
+      }),
+    );
+    const stored = JSON.stringify(rows[0].details);
+    expect(stored).not.toContain(secret);
+  });
+
+  it("does not stamp rows written by detached work outside the request context", async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    const ctx = mustBuildContext(
+      fakeReq(
+        { type: "board", source: "board_key", keyId: "key-7" },
+        { "X-Paperclip-Change-Reason": "wake agent" },
+      ),
+    );
+    await runWithRequestAuditContext(ctx, async () => {
+      await runOutsideRequestAuditContext(() =>
+        persistActivity(fakeDb(rows), {
+          ...baseInput,
+          actorType: "agent",
+          actorId: "agent-1",
+          details: { a: 1 },
+        }),
+      );
+    });
+    expect(rows[0].details).toEqual({ a: 1 });
   });
 
   it("bounds and sanitizes caller-supplied reason and correlation id", () => {

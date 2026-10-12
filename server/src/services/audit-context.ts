@@ -92,22 +92,34 @@ export function auditContextMiddleware() {
 export const AUDIT_DETAILS_KEY = "audit";
 
 /**
- * Merge request provenance into already-redacted activity details. Applied
- * after redaction on purpose: the values are an enum, a credential row id and
- * a bounded reason, not caller data. An explicit `audit` key set by the caller
- * wins.
+ * Merge request provenance into activity details. `details.audit` is a reserved
+ * key: any caller-supplied value is stripped and replaced with the current
+ * request context, or removed when there is no context, so callers can never
+ * forge provenance. The merged block is redacted downstream by
+ * `redactActivityDetails` together with the rest of `details`, because the
+ * free-text reason is caller data and may contain secrets.
  */
 export function withRequestAuditDetails(
   details: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
   const context = storage.getStore();
-  if (!context) return details;
-  if (details && AUDIT_DETAILS_KEY in details) return details;
+  const base: Record<string, unknown> = details ? { ...details } : {};
+  if (AUDIT_DETAILS_KEY in base) delete base[AUDIT_DETAILS_KEY];
+  if (!context) return details ? base : details;
   const audit: Record<string, string> = { actorSource: context.actorSource };
   if (context.keyId) audit.keyId = context.keyId;
   if (context.reason) audit.reason = context.reason;
   if (context.correlationId) audit.correlationId = context.correlationId;
-  return { ...(details ?? {}), [AUDIT_DETAILS_KEY]: audit };
+  return { ...base, [AUDIT_DETAILS_KEY]: audit };
+}
+
+/**
+ * Run detached background work (fire-and-forget agent runs) outside the
+ * request audit context, so rows written by agent/system actors are not stamped
+ * with the waking human's provenance. Request-synchronous writes keep the stamp.
+ */
+export function runOutsideRequestAuditContext<T>(fn: () => T): T {
+  return storage.exit(fn);
 }
 
 function canonicalize(value: unknown): unknown {

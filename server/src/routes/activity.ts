@@ -6,10 +6,10 @@ import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
-import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
-import { logActivity } from "../services/activity-log.js";
+import { logActivity, redactActivityDetails } from "../services/activity-log.js";
+import { withRequestAuditDetails } from "../services/audit-context.js";
 
 /** Max rows a single CSV export will stream (guards against runaway exports). */
 const AUDIT_CSV_EXPORT_MAX_ROWS = 10_000;
@@ -330,10 +330,13 @@ export function activityRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // Stamp request provenance like persistActivity does: `details.audit` is
+    // reserved and a caller-supplied value is stripped, then the merged block
+    // is redacted before storage.
     const event = await svc.create({
       companyId,
       ...req.body,
-      details: req.body.details ? sanitizeRecord(req.body.details) : null,
+      details: await redactActivityDetails(db, withRequestAuditDetails(req.body.details ?? null)),
     });
     res.status(201).json(event);
   });

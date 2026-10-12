@@ -159,7 +159,9 @@ export function publishActivity(publication: ActivityPublication) {
 }
 
 export async function persistActivity(db: Db, input: LogActivityInput) {
-  const redactedDetails = withRequestAuditDetails(await redactActivityDetails(db, input.details ?? null));
+  // Merge provenance first so the free-text reason is redacted together with
+  // the rest of details before it is stored or broadcast.
+  const redactedDetails = await redactActivityDetails(db, withRequestAuditDetails(input.details ?? null));
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
   const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
