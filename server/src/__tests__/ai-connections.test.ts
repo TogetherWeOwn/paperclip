@@ -12,7 +12,8 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, isAiConnectionReconnectable } from "../services/ai-connection-runtime.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -813,4 +814,59 @@ describe("AI connection recovery delivery", () => {
       }
     }, 30000,
   );
+});
+
+describe("AI connection intent gating on prepare failure", () => {
+  it("treats only genuine missing-credential failures as reconnectable", () => {
+    for (const code of [
+      "ai_connection_default_missing",
+      "ai_connection_missing",
+      "ai_connection_unavailable",
+      "ai_connection_responsible_user_missing",
+      "ai_connection_credential_missing",
+    ]) {
+      expect(isAiConnectionReconnectable(unprocessable("fixture", { code })), code).toBe(true);
+    }
+    for (const code of ["ai_connection_incompatible", "ai_connection_busy"]) {
+      expect(isAiConnectionReconnectable(unprocessable("fixture", { code })), code).toBe(false);
+    }
+    expect(isAiConnectionReconnectable(forbidden("fixture"))).toBe(false);
+    expect(isAiConnectionReconnectable(unprocessable("fixture"))).toBe(false);
+    expect(isAiConnectionReconnectable(new Error("The selected default changed. Retry this execution."))).toBe(false);
+    expect(isAiConnectionReconnectable(null)).toBe(false);
+  });
+
+  it("grounds the gate in real select() errors: incompatible opens nothing, missing default still opens", async () => {
+    const incompatibleUser = `gate-incompatible-${randomUUID()}`;
+    const missingUser = `gate-missing-${randomUUID()}`;
+    await db.insert(companyMemberships).values([incompatibleUser, missingUser].map(principalId => ({ companyId, principalId, principalType: "user", status: "active", membershipRole: "member" })));
+    const incompatibleError = await service.select({ ...input, adapterType: "codex_local", userId: incompatibleUser }).then(() => null, (error: unknown) => error);
+    expect(incompatibleError).toBeInstanceOf(Error);
+    expect(String((incompatibleError as { details?: { code?: unknown } }).details?.code)).toBe("ai_connection_incompatible");
+    expect(isAiConnectionReconnectable(incompatibleError)).toBe(false);
+    const missingError = await service.select({ ...input, userId: missingUser }).then(() => null, (error: unknown) => error);
+    expect(String((missingError as { details?: { code?: unknown } }).details?.code)).toBe("ai_connection_default_missing");
+    expect(isAiConnectionReconnectable(missingError)).toBe(true);
+  });
+
+  it("still opens a purpose=ai intent for the genuine missing-credential case", async () => {
+    const userId = `gate-opens-${randomUUID()}`;
+    const gatedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id: gatedAgentId, companyId, name: "Gated agent", status: "active", adapterType: "claude_local", runtimeConfig: { aiConnection: binding } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Genuine missing credential", status: "in_progress", assigneeAgentId: gatedAgentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: gatedAgentId, status: "running", responsibleUserId: userId, contextSnapshot: { issueId } });
+    const outcome = await connectionIntentService(db).request(
+      { sub: gatedAgentId, company_id: companyId, run_id: runId, responsible_user_id: userId },
+      "anthropic",
+      { purpose: "ai" },
+    );
+    expect(outcome.state).toBe("needs_user_action");
+    expect(outcome.interactionId).toBeTruthy();
+    const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, outcome.interactionId!));
+    expect(row.kind).toBe("connection_intent");
+    expect((row.payload as { purpose?: string }).purpose).toBe("ai");
+  });
 });

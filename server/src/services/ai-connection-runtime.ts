@@ -21,6 +21,30 @@ export function isAiConnectionBusy(error: unknown): error is HttpError {
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_busy";
 }
 
+// Error codes where asking the responsible user to (re)connect this AI
+// provider can actually repair the run. Mirrors the hire-time allowlist in
+// routes/agents.ts validateManagedAgentBinding: compatibility and access
+// denials stay errors because reconnecting cannot fix them. Anything else —
+// an incompatible harness/model binding, a forbidden audience, a transient
+// default-changed race, or an infrastructure failure — must not open a
+// purpose=ai connection intent.
+const AI_CONNECTION_RECONNECT_CODES = new Set([
+  "ai_connection_default_missing",
+  "ai_connection_missing",
+  "ai_connection_unavailable",
+  "ai_connection_responsible_user_missing",
+  // Run-time only: the grant exists but its credential is gone, so only a
+  // reconnect repairs it. Hire-time validation cannot produce this code.
+  "ai_connection_credential_missing",
+]);
+
+export function isAiConnectionReconnectable(error: unknown): boolean {
+  return error instanceof HttpError &&
+    AI_CONNECTION_RECONNECT_CODES.has(
+      String((error.details as { code?: unknown } | undefined)?.code),
+    );
+}
+
 // Blank values intentionally override inherited credentials in CLI child environments.
 export const AI_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
