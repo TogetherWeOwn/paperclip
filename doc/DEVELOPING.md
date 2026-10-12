@@ -90,6 +90,19 @@ Workflow changes take effect after merge: `pr.yml` pins
 previous master version. The new job first runs on pull requests opened after
 merge.
 
+The quality-gate lane is skipped only when the policy job confirms from the
+merge commit's base parent (`HEAD^1`, the live base tip) that `package.json`
+lacks `test:quality-gates` (for example, the pre-gates `deploy/tog6` line).
+Detection reads the checked-out merge commit, never the event's `base.sha`
+merge-base, so a stale merge-base cannot skip a lane the merge tree can run.
+Detection errors (including a non-merge checkout) fail policy closed, and
+`verify` accepts the lane's skipped result only when that explicit base-parent
+decision is false. A pull request cannot skip the lane by removing gate
+tooling from its own head. `scripts/quality-gates/workflow.test.mjs` pins this
+base-parent decision wiring (policy `outputs.quality_gate_tooling` value,
+`HEAD^1` with merge-commit guard, no event `base.sha`, lane `if`, and verify
+env) and the aggregate result handling.
+
 ## Start Dev
 
 From repo root:
