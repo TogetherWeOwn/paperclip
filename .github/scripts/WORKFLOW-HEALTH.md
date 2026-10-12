@@ -62,3 +62,15 @@ Do not dispatch or rerun publishing workflows to test this boundary. Inspect
 post-merge automatic Docker, Release, and Workflow Health results at the exact
 merge SHA. Require the fork local-build result and skipped publisher jobs;
 parser validation alone is not proof that a hosted image build passed.
+
+## Mirror PR test groups
+
+Upstream mirror PRs target bases named `mirror/base-*`, `mirror-base/*`, or
+`mirror/upstream-*`. On those bases, each `General tests` matrix entry asks the
+PR head's `scripts/run-vitest-stable.mjs --mode general --dry-run` which groups
+it defines. A group the head does not define is skipped, with a notice and a
+step-summary line. It is never reported as passed. If the head group list
+cannot be read, the group runs. Ordinary PRs always run their group.
+
+The resolver comes from master, not from the PR merge commit. The policy job
+checks the PR's current base tip, not the base pinned when the event fired.
