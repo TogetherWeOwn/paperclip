@@ -90,6 +90,19 @@ Workflow changes take effect after merge: `pr.yml` pins
 previous master version. The new job first runs on pull requests opened after
 merge.
 
+The quality-gate lane is skipped only when the policy job confirms from the
+merge commit's base parent (`HEAD^1`, the live base tip) that `package.json`
+lacks `test:quality-gates` (for example, the pre-gates `deploy/tog6` line).
+Detection reads the checked-out merge commit, never the event's `base.sha`
+merge-base, so a stale merge-base cannot skip a lane the merge tree can run.
+Detection errors (including a non-merge checkout) fail policy closed, and
+`verify` accepts the lane's skipped result only when that explicit base-parent
+decision is false. A pull request cannot skip the lane by removing gate
+tooling from its own head. `scripts/quality-gates/workflow.test.mjs` pins this
+base-parent decision wiring (policy `outputs.quality_gate_tooling` value,
+`HEAD^1` with merge-commit guard, no event `base.sha`, lane `if`, and verify
+env) and the aggregate result handling.
+
 ## Start Dev
 
 From repo root:
@@ -1075,6 +1088,8 @@ For project execution worktrees, Paperclip can also run a project-defined provis
 An issue can pin its isolated worktree to an exact pre-existing branch instead of a template-derived one — the contract PR-preparation tasks use. Set the issue's `executionWorkspaceSettings` to `{ "mode": "isolated_workspace", "workspaceStrategy": { "type": "git_worktree", "existingBranch": "<branch>" } }`. The validator requires isolated mode plus a `git_worktree` strategy and rejects `branchTemplate` alongside `existingBranch`. At dispatch the runtime attaches (never creates, renames, fast-forwards, or resets) that branch: it reuses a registered worktree that already has the branch checked out (including legacy `.worktrees/` paths), otherwise it attaches the branch under the managed worktree parent. A missing branch, an occupied worktree path on another branch, or a non-worktree strategy fails closed with a `workspace_validation_failed` error instead of falling back to the shared checkout or a derived branch, and an inherited `reuse_existing` workspace binding on a different branch is ignored in favor of realizing the pinned branch.
 
 When a run reuses an isolated worktree, Paperclip checks that HEAD is on the branch recorded for the workspace and repairs the drift it can prove safe. A clean worktree whose checked-out branch is forward of the recorded branch adopts that branch (`enableWorkspaceBranchReconcileForward`). A clean worktree that is detached, behind, or diverged gets the recorded branch checked out again (`enableWorkspaceDirtyQuarantineRepair`). A detached commit that no ref reaches is first pinned on `paperclip/rescue/<issue>/detached-<time>`, and a displaced named branch keeps its own ref. A dirty worktree is committed to a rescue branch before the restore. The restore is refused while another run is running in the same worktree, while a runtime service of the workspace is running, or while an interrupted git operation (rebase, merge, bisect) is in progress. Before a run starts, a branch that an operator owns only ever gets this plain checkout. Every repair writes an `execution_workspace.*` activity entry. Anything else fails closed with `workspace_validation_failed`.
+
+A background sweep applies the same plain checkout to parked issues. It selects active `workspace_validation` recoveries whose evidence reason is `git_worktree_branch_incoherence`, never-tried cards first and then the least recently tried, and processes at most five per scheduler tick. It acts only when the recovery belongs to the workspace's source issue, the source issue is still `blocked` with no unresolved blocker or pending interaction, the worktree is clean and registered, the recorded branch exists, a recovery action still matches the worktree state, and no run or runtime service is active. It does not run while heartbeat scheduling is suppressed, and it skips companies that are not active. A repaired issue returns to `todo` and its assignee is woken. Each skip is counted by reason, and it is gated by `enableWorkspaceDirtyQuarantineRepair`. `POST /api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence?dryRun=true` reports the decision for each candidate without changing anything.
 
 Heavier setup that is only needed by a managed runtime service can use `workspaceStrategy.runtimeProvisionCommand`. Paperclip runs this command lazily before spawning the first service in a start batch, serializes concurrent provisioning for the same workspace, and records the attempt as `workspace_runtime_provision`. The command receives the same workspace environment as `provisionCommand` and should be idempotent because later service-start batches invoke it again.
 

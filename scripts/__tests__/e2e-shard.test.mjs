@@ -225,7 +225,6 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     "verify_serialized_server",
     "canary_dry_run",
     "e2e_shards",
-    "quality_gates",
   ]) {
     assert.match(
       jobs.get(jobId),
@@ -233,6 +232,16 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
       `${jobId} must run only when the gate selects full CI`,
     );
   }
+
+  // The quality-gates lane also requires the merge commit's base parent to
+  // carry the phase-1 tooling. The decision comes from the policy job's
+  // base-parent detection, never from the PR head or the stale event base.sha,
+  // so a PR cannot switch the lane off by deleting it.
+  assert.match(
+    jobs.get("quality_gates"),
+    /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
+    "quality_gates must run when full CI is selected and the base parent has the phase-1 tooling",
+  );
 
   assert.doesNotMatch(
     jobs.get("policy"),
@@ -266,6 +275,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(verify, /QUALITY_GATES_RESULT: \$\{\{ needs\.quality_gates\.result \}\}/);
   assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "success"/);
   assert.match(verify, /test "\$QUALITY_GATES_RESULT" = "skipped"/);
+  assert.match(verify, /QUALITY_GATE_TOOLING: \$\{\{ needs\.policy\.outputs\.quality_gate_tooling \}\}/);
 
   const e2e = jobs.get("e2e");
   assert.match(e2e, /^ {4}needs: \[gate, policy, e2e_shards\]$/m);

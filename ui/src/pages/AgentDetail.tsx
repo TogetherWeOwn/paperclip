@@ -3308,6 +3308,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
     if (taskKey) payload.taskKey = taskKey;
     return payload;
   }, [run.contextSnapshot]);
+  const { pushToast } = useToastActions();
   const retryRun = useMutation({
     mutationFn: async () => {
       return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);
@@ -3317,6 +3318,13 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       if (newRun.runId)
         navigate(`/agents/${agentRouteId}/runs/${newRun.runId}`);
       else if (newRun.issueId) navigate(`/issues/${newRun.issueId}`);
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Run retry failed",
+        body: error instanceof Error ? error.message : "Unable to retry run",
+        tone: "error",
+      });
     },
   });
 
@@ -3537,11 +3545,6 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
             {resumeRun.isError && (
               <div className="text-xs text-destructive">
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}
-              </div>
-            )}
-            {retryRun.isError && (
-              <div className="text-xs text-destructive">
-                {retryRun.error instanceof Error ? retryRun.error.message : "Failed to retry run"}
               </div>
             )}
             {startTime && (
