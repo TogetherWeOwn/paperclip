@@ -30,11 +30,13 @@ moves, reverse moves, and unrelated docs-only moves across all scopes.
 Only docs-only diffs skip scoped checks: `doc/**/*.md`, `README.md`, and
 `CONTRIBUTING.md`. Every other path runs them, including unknown top-level
 paths, `skills/`, `announcements/`, `.npmrc`, and `.pnpmfile.*`. An empty diff
-also runs them. An unknown scope warns and runs them too, so a stale base that
-predates a newly added scope cannot fail the changes job. The selector script `scripts/ci-affected-work.mjs` runs from the
-base commit, and the pull request head is fetched only as diff data. The
-workflow files that gate a pull request still come from its merge commit;
-pinning that gate to master belongs to the follow-up `pr-trusted` wiring.
+also runs them. An unknown scope warns and runs them too as a fail-open fallback.
+The selector script `scripts/ci-affected-work.mjs` runs from the current tip of
+the pull request's trusted base branch, rather than the base SHA recorded when
+the PR was opened; the pull request head is fetched only as diff data, and the
+triple-dot diff still uses the event's base and head SHAs. The workflow files
+that gate a pull request still come from its merge commit; pinning that gate to
+master belongs to the `pr-trusted` wiring.
 Master pushes and nightly schedules always run all scoped checks. Its single `ci-ok` job rejects scope errors, failed validation,
 and unexpected skips. Existing repository-required checks remain unchanged.
 The other repaired workflows use the same scoped changes job; their explicit

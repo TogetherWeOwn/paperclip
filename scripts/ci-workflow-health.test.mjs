@@ -141,6 +141,15 @@ test("forks reject every publishing job even with otherwise successful prerequis
   }
 });
 
+test("affected-work selector uses the current trusted base ref while diffing event SHAs", () => {
+  const text = workflow("ci-changes");
+  const checkout = text.split("      - uses: actions/checkout@")[1]?.split("      - uses: actions/setup-node@")[0] ?? "";
+  assert.ok(checkout.includes("ref: ${{ github.event.pull_request.base.ref || github.sha }}"));
+  assert.ok(!checkout.includes("pull_request.base.sha"));
+  assert.ok(text.includes("CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}"));
+  assert.ok(text.includes("CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}"));
+});
+
 test("PR selection runs all non-docs work while master, nightly and explicit calls always run", () => {
   for (const scope of ["docker", "smoke", "release", "workflows"]) {
     assert.equal(affectedWork("pull_request", scope, ["doc/PRODUCT.md"]), false);
@@ -230,7 +239,7 @@ test("ci-changes runs the classifier from the trusted base and fetches the PR he
   const select = changes.indexOf("run: node scripts/ci-affected-work.mjs");
   assert.ok(checkout >= 0 && fetchHead > checkout && select > fetchHead, "checkout, then head fetch, then selection");
   const setup = changes.slice(checkout, fetchHead);
-  assert.match(setup, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.sha \}\}/);
+  assert.match(setup, /ref: \$\{\{ github\.event\.pull_request\.base\.ref \|\| github\.sha \}\}/);
   assert.match(setup, /fetch-depth: 0/);
   assert.match(setup, /persist-credentials: false/);
   assert.doesNotMatch(changes, /ref: \$\{\{ github\.event\.pull_request\.head/);
