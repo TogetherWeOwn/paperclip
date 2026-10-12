@@ -387,7 +387,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     pullRequestDetailsByKey.set(`${companyId}:10624`, {
       state: "merged",
       headRef: "unrelated-delivery",
-      headSha,
+      // A different branch carries a different commit. Delivery matches by
+      // head SHA (same repo), so this must not equal the workspace HEAD —
+      // otherwise it would (correctly) count as delivery. Card-free publish
+      // refs reuse the workspace HEAD and are covered separately.
+      headSha: "0000000000000000000000000000000000000000",
     });
     pullRequestDetailsByKey.set(`${companyId}:10625`, {
       state: "merged",
@@ -476,6 +480,49 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep.archived).toBe(1);
     expect(archived).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
+  }, 20_000);
+
+  it("reports a card-free publish ref delivery as merged_via_pr", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-cardfree-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+    await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
+    await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
+    await runGit(worktreePath, ["add", "delivered.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
+
+    const seeded = await seedTerminalWorkspace();
+    // Card-free publish: the agent keeps commits on the workspace branch but
+    // opens the PR from a different ref carrying the same HEAD commit.
+    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, {
+      state: "merged",
+      headRef: "fix/short-slug",
+      headSha: await readGit(worktreePath, ["rev-parse", "HEAD"]),
+    });
+    await db.update(executionWorkspaces).set({
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      providerType: "git_worktree",
+      baseRef: "main",
+      repoUrl: "https://github.com/paperclipai/paperclip.git",
+      branchName: "PAP-16015-delivery",
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId: seeded.sourceIssueId,
+      type: "pull_request",
+      provider: "github",
+      title: "Card-free delivery",
+      url: "https://github.com/paperclipai/paperclip/pull/10623",
+      status: "merged",
+    });
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("merged_via_pr");
+    expect(readiness?.git?.isMergedIntoBase).toBe(false);
   }, 20_000);
 
   async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date } = {}) {
@@ -986,7 +1033,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   });
 
-  it("does not trust directly linked merged products for a different repository or branch", async () => {
+  it("does not trust directly linked merged products for a different repository or a different head commit", async () => {
     const seeded = await seedTerminalWorkspace();
     await db.insert(issueWorkProducts).values([
       {
