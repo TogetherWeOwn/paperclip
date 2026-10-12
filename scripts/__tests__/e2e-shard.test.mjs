@@ -322,7 +322,7 @@ test("the trusted PR workflow aggregates every lane in ci-ok", () => {
     ["SERIALIZED_RESULT", "needs.verify_serialized_server.result"],
     ["CANARY_RESULT", "needs.canary_dry_run.result"],
   ]) {
-    assert.match(ciOk, new RegExp(`${env}: \\$\\{\\{ ${expression.replace(/\./g, "\\.")} \\}\\}`), `ci-ok must wire ${env}`);
+    assert.ok(ciOk.includes(`${env}: \${{ ${expression} }}`), `ci-ok must wire ${env}`);
   }
   assert.match(ciOk, /test "\$SERIALIZED_RESULT" = "\$expected"/);
   assert.match(ciOk, /test "\$CANARY_RESULT" = "\$expected"/);
