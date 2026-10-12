@@ -1,21 +1,46 @@
-import { describe, expect, it, vi } from "vitest";
-import type { Request } from "express";
 import type { Db } from "@paperclipai/db";
+import type { Request } from "express";
+import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../services/instance-settings.js", () => ({
-  instanceSettingsService: () => ({ getGeneral: async () => ({ censorUsernameInLogs: false }) }),
+  instanceSettingsService: () => ({
+    getGeneral: async () => ({ censorUsernameInLogs: false }),
+  }),
 }));
 
 import { persistActivity } from "../services/activity-log.js";
+import type { RequestAuditContext } from "../services/audit-context.js";
 import {
   buildRequestAuditContext,
   hashJsonValue,
   runWithRequestAuditContext,
 } from "../services/audit-context.js";
 
-function fakeReq(actor: Record<string, unknown>, headers: Record<string, string> = {}): Request {
-  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
-  return { actor, header: (name: string) => lower[name.toLowerCase()] } as unknown as Request;
+function fakeReq(
+  actor: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Request {
+  const lower = Object.fromEntries(
+    Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]),
+  );
+  return {
+    actor,
+    header: (name: string) => lower[name.toLowerCase()],
+  } as unknown as Request;
+}
+
+function mustBuildContext(req: Request): RequestAuditContext {
+  const ctx = buildRequestAuditContext(req);
+  if (!ctx) throw new Error("expected audit context");
+  return ctx;
+}
+
+function auditOf(row: Record<string, unknown>): unknown {
+  return (row.details as Record<string, unknown>).audit;
+}
+
+function configHashAfterOf(row: Record<string, unknown>): unknown {
+  return (row.details as Record<string, unknown>).configHashAfter;
 }
 
 function fakeDb(captured: Array<Record<string, unknown>>): Db {
@@ -42,27 +67,39 @@ describe("request audit context on activity rows", () => {
   it("distinguishes a host producer (board_key) from a browser session on the same identity", async () => {
     const rows: Array<Record<string, unknown>> = [];
     const db = fakeDb(rows);
-    const producer = buildRequestAuditContext(
+    const producer = mustBuildContext(
       fakeReq(
-        { type: "board", userId: "board-user", source: "board_key", keyId: "key-row-7" },
-        { "X-Paperclip-Change-Reason": "cap timer: weekly window", "X-Paperclip-Correlation-Id": "cap-timer/2026-10-11" },
+        {
+          type: "board",
+          userId: "board-user",
+          source: "board_key",
+          keyId: "key-row-7",
+        },
+        {
+          "X-Paperclip-Change-Reason": "cap timer: weekly window",
+          "X-Paperclip-Correlation-Id": "cap-timer/2026-10-11",
+        },
       ),
-    )!;
-    const browser = buildRequestAuditContext(
+    );
+    const browser = mustBuildContext(
       fakeReq({ type: "board", userId: "board-user", source: "session" }),
-    )!;
+    );
 
-    await runWithRequestAuditContext(producer, () => persistActivity(db, { ...baseInput, details: { configHashAfter: "x" } }));
-    await runWithRequestAuditContext(browser, () => persistActivity(db, { ...baseInput }));
+    await runWithRequestAuditContext(producer, () =>
+      persistActivity(db, { ...baseInput, details: { configHashAfter: "x" } }),
+    );
+    await runWithRequestAuditContext(browser, () =>
+      persistActivity(db, { ...baseInput }),
+    );
 
-    expect((rows[0].details as any).audit).toEqual({
+    expect(auditOf(rows[0])).toEqual({
       actorSource: "board_key",
       keyId: "key-row-7",
       reason: "cap timer: weekly window",
       correlationId: "cap-timer/2026-10-11",
     });
-    expect((rows[0].details as any).configHashAfter).toBe("x");
-    expect((rows[1].details as any).audit).toEqual({ actorSource: "session" });
+    expect(configHashAfterOf(rows[0])).toBe("x");
+    expect(auditOf(rows[1])).toEqual({ actorSource: "session" });
   });
 
   it("writes no audit block outside a request", async () => {
@@ -73,21 +110,28 @@ describe("request audit context on activity rows", () => {
 
   it("does not overwrite an explicit audit key set by the caller", async () => {
     const rows: Array<Record<string, unknown>> = [];
-    const ctx = buildRequestAuditContext(fakeReq({ type: "board", source: "session" }))!;
+    const ctx = mustBuildContext(fakeReq({ type: "board", source: "session" }));
     await runWithRequestAuditContext(ctx, () =>
-      persistActivity(fakeDb(rows), { ...baseInput, details: { audit: { custom: true } } }));
-    expect((rows[0].details as any).audit).toEqual({ custom: true });
+      persistActivity(fakeDb(rows), {
+        ...baseInput,
+        details: { audit: { custom: true } },
+      }),
+    );
+    expect(auditOf(rows[0])).toEqual({ custom: true });
   });
 
   it("bounds and sanitizes caller-supplied reason and correlation id", () => {
-    const ctx = buildRequestAuditContext(
+    const ctx = mustBuildContext(
       fakeReq(
         { type: "board", source: "board_key", keyId: "k" },
-        { "x-paperclip-change-reason": `a\nb${"x".repeat(400)}`, "x-paperclip-correlation-id": "bad id with spaces" },
+        {
+          "x-paperclip-change-reason": `a\nb${"x".repeat(400)}`,
+          "x-paperclip-correlation-id": "bad id with spaces",
+        },
       ),
-    )!;
+    );
     expect(ctx.reason).toHaveLength(256);
-    expect(ctx.reason).not.toMatch(/[\n]/);
+    expect(ctx.reason).not.toContain("\n");
     expect(ctx.correlationId).toBeNull();
   });
 
@@ -96,7 +140,9 @@ describe("request audit context on activity rows", () => {
   });
 
   it("hashes config independent of key order and detects change", () => {
-    expect(hashJsonValue({ a: 1, b: { c: 2, d: 3 } })).toBe(hashJsonValue({ b: { d: 3, c: 2 }, a: 1 }));
+    expect(hashJsonValue({ a: 1, b: { c: 2, d: 3 } })).toBe(
+      hashJsonValue({ b: { d: 3, c: 2 }, a: 1 }),
+    );
     expect(hashJsonValue({ a: 1 })).not.toBe(hashJsonValue({ a: 2 }));
   });
 });

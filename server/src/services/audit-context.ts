@@ -21,8 +21,6 @@ export const CORRELATION_ID_HEADER = "x-paperclip-correlation-id";
 
 const MAX_REASON_LENGTH = 256;
 const MAX_CORRELATION_ID_LENGTH = 128;
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 const CORRELATION_ID_RE = /^[A-Za-z0-9._:/-]+$/;
 
 const storage = new AsyncLocalStorage<RequestAuditContext>();
@@ -31,24 +29,43 @@ export function getRequestAuditContext(): RequestAuditContext | undefined {
   return storage.getStore();
 }
 
-export function runWithRequestAuditContext<T>(context: RequestAuditContext, fn: () => T): T {
+export function runWithRequestAuditContext<T>(
+  context: RequestAuditContext,
+  fn: () => T,
+): T {
   return storage.run(context, fn);
+}
+
+function stripControlChars(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    const code = ch.codePointAt(0) ?? 32;
+    out += code <= 0x1f || code === 0x7f ? " " : ch;
+  }
+  return out;
 }
 
 function readReason(req: Request): string | null {
   const raw = req.header(CHANGE_REASON_HEADER);
   if (!raw) return null;
-  const cleaned = raw.replace(CONTROL_CHARS_RE, " ").trim().slice(0, MAX_REASON_LENGTH);
+  const cleaned = stripControlChars(raw).trim().slice(0, MAX_REASON_LENGTH);
   return cleaned.length > 0 ? cleaned : null;
 }
 
 function readCorrelationId(req: Request): string | null {
   const raw = req.header(CORRELATION_ID_HEADER)?.trim();
-  if (!raw || raw.length > MAX_CORRELATION_ID_LENGTH || !CORRELATION_ID_RE.test(raw)) return null;
+  if (
+    !raw ||
+    raw.length > MAX_CORRELATION_ID_LENGTH ||
+    !CORRELATION_ID_RE.test(raw)
+  )
+    return null;
   return raw;
 }
 
-export function buildRequestAuditContext(req: Request): RequestAuditContext | null {
+export function buildRequestAuditContext(
+  req: Request,
+): RequestAuditContext | null {
   const actor = req.actor;
   if (!actor || actor.type === "none") return null;
   return {
@@ -99,7 +116,10 @@ function canonicalize(value: unknown): unknown {
     return Object.fromEntries(
       Object.keys(value as Record<string, unknown>)
         .sort()
-        .map((key) => [key, canonicalize((value as Record<string, unknown>)[key])]),
+        .map((key) => [
+          key,
+          canonicalize((value as Record<string, unknown>)[key]),
+        ]),
     );
   }
   return value;
