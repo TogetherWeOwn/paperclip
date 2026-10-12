@@ -25,6 +25,7 @@ import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { auditContextMiddleware } from "./services/audit-context.js";
 import { observerCeiling } from "./middleware/observer-ceiling.js";
 import {
   privateHostnameGuard,
@@ -576,6 +577,9 @@ export async function createApp(
   // before every route, so observer
   // credentials can never reach generic permissions or mutation handlers.
   app.use(observerCeiling());
+  // Stamps actorSource / credential row id / change reason onto every activity
+  // row written while serving the request.
+  app.use(auditContextMiddleware());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);

@@ -10,6 +10,7 @@ import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { withRequestAuditDetails } from "./audit-context.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
@@ -158,7 +159,9 @@ export function publishActivity(publication: ActivityPublication) {
 }
 
 export async function persistActivity(db: Db, input: LogActivityInput) {
-  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
+  // Merge provenance first so the free-text reason is redacted together with
+  // the rest of details before it is stored or broadcast.
+  const redactedDetails = await redactActivityDetails(db, withRequestAuditDetails(input.details ?? null, { actorType: input.actorType, actorId: input.actorId }));
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
   const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,

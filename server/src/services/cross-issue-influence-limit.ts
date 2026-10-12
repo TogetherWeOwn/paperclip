@@ -4,6 +4,7 @@ import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { withRequestAuditDetails } from "./audit-context.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
@@ -141,7 +142,7 @@ export async function observeCrossIssueInfluence(
         : CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY,
       entityType: "issue",
       entityId: input.targetIssueId,
-      details: {
+      details: withRequestAuditDetails({
         kind: input.kind,
         sourceIssueId,
         targetIssueId: input.targetIssueId,
@@ -151,7 +152,7 @@ export async function observeCrossIssueInfluence(
         mode: decision.mode,
         enforceAt: decision.enforceAt,
         allowed: decision.allowed,
-      },
+      }, { actorType: "agent", actorId: input.agentId }),
     });
 
     const logContext = {
