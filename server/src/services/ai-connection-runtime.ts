@@ -36,6 +36,10 @@ const AI_CONNECTION_RECONNECT_CODES = new Set([
   // Run-time only: the grant exists but its credential is gone, so only a
   // reconnect repairs it. Hire-time validation cannot produce this code.
   "ai_connection_credential_missing",
+  // Run-time only: the responsible user's personal default exists but has no
+  // install on this agent. Completing a purpose=ai intent adds the install
+  // before re-checking permission, so the card repairs this case.
+  "ai_connection_not_installed",
 ]);
 
 export function isAiConnectionReconnectable(error: unknown): boolean {
@@ -43,6 +47,23 @@ export function isAiConnectionReconnectable(error: unknown): boolean {
     AI_CONNECTION_RECONNECT_CODES.has(
       String((error.details as { code?: unknown } | undefined)?.code),
     );
+}
+
+// The run-prepare branch in heartbeat.ts opens a purpose=ai card through this
+// predicate, so tests can exercise the exact gate decision without booting a
+// full heartbeat run.
+export function shouldRequestAiConnectionIntentOnPrepareFailure(input: {
+  responsibleUserId: string | null;
+  issueId: string | null | undefined;
+  bindingMode: AiConnectionBinding["mode"];
+  error: unknown;
+}): boolean {
+  return Boolean(
+    input.responsibleUserId &&
+      input.issueId &&
+      input.bindingMode === "responsible_user" &&
+      isAiConnectionReconnectable(input.error),
+  );
 }
 
 // Blank values intentionally override inherited credentials in CLI child environments.
