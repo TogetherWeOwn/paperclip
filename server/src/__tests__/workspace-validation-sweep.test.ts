@@ -14,7 +14,9 @@ import {
   instanceSettings,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
   issues,
+  issueThreadInteractions,
   projects,
   projectWorkspaces,
   workspaceRuntimeServices,
@@ -806,6 +808,176 @@ describeEmbeddedPostgres("workspace validation recovery sweep", () => {
       readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
     ).resolves.toBe("feature/live");
     expect(await loadIssueStatus(parked.issueId)).toBe("done");
+    expect(calls).toEqual([]);
+  }, 30_000);
+
+  it.each(["backlog", "todo", "in_progress", "in_review"] as const)(
+    "leaves a card alone while its source issue is %s rather than blocked",
+    async (status) => {
+      const { repoRoot, worktreePath } = await createDriftedWorktree(tempDirs, {
+        recordedBranch: "feature/recorded",
+        driftedBranch: "feature/live",
+      });
+      const parked = await parkCard({
+        repoRoot,
+        worktreePath,
+        recordedBranch: "feature/recorded",
+      });
+      await db
+        .update(issues)
+        .set({ status })
+        .where(eq(issues.id, parked.issueId));
+      const { calls, wakeup } = wakeupRecorder();
+
+      const result = await sweepWorkspaceValidationRecoveries(db, {
+        limit: 10,
+        wakeup,
+        minAttemptIntervalMs: 0,
+      });
+
+      expect(result).toMatchObject({
+        restored: 0,
+        skipped: expect.objectContaining({ source_issue_not_blocked: 1 }),
+      });
+      await expect(
+        readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+      ).resolves.toBe("feature/live");
+      expect(await loadAction(parked.actionId)).toMatchObject({
+        status: "active",
+      });
+      expect(await loadIssueStatus(parked.issueId)).toBe(status);
+      expect(calls).toEqual([]);
+    },
+    30_000,
+  );
+
+  it("skips a blocked card while its source issue has an open blocker, and restores it once the blocker is done", async () => {
+    const { repoRoot, worktreePath } = await createDriftedWorktree(tempDirs, {
+      recordedBranch: "feature/recorded",
+      driftedBranch: "feature/live",
+    });
+    const parked = await parkCard({
+      repoRoot,
+      worktreePath,
+      recordedBranch: "feature/recorded",
+    });
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: parked.companyId,
+      projectId: parked.projectId,
+      projectWorkspaceId: parked.projectWorkspaceId,
+      title: "Blocking task",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: parked.agentId,
+    });
+    await db.insert(issueRelations).values({
+      companyId: parked.companyId,
+      issueId: blockerId,
+      relatedIssueId: parked.issueId,
+      type: "blocks",
+    });
+    const { calls, wakeup } = wakeupRecorder();
+
+    const whileBlocked = await sweepWorkspaceValidationRecoveries(db, {
+      limit: 10,
+      wakeup,
+      minAttemptIntervalMs: 0,
+    });
+
+    expect(whileBlocked).toMatchObject({
+      restored: 0,
+      skipped: expect.objectContaining({ source_issue_has_open_blockers: 1 }),
+    });
+    await expect(
+      readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+    ).resolves.toBe("feature/live");
+    expect(await loadIssueStatus(parked.issueId)).toBe("blocked");
+    expect(calls).toEqual([]);
+
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, blockerId));
+
+    const afterBlockerDone = await sweepWorkspaceValidationRecoveries(db, {
+      limit: 10,
+      wakeup,
+      minAttemptIntervalMs: 0,
+    });
+
+    expect(afterBlockerDone).toMatchObject({ restored: 1 });
+    expect(await loadIssueStatus(parked.issueId)).toBe("todo");
+  }, 30_000);
+
+  it("skips a blocked card while its source issue waits on a pending interaction", async () => {
+    const { repoRoot, worktreePath } = await createDriftedWorktree(tempDirs, {
+      recordedBranch: "feature/recorded",
+      driftedBranch: "feature/live",
+    });
+    const parked = await parkCard({
+      repoRoot,
+      worktreePath,
+      recordedBranch: "feature/recorded",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: parked.companyId,
+      issueId: parked.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { version: 1, prompt: "Confirm the next step" },
+    });
+    const { calls, wakeup } = wakeupRecorder();
+
+    const result = await sweepWorkspaceValidationRecoveries(db, {
+      limit: 10,
+      wakeup,
+      minAttemptIntervalMs: 0,
+    });
+
+    expect(result).toMatchObject({
+      restored: 0,
+      skipped: expect.objectContaining({
+        source_issue_has_pending_interaction: 1,
+      }),
+    });
+    await expect(
+      readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+    ).resolves.toBe("feature/live");
+    expect(await loadIssueStatus(parked.issueId)).toBe("blocked");
+    expect(calls).toEqual([]);
+  }, 30_000);
+
+  it("leaves cards of a company that is not active untouched", async () => {
+    const { repoRoot, worktreePath } = await createDriftedWorktree(tempDirs, {
+      recordedBranch: "feature/recorded",
+      driftedBranch: "feature/live",
+    });
+    const parked = await parkCard({
+      repoRoot,
+      worktreePath,
+      recordedBranch: "feature/recorded",
+    });
+    await db
+      .update(companies)
+      .set({ status: "paused" })
+      .where(eq(companies.id, parked.companyId));
+    const { calls, wakeup } = wakeupRecorder();
+
+    const result = await sweepWorkspaceValidationRecoveries(db, {
+      limit: 10,
+      wakeup,
+      minAttemptIntervalMs: 0,
+    });
+
+    expect(result).toMatchObject({ scanned: 0, restored: 0 });
+    await expect(
+      readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+    ).resolves.toBe("feature/live");
+    expect(await loadAction(parked.actionId)).toMatchObject({
+      status: "active",
+    });
     expect(calls).toEqual([]);
   }, 30_000);
 

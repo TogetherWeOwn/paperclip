@@ -11,6 +11,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueWorkProducts,
   issues,
   projects,
@@ -281,7 +282,10 @@ export type RecordedBranchRestoreSkipReason =
   | "dirty"
   | "busy"
   | "branch_missing"
-  | "not_registered";
+  | "not_registered"
+  | "source_issue_not_blocked"
+  | "source_issue_has_open_blockers"
+  | "source_issue_has_pending_interaction";
 
 export type RecordedBranchRestoreClassification =
   | { eligible: true; inspection: ExecutionWorkspaceBranchReconcileInspection }
@@ -744,6 +748,49 @@ function assertLockedBranchReconcileWorkspaceStillMatchesInspection(input: {
   }
 }
 
+// Restore only the blocked state parking leaves; anything else was moved since then.
+async function recordedBranchRestoreSourceIssueSkip(input: {
+  db: Db;
+  companyId: string;
+  sourceIssueId: string;
+}): Promise<{ reason: RecordedBranchRestoreSkipReason; message: string } | null> {
+  const [sourceIssue] = await input.db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId)))
+    .limit(1);
+  if (sourceIssue?.status !== "blocked") {
+    return {
+      reason: "source_issue_not_blocked",
+      message: `Source issue is ${sourceIssue?.status ?? "missing"}, not blocked`,
+    };
+  }
+  const { issueService } = await import("./issues.js");
+  const readiness = await issueService(input.db).getDependencyReadiness(input.sourceIssueId, input.db);
+  if (readiness.unresolvedBlockerCount > 0) {
+    return {
+      reason: "source_issue_has_open_blockers",
+      message: "Source issue still has an unresolved blocker",
+    };
+  }
+  const [pendingInteraction] = await input.db
+    .select({ id: issueThreadInteractions.id })
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, input.sourceIssueId),
+      eq(issueThreadInteractions.status, "pending"),
+    ))
+    .limit(1);
+  if (pendingInteraction) {
+    return {
+      reason: "source_issue_has_pending_interaction",
+      message: "Source issue is waiting on a pending interaction",
+    };
+  }
+  return null;
+}
+
 async function recordedBranchRestoreSkip(input: {
   db: Db;
   row: ExecutionWorkspaceRow;
@@ -752,6 +799,12 @@ async function recordedBranchRestoreSkip(input: {
   inspection: ExecutionWorkspaceBranchReconcileInspection;
   heartbeatRunId: string | null;
 }): Promise<{ reason: RecordedBranchRestoreSkipReason; message: string } | null> {
+  const sourceIssueSkip = await recordedBranchRestoreSourceIssueSkip({
+    db: input.db,
+    companyId: input.row.companyId,
+    sourceIssueId: input.sourceIssueId,
+  });
+  if (sourceIssueSkip) return sourceIssueSkip;
   const { inspection } = input;
   if (inspection.cleanliness === "unknown") {
     return { reason: "inspection_failed", message: "Recorded branch restore could not read the worktree status" };
@@ -3888,6 +3941,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .where(eq(issues.id, lockedWorkspace.sourceIssueId))
             .for("update");
           if (!sourceBefore) throw notFound("Source issue not found");
+          if (input.mode === "restore") {
+            const sourceIssueSkip = await recordedBranchRestoreSourceIssueSkip({
+              db: txDb,
+              companyId: lockedWorkspace.companyId,
+              sourceIssueId: lockedWorkspace.sourceIssueId,
+            });
+            if (sourceIssueSkip) {
+              throw unprocessable(sourceIssueSkip.message, { reason: sourceIssueSkip.reason, inspection });
+            }
+          }
 
           const requestedStatus = quarantineRestoreRequestedSourceStatus(sourceBefore);
           const policy = normalizeIssueExecutionPolicy(sourceBefore.executionPolicy ?? null);

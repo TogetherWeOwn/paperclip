@@ -1678,7 +1678,8 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        const schedulingSuppressed = (await heartbeat.resolveSchedulingSuppression()).suppressed;
+        if (!schedulingSuppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {
@@ -1699,7 +1700,7 @@ async function startServerWithDatabaseTeardown(
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
-        scheduleWorkspaceValidationRecoverySweep();
+        if (!schedulingSuppressed) scheduleWorkspaceValidationRecoverySweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();

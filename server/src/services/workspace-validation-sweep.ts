@@ -1,4 +1,4 @@
-import { type Db, issueRecoveryActions } from "@paperclipai/db";
+import { companies, type Db, issueRecoveryActions } from "@paperclipai/db";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
@@ -26,6 +26,9 @@ export const WORKSPACE_VALIDATION_SKIP_REASONS = [
   "busy",
   "branch_missing",
   "not_registered",
+  "source_issue_not_blocked",
+  "source_issue_has_open_blockers",
+  "source_issue_has_pending_interaction",
 ] as const;
 export type WorkspaceValidationSkipReason =
   (typeof WORKSPACE_VALIDATION_SKIP_REASONS)[number];
@@ -97,6 +100,13 @@ async function listIncoherenceCandidates(
       evidence: issueRecoveryActions.evidence,
     })
     .from(issueRecoveryActions)
+    .innerJoin(
+      companies,
+      and(
+        eq(companies.id, issueRecoveryActions.companyId),
+        eq(companies.status, "active"),
+      ),
+    )
     .where(
       and(
         eq(issueRecoveryActions.kind, "workspace_validation"),
