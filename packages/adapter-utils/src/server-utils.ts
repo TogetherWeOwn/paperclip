@@ -2658,7 +2658,8 @@ function renderPaperclipWakePromptBody(
   }
   if (!resumedSession && normalized.executionWorkspace?.branchName) {
     lines.push(
-      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it.`,
+      // paperclip:allow-git-push: prompt prose shows the agent the publish command to type; adapter code itself never pushes.
+      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it. On a public repository never publish a branch name that carries a tracker id: push HEAD to a card-free ref (${markdownInlineCode("git push origin HEAD:refs/heads/<type>/<short-slug>")}) and open the PR from that ref.`,
     );
   }
   if (normalized.simplifiedEnglishInteractions) {

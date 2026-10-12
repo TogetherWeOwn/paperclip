@@ -2195,7 +2195,8 @@ describe("renderPaperclipWakePrompt", () => {
 
     const firstPrompt = renderPaperclipWakePrompt(payload);
     expect(firstPrompt).toContain(
-      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch; keep all commits on it.",
+      // paperclip:allow-git-push: assertion mirrors the prompt prose above; no push behavior under test.
+      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch; keep all commits on it. On a public repository never publish a branch name that carries a tracker id: push HEAD to a card-free ref (`git push origin HEAD:refs/heads/<type>/<short-slug>`) and open the PR from that ref.",
     );
 
     const resumedPrompt = renderPaperclipWakePrompt(payload, {

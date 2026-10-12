@@ -1431,11 +1431,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               { details, checkedAtMs: now().getTime() },
             );
           }
+          // A merged PR delivers the workspace when its head commit is the
+          // workspace HEAD. The head ref may differ: on public repos agents
+          // push HEAD to a card-free ref so the published branch never
+          // carries a tracker id.
           if (
             details.state === "merged"
-            && details.headRef === workspace.branchName
-            && details.headSha === workspaceHeadSha
+            && details.headSha !== null
             && workspaceHeadSha !== null
+            && details.headSha === workspaceHeadSha
           ) {
             mergedPullRequest = true;
             break;
