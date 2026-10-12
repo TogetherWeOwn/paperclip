@@ -648,6 +648,11 @@ jobs:
     # Phase-1 deterministic quality gates. New checks start in WARN mode
     # (continue-on-error: report, do not fail) unless marked HARD. Runs on the
     # existing PR runners only. No paid Actions minutes.
+    #
+    # This job is defined on master but its scripts come from the PR's own
+    # checkout. A PR whose base branch predates the gates (deploy/tog6) has none
+    # of them, so detect_gates skips every later step and the job passes without
+    # running anything. Back-port the gate files to such a base to turn them on.
     name: Quality gates (phase 1)
     needs: [gate, policy]
     if: ${{ needs.gate.outputs.full_ci == 'true' }}
@@ -664,13 +669,25 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Detect gate scripts in this tree
+        id: detect_gates
+        run: |
+          if [ -f scripts/quality-gates/biome-changed.mjs ] && grep -q '"test:quality-gates"' package.json; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Quality gates skipped::this PR's base branch has no scripts/quality-gates; gates do not run until the base carries them"
+          fi
+
       - name: Setup Node.js for pnpm bootstrap
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           package-manager-cache: false
 
       - name: Setup pnpm
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         env:
           NPM_CONFIG_AUDIT: "false"
@@ -683,12 +700,14 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Locate pnpm store
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         id: pnpm_store
         run: |
           echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
           echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
 
       - name: Restore pnpm store (read only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm_store.outputs.path }}
@@ -696,6 +715,7 @@ jobs:
           restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
 
       - name: Install dependencies
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         # Same inline-resolution pattern as the test lanes: a stale lockfile
         # for the merge tree resolves locally without waiting on artifacts.
         run: |
@@ -706,19 +726,23 @@ jobs:
           fi
 
       - name: Test quality-gate scripts
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         run: pnpm test:quality-gates
 
       - name: Biome full scan (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: pnpm exec biome check .
 
       - name: Biome added files (HARD); modified files (WARN)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node scripts/quality-gates/biome-changed.mjs
 
       - name: Floor guard — bar-lowering check (WARN during calibration)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -726,6 +750,7 @@ jobs:
         run: node scripts/quality-gates/floor-guard.mjs
 
       - name: ast-grep shared rules (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -733,6 +758,7 @@ jobs:
         run: node scripts/quality-gates/ast-grep-changed.mjs
 
       - name: Coverage changed lines (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -740,10 +766,12 @@ jobs:
         run: node scripts/quality-gates/coverage-changed.mjs
 
       - name: pnpm audit (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: pnpm audit --audit-level=moderate
 
       - name: Trivy filesystem scan (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # pinned action revision
         with:
@@ -755,6 +783,7 @@ jobs:
           version: ${{ env.TRIVY_VERSION }}
 
       - name: Gitleaks secret scan (WARN, report only)
+        if: ${{ steps.detect_gates.outputs.present == 'true' }}
         continue-on-error: true
         run: |
           set -euo pipefail

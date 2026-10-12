@@ -90,6 +90,13 @@ Workflow changes take effect after merge: `pr.yml` pins
 previous master version. The new job first runs on pull requests opened after
 merge.
 
+The gate scripts come from the pull request's own checkout, not from master. A
+pull request whose base branch has no `scripts/quality-gates` (for example
+`deploy/tog6`) cannot run them, so step `detect_gates` skips every later step
+and the job passes with a notice. Back-port the gate files to that base branch
+to turn the gates on there. `scripts/quality-gates/workflow.test.mjs` pins
+the guard on every step.
+
 ## Start Dev
 
 From repo root:
