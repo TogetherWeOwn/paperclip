@@ -30,7 +30,8 @@ moves, reverse moves, and unrelated docs-only moves across all scopes.
 Only docs-only diffs skip scoped checks: `doc/**/*.md`, `README.md`, and
 `CONTRIBUTING.md`. Every other path runs them, including unknown top-level
 paths, `skills/`, `announcements/`, `.npmrc`, and `.pnpmfile.*`. An empty diff
-also runs them. The selector script `scripts/ci-affected-work.mjs` runs from the
+also runs them. An unknown scope warns and runs them too, so a stale base that
+predates a newly added scope cannot fail the changes job. The selector script `scripts/ci-affected-work.mjs` runs from the
 base commit, and the pull request head is fetched only as diff data. The
 workflow files that gate a pull request still come from its merge commit;
 pinning that gate to master belongs to the follow-up `pr-trusted` wiring.

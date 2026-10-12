@@ -4,8 +4,18 @@ import { pathToFileURL } from "node:url";
 
 const docsOnly = (file) => /^doc\/.+\.md$/.test(file) || /^(README|CONTRIBUTING)\.md$/.test(file);
 
+const KNOWN_SCOPES = ["docker", "smoke", "release", "workflows", "pr"];
+
 export function affectedWork(event, scope, files) {
-  if (!["docker", "smoke", "release", "workflows", "pr"].includes(scope)) throw new Error(`Unknown CI scope: ${scope}`);
+  if (!KNOWN_SCOPES.includes(scope)) {
+    // Fail open: the changes job checks out this selector from the PR base,
+    // so a stale base predates scopes added later (e.g. "pr"). Throwing here
+    // fails the changes job and cascades to e2e/verify/ci-ok, and no push to
+    // the PR branch can fix it. Running the work is always safe, so an
+    // unknown scope warns and reports affected instead of throwing.
+    console.warn(`Unknown CI scope: ${scope} - failing open to affected=true`);
+    return true;
+  }
   // Master pushes, schedules, and explicitly selected reusable/dispatch runs
   // verify the full scope. Only PRs may omit unaffected work.
   if (event !== "pull_request") return true;
