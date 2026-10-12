@@ -262,6 +262,8 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  holdsIssueAgainstAutoRelease,
+  shouldWakeAfterStopRelay,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -14975,6 +14977,7 @@ export function issueRoutes(
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
+          !holdsIssueAgainstAutoRelease(issue.unblockDescriptor, issue.status) &&
           (existing.status !== "blocked" ||
             Array.isArray(req.body.blockedByIssueIds) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);
@@ -15023,10 +15026,7 @@ export function issueRoutes(
               childStatus: issue.status,
             },
           });
-          if (
-            stopRelay.parent.assigneeAgentId &&
-            !isClosedIssueStatus(stopRelay.parent.status)
-          ) {
+          if (shouldWakeAfterStopRelay(stopRelay.parent)) {
             addWakeup(stopRelay.parent.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",

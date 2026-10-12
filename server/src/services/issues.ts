@@ -3,6 +3,7 @@ import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackCo
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
+import { holdsIssueAgainstAutoRelease } from "./issue-dependency-wakeups.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
@@ -7736,6 +7737,7 @@ export function issueService(db: Db) {
         companyId: issues.companyId,
         assigneeAgentId: issues.assigneeAgentId,
         status: issues.status,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(
@@ -7751,6 +7753,7 @@ export function issueService(db: Db) {
             companyId: string;
             assigneeAgentId: string | null;
             status: string;
+            unblockDescriptor: typeof issues.$inferSelect.unblockDescriptor;
           }>,
         ) => rows[0] ?? null,
       );
@@ -9044,6 +9047,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           blockedTransitionAt: issues.blockedTransitionAt,
+          unblockDescriptor: issues.unblockDescriptor,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
@@ -9060,7 +9064,8 @@ export function issueService(db: Db) {
       const wakeableCandidates = candidates.filter(
         (candidate) =>
           candidate.assigneeAgentId &&
-          !["backlog", "done", "cancelled"].includes(candidate.status),
+          !["backlog", "done", "cancelled"].includes(candidate.status) &&
+          !holdsIssueAgainstAutoRelease(candidate.unblockDescriptor, candidate.status),
       );
       if (wakeableCandidates.length === 0) return [];
 
@@ -9105,6 +9110,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           companyId: issues.companyId,
+          unblockDescriptor: issues.unblockDescriptor,
         })
         .from(issues)
         .where(eq(issues.id, parentIssueId))
@@ -9112,6 +9118,7 @@ export function issueService(db: Db) {
       if (!parent || parent.conversationAgentId || !parent.assigneeAgentId || ["backlog", "done", "cancelled"].includes(parent.status)) {
         return null;
       }
+      if (holdsIssueAgainstAutoRelease(parent.unblockDescriptor, parent.status)) return null;
 
       const children = await db
         .select({
@@ -11391,6 +11398,9 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          unblockDescriptor: null,
+          blockedTransitionAt: null,
+          blockedOwnerNotifiedAt: null,
           startedAt: now,
           updatedAt: now,
         })
@@ -11506,6 +11516,11 @@ export function issueService(db: Db) {
           };
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
+          }
+          if (current.status === "blocked") {
+            adoptionSet.unblockDescriptor = null;
+            adoptionSet.blockedTransitionAt = null;
+            adoptionSet.blockedOwnerNotifiedAt = null;
           }
           const adopted = await db
             .update(issues)

@@ -693,6 +693,25 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(receipts.filter((row) => row.status === "coalesced")).toHaveLength(2);
   });
 
+  it("does not heal a resolved dependent that holds a denial descriptor", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: { owner: "board", action: "Reassess the denial.", kind: "denial" } })
+      .where(eq(issues.id, blockedIssueId));
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(0);
+    expect(result.holdSkipped).toBe(1);
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(wakes).toHaveLength(0);
+  });
+
   it("retries a resolved dependency wake when the prior wake was skipped as stale", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });

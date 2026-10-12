@@ -24,6 +24,7 @@ import {
   ISSUE_WORK_MODES,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
+  ISSUE_UNBLOCK_DESCRIPTOR_KINDS,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_THREAD_INTERACTION_CANONICAL_RESOLVER_POLICIES,
   ISSUE_THREAD_INTERACTION_EFFECTIVE_RESOLVER_POLICY_SOURCES,
@@ -692,6 +693,7 @@ const createIssueBaseSchema = z.object({
         z.literal("board"),
       ]),
       action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+      kind: z.enum(ISSUE_UNBLOCK_DESCRIPTOR_KINDS).optional(),
     })
     .strict()
     .optional()
