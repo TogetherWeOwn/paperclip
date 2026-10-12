@@ -27,9 +27,14 @@ Workflow Health runs on PRs without a workflow-level path filter. Its read-only
 to include both removed and added paths; moving an in-scope harness into docs
 cannot skip its validation. Real Git rename fixtures cover harness and dependency
 moves, reverse moves, and unrelated docs-only moves across all scopes.
-Dependency, lockfile, patch, and `.github` changes run all scoped checks.
-Master pushes and nightly schedules always run
-all scoped checks. Its single `ci-ok` job rejects scope errors, failed validation,
+Only docs-only diffs skip scoped checks: `doc/**/*.md`, `README.md`, and
+`CONTRIBUTING.md`. Every other path runs them, including unknown top-level
+paths, `skills/`, `announcements/`, `.npmrc`, and `.pnpmfile.*`. An empty diff
+also runs them. The selector script `scripts/ci-affected-work.mjs` runs from the
+base commit, and the pull request head is fetched only as diff data. The
+workflow files that gate a pull request still come from its merge commit;
+pinning that gate to master belongs to the follow-up `pr-trusted` wiring.
+Master pushes and nightly schedules always run all scoped checks. Its single `ci-ok` job rejects scope errors, failed validation,
 and unexpected skips. Existing repository-required checks remain unchanged.
 The other repaired workflows use the same scoped changes job; their explicit
 release/source selections run their full existing verification lanes.

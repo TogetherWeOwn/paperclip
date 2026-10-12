@@ -23,11 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
+      - name: Fetch the pull request head as diff data only
+        if: github.event_name == 'pull_request'
+        env:
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags --quiet origin "$CI_HEAD_SHA"
       - name: Select affected work (full on master, nightly, and explicit calls)
         id: scope
         env:
