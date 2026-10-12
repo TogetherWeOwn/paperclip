@@ -30,8 +30,10 @@ moves, reverse moves, and unrelated docs-only moves across all scopes.
 Only docs-only diffs skip scoped checks: `doc/**/*.md`, `README.md`, and
 `CONTRIBUTING.md`. Every other path runs them, including unknown top-level
 paths, `skills/`, `announcements/`, `.npmrc`, and `.pnpmfile.*`. An empty diff
-also runs them. The selector script `scripts/ci-affected-work.mjs` runs from the
-base commit, and the pull request head is fetched only as diff data. The
+also runs them. The selector script `scripts/ci-affected-work.mjs` runs from a
+sparse checkout of `master`, never from the PR base (a deploy branch may predate
+it); the base commit only supplies diff objects, and the pull request head is
+fetched only as diff data. The
 workflow files that gate a pull request still come from its merge commit;
 `pr.yml` pins the trusted workflow to master, so trusted-workflow wiring takes
 effect on PRs only after it merges.
