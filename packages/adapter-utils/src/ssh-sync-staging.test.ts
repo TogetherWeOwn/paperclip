@@ -1,6 +1,6 @@
 import { execFile, spawnSync } from "node:child_process";
 import { promises as fsPromises } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -347,6 +347,22 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     await expect(prepared.restoreWorkspace()).rejects.toMatchObject({ code: "ssh_sync_insufficient_staging_space" });
   });
 
+  itWithGnuDu("counts each hard link in the free-space check, since the merge writes one copy per name", async () => {
+    await writeTree(localDir, { "src/app.ts": "export const app = 1;\n" });
+    const prepared = await prepare();
+    const remote = prepared.workspaceRemoteDir;
+    await writeFile(path.join(remote, "data.bin"), Buffer.alloc(1 * MB, 7));
+    for (let index = 0; index < 9; index += 1) {
+      await link(path.join(remote, "data.bin"), path.join(remote, `link-${index}.bin`));
+    }
+    // Ten names share 1 MiB on disk, but the merge writes ten copies: 10 MiB to
+    // restore, 20 MiB required. 12 MiB free fits the single-counted 2 MiB.
+    vi.spyOn(fsPromises, "statfs").mockResolvedValue({ bavail: 12 * 1024, bsize: 1024 } as Awaited<ReturnType<typeof fsPromises.statfs>>);
+
+    await expect(prepared.restoreWorkspace()).rejects.toMatchObject({ code: "ssh_sync_insufficient_staging_space" });
+    expect(await readFile(path.join(localDir, "src/app.ts"), "utf8")).toBe("export const app = 1;\n");
+  });
+
   it("does not delete a local nested worktree when the remote replaces its parent directory", async () => {
     await writeTree(localDir, {
       "packages/a/x.ts": "local\n",
@@ -510,6 +526,28 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("remote\n");
     expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt3/deep.txt"), "utf8")).toBe("local nested worktree\n");
     expect(await exists(path.join(localDir, "node_modules"))).toBe(false);
+  });
+
+  it("refuses a no-baseline restore that replaces a kept worktree's parent before clearing anything", async () => {
+    await writeTree(localDir, {
+      "packages/a/x.ts": "local\n",
+      "packages/a/.claude/worktrees/wt/f.txt": "local worktree\n",
+      "other.txt": "local\n",
+    });
+    const remote = path.join(remoteCwd, "ws");
+    await writeTree(remote, {
+      // The remote replaces the directory holding the local worktree with a file.
+      "packages/a": "now a file\n",
+      "other.txt": "remote\n",
+    });
+
+    await expect(restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: remote }))
+      .rejects.toMatchObject({ code: "workspace_restore_protected_children" });
+
+    // The refusal lands before the clear, so unrelated local files survive too.
+    expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
+    expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("local\n");
+    expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
   });
 
   it("normalizes the configured directories and rejects patterns tar and the baseline would read differently", () => {

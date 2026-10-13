@@ -687,7 +687,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
-const PROTECTED_CHILDREN_ERROR_CODE = "workspace_restore_protected_children";
+export const PROTECTED_CHILDREN_ERROR_CODE = "workspace_restore_protected_children";
 
 // Refuses to replace `relative` when it holds a path the restore must never
 // touch. The merge captures the target without its excluded paths, so it cannot

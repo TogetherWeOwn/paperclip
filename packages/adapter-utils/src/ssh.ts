@@ -15,7 +15,7 @@ import {
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { mergeDirectoryWithBaseline, PROTECTED_CHILDREN_ERROR_CODE } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -484,9 +484,13 @@ interface RemoteDirSizeEstimate {
 // available on the BSD/Linux remotes we target; it is block-rounded, which keeps
 // the reported percent safely below 100 until the stream actually closes. GNU
 // `--exclude` and BSD `-I` are tried so the figure leaves out what tar skips;
-// a remote with neither falls back to the unfiltered total. Returns null when
+// a remote with neither falls back to the unfiltered total. `--count-links`
+// counts each hard link separately: `du` otherwise counts linked contents once,
+// but the baseline merge writes a separate copy for every filename, so the
+// uncounted links would fill the disk after the check passed. Returns null when
 // unavailable so the caller falls back to MB-received mode and skips the
-// free-space preflight.
+// free-space preflight. (BSD `du` has no count-links equivalent, so the BSD
+// fallback stays a lower bound when the remote hardlinks large files.)
 async function probeRemoteDirSize(input: {
   spec: SshConnectionConfig;
   remoteDir: string;
@@ -501,10 +505,10 @@ async function probeRemoteDirSize(input: {
   const bsdExcludeAware = rawPatterns.every((pattern) => !pattern.includes("/"));
   const script = [
     `cd ${shellQuote(input.remoteDir)} 2>/dev/null || exit 0`,
-    `size=$(du -sk ${gnuFlags} . 2>/dev/null | cut -f1)`,
+    `size=$(du -sk --count-links ${gnuFlags} . 2>/dev/null | cut -f1)`,
     // tar streams a sparse file as zeros, so the restore writes its apparent size.
     `if [ -n "$size" ]; then`,
-    `  apparent=$(du -sk --apparent-size ${gnuFlags} . 2>/dev/null | cut -f1)`,
+    `  apparent=$(du -sk --count-links --apparent-size ${gnuFlags} . 2>/dev/null | cut -f1)`,
     `  if [ -n "$apparent" ] && [ "$apparent" -gt "$size" ]; then size=$apparent; fi`,
     `  echo "x $size"; exit 0`,
     `fi`,
@@ -1759,6 +1763,35 @@ async function extractDirectoryFromSsh(input: {
 
 // Replaces `localDir` with the remote directory. The tree is staged in the temp
 // directory first so a failed transfer never leaves `localDir` half-written.
+// Refuses a no-baseline restore whose staged tree replaces a kept local entry's
+// parent directory with a non-directory, before anything is cleared. The clear
+// keeps a preserved entry's ancestor directories, so without this check the
+// later copy fails (it cannot copy the staged file over the kept directory)
+// after unrelated local files have already been deleted. Mirrors the baseline
+// restore's protected-children refusal, which runs before `beforeApply`.
+async function assertNoPreservedParentReplacements(
+  stagingDir: string,
+  localDir: string,
+  preserveEntries: readonly string[] = [],
+): Promise<void> {
+  for (const preserved of preserveEntries) {
+    const parts = preserved.split("/");
+    for (let depth = 1; depth <= parts.length; depth += 1) {
+      const ancestor = parts.slice(0, depth).join("/");
+      const [staged, local] = await Promise.all([
+        fs.lstat(path.join(stagingDir, ...ancestor.split("/"))).catch(() => null),
+        fs.lstat(path.join(localDir, ...ancestor.split("/"))).catch(() => null),
+      ]);
+      if (staged && !staged.isDirectory() && local?.isDirectory()) {
+        throw Object.assign(
+          new Error(`Cannot replace ${ancestor}: it holds ${preserved}, which a restore never removes.`),
+          { code: PROTECTED_CHILDREN_ERROR_CODE },
+        );
+      }
+    }
+  }
+}
+
 export async function syncDirectoryFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
@@ -1785,6 +1818,9 @@ export async function syncDirectoryFromSsh(input: {
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
     });
+    // Refuse before the clear: a staged file that replaces a kept directory
+    // would fail the copy after unrelated local files are already deleted.
+    await assertNoPreservedParentReplacements(stagingDir, input.localDir, input.preserveLocalEntries);
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
     await copyDirectoryContents(stagingDir, input.localDir);
   } finally {
