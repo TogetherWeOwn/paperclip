@@ -550,6 +550,56 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
   });
 
+  itWithGnuDu("fails a no-baseline git restore before the branch advances when the temp volume is too small", async () => {
+    await writeTree(localDir, { "src/app.ts": "export const app = 1;\n" });
+    await git(localDir, ["init", "-q", "-b", "main"]);
+    await git(localDir, ["add", "-A"]);
+    await git(localDir, ["commit", "-q", "-m", "init"]);
+    const initialHead = await gitOutput(localDir, ["rev-parse", "main"]);
+    const prepared = await prepare();
+    const remote = prepared.workspaceRemoteDir;
+    await writeFile(path.join(remote, "data.bin"), Buffer.alloc(2 * MB, 7));
+    await git(remote, ["add", "-A"]);
+    await git(remote, ["commit", "-q", "-m", "remote work"]);
+    vi.spyOn(fsPromises, "statfs").mockResolvedValue({ bavail: 1024, bsize: 1024 } as Awaited<ReturnType<typeof fsPromises.statfs>>);
+
+    await expect(restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: remote }))
+      .rejects.toMatchObject({ code: "ssh_sync_insufficient_staging_space" });
+
+    // The refusal lands before the export, so the branch tip and files are untouched.
+    expect(await gitOutput(localDir, ["rev-parse", "main"])).toBe(initialHead);
+    expect(await readFile(path.join(localDir, "src/app.ts"), "utf8")).toBe("export const app = 1;\n");
+    expect(await exists(path.join(localDir, "data.bin"))).toBe(false);
+  });
+
+  it("refuses a no-baseline git restore that replaces a kept worktree's parent without moving the branch", async () => {
+    await writeTree(localDir, { "packages/a/x.ts": "local\n", "other.txt": "local\n" });
+    await git(localDir, ["init", "-q", "-b", "main"]);
+    await git(localDir, ["add", "-A"]);
+    await git(localDir, ["commit", "-q", "-m", "init"]);
+    // Untracked, so only the protection check stands between it and the reset.
+    await writeTree(localDir, { "packages/a/.claude/worktrees/wt/f.txt": "local worktree\n" });
+    const initialHead = await gitOutput(localDir, ["rev-parse", "main"]);
+    const prepared = await prepare();
+    const remote = prepared.workspaceRemoteDir;
+
+    // The remote run commits, and replaces the directory that holds the worktree.
+    await rm(path.join(remote, "packages/a"), { recursive: true });
+    await writeFile(path.join(remote, "packages/a"), "now a file\n");
+    await writeFile(path.join(remote, "other.txt"), "remote\n");
+    await git(remote, ["add", "-A"]);
+    await git(remote, ["commit", "-q", "-m", "remote work"]);
+
+    await expect(restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: remote }))
+      .rejects.toMatchObject({ code: "workspace_restore_protected_children" });
+
+    // A refused restore leaves the checkout exactly as it was: same branch tip, same files.
+    expect(await gitOutput(localDir, ["rev-parse", "main"])).toBe(initialHead);
+    expect(await readFile(path.join(localDir, "packages/a/.claude/worktrees/wt/f.txt"), "utf8")).toBe("local worktree\n");
+    expect(await readFile(path.join(localDir, "packages/a/x.ts"), "utf8")).toBe("local\n");
+    expect(await readFile(path.join(localDir, "other.txt"), "utf8")).toBe("local\n");
+  });
+
   it("normalizes the configured directories and rejects patterns tar and the baseline would read differently", () => {
     expect(resolveNestedWorktreeExcludes({ nestedWorktreeDirs: ["./wt/", "/other"] })).toEqual([
       "wt", "wt/*", "*/wt", "*/wt/*",

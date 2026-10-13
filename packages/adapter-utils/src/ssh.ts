@@ -2059,21 +2059,41 @@ async function restoreWorkspaceRootFromSsh(input: {
 
   if (gitSnapshot) {
     const projectRepositoryEntries = input.hasProjectRepositories ? [PROJECT_REPOSITORIES_DIR] : [];
-    await exportGitWorkspaceFromSsh({
-      spec: input.spec,
-      remoteDir,
-      localDir: input.localDir,
-      onProgress: input.onProgress,
-    });
-    await syncDirectoryFromSsh({
-      spec: input.spec,
-      remoteDir,
-      localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries, ...nestedWorktreeExcludes],
-      preserveLocalEntries: [".git", ...projectRepositoryEntries, ...localNestedWorktreeDirs],
-      onProgress: input.onProgress,
-      progressLabel: input.progressLabel,
-    });
+    const exclude = [".git", ".paperclip-runtime", ...projectRepositoryEntries, ...nestedWorktreeExcludes];
+    const preserveLocalEntries = [".git", ...projectRepositoryEntries, ...localNestedWorktreeDirs];
+    // Probe before the first write: the history bundle lands in the temp
+    // directory too, so a full volume must refuse before the download, and the
+    // branch must not advance before either refusal.
+    const [treeSize, historySize] = await Promise.all([
+      probeRemoteDirSize({ spec: input.spec, remoteDir, exclude }),
+      probeRemoteDirSize({ spec: input.spec, remoteDir: path.posix.join(remoteDir, ".git") }),
+    ]);
+    await assertStagingSpace([treeSize, historySize]);
+    // Stage the tree and refuse a protected parent replacement before the
+    // export below runs `git reset --hard` on the local checkout.
+    const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+    try {
+      await extractDirectoryFromSsh({
+        spec: input.spec,
+        remoteDir,
+        targetDir: stagingDir,
+        exclude,
+        remoteSize: treeSize,
+        onProgress: input.onProgress,
+        progressLabel: input.progressLabel,
+      });
+      await assertNoPreservedParentReplacements(stagingDir, input.localDir, preserveLocalEntries);
+      await exportGitWorkspaceFromSsh({
+        spec: input.spec,
+        remoteDir,
+        localDir: input.localDir,
+        onProgress: input.onProgress,
+      });
+      await clearLocalDirectory(input.localDir, preserveLocalEntries);
+      await copyDirectoryContents(stagingDir, input.localDir);
+    } finally {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    }
     return;
   }
 
