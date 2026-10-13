@@ -1022,6 +1022,10 @@ async function exportGitWorkspaceFromSsh(input: {
       timeout: 60_000,
       maxBuffer: 1024 * 1024,
     });
+    // The imported objects now live in the local repository. Remove the bundle
+    // before resetting the checkout, which may write a second copy of the tree
+    // onto the same volume as TMPDIR.
+    await fs.rm(bundleDir, { recursive: true, force: true });
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {
         timeout: 60_000,

@@ -38,6 +38,25 @@ done
 printf '999999999\\t.\\n'
 `;
 
+const FAKE_GIT = `#!/bin/sh
+if [ "$1" = "-C" ] && [ "$2" = "$FAKE_GIT_LOCAL_DIR" ]; then
+  for arg; do
+    if [ "$arg" = "reset" ]; then
+      if find "$TMPDIR" -maxdepth 2 -name workspace.bundle -type f -print -quit | grep -q .; then
+        printf 'bundle-present\\n' >> "$FAKE_GIT_RESET_BUNDLE_LOG"
+      else
+        printf 'bundle-absent\\n' >> "$FAKE_GIT_RESET_BUNDLE_LOG"
+      fi
+    fi
+  done
+fi
+exec "$FAKE_GIT_REAL_PATH" "$@"
+`;
+
+const realGitPath = spawnSync("sh", ["-c", "command -v git"], {
+  encoding: "utf8",
+  env: { ...process.env, PATH: "/usr/bin:/bin:/usr/local/bin" },
+}).stdout.trim();
 const MB = 1024 * 1024;
 // The size probe needs GNU du (--exclude, --apparent-size) on the "remote".
 const hasGnuDu = spawnSync("du", ["--version"], { stdio: "ignore" }).status === 0;
@@ -570,6 +589,30 @@ describe("ssh workspace sync staging", { timeout: 90_000 }, () => {
     expect(await gitOutput(localDir, ["rev-parse", "main"])).toBe(initialHead);
     expect(await readFile(path.join(localDir, "src/app.ts"), "utf8")).toBe("export const app = 1;\n");
     expect(await exists(path.join(localDir, "data.bin"))).toBe(false);
+  });
+
+  it("removes the downloaded history bundle before resetting the local checkout", async () => {
+    await writeTree(localDir, { "src/app.ts": "export const app = 1;\\n" });
+    await git(localDir, ["init", "-q", "-b", "main"]);
+    await git(localDir, ["add", "-A"]);
+    await git(localDir, ["commit", "-q", "-m", "init"]);
+    const prepared = await prepare();
+    const remote = prepared.workspaceRemoteDir;
+    await writeFile(path.join(remote, "data.bin"), Buffer.alloc(2 * MB, 7));
+    await git(remote, ["add", "-A"]);
+    await git(remote, ["commit", "-q", "-m", "remote work"]);
+
+    const resetBundleLog = path.join(root, "reset-bundle.log");
+    await writeFile(path.join(bin, "git"), FAKE_GIT, { mode: 0o755 });
+    await writeFile(resetBundleLog, "");
+    vi.stubEnv("FAKE_GIT_REAL_PATH", realGitPath);
+    vi.stubEnv("FAKE_GIT_LOCAL_DIR", localDir);
+    vi.stubEnv("FAKE_GIT_RESET_BUNDLE_LOG", resetBundleLog);
+
+    await restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: remote });
+
+    expect(await readFile(resetBundleLog, "utf8")).toContain("bundle-absent");
+    expect(await readFile(path.join(localDir, "data.bin"))).toHaveLength(2 * MB);
   });
 
   it("refuses a no-baseline git restore that replaces a kept worktree's parent without moving the branch", async () => {
