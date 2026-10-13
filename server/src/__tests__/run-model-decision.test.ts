@@ -5,9 +5,13 @@ import {
   RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS,
   RUN_MODEL_DECISION_RETRY_REASON,
   RUN_MODEL_DECISION_RPC_TIMEOUT_MS,
+  RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING,
   RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
+  buildModelDecisionRecord,
+  evaluateRunModelDecisionSeam,
   evaluateRunModelDecisionSkip,
+  hasAssignedModelLane,
   isRunModelDecisionDeferral,
   isSecretEnvBinding,
   readPreviousRunModelDecision,
@@ -470,5 +474,86 @@ describe("run model decision helpers", () => {
     expect(isRunModelDecisionDeferral(deferral)).toBe(true);
     expect(isRunModelDecisionDeferral(new Error("x"))).toBe(false);
     expect(deferral).toMatchObject({ code: "model_decision_pending", retryAfterMs: 30_000, record });
+  });
+});
+
+describe("run model decision seam enforcement (wrong-base re-expression)", () => {
+  it("fails closed when no run.model.resolve holder exists", () => {
+    expect(evaluateRunModelDecisionSeam({ kind: "none" })).toMatchObject({
+      enforced: false,
+      violation: RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING,
+    });
+  });
+
+  it("fails closed when the holder is foreign or disputed", () => {
+    const holders: RunModelDecisionHolderSelection[] = [
+      { kind: "conflict", pluginKeys: ["foreign-router", "model-router"] },
+      { kind: "unavailable", reason: "holder lookup failed: db down" },
+    ];
+    for (const holder of holders) {
+      expect(evaluateRunModelDecisionSeam(holder)).toMatchObject({
+        enforced: false,
+        violation: RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING,
+      });
+    }
+  });
+
+  it("enforces through the single holder and its manifest allowlist", () => {
+    expect(
+      evaluateRunModelDecisionSeam({
+        kind: "single",
+        holder: {
+          pluginId: "p-router",
+          pluginKey: "model-router",
+          envKeys: ["PAPERCLIP_ASSIGNED_MODEL"],
+        },
+      }),
+    ).toEqual({
+      enforced: true,
+      holder: {
+        pluginId: "p-router",
+        pluginKey: "model-router",
+        envKeys: ["PAPERCLIP_ASSIGNED_MODEL"],
+      },
+    });
+  });
+
+  it("reports lane presence from decision metadata, never adapter config", () => {
+    const decided = buildModelDecisionRecord({
+      answer: {
+        kind: "decide",
+        decisionId: "dec-1",
+        model: "claude-opus-5-5",
+        source: "router",
+      },
+      pluginKey: "model-router",
+      latencyMs: 7,
+      outcome: "decided",
+    });
+    const skipped = buildModelDecisionRecord({
+      answer: null,
+      pluginKey: null,
+      latencyMs: 0,
+      outcome: "skipped",
+      reason: "no_capability_holder",
+    });
+    const kept = buildModelDecisionRecord({
+      answer: { kind: "keep" },
+      pluginKey: "model-router",
+      latencyMs: 7,
+      outcome: "kept",
+    });
+    const exempt = buildModelDecisionRecord({
+      answer: null,
+      pluginKey: "model-router",
+      latencyMs: 7,
+      outcome: "exempt",
+      reason: "pacer closed",
+    });
+    expect(hasAssignedModelLane(decided)).toBe(true);
+    expect(hasAssignedModelLane(kept)).toBe(true);
+    expect(hasAssignedModelLane(skipped)).toBe(false);
+    expect(hasAssignedModelLane(exempt)).toBe(false);
+    expect(hasAssignedModelLane(null)).toBe(false);
   });
 });
