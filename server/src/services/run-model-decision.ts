@@ -420,6 +420,84 @@ export function selectRunModelDecisionHolder(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Seam enforcement: wrong-base case re-expressed as decision metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Seam-level violation code for a run with no authoritative assigned-model
+ * holder. This expresses the `assigned_model_missing` case as
+ * run-model-decision metadata: the run must fail closed
+ * instead of starting on the default model. It is deliberately separate
+ * from the live `resolveRunModelDecision` skip path (`no_capability_holder`
+ * proceeds), which stays unchanged for router-less companies; seam
+ * consumers (pre-dispatch mediation) evaluate this helper and park on
+ * `enforced: false`.
+ */
+export const RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING =
+  "assigned_model_missing";
+
+export type RunModelDecisionSeamEnforcement =
+  | { enforced: true; holder: RunModelDecisionHolder }
+  | {
+      enforced: false;
+      violation: typeof RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING;
+      reason: string;
+    };
+
+/**
+ * Evaluates whether the selected holder can authoritatively resolve this
+ * run's assigned model. Anything but exactly one holder fails closed:
+ * `none` (missing holder), `conflict` (a foreign router disputes
+ * authority), and `unavailable` (the lookup failed, so holder origin is
+ * unverified). The enforced holder carries the manifest
+ * `modelRouting.envKeys` allowlist; its answers are validated against it
+ * as `allowlistedEnvKeys` at the decision call site.
+ */
+export function evaluateRunModelDecisionSeam(
+  holder: RunModelDecisionHolderSelection,
+): RunModelDecisionSeamEnforcement {
+  if (holder.kind === "single") return { enforced: true, holder: holder.holder };
+  const reason =
+    holder.kind === "none"
+      ? `no ${RUN_MODEL_DECISION_CAPABILITY} holder: assigned model lane cannot be resolved`
+      : holder.kind === "conflict"
+        ? `multiple ${RUN_MODEL_DECISION_CAPABILITY} holders: ${holder.pluginKeys.join(", ")}`
+        : holder.reason;
+  return {
+    enforced: false,
+    violation: RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING,
+    reason,
+  };
+}
+
+/**
+ * True when the recorded model decision carries an assigned-model lane.
+ * A `decide` answer carries the lane in `record.model`; an authoritative
+ * `keep` answer carries it in `outcome: "kept"` with a non-null `pluginKey`
+ * (the single holder chose to keep the configured model, so the lane is
+ * resolved even though `model` stays null). Every other outcome (`skipped`,
+ * `deferred`, `timeout`, `exempt`) is lane-absent, including advisory records
+ * whose top-level outcome is `timeout`. Reads only run-model-decision
+ * metadata; it never reads `adapterConfig.model`, so lane-present vs
+ * lane-absent checks at the seam boundary (e.g. the purpose=ai intent opener)
+ * stay independent of adapter configuration.
+ */
+export function hasAssignedModelLane(
+  record:
+    | Pick<RunModelDecisionRecord, "model" | "outcome" | "pluginKey">
+    | null
+    | undefined,
+): boolean {
+  if (readNonEmptyString(record?.model ?? null) !== null) return true;
+  if (
+    (record?.outcome === "decided" || record?.outcome === "kept") &&
+    readNonEmptyString(record?.pluginKey ?? null) !== null
+  )
+    return true;
+  return false;
+}
+
 /** Reads `previous` from the last run on the same issue and agent. */
 export function readPreviousRunModelDecision(
   row: { id: string; contextSnapshot: unknown } | null | undefined,
