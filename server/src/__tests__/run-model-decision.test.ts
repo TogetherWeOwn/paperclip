@@ -537,8 +537,23 @@ describe("run model decision seam enforcement (wrong-base re-expression)", () =>
       outcome: "skipped",
       reason: "no_capability_holder",
     });
+    const kept = buildModelDecisionRecord({
+      answer: { kind: "keep" },
+      pluginKey: "model-router",
+      latencyMs: 7,
+      outcome: "kept",
+    });
+    const exempt = buildModelDecisionRecord({
+      answer: null,
+      pluginKey: "model-router",
+      latencyMs: 7,
+      outcome: "exempt",
+      reason: "pacer closed",
+    });
     expect(hasAssignedModelLane(decided)).toBe(true);
+    expect(hasAssignedModelLane(kept)).toBe(true);
     expect(hasAssignedModelLane(skipped)).toBe(false);
+    expect(hasAssignedModelLane(exempt)).toBe(false);
     expect(hasAssignedModelLane(null)).toBe(false);
   });
 });

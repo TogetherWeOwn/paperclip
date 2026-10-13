@@ -473,15 +473,29 @@ export function evaluateRunModelDecisionSeam(
 
 /**
  * True when the recorded model decision carries an assigned-model lane.
- * Reads only run-model-decision metadata (`record.model`); it never reads
- * `adapterConfig.model`, so lane-present vs lane-absent checks at the seam
- * boundary (e.g. the purpose=ai intent opener) stay independent of adapter
- * configuration.
+ * A `decide` answer carries the lane in `record.model`; an authoritative
+ * `keep` answer carries it in `outcome: "kept"` with a non-null `pluginKey`
+ * (the single holder chose to keep the configured model, so the lane is
+ * resolved even though `model` stays null). Every other outcome (`skipped`,
+ * `deferred`, `timeout`, `exempt`) is lane-absent, including advisory records
+ * whose top-level outcome is `timeout`. Reads only run-model-decision
+ * metadata; it never reads `adapterConfig.model`, so lane-present vs
+ * lane-absent checks at the seam boundary (e.g. the purpose=ai intent opener)
+ * stay independent of adapter configuration.
  */
 export function hasAssignedModelLane(
-  record: Pick<RunModelDecisionRecord, "model"> | null | undefined,
+  record:
+    | Pick<RunModelDecisionRecord, "model" | "outcome" | "pluginKey">
+    | null
+    | undefined,
 ): boolean {
-  return readNonEmptyString(record?.model ?? null) !== null;
+  if (readNonEmptyString(record?.model ?? null) !== null) return true;
+  if (
+    (record?.outcome === "decided" || record?.outcome === "kept") &&
+    readNonEmptyString(record?.pluginKey ?? null) !== null
+  )
+    return true;
+  return false;
 }
 
 /** Reads `previous` from the last run on the same issue and agent. */
