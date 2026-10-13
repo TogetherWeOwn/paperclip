@@ -64,6 +64,7 @@ import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { inheritNativeRunnerAdapterConfig } from "../services/native-runtime/native-agent-runtime-inheritance.js";
 import { agentInstructionsBundleMode } from "../services/agent-instructions.js";
+import { hashJsonValue } from "../services/audit-context.js";
 import {
   agentService,
   agentInstructionsService,
@@ -4000,6 +4001,8 @@ export function agentRoutes(
           supported: snapshot.supported,
           entryCount: snapshot.entries.length,
           warningCount: snapshot.warnings.length,
+          configHashBefore: hashJsonValue(agent.adapterConfig ?? null),
+          configHashAfter: hashJsonValue(nextAdapterConfig),
         },
       });
 
@@ -5145,6 +5148,9 @@ export function agentRoutes(
     assertExternalInstructionsAdmin(req, existing);
 
     const actor = getActorInfo(req);
+    const previousFile = await instructions
+      .readFile(existing, req.body.path)
+      .catch(() => null);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
     });
@@ -5179,6 +5185,8 @@ export function agentRoutes(
         path: result.file.path,
         size: result.file.size,
         clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate === true,
+        contentHashBefore: previousFile ? hashJsonValue(previousFile.content) : null,
+        contentHashAfter: hashJsonValue(result.file.content),
       },
     });
 
@@ -5422,7 +5430,15 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(requestedRuntimeConfig
+          ? {
+              runtimeConfigHashBefore: hashJsonValue(existing.runtimeConfig ?? null),
+              runtimeConfigHashAfter: hashJsonValue(requestedRuntimeConfig),
+            }
+          : {}),
+      },
     });
 
     res.json(redactAgentRowForResponse(agent));

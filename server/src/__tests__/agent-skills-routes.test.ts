@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hashJsonValue } from "../services/audit-context.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -619,6 +620,49 @@ describe.sequential("agent skill routes", () => {
       }),
       ["paperclipai/paperclip/paperclip"],
     );
+  });
+
+  it("records adapter config hashes when syncing skills", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("acpx_local"),
+      adapterConfig: { agent: "codex" },
+    });
+    mockSecretService.resolveAdapterConfigForRuntime.mockResolvedValueOnce({
+      config: {
+        agent: "codex",
+        paperclipSkillSync: {
+          desiredSkills: ["paperclipai/paperclip/paperclip"],
+        },
+      },
+    });
+    mockAdapter.syncSkills.mockResolvedValue({
+      adapterType: "acpx_local",
+      supported: true,
+      mode: "ephemeral",
+      desiredSkills: ["paperclipai/paperclip/paperclip"],
+      entries: [],
+      warnings: [],
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .post("/api/agents/11111111-1111-4111-8111-111111111111/skills/sync?companyId=company-1")
+      .send({ desiredSkills: ["paperclip"], mode: "replace" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.skills_synced",
+        details: expect.objectContaining({
+          configHashBefore: hashJsonValue({ agent: "codex" }),
+        }),
+      }),
+    );
+    const details = (mockLogActivity.mock.calls.find((call) =>
+      (call[1] as { action?: string })?.action === "agent.skills_synced",
+    )?.[1] as { details?: Record<string, unknown> } | undefined)?.details;
+    expect(typeof details?.configHashAfter).toBe("string");
+    expect(details?.configHashAfter).not.toBe(details?.configHashBefore);
   });
 
   it("requires an explicit actionable merge mode for skill sync", async () => {
