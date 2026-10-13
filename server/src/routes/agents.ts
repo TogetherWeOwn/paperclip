@@ -4002,7 +4002,7 @@ export function agentRoutes(
           entryCount: snapshot.entries.length,
           warningCount: snapshot.warnings.length,
           configHashBefore: hashJsonValue(agent.adapterConfig ?? null),
-          configHashAfter: hashJsonValue(nextAdapterConfig),
+          configHashAfter: hashJsonValue(updated.adapterConfig ?? null),
         },
       });
 

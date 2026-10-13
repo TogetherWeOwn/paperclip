@@ -623,10 +623,20 @@ describe.sequential("agent skill routes", () => {
   });
 
   it("records adapter config hashes when syncing skills", async () => {
+    const persistedAdapterConfig = {
+      env: { LEGACY_VALUE: { type: "plain", value: "normalized" } },
+      paperclipSkillSync: {
+        desiredSkills: ["paperclipai/paperclip/paperclip"],
+      },
+    };
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent("acpx_local"),
       adapterConfig: { agent: "codex" },
     });
+    mockAgentService.update.mockImplementationOnce(async () => ({
+      ...makeAgent("acpx_local"),
+      adapterConfig: persistedAdapterConfig,
+    }));
     mockSecretService.resolveAdapterConfigForRuntime.mockResolvedValueOnce({
       config: {
         agent: "codex",
@@ -661,8 +671,12 @@ describe.sequential("agent skill routes", () => {
     const details = (mockLogActivity.mock.calls.find((call) =>
       (call[1] as { action?: string })?.action === "agent.skills_synced",
     )?.[1] as { details?: Record<string, unknown> } | undefined)?.details;
-    expect(typeof details?.configHashAfter).toBe("string");
+    expect(details?.configHashAfter).toBe(hashJsonValue(persistedAdapterConfig));
     expect(details?.configHashAfter).not.toBe(details?.configHashBefore);
+    const updatePatch = mockAgentService.update.mock.calls.at(-1)?.[1] as {
+      adapterConfig: Record<string, unknown>;
+    };
+    expect(details?.configHashAfter).not.toBe(hashJsonValue(updatePatch.adapterConfig));
   });
 
   it("requires an explicit actionable merge mode for skill sync", async () => {
