@@ -426,8 +426,8 @@ export function selectRunModelDecisionHolder(
 
 /**
  * Seam-level violation code for a run with no authoritative assigned-model
- * holder. This re-expresses the wrong-base `assigned_model_missing` case
- * (TOG-608 era) as run-model-decision metadata: the run must fail closed
+ * holder. This expresses the `assigned_model_missing` case as
+ * run-model-decision metadata: the run must fail closed
  * instead of starting on the default model. It is deliberately separate
  * from the live `resolveRunModelDecision` skip path (`no_capability_holder`
  * proceeds), which stays unchanged for router-less companies; seam
