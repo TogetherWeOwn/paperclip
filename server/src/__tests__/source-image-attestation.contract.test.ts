@@ -45,12 +45,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import * as agentPermissions from "../services/agent-permissions.js";
-import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
 import type {
   QueuedRunFacts,
   ReviewParticipantFacts,
 } from "../modules/run-dispatch/domain/policy.js";
+import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
+import * as agentPermissions from "../services/agent-permissions.js";
 import * as environmentRuntime from "../services/environment-runtime.js";
 import { readWorkspaceRealizationRequest } from "../services/workspace-realization.js";
 
@@ -87,7 +87,10 @@ type SourceImageAttestationResult =
   | { ok: true; digest: string; verifiedAtValidationTime: true }
   | {
       ok: false;
-      errorCode: "mutable_tag_refused" | "digest_mismatch" | "digest_unparseable";
+      errorCode:
+        | "mutable_tag_refused"
+        | "digest_mismatch"
+        | "digest_unparseable";
     };
 
 type SourceImageAttestationOp = (
@@ -105,9 +108,10 @@ async function resolveAttestOp(): Promise<SourceImageAttestationOp> {
   // time; `/* @vite-ignore */` keeps Vitest from statically analyzing it.
   let mod: Record<string, unknown>;
   try {
-    mod = (await import(
-      /* @vite-ignore */ ATTEST_MODULE_SPECIFIER
-    )) as Record<string, unknown>;
+    mod = (await import(/* @vite-ignore */ ATTEST_MODULE_SPECIFIER)) as Record<
+      string,
+      unknown
+    >;
   } catch (cause) {
     throw new Error(
       `missing ${ATTEST_OP_NAME}: failed to import ${ATTEST_MODULE_SPECIFIER} ` +
@@ -199,6 +203,7 @@ function noReviewParticipant(): ReviewParticipantFacts {
 describe("contract: source-to-deployed-image attestation", () => {
   it("contract: exposes a source-to-image attestation operation", async () => {
     const op = await requireAttestOp();
+    expect(typeof op).toBe("function");
   });
 
   it("contract: accepts an exact OCI revision/digest binding verified at validation time", async () => {
@@ -323,9 +328,12 @@ describe("non-substitute: tags and existing operations are not attestation", () 
     expect(MUTABLE_TAG_FROM_RECEIPT.split("@")).toHaveLength(1);
   });
 
-  it.each(MUTABLE_TAGS)("non-substitute: mutable tag carries no digest (%s)", (tag) => {
-    expect(tag.includes("@sha256:")).toBe(false);
-  });
+  it.each(MUTABLE_TAGS)(
+    "non-substitute: mutable tag carries no digest (%s)",
+    (tag) => {
+      expect(tag.includes("@sha256:")).toBe(false);
+    },
+  );
 
   it("non-substitute: queued-run staleness recheck carries no image digest binding", () => {
     const facts: QueuedRunFacts = {
@@ -390,7 +398,10 @@ describe("non-substitute: tags and existing operations are not attestation", () 
     for (const mod of [dispatchPolicy, agentPermissions, environmentRuntime]) {
       const record = mod as unknown as Record<string, unknown>;
       for (const name of ATTEST_OP_NAMES) {
-        expect(name in record, `"${name}" must stay absent from seam modules`).toBe(false);
+        expect(
+          name in record,
+          `"${name}" must stay absent from seam modules`,
+        ).toBe(false);
       }
     }
   });

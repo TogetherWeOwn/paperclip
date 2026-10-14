@@ -44,14 +44,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import * as agentPermissions from "../services/agent-permissions.js";
-import { classifyEnvironmentCapabilities } from "../services/environment-runtime.js";
-import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
 import type {
   QueuedRunFacts,
   ReviewParticipantFacts,
   ScheduledRetryFacts,
 } from "../modules/run-dispatch/domain/policy.js";
+import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
+import * as agentPermissions from "../services/agent-permissions.js";
+import { classifyEnvironmentCapabilities } from "../services/environment-runtime.js";
 import { readWorkspaceRealizationRequest } from "../services/workspace-realization.js";
 
 // ---------------------------------------------------------------------------
@@ -227,6 +227,7 @@ function baseScheduledRetryFacts(): ScheduledRetryFacts {
 describe("contract: source-bound transport-only validation", () => {
   it("contract: exposes a source-issue-bound transport-only validation operation", async () => {
     const op = await requireTransportOnlyOp();
+    expect(typeof op).toBe("function");
   });
 
   it("contract: authorizes the intended principal for the given source issue", async () => {
@@ -440,7 +441,13 @@ describe("contract: source-bound transport-only validation", () => {
   // condition 3 ("any non-empty class denies"); the condition-3/item-4 `null`
   // ambiguity is raised for CISO resolution on the card and must not be
   // silently weakened here.
-  it.each([null, "Runtime.Manage", "runtime.manage ", "shell.execute", "  Custom.Tool  "] as const)(
+  it.each([
+    null,
+    "Runtime.Manage",
+    "runtime.manage ",
+    "shell.execute",
+    "  Custom.Tool  ",
+  ] as const)(
     "contract: denies low-trust tool class %s after normalization",
     async (requestedToolClass) => {
       const op = await requireTransportOnlyOp();
@@ -558,9 +565,7 @@ describe("non-substitute: existing operations are not transport-only validation"
 
   it("non-substitute: low-trust helper alone authorizes no principal transport", () => {
     expect(agentPermissions.permissionsImplyLowTrust({})).toBe(false);
-    const verdict = agentPermissions.permissionsImplyLowTrust(
-      {},
-    ) as unknown;
+    const verdict = agentPermissions.permissionsImplyLowTrust({}) as unknown;
     expect(typeof verdict).toBe("boolean");
     expect("boundary" in Object(verdict)).toBe(false);
   });
@@ -569,7 +574,10 @@ describe("non-substitute: existing operations are not transport-only validation"
     for (const mod of [dispatchPolicy, agentPermissions]) {
       const record = mod as unknown as Record<string, unknown>;
       for (const name of TRANSPORT_OP_NAMES) {
-        expect(name in record, `"${name}" must stay absent from seam modules`).toBe(false);
+        expect(
+          name in record,
+          `"${name}" must stay absent from seam modules`,
+        ).toBe(false);
       }
     }
   });
