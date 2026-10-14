@@ -22,7 +22,10 @@ export type VerifySourceImageAttestationResult =
   | { ok: true; digest: string; verifiedAtValidationTime: true }
   | {
       ok: false;
-      errorCode: "mutable_tag_refused" | "digest_mismatch" | "digest_unparseable";
+      errorCode:
+        | "mutable_tag_refused"
+        | "digest_mismatch"
+        | "digest_unparseable";
     };
 
 const EXPECTED_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
@@ -40,7 +43,9 @@ export function verifySourceImageAttestation(
   input: VerifySourceImageAttestationInput,
 ): VerifySourceImageAttestationResult {
   const expectedDigest =
-    input !== null && typeof input === "object" ? input.expectedDigest : undefined;
+    input !== null && typeof input === "object"
+      ? input.expectedDigest
+      : undefined;
   if (
     typeof expectedDigest !== "string" ||
     !EXPECTED_DIGEST_PATTERN.test(expectedDigest)
@@ -49,7 +54,9 @@ export function verifySourceImageAttestation(
   }
 
   const imageReference =
-    input !== null && typeof input === "object" ? input.imageReference : undefined;
+    input !== null && typeof input === "object"
+      ? input.imageReference
+      : undefined;
   if (typeof imageReference !== "string" || imageReference.length === 0) {
     return refuse("mutable_tag_refused");
   }
