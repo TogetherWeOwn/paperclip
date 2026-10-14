@@ -140,7 +140,7 @@ async function requireAttestOp(): Promise<SourceImageAttestationOp> {
 // ---------------------------------------------------------------------------
 
 const NOW = new Date("2026-01-01T00:00:00.000Z");
-const SOURCE_REVISION = "9c0a032bb9c0a032bb9c0a032bb9c0a032bb9c0a03";
+const SOURCE_REVISION = "9c0a032bb9c0a032bb9c0a032bb9c0a032bb9c0a";
 const PINNED_DIGEST = `sha256:${"ab".repeat(32)}`;
 const OTHER_DIGEST = `sha256:${"cd".repeat(32)}`;
 const PINNED_REFERENCE = `registry.example.com/paperclip-bot@${PINNED_DIGEST}`;
