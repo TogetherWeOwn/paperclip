@@ -5,6 +5,7 @@ import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
+import { assertNativeSshProbeSupported } from "../services/native-ssh-authority.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
@@ -3314,6 +3315,7 @@ export function agentRoutes(
   }
 
   async function testManagedEnvironment(adapterType: string, context: Parameters<ReturnType<typeof requireServerAdapter>["testEnvironment"]>[0], binding: AiConnectionBinding) {
+    assertNativeSshProbeSupported(context.executionTarget);
     await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
     const result = await requireServerAdapter(adapterType).testEnvironment(context);
     if (result.status === "fail") return result;
@@ -3573,6 +3575,8 @@ export function agentRoutes(
             effectiveAdapterConfig.apiKey = req.body.testCredentials.API_SERVER_KEY;
           }
         }
+        // The probe runs on the target; on SSH it needs a run to authorize it.
+        assertNativeSshProbeSupported(executionTarget);
         const managed = aiBinding ? await prepareManagedAiRuntime(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowUninstalledPersonal: !req.body.agentId, allowUninstalledShared: !req.body.agentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }) : null;
         let result;
         try {

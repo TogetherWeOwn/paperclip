@@ -8,6 +8,7 @@ import {
   getActiveNativeSshHostExecutor,
   NATIVE_SSH_ENVELOPE_AUDIENCE,
   NATIVE_SSH_SIGNER_REQUEST_VERSION,
+  isNativeSshAuthorityRequired,
   nativeSshEnvelopeSigningPayload,
   requestNativeSshSignerEnvelope,
   runWithNativeSshHostExecutor,
@@ -27,6 +28,7 @@ const launchInput = {
     username: "fixture-agent",
     remoteCwd: "/srv/paperclip/run",
   },
+  env: { PATH: "/usr/local/bin:/usr/bin", ANTHROPIC_API_KEY: "secret-value-never-in-authority" },
 };
 
 const keys = generateKeyPairSync("ed25519");
@@ -58,6 +60,7 @@ function expectedAuthority(overrides: Partial<{ opaqueRequestId: string; issuedA
     args: [...launchInput.args],
     remote: { ...launchInput.remote },
     argvSha256: sha256CanonicalJson({ command: launchInput.command, args: launchInput.args }),
+    envSha256: sha256CanonicalJson(launchInput.env),
     issuedAt: issuedAt.toISOString(),
     expiresAt: new Date(issuedAt.getTime() + (overrides.ttlMs ?? 60_000)).toISOString(),
   };
@@ -243,8 +246,62 @@ describe("createNativeSshHostExecutorTarget", () => {
         throw new Error("ledger down");
       },
     });
-    await expect(target.authorizeLaunch(launchInput)).rejects.toThrow("ledger down");
+    await expect(target.authorizeLaunch(launchInput)).rejects.toMatchObject({
+      code: "native_ssh_ledger_unavailable",
+      message: expect.stringContaining("ledger down"),
+    });
     expect(signer.requestEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("refuses the launch when the envelope digest cannot be recorded", async () => {
+    const target = makeTarget(
+      { requestEnvelope: async () => signEnvelope(expectedAuthority()) },
+      {
+        persistEnvelope: async () => {
+          throw new Error("ledger down");
+        },
+      },
+    );
+    await expect(target.authorizeLaunch(launchInput)).rejects.toMatchObject({
+      code: "native_ssh_ledger_unavailable",
+    });
+  });
+
+  it("reports a signer transport failure as signer unavailable", async () => {
+    const target = makeTarget({ requestEnvelope: async () => Promise.reject(new Error("connect ECONNREFUSED")) });
+    await expect(target.authorizeLaunch(launchInput)).rejects.toMatchObject({
+      code: "native_ssh_signer_unavailable",
+      message: expect.stringContaining("ECONNREFUSED"),
+    });
+  });
+
+  it("stops waiting for a signer that does not answer in time", async () => {
+    const target = makeTarget({ requestEnvelope: () => new Promise(() => {}) }, { signerTimeoutMs: 20 });
+    await expect(target.authorizeLaunch(launchInput)).rejects.toMatchObject({
+      code: "native_ssh_signer_unavailable",
+      message: expect.stringMatching(/did not answer/i),
+    });
+  });
+
+  it("binds a digest of the launch environment, never its values", async () => {
+    const target = makeTarget({ requestEnvelope: async () => signEnvelope(expectedAuthority()) });
+    const envelope = await target.authorizeLaunch(launchInput);
+    expect(envelope.authority.envSha256).toBe(sha256CanonicalJson(launchInput.env));
+    expect(JSON.stringify(envelope)).not.toContain("secret-value-never-in-authority");
+  });
+});
+
+describe("isNativeSshAuthorityRequired", () => {
+  it.each([
+    [undefined, false],
+    ["", false],
+    ["off", false],
+    ["required", true],
+    // An unrecognized value is a misconfiguration; it enforces rather than silently disabling.
+    ["requried", true],
+    ["on", true],
+  ])("reads %j as required=%s", (value, required) => {
+    expect(isNativeSshAuthorityRequired({ PAPERCLIP_NATIVE_SSH_AUTHORITY: value })).toBe(required);
   });
 });
 
@@ -287,6 +344,8 @@ describe("assertNativeSshLaunchAuthority", () => {
     ["port", { ...launchInput, remote: { ...launchInput.remote, port: 2222 } }],
     ["username", { ...launchInput, remote: { ...launchInput.remote, username: "root" } }],
     ["cwd", { ...launchInput, remote: { ...launchInput.remote, remoteCwd: "/" } }],
+    ["env", { ...launchInput, env: { ...launchInput.env, NODE_OPTIONS: "--require=/tmp/hook.js" } }],
+    ["PATH", { ...launchInput, env: { ...launchInput.env, PATH: "/tmp/shadow/bin" } }],
   ])("rejects a launch whose %s differs from the authorized one", async (_field, launch) => {
     const envelope = await issue();
     expect(() => assertNativeSshLaunchAuthority(envelope, launch, { now: () => NOW })).toThrowError(

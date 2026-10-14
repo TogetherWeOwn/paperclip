@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createEd25519NativeSshEnvelopeVerifier,
   getActiveNativeSshHostExecutor,
@@ -10,10 +10,18 @@ import {
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING } from "./run-model-decision.js";
 import {
+  assertNativeSshProbeSupported,
   createNativeSshHostExecutorForRun,
   NativeSshAssignedModelMissingError,
   runWithRunNativeSshHostExecutor,
 } from "./native-ssh-authority.js";
+
+beforeEach(() => {
+  vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "required");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 const keys = generateKeyPairSync("ed25519");
 const verifyEnvelope = createEd25519NativeSshEnvelopeVerifier(
@@ -49,6 +57,7 @@ const launch = {
   command: "claude",
   args: ["--print"],
   remote: { host: "h.example.test", port: 22, username: "agent", remoteCwd: "/srv/run" },
+  env: {},
 };
 
 type Input = Parameters<typeof createNativeSshHostExecutorForRun>[0];
@@ -98,6 +107,13 @@ describe("createNativeSshHostExecutorForRun", () => {
     });
     expect(persisted).toHaveLength(1);
     expect(envelope.authority).toMatchObject({ ...ids, adapterType: "claude_local" });
+  });
+
+  it("returns no executor for an SSH run while native SSH authority is off", () => {
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "off");
+    const signer = { requestEnvelope: vi.fn() };
+    expect(build({ holder: { kind: "none" }, decision: null, signer }).target).toBeNull();
+    expect(signer.requestEnvelope).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -177,5 +193,22 @@ describe("runWithRunNativeSshHostExecutor", () => {
     await expect(
       runWithRunNativeSshHostExecutor(null, async () => getActiveNativeSshHostExecutor()),
     ).resolves.toBeNull();
+  });
+});
+
+describe("assertNativeSshProbeSupported", () => {
+  it("refuses an SSH probe with a 422 while native SSH authority is required", () => {
+    expect(() => assertNativeSshProbeSupported(sshTarget)).toThrowError(
+      expect.objectContaining({ status: 422, details: expect.objectContaining({ code: "native_ssh_authority_required" }) }),
+    );
+  });
+
+  it.each([
+    ["an SSH target with authority off", sshTarget, "off"],
+    ["a local target", { kind: "local" }, "required"],
+    ["no target", null, "required"],
+  ])("allows %s", (_name, target, mode) => {
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", mode);
+    expect(() => assertNativeSshProbeSupported(target as AdapterExecutionTarget | null)).not.toThrow();
   });
 });

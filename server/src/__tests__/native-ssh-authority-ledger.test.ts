@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   createEd25519NativeSshEnvelopeVerifier,
@@ -37,6 +37,7 @@ const launch = {
   command: "claude",
   args: ["--print"],
   remote: { host: "h.example.test", port: 22, username: "agent", remoteCwd: "/srv/run" },
+  env: {},
 };
 
 describeEmbeddedPostgres("native SSH authority run ledger", () => {
@@ -48,7 +49,12 @@ describeEmbeddedPostgres("native SSH authority run ledger", () => {
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "required");
+  });
+
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -101,6 +107,8 @@ describeEmbeddedPostgres("native SSH authority run ledger", () => {
     const ids = await seedRun();
     const keys = generateKeyPairSync("ed25519");
     const signerSaw: Array<{ request: NativeSshSignerRequest; recorded: unknown }> = [];
+    // Stands in for the heartbeat's in-memory context, which later run writes persist whole.
+    const runContext: Record<string, unknown> = { issueId: ids.issueId };
     const executor = createNativeSshHostExecutorForRun({
       ...ids,
       target: sshTarget,
@@ -110,7 +118,7 @@ describeEmbeddedPostgres("native SSH authority run ledger", () => {
       verifyEnvelope: createEd25519NativeSshEnvelopeVerifier(
         keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
       ),
-      ...nativeSshAuthorityRunLedger(db, ids.runId),
+      ...nativeSshAuthorityRunLedger(db, ids.runId, runContext),
       // Stand-in for the out-of-process signer: it receives only the opaque id
       // and signs the authority the server recorded for it, nothing the caller says.
       signer: {
@@ -139,6 +147,11 @@ describeEmbeddedPostgres("native SSH authority run ledger", () => {
     expect(after.nativeSshAuthority).toEqual(envelope.authority);
     expect(after.nativeSshEnvelopeSha256).toBe(sha256CanonicalJson(envelope));
     expect(after.modelDecision).toEqual({ model: "claude-opus-5", outcome: "decided", pluginKey: "model-router" });
+    // A later full-snapshot write of the run context keeps the record.
+    expect(runContext).toMatchObject({
+      nativeSshAuthority: envelope.authority,
+      nativeSshEnvelopeSha256: sha256CanonicalJson(envelope),
+    });
     expect(envelope.authority.assignedModel.sha256).toBe(
       createHash("sha256").update("claude-opus-5").digest("hex"),
     );

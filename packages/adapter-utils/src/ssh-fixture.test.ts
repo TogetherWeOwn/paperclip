@@ -19,7 +19,6 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
-import { issueFixtureNativeSshAuthority } from "./test-support/native-ssh-authority.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
@@ -450,13 +449,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("builds a remote script that sources login profiles but no nvm", async () => {
-    const authority = await issueFixtureNativeSshAuthority({
-      command: "node",
-      args: ["--version"],
-      remote: { host: "ssh.example.test", port: 22, username: "ssh-user", remoteCwd: "/srv/paperclip/workspace" },
-    });
     const target = await buildSshSpawnTarget({
-      authority,
       spec: {
         host: "ssh.example.test",
         port: 22,
@@ -499,14 +492,8 @@ describe("ssh env-lab fixture", () => {
   });
 
   it("rejects invalid environment variable keys when constructing SSH spawn targets", async () => {
-    const authority = await issueFixtureNativeSshAuthority({
-      command: "env",
-      args: [],
-      remote: { host: "ssh.example.test", port: 22, username: "ssh-user", remoteCwd: "/srv/paperclip/workspace" },
-    });
     await expect(
       buildSshSpawnTarget({
-        authority,
         spec: {
           host: "ssh.example.test",
           port: 22,

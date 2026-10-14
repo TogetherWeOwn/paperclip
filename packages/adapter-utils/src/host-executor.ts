@@ -4,6 +4,9 @@ import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from 
 export const NATIVE_SSH_SIGNER_REQUEST_VERSION = "1" as const;
 export const NATIVE_SSH_ENVELOPE_AUDIENCE = "paperclip-native-ssh" as const;
 export const NATIVE_SSH_MAX_AUTHORITY_LIFETIME_MS = 60_000;
+export const NATIVE_SSH_SIGNER_TIMEOUT_MS = 10_000;
+/** Server environment switch. Unset, empty or `off`: SSH launches need an authority only when an executor is bound. */
+export const NATIVE_SSH_AUTHORITY_ENV = "PAPERCLIP_NATIVE_SSH_AUTHORITY";
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
@@ -17,6 +20,7 @@ export type NativeSshAuthorityErrorCode =
   | "native_ssh_authority_replayed"
   | "native_ssh_signer_request_invalid"
   | "native_ssh_signer_unavailable"
+  | "native_ssh_ledger_unavailable"
   | "native_ssh_signer_envelope_invalid"
   | "native_ssh_signature_invalid";
 
@@ -63,6 +67,8 @@ export interface NativeSshLaunchAuthority {
   readonly args: readonly string[];
   readonly remote: NativeSshRemoteTarget;
   readonly argvSha256: string;
+  /** Digest of the exact launch environment; the values themselves never leave the server. */
+  readonly envSha256: string;
   readonly launchSpecSha256: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
@@ -79,6 +85,8 @@ export interface NativeSshLaunchInput {
   readonly command: string;
   readonly args: readonly string[];
   readonly remote: NativeSshRemoteTarget;
+  /** The environment the remote command starts with. PATH or NODE_OPTIONS can change what runs. */
+  readonly env: Readonly<Record<string, string>>;
 }
 
 /** Decides whether the signer's signature over the envelope is genuine. Never trusts the transport. */
@@ -112,6 +120,17 @@ export interface CreateNativeSshHostExecutorTargetInput {
   readonly nextOpaqueRequestId?: () => string;
   readonly now?: () => Date;
   readonly maxLifetimeMs?: number;
+  /** How long to wait for the signer before refusing the launch. */
+  readonly signerTimeoutMs?: number;
+}
+
+/**
+ * True unless the server environment leaves native SSH authority off. An
+ * unrecognized value enforces, so a typo cannot silently disable the check.
+ */
+export function isNativeSshAuthorityRequired(env: Record<string, string | undefined> = process.env): boolean {
+  const value = env[NATIVE_SSH_AUTHORITY_ENV]?.trim().toLowerCase() ?? "";
+  return value !== "" && value !== "off";
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -178,7 +197,9 @@ function assertLaunchInput(input: NativeSshLaunchInput): void {
     input.remote.port < 1 ||
     input.remote.port > 65_535 ||
     !readNonEmptyString(input.remote.username) ||
-    !readNonEmptyString(input.remote.remoteCwd)
+    !readNonEmptyString(input.remote.remoteCwd) ||
+    !readRecord(input.env) ||
+    Object.values(input.env).some((value) => typeof value !== "string")
   ) {
     throw new NativeSshAuthorityError(
       "native_ssh_authority_invalid",
@@ -287,6 +308,7 @@ function parseAuthority(value: unknown): NativeSshLaunchAuthority | null {
     typeof remote.username !== "string" ||
     typeof remote.remoteCwd !== "string" ||
     typeof authority.argvSha256 !== "string" ||
+    typeof authority.envSha256 !== "string" ||
     typeof authority.launchSpecSha256 !== "string" ||
     typeof authority.issuedAt !== "string" ||
     typeof authority.expiresAt !== "string"
@@ -343,6 +365,7 @@ function buildAuthority(
       remoteCwd: input.remote.remoteCwd,
     },
     argvSha256: sha256CanonicalJson({ command: input.command, args: [...input.args] }),
+    envSha256: sha256CanonicalJson(input.env),
     issuedAt: issuedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
   };
@@ -399,6 +422,8 @@ export function assertNativeSshLaunchAuthority(
     authority.command !== launch.command ||
     stableJson(authority.args) !== stableJson(launch.args) ||
     authority.argvSha256 !== sha256CanonicalJson({ command: launch.command, args: [...launch.args] }) ||
+    !readRecord(launch.env) ||
+    authority.envSha256 !== sha256CanonicalJson(launch.env) ||
     authority.remote.host !== launch.remote.host ||
     authority.remote.port !== launch.remote.port ||
     authority.remote.username !== launch.remote.username ||
@@ -410,6 +435,54 @@ export function assertNativeSshLaunchAuthority(
     );
   }
   if (options.consume) consumedProofs.add(envelope);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A ledger write that fails refuses the launch with a code callers can tell apart from config errors. */
+async function recordInLedger(what: string, write: () => Promise<void>): Promise<void> {
+  try {
+    await write();
+  } catch (error) {
+    throw new NativeSshAuthorityError(
+      "native_ssh_ledger_unavailable",
+      `Native SSH ${what} could not be recorded: ${errorMessage(error)}`,
+    );
+  }
+}
+
+/** Bounded signer round trip; a transport failure or silence is "signer unavailable". */
+async function askSigner(
+  signer: NativeSshSignerTransport | null | undefined,
+  request: NativeSshSignerRequest,
+  timeoutMs: number,
+): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new NativeSshAuthorityError(
+            "native_ssh_signer_unavailable",
+            `Native SSH signer did not answer within ${timeoutMs}ms`,
+          ),
+        ),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([requestNativeSshSignerEnvelope(signer, request), timeout]);
+  } catch (error) {
+    if (error instanceof NativeSshAuthorityError) throw error;
+    throw new NativeSshAuthorityError(
+      "native_ssh_signer_unavailable",
+      `Native SSH signer request failed: ${errorMessage(error)}`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function createNativeSshHostExecutorTarget(
@@ -427,6 +500,13 @@ export function createNativeSshHostExecutorTarget(
       `Native SSH authority lifetime must be between 1 and ${NATIVE_SSH_MAX_AUTHORITY_LIFETIME_MS}ms`,
     );
   }
+  if (input.signerTimeoutMs !== undefined && (!Number.isSafeInteger(input.signerTimeoutMs) || input.signerTimeoutMs <= 0)) {
+    throw new NativeSshAuthorityError(
+      "native_ssh_authority_invalid",
+      "Native SSH signer timeout must be a positive number of milliseconds",
+    );
+  }
+  const signerTimeoutMs = input.signerTimeoutMs ?? NATIVE_SSH_SIGNER_TIMEOUT_MS;
   const now = input.now ?? (() => new Date());
   const nextOpaqueRequestId = input.nextOpaqueRequestId ?? (() => randomUUID());
   const usedRequestIds = new Set<string>();
@@ -472,12 +552,9 @@ export function createNativeSshHostExecutorTarget(
         issuedAt,
         new Date(issuedAt.getTime() + maxLifetimeMs),
       );
-      await input.persistAuthority(authority);
+      await recordInLedger("authority", () => input.persistAuthority(authority));
       const envelope = parseEnvelope(
-        await requestNativeSshSignerEnvelope(input.signer, {
-          version: NATIVE_SSH_SIGNER_REQUEST_VERSION,
-          opaqueRequestId,
-        }),
+        await askSigner(input.signer, { version: NATIVE_SSH_SIGNER_REQUEST_VERSION, opaqueRequestId }, signerTimeoutMs),
       );
       if (!(await input.verifyEnvelope(envelope))) {
         throw new NativeSshAuthorityError(
@@ -497,10 +574,9 @@ export function createNativeSshHostExecutorTarget(
           "Native SSH authority expired before the launch",
         );
       }
-      await input.persistEnvelope?.({
-        authority,
-        envelopeSha256: sha256CanonicalJson(envelope),
-      });
+      await recordInLedger("envelope digest", async () =>
+        input.persistEnvelope?.({ authority, envelopeSha256: sha256CanonicalJson(envelope) }),
+      );
       const proof = deepFreezeEnvelope(envelope);
       issuedProofs.add(proof);
       return proof;
