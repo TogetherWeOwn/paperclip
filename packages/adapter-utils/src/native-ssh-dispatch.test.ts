@@ -38,7 +38,7 @@ const spec: SshRemoteExecutionSpec = {
   username: "fixture-agent",
   remoteCwd: "/srv/paperclip/run",
   remoteWorkspacePath: "/srv/paperclip/run",
-  privateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----",
+  privateKey: "fixture-private-key-not-a-real-key",
   knownHosts: "fixture.example.test ssh-ed25519 AAAAfixture",
   strictHostKeyChecking: true,
 };
