@@ -137,13 +137,17 @@ function wakeContextSnapshotBytes(value: Record<string, unknown>): number {
 
 /**
  * Caps an enriched wake context snapshot to `maxBytes` serialized bytes.
- * The `debug` object goes first. Unprotected strings then shrink, if that
- * alone reaches the budget. Oldest wake comment ids drop only when dropping
- * them (with strings shrunk to fit) reaches the budget, because an id drop
+ * The `debug` object goes first. Unprotected values then shrink (nested
+ * strings truncate largest-first, then unshrinkable values blank out, then
+ * whole unprotected subtrees collapse to a removal marker), if that alone
+ * reaches the budget. Oldest wake comment ids drop only when dropping
+ * them (with values shrunk to fit) reaches the budget, because an id drop
  * that cannot reach it loses thread pointers for no byte gain. Queued comment
  * ids and every protected routing key are never touched: dropping pending
  * input would silently lose work, and rewriting an id or reason would change
- * what the run does.
+ * what the run does. The returned snapshot fits the budget whenever any
+ * combination of unprotected reductions can reach it; only protected-only
+ * content over the budget is returned best-effort with an honest byte count.
  */
 export function capWakeContextSnapshotBytes(
   input: Record<string, unknown>,
@@ -163,12 +167,12 @@ export function capWakeContextSnapshotBytes(
 
   const ids = extractWakeCommentIds(base);
   const dropCount = Math.max(0, ids.length - WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
-  const shrunkKeepingIds = shrinkUnprotectedStrings({ ...base }, maxBytes);
+  const shrunkKeepingIds = shrinkUnprotectedValues({ ...base }, maxBytes);
   if (dropCount === 0 || wakeContextSnapshotBytes(shrunkKeepingIds) <= maxBytes) {
     return finishWakeContextCap(shrunkKeepingIds, 0);
   }
 
-  const shrunkWithTrimmedIds = shrinkUnprotectedStrings(
+  const shrunkWithTrimmedIds = shrinkUnprotectedValues(
     withTrimmedWakeCommentIds(base, ids, dropCount),
     maxBytes,
   );
@@ -194,30 +198,184 @@ function withTrimmedWakeCommentIds(
   };
 }
 
-function shrinkUnprotectedStrings(
+/**
+ * Bookkeeping keys the cap itself writes. They are tiny, but removing them
+ * would lie about the truncation, so no reduction phase touches them.
+ */
+const WAKE_CONTEXT_CAP_BOOKKEEPING_KEYS = new Set([
+  "snapshotTruncated",
+  "wakeCommentIdsDroppedFromFront",
+]);
+
+type WakeSnapshotPath = Array<string | number>;
+
+interface UnprotectedStringLeaf {
+  path: WakeSnapshotPath;
+  value: string;
+  bytes: number;
+}
+
+function isWakeSnapshotObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isProtectedWakeSnapshotKey(key: string): boolean {
+  return WAKE_CONTEXT_SNAPSHOT_PROTECTED_KEYS.has(key) || WAKE_CONTEXT_CAP_BOOKKEEPING_KEYS.has(key);
+}
+
+function collectUnprotectedStringLeaves(snapshot: Record<string, unknown>): UnprotectedStringLeaf[] {
+  const out: UnprotectedStringLeaf[] = [];
+  const visit = (value: unknown, path: WakeSnapshotPath, sheltered: boolean): void => {
+    if (typeof value === "string") {
+      if (!sheltered && value.length > 0) {
+        out.push({ path, value, bytes: Buffer.byteLength(value, "utf8") });
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        visit(value[index], [...path, index], sheltered);
+      }
+      return;
+    }
+    if (isWakeSnapshotObject(value)) {
+      for (const [key, entry] of Object.entries(value)) {
+        visit(entry, [...path, key], sheltered);
+      }
+    }
+  };
+  for (const [key, value] of Object.entries(snapshot)) {
+    visit(value, [key], isProtectedWakeSnapshotKey(key));
+  }
+  return out;
+}
+
+function compareWakeSnapshotPaths(a: WakeSnapshotPath, b: WakeSnapshotPath): number {
+  const shared = Math.min(a.length, b.length);
+  for (let index = 0; index < shared; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (left === right) continue;
+    if (typeof left === "number" && typeof right === "number") return left - right;
+    return String(left) < String(right) ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+function setWakeSnapshotPath(snapshot: Record<string, unknown>, path: WakeSnapshotPath, value: unknown): void {
+  let node: unknown = snapshot;
+  for (const segment of path.slice(0, -1)) {
+    if (typeof segment === "number") {
+      if (!Array.isArray(node)) return;
+      node = node[segment];
+    } else {
+      if (!isWakeSnapshotObject(node)) return;
+      node = node[segment];
+    }
+  }
+  const last = path[path.length - 1];
+  if (typeof last === "number") {
+    if (Array.isArray(node)) node[last] = value;
+  } else if (isWakeSnapshotObject(node)) {
+    node[last] = value;
+  }
+}
+
+/**
+ * Truncates a string to fit the remaining budget ratio. Returns the original
+ * value when truncating would not help: a truncation marker longer than the
+ * value it replaces only grows the snapshot.
+ */
+function truncateWakeSnapshotString(value: string, ratio: number): string {
+  const keepChars = Math.max(0, Math.floor(value.length * ratio) - 64);
+  if (keepChars >= value.length) return value;
+  const removed = value.length - keepChars;
+  const candidate = `${value.slice(0, keepChars)}…[truncated ${removed} chars]`;
+  return Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(value, "utf8") ? candidate : value;
+}
+
+/**
+ * Shrinks every unprotected value (at any depth) until the serialized
+ * snapshot fits `maxBytes`. Protected routing keys, queued input, and the
+ * cap's own bookkeeping markers are never touched. Three phases, each
+ * strictly reducing the serialized size so the loop always terminates:
+ * proportional truncation of the largest nested strings first (least data
+ * loss), then blanking the values a marker cannot shrink, then collapsing
+ * the largest remaining unprotected subtree into a removal marker.
+ */
+function shrinkUnprotectedValues(
   snapshot: Record<string, unknown>,
   maxBytes: number,
 ): Record<string, unknown> {
   let bytes = wakeContextSnapshotBytes(snapshot);
   while (bytes > maxBytes) {
+    const leaves = collectUnprotectedStringLeaves(snapshot);
+    if (leaves.length === 0) break;
+    leaves.sort((a, b) => b.bytes - a.bytes || compareWakeSnapshotPaths(a.path, b.path));
+    // Truncate a largest-first prefix whose estimated saving covers the
+    // overage, so a crowd of small strings converges in few passes instead of
+    // one stringify per value. Replacing a value never shifts paths, so the
+    // whole prefix applies safely before re-measuring.
+    const ratio = maxBytes / bytes;
+    const overage = bytes - maxBytes;
+    let covered = 0;
+    const planned: Array<{ path: WakeSnapshotPath; candidate: string; saving: number }> = [];
+    for (const target of leaves) {
+      const candidate = truncateWakeSnapshotString(target.value, ratio);
+      if (candidate === target.value) continue;
+      const saving = target.bytes - Buffer.byteLength(candidate, "utf8");
+      if (saving <= 0) continue;
+      planned.push({ path: target.path, candidate, saving });
+      covered += saving;
+      if (covered >= overage) break;
+    }
+    if (planned.length === 0) break;
+    for (const { path, candidate } of planned) {
+      setWakeSnapshotPath(snapshot, path, candidate);
+    }
+    const nextBytes = wakeContextSnapshotBytes(snapshot);
+    if (nextBytes >= bytes) break;
+    bytes = nextBytes;
+  }
+  while (bytes > maxBytes) {
+    const leaves = collectUnprotectedStringLeaves(snapshot);
+    if (leaves.length === 0) break;
+    leaves.sort((a, b) => b.bytes - a.bytes || compareWakeSnapshotPaths(a.path, b.path));
+    const overage = bytes - maxBytes;
+    let covered = 0;
+    let count = 0;
+    for (const leaf of leaves) {
+      // Blanking a value saves at least its content bytes (JSON escapes can
+      // only inflate the saving), so this prefix covers the overage.
+      covered += leaf.bytes;
+      count += 1;
+      if (covered >= overage) break;
+    }
+    for (const leaf of leaves.slice(0, Math.max(1, count))) {
+      setWakeSnapshotPath(snapshot, leaf.path, "");
+    }
+    const nextBytes = wakeContextSnapshotBytes(snapshot);
+    if (nextBytes >= bytes) break;
+    bytes = nextBytes;
+  }
+  while (bytes > maxBytes) {
     let largestKey: string | null = null;
     let largestBytes = 0;
     for (const [key, value] of Object.entries(snapshot)) {
-      if (WAKE_CONTEXT_SNAPSHOT_PROTECTED_KEYS.has(key)) continue;
-      if (typeof value !== "string") continue;
-      const size = Buffer.byteLength(value, "utf8");
+      if (isProtectedWakeSnapshotKey(key)) continue;
+      const size = Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
       if (size > largestBytes) {
         largestBytes = size;
         largestKey = key;
       }
     }
     if (largestKey === null || largestBytes <= 0) break;
-    const value = snapshot[largestKey] as string;
-    const keepChars = Math.max(0, Math.floor(value.length * (maxBytes / bytes)) - 64);
-    snapshot[largestKey] =
-      value.length > keepChars
-        ? `${value.slice(0, Math.max(0, keepChars))}…[truncated ${value.length - Math.max(0, keepChars)} chars]`
-        : value;
+    const marker = `…[removed ${largestBytes} bytes]`;
+    if (Buffer.byteLength(marker, "utf8") < largestBytes) {
+      snapshot[largestKey] = marker;
+    } else {
+      delete snapshot[largestKey];
+    }
     const nextBytes = wakeContextSnapshotBytes(snapshot);
     if (nextBytes >= bytes) break;
     bytes = nextBytes;

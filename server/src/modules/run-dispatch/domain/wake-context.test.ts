@@ -171,6 +171,97 @@ describe("capWakeContextSnapshotBytes", () => {
     });
     expect(result.snapshot.wakeCommentIds).toEqual(ids);
     expect(result.droppedWakeCommentIds).toBe(0);
+    expect(result.truncated).toBe(true);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("enforces the byte bound for an oversized nested diagnostic value", () => {
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1", "comment-2"],
+      diagnostics: { trace: "x".repeat(30_000) },
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.snapshot.wakeCommentIds).toEqual(["comment-1", "comment-2"]);
+    expect(result.droppedWakeCommentIds).toBe(0);
+    expect(result.snapshot.issueId).toBe("issue-1");
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("enforces the byte bound for large nested arrays", () => {
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ["comment-1"],
+      events: Array.from({ length: 2_000 }, (_, i) => ({ index: i, payload: "y".repeat(50) })),
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.snapshot.wakeCommentIds).toEqual(["comment-1"]);
+    expect(result.droppedWakeCommentIds).toBe(0);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("enforces the byte bound for many small keys", () => {
+    const diagnostics: Record<string, string> = {};
+    for (let i = 0; i < 3_000; i += 1) diagnostics[`key-${i}`] = "v".repeat(20);
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      diagnostics,
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.snapshot.issueId).toBe("issue-1");
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+  });
+
+  it("never replaces a string with a longer truncation marker", () => {
+    // Every value here is shorter than any truncation marker, so appending a
+    // marker can only grow the snapshot. The cap must still reach the budget
+    // without emitting a longer replacement.
+    const filler: Record<string, string> = {};
+    for (let i = 0; i < 2_000; i += 1) filler[`tiny-${i}`] = "v".repeat(30);
+    const input = {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      filler,
+    };
+    const result = capWakeContextSnapshotBytes(input);
+    expect(result.truncated).toBe(true);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    const collectStrings = (value: unknown, out: string[]): void => {
+      if (typeof value === "string") {
+        out.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) collectStrings(entry, out);
+        return;
+      }
+      if (typeof value === "object" && value !== null) {
+        for (const entry of Object.values(value)) collectStrings(entry, out);
+      }
+    };
+    const shrunk: string[] = [];
+    collectStrings(result.snapshot, shrunk);
+    for (const value of shrunk) {
+      expect(value.length).toBeLessThanOrEqual(30);
+    }
   });
 
   it("accumulates the dropped id count across repeated caps", () => {
