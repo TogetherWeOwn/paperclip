@@ -24,7 +24,7 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
-import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import { buildSshSpawnTarget, sshLaunchEnv, type SshRemoteExecutionSpec } from "./ssh.js";
 import {
   getActiveNativeSshHostExecutor,
   isNativeSshAuthorityRequired,
@@ -3779,7 +3779,8 @@ async function resolveSpawnTarget(
             username: remote.username,
             remoteCwd: remote.remoteCwd,
           },
-          env: sshEnv,
+          // What the remote command actually gets after the SSH size budget.
+          env: sshLaunchEnv({ spec: remote, command, args, env: sshEnv }).env,
         })
       : null;
     if (authority) options.onNativeSshAuthority?.(authority);

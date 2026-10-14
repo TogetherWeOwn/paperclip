@@ -60,6 +60,7 @@ function expectedAuthority(overrides: Partial<{ opaqueRequestId: string; issuedA
     args: [...launchInput.args],
     remote: { ...launchInput.remote },
     argvSha256: sha256CanonicalJson({ command: launchInput.command, args: launchInput.args }),
+    envKeys: Object.keys(launchInput.env).sort(),
     envSha256: sha256CanonicalJson(launchInput.env),
     issuedAt: issuedAt.toISOString(),
     expiresAt: new Date(issuedAt.getTime() + (overrides.ttlMs ?? 60_000)).toISOString(),
@@ -287,6 +288,8 @@ describe("createNativeSshHostExecutorTarget", () => {
     const target = makeTarget({ requestEnvelope: async () => signEnvelope(expectedAuthority()) });
     const envelope = await target.authorizeLaunch(launchInput);
     expect(envelope.authority.envSha256).toBe(sha256CanonicalJson(launchInput.env));
+    // Key names let the signer judge what is set; values stay on the server.
+    expect(envelope.authority.envKeys).toEqual(["ANTHROPIC_API_KEY", "PATH"]);
     expect(JSON.stringify(envelope)).not.toContain("secret-value-never-in-authority");
   });
 });

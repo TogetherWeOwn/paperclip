@@ -67,6 +67,8 @@ export interface NativeSshLaunchAuthority {
   readonly args: readonly string[];
   readonly remote: NativeSshRemoteTarget;
   readonly argvSha256: string;
+  /** Sorted names of the launch environment, so a signer can judge what is set. */
+  readonly envKeys: readonly string[];
   /** Digest of the exact launch environment; the values themselves never leave the server. */
   readonly envSha256: string;
   readonly launchSpecSha256: string;
@@ -308,6 +310,8 @@ function parseAuthority(value: unknown): NativeSshLaunchAuthority | null {
     typeof remote.username !== "string" ||
     typeof remote.remoteCwd !== "string" ||
     typeof authority.argvSha256 !== "string" ||
+    !Array.isArray(authority.envKeys) ||
+    authority.envKeys.some((key) => typeof key !== "string") ||
     typeof authority.envSha256 !== "string" ||
     typeof authority.launchSpecSha256 !== "string" ||
     typeof authority.issuedAt !== "string" ||
@@ -365,6 +369,7 @@ function buildAuthority(
       remoteCwd: input.remote.remoteCwd,
     },
     argvSha256: sha256CanonicalJson({ command: input.command, args: [...input.args] }),
+    envKeys: Object.keys(input.env).sort(),
     envSha256: sha256CanonicalJson(input.env),
     issuedAt: issuedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
@@ -375,6 +380,7 @@ function buildAuthority(
 function deepFreezeEnvelope(envelope: NativeSshSignedEnvelope): NativeSshSignedEnvelope {
   const { authority } = envelope;
   Object.freeze(authority.args);
+  Object.freeze(authority.envKeys);
   Object.freeze(authority.remote);
   Object.freeze(authority.assignedModel);
   Object.freeze(authority);
@@ -423,6 +429,7 @@ export function assertNativeSshLaunchAuthority(
     stableJson(authority.args) !== stableJson(launch.args) ||
     authority.argvSha256 !== sha256CanonicalJson({ command: launch.command, args: [...launch.args] }) ||
     !readRecord(launch.env) ||
+    stableJson(authority.envKeys) !== stableJson(Object.keys(launch.env).sort()) ||
     authority.envSha256 !== sha256CanonicalJson(launch.env) ||
     authority.remote.host !== launch.remote.host ||
     authority.remote.port !== launch.remote.port ||
