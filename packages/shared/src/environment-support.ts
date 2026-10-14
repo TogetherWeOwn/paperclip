@@ -81,9 +81,11 @@ export function adapterSupportsRemoteManagedEnvironments(adapterType: string): b
 }
 
 export function supportedEnvironmentDriversForAdapter(adapterType: string): EnvironmentDriver[] {
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
-    ? ["local", "ssh", "sandbox"]
-    : ["local"];
+  if (!adapterSupportsRemoteManagedEnvironments(adapterType)) return ["local"];
+  // The runner backend refuses SSH transports without an executor-issued
+  // launch authority, so SSH is not an admissible driver for it.
+  if (adapterType === "paperclip_runner") return ["local", "sandbox"];
+  return ["local", "ssh", "sandbox"];
 }
 
 export function supportedSandboxProvidersForAdapter(
