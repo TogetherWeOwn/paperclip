@@ -1,6 +1,13 @@
 # Native SSH launch authority
 
-Paperclip can require a signed launch authority before it starts a process on an SSH execution target. The authority binds one launch to one run, one agent, one assigned model, one exact command and argument list, one environment (as a digest), and one remote target. A signer outside the Paperclip server approves it.
+Paperclip can require a signed launch authority before it starts a process on an SSH execution target. The authority binds one launch to these:
+
+- one run, one agent and one assigned model;
+- one exact command and argument list;
+- one environment: its sorted key names and a digest of its values;
+- one remote target.
+
+A signer outside the Paperclip server approves it.
 
 ## Enforcement switch
 
@@ -46,10 +53,12 @@ Signer transport failures, signer silence and ledger write failures refuse the l
 
 The heartbeat service takes `nativeSshSigner` (the transport to the signer) and `nativeSshEnvelopeVerifier` (for example `createEd25519NativeSshEnvelopeVerifier(publicKeyPem)`). This release line has no built-in signer transport. Provide them in code before you set enforcement to `required`. Local and sandbox targets are not affected.
 
-The environment is bound only as a digest. Its values are not stored in the authority.
+The environment that is bound is the one the remote command actually gets, after the SSH size budget drops oversized values. The authority holds its sorted key names and a digest. The values are not stored in it.
 
 No database migration is needed. The authority and the envelope digest use the existing run context snapshot.
 
 ## Threat model limits
 
-The signer's approval binds what the server asks to launch. It does not protect against code running inside the Paperclip server process. That code holds the SSH key and can construct its own executor. The signed envelope is not sent to the SSH host, so the host does not verify it.
+- The signer's approval binds what the server asks to launch. It does not protect against code running inside the Paperclip server process. That code holds the SSH key and can construct its own executor.
+- The signed envelope is not sent to the SSH host, so the host does not verify it.
+- `runChildProcess` has no cancellation hook before spawn. If a run is cancelled while the signer is answering (at most 10 seconds), the launch still starts when the signer answers in time. Resolve this before you turn enforcement on for production.

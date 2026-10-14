@@ -69,6 +69,7 @@ function authorityFor(overrides: { args?: string[]; issuedAt?: Date; ttlMs?: num
     args,
     remote: launch.remote,
     argvSha256: sha256CanonicalJson({ command: COMMAND, args }),
+    envKeys: [],
     envSha256: sha256CanonicalJson({}),
     issuedAt: issuedAt.toISOString(),
     expiresAt: new Date(issuedAt.getTime() + (overrides.ttlMs ?? 60_000)).toISOString(),
@@ -168,6 +169,30 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
     expect(result.nativeSshAuthority!.launchSpecSha256).toMatch(/^[a-f0-9]{64}$/);
     // Key material is cleaned up once the launch is done.
     expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("binds the environment actually sent after the SSH size budget", async () => {
+    let recorded: NativeSshLaunchAuthority | null = null;
+    // Together over the 96 KiB SSH env budget: the smaller one is dropped before launch.
+    const big = { BIG_A: "a".repeat(50_000), BIG_B: "b".repeat(49_000) };
+    const result = await runChildProcess(RUN, COMMAND, ARGS, {
+      cwd: sandbox,
+      env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, ...big },
+      timeoutSec: 10,
+      graceSec: 1,
+      onLog: async () => {},
+      remoteExecution: spec,
+      hostExecutor: executor(async (authority) => {
+        recorded = authority;
+        return sign(authority);
+      }),
+    });
+    expect(result.exitCode).toBe(0);
+    const sent = readFileSync(marker, "utf8");
+    expect(sent).toContain("BIG_A=");
+    expect(sent).not.toContain("BIG_B=");
+    expect(recorded!.envKeys).toContain("BIG_A");
+    expect(recorded!.envKeys).not.toContain("BIG_B");
   });
 
   it("accepts an executor bound by the active run scope instead of an explicit option", async () => {
