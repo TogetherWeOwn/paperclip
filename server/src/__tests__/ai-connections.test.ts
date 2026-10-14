@@ -285,6 +285,16 @@ describe("managed AI connections", () => {
       await expect(assertManagedAiProjectAuth({ args: ["--api-key=override"] }, "xai", target)).rejects.toThrow("overrides");
     } finally { execute.mockRestore(); }
   });
+  it("launches the remote project-auth probe under the run's native SSH executor", async () => {
+    const execute = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess");
+    const target = { kind: "remote", transport: "ssh", remoteCwd: "/srv/project" } as Parameters<typeof assertManagedAiProjectAuth>[2];
+    const hostExecutor = { kind: "native_ssh" as const, authorizeLaunch: vi.fn() };
+    try {
+      execute.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", signal: null, timedOut: false } as Awaited<ReturnType<typeof executionTarget.runAdapterExecutionTargetProcess>>);
+      await expect(assertManagedAiProjectAuth({}, "openai", target, hostExecutor)).resolves.toBeUndefined();
+      expect(execute.mock.calls[0][4]).toMatchObject({ hostExecutor });
+    } finally { execute.mockRestore(); }
+  });
   it("keeps personal defaults separate and does not replace the first default", async () => {
     const first = await create("alice", "Alice first");
     await create("alice", "Alice second");
