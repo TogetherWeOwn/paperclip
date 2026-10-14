@@ -7740,6 +7740,31 @@ describe("native session bounded recovery", () => {
     });
   });
 
+  it("fails an SSH-bound Paperclip Runner launch terminally on the first attempt", () => {
+    const code = nativeSessionFailureSourceCode(
+      new Error(
+        "runner_transport_ineligible: Paperclip Runner launches over SSH are refused without an executor-issued launch authority",
+      ),
+    );
+    expect(code).toBe("runner_transport_ineligible");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure",
+      failureCode: "runner_transport_ineligible",
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionRecoveryProjection({
+        phase: "terminal_failure",
+        failureCode: code,
+        agentId: "agent",
+      }),
+    ).toMatchObject({
+      issueStatus: "blocked",
+      recoveryOwner: { kind: "board" },
+      recoveryActionCause: "runner_transport_ineligible",
+    });
+  });
+
   it("preserves stable provider and runner failure causes", () => {
     expect(
       nativeSessionFailureSourceCode(
@@ -7819,6 +7844,13 @@ describe("native session bounded recovery", () => {
         ),
       ),
     ).toBe("runner_remote_provider_artifact_incompatible");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "runner_transport_ineligible: Paperclip Runner launches over SSH are refused",
+        ),
+      ),
+    ).toBe("runner_transport_ineligible");
     expect(
       nativeSessionFailureSourceCode(
         new Error("native_current_wake_comments_unread"),
