@@ -285,9 +285,14 @@ function setWakeSnapshotPath(snapshot: Record<string, unknown>, path: WakeSnapsh
 /**
  * Truncates a string to fit the remaining budget ratio. Returns the original
  * value when truncating would not help: a truncation marker longer than the
- * value it replaces only grows the snapshot.
+ * value it replaces only grows the snapshot. Short strings (ids, paths,
+ * routing markers) are never truncated: their byte saving is negligible, but
+ * rewriting a 36-char UUID into a truncation marker breaks the admitted-wake
+ * id equality, the current-wake-comments binding, and the attachment UUID
+ * gate, while the large body that actually covers the overage is still huge.
  */
 function truncateWakeSnapshotString(value: string, ratio: number): string {
+  if (value.length < 256) return value;
   const keepChars = Math.max(0, Math.floor(value.length * ratio) - 64);
   if (keepChars >= value.length) return value;
   const removed = value.length - keepChars;

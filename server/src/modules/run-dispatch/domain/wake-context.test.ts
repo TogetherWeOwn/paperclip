@@ -381,6 +381,52 @@ describe("capWakeContextSnapshotBytes", () => {
     );
   });
 
+  it("keeps admitted paperclipWake ids when one large comment body exceeds the budget", () => {
+    const issueId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    const commentId = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+    const attachmentId = "cccccccc-3333-4333-8333-cccccccccccc";
+    const contentPath = `/api/attachments/${attachmentId}/content`;
+    const result = capWakeContextSnapshotBytes({
+      issueId,
+      taskId: issueId,
+      wakeReason: "issue_commented",
+      source: "chat:discord",
+      wakeCommentIds: [commentId],
+      commentId,
+      wakeCommentId: commentId,
+      paperclipExternalChatExecutionBound: true,
+      paperclipWake: {
+        issue: { id: issueId },
+        commentIds: [commentId],
+        latestCommentId: commentId,
+        comments: [{ id: commentId, body: "x".repeat(30_000) }],
+        attachments: [{ id: attachmentId, contentPath }],
+        externalChatProvider: "discord",
+        externalChatExecutionBound: true,
+      },
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    const wake = result.snapshot.paperclipWake as {
+      issue: { id: string };
+      commentIds: string[];
+      latestCommentId: string;
+      comments: Array<{ id: string; body: string }>;
+      attachments: Array<{ id: string; contentPath: string }>;
+    };
+    expect(wake.issue.id).toBe(issueId);
+    expect(wake.commentIds).toEqual([commentId]);
+    expect(wake.latestCommentId).toBe(commentId);
+    expect(wake.comments[0].id).toBe(commentId);
+    expect(wake.attachments[0].id).toBe(attachmentId);
+    expect(wake.attachments[0].contentPath).toBe(contentPath);
+    expect(wake.comments[0].body.length).toBeLessThan(30_000);
+    expect(JSON.stringify(result.snapshot)).not.toContain("…[truncated 36 chars]");
+  });
+
   it("is deterministic for the same input", () => {
     const input = {
       issueId: "issue-1",
