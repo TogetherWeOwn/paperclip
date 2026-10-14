@@ -146,8 +146,9 @@ function wakeContextSnapshotBytes(value: Record<string, unknown>): number {
  * ids and every protected routing key are never touched: dropping pending
  * input would silently lose work, and rewriting an id or reason would change
  * what the run does. The returned snapshot fits the budget whenever any
- * combination of unprotected reductions can reach it; only protected-only
- * content over the budget is returned best-effort with an honest byte count.
+ * combination of unprotected reductions can reach it. When protected content
+ * alone is over the budget, no reduction can fit it, so the debug-stripped
+ * snapshot is returned unreduced with an honest byte count.
  */
 export function capWakeContextSnapshotBytes(
   input: Record<string, unknown>,
@@ -167,7 +168,7 @@ export function capWakeContextSnapshotBytes(
 
   const ids = extractWakeCommentIds(base);
   const dropCount = Math.max(0, ids.length - WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
-  const shrunkKeepingIds = shrinkUnprotectedValues({ ...base }, maxBytes);
+  const shrunkKeepingIds = shrinkUnprotectedValues(base, maxBytes);
   if (dropCount === 0 || wakeContextSnapshotBytes(shrunkKeepingIds) <= maxBytes) {
     return finishWakeContextCap(shrunkKeepingIds, 0);
   }
@@ -179,7 +180,7 @@ export function capWakeContextSnapshotBytes(
   if (wakeContextSnapshotBytes(shrunkWithTrimmedIds) <= maxBytes) {
     return finishWakeContextCap(shrunkWithTrimmedIds, dropCount);
   }
-  return finishWakeContextCap(shrunkKeepingIds, 0);
+  return finishWakeContextCap(base, 0);
 }
 
 function withTrimmedWakeCommentIds(
@@ -294,6 +295,16 @@ function truncateWakeSnapshotString(value: string, ratio: number): string {
   return Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(value, "utf8") ? candidate : value;
 }
 
+function protectedWakeSnapshotBytes(snapshot: Record<string, unknown>): number {
+  return wakeContextSnapshotBytes(
+    Object.fromEntries(
+      Object.entries(snapshot).filter(([key]) =>
+        isProtectedWakeSnapshotKey(key),
+      ),
+    ),
+  );
+}
+
 /**
  * Shrinks every unprotected value (at any depth) until the serialized
  * snapshot fits `maxBytes`. Protected routing keys, queued input, and the
@@ -301,12 +312,16 @@ function truncateWakeSnapshotString(value: string, ratio: number): string {
  * strictly reducing the serialized size so the loop always terminates:
  * proportional truncation of the largest nested strings first (least data
  * loss), then blanking the values a marker cannot shrink, then collapsing
- * the largest remaining unprotected subtree into a removal marker.
+ * the largest remaining unprotected subtree into a removal marker. Returns
+ * the input unchanged when protected content alone exceeds the budget,
+ * because no reduction can fit it. The input is never mutated.
  */
 function shrinkUnprotectedValues(
-  snapshot: Record<string, unknown>,
+  input: Record<string, unknown>,
   maxBytes: number,
 ): Record<string, unknown> {
+  if (protectedWakeSnapshotBytes(input) > maxBytes) return input;
+  const snapshot = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
   let bytes = wakeContextSnapshotBytes(snapshot);
   while (bytes > maxBytes) {
     const leaves = collectUnprotectedStringLeaves(snapshot);
@@ -371,7 +386,7 @@ function shrinkUnprotectedValues(
     }
     if (largestKey === null || largestBytes <= 0) break;
     const marker = `…[removed ${largestBytes} bytes]`;
-    if (Buffer.byteLength(marker, "utf8") < largestBytes) {
+    if (Buffer.byteLength(JSON.stringify(marker), "utf8") < largestBytes) {
       snapshot[largestKey] = marker;
     } else {
       delete snapshot[largestKey];

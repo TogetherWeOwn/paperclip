@@ -311,6 +311,76 @@ describe("capWakeContextSnapshotBytes", () => {
     ).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
   });
 
+  it("keeps nested unprotected values intact when dropping wake comment ids fits the budget", () => {
+    const ids = Array.from(
+      { length: 1000 },
+      (_, i) => `comment-${String(i).padStart(4, "0")}-${"0".repeat(32)}`,
+    );
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      wakeCommentIds: ids,
+      checkboxSelection: { q1: ["option-a", "option-b"] },
+      itemVerdicts: { "item-1": "accepted" },
+    });
+    expect(result.droppedWakeCommentIds).toBe(
+      ids.length - WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
+    );
+    expect(result.snapshot.checkboxSelection).toEqual({
+      q1: ["option-a", "option-b"],
+    });
+    expect(result.snapshot.itemVerdicts).toEqual({ "item-1": "accepted" });
+  });
+
+  it("keeps routing flags unreduced when protected queued ids alone exceed the budget", () => {
+    const queued = Array.from(
+      { length: 700 },
+      (_, i) => `queued-${String(i).padStart(4, "0")}-${"0".repeat(32)}`,
+    );
+    const flags = {
+      paperclipHarnessCheckedOut: true,
+      paperclipExternalChatExecutionBound: true,
+      workspaceBusyDeferredWhileAssignee: false,
+      interactionStatus: "accepted",
+      activeTreeHold: true,
+    };
+    const result = capWakeContextSnapshotBytes({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      queuedCommentIds: queued,
+      ...flags,
+    });
+    expect(result.snapshot).toEqual({
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      queuedCommentIds: queued,
+      ...flags,
+      snapshotTruncated: true,
+    });
+    expect(result.droppedWakeCommentIds).toBe(0);
+    expect(result.bytes).toBe(
+      Buffer.byteLength(JSON.stringify(result.snapshot), "utf8"),
+    );
+  });
+
+  it("fits the budget when many top-level keys collapse to removal markers", () => {
+    const input: Record<string, unknown> = {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+    };
+    const sized = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    for (let i = 0; i < 3_000; i += 1) {
+      input[`key-${String(i).padStart(4, "0")}`] = sized;
+    }
+    const result = capWakeContextSnapshotBytes(input);
+    expect(result.truncated).toBe(true);
+    expect(result.snapshot.issueId).toBe("issue-1");
+    expect(result.bytes).toBeLessThanOrEqual(WAKE_CONTEXT_SNAPSHOT_MAX_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(result.snapshot), "utf8")).toBe(
+      result.bytes,
+    );
+  });
+
   it("is deterministic for the same input", () => {
     const input = {
       issueId: "issue-1",
