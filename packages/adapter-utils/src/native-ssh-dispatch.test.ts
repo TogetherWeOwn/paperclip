@@ -86,17 +86,22 @@ function sign(authority: NativeSshLaunchAuthority, privateKey = keys.privateKey)
   };
 }
 
+// Stand-in signer: like the real one, it is handed only the request id and signs
+// the authority the executor recorded for it (passed here as `recorded`).
 function executor(
-  requestEnvelope: () => Promise<unknown>,
+  requestEnvelope: ((recorded: NativeSshLaunchAuthority) => Promise<unknown>) | null,
   extra: { now?: () => Date; nextOpaqueRequestId?: () => string } = {},
 ): NativeSshHostExecutorTarget {
+  let recorded: NativeSshLaunchAuthority | null = null;
   return createNativeSshHostExecutorTarget({
     ...IDS,
     adapterType: "claude_local",
     assignedModel: { version: "1", model: "claude-opus-5", sha256: sha256CanonicalJson("claude-opus-5") },
-    signer: { requestEnvelope },
+    signer: { requestEnvelope: (requestEnvelope ? () => requestEnvelope(recorded!) : null) as never },
     verifyEnvelope,
-    persistAuthority: async () => {},
+    persistAuthority: async (authority) => {
+      recorded = authority;
+    },
     nextOpaqueRequestId: () => REQUEST_ID,
     ...extra,
   });
@@ -150,7 +155,7 @@ afterEach(async () => {
 
 describe("native SSH egress enforcement at the agent-launch dispatch site", () => {
   it("launches exactly once when a verified authority matches, and reports the receipt", async () => {
-    const result = await launchWith(executor(async () => sign(authorityFor())));
+    const result = await launchWith(executor(async (recorded) => sign(recorded)));
 
     expect(result.exitCode).toBe(0);
     expect(childStarted()).toBe(true);
@@ -161,7 +166,7 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
   });
 
   it("accepts an executor bound by the active run scope instead of an explicit option", async () => {
-    const result = await runWithNativeSshHostExecutor(executor(async () => sign(authorityFor())), () => launchWith());
+    const result = await runWithNativeSshHostExecutor(executor(async (recorded) => sign(recorded)), () => launchWith());
     expect(result.exitCode).toBe(0);
     expect(childStarted()).toBe(true);
   });
@@ -175,16 +180,16 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
   };
   const negatives: Array<[string, () => NativeSshHostExecutorTarget | null, string]> = [
     ["no executor at all", () => null, "Native SSH execution requires"],
-    ["signer unavailable", () => executor(null as never), "unavailable"],
+    ["signer unavailable", () => executor(null), "unavailable"],
     ["signer throws", () => executor(async () => Promise.reject(new Error("signer down"))), "signer down"],
     [
       "tampered signature",
-      () => executor(async () => ({ ...sign(authorityFor()), signature: Buffer.from("forged").toString("base64") })),
+      () => executor(async (recorded) => ({ ...sign(recorded), signature: Buffer.from("forged").toString("base64") })),
       "signature",
     ],
     [
       "foreign signing key",
-      () => executor(async () => sign(authorityFor(), generateKeyPairSync("ed25519").privateKey)),
+      () => executor(async (recorded) => sign(recorded, generateKeyPairSync("ed25519").privateKey)),
       "signature",
     ],
     [
@@ -192,11 +197,11 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
       () => executor(async () => sign(authorityFor({ args: [...ARGS, "--dangerously-skip-permissions"] }))),
       "does not match",
     ],
-    ["expired authority", () => executor(async () => sign(authorityFor({ issuedAt: stale })), { now: lapsingClock() }), "expired"],
+    ["expired authority", () => executor(async (recorded) => sign(recorded), { now: lapsingClock() }), "expired"],
     [
       "replayed request id",
       () => {
-        const reuse = executor(async () => sign(authorityFor()));
+        const reuse = executor(async (recorded) => sign(recorded));
         return {
           kind: "native_ssh" as const,
           async authorizeLaunch(input) {
@@ -216,9 +221,9 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
   });
 
   it("does not let an inherited run-scope executor bypass an explicit denial", async () => {
-    const good = executor(async () => sign(authorityFor()));
+    const good = executor(async (recorded) => sign(recorded));
     const readings = [stale];
-    const bad = executor(async () => sign(authorityFor({ issuedAt: stale })), {
+    const bad = executor(async (recorded) => sign(recorded), {
       now: () => readings.shift() ?? new Date(),
     });
     await expect(runWithNativeSshHostExecutor(good, () => launchWith(bad))).rejects.toThrow(/expired/i);
@@ -228,7 +233,7 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
 
 describe("ssh.ts agent-launch builder is gated independently of its caller", () => {
   async function issue() {
-    return executor(async () => sign(authorityFor())).authorizeLaunch(launch);
+    return executor(async (recorded) => sign(recorded)).authorizeLaunch(launch);
   }
 
   it.each([
@@ -265,7 +270,7 @@ describe("ssh.ts agent-launch builder is gated independently of its caller", () 
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-29T12:00:00.000Z"));
-      const proof = await executor(async () => sign(authorityFor({ issuedAt: new Date() }))).authorizeLaunch(launch);
+      const proof = await executor(async (recorded) => sign(recorded)).authorizeLaunch(launch);
       vi.setSystemTime(new Date("2026-08-29T12:01:01.000Z"));
       await expect(
         buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env: {}, authority: proof }),
