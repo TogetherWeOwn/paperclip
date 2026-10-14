@@ -46,16 +46,16 @@
 
 import { describe, expect, it } from "vitest";
 import type {
-  QueuedRunFacts,
-  ReviewParticipantFacts,
+	QueuedRunFacts,
+	ReviewParticipantFacts,
 } from "../modules/run-dispatch/domain/policy.js";
 import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
 import * as agentPermissions from "../services/agent-permissions.js";
 import * as environmentRuntime from "../services/environment-runtime.js";
 import {
-  verifySourceImageAttestation,
-  type VerifySourceImageAttestationInput,
-  type VerifySourceImageAttestationResult,
+	type VerifySourceImageAttestationInput,
+	type VerifySourceImageAttestationResult,
+	verifySourceImageAttestation,
 } from "../services/source-image-attestation.js";
 import { readWorkspaceRealizationRequest } from "../services/workspace-realization.js";
 
@@ -69,7 +69,7 @@ import { readWorkspaceRealizationRequest } from "../services/workspace-realizati
 
 /** Canonical module specifier for the Builder-owned operation. */
 const ATTEST_MODULE_SPECIFIER: string =
-  "../services/source-image-attestation.js";
+	"../services/source-image-attestation.js";
 /** Canonical export name for the Builder-owned operation. */
 const ATTEST_OP_NAME = "verifySourceImageAttestation";
 
@@ -77,8 +77,8 @@ const ATTEST_OP_NAME = "verifySourceImageAttestation";
 // seam test at the bottom of this file; they exist only in that negative
 // assertion and must not be added back to the resolver above.
 const ATTEST_OP_NAMES = [
-  "verifySourceImageAttestation",
-  "verifySourceImageBinding",
+	"verifySourceImageAttestation",
+	"verifySourceImageBinding",
 ] as const;
 
 // Contract types are the implementation's exported types directly, so a
@@ -87,53 +87,52 @@ type SourceImageAttestationInput = VerifySourceImageAttestationInput;
 type SourceImageAttestationResult = VerifySourceImageAttestationResult;
 
 type SourceImageAttestationOp = (
-  input: SourceImageAttestationInput,
+	input: SourceImageAttestationInput,
 ) => Promise<SourceImageAttestationResult> | SourceImageAttestationResult;
 
 // Compiler pins the contract to the implementation: a signature change in
 // `source-image-attestation.ts` fails typecheck here.
-const _directAttestOp: SourceImageAttestationOp =
-  verifySourceImageAttestation;
+const _directAttestOp: SourceImageAttestationOp = verifySourceImageAttestation;
 void _directAttestOp;
 
 async function resolveAttestOp(): Promise<SourceImageAttestationOp> {
-  // In-module dynamic import (never `new Function("return import(...)")`):
-  // the Function form evaluates in global scope, so a relative specifier can
-  // never resolve against this file and every failure collapses to a bare
-  // `null`. Here the specifier resolves against this test module and the real
-  // resolution cause propagates instead of being swallowed.
-  // `ATTEST_MODULE_SPECIFIER` is typed `string` (not a literal) so the
-  // typechecker does not try to resolve the Builder-owned module at compile
-  // time; `/* @vite-ignore */` keeps Vitest from statically analyzing it.
-  let mod: Record<string, unknown>;
-  try {
-    mod = (await import(/* @vite-ignore */ ATTEST_MODULE_SPECIFIER)) as Record<
-      string,
-      unknown
-    >;
-  } catch (cause) {
-    throw new Error(
-      `missing ${ATTEST_OP_NAME}: failed to import ${ATTEST_MODULE_SPECIFIER} ` +
-        `(the paired Builder slice must export ${ATTEST_OP_NAME} from ` +
-        `server/src/services/source-image-attestation.ts)`,
-      { cause },
-    );
-  }
-  const candidate = mod[ATTEST_OP_NAME];
-  if (typeof candidate !== "function") {
-    throw new Error(
-      `missing ${ATTEST_OP_NAME}: ${ATTEST_MODULE_SPECIFIER} resolved ` +
-        `but does not export a function named "${ATTEST_OP_NAME}" ` +
-        `(exports: ${Object.keys(mod).join(", ") || "<none>"})`,
-    );
-  }
-  return candidate as SourceImageAttestationOp;
+	// In-module dynamic import (never `new Function("return import(...)")`):
+	// the Function form evaluates in global scope, so a relative specifier can
+	// never resolve against this file and every failure collapses to a bare
+	// `null`. Here the specifier resolves against this test module and the real
+	// resolution cause propagates instead of being swallowed.
+	// `ATTEST_MODULE_SPECIFIER` is typed `string` (not a literal) so the
+	// typechecker does not try to resolve the Builder-owned module at compile
+	// time; `/* @vite-ignore */` keeps Vitest from statically analyzing it.
+	let mod: Record<string, unknown>;
+	try {
+		mod = (await import(/* @vite-ignore */ ATTEST_MODULE_SPECIFIER)) as Record<
+			string,
+			unknown
+		>;
+	} catch (cause) {
+		throw new Error(
+			`missing ${ATTEST_OP_NAME}: failed to import ${ATTEST_MODULE_SPECIFIER} ` +
+				`(the paired Builder slice must export ${ATTEST_OP_NAME} from ` +
+				`server/src/services/source-image-attestation.ts)`,
+			{ cause },
+		);
+	}
+	const candidate = mod[ATTEST_OP_NAME];
+	if (typeof candidate !== "function") {
+		throw new Error(
+			`missing ${ATTEST_OP_NAME}: ${ATTEST_MODULE_SPECIFIER} resolved ` +
+				`but does not export a function named "${ATTEST_OP_NAME}" ` +
+				`(exports: ${Object.keys(mod).join(", ") || "<none>"})`,
+		);
+	}
+	return candidate as SourceImageAttestationOp;
 }
 
 async function requireAttestOp(): Promise<SourceImageAttestationOp> {
-  // NOTE: never `expect(op).toBeDefined()` here: toBeDefined passes for null,
-  // which would let these contracts pass vacuously without an implementation.
-  return resolveAttestOp();
+	// NOTE: never `expect(op).toBeDefined()` here: toBeDefined passes for null,
+	// which would let these contracts pass vacuously without an implementation.
+	return resolveAttestOp();
 }
 
 // ---------------------------------------------------------------------------
@@ -149,15 +148,15 @@ const PINNED_REFERENCE = `registry.example.com/paperclip-bot@${PINNED_DIGEST}`;
 const MUTABLE_TAG_FROM_RECEIPT = "paperclip-local:2026.1005.0-tog.9-9c0a032bb";
 
 const MUTABLE_TAGS = [
-  MUTABLE_TAG_FROM_RECEIPT,
-  "paperclip-local:latest",
-  "registry.example.com/paperclip-bot:2026.1005.0",
-  // CISO item 6: bare repository (implicit `:latest`) and `:dev`/`:edge` tags
-  // are mutable forms too. All entries stay `@`-free so the `non-substitute:`
-  // digest-absence checks below keep passing unchanged.
-  "registry.example.com/paperclip-bot",
-  "registry.example.com/paperclip-bot:dev",
-  "registry.example.com/paperclip-bot:edge",
+	MUTABLE_TAG_FROM_RECEIPT,
+	"paperclip-local:latest",
+	"registry.example.com/paperclip-bot:2026.1005.0",
+	// CISO item 6: bare repository (implicit `:latest`) and `:dev`/`:edge` tags
+	// are mutable forms too. All entries stay `@`-free so the `non-substitute:`
+	// digest-absence checks below keep passing unchanged.
+	"registry.example.com/paperclip-bot",
+	"registry.example.com/paperclip-bot:dev",
+	"registry.example.com/paperclip-bot:edge",
 ] as const;
 
 /**
@@ -166,33 +165,33 @@ const MUTABLE_TAGS = [
  * because these contain `@sha256:` by construction.
  */
 const MUTABLE_TAGGED_PINNED = [
-  `registry.example.com/paperclip-bot:dev@${PINNED_DIGEST}`,
-  `registry.example.com/paperclip-bot:edge@${PINNED_DIGEST}`,
+	`registry.example.com/paperclip-bot:dev@${PINNED_DIGEST}`,
+	`registry.example.com/paperclip-bot:edge@${PINNED_DIGEST}`,
 ] as const;
 
 /** Malformed digest forms that must report `digest_unparseable` (CISO item 5). */
 const UNPARSEABLE_REFERENCES = [
-  `registry.example.com/paperclip-bot@sha256:not-hex`,
-  `registry.example.com/paperclip-bot@sha256:ab12`,
-  `registry.example.com/paperclip-bot@sha256:${"ab".repeat(33)}`,
-  `registry.example.com/paperclip-bot@sha256:${"AB".repeat(32)}`,
-  `registry.example.com/paperclip-bot@sha512:${"ab".repeat(32)}`,
-  `registry.example.com/paperclip-bot@md5:${"ab".repeat(32)}`,
-  `registry.example.com/paperclip-bot@sha256:`,
-  `registry.example.com/sha256:${"ab".repeat(32)}/paperclip-bot`,
-  `registry.example.com/paperclip-bot@sha256:${"ab".repeat(32)}@extra`,
-  `@sha256:${"ab".repeat(32)}`,
+	`registry.example.com/paperclip-bot@sha256:not-hex`,
+	`registry.example.com/paperclip-bot@sha256:ab12`,
+	`registry.example.com/paperclip-bot@sha256:${"ab".repeat(33)}`,
+	`registry.example.com/paperclip-bot@sha256:${"AB".repeat(32)}`,
+	`registry.example.com/paperclip-bot@sha512:${"ab".repeat(32)}`,
+	`registry.example.com/paperclip-bot@md5:${"ab".repeat(32)}`,
+	`registry.example.com/paperclip-bot@sha256:`,
+	`registry.example.com/sha256:${"ab".repeat(32)}/paperclip-bot`,
+	`registry.example.com/paperclip-bot@sha256:${"ab".repeat(32)}@extra`,
+	`@sha256:${"ab".repeat(32)}`,
 ] as const;
 
 function noReviewParticipant(): ReviewParticipantFacts {
-  return {
-    isInReview: false,
-    hasParticipant: false,
-    participantIsAgent: false,
-    participantAgentId: null,
-    currentStageType: null,
-    currentParticipant: null,
-  };
+	return {
+		isInReview: false,
+		hasParticipant: false,
+		participantIsAgent: false,
+		participantAgentId: null,
+		currentStageType: null,
+		currentParticipant: null,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -200,188 +199,188 @@ function noReviewParticipant(): ReviewParticipantFacts {
 // ---------------------------------------------------------------------------
 
 describe("contract: source-to-deployed-image attestation", () => {
-  it("contract: exposes a source-to-image attestation operation", async () => {
-    const op = await requireAttestOp();
-    expect(typeof op).toBe("function");
-  });
+	it("contract: exposes a source-to-image attestation operation", async () => {
+		const op = await requireAttestOp();
+		expect(typeof op).toBe("function");
+	});
 
-  it("contract: accepts an exact OCI revision/digest binding verified at validation time", async () => {
-    const op = await requireAttestOp();
-    const result = await op({
-      sourceRevision: SOURCE_REVISION,
-      imageReference: PINNED_REFERENCE,
-      expectedDigest: PINNED_DIGEST,
-    });
-    expect(result).toMatchObject({
-      ok: true,
-      digest: PINNED_DIGEST,
-      verifiedAtValidationTime: true,
-    });
-    expect("deferred" in result).toBe(false);
-  });
+	it("contract: accepts an exact OCI revision/digest binding verified at validation time", async () => {
+		const op = await requireAttestOp();
+		const result = await op({
+			sourceRevision: SOURCE_REVISION,
+			imageReference: PINNED_REFERENCE,
+			expectedDigest: PINNED_DIGEST,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			digest: PINNED_DIGEST,
+			verifiedAtValidationTime: true,
+		});
+		expect("deferred" in result).toBe(false);
+	});
 
-  it.each(MUTABLE_TAGS)(
-    "contract: refuses mutable-tag acceptance (%s)",
-    async (imageReference) => {
-      const op = await requireAttestOp();
-      const result = await op({
-        sourceRevision: SOURCE_REVISION,
-        imageReference,
-        expectedDigest: PINNED_DIGEST,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "mutable_tag_refused",
-      });
-    },
-  );
+	it.each(MUTABLE_TAGS)(
+		"contract: refuses mutable-tag acceptance (%s)",
+		async (imageReference) => {
+			const op = await requireAttestOp();
+			const result = await op({
+				sourceRevision: SOURCE_REVISION,
+				imageReference,
+				expectedDigest: PINNED_DIGEST,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "mutable_tag_refused",
+			});
+		},
+	);
 
-  it("contract: rejects a digest that does not match the expected binding", async () => {
-    const op = await requireAttestOp();
-    const result = await op({
-      sourceRevision: SOURCE_REVISION,
-      imageReference: PINNED_REFERENCE,
-      expectedDigest: OTHER_DIGEST,
-    });
-    expect(result).toMatchObject({
-      ok: false,
-      errorCode: "digest_mismatch",
-    });
-  });
+	it("contract: rejects a digest that does not match the expected binding", async () => {
+		const op = await requireAttestOp();
+		const result = await op({
+			sourceRevision: SOURCE_REVISION,
+			imageReference: PINNED_REFERENCE,
+			expectedDigest: OTHER_DIGEST,
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			errorCode: "digest_mismatch",
+		});
+	});
 
-  it.each(MUTABLE_TAGGED_PINNED)(
-    "contract: refuses tagged-but-pinned references as mutable (%s)",
-    async (imageReference) => {
-      const op = await requireAttestOp();
-      const result = await op({
-        sourceRevision: SOURCE_REVISION,
-        imageReference,
-        expectedDigest: PINNED_DIGEST,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "mutable_tag_refused",
-      });
-    },
-  );
+	it.each(MUTABLE_TAGGED_PINNED)(
+		"contract: refuses tagged-but-pinned references as mutable (%s)",
+		async (imageReference) => {
+			const op = await requireAttestOp();
+			const result = await op({
+				sourceRevision: SOURCE_REVISION,
+				imageReference,
+				expectedDigest: PINNED_DIGEST,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "mutable_tag_refused",
+			});
+		},
+	);
 
-  it.each(UNPARSEABLE_REFERENCES)(
-    "contract: reports malformed digests as digest_unparseable (%s)",
-    async (imageReference) => {
-      const op = await requireAttestOp();
-      const result = await op({
-        sourceRevision: SOURCE_REVISION,
-        imageReference,
-        expectedDigest: PINNED_DIGEST,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "digest_unparseable",
-      });
-    },
-  );
+	it.each(UNPARSEABLE_REFERENCES)(
+		"contract: reports malformed digests as digest_unparseable (%s)",
+		async (imageReference) => {
+			const op = await requireAttestOp();
+			const result = await op({
+				sourceRevision: SOURCE_REVISION,
+				imageReference,
+				expectedDigest: PINNED_DIGEST,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "digest_unparseable",
+			});
+		},
+	);
 
-  it("contract: reports a malformed expectedDigest as digest_unparseable", async () => {
-    const op = await requireAttestOp();
-    const malformedExpected = [
-      "not-a-digest",
-      "",
-      `sha256:${"AB".repeat(32)}`,
-      `sha512:${"ab".repeat(32)}`,
-    ];
-    for (const expectedDigest of malformedExpected) {
-      const result = await op({
-        sourceRevision: SOURCE_REVISION,
-        imageReference: PINNED_REFERENCE,
-        expectedDigest,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "digest_unparseable",
-      });
-    }
-  });
+	it("contract: reports a malformed expectedDigest as digest_unparseable", async () => {
+		const op = await requireAttestOp();
+		const malformedExpected = [
+			"not-a-digest",
+			"",
+			`sha256:${"AB".repeat(32)}`,
+			`sha512:${"ab".repeat(32)}`,
+		];
+		for (const expectedDigest of malformedExpected) {
+			const result = await op({
+				sourceRevision: SOURCE_REVISION,
+				imageReference: PINNED_REFERENCE,
+				expectedDigest,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "digest_unparseable",
+			});
+		}
+	});
 
-  it("contract: binds the source revision and echoes it on success", async () => {
-    const op = await requireAttestOp();
-    const result = await op({
-      sourceRevision: SOURCE_REVISION,
-      imageReference: PINNED_REFERENCE,
-      expectedDigest: PINNED_DIGEST,
-    });
-    expect(result).toMatchObject({
-      ok: true,
-      digest: PINNED_DIGEST,
-      sourceRevision: SOURCE_REVISION,
-      verifiedAtValidationTime: true,
-    });
-  });
+	it("contract: binds the source revision and echoes it on success", async () => {
+		const op = await requireAttestOp();
+		const result = await op({
+			sourceRevision: SOURCE_REVISION,
+			imageReference: PINNED_REFERENCE,
+			expectedDigest: PINNED_DIGEST,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			digest: PINNED_DIGEST,
+			sourceRevision: SOURCE_REVISION,
+			verifiedAtValidationTime: true,
+		});
+	});
 
-  it.each(["", "zzz", `sha256:${"AB".repeat(32)}`, "9c0a032"])(
-    "contract: reports a malformed sourceRevision %s as revision_unparseable",
-    async (sourceRevision) => {
-      const op = await requireAttestOp();
-      const result = await op({
-        sourceRevision,
-        imageReference: PINNED_REFERENCE,
-        expectedDigest: PINNED_DIGEST,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "revision_unparseable",
-      });
-    },
-  );
+	it.each(["", "zzz", `sha256:${"AB".repeat(32)}`, "9c0a032"])(
+		"contract: reports a malformed sourceRevision %s as revision_unparseable",
+		async (sourceRevision) => {
+			const op = await requireAttestOp();
+			const result = await op({
+				sourceRevision,
+				imageReference: PINNED_REFERENCE,
+				expectedDigest: PINNED_DIGEST,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "revision_unparseable",
+			});
+		},
+	);
 
-  it("contract: reports a missing sourceRevision as revision_unparseable", async () => {
-    const op = await requireAttestOp();
-    const result = await op({
-      sourceRevision: undefined as unknown as string,
-      imageReference: PINNED_REFERENCE,
-      expectedDigest: PINNED_DIGEST,
-    });
-    expect(result).toMatchObject({
-      ok: false,
-      errorCode: "revision_unparseable",
-    });
-  });
+	it("contract: reports a missing sourceRevision as revision_unparseable", async () => {
+		const op = await requireAttestOp();
+		const result = await op({
+			sourceRevision: undefined as unknown as string,
+			imageReference: PINNED_REFERENCE,
+			expectedDigest: PINNED_DIGEST,
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			errorCode: "revision_unparseable",
+		});
+	});
 
-  it.each([
-    ` r.io/x@${PINNED_DIGEST}`,
-    `a b c@${PINNED_DIGEST}`,
-    `r.io/x\n@${PINNED_DIGEST}`,
-    `https://evil/x@${PINNED_DIGEST}`,
-    `r.io/@${PINNED_DIGEST}`,
-    `/@${PINNED_DIGEST}`,
-  ])(
-    "contract: reports a malformed repository %s as repository_unparseable",
-    async (imageReference) => {
-      const op = await requireAttestOp();
-      const result = await op({
-        sourceRevision: SOURCE_REVISION,
-        imageReference,
-        expectedDigest: PINNED_DIGEST,
-      });
-      expect(result).toMatchObject({
-        ok: false,
-        errorCode: "repository_unparseable",
-      });
-    },
-  );
+	it.each([
+		` r.io/x@${PINNED_DIGEST}`,
+		`a b c@${PINNED_DIGEST}`,
+		`r.io/x\n@${PINNED_DIGEST}`,
+		`https://evil/x@${PINNED_DIGEST}`,
+		`r.io/@${PINNED_DIGEST}`,
+		`/@${PINNED_DIGEST}`,
+	])(
+		"contract: reports a malformed repository %s as repository_unparseable",
+		async (imageReference) => {
+			const op = await requireAttestOp();
+			const result = await op({
+				sourceRevision: SOURCE_REVISION,
+				imageReference,
+				expectedDigest: PINNED_DIGEST,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				errorCode: "repository_unparseable",
+			});
+		},
+	);
 
-  it("contract: validates any registry when digests match (no allowlist)", async () => {
-    const op = await requireAttestOp();
-    const result = await op({
-      sourceRevision: SOURCE_REVISION,
-      imageReference: `evil.example.com/anything@${PINNED_DIGEST}`,
-      expectedDigest: PINNED_DIGEST,
-    });
-    expect(result).toMatchObject({
-      ok: true,
-      digest: PINNED_DIGEST,
-      verifiedAtValidationTime: true,
-    });
-  });
+	it("contract: validates any registry when digests match (no allowlist)", async () => {
+		const op = await requireAttestOp();
+		const result = await op({
+			sourceRevision: SOURCE_REVISION,
+			imageReference: `evil.example.com/anything@${PINNED_DIGEST}`,
+			expectedDigest: PINNED_DIGEST,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			digest: PINNED_DIGEST,
+			verifiedAtValidationTime: true,
+		});
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -389,86 +388,86 @@ describe("contract: source-to-deployed-image attestation", () => {
 // ---------------------------------------------------------------------------
 
 describe("non-substitute: tags and existing operations are not attestation", () => {
-  it("non-substitute: the receipt tag carries no digest binding", () => {
-    expect(MUTABLE_TAG_FROM_RECEIPT.includes("@sha256:")).toBe(false);
-    expect(MUTABLE_TAG_FROM_RECEIPT.split("@")).toHaveLength(1);
-  });
+	it("non-substitute: the receipt tag carries no digest binding", () => {
+		expect(MUTABLE_TAG_FROM_RECEIPT.includes("@sha256:")).toBe(false);
+		expect(MUTABLE_TAG_FROM_RECEIPT.split("@")).toHaveLength(1);
+	});
 
-  it.each(MUTABLE_TAGS)(
-    "non-substitute: mutable tag carries no digest (%s)",
-    (tag) => {
-      expect(tag.includes("@sha256:")).toBe(false);
-    },
-  );
+	it.each(MUTABLE_TAGS)(
+		"non-substitute: mutable tag carries no digest (%s)",
+		(tag) => {
+			expect(tag.includes("@sha256:")).toBe(false);
+		},
+	);
 
-  it("non-substitute: queued-run staleness recheck carries no image digest binding", () => {
-    const facts: QueuedRunFacts = {
-      runId: "run-1",
-      runAgentId: "22222222-2222-4222-8222-222222222222",
-      issueId: "11111111-1111-4111-8111-111111111111",
-      retryReasonKind: "other",
-      issueFound: false,
-      issueStatus: "in_progress",
-      issueAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
-      issueExecutionRunId: "run-1",
-      isResolvedInteractionContinuation: false,
-      isInteractionWake: false,
-      isAuthorizedSourceScopedRecovery: false,
-      isNonAssigneeWorkspaceBusyRetry: false,
-      resumeIntent: false,
-      wakeCommentIdPresent: false,
-      continuationParkApplies: false,
-      continuationParksExecutor: false,
-      continuationSummaryBody: null,
-      wakeReason: null,
-      retryReason: null,
-      reviewParticipant: noReviewParticipant(),
-    };
-    const decision = dispatchPolicy.decideQueuedRunStaleness(facts, NOW);
-    expect(decision).toMatchObject({
-      stale: true,
-      errorCode: "issue_not_found",
-    });
-    const record = decision as unknown as Record<string, unknown>;
-    for (const key of ["digest", "imageReference", "attestation"]) {
-      expect(record).not.toHaveProperty(key);
-    }
-  });
+	it("non-substitute: queued-run staleness recheck carries no image digest binding", () => {
+		const facts: QueuedRunFacts = {
+			runId: "run-1",
+			runAgentId: "22222222-2222-4222-8222-222222222222",
+			issueId: "11111111-1111-4111-8111-111111111111",
+			retryReasonKind: "other",
+			issueFound: false,
+			issueStatus: "in_progress",
+			issueAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
+			issueExecutionRunId: "run-1",
+			isResolvedInteractionContinuation: false,
+			isInteractionWake: false,
+			isAuthorizedSourceScopedRecovery: false,
+			isNonAssigneeWorkspaceBusyRetry: false,
+			resumeIntent: false,
+			wakeCommentIdPresent: false,
+			continuationParkApplies: false,
+			continuationParksExecutor: false,
+			continuationSummaryBody: null,
+			wakeReason: null,
+			retryReason: null,
+			reviewParticipant: noReviewParticipant(),
+		};
+		const decision = dispatchPolicy.decideQueuedRunStaleness(facts, NOW);
+		expect(decision).toMatchObject({
+			stale: true,
+			errorCode: "issue_not_found",
+		});
+		const record = decision as unknown as Record<string, unknown>;
+		for (const key of ["digest", "imageReference", "attestation"]) {
+			expect(record).not.toHaveProperty(key);
+		}
+	});
 
-  it("non-substitute: adapter test-environment capability classification carries no digest binding", () => {
-    const effective = environmentRuntime.classifyEnvironmentCapabilities({
-      verifiedMethods: ["environmentExecute"],
-    }) as unknown as Record<string, unknown>;
-    for (const key of ["digest", "imageReference", "attestation"]) {
-      expect(effective).not.toHaveProperty(key);
-    }
-  });
+	it("non-substitute: adapter test-environment capability classification carries no digest binding", () => {
+		const effective = environmentRuntime.classifyEnvironmentCapabilities({
+			verifiedMethods: ["environmentExecute"],
+		}) as unknown as Record<string, unknown>;
+		for (const key of ["digest", "imageReference", "attestation"]) {
+			expect(effective).not.toHaveProperty(key);
+		}
+	});
 
-  it("non-substitute: workspace realization parsing carries no digest binding", () => {
-    const parsed = readWorkspaceRealizationRequest({
-      version: 1,
-      adapterType: "synthetic-adapter",
-      companyId: "11111111-1111-4111-8111-111111111111",
-      environmentId: "44444444-4444-4444-8444-444444444444",
-      heartbeatRunId: "run-1",
-      source: { localPath: "/synthetic/workspace" },
-    });
-    expect(parsed).not.toBeNull();
-    const record = parsed as unknown as Record<string, unknown>;
-    for (const key of ["digest", "imageReference", "attestation"]) {
-      expect(record).not.toHaveProperty(key);
-    }
-  });
+	it("non-substitute: workspace realization parsing carries no digest binding", () => {
+		const parsed = readWorkspaceRealizationRequest({
+			version: 1,
+			adapterType: "synthetic-adapter",
+			companyId: "11111111-1111-4111-8111-111111111111",
+			environmentId: "44444444-4444-4444-8444-444444444444",
+			heartbeatRunId: "run-1",
+			source: { localPath: "/synthetic/workspace" },
+		});
+		expect(parsed).not.toBeNull();
+		const record = parsed as unknown as Record<string, unknown>;
+		for (const key of ["digest", "imageReference", "attestation"]) {
+			expect(record).not.toHaveProperty(key);
+		}
+	});
 
-  it("non-substitute: no current seam module exports the attestation operation", () => {
-    for (const mod of [dispatchPolicy, agentPermissions, environmentRuntime]) {
-      const record = mod as unknown as Record<string, unknown>;
-      for (const name of ATTEST_OP_NAMES) {
-        expect(
-          name in record,
-          `"${name}" must stay absent from seam modules`,
-        ).toBe(false);
-      }
-    }
-  });
+	it("non-substitute: no current seam module exports the attestation operation", () => {
+		for (const mod of [dispatchPolicy, agentPermissions, environmentRuntime]) {
+			const record = mod as unknown as Record<string, unknown>;
+			for (const name of ATTEST_OP_NAMES) {
+				expect(
+					name in record,
+					`"${name}" must stay absent from seam modules`,
+				).toBe(false);
+			}
+		}
+	});
 });
