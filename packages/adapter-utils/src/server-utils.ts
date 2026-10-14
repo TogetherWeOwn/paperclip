@@ -25,6 +25,12 @@ import {
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import {
+  getActiveNativeSshHostExecutor,
+  NativeSshAuthorityError,
+  type NativeSshHostExecutorTarget,
+  type NativeSshSignedEnvelope,
+} from "./host-executor.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
@@ -63,6 +69,12 @@ export interface RunProcessResult {
   stderr: string;
   pid: number | null;
   startedAt: string | null;
+  /** Receipt of the signed authority that permitted a native SSH launch; null for local runs. */
+  nativeSshAuthority?: {
+    readonly opaqueRequestId: string;
+    readonly launchSpecSha256: string;
+    readonly expiresAt: string;
+  } | null;
   // The stop timestamp and the measured wall time of one execution. Both are
   // optional and additive: a producer that does not measure them leaves them
   // absent, so the many existing `RunProcessResult` producers stay unchanged.
@@ -3734,10 +3746,32 @@ async function resolveSpawnTarget(
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    hostExecutor?: NativeSshHostExecutorTarget | null;
+    onNativeSshAuthority?: (envelope: NativeSshSignedEnvelope) => void;
   } = {},
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
   if (remote) {
+    // Pre-dispatch mediation: no ssh lookup, argv, key material or child exists
+    // until a signer-verified authority for exactly this launch is in hand.
+    const hostExecutor = options.hostExecutor ?? getActiveNativeSshHostExecutor();
+    if (!hostExecutor) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_required",
+        "Native SSH execution requires a server-derived host executor and signed authority",
+      );
+    }
+    const authority = await hostExecutor.authorizeLaunch({
+      command,
+      args,
+      remote: {
+        host: remote.host,
+        port: remote.port,
+        username: remote.username,
+        remoteCwd: remote.remoteCwd,
+      },
+    });
+    options.onNativeSshAuthority?.(authority);
     const sshResolved = await resolveCommandPath("ssh", process.cwd(), env);
     if (!sshResolved) {
       throw new Error('Command not found in PATH: "ssh"');
@@ -3751,6 +3785,7 @@ async function resolveSpawnTarget(
           (entry): entry is [string, string] => typeof entry[1] === "string",
         ),
       ),
+      authority,
     });
     return {
       command: sshResolved,
@@ -4808,6 +4843,12 @@ export async function runChildProcess(
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
     /**
+     * Server-created authority issuer for native SSH launches. Falls back to
+     * the executor bound to the current run scope; with neither, a remote
+     * launch is refused before anything is spawned.
+     */
+    hostExecutor?: NativeSshHostExecutorTarget | null;
+    /**
      * Default true: the child starts from the server's environment minus the
      * server-secret denylist, then `env` is merged over it. Set false to start
      * from an empty environment so the child sees exactly `env` (plus a default
@@ -4821,6 +4862,7 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    let nativeSshAuthority: RunProcessResult["nativeSshAuthority"] = null;
     const {
       env: prunedRawMerged,
       dropped: droppedEnvKeys,
@@ -4866,6 +4908,14 @@ export async function runChildProcess(
         ? pruneOversizedLaunchEnv(opts.env) as Record<string, string>
         : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
+      hostExecutor: opts.hostExecutor ?? null,
+      onNativeSshAuthority: (envelope) => {
+        nativeSshAuthority = {
+          opaqueRequestId: envelope.authority.opaqueRequestId,
+          launchSpecSha256: envelope.authority.launchSpecSha256,
+          expiresAt: envelope.authority.expiresAt,
+        };
+      },
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
@@ -5097,6 +5147,7 @@ export async function runChildProcess(
                     stderr,
                     pid: child.pid ?? null,
                     startedAt,
+                    nativeSshAuthority,
                     terminalResultCleanup: terminalCleanupStarted
                       ? {
                           kind: "terminal_result_cleanup",

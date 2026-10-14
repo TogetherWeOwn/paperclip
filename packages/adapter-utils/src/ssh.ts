@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { assertNativeSshLaunchAuthority, type NativeSshSignedEnvelope } from "./host-executor.js";
 import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remote-execution-env.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -1483,11 +1484,31 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /**
+   * Executor-issued proof that this exact command, argv and remote target was
+   * signed for this launch. Checked and spent before any argv, environment or
+   * key material is touched, so a refused launch leaves nothing behind.
+   */
+  authority: NativeSshSignedEnvelope;
 }): Promise<{
   command: string;
   args: string[];
   cleanup: () => Promise<void>;
 }> {
+  assertNativeSshLaunchAuthority(
+    input.authority,
+    {
+      command: input.command,
+      args: input.args,
+      remote: {
+        host: input.spec.host,
+        port: input.spec.port,
+        username: input.spec.username,
+        remoteCwd: input.spec.remoteCwd,
+      },
+    },
+    { consume: true },
+  );
   // Source the login profiles first, then run `env KEY=VAL cmd` so
   // user-supplied identity overrides win over anything a profile re-exports.
   // The SSH target is an operator-configured host, not a Paperclip sandbox
