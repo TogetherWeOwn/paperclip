@@ -10663,6 +10663,19 @@ export async function createRunnerdBackend(input: {
     },
   ) => Promise<unknown>;
 }): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
+  // The Paperclip Runner has no signed launch authority on SSH transports:
+  // its start command runs through the server-owned SSH command runner, which
+  // the native-SSH dispatch mediation does not gate. Refuse before any ledger
+  // write, state migration, or remote contact until that path carries an
+  // executor-issued authority for the exact launch.
+  if (
+    input.runnerExecutionTarget?.kind === "remote" &&
+    input.runnerExecutionTarget.transport === "ssh"
+  ) {
+    throw new Error(
+      "runner_transport_ineligible: Paperclip Runner launches over SSH are refused without an executor-issued launch authority",
+    );
+  }
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {
