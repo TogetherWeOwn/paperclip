@@ -587,11 +587,19 @@ import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
+  NativeSshAuthorityError,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
+  type NativeSshEnvelopeVerifier,
+  type NativeSshSignerTransport,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import {
+  createNativeSshHostExecutorForRun,
+  nativeSshAuthorityRunLedger,
+  runWithRunNativeSshHostExecutor,
+} from "./native-ssh-authority.js";
 import {
   readPaperclipSkillSyncPreference,
   selectPaperclipTaskMarkdown,
@@ -9476,6 +9484,12 @@ export interface HeartbeatServiceOptions {
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
   /**
+   * Out-of-process signer for native SSH launch authorities and the check of
+   * its signature. Without both, every SSH-target launch is refused.
+   */
+  nativeSshSigner?: NativeSshSignerTransport;
+  nativeSshEnvelopeVerifier?: NativeSshEnvelopeVerifier;
+  /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
    * session loop, persistence port, and finalizer without spawning a provider.
@@ -16909,7 +16923,7 @@ export function heartbeatService(
       }
     }
     const agentConfig = parseObject(agent.adapterConfig);
-    return resolveRunModelDecision({
+    const resolution = await resolveRunModelDecision({
       requireDecision: input.requireDecision,
       skip: {
         issueId,
@@ -16938,6 +16952,8 @@ export function heartbeatService(
           ? manager.call(pluginId, "resolveRunModel", params, timeoutMs)
           : Promise.reject(new Error("plugin worker manager unavailable")),
     });
+    // The holder selection is what the native SSH seam enforces against.
+    return { ...resolution, holder };
   }
 
   /**
@@ -23271,6 +23287,21 @@ export function heartbeatService(
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
+      // Every launch on an SSH host needs a signer-verified authority bound to the
+      // decided model. Built once per run; a missing model refuses the run here.
+      const nativeSshHostExecutor = createNativeSshHostExecutorForRun({
+        runId: run.id,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId: issueRef?.id ?? null,
+        adapterType: agent.adapterType,
+        target: executionTarget,
+        holder: modelDecision.holder,
+        decision: modelDecision.record,
+        signer: options.nativeSshSigner,
+        verifyEnvelope: options.nativeSshEnvelopeVerifier,
+        ...nativeSshAuthorityRunLedger(db, run.id),
+      });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
@@ -23299,8 +23330,10 @@ export function heartbeatService(
         if (saved.state !== "superseded") await recordInstructionSave(saved);
       };
       if (managedAiRuntime && aiBinding) {
-        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
-        catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
+        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget, nativeSshHostExecutor); }
+        catch (error) {
+          if (error instanceof NativeSshAuthorityError) throw error;
+          throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
       const remoteExecution = realizationResult.remoteExecution;
       if (
@@ -25528,7 +25561,8 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
-                  return adapter.execute({
+                  // Every SSH launch inside the adapter needs the run's executor bound.
+                  return runWithRunNativeSshHostExecutor(nativeSshHostExecutor, () => adapter.execute({
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -25602,7 +25636,7 @@ export function heartbeatService(
                       });
                     },
                     authToken: isolatedRuntime ? undefined : authToken ?? undefined,
-                  });
+                  }));
                 },
               );
             if (!guardedDispatch.dispatched) return;
