@@ -12,6 +12,7 @@
  */
 
 export type VerifySourceImageAttestationInput = {
+  /** Source commit id bound to the attestation: 40-64 lowercase hex. */
   sourceRevision: string;
   imageReference: string;
   /** Expected OCI digest, `sha256:<64 lowercase hex>`. */
@@ -19,16 +20,26 @@ export type VerifySourceImageAttestationInput = {
 };
 
 export type VerifySourceImageAttestationResult =
-  | { ok: true; digest: string; verifiedAtValidationTime: true }
+  | {
+      ok: true;
+      digest: string;
+      sourceRevision: string;
+      verifiedAtValidationTime: true;
+    }
   | {
       ok: false;
       errorCode:
         | "mutable_tag_refused"
         | "digest_mismatch"
-        | "digest_unparseable";
+        | "digest_unparseable"
+        | "revision_unparseable"
+        | "repository_unparseable";
     };
 
 const EXPECTED_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40,64}$/;
+const REPOSITORY_COMPONENT_PATTERN = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const HOST_COMPONENT_PATTERN = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
 
 function refuse(
   errorCode: Extract<
@@ -39,9 +50,77 @@ function refuse(
   return { ok: false, errorCode };
 }
 
+/**
+ * OCI repository grammar: optional host[:port] first component, path
+ * components `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*` separated by single `/`.
+ * Rejects whitespace/control characters, URL schemes, and empty components
+ * (leading/trailing/double slashes) so a caller-kept reference string cannot
+ * pass as an exact binding with injection-sensitive content.
+ */
+function isValidRepository(repository: string): boolean {
+  if (repository.length === 0 || repository.length > 255) {
+    return false;
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(repository)) {
+    return false;
+  }
+  if (repository.includes("://")) {
+    return false;
+  }
+  if (
+    repository.startsWith("/") ||
+    repository.endsWith("/") ||
+    repository.includes("//")
+  ) {
+    return false;
+  }
+  const parts = repository.split("/");
+  for (let index = 0; index < parts.length; index += 1) {
+    const component = parts[index] as string;
+    if (component.length === 0) {
+      return false;
+    }
+    if (index === 0 && parts.length > 1) {
+      const colonIndex = component.indexOf(":");
+      if (colonIndex !== -1) {
+        const host = component.slice(0, colonIndex);
+        const port = component.slice(colonIndex + 1);
+        if (
+          host.length === 0 ||
+          !HOST_COMPONENT_PATTERN.test(host.toLowerCase())
+        ) {
+          return false;
+        }
+        if (!/^[0-9]+$/.test(port)) {
+          return false;
+        }
+        continue;
+      }
+    }
+    if (component.includes(":")) {
+      return false;
+    }
+    if (!REPOSITORY_COMPONENT_PATTERN.test(component.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function verifySourceImageAttestation(
   input: VerifySourceImageAttestationInput,
 ): VerifySourceImageAttestationResult {
+  const sourceRevision =
+    input !== null && typeof input === "object"
+      ? input.sourceRevision
+      : undefined;
+  if (
+    typeof sourceRevision !== "string" ||
+    !SOURCE_REVISION_PATTERN.test(sourceRevision)
+  ) {
+    return refuse("revision_unparseable");
+  }
+
   const expectedDigest =
     input !== null && typeof input === "object"
       ? input.expectedDigest
@@ -79,13 +158,16 @@ export function verifySourceImageAttestation(
   if (repository.length === 0) {
     return refuse("digest_unparseable");
   }
-
   // Mutability wins over the digest binding: a tag qualifier on the
   // repository name (the colon after the last slash, so registry ports are
   // not mistaken for tags) refuses even when a digest is present.
   const repositoryName = repository.slice(repository.lastIndexOf("/") + 1);
   if (repositoryName.includes(":")) {
     return refuse("mutable_tag_refused");
+  }
+
+  if (!isValidRepository(repository)) {
+    return refuse("repository_unparseable");
   }
 
   if (!EXPECTED_DIGEST_PATTERN.test(digestPart)) {
@@ -99,6 +181,7 @@ export function verifySourceImageAttestation(
   return {
     ok: true,
     digest: expectedDigest,
+    sourceRevision,
     verifiedAtValidationTime: true,
   };
 }

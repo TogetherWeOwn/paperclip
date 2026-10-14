@@ -1,13 +1,14 @@
 /**
- * Test-author slice: source-bound transport-only validation contracts.
+ * Source-bound transport-only validation contracts.
  *
- * TEST-ONLY. No implementation in this change.
+ * Implementation is present in
+ * `server/src/services/source-transport-validation.ts` and this suite is
+ * green, pinning the implementation. The `contract:` tests below are the
+ * executable contract: they fail if the operation regresses.
  *
- * - Every `contract:` test below is expected to FAIL until the paired Builder
- *   slice provides the operation (initial red proof: 6 failing contracts on
- *   this file; CISO follow-up items 1-4 extend the suite and stay red until
- *   the Builder slice satisfies them). Red proof is recorded in the pull
- *   request description; the suite stays red until the Builder slice lands.
+ * - Initial red proof (6 failing contracts on this file; CISO follow-up
+ *   items 1-4) is recorded in the pull request description; the Builder
+ *   slice has landed so the suite stays green.
  * - The resolver below uses ONLY the canonical module path and export name
  *   (CISO item 1) and surfaces resolution failures with their real cause
  *   instead of swallowing them.
@@ -52,6 +53,11 @@ import type {
 import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
 import * as agentPermissions from "../services/agent-permissions.js";
 import { classifyEnvironmentCapabilities } from "../services/environment-runtime.js";
+import {
+  validateSourceTransportOnly,
+  type ValidateSourceTransportOnlyInput,
+  type ValidateSourceTransportOnlyResult,
+} from "../services/source-transport-validation.js";
 import { readWorkspaceRealizationRequest } from "../services/workspace-realization.js";
 
 // ---------------------------------------------------------------------------
@@ -76,49 +82,20 @@ const TRANSPORT_OP_NAMES = [
   "validateSourceTransport",
 ] as const;
 
-type TransportOnlyValidationInput = {
-  sourceIssueId: string;
-  principalAgentId: string;
-  /** The source issue's current assignee; the pure core compares the two. */
-  issueAssigneeAgentId: string;
-  workspaceId: string;
-  /** Transport the principal asked to validate in. */
-  transport: string;
-  /** Transport the selected workspace is bound to. */
-  workspaceTransport: string;
-  dependenciesBlocked?: { unresolvedBlockerIssueIds: string[] } | null;
-  isLowTrust?: boolean;
-  requestedToolClass?: string | null;
-  effects?: {
-    startRuntimeService?: () => unknown;
-    executeProduct?: () => unknown;
-    executeStaging?: () => unknown;
-  } | null;
-};
-
-type TransportOnlyValidationResult =
-  | {
-      ok: true;
-      boundary: "transport-only";
-      runtimeInvoked: false;
-      validatedWorkspaceId: string;
-      checkedDependencies: true;
-      preflight: "enforced";
-    }
-  | {
-      ok: false;
-      errorCode:
-        | "unauthorized_principal"
-        | "issue_dependencies_blocked"
-        | "low_trust_preflight_denied"
-        | "workspace_transport_mismatch";
-      boundary: "transport-only";
-      runtimeInvoked: false;
-    };
+// Contract types are the implementation's exported types directly, so a
+// signature change in `source-transport-validation.ts` fails typecheck here.
+type TransportOnlyValidationInput = ValidateSourceTransportOnlyInput;
+type TransportOnlyValidationResult = ValidateSourceTransportOnlyResult;
 
 type TransportOnlyValidationOp = (
   input: TransportOnlyValidationInput,
 ) => Promise<TransportOnlyValidationResult> | TransportOnlyValidationResult;
+
+// Compiler pins the contract to the implementation: a signature change in
+// `source-transport-validation.ts` fails typecheck here.
+const _directTransportOp: TransportOnlyValidationOp =
+  validateSourceTransportOnly;
+void _directTransportOp;
 
 async function resolveTransportOnlyOp(): Promise<TransportOnlyValidationOp> {
   // In-module dynamic import (never `new Function("return import(...)")`):
@@ -434,6 +411,76 @@ describe("contract: source-bound transport-only validation", () => {
       });
     }
   });
+
+  it("contract: denies empty or missing sourceIssueId as unauthorized_principal (fail-closed)", async () => {
+    const op = await requireTransportOnlyOp();
+    const inputs: TransportOnlyValidationInput[] = [
+      { ...baseValidInput(), sourceIssueId: "" },
+      {
+        ...baseValidInput(),
+        sourceIssueId: undefined as unknown as string,
+      },
+      { ...baseValidInput(), sourceIssueId: "OTHER-ISSUE-ID" },
+    ];
+    // Empty/missing bindings deny; a well-formed id distinct from the fixture
+    // still authorizes here because the pure core only proves non-emptiness —
+    // issue-ownership lookup happens at the caller seam, not in this helper.
+    const expected: Array<"unauthorized_principal" | "ok"> = [
+      "unauthorized_principal",
+      "unauthorized_principal",
+      "ok",
+    ];
+    for (let index = 0; index < inputs.length; index += 1) {
+      const result = await op(inputs[index] as TransportOnlyValidationInput);
+      if (expected[index] === "ok") {
+        expect(result).toMatchObject({ ok: true });
+      } else {
+        expect(result).toMatchObject({
+          ok: false,
+          errorCode: "unauthorized_principal",
+          boundary: "transport-only",
+          runtimeInvoked: false,
+        });
+      }
+    }
+  });
+
+  it("contract: denies empty or missing workspaceId as workspace_transport_mismatch (fail-closed)", async () => {
+    const op = await requireTransportOnlyOp();
+    const inputs: TransportOnlyValidationInput[] = [
+      { ...baseValidInput(), workspaceId: "" },
+      {
+        ...baseValidInput(),
+        workspaceId: undefined as unknown as string,
+      },
+    ];
+    for (const input of inputs) {
+      const result = await op(input);
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "workspace_transport_mismatch",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    }
+  });
+
+  it.each(["true", 1, "yes", {}, [], null, undefined] as const)(
+    "contract: denies non-boolean isLowTrust %s as low_trust_preflight_denied (fail-closed)",
+    async (isLowTrust) => {
+      const op = await requireTransportOnlyOp();
+      const result = await op({
+        ...baseValidInput(),
+        isLowTrust: isLowTrust as unknown as boolean,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "low_trust_preflight_denied",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    },
+  );
 
   // CISO exact item 4 (strict reading): under low trust, `requestedToolClass`
   // denies AFTER normalization (trim + lowercase) — including `null` and

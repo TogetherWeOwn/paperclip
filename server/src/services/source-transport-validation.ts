@@ -83,8 +83,11 @@ export function validateSourceTransportOnly(
   }
 
   // 1. The intended principal must equal the source issue's assignee. Empty or
-  // missing identities deny rather than passing vacuously.
+  // missing identities deny rather than passing vacuously. The source binding
+  // itself must be non-empty: without a source issue id the function cannot
+  // tell which source issue it was bound to.
   if (
+    !isNonEmptyString(input.sourceIssueId) ||
     !isNonEmptyString(input.principalAgentId) ||
     !isNonEmptyString(input.issueAssigneeAgentId) ||
     input.principalAgentId !== input.issueAssigneeAgentId
@@ -114,16 +117,22 @@ export function validateSourceTransportOnly(
     }
   }
 
-  // 3. Low-trust preflight: any low-trust invocation denies, including a null
-  // or absent tool class. This pins the strict superset — deny on null rather
-  // than silently scoping it out.
-  if (input.isLowTrust === true) {
+  // 3. Low-trust preflight: fail closed unless the caller proves standard
+  // trust with the explicit boolean false. Any other value — true, truthy
+  // non-booleans ("true", 1, "yes", {}, []), null, or an omitted field —
+  // denies, including a null or absent tool class. This pins the strict
+  // superset — deny on malformed rather than silently scoping it out — so the
+  // `preflight: "enforced"` stamp on success never covers an unproven fact.
+  if (input.isLowTrust !== false) {
     return denied("low_trust_preflight_denied");
   }
 
   // 4. The selected workspace must be bound to the principal transport. Empty
-  // or missing transports deny rather than matching vacuously.
+  // or missing transports deny rather than matching vacuously, and the
+  // workspace id itself must be non-empty so `validatedWorkspaceId` never
+  // echoes "" or an absent value on an `ok:true` result.
   if (
+    !isNonEmptyString(input.workspaceId) ||
     !isNonEmptyString(input.transport) ||
     !isNonEmptyString(input.workspaceTransport) ||
     input.transport !== input.workspaceTransport

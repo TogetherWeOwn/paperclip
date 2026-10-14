@@ -1,21 +1,21 @@
 /**
- * Test-author slice: source-to-deployed-image attestation contracts.
+ * Source-to-deployed-image attestation contracts.
  *
- * TEST-ONLY. No implementation in this change.
+ * Implementation is present in
+ * `server/src/services/source-image-attestation.ts` and this suite is
+ * green, pinning the implementation. The `contract:` tests below are the
+ * executable contract: they fail if the operation regresses.
  *
  * DIGEST PINNING, NOT PROVENANCE: a success result proves only that two
- * caller-supplied digest strings matched at validation time. It does not
- * prove what source built an image, what is deployed, or that any
- * registry/signature check ran. There is deliberately NO registry allowlist:
- * any registry (including unknown or untrusted hosts) validates when the
- * digests match (see the `evil.example.com` test below).
+ * caller-supplied digest strings matched at validation time for the bound
+ * source revision. It does not prove what source built an image, what is
+ * deployed, or that any registry/signature check ran. There is deliberately
+ * NO registry allowlist: any registry (including unknown or untrusted hosts)
+ * validates when the digests match (see the `evil.example.com` test below).
  *
- * - Every `contract:` test below is expected to FAIL until the paired Builder
- *   slice provides the operation (initial red proof: 6 failing contracts on
- *   this file; CISO follow-up items 1, 5-7 extend the suite and stay red
- *   until the Builder slice satisfies them). Red proof is recorded in the
- *   pull request description; the suite stays red until the Builder slice
- *   lands.
+ * - Initial red proof (6 failing contracts on this file; CISO follow-up
+ *   items 1, 5-7) is recorded in the pull request description; the Builder
+ *   slice has landed so the suite stays green.
  * - The resolver below uses ONLY the canonical module path and export name
  *   (CISO item 1) and surfaces resolution failures with their real cause
  *   instead of swallowing them.
@@ -52,6 +52,11 @@ import type {
 import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
 import * as agentPermissions from "../services/agent-permissions.js";
 import * as environmentRuntime from "../services/environment-runtime.js";
+import {
+  verifySourceImageAttestation,
+  type VerifySourceImageAttestationInput,
+  type VerifySourceImageAttestationResult,
+} from "../services/source-image-attestation.js";
 import { readWorkspaceRealizationRequest } from "../services/workspace-realization.js";
 
 // ---------------------------------------------------------------------------
@@ -76,26 +81,20 @@ const ATTEST_OP_NAMES = [
   "verifySourceImageBinding",
 ] as const;
 
-type SourceImageAttestationInput = {
-  sourceRevision: string;
-  imageReference: string;
-  /** Expected OCI digest, `sha256:<64 lowercase hex>`. */
-  expectedDigest: string;
-};
-
-type SourceImageAttestationResult =
-  | { ok: true; digest: string; verifiedAtValidationTime: true }
-  | {
-      ok: false;
-      errorCode:
-        | "mutable_tag_refused"
-        | "digest_mismatch"
-        | "digest_unparseable";
-    };
+// Contract types are the implementation's exported types directly, so a
+// signature change in `source-image-attestation.ts` fails typecheck here.
+type SourceImageAttestationInput = VerifySourceImageAttestationInput;
+type SourceImageAttestationResult = VerifySourceImageAttestationResult;
 
 type SourceImageAttestationOp = (
   input: SourceImageAttestationInput,
 ) => Promise<SourceImageAttestationResult> | SourceImageAttestationResult;
+
+// Compiler pins the contract to the implementation: a signature change in
+// `source-image-attestation.ts` fails typecheck here.
+const _directAttestOp: SourceImageAttestationOp =
+  verifySourceImageAttestation;
+void _directAttestOp;
 
 async function resolveAttestOp(): Promise<SourceImageAttestationOp> {
   // In-module dynamic import (never `new Function("return import(...)")`):
@@ -302,6 +301,73 @@ describe("contract: source-to-deployed-image attestation", () => {
       });
     }
   });
+
+  it("contract: binds the source revision and echoes it on success", async () => {
+    const op = await requireAttestOp();
+    const result = await op({
+      sourceRevision: SOURCE_REVISION,
+      imageReference: PINNED_REFERENCE,
+      expectedDigest: PINNED_DIGEST,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      digest: PINNED_DIGEST,
+      sourceRevision: SOURCE_REVISION,
+      verifiedAtValidationTime: true,
+    });
+  });
+
+  it.each(["", "zzz", `sha256:${"AB".repeat(32)}`, "9c0a032"])(
+    "contract: reports a malformed sourceRevision %s as revision_unparseable",
+    async (sourceRevision) => {
+      const op = await requireAttestOp();
+      const result = await op({
+        sourceRevision,
+        imageReference: PINNED_REFERENCE,
+        expectedDigest: PINNED_DIGEST,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "revision_unparseable",
+      });
+    },
+  );
+
+  it("contract: reports a missing sourceRevision as revision_unparseable", async () => {
+    const op = await requireAttestOp();
+    const result = await op({
+      sourceRevision: undefined as unknown as string,
+      imageReference: PINNED_REFERENCE,
+      expectedDigest: PINNED_DIGEST,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: "revision_unparseable",
+    });
+  });
+
+  it.each([
+    ` r.io/x@${PINNED_DIGEST}`,
+    `a b c@${PINNED_DIGEST}`,
+    `r.io/x\n@${PINNED_DIGEST}`,
+    `https://evil/x@${PINNED_DIGEST}`,
+    `r.io/@${PINNED_DIGEST}`,
+    `/@${PINNED_DIGEST}`,
+  ])(
+    "contract: reports a malformed repository %s as repository_unparseable",
+    async (imageReference) => {
+      const op = await requireAttestOp();
+      const result = await op({
+        sourceRevision: SOURCE_REVISION,
+        imageReference,
+        expectedDigest: PINNED_DIGEST,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "repository_unparseable",
+      });
+    },
+  );
 
   it("contract: validates any registry when digests match (no allowlist)", async () => {
     const op = await requireAttestOp();
