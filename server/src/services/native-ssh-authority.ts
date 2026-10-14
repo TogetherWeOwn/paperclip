@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   createNativeSshHostExecutorTarget,
   runWithNativeSshHostExecutor,
@@ -82,6 +84,34 @@ export function createNativeSshHostExecutorForRun(
     issueId: issueId ?? "",
     assignedModel: assignedModelForNativeSsh(holder, decision),
   });
+}
+
+/**
+ * Records the run's native SSH authority on its heartbeat run row: the exact
+ * authority before the signer is asked (the signer signs only what the server
+ * recorded for the opaque id), then the signed envelope's digest. Either write
+ * failing aborts the launch.
+ */
+export function nativeSshAuthorityRunLedger(
+  db: Db,
+  runId: string,
+): Pick<CreateNativeSshHostExecutorTargetInput, "persistAuthority" | "persistEnvelope"> {
+  async function record(patch: Record<string, unknown>, what: string) {
+    const rows = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning({ id: heartbeatRuns.id });
+    if (rows.length === 0) throw new Error(`Failed to record native SSH ${what} on the run`);
+  }
+  return {
+    persistAuthority: (authority) =>
+      record({ nativeSshAuthority: authority, nativeSshEnvelopeSha256: null }, "authority"),
+    persistEnvelope: ({ envelopeSha256 }) =>
+      record({ nativeSshEnvelopeSha256: envelopeSha256 }, "envelope digest"),
+  };
 }
 
 /** Runs `fn` with the run's executor bound to every launch it makes; unbound when there is none. */
