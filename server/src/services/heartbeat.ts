@@ -23300,7 +23300,7 @@ export function heartbeatService(
         decision: modelDecision.record,
         signer: options.nativeSshSigner,
         verifyEnvelope: options.nativeSshEnvelopeVerifier,
-        ...nativeSshAuthorityRunLedger(db, run.id),
+        ...nativeSshAuthorityRunLedger(db, run.id, context),
       });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;

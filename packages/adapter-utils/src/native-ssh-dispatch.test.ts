@@ -48,6 +48,7 @@ const launch = {
   command: COMMAND,
   args: ARGS,
   remote: { host: spec.host, port: spec.port, username: spec.username, remoteCwd: spec.remoteCwd },
+  env: {},
 };
 
 let sandbox: string;
@@ -68,6 +69,7 @@ function authorityFor(overrides: { args?: string[]; issuedAt?: Date; ttlMs?: num
     args,
     remote: launch.remote,
     argvSha256: sha256CanonicalJson({ command: COMMAND, args }),
+    envSha256: sha256CanonicalJson({}),
     issuedAt: issuedAt.toISOString(),
     expiresAt: new Date(issuedAt.getTime() + (overrides.ttlMs ?? 60_000)).toISOString(),
   };
@@ -133,6 +135,8 @@ function childStarted() {
 }
 
 beforeEach(async () => {
+  // Enforced unless a test opts out; "off" is covered on its own below.
+  vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "required");
   sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "native-ssh-dispatch-"));
   originalTmpdir = process.env.TMPDIR;
   // Isolate temp-file artifacts so "zero key material written" is observable.
@@ -148,6 +152,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   if (originalTmpdir === undefined) delete process.env.TMPDIR;
   else process.env.TMPDIR = originalTmpdir;
   await fs.rm(sandbox, { recursive: true, force: true });
@@ -231,6 +236,34 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
   });
 });
 
+describe("native SSH authority off (server environment)", () => {
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "off");
+  });
+
+  it("launches without an executor as before", async () => {
+    const result = await launchWith();
+    expect(result.exitCode).toBe(0);
+    expect(childStarted()).toBe(true);
+    expect(result.nativeSshAuthority).toBeNull();
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("still enforces an executor that is bound", async () => {
+    const forged = executor(async (recorded) => ({ ...sign(recorded), signature: Buffer.from("forged").toString("base64") }));
+    await expect(launchWith(forged)).rejects.toThrow(/signature/i);
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("still refuses an authority that was handed to the builder but not issued", async () => {
+    await expect(
+      buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env: {}, authority: sign(authorityFor()) as never }),
+    ).rejects.toMatchObject({ code: "native_ssh_authority_required" });
+    expect(await tempArtifacts()).toEqual([]);
+  });
+});
+
 describe("ssh.ts agent-launch builder is gated independently of its caller", () => {
   async function issue() {
     return executor(async (recorded) => sign(recorded)).authorizeLaunch(launch);
@@ -252,6 +285,14 @@ describe("ssh.ts agent-launch builder is gated independently of its caller", () 
     const proof = await issue();
     await expect(
       buildSshSpawnTarget({ spec, command: COMMAND, args: [...ARGS, "--extra"], env: {}, authority: proof }),
+    ).rejects.toMatchObject({ code: "native_ssh_authority_mismatch" });
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses an authority issued for a different environment", async () => {
+    const proof = await issue();
+    await expect(
+      buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env: { PATH: "/tmp/shadow/bin" }, authority: proof }),
     ).rejects.toMatchObject({ code: "native_ssh_authority_mismatch" });
     expect(await tempArtifacts()).toEqual([]);
   });
@@ -287,11 +328,11 @@ describe("ssh call-site inventory", () => {
   const sshSource = readFileSync(path.join(root, "ssh.ts"), "utf8");
   const serverUtilsSource = readFileSync(path.join(root, "server-utils.ts"), "utf8");
 
-  function enclosingFunctions(source: string, needle: string): string[] {
+  function enclosingFunctions(source: string, needle: string | RegExp): string[] {
     const lines = source.split("\n");
     const out: string[] = [];
     lines.forEach((line, index) => {
-      if (!line.includes(needle)) return;
+      if (typeof needle === "string" ? !line.includes(needle) : !needle.test(line)) return;
       for (let i = index; i >= 0; i -= 1) {
         const match = /^(?:export )?(?:async )?function (\w+)/.exec(lines[i]);
         if (match) {
@@ -307,10 +348,16 @@ describe("ssh call-site inventory", () => {
     // Anything new that spawns ssh or stages a private key must be classified here on purpose:
     //  - mediated: starts an agent command, requires an executor-issued authority.
     //  - transport: workspace/file transfer or probe commands issued by the server, never an agent launch.
-    const spawners = enclosingFunctions(sshSource, 'spawn("ssh"');
+    // Any child-process helper given "ssh" as its command, not only spawn().
+    const spawners = enclosingFunctions(
+      sshSource,
+      /\b(?:spawn|spawnSync|execFile|execFileSync|execFileText|spawnText|execa)\(\s*["']ssh["']/,
+    );
     const keyStagers = enclosingFunctions(sshSource, "await createSshAuthArgs(");
     const mediated = ["buildSshSpawnTarget"];
     const transport = ["runSshCommand", "streamLocalFileToSsh", "streamSshToLocalFile", "syncDirectoryFromSsh", "syncDirectoryToSsh"];
+    // The detector must see the execFileText/spawnText sites, or the check below is vacuous.
+    expect(spawners).toContain("runSshCommand");
     expect([...spawners, ...keyStagers].every((name) => [...mediated, ...transport].includes(name))).toBe(true);
     expect(keyStagers).toEqual([...mediated, ...transport].sort());
   });

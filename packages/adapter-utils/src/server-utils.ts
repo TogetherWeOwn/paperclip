@@ -27,6 +27,7 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import {
   getActiveNativeSshHostExecutor,
+  isNativeSshAuthorityRequired,
   NativeSshAuthorityError,
   type NativeSshHostExecutorTarget,
   type NativeSshSignedEnvelope,
@@ -3752,26 +3753,36 @@ async function resolveSpawnTarget(
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
   if (remote) {
+    const sshEnv = Object.fromEntries(
+      Object.entries(options.remoteEnv ?? {}).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
     // Pre-dispatch mediation: no ssh lookup, argv, key material or child exists
     // until a signer-verified authority for exactly this launch is in hand.
+    // A bound executor is always enforced; with none, the server's
+    // PAPERCLIP_NATIVE_SSH_AUTHORITY decides whether the launch is refused.
     const hostExecutor = options.hostExecutor ?? getActiveNativeSshHostExecutor();
-    if (!hostExecutor) {
+    if (!hostExecutor && isNativeSshAuthorityRequired()) {
       throw new NativeSshAuthorityError(
         "native_ssh_authority_required",
         "Native SSH execution requires a server-derived host executor and signed authority",
       );
     }
-    const authority = await hostExecutor.authorizeLaunch({
-      command,
-      args,
-      remote: {
-        host: remote.host,
-        port: remote.port,
-        username: remote.username,
-        remoteCwd: remote.remoteCwd,
-      },
-    });
-    options.onNativeSshAuthority?.(authority);
+    const authority = hostExecutor
+      ? await hostExecutor.authorizeLaunch({
+          command,
+          args,
+          remote: {
+            host: remote.host,
+            port: remote.port,
+            username: remote.username,
+            remoteCwd: remote.remoteCwd,
+          },
+          env: sshEnv,
+        })
+      : null;
+    if (authority) options.onNativeSshAuthority?.(authority);
     const sshResolved = await resolveCommandPath("ssh", process.cwd(), env);
     if (!sshResolved) {
       throw new Error('Command not found in PATH: "ssh"');
@@ -3780,11 +3791,7 @@ async function resolveSpawnTarget(
       spec: remote,
       command,
       args,
-      env: Object.fromEntries(
-        Object.entries(options.remoteEnv ?? {}).filter(
-          (entry): entry is [string, string] => typeof entry[1] === "string",
-        ),
-      ),
+      env: sshEnv,
       authority,
     });
     return {
@@ -4844,8 +4851,9 @@ export async function runChildProcess(
     localProcessSandbox?: LocalProcessSandboxOptions | null;
     /**
      * Server-created authority issuer for native SSH launches. Falls back to
-     * the executor bound to the current run scope; with neither, a remote
-     * launch is refused before anything is spawned.
+     * the executor bound to the current run scope. With neither, a remote
+     * launch is refused before anything is spawned when the server requires
+     * native SSH authority (PAPERCLIP_NATIVE_SSH_AUTHORITY).
      */
     hostExecutor?: NativeSshHostExecutorTarget | null;
     /**

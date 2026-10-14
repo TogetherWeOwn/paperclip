@@ -3,11 +3,13 @@ import { eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   createNativeSshHostExecutorTarget,
+  isNativeSshAuthorityRequired,
   runWithNativeSshHostExecutor,
   type CreateNativeSshHostExecutorTargetInput,
   type NativeSshHostExecutorTarget,
 } from "@paperclipai/adapter-utils";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { unprocessable } from "../errors.js";
 import {
   evaluateRunModelDecisionSeam,
   RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING,
@@ -69,15 +71,20 @@ function assignedModelForNativeSsh(
   return { version: "1", model, sha256: createHash("sha256").update(model).digest("hex") };
 }
 
+function isSshTarget(target: AdapterExecutionTarget | null | undefined): boolean {
+  return target?.kind === "remote" && target.transport === "ssh";
+}
+
 /**
  * Builds the run's native SSH authority issuer, or null when the run does not
- * launch over SSH. For an SSH run, a missing assigned model or run identity
- * throws here, before any ledger write, signer request or ssh client.
+ * launch over SSH or the server leaves native SSH authority off. For an SSH
+ * run that requires it, a missing assigned model or run identity throws here,
+ * before any ledger write, signer request or ssh client.
  */
 export function createNativeSshHostExecutorForRun(
   input: CreateNativeSshHostExecutorForRunInput,
 ): NativeSshHostExecutorTarget | null {
-  if (input.target?.kind !== "remote" || input.target.transport !== "ssh") return null;
+  if (!isSshTarget(input.target) || !isNativeSshAuthorityRequired()) return null;
   const { target: _target, holder, decision, issueId, ...seed } = input;
   return createNativeSshHostExecutorTarget({
     ...seed,
@@ -87,14 +94,29 @@ export function createNativeSshHostExecutorForRun(
 }
 
 /**
+ * A probe outside a run (environment Test, connection adoption) has no run,
+ * issue or decided model to bind an authority to. While the server requires
+ * native SSH authority, refuse it on SSH targets with a clear 422.
+ */
+export function assertNativeSshProbeSupported(target: AdapterExecutionTarget | null | undefined): void {
+  if (!isSshTarget(target) || !isNativeSshAuthorityRequired()) return;
+  throw unprocessable(
+    "This check cannot run on an SSH environment while native SSH launch authority is required: it has no run to authorize it.",
+    { code: "native_ssh_authority_required" },
+  );
+}
+
+/**
  * Records the run's native SSH authority on its heartbeat run row: the exact
  * authority before the signer is asked (the signer signs only what the server
  * recorded for the opaque id), then the signed envelope's digest. Either write
- * failing aborts the launch.
+ * failing aborts the launch. `runContext`, the run's in-memory context, gets
+ * the same fields so later whole-snapshot writes of it keep them.
  */
 export function nativeSshAuthorityRunLedger(
   db: Db,
   runId: string,
+  runContext?: Record<string, unknown>,
 ): Pick<CreateNativeSshHostExecutorTargetInput, "persistAuthority" | "persistEnvelope"> {
   async function record(patch: Record<string, unknown>, what: string) {
     const rows = await db
@@ -105,6 +127,7 @@ export function nativeSshAuthorityRunLedger(
       .where(eq(heartbeatRuns.id, runId))
       .returning({ id: heartbeatRuns.id });
     if (rows.length === 0) throw new Error(`Failed to record native SSH ${what} on the run`);
+    if (runContext) Object.assign(runContext, patch);
   }
   return {
     persistAuthority: (authority) =>

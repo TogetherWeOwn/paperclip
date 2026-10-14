@@ -74,6 +74,8 @@ export {
   createEd25519NativeSshEnvelopeVerifier,
   createNativeSshHostExecutorTarget,
   getActiveNativeSshHostExecutor,
+  isNativeSshAuthorityRequired,
+  NATIVE_SSH_AUTHORITY_ENV,
   NativeSshAuthorityError,
   nativeSshEnvelopeSigningPayload,
   runWithNativeSshHostExecutor,
