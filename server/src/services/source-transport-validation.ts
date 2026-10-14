@@ -30,7 +30,7 @@ export type ValidateSourceTransportOnlyInput = {
   /** Transport the selected workspace is bound to. */
   workspaceTransport: string;
   dependenciesBlocked?: { unresolvedBlockerIssueIds: string[] } | null;
-  isLowTrust?: boolean;
+  isLowTrust: boolean;
   requestedToolClass?: string | null;
   effects?: SourceTransportValidationEffects | null;
 };

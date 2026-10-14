@@ -316,7 +316,14 @@ describe("contract: source-to-deployed-image attestation", () => {
     });
   });
 
-  it.each(["", "zzz", `sha256:${"AB".repeat(32)}`, "9c0a032"])(
+  it.each([
+    "",
+    "zzz",
+    `sha256:${"AB".repeat(32)}`,
+    "9c0a032",
+    "a".repeat(41),
+    "a".repeat(63),
+  ])(
     "contract: reports a malformed sourceRevision %s as revision_unparseable",
     async (sourceRevision) => {
       const op = await requireAttestOp();
@@ -352,6 +359,10 @@ describe("contract: source-to-deployed-image attestation", () => {
     `https://evil/x@${PINNED_DIGEST}`,
     `r.io/@${PINNED_DIGEST}`,
     `/@${PINNED_DIGEST}`,
+    `r.io/Org/App@${PINNED_DIGEST}`,
+    `r.io/Kubernetes/x@${PINNED_DIGEST}`,
+    `r.io/x/K@${PINNED_DIGEST}`,
+    `K.io/x@${PINNED_DIGEST}`,
   ])(
     "contract: reports a malformed repository %s as repository_unparseable",
     async (imageReference) => {

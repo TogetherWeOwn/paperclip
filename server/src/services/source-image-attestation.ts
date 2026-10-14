@@ -12,7 +12,7 @@
  */
 
 export type VerifySourceImageAttestationInput = {
-  /** Source commit id bound to the attestation: 40-64 lowercase hex. */
+  /** Source commit id bound to the attestation: 40 (SHA-1) or 64 (SHA-256) lowercase hex. */
   sourceRevision: string;
   imageReference: string;
   /** Expected OCI digest, `sha256:<64 lowercase hex>`. */
@@ -37,9 +37,9 @@ export type VerifySourceImageAttestationResult =
     };
 
 const EXPECTED_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
-const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40,64}$/;
+const SOURCE_REVISION_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const REPOSITORY_COMPONENT_PATTERN = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
-const HOST_COMPONENT_PATTERN = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
+const HOST_COMPONENT_PATTERN = /^[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*$/;
 
 function refuse(
   errorCode: Extract<
@@ -61,8 +61,13 @@ function hasRejectedControlCharacter(value: string): boolean {
 }
 
 /**
- * OCI repository grammar: optional host[:port] first component, path
+ * OCI repository grammar: optional registry host first component, path
  * components `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*` separated by single `/`.
+ * The first component is a registry domain (matched case-insensitively for
+ * ASCII letters) when it contains a `.` or `:` or equals `localhost`;
+ * otherwise it is a path component and must be lowercase. No case folding is
+ * applied before the grammar test so uppercase path components and non-ASCII
+ * homoglyphs (for example U+212A, which lowercases to `k`) never pass.
  * Rejects whitespace/control characters, URL schemes, and empty components
  * (leading/trailing/double slashes) so a caller-kept reference string cannot
  * pass as an exact binding with injection-sensitive content.
@@ -95,13 +100,16 @@ function isValidRepository(repository: string): boolean {
       if (colonIndex !== -1) {
         const host = component.slice(0, colonIndex);
         const port = component.slice(colonIndex + 1);
-        if (
-          host.length === 0 ||
-          !HOST_COMPONENT_PATTERN.test(host.toLowerCase())
-        ) {
+        if (host.length === 0 || !HOST_COMPONENT_PATTERN.test(host)) {
           return false;
         }
         if (!/^[0-9]+$/.test(port)) {
+          return false;
+        }
+        continue;
+      }
+      if (component.includes(".") || component.toLowerCase() === "localhost") {
+        if (!HOST_COMPONENT_PATTERN.test(component)) {
           return false;
         }
         continue;
@@ -110,7 +118,7 @@ function isValidRepository(repository: string): boolean {
     if (component.includes(":")) {
       return false;
     }
-    if (!REPOSITORY_COMPONENT_PATTERN.test(component.toLowerCase())) {
+    if (!REPOSITORY_COMPONENT_PATTERN.test(component)) {
       return false;
     }
   }
