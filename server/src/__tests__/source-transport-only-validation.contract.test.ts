@@ -3,10 +3,14 @@
  *
  * TEST-ONLY. No implementation in this change.
  *
- * - Every `contract:` test below is expected to FAIL on the current head (the
- *   operation does not exist yet) and turn green only after the paired Builder
- *   slice provides it. Red proof (12 failing contracts) is recorded in the
- *   pull request description; the suite stays red until the Builder slice lands.
+ * - Every `contract:` test below is expected to FAIL until the paired Builder
+ *   slice provides the operation (initial red proof: 6 failing contracts on
+ *   this file; CISO follow-up items 1-4 extend the suite and stay red until
+ *   the Builder slice satisfies them). Red proof is recorded in the pull
+ *   request description; the suite stays red until the Builder slice lands.
+ * - The resolver below uses ONLY the canonical module path and export name
+ *   (CISO item 1) and surfaces resolution failures with their real cause
+ *   instead of swallowing them.
  * - Every `non-substitute:` test PASSES on the current head. They pin the
  *   proved remainder: heartbeat wake, issue checkout, adapter test-environment
  *   capability classification, workspace realization parsing, and the
@@ -52,13 +56,21 @@ import { readWorkspaceRealizationRequest } from "../services/workspace-realizati
 
 // ---------------------------------------------------------------------------
 // Future operation shape (the Builder slice must provide this).
+//
+// Canonical location ONLY (CISO item 1): the resolver consults exactly one
+// module specifier and one export name. Resolving fallback aliases would let
+// production and tests diverge, so aliases are never consulted here.
 // ---------------------------------------------------------------------------
 
-const TRANSPORT_MODULE_SPECIFIERS = [
-  "../services/source-transport-validation.js",
-  "../services/source-transport-only-validation.js",
-] as const;
+/** Canonical module specifier for the Builder-owned operation. */
+const TRANSPORT_MODULE_SPECIFIER: string =
+  "../services/source-transport-validation.js";
+/** Canonical export name for the Builder-owned operation. */
+const TRANSPORT_OP_NAME = "validateSourceTransportOnly";
 
+// Legacy alias names stay pinned as NEVER-exported by the `non-substitute:`
+// seam test at the bottom of this file; they exist only in that negative
+// assertion and must not be added back to the resolver above.
 const TRANSPORT_OP_NAMES = [
   "validateSourceTransportOnly",
   "validateSourceTransport",
@@ -108,55 +120,43 @@ type TransportOnlyValidationOp = (
   input: TransportOnlyValidationInput,
 ) => Promise<TransportOnlyValidationResult> | TransportOnlyValidationResult;
 
-async function tryDynamicImport(
-  specifier: string,
-): Promise<Record<string, unknown> | null> {
+async function resolveTransportOnlyOp(): Promise<TransportOnlyValidationOp> {
+  // In-module dynamic import (never `new Function("return import(...)")`):
+  // the Function form evaluates in global scope, so a relative specifier can
+  // never resolve against this file and every failure collapses to a bare
+  // `null`. Here the specifier resolves against this test module and the real
+  // resolution cause propagates instead of being swallowed.
+  // `TRANSPORT_MODULE_SPECIFIER` is typed `string` (not a literal) so the
+  // typechecker does not try to resolve the Builder-owned module at compile
+  // time; `/* @vite-ignore */` keeps Vitest from statically analyzing it.
+  let mod: Record<string, unknown>;
   try {
-    const loader = Function("specifier", "return import(specifier)") as (
-      specifier: string,
-    ) => Promise<unknown>;
-    return (await loader(specifier)) as Record<string, unknown>;
-  } catch {
-    return null;
+    mod = (await import(
+      /* @vite-ignore */ TRANSPORT_MODULE_SPECIFIER
+    )) as Record<string, unknown>;
+  } catch (cause) {
+    throw new Error(
+      `missing ${TRANSPORT_OP_NAME}: failed to import ${TRANSPORT_MODULE_SPECIFIER} ` +
+        `(the paired Builder slice must export ${TRANSPORT_OP_NAME} from ` +
+        `server/src/services/source-transport-validation.ts)`,
+      { cause },
+    );
   }
-}
-
-function pickTransportOp(
-  mod: Record<string, unknown> | null,
-): TransportOnlyValidationOp | null {
-  if (!mod) return null;
-  for (const name of TRANSPORT_OP_NAMES) {
-    if (typeof mod[name] === "function") {
-      return mod[name] as TransportOnlyValidationOp;
-    }
+  const candidate = mod[TRANSPORT_OP_NAME];
+  if (typeof candidate !== "function") {
+    throw new Error(
+      `missing ${TRANSPORT_OP_NAME}: ${TRANSPORT_MODULE_SPECIFIER} resolved ` +
+        `but does not export a function named "${TRANSPORT_OP_NAME}" ` +
+        `(exports: ${Object.keys(mod).join(", ") || "<none>"})`,
+    );
   }
-  return null;
+  return candidate as TransportOnlyValidationOp;
 }
-
-let cachedTransportOp: TransportOnlyValidationOp | null | undefined;
-async function resolveTransportOnlyOp(): Promise<TransportOnlyValidationOp | null> {
-  if (cachedTransportOp !== undefined) return cachedTransportOp;
-  for (const specifier of TRANSPORT_MODULE_SPECIFIERS) {
-    const op = pickTransportOp(await tryDynamicImport(specifier));
-    if (op) {
-      cachedTransportOp = op;
-      return op;
-    }
-  }
-  cachedTransportOp = null;
-  return null;
-}
-
-const MISSING_OP =
-  "missing validateSourceTransportOnly: the paired Builder slice must export it " +
-  "from server/src/services/source-transport-validation.ts (see the paired Builder change)";
 
 async function requireTransportOnlyOp(): Promise<TransportOnlyValidationOp> {
-  const op = await resolveTransportOnlyOp();
   // NOTE: never `expect(op).toBeDefined()` here: toBeDefined passes for null,
   // which would let these contracts pass vacuously without an implementation.
-  if (op === null) throw new Error(MISSING_OP);
-  return op;
+  return resolveTransportOnlyOp();
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +336,127 @@ describe("contract: source-bound transport-only validation", () => {
       runtimeInvoked: false,
     });
   });
+
+  it("contract: never invokes effects callbacks on deny paths", async () => {
+    const op = await requireTransportOnlyOp();
+    const denyInputs: TransportOnlyValidationInput[] = [
+      { ...baseValidInput(), principalAgentId: WRONG_PRINCIPAL_AGENT_ID },
+      {
+        ...baseValidInput(),
+        dependenciesBlocked: { unresolvedBlockerIssueIds: [BLOCKER_ISSUE_ID] },
+      },
+      {
+        ...baseValidInput(),
+        isLowTrust: true,
+        requestedToolClass: "runtime.manage",
+      },
+      { ...baseValidInput(), workspaceTransport: "remote_managed" },
+    ];
+    for (const input of denyInputs) {
+      let calls = 0;
+      const counting = () => {
+        calls += 1;
+      };
+      const result = await op({
+        ...input,
+        effects: {
+          startRuntimeService: counting,
+          executeProduct: counting,
+          executeStaging: counting,
+        },
+      });
+      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+      expect(calls).toBe(0);
+    }
+  });
+
+  it("contract: denies empty identities as unauthorized_principal (fail-closed)", async () => {
+    const op = await requireTransportOnlyOp();
+    const emptyIdentityInputs: TransportOnlyValidationInput[] = [
+      {
+        ...baseValidInput(),
+        principalAgentId: undefined as unknown as string,
+        issueAssigneeAgentId: undefined as unknown as string,
+      },
+      { ...baseValidInput(), principalAgentId: "", issueAssigneeAgentId: "" },
+    ];
+    for (const input of emptyIdentityInputs) {
+      const result = await op(input);
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "unauthorized_principal",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    }
+  });
+
+  it("contract: denies empty transports as workspace_transport_mismatch (fail-closed)", async () => {
+    const op = await requireTransportOnlyOp();
+    const emptyTransportInputs: TransportOnlyValidationInput[] = [
+      {
+        ...baseValidInput(),
+        transport: undefined as unknown as string,
+        workspaceTransport: undefined as unknown as string,
+      },
+      { ...baseValidInput(), transport: "", workspaceTransport: "" },
+    ];
+    for (const input of emptyTransportInputs) {
+      const result = await op(input);
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "workspace_transport_mismatch",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    }
+  });
+
+  it("contract: denies malformed dependenciesBlocked as issue_dependencies_blocked (fail-closed)", async () => {
+    const op = await requireTransportOnlyOp();
+    const malformed = [
+      {},
+      { unresolvedBlockerIssueIds: "not-an-array" },
+      { unresolvedBlockerIssueIds: null },
+    ] as unknown as TransportOnlyValidationInput["dependenciesBlocked"][];
+    for (const dependenciesBlocked of malformed) {
+      const result = await op({ ...baseValidInput(), dependenciesBlocked });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "issue_dependencies_blocked",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    }
+  });
+
+  // CISO exact item 4 (strict reading): under low trust, `requestedToolClass`
+  // denies AFTER normalization (trim + lowercase) — including `null` and
+  // unknown-but-equivalent labels. This pins the strict superset of CISO
+  // condition 3 ("any non-empty class denies"); the condition-3/item-4 `null`
+  // ambiguity is raised for CISO resolution on the card and must not be
+  // silently weakened here.
+  it.each([null, "Runtime.Manage", "runtime.manage ", "shell.execute", "  Custom.Tool  "] as const)(
+    "contract: denies low-trust tool class %s after normalization",
+    async (requestedToolClass) => {
+      const op = await requireTransportOnlyOp();
+      const result = await op({
+        ...baseValidInput(),
+        isLowTrust: true,
+        requestedToolClass,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "low_trust_preflight_denied",
+        boundary: "transport-only",
+        runtimeInvoked: false,
+      });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
