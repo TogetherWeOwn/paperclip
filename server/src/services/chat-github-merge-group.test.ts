@@ -23,9 +23,11 @@ const HEAD_B = "b".repeat(40);
 const BASE_NEW = "c".repeat(40);
 const BASE_OLD = "d".repeat(40);
 const GROUP = "e".repeat(40);
-/** Real queue form: the ref suffix and the group commit's single parent are
- * the previous queue state (base or earlier group), never the PR head. */
-const PARENT = "6".repeat(40);
+/** Real queue form: the ref suffix and the group commit's first parent are
+ * the previous queue state (here the base tip for a fresh group), never the
+ * PR head. Comparisons are complete `git log BASE..HEAD` inventories: the
+ * reviewed branch commits appear alongside the queue merge commit(s). */
+const PARENT = BASE_NEW;
 const GROUP_REF = `refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`;
 
 function context(overrides: Partial<MergeGroupContext> = {}): MergeGroupContext {
@@ -99,6 +101,11 @@ function github(overrides: Partial<MergeGroupGitHub> = {}): MergeGroupGitHub {
     getCompare: async () => ({
       truncated: false,
       commits: [
+        {
+          sha: HEAD_A,
+          parents: [BASE_OLD],
+          message: "Add feature A",
+        },
         {
           sha: GROUP,
           parents: [PARENT, HEAD_A],
@@ -323,6 +330,11 @@ describe("decideMergeGroupCarry", () => {
       truncated: false,
       commits: [
         {
+          sha: second,
+          parents: [BASE_OLD],
+          message: "Add feature A",
+        },
+        {
           sha: GROUP,
           parents: [PARENT, second],
           message: "Merge pull request #12 from alice/feature",
@@ -520,7 +532,9 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
+          { sha: HEAD_A, parents: [BASE_OLD], message: "Work on A" },
           { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: HEAD_B, parents: [BASE_OLD], message: "Work on B" },
           { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
@@ -584,7 +598,9 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
+          { sha: HEAD_A, parents: [BASE_OLD], message: "Work on A" },
           { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: HEAD_B, parents: [BASE_OLD], message: "Work on B" },
           { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
@@ -641,7 +657,9 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
+          { sha: HEAD_A, parents: [BASE_OLD], message: "Work on A" },
           { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: HEAD_B, parents: [BASE_OLD], message: "Work on B" },
           { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
@@ -839,6 +857,11 @@ describe("real queue group tree shape", () => {
         getCompare: async () => ({
           truncated: false,
           commits: [
+            {
+              sha: sha("e"),
+              parents: [sha("f")],
+              message: "Queue proof change",
+            },
             {
               sha: sha("d"),
               parents: [sha("b"), sha("e")],

@@ -17,7 +17,9 @@ const APP_ID = "5191093";
 const REPO = "example-org/example-repo";
 const GROUP = "e".repeat(40);
 const HEAD_A = "a".repeat(40);
-const PARENT = "6".repeat(40);
+const BASE_C = "c".repeat(40);
+/** Previous queue state: the base tip for a fresh group. */
+const PARENT = BASE_C;
 
 function context(): MergeGroupContext {
   return {
@@ -288,6 +290,11 @@ describe("planMergeGroupCheckPublication", () => {
         getCompare: async () => ({
           truncated: false,
           commits: [
+            {
+              sha: HEAD_A,
+              parents: ["d".repeat(40)],
+              message: "Add feature A",
+            },
             {
               sha: GROUP,
               parents: [PARENT, HEAD_A],

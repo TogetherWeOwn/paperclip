@@ -44,7 +44,8 @@ const HEAD = "a".repeat(40);
 const BASE_NEW = "c".repeat(40);
 const BASE_OLD = "d".repeat(40);
 const GROUP = "e".repeat(40);
-const PARENT = "6".repeat(40);
+/** Previous queue state: the base tip for a fresh group. */
+const PARENT = BASE_NEW;
 const GROUP_REF = `refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`;
 const FILE = "f".repeat(40);
 const FILE_V2 = "9".repeat(40);
@@ -68,7 +69,11 @@ function fakeGitHub(endpointId: string) {
     nextRunId: 100,
     refSha: GROUP,
     listing: "ok" as "ok" | "malformed" | "truncated" | "missing_total" | "error",
-    post: "ok" as "ok" | "error" | "lose_response",
+    listingLag: false,
+    post: "ok" as "ok" | "error" | "lose_response" | "accept_then_502_once" | "empty_receipt",
+    // Fires inside the final group-check listing so a test can revoke
+    // configuration mid-listing (R1). Awaited before the listing responds.
+    onGroupListing: undefined as (() => void | Promise<void>) | undefined,
   };
   const entries = (a: string) => ({
     sha: "x",
@@ -105,8 +110,13 @@ function fakeGitHub(endpointId: string) {
       });
     if (path === `/compare/${BASE_NEW}...${GROUP}`)
       return json({
-        total_commits: 1,
+        total_commits: 2,
         commits: [
+          {
+            sha: HEAD,
+            parents: [{ sha: BASE_OLD }],
+            commit: { message: "Add the reviewed feature" },
+          },
           {
             sha: GROUP,
             parents: [{ sha: PARENT }, { sha: HEAD }],
@@ -137,15 +147,23 @@ function fakeGitHub(endpointId: string) {
         ],
       });
     if (path.startsWith(`/commits/${GROUP}/check-runs`)) {
+      if (state.onGroupListing) {
+        const hook = state.onGroupListing;
+        state.onGroupListing = undefined;
+        await hook();
+      }
       if (state.listing === "error") return json({ message: "boom" }, 502);
       if (state.listing === "malformed") return json({ check_runs: "nope", total_count: 0 });
       if (state.listing === "missing_total") return json({ check_runs: state.runs });
       if (state.listing === "truncated")
         return json({ total_count: state.runs.length + 40, check_runs: state.runs });
+      if (state.listingLag) return json({ total_count: 0, check_runs: [] });
       return json({ total_count: state.runs.length, check_runs: state.runs });
     }
     if (method === "POST" && path === "/check-runs") {
-      if (state.post === "error") return json({ message: "boom" }, 500);
+      // A definitive rejection: the provider refused before applying, so no
+      // write is in flight and a retry may POST fresh.
+      if (state.post === "error") return json({ message: "boom" }, 422);
       const body = JSON.parse(String(init?.body));
       const run: RunRecord = {
         id: state.nextRunId++,
@@ -157,14 +175,24 @@ function fakeGitHub(endpointId: string) {
       };
       state.runs.push(run);
       if (state.post === "lose_response") throw new TypeError("socket hang up");
-      return json({ id: run.id });
+      if (state.post === "accept_then_502_once") {
+        // Ambiguous upstream failure: the write landed, the response is a
+        // gateway error, and the next listing lags behind.
+        state.post = "ok";
+        state.listingLag = true;
+        return json({ message: "Bad Gateway" }, 502);
+      }
+      // An empty success body proves nothing was created (R4).
+      if (state.post === "empty_receipt") return json({});
+      // A positive receipt names the created check (R4).
+      return json(run);
     }
     const patch = /^\/check-runs\/(\d+)$/.exec(path);
     if (method === "PATCH" && patch) {
       const run = state.runs.find((r) => r.id === Number(patch[1]));
       if (!run) return json({}, 404);
       run.conclusion = JSON.parse(String(init?.body)).conclusion;
-      return json({ id: run.id });
+      return json(run);
     }
     return json({ message: `unexpected ${method} ${path}` }, 404);
   }) as typeof fetch;
@@ -518,5 +546,173 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
       status: "cancelled",
       result: { code: "carry_disabled" },
     });
+  });
+
+  it("does not POST success when the flag is revoked during the final listing (R1)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.onGroupListing = async () => {
+      await db
+        .update(chatGitHubConfigurations)
+        .set({ configuration: { mergeGroupCarryEnabled: false } as never })
+        .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+    };
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    await service.processPending();
+    expect(github.posts()).toBe(0);
+    expect((await action(queued.id)).status).not.toBe("processed");
+  });
+
+  it("keeps one POST across an accepted write, a 502, and a lagging empty listing (R3)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.post = "accept_then_502_once";
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    await service.processPending();
+    // The first POST landed (one run exists) but answered 502: ambiguous, so
+    // the intent is kept and the action stays retryable.
+    expect(github.state.runs).toHaveLength(1);
+    expect(await action(queued.id)).toMatchObject({
+      status: "failed",
+      result: expect.objectContaining({ retryable: true }),
+    });
+    // The lagging empty listing cannot prove absence: no second POST.
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(github.posts()).toBe(1);
+    expect(github.state.runs).toHaveLength(1);
+    // Once the listing catches up, the run is adopted in place and settles.
+    github.state.listingLag = false;
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(1);
+    expect(await action(queued.id)).toMatchObject({ status: "processed" });
+    expect(await carryRun()).toMatchObject({ status: "processed", verdictOk: true });
+  });
+
+  it("never settles processed on an empty success receipt (R4)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.post = "empty_receipt";
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    await service.processPending();
+    // HTTP 200 `{}` is ambiguity, not success: no processed settlement, the
+    // intent is kept for reconciliation.
+    expect(await action(queued.id)).toMatchObject({
+      status: "failed",
+      result: expect.objectContaining({ retryable: true }),
+    });
+    expect((await carryRun())?.status).not.toBe("processed");
+    // The recorded write reconciles through the listing on retry.
+    github.state.post = "ok";
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(await action(queued.id)).toMatchObject({ status: "processed" });
+    expect(await carryRun()).toMatchObject({ status: "processed", checkId: "100" });
+  });
+
+  it("recovers reconcile-only after attempt eight instead of stranding ambiguous work (R5)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.post = "lose_response";
+    github.state.listingLag = true;
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    const retryableNow = async () => {
+      const current = await action(queued.id);
+      await db
+        .update(chatActions)
+        .set({
+          result: {
+            ...(current.result as Record<string, unknown>),
+            retryAt: new Date(0).toISOString(),
+          },
+        })
+        .where(eq(chatActions.id, queued.id));
+    };
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await service.processPending();
+      await retryableNow();
+    }
+    // Eight ambiguous attempts: exactly one POST ever, the action stays
+    // retryable in reconcile-only recovery, and the row keeps its intent.
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(0);
+    const exhausted = await action(queued.id);
+    expect(exhausted.status).toBe("failed");
+    expect(exhausted.result).toMatchObject({ retryable: true, reconcileOnly: true });
+    const stranded = await carryRun();
+    expect(stranded).toMatchObject({ status: "processing" });
+    expect(stranded?.publicationAttempt).not.toBeNull();
+    // The listing catches up: the original write is adopted, never re-posted.
+    github.state.listingLag = false;
+    await service.processPending();
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(1);
+    expect(await action(queued.id)).toMatchObject({ status: "processed" });
+    expect(await carryRun()).toMatchObject({ status: "processed", verdictOk: true });
+  });
+
+  it("retires reconcile-only work through explicit supersession (R5)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.post = "lose_response";
+    github.state.listingLag = true;
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    await service.processPending();
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(github.posts()).toBe(1);
+    // The queue regenerated while the listing stayed empty: the work is
+    // terminally superseded, with an explicit code on both rows.
+    github.state.refSha = "1".repeat(40);
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(github.posts()).toBe(1);
+    expect(await action(queued.id)).toMatchObject({
+      status: "cancelled",
+      result: { code: "carry_superseded" },
+    });
+    expect(await carryRun()).toMatchObject({
+      status: "failed",
+      code: "carry_superseded",
+    });
+  });
+
+  it("re-judges a redelivery after the review completes instead of replaying weak_review (R2)", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    // The exact head carries an incomplete 4/5 review: fail-closed publication.
+    await db
+      .update(chatGitHubReviews)
+      .set({
+        assessment: { complete: true, score: 4 } as never,
+        conclusion: "action_required",
+      })
+      .where(eq(chatGitHubReviews.endpointId, ids.endpointId));
+    const first = await enqueue(service);
+    await service.processPending();
+    expect(github.state.runs[0]).toMatchObject({ conclusion: "action_required" });
+    expect(await action(first.id)).toMatchObject({ status: "processed" });
+    expect(await carryRun()).toMatchObject({ verdictOk: false, code: "weak_review" });
+    // The same head completes 5/5; a new delivery for the same group must
+    // recompute and publish success, not replay the stale weak verdict.
+    await db
+      .update(chatGitHubReviews)
+      .set({
+        assessment: { complete: true, score: 5 } as never,
+        conclusion: "success",
+      })
+      .where(eq(chatGitHubReviews.endpointId, ids.endpointId));
+    const callsBefore = github.state.calls.length;
+    const second = await enqueue(service);
+    await service.processPending();
+    const redelivery = await action(second.id);
+    expect(redelivery.result).not.toMatchObject({ replayed: true });
+    expect(github.state.calls.length).toBeGreaterThan(callsBefore);
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(1);
+    expect(github.state.runs[0]).toMatchObject({ conclusion: "success" });
+    expect(await carryRun()).toMatchObject({ verdictOk: true, code: "carry" });
   });
 });

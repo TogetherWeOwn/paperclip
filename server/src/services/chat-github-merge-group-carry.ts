@@ -65,6 +65,19 @@ export type MergeGroupGitHubRequest = <T>(
   options?: { method?: string; body?: unknown },
 ) => Promise<T>;
 
+/** Strict provider identity: a digit string or a safe-integer number. Arrays,
+ * objects, floats, and other shapes must never coerce into an App identity —
+ * `String(...)` would turn `['5191093']` into `'5191093'`. Null when the raw
+ * value is not a plain App ID. */
+function strictAppId(raw: unknown): string | null {
+  if (typeof raw === "number") {
+    if (!Number.isSafeInteger(raw) || raw < 0) return null;
+    return String(raw);
+  }
+  if (typeof raw === "string" && /^[0-9]+$/.test(raw)) return raw;
+  return null;
+}
+
 /** Map raw GitHub REST payloads onto the pure decision interface. Every
  * failure or malformed payload becomes null so the decision fails closed. */
 export function createMergeGroupGitHubReader(
@@ -147,10 +160,14 @@ export function createMergeGroupGitHubReader(
       // Exact totals only: a missing or malformed total cannot prove the page
       // is complete, so it is rejected rather than defaulted. A short page is
       // truncated evidence (rejected downstream); a long page is malformed.
+      // Repeated commit identities can satisfy the total while hiding unseen
+      // commits, so uniqueness is required as well.
       const total = compare.total_commits;
       if (typeof total !== "number" || !Number.isInteger(total) || total < 0)
         return null;
       if (total < commits.length) return null;
+      const identities = new Set(commits.map((commit) => commit.sha.toLowerCase()));
+      if (identities.size !== commits.length) return null;
       return { truncated: total > commits.length, commits };
     },
     async getMergeBase(baseSha, headSha) {
@@ -224,6 +241,17 @@ export function createMergeGroupGitHubReader(
         return null;
       const entries: { path: string; mode: string; type: string; sha: string | null }[] = [];
       const seenPaths = new Set<string>();
+      // Valid Git path structure: no NUL byte, no leading slash, no empty
+      // segments, and no `.`/`..` segments. Only structure is enforced here —
+      // legitimate whitespace and executable/symlink/gitlink modes still pass.
+      const isValidGitPath = (path: string): boolean => {
+        if (path.includes("\0") || path.startsWith("/")) return false;
+        const segments = path.split("/");
+        return segments.every(
+          (segment) =>
+            segment.length > 0 && segment !== "." && segment !== "..",
+        );
+      };
       for (const entry of tree.tree) {
         if (!entry || typeof entry !== "object") return null;
         const node = entry as {
@@ -235,6 +263,7 @@ export function createMergeGroupGitHubReader(
         if (
           typeof node.path !== "string" ||
           node.path.length === 0 ||
+          !isValidGitPath(node.path) ||
           seenPaths.has(node.path) ||
           typeof node.mode !== "string" ||
           typeof node.type !== "string" ||
@@ -294,16 +323,18 @@ export function createMergeGroupGitHubReader(
           external_id?: unknown;
           app?: { id?: unknown };
         };
+        const appId = strictAppId(run.app?.id);
         if (
           typeof run.status !== "string" ||
           typeof run.external_id !== "string" ||
+          appId === null ||
           (run.conclusion !== null &&
             run.conclusion !== undefined &&
             typeof run.conclusion !== "string")
         )
           return null;
         checks.push({
-          appId: String(run.app?.id ?? ""),
+          appId,
           externalId: run.external_id,
           status: run.status,
           conclusion:
@@ -361,19 +392,24 @@ export async function readMergeGroupCheckRuns(
       external_id?: unknown;
       app?: { id?: unknown };
     } | null;
+    // Check IDs are positive safe integers: -1, 0, and 2^53 are malformed
+    // evidence, never run identities.
+    const appId = strictAppId(run?.app?.id);
     if (
       !run ||
       typeof run.id !== "number" ||
-      !Number.isInteger(run.id) ||
+      !Number.isSafeInteger(run.id) ||
+      run.id <= 0 ||
       typeof run.status !== "string" ||
-      typeof run.external_id !== "string"
+      typeof run.external_id !== "string" ||
+      appId === null
     )
       throw unavailable();
     return {
       id: run.id,
       status: run.status,
       externalId: run.external_id,
-      appId: String(run.app?.id ?? ""),
+      appId,
     };
   });
 }
@@ -492,18 +528,25 @@ export function checkMergeGroupBoundary(args: {
   return "match";
 }
 
-/** A provider rejection is definitive only when an HTTP status was received
- * (the provider answered, so no write was applied). Transport failures,
- * timeouts, and lost responses are ambiguous — the write may have landed —
- * and must reconcile, never blindly retry a POST. Defaults to ambiguous. */
+/** HTTP statuses that document a rejected-before-application outcome for a
+ * check-run write: the request was refused (bad request, auth, forbidden,
+ * unknown target, unprocessable), so no write applied. Every other signal —
+ * 5xx (including a gateway error after an upstream commit), 429, an unknown
+ * status, a transport failure, a timeout, or a lost response — is ambiguous:
+ * the write may have landed and must reconcile, never blindly retry a POST.
+ * Defaults to ambiguous. */
+const DEFINITIVE_NON_APPLICATION_STATUS = new Set([400, 401, 403, 404, 422]);
+
+/** A provider rejection is definitive only when the provider answered with a
+ * documented non-application status. Anything else keeps the write intent
+ * and reconciles. Defaults to ambiguous. */
 export function isDefinitiveProviderRejection(error: unknown): boolean {
   const details = (error as { details?: unknown } | null)?.details;
-  return (
-    !!details &&
-    typeof details === "object" &&
-    typeof (details as { providerStatus?: unknown }).providerStatus ===
-      "number"
-  );
+  const status =
+    details && typeof details === "object"
+      ? (details as { providerStatus?: unknown }).providerStatus
+      : undefined;
+  return typeof status === "number" && DEFINITIVE_NON_APPLICATION_STATUS.has(status);
 }
 
 export type MergeGroupCheckPublication = {
@@ -552,6 +595,53 @@ export function planMergeGroupCheckPublication(args: {
   );
   if (match) return { method: "PATCH", path: `/check-runs/${match.id}`, body };
   return { method: "POST", path: "/check-runs", body };
+}
+
+/** Positive provider receipt for a check-run write. A 200 with an empty or
+ * partial body (`{}`) proves nothing was created: it stays ambiguous,
+ * reconciles through the listing, and never settles `processed`. Only a
+ * receipt naming this exact check (positive ID), this group head, this
+ * idempotency key, the review App, and a completed conclusion matching the
+ * planned verdict counts as success. Null = ambiguous, never success. */
+export function parseMergeGroupCheckReceipt(args: {
+  response: unknown;
+  ctx: MergeGroupContext;
+  endpointId: string;
+  appId: string;
+  expectedConclusion: "success" | "action_required";
+}): { checkId: string } | null {
+  const receipt = args.response as {
+    id?: unknown;
+    head_sha?: unknown;
+    external_id?: unknown;
+    app?: { id?: unknown };
+    status?: unknown;
+    conclusion?: unknown;
+  } | null;
+  if (!receipt || typeof receipt !== "object") return null;
+  const checkId =
+    typeof receipt.id === "number" &&
+    Number.isSafeInteger(receipt.id) &&
+    receipt.id > 0
+      ? String(receipt.id)
+      : typeof receipt.id === "string" && /^[1-9][0-9]*$/.test(receipt.id)
+        ? receipt.id
+        : null;
+  if (checkId === null) return null;
+  if (
+    typeof receipt.head_sha !== "string" ||
+    receipt.head_sha.toLowerCase() !== args.ctx.groupSha.toLowerCase()
+  )
+    return null;
+  if (
+    receipt.external_id !==
+    mergeGroupCarryExternalId(args.endpointId, args.ctx.groupSha)
+  )
+    return null;
+  if (strictAppId(receipt.app?.id) !== args.appId) return null;
+  if (receipt.status !== "completed") return null;
+  if (receipt.conclusion !== args.expectedConclusion) return null;
+  return { checkId };
 }
 
 function toReviewRecord(row: {
@@ -617,6 +707,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
     code: string,
     attempts: number,
     retryable: boolean,
+    extraResult?: Record<string, unknown>,
   ) {
     await db
       .update(chatActions)
@@ -633,6 +724,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
               }
             : {}),
           code,
+          ...extraResult,
         },
         updatedAt: new Date(),
       })
@@ -693,6 +785,35 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
     } catch (error) {
       if (error instanceof GitHubPublicationLeaseLost) return;
       const attempts = prior + 1;
+      // Ambiguous in-flight work never strands: when the row still holds an
+      // unconfirmed write intent, this action becomes its reconcile-only
+      // recoverer instead of cancelling at attempt eight. Recovery retries
+      // reconciliation until the write is adopted, superseded, or expired —
+      // never a second POST on an empty listing.
+      let row: { publicationAttempt: unknown } | undefined;
+      try {
+        [row] = await db
+          .select({
+            publicationAttempt: chatGithubCarryRuns.publicationAttempt,
+          })
+          .from(chatGithubCarryRuns)
+          .where(
+            and(
+              eq(chatGithubCarryRuns.endpointId, action.endpointId),
+              eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
+              eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
+            ),
+          )
+          .limit(1);
+      } catch {
+        row = undefined;
+      }
+      if (row?.publicationAttempt) {
+        await failAction(id, "carry_publication_failed", attempts, true, {
+          reconcileOnly: true,
+        }).catch(() => {});
+        return;
+      }
       const retryable = attempts < 8;
       await failAction(id, "carry_publication_failed", attempts, retryable).catch(
         () => {},
@@ -737,6 +858,104 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           .set({ status, result, updatedAt: new Date() })
           .where(eq(chatActions.id, id));
       });
+    const nextAttempts = () =>
+      Number((action.result as { attempts?: unknown } | null)?.attempts ?? 0) + 1;
+    const isReconcileOnly = () =>
+      (action.result as { reconcileOnly?: unknown } | null)?.reconcileOnly ===
+      true;
+
+    /** Bounded terminal settlement for reconcile-only recovery. Ambiguous
+     * work retires only through an explicit bound: the delivery window
+     * expired (the group is superseded by definition), or the live queue ref
+     * moved past this group (another group owns the queue now). Anything
+     * else keeps reconciling. True when settled terminally. */
+    const settleReconcileTerminal = async (): Promise<boolean> => {
+      const finish = async (code: "carry_expired" | "carry_superseded") => {
+        const rowId = carryRowId;
+        if (rowId) {
+          await lease
+            .commit(async (tx) => {
+              await tx
+                .update(chatGithubCarryRuns)
+                .set({
+                  status: "failed",
+                  code,
+                  publicationAttempt: null,
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatGithubCarryRuns.id, rowId));
+            })
+            .catch(() => {});
+        }
+        await settle("cancelled", { code });
+      };
+      const ageMs = Date.now() - new Date(action.createdAt).getTime();
+      if (ageMs > MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS) {
+        await finish("carry_expired");
+        return true;
+      }
+      let liveRef: string | null = null;
+      try {
+        liveRef = await createMergeGroupGitHubReader(request).getRefSha(
+          ctx.groupRef,
+        );
+      } catch {
+        liveRef = null;
+      }
+      if (
+        liveRef &&
+        liveRef.toLowerCase() !== ctx.groupSha.toLowerCase()
+      ) {
+        await finish("carry_superseded");
+        return true;
+      }
+      return false;
+    };
+
+    /** Terminal abort that never strands ambiguous work. When the owned row
+     * still holds an unconfirmed write intent, this action becomes its
+     * reconcile-only recoverer (bounded by supersession/expiry) instead of
+     * cancelling. Otherwise the row is failed explicitly with the code — a
+     * terminal, inspectable state a new delivery can take over — and the
+     * action cancels. */
+    const abortUnresolved = async (code: string): Promise<void> => {
+      const rowId = carryRowId;
+      if (rowId) {
+        let row: { publicationAttempt: unknown } | undefined;
+        try {
+          [row] = await db
+            .select({
+              publicationAttempt: chatGithubCarryRuns.publicationAttempt,
+            })
+            .from(chatGithubCarryRuns)
+            .where(eq(chatGithubCarryRuns.id, rowId))
+            .limit(1);
+        } catch {
+          row = undefined;
+        }
+        if (row?.publicationAttempt) {
+          if (await settleReconcileTerminal()) return;
+          await failAction(id, code, nextAttempts(), true, {
+            reconcileOnly: true,
+          });
+          return;
+        }
+        await lease
+          .commit(async (tx) => {
+            await tx
+              .update(chatGithubCarryRuns)
+              .set({ status: "failed", code, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(chatGithubCarryRuns.id, rowId),
+                  ne(chatGithubCarryRuns.status, "processed"),
+                ),
+              );
+          })
+          .catch(() => {});
+      }
+      await settle("cancelled", { code });
+    };
 
     const [source] = await db
       .select({
@@ -829,24 +1048,42 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           ),
         )
         .limit(1);
-      if (
-        existing?.status === "processed" &&
-        mergeGroupProofReplayMatches({
+      if (existing?.status === "processed") {
+        // Replay compares the stored proof (heads plus review outcomes)
+        // against current local review evidence. Only a stored successful
+        // carry replays; mutable or negative outcomes — a 4/5 that has since
+        // completed 5/5, a rescored or reconcluded review — are re-judged so
+        // the fresh verdict is published, never the stale one.
+        const storedReviewRows = await db
+          .select()
+          .from(chatGitHubReviews)
+          .where(
+            and(
+              eq(chatGitHubReviews.endpointId, action.endpointId),
+              eq(chatGitHubReviews.repositoryId, ctx.repositoryId),
+            ),
+          )
+          .orderBy(desc(chatGitHubReviews.createdAt))
+          .limit(500);
+        const replayed = mergeGroupProofReplayMatches({
           stored: existing.proofFingerprint,
           endpointId: action.endpointId,
           appId,
           ctx,
           configurationRevision: source.revision,
           runtimeGeneration: sourceGeneration,
-        })
-      ) {
-        // Same proof, already published: no new provider write.
-        await settle("processed", {
-          code: existing.code,
-          carryRunId: existing.id,
-          replayed: true,
+          verdictOk: existing.verdictOk === true,
+          currentReviews: storedReviewRows.map(toReviewRecord),
         });
-        return;
+        if (replayed) {
+          // Same proof, already published: no new provider write.
+          await settle("processed", {
+            code: existing.code,
+            carryRunId: existing.id,
+            replayed: true,
+          });
+          return;
+        }
       }
       // A processing/failed/cancelled row is a prior owner that never
       // finished (the lease proves it is gone); a processed row whose proof no
@@ -884,7 +1121,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
     // Evidence is read fresh, uncached, immediately before the single write.
     let evaluation = await evaluateCarry(request, action, ctx, appId);
     if (!evaluation) {
-      await settle("cancelled", { code: "carry_disabled" });
+      await abortUnresolved("carry_disabled");
       return;
     }
     // The write boundary: re-read every mutable identity uncached and compare
@@ -910,17 +1147,17 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       : "connection";
     let proofGeneration = observation?.generation ?? sourceGeneration;
     if (boundaryCheck === "disabled") {
-      await settle("cancelled", { code: "carry_disabled" });
+      await abortUnresolved("carry_disabled");
       return;
     }
     if (boundaryCheck === "connection" || !observation) {
-      await settle("cancelled", { code: "connection_changed" });
+      await abortUnresolved("connection_changed");
       return;
     }
     if (boundaryCheck === "drift") {
       const second = await evaluateCarry(request, action, ctx, appId);
       if (!second) {
-        await settle("cancelled", { code: "carry_disabled" });
+        await abortUnresolved("carry_disabled");
         return;
       }
       const recheck = await readMergeGroupBoundaryObservation(
@@ -939,11 +1176,11 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           })
         : "connection";
       if (recheckResult === "disabled") {
-        await settle("cancelled", { code: "carry_disabled" });
+        await abortUnresolved("carry_disabled");
         return;
       }
       if (recheckResult === "connection") {
-        await settle("cancelled", { code: "connection_changed" });
+        await abortUnresolved("connection_changed");
         return;
       }
       if (recheckResult === "drift") {
@@ -954,16 +1191,12 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           evaluation = second;
           proofGeneration = recheck?.generation ?? proofGeneration;
         } else {
-          const attempts =
-            Number(
-              (action.result as { attempts?: unknown } | null)?.attempts ?? 0,
-            ) + 1;
-          await failAction(
-            id,
-            "carry_evidence_unstable",
-            attempts,
-            attempts < 8,
-          );
+          const attempts = nextAttempts();
+          if (attempts >= 8) {
+            await abortUnresolved("carry_evidence_unstable");
+            return;
+          }
+          await failAction(id, "carry_evidence_unstable", attempts, true);
           return;
         }
       } else {
@@ -989,6 +1222,49 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
     // malformed or truncated listing throws here and nothing is ever written.
     const existingChecks = await readMergeGroupCheckRuns(request, ctx.groupSha);
 
+    // Final publication authorization: revalidate every mutable identity
+    // uncached AFTER the last inventory read, at the intent-commit/POST
+    // authorization point. A revocation that landed during the listing — a
+    // disabled flag, a new policy revision, a rotated endpoint epoch or
+    // credential generation, a changed review App, a disabled repository, a
+    // moved queue ref, or a moved PR head — cancels or defers here. No stale
+    // evidence authorizes the write. (The residual remote race — a GitHub
+    // change between this read and the POST — is documented, not eliminated.)
+    {
+      const authorization = await readMergeGroupBoundaryObservation(
+        db,
+        request,
+        action,
+        ctx,
+        evaluation.pullNumbers,
+      );
+      const authorizationCheck: MergeGroupBoundaryCheck = authorization
+        ? checkMergeGroupBoundary({
+            observation: authorization,
+            sourceGeneration,
+            sourceAppId: appId,
+            evaluation,
+          })
+        : "connection";
+      if (authorizationCheck === "disabled") {
+        await abortUnresolved("carry_disabled");
+        return;
+      }
+      if (authorizationCheck === "connection" || !authorization) {
+        await abortUnresolved("connection_changed");
+        return;
+      }
+      if (authorizationCheck === "drift") {
+        const attempts = nextAttempts();
+        if (attempts >= 8) {
+          await abortUnresolved("carry_evidence_unstable");
+          return;
+        }
+        await failAction(id, "carry_evidence_unstable", attempts, true);
+        return;
+      }
+    }
+
     const origin = runtimePublicOrigin();
     const detailsUrl = origin
       ? `${origin}/${encodeURIComponent(source.companyPrefix)}/apps/chat/${action.endpointId}/reviews`
@@ -1001,14 +1277,22 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       existingChecks,
       detailsUrl,
     });
-    if (plan.method === "POST" && pendingAttempt) {
-      // An earlier attempt may have landed without a confirmed receipt, and a
-      // possibly stale empty listing cannot prove otherwise. Reconcile only:
-      // stay non-successful and retryable, never a second POST.
-      const attempts =
-        Number((action.result as { attempts?: unknown } | null)?.attempts ?? 0) +
-        1;
-      await failAction(id, "carry_ambiguous_write", attempts, attempts < 8);
+    if (plan.method === "POST" && (pendingAttempt || isReconcileOnly())) {
+      // An earlier attempt may have landed without a confirmed receipt (or
+      // this action is in reconcile-only recovery), and a possibly stale
+      // empty listing cannot prove otherwise. Reconcile only: never a second
+      // POST. Explicit terminal bounds (supersession/expiry) retire the work;
+      // at the attempt bound with live intent, enter (or stay in)
+      // reconcile-only recovery instead of stranding it.
+      if (await settleReconcileTerminal()) return;
+      const attempts = nextAttempts();
+      if (attempts >= 8 || isReconcileOnly()) {
+        await failAction(id, "carry_ambiguous_write", attempts, true, {
+          reconcileOnly: true,
+        });
+        return;
+      }
+      await failAction(id, "carry_ambiguous_write", attempts, true);
       return;
     }
     // Record the write intent durably before the provider call so a crash or
@@ -1027,17 +1311,18 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           .where(eq(chatGithubCarryRuns.id, carryRowId));
       });
     }
-    let posted: { id?: unknown } | undefined;
+    let posted: unknown;
     try {
-      posted = await request<{ id?: unknown }>(plan.path, {
+      posted = await request<unknown>(plan.path, {
         method: plan.method,
         body: plan.body,
       });
     } catch (error) {
       if (carryRowId) {
-        // Definitive rejections (an HTTP status arrived) leave no ambiguity;
+        // Only a documented definitive non-application clears the intent;
         // anything else may have landed and must reconcile.
         const ambiguous = !isDefinitiveProviderRejection(error);
+        const rowId = carryRowId;
         await lease
           .commit(async (tx) => {
             await tx
@@ -1048,16 +1333,46 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
                   : null,
                 updatedAt: new Date(),
               })
-              .where(eq(chatGithubCarryRuns.id, carryRowId));
+              .where(eq(chatGithubCarryRuns.id, rowId));
           })
           .catch(() => {});
       }
       throw error;
     }
-    const checkId =
-      typeof posted?.id === "number" || typeof posted?.id === "string"
-        ? String(posted.id)
-        : null;
+    // A positive receipt is required before `processed`: an empty or partial
+    // success body stays ambiguous, keeps the intent, and reconciles — it
+    // never settles success.
+    const receipt = parseMergeGroupCheckReceipt({
+      response: posted,
+      ctx,
+      endpointId: action.endpointId,
+      appId,
+      expectedConclusion: plan.body.conclusion,
+    });
+    if (!receipt) {
+      if (carryRowId) {
+        const rowId = carryRowId;
+        await lease
+          .commit(async (tx) => {
+            await tx
+              .update(chatGithubCarryRuns)
+              .set({
+                publicationAttempt: { ...attempt, ambiguous: true },
+                updatedAt: new Date(),
+              })
+              .where(eq(chatGithubCarryRuns.id, rowId));
+          })
+          .catch(() => {});
+      }
+      const attempts = nextAttempts();
+      if (attempts >= 8) {
+        await abortUnresolved("carry_receipt_unverified");
+        return;
+      }
+      await failAction(id, "carry_receipt_unverified", attempts, true);
+      return;
+    }
+    const checkId = receipt.checkId;
 
     await lease.commit(async (tx) => {
       await tx
