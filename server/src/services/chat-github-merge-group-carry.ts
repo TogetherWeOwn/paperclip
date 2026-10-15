@@ -126,6 +126,7 @@ export function createMergeGroupGitHubReader(
         };
         if (
           typeof commit.sha !== "string" ||
+          !FULL_SHA.test(commit.sha) ||
           !Array.isArray(commit.parents) ||
           typeof commit.commit?.message !== "string"
         )
@@ -133,7 +134,8 @@ export function createMergeGroupGitHubReader(
         const parents: string[] = [];
         for (const parent of commit.parents) {
           const parentSha = (parent as { sha?: unknown } | null)?.sha;
-          if (typeof parentSha !== "string") return null;
+          if (typeof parentSha !== "string" || !FULL_SHA.test(parentSha))
+            return null;
           parents.push(parentSha.toLowerCase());
         }
         commits.push({
@@ -142,10 +144,13 @@ export function createMergeGroupGitHubReader(
           message: commit.commit.message,
         });
       }
-      const total =
-        typeof compare.total_commits === "number"
-          ? compare.total_commits
-          : commits.length;
+      // Exact totals only: a missing or malformed total cannot prove the page
+      // is complete, so it is rejected rather than defaulted. A short page is
+      // truncated evidence (rejected downstream); a long page is malformed.
+      const total = compare.total_commits;
+      if (typeof total !== "number" || !Number.isInteger(total) || total < 0)
+        return null;
+      if (total < commits.length) return null;
       return { truncated: total > commits.length, commits };
     },
     async getMergeBase(baseSha, headSha) {
@@ -206,9 +211,19 @@ export function createMergeGroupGitHubReader(
       }
       if (!raw || typeof raw !== "object") return null;
       const tree = raw as { sha?: unknown; truncated?: unknown; tree?: unknown };
-      if (typeof tree.sha !== "string" || !Array.isArray(tree.tree))
+      // Strict tree evidence: an explicit boolean truncation flag, exact
+      // object identities, supported type/mode pairs, and nonempty unique
+      // paths. Anything less is rejected — a malformed blob must never
+      // masquerade as a deletion in the absence comparison downstream.
+      if (
+        typeof tree.sha !== "string" ||
+        !FULL_SHA.test(tree.sha) ||
+        typeof tree.truncated !== "boolean" ||
+        !Array.isArray(tree.tree)
+      )
         return null;
       const entries: { path: string; mode: string; type: string; sha: string | null }[] = [];
+      const seenPaths = new Set<string>();
       for (const entry of tree.tree) {
         if (!entry || typeof entry !== "object") return null;
         const node = entry as {
@@ -217,17 +232,35 @@ export function createMergeGroupGitHubReader(
           type?: unknown;
           sha?: unknown;
         };
-        if (typeof node.path !== "string") return null;
+        if (
+          typeof node.path !== "string" ||
+          node.path.length === 0 ||
+          seenPaths.has(node.path) ||
+          typeof node.mode !== "string" ||
+          typeof node.type !== "string" ||
+          typeof node.sha !== "string" ||
+          !FULL_SHA.test(node.sha) ||
+          !(
+            (node.type === "blob" &&
+              (node.mode === "100644" ||
+                node.mode === "100755" ||
+                node.mode === "120000")) ||
+            (node.type === "tree" && node.mode === "040000") ||
+            (node.type === "commit" && node.mode === "160000")
+          )
+        )
+          return null;
+        seenPaths.add(node.path);
         entries.push({
           path: node.path,
-          mode: typeof node.mode === "string" ? node.mode : "",
-          type: typeof node.type === "string" ? node.type : "",
-          sha: typeof node.sha === "string" ? node.sha : null,
+          mode: node.mode,
+          type: node.type,
+          sha: node.sha,
         });
       }
       return {
         sha: tree.sha,
-        truncated: tree.truncated === true,
+        truncated: tree.truncated,
         entries,
       };
     },

@@ -357,3 +357,22 @@ describe("required repository isolation (F4)", () => {
     expect(f.state.action?.result?.replayed).not.toBe(true);
   });
 });
+
+describe("required ambiguous-write recovery (F5)", () => {
+  it("does not POST again after an ambiguous accepted write hidden by listing lag", async () => {
+    const f = fixture();
+    await f.enqueue();
+    f.state.postMode = "lose_response";
+    await f.service.processPending();
+    expect(f.state.action?.status).toBe("failed");
+    expect(f.state.runs).toHaveLength(1);
+    f.state.postMode = "ok";
+    f.state.listingLag = true;
+    f.state.action!.result.retryAt = new Date(0).toISOString();
+    await f.service.processPending();
+    // The first POST landed (one run exists) but its response was lost; the
+    // lagging empty listing cannot prove absence, so no second POST follows.
+    expect(f.state.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    expect(f.state.runs).toHaveLength(1);
+  });
+});

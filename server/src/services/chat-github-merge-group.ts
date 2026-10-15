@@ -371,7 +371,11 @@ export function prsFromCompareCommits(
 }
 
 function treeKey(entry: MergeGroupTreeEntry | undefined): string | null {
-  if (!entry || !entry.sha) return null;
+  if (!entry) return null;
+  // A present entry without an object identity is malformed evidence, not an
+  // absent path: it must never compare equal to a deletion. Validated trees
+  // always carry SHAs; this is defense in depth for direct callers.
+  if (!entry.sha) return `present:${entry.type}:${entry.mode}:missing-sha`;
   return `${entry.type}:${entry.mode}:${entry.sha.toLowerCase()}`;
 }
 
