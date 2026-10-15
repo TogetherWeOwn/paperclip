@@ -19,6 +19,8 @@ import type {
   GitHubReviewEventContext,
   GitHubReviewPolicy,
   GitHubTaskReview,
+  MergeGroupCarryProofFingerprint,
+  MergeGroupCarryPublicationAttempt,
 } from "@paperclipai/shared";
 import { chatEndpoints } from "./chat_channels.js";
 import { issues } from "./issues.js";
@@ -160,9 +162,12 @@ export const chatGitHubReviews = pgTable(
   ],
 );
 
-/** One verdict per merge-queue group key (endpoint + group SHA). The insert
+/** One verdict per merge-queue group key (endpoint + repository + group
+ * SHA). Git object IDs are not repository identities, so the repository is
+ * part of the durable key and every claim/read/update predicate. The insert
  * claim serializes concurrent deliveries; a processed row answers redelivery
- * without new provider writes, and any group change is a new key. */
+ * only when its stored proof fingerprint still matches, and any group change
+ * is a new key. */
 export const chatGithubCarryRuns = pgTable(
   "chat_github_carry_runs",
   {
@@ -188,6 +193,8 @@ export const chatGithubCarryRuns = pgTable(
     detail: text("detail"),
     checkId: text("check_id"),
     externalId: text("external_id").notNull(),
+    proofFingerprint: jsonb("proof_fingerprint").$type<MergeGroupCarryProofFingerprint>(),
+    publicationAttempt: jsonb("publication_attempt").$type<MergeGroupCarryPublicationAttempt>(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -202,6 +209,7 @@ export const chatGithubCarryRuns = pgTable(
     }).onDelete("cascade"),
     uniqueIndex("chat_github_carry_runs_group_uq").on(
       t.endpointId,
+      t.repositoryId,
       t.groupSha,
     ),
     index("chat_github_carry_runs_endpoint_idx").on(

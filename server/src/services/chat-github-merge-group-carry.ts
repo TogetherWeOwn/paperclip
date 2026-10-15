@@ -18,11 +18,17 @@ import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
 } from "./chat-github-publication-lease.js";
+import type {
+  MergeGroupCarryProofFingerprint,
+  MergeGroupCarryPublicationAttempt,
+} from "@paperclipai/shared";
 import {
   PAPERCLIP_REVIEW_CHECK_NAME,
+  buildMergeGroupProofFingerprint,
   decideMergeGroupCarry,
   mergeGroupCarryCheckBody,
   mergeGroupCarryExternalId,
+  mergeGroupProofReplayMatches,
   parseMergeGroupQueuedPrs,
   prsFromCompareCommits,
   type MergeGroupCarryInput,
@@ -339,6 +345,134 @@ export async function readMergeGroupCheckRuns(
   });
 }
 
+/** Mutable identities re-read uncached at the provider-write boundary. */
+export type MergeGroupBoundaryObservation = {
+  revision: number;
+  generation: number;
+  enabled: boolean;
+  admitted: boolean;
+  appId: string;
+  refSha: string | null;
+  heads: Map<number, string | null>;
+};
+
+export type MergeGroupBoundaryCheck =
+  | "match"
+  | "disabled"
+  | "connection"
+  | "drift";
+
+/** Re-read every mutable identity uncached at the write boundary: policy
+ * revision and enablement, endpoint/credential epoch, review-app identity,
+ * repository admission, the live queue-ref target, and every candidate pull
+ * head. No memoization — these reads must observe the provider and the
+ * configuration as they are now, not as evaluation saw them. Null when the
+ * source row itself is gone. */
+export async function readMergeGroupBoundaryObservation(
+  db: Db,
+  request: MergeGroupGitHubRequest,
+  action: Pick<typeof chatActions.$inferSelect, "companyId" | "endpointId">,
+  ctx: MergeGroupContext,
+  pullNumbers: number[],
+): Promise<MergeGroupBoundaryObservation | null> {
+  const [fresh] = await db
+    .select({
+      endpoint: chatEndpoints,
+      resource: chatEndpointResources,
+      configuration: chatGitHubConfigurations.configuration,
+      revision: chatGitHubConfigurations.revision,
+    })
+    .from(chatEndpoints)
+    .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
+    .innerJoin(
+      chatGitHubConfigurations,
+      eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
+    )
+    .innerJoin(
+      chatEndpointResources,
+      eq(chatEndpointResources.endpointId, chatEndpoints.id),
+    )
+    .where(
+      and(
+        eq(chatEndpoints.id, action.endpointId),
+        eq(chatEndpoints.companyId, action.companyId),
+        eq(chatEndpointResources.providerResourceId, ctx.repository),
+      ),
+    );
+  if (!fresh) return null;
+  const generation =
+    (fresh.endpoint.setup as { runtimeGeneration?: number } | null)
+      ?.runtimeGeneration ?? 0;
+  const reader = createMergeGroupGitHubReader(request);
+  const heads = new Map<number, string | null>();
+  for (const pullNumber of pullNumbers) {
+    const pull = await reader.getPull(pullNumber);
+    heads.set(pullNumber, pull ? pull.headSha : null);
+  }
+  return {
+    revision: fresh.revision,
+    generation,
+    enabled: mergeGroupCarryEnabled(fresh.configuration),
+    admitted:
+      ["active", "verifying"].includes(fresh.endpoint.status) &&
+      fresh.resource.enabled &&
+      fresh.resource.availability === "available" &&
+      String(fresh.resource.metadata?.providerRepositoryId) ===
+        ctx.repositoryId,
+    appId: fresh.endpoint.botExternalId ?? "",
+    refSha: await reader.getRefSha(ctx.groupRef),
+    heads,
+  };
+}
+
+/** True only when the boundary observation matches the evaluated evidence on
+ * every mutable identity. `disabled`/`connection` cancel without a provider
+ * write; `drift` re-judges once. Success is never published from stale
+ * evidence — only a matched boundary publishes it. */
+export function checkMergeGroupBoundary(args: {
+  observation: MergeGroupBoundaryObservation;
+  sourceGeneration: number;
+  sourceAppId: string;
+  evaluation: {
+    revision: number;
+    observedRefSha: string | null;
+    observedHeads: Array<{ pullNumber: number; headSha: string }>;
+  };
+}): MergeGroupBoundaryCheck {
+  const { observation: o, evaluation: e } = args;
+  if (!o.enabled) return "disabled";
+  if (
+    !o.admitted ||
+    o.generation !== args.sourceGeneration ||
+    o.appId !== args.sourceAppId
+  )
+    return "connection";
+  if (o.revision !== e.revision) return "drift";
+  const norm = (sha: string | null) => sha?.toLowerCase() ?? null;
+  if (norm(o.refSha) !== norm(e.observedRefSha)) return "drift";
+  const expected = new Map(
+    e.observedHeads.map((head) => [head.pullNumber, head.headSha.toLowerCase()]),
+  );
+  if (o.heads.size !== expected.size) return "drift";
+  for (const [pullNumber, headSha] of expected)
+    if (norm(o.heads.get(pullNumber) ?? null) !== headSha) return "drift";
+  return "match";
+}
+
+/** A provider rejection is definitive only when an HTTP status was received
+ * (the provider answered, so no write was applied). Transport failures,
+ * timeouts, and lost responses are ambiguous — the write may have landed —
+ * and must reconcile, never blindly retry a POST. Defaults to ambiguous. */
+export function isDefinitiveProviderRejection(error: unknown): boolean {
+  const details = (error as { details?: unknown } | null)?.details;
+  return (
+    !!details &&
+    typeof details === "object" &&
+    typeof (details as { providerStatus?: unknown }).providerStatus ===
+      "number"
+  );
+}
+
 export type MergeGroupCheckPublication = {
   method: "POST" | "PATCH";
   path: string;
@@ -537,6 +671,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           .where(
             and(
               eq(chatGithubCarryRuns.endpointId, action.endpointId),
+              eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
               eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
               ne(chatGithubCarryRuns.status, "processed"),
             ),
@@ -624,6 +759,10 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       action.endpointId,
       ctx.groupSha,
     );
+    const appId = source.endpoint.botExternalId ?? "";
+    const sourceGeneration =
+      (source.endpoint.setup as { runtimeGeneration?: number } | null)
+        ?.runtimeGeneration ?? 0;
     const [claimed] = await db
       .insert(chatGithubCarryRuns)
       .values({
@@ -641,6 +780,10 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       })
       .onConflictDoNothing()
       .returning({ id: chatGithubCarryRuns.id });
+    // A prior attempt's write intent survives takeover: an ambiguous write
+    // reconciles only and never authorizes a second POST.
+    let carryRowId: string | null = claimed?.id ?? null;
+    let pendingAttempt: MergeGroupCarryPublicationAttempt | null = null;
     if (!claimed) {
       const [existing] = await db
         .select()
@@ -648,15 +791,23 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
         .where(
           and(
             eq(chatGithubCarryRuns.endpointId, action.endpointId),
+            eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
             eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
           ),
         )
         .limit(1);
       if (
         existing?.status === "processed" &&
-        existing.configurationRevision === source.revision
+        mergeGroupProofReplayMatches({
+          stored: existing.proofFingerprint,
+          endpointId: action.endpointId,
+          appId,
+          ctx,
+          configurationRevision: source.revision,
+          runtimeGeneration: sourceGeneration,
+        })
       ) {
-        // Same group, same policy, already published: no new provider write.
+        // Same proof, already published: no new provider write.
         await settle("processed", {
           code: existing.code,
           carryRunId: existing.id,
@@ -664,10 +815,13 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
         });
         return;
       }
-      // processing/failed/cancelled rows are a prior owner that never
-      // finished (the lease proves it is gone); a processed row under an
-      // older policy revision is re-judged. Take it over.
-      if (existing)
+      // A processing/failed/cancelled row is a prior owner that never
+      // finished (the lease proves it is gone); a processed row whose proof no
+      // longer matches is re-judged. Take it over, preserving any unconfirmed
+      // write intent for reconciliation.
+      if (existing) {
+        carryRowId = existing.id;
+        pendingAttempt = existing.publicationAttempt ?? null;
         await lease.commit(async (tx) => {
           await tx
             .update(chatGithubCarryRuns)
@@ -678,6 +832,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
             })
             .where(eq(chatGithubCarryRuns.id, existing.id));
         });
+      }
     }
 
     const token = await githubBotRepositoryToken(
@@ -692,19 +847,114 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       path: string,
       options?: { method?: string; body?: unknown },
     ) => githubBotRequest<T>(lease.fetch, token, `${prefix}${path}`, options);
-    const appId = source.endpoint.botExternalId ?? "";
-
-    // Read the group head's existing runs first and strictly: an unavailable,
-    // malformed or truncated listing throws here and nothing is ever POSTed.
-    const existingChecks = await readMergeGroupCheckRuns(request, ctx.groupSha);
 
     // Evidence is read fresh, uncached, immediately before the single write.
-    const evaluation = await evaluateCarry(request, action, ctx, appId);
+    let evaluation = await evaluateCarry(request, action, ctx, appId);
     if (!evaluation) {
       await settle("cancelled", { code: "carry_disabled" });
       return;
     }
+    // The write boundary: re-read every mutable identity uncached and compare
+    // against the evaluated evidence. Success is published only on a matched
+    // boundary. Drift re-judges once; connection breaks cancel without a
+    // provider write. A last-minute read is not an atomic cross-system
+    // compare-and-write — the residual remote race is documented on the
+    // replay predicate — but no stale evidence ever authorizes success.
+    let observation = await readMergeGroupBoundaryObservation(
+      db,
+      request,
+      action,
+      ctx,
+      evaluation.pullNumbers,
+    );
+    let boundaryCheck: MergeGroupBoundaryCheck = observation
+      ? checkMergeGroupBoundary({
+          observation,
+          sourceGeneration,
+          sourceAppId: appId,
+          evaluation,
+        })
+      : "connection";
+    let proofGeneration = observation?.generation ?? sourceGeneration;
+    if (boundaryCheck === "disabled") {
+      await settle("cancelled", { code: "carry_disabled" });
+      return;
+    }
+    if (boundaryCheck === "connection" || !observation) {
+      await settle("cancelled", { code: "connection_changed" });
+      return;
+    }
+    if (boundaryCheck === "drift") {
+      const second = await evaluateCarry(request, action, ctx, appId);
+      if (!second) {
+        await settle("cancelled", { code: "carry_disabled" });
+        return;
+      }
+      const recheck = await readMergeGroupBoundaryObservation(
+        db,
+        request,
+        action,
+        ctx,
+        second.pullNumbers,
+      );
+      const recheckResult: MergeGroupBoundaryCheck = recheck
+        ? checkMergeGroupBoundary({
+            observation: recheck,
+            sourceGeneration,
+            sourceAppId: appId,
+            evaluation: second,
+          })
+        : "connection";
+      if (recheckResult === "disabled") {
+        await settle("cancelled", { code: "carry_disabled" });
+        return;
+      }
+      if (recheckResult === "connection") {
+        await settle("cancelled", { code: "connection_changed" });
+        return;
+      }
+      if (recheckResult === "drift") {
+        // Fail-closed verdicts are always safe to publish; an ok verdict on
+        // still-drifting evidence is not. Stay non-successful and retryable
+        // without any provider write rather than publish from drift.
+        if (!second.verdict.ok) {
+          evaluation = second;
+          proofGeneration = recheck?.generation ?? proofGeneration;
+        } else {
+          const attempts =
+            Number(
+              (action.result as { attempts?: unknown } | null)?.attempts ?? 0,
+            ) + 1;
+          await failAction(
+            id,
+            "carry_evidence_unstable",
+            attempts,
+            attempts < 8,
+          );
+          return;
+        }
+      } else {
+        evaluation = second;
+        if (recheck) {
+          observation = recheck;
+          proofGeneration = recheck.generation;
+        }
+      }
+    }
     const { verdict } = evaluation;
+    const proof = buildMergeGroupProofFingerprint({
+      endpointId: action.endpointId,
+      appId,
+      ctx,
+      heads: verdict.ok ? verdict.carried : [],
+      reviews: evaluation.reviews,
+      configurationRevision: evaluation.revision,
+      runtimeGeneration: proofGeneration,
+    });
+
+    // Read the group head's existing runs last and strictly: an unavailable,
+    // malformed or truncated listing throws here and nothing is ever written.
+    const existingChecks = await readMergeGroupCheckRuns(request, ctx.groupSha);
 
     const origin = runtimePublicOrigin();
     const detailsUrl = origin
@@ -718,12 +968,59 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       existingChecks,
       detailsUrl,
     });
-    // A lost POST response replays into a PATCH of the run carrying this
-    // external id; the listing above is what makes that replay safe.
-    const posted = await request<{ id?: unknown }>(plan.path, {
+    if (plan.method === "POST" && pendingAttempt) {
+      // An earlier attempt may have landed without a confirmed receipt, and a
+      // possibly stale empty listing cannot prove otherwise. Reconcile only:
+      // stay non-successful and retryable, never a second POST.
+      const attempts =
+        Number((action.result as { attempts?: unknown } | null)?.attempts ?? 0) +
+        1;
+      await failAction(id, "carry_ambiguous_write", attempts, attempts < 8);
+      return;
+    }
+    // Record the write intent durably before the provider call so a crash or
+    // a lost response retries into reconciliation, never a blind second POST.
+    const attempt: MergeGroupCarryPublicationAttempt = {
       method: plan.method,
-      body: plan.body,
-    });
+      externalId,
+      attemptedAt: new Date().toISOString(),
+      ambiguous: false,
+    };
+    if (carryRowId) {
+      await lease.commit(async (tx) => {
+        await tx
+          .update(chatGithubCarryRuns)
+          .set({ publicationAttempt: attempt, updatedAt: new Date() })
+          .where(eq(chatGithubCarryRuns.id, carryRowId));
+      });
+    }
+    let posted: { id?: unknown } | undefined;
+    try {
+      posted = await request<{ id?: unknown }>(plan.path, {
+        method: plan.method,
+        body: plan.body,
+      });
+    } catch (error) {
+      if (carryRowId) {
+        // Definitive rejections (an HTTP status arrived) leave no ambiguity;
+        // anything else may have landed and must reconcile.
+        const ambiguous = !isDefinitiveProviderRejection(error);
+        await lease
+          .commit(async (tx) => {
+            await tx
+              .update(chatGithubCarryRuns)
+              .set({
+                publicationAttempt: ambiguous
+                  ? { ...attempt, ambiguous: true }
+                  : null,
+                updatedAt: new Date(),
+              })
+              .where(eq(chatGithubCarryRuns.id, carryRowId));
+          })
+          .catch(() => {});
+      }
+      throw error;
+    }
     const checkId =
       typeof posted?.id === "number" || typeof posted?.id === "string"
         ? String(posted.id)
@@ -741,11 +1038,14 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
           code: verdict.code,
           detail: verdict.ok ? null : verdict.detail,
           checkId,
+          proofFingerprint: proof,
+          publicationAttempt: null,
           updatedAt: new Date(),
         })
         .where(
           and(
             eq(chatGithubCarryRuns.endpointId, action.endpointId),
+            eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
             eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
           ),
         );
@@ -761,13 +1061,22 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
   }
 
   /** One uncached evidence pass. Returns null when carry was disabled after
-   * admission. The policy revision is read at this moment, not at delivery. */
+   * admission. The policy revision is read at this moment, not at delivery.
+   * Observed provider identities (queue-ref target, pull heads) are returned
+   * alongside the verdict so the write boundary can revalidate them uncached. */
   async function evaluateCarry(
     request: MergeGroupGitHubRequest,
     action: typeof chatActions.$inferSelect,
     ctx: MergeGroupContext,
     appId: string,
-  ): Promise<{ verdict: MergeGroupCarryVerdict; revision: number } | null> {
+  ): Promise<{
+    verdict: MergeGroupCarryVerdict;
+    revision: number;
+    reviews: MergeGroupReviewRecord[];
+    pullNumbers: number[];
+    observedRefSha: string | null;
+    observedHeads: Array<{ pullNumber: number; headSha: string }>;
+  } | null> {
     const [config] = await db
       .select({
         revision: chatGitHubConfigurations.revision,
@@ -845,9 +1154,19 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       configurationRevision: config.revision,
       reviews,
     };
+    // Read through the same memo so the decision observes identical evidence
+    // with no extra provider call; the boundary re-reads these uncached.
+    const observedRefSha = await cached.getRefSha(ctx.groupRef);
     return {
       verdict: await decideMergeGroupCarry(ctx, cached, input),
       revision: config.revision,
+      reviews,
+      pullNumbers: [...pullNumbers].sort((a, b) => a - b),
+      observedRefSha,
+      observedHeads: [...confirmed].map(([pullNumber, head]) => ({
+        pullNumber,
+        headSha: head.headSha,
+      })),
     };
   }
 

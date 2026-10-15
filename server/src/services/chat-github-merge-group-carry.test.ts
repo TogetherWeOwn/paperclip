@@ -287,7 +287,13 @@ describe("planMergeGroupCheckPublication", () => {
         getPull: async () => ({ number: 12, headSha: HEAD_A, baseSha: "d".repeat(40), state: "open", merged: false }),
         getCompare: async () => ({
           truncated: false,
-          commits: [{ sha: GROUP, parents: [PARENT], message: "docs (#12)" }],
+          commits: [
+            {
+              sha: GROUP,
+              parents: [PARENT, HEAD_A],
+              message: "Merge pull request #12 from alice/feature",
+            },
+          ],
         }),
         getMergeBase: async () => "d".repeat(40),
         getRefSha: async () => GROUP,

@@ -1989,6 +1989,13 @@
       "when": 1792023935339,
       "tag": "0285_green_nebula",
       "breakpoints": true
+    },
+    {
+      "idx": 286,
+      "version": "7",
+      "when": 1792053305852,
+      "tag": "0286_gray_spiral",
+      "breakpoints": true
     }
   ]
 }

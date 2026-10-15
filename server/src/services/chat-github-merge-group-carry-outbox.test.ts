@@ -59,7 +59,7 @@ type RunRecord = {
   app: { id: number };
 };
 
-/** In-memory GitHub: serves the evidence for one clean squash group and
+/** In-memory GitHub: serves the evidence for one clean merge-method group and
  * records every call so tests can prove which writes happened. */
 function fakeGitHub(endpointId: string) {
   const state = {
@@ -107,7 +107,11 @@ function fakeGitHub(endpointId: string) {
       return json({
         total_commits: 1,
         commits: [
-          { sha: GROUP, parents: [{ sha: PARENT }], commit: { message: "docs (#12)" } },
+          {
+            sha: GROUP,
+            parents: [{ sha: PARENT }, { sha: HEAD }],
+            commit: { message: "Merge pull request #12 from alice/feature" },
+          },
         ],
       });
     if (path === `/compare/${BASE_NEW}...${HEAD}`)

@@ -101,8 +101,8 @@ function github(overrides: Partial<MergeGroupGitHub> = {}): MergeGroupGitHub {
       commits: [
         {
           sha: GROUP,
-          parents: [PARENT],
-          message: "docs: queued change (#12)",
+          parents: [PARENT, HEAD_A],
+          message: "Merge pull request #12 from alice/feature",
         },
       ],
     }),
@@ -344,7 +344,11 @@ describe("decideMergeGroupCarry", () => {
     expect(moved.code).toBe("stale_head");
   });
 
-  it("fails closed when a squashed head moved to different content", async () => {
+  it("fails closed when the queued head moved past its merge-method pin", async () => {
+    // The group binds HEAD_A immutably while the pull now points at HEAD_B
+    // with different content: the pin mismatch fails closed before any tree
+    // comparison runs. (Unbound squash shapes fail as ambiguous_group
+    // instead; see the identity suite.)
     const verdict = await decideMergeGroupCarry(
       context(),
       github({
@@ -374,7 +378,7 @@ describe("decideMergeGroupCarry", () => {
       input({ reviews: [review({ headSha: HEAD_B })] }),
     );
     expect(verdict.ok).toBe(false);
-    expect(verdict.code).toBe("nonempty_delta");
+    expect(verdict.code).toBe("stale_head");
   });
 
   it("fails closed when a queued pull request is closed or already merged", async () => {
@@ -516,8 +520,8 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
-          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
-          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
+          { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
       getTree: async (sha: string) => {
@@ -580,8 +584,8 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
-          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
-          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
+          { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
       getTree: async (sha: string) => {
@@ -637,8 +641,8 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
-          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
-          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
+          { sha: "1".repeat(40), parents: [PARENT, HEAD_A], message: "Merge pull request #12 from alice/a" },
+          { sha: GROUP, parents: ["1".repeat(40), HEAD_B], message: "Merge pull request #13 from bob/b" },
         ],
       }),
       getTree: async (sha: string) => {
@@ -786,10 +790,12 @@ describe("mergeGroupCarryCheckBody", () => {
   });
 });
 
-// Compact, sanitized reduction of a real squash queue group: base drift added
-// docs/queue-proof-a.md after the PR branched, the PR added
+// Compact, sanitized reduction of a real queue group tree set: base drift
+// added docs/queue-proof-a.md after the PR branched, the PR added
 // docs/queue-proof-c.md, and the shared "docs" directory hash differs in all
 // four trees. Only leaf blobs may decide ownership; directory nodes are noise.
+// (Commit metadata is merge-method: only merge-method groups carry a head
+// binding the decision can prove.)
 describe("real queue group tree shape", () => {
   const sha = (char: string) => char.repeat(40);
   const blob = (path: string, blobSha: string) => ({
@@ -815,7 +821,7 @@ describe("real queue group tree shape", () => {
   };
   const PR = 21;
 
-  it("carries a squash group whose base drifted, ignoring directory nodes", async () => {
+  it("carries a merge-method group whose base drifted, ignoring directory nodes", async () => {
     const verdict = await decideMergeGroupCarry(
       context({
         groupSha: sha("d"),
@@ -835,8 +841,8 @@ describe("real queue group tree shape", () => {
           commits: [
             {
               sha: sha("d"),
-              parents: [sha("b")],
-              message: `queued change (#${PR})`,
+              parents: [sha("b"), sha("e")],
+              message: `Merge pull request #${PR} from example/queue-proof`,
             },
           ],
         }),

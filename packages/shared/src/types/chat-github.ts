@@ -191,3 +191,41 @@ export function defaultGitHubReviewPolicy(): GitHubReviewPolicy {
     ratingThreshold: 5,
   };
 }
+
+/** Durable proof fingerprint for one native merge-group carry publication
+ * (write-boundary freshness + repository isolation). It binds the exact provider identities observed
+ * at the write boundary — repository, group, base, queue ref, every exact
+ * queued head, policy revision, endpoint/credential epoch, and the review
+ * evidence — so redelivery replays only validate this fingerprint instead of
+ * trusting (group SHA, policy revision) alone. Heads entries are sorted by
+ * pull number for stable comparison. */
+export interface MergeGroupCarryProofFingerprint {
+  version: 1;
+  endpointId: string;
+  appId: string;
+  repositoryId: string;
+  repository: string;
+  groupSha: string;
+  groupRef: string;
+  baseSha: string;
+  heads: Array<{ pullNumber: number; headSha: string }>;
+  reviews: Array<{
+    pullNumber: number;
+    headSha: string;
+    configurationRevision: number;
+  }>;
+  configurationRevision: number;
+  runtimeGeneration: number;
+}
+
+/** Durable publication-write intent for one merge-group carry attempt
+ * (ambiguous-write recovery). A non-null attempt whose outcome was never confirmed
+ * (ambiguous, or recorded before a crash) authorizes reconciliation only —
+ * PATCH an adopted run or wait — never a second POST on a possibly stale
+ * empty listing. Null means no write is in flight and a fresh POST is safe. */
+export interface MergeGroupCarryPublicationAttempt {
+  method: "POST" | "PATCH";
+  externalId: string;
+  attemptedAt: string;
+  ambiguous: boolean;
+}

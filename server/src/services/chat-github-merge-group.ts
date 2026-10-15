@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { githubCommitSchema, githubIdSchema } from "@paperclipai/shared";
+import type { MergeGroupCarryProofFingerprint } from "@paperclipai/shared";
 
 /**
  * Native Paperclip Review carry for GitHub merge-queue groups.
@@ -11,6 +12,13 @@ import { githubCommitSchema, githubIdSchema } from "@paperclipai/shared";
  * diff-of-diff, verified by tree ownership, not by commit titles). Every
  * other outcome fails closed with `action_required`: missing or weak reviews
  * are never synthesized from titles, comments, or older heads.
+ *
+ * Identity is proven only for merge-method groups: every group commit must be
+ * a merge commit whose second parent immutably names the queued PR head, and
+ * every queue-ref PR must own such an entry. Squash and rebase shapes carry
+ * no immutable binding of the group to the reviewed heads — the current pull
+ * head and matching trees cannot prove which head the group was cut from —
+ * so they fail closed as `ambiguous_group`, as does any unrecognized commit.
  *
  * This module is pure: GitHub reads arrive through `MergeGroupGitHub` and
  * review rows through `MergeGroupCarryInput`, so the whole acceptance matrix
@@ -245,6 +253,85 @@ export function sameMergeGroupCarryFingerprint(
   );
 }
 
+const byPullNumber = (
+  left: { pullNumber: number },
+  right: { pullNumber: number },
+): number => left.pullNumber - right.pullNumber;
+
+/** Snapshot the exact identities observed at the write boundary. Heads and
+ * reviews are normalized (lowercase SHAs, sorted by pull number) so a stored
+ * fingerprint compares stably. */
+export function buildMergeGroupProofFingerprint(args: {
+  endpointId: string;
+  appId: string;
+  ctx: MergeGroupContext;
+  heads: Array<{ pullNumber: number; headSha: string }>;
+  reviews: MergeGroupCarryInput["reviews"];
+  configurationRevision: number;
+  runtimeGeneration: number;
+}): MergeGroupCarryProofFingerprint {
+  return {
+    version: 1,
+    endpointId: args.endpointId,
+    appId: args.appId,
+    repositoryId: args.ctx.repositoryId,
+    repository: args.ctx.repository,
+    groupSha: args.ctx.groupSha.toLowerCase(),
+    groupRef: args.ctx.groupRef,
+    baseSha: args.ctx.baseSha.toLowerCase(),
+    heads: args.heads
+      .map((head) => ({
+        pullNumber: head.pullNumber,
+        headSha: head.headSha.toLowerCase(),
+      }))
+      .sort(byPullNumber),
+    reviews: args.reviews
+      .map((review) => ({
+        pullNumber: review.pullNumber,
+        headSha: review.headSha.toLowerCase(),
+        configurationRevision: review.configurationRevision,
+      }))
+      .sort(byPullNumber),
+    configurationRevision: args.configurationRevision,
+    runtimeGeneration: args.runtimeGeneration,
+  };
+}
+
+/** Redelivery replay predicate. A stored proof replays only when every
+ * database-observable field still matches the current delivery and source —
+ * endpoint, review app, repository, group, base, queue ref, policy revision,
+ * and endpoint/credential epoch — plus intact write-time head/review
+ * evidence. Anything else is re-judged, never replayed.
+ *
+ * Residual: provider-fresh heads are not re-read on replay (replay performs
+ * no provider calls). The write-time proof was boundary-validated at
+ * publication, the group commit is immutable, and a regenerated queue is a
+ * new group key; post-publish head drift cannot retroactively falsify the
+ * published content binding. */
+export function mergeGroupProofReplayMatches(args: {
+  stored: MergeGroupCarryProofFingerprint | null | undefined;
+  endpointId: string;
+  appId: string;
+  ctx: MergeGroupContext;
+  configurationRevision: number;
+  runtimeGeneration: number;
+}): boolean {
+  const proof = args.stored;
+  if (!proof || proof.version !== 1) return false;
+  if (!Array.isArray(proof.heads) || !Array.isArray(proof.reviews)) return false;
+  return (
+    proof.endpointId === args.endpointId &&
+    proof.appId === args.appId &&
+    proof.repositoryId === args.ctx.repositoryId &&
+    proof.repository === args.ctx.repository &&
+    proof.groupSha === args.ctx.groupSha.toLowerCase() &&
+    proof.groupRef === args.ctx.groupRef &&
+    proof.baseSha === args.ctx.baseSha.toLowerCase() &&
+    proof.configurationRevision === args.configurationRevision &&
+    proof.runtimeGeneration === args.runtimeGeneration
+  );
+}
+
 const MERGE_SUBJECT = /^Merge pull request #(\d{1,9}) from \S+/;
 const SQUASH_SUFFIX = /\(#(\d{1,9})\)\s*$/;
 
@@ -255,7 +342,10 @@ export type MergeGroupCommitPr = {
 };
 
 /** PR numbers from queue-generated commit subjects. Titles are hints only; a
- * merge-method commit additionally pins the PR head through its second parent. */
+ * merge-method commit additionally pins the PR head through its second parent.
+ * Discovery only: squash entries (`pinnedHeadSha: null`) and unrecognized
+ * commits are returned here but always rejected by `decideMergeGroupCarry`,
+ * which requires a merge-method binding for every group member. */
 export function prsFromCompareCommits(
   commits: MergeGroupCompareCommit[],
 ): MergeGroupCommitPr[] {
@@ -449,17 +539,48 @@ export async function decideMergeGroupCarry(
         refPr.pullNumber,
       );
   }
-  const commitPrs = prsFromCompareCommits(compare.commits);
-  const pinnedHeads = new Map<number, string>();
-  for (const entry of commitPrs)
-    if (entry.pinnedHeadSha) pinnedHeads.set(entry.pullNumber, entry.pinnedHeadSha);
-  const candidates = [...refPrs];
-  for (const { pullNumber } of commitPrs) {
-    if (candidates.some((candidate) => candidate.pullNumber === pullNumber))
-      continue;
-    candidates.push({ pullNumber, shortSha: "" });
+  // Immutable membership proof. Every group commit must be a merge-method
+  // entry whose second parent names the exact queued PR head; anything else
+  // — a squash/rebase shape, an unrecognized message, a malformed parent, or
+  // conflicting bindings for one PR — proves nothing about which head the
+  // group was cut from and fails closed. Title hints never become identity.
+  const boundHeads = new Map<number, string>();
+  for (const commit of compare.commits) {
+    const firstLine = commit.message.split("\n", 1)[0] ?? "";
+    const merge = MERGE_SUBJECT.exec(firstLine);
+    const secondParent = commit.parents[1]?.toLowerCase() ?? null;
+    if (
+      !merge ||
+      commit.parents.length !== 2 ||
+      !secondParent ||
+      !/^[0-9a-f]{40}$/.test(secondParent) ||
+      !/^[0-9a-f]{40}$/i.test(commit.sha)
+    )
+      return fail(
+        "ambiguous_group",
+        `the group contains commit ${commit.sha} with no immutable binding to a queued pull request head, so the group membership cannot be proven`,
+      );
+    const pullNumber = Number(merge[1]);
+    const prior = boundHeads.get(pullNumber);
+    if (prior !== undefined && prior !== secondParent)
+      return fail(
+        "ambiguous_group",
+        `pull request #${pullNumber} is bound to conflicting heads inside one group, so the queued head cannot be determined`,
+        pullNumber,
+      );
+    boundHeads.set(pullNumber, secondParent);
   }
-  candidates.sort((a, b) => a.pullNumber - b.pullNumber);
+  for (const refPr of refPrs) {
+    if (!boundHeads.has(refPr.pullNumber))
+      return fail(
+        "ambiguous_group",
+        `the queue ref names pull request #${refPr.pullNumber}, which has no merge-method entry in the group, so the group membership cannot be proven`,
+        refPr.pullNumber,
+      );
+  }
+  const candidates = [...boundHeads.keys()]
+    .sort((a, b) => a - b)
+    .map((pullNumber) => ({ pullNumber, shortSha: "" }));
   if (candidates.length === 0 || candidates.length > MAX_QUEUED_PRS)
     return fail(
       "ambiguous_group",
@@ -494,8 +615,11 @@ export async function decideMergeGroupCarry(
         `pull request #${candidate.pullNumber} is ${pull.merged ? "already merged" : `not open (${pull.state})`}, so it is no longer a queued entry`,
         candidate.pullNumber,
       );
-    const pinned = pinnedHeads.get(candidate.pullNumber);
-    if (pinned && pinned !== headSha)
+    // Every candidate carries an immutable pin by construction (the binding
+    // pass above rejects unbound shapes). The current pull head is accepted
+    // only as a freshness check against that pin — never as identity proof.
+    const pinned = boundHeads.get(candidate.pullNumber)!;
+    if (pinned !== headSha)
       return fail(
         "stale_head",
         `pull request #${candidate.pullNumber} now points at ${headSha}, which no longer matches the head ${pinned} merged into the queued group; the group is superseded`,
