@@ -94,11 +94,16 @@ const withoutChatExcludedSuites = nativeRunnerSuiteRunsInRustCachedLane
   : [chatSuite];
 const generalWorkspacesAGroupName = "general-workspaces-a";
 const generalWorkspacesBGroupName = "general-workspaces-b";
+const generalWorkspacesCGroupName = "general-workspaces-c";
+// Newer trusted workflows call C explicitly. Keep DB in B and keep the
+// default A/B plan unchanged so older release/local callers retain coverage.
+const generalWorkspacesCProjects = ["@paperclipai/db"];
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
 const allowedGeneralGroupNames = [
   ...generalGroupNames,
+  generalWorkspacesCGroupName,
   generalServerWithoutChatGroupName,
   generalChatGroupName,
   generalServerNativeRunnerGroupName,
@@ -454,6 +459,11 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
     return;
   }
 
+  if (groupName === generalWorkspacesCGroupName) {
+    runProjectGroup(generalWorkspacesCProjects, groupName);
+    return;
+  }
+
   fail(`Unknown group "${groupName}".`);
 }
 
@@ -535,7 +545,9 @@ if (options.dryRun) {
             ? generalWorkspacesAProjects
             : options.group === generalWorkspacesBGroupName
               ? generalWorkspacesBProjects
-              : null,
+              : options.group === generalWorkspacesCGroupName
+                ? generalWorkspacesCProjects
+                : null,
         workspacesVitestShard:
           options.group === generalWorkspacesAGroupName &&
           options.shardCount !== null &&
