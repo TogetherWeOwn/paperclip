@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createMergeGroupGitHubReader } from "./chat-github-merge-group-carry.js";
+import {
+  createMergeGroupGitHubReader,
+  readMergeGroupCheckRuns,
+  type MergeGroupGitHubRequest,
+} from "./chat-github-merge-group-carry.js";
 import {
   decideMergeGroupCarry,
   type MergeGroupContext,
@@ -193,5 +197,138 @@ describe("required fail-closed API evidence (F3)", () => {
       ],
     };
     expect((await decideMergeGroupCarry(ctx, github(), input)).ok).toBe(false);
+  });
+});
+
+describe("strict evidence readers (R7)", () => {
+  const validEntry = {
+    path: "src/a.ts",
+    type: "blob",
+    mode: "100644",
+    sha: H,
+  };
+  const treeOf = (entries: unknown[]) =>
+    reader({ sha: G, truncated: false, tree: entries }).getTree(G);
+
+  it("rejects duplicate comparison commit identities", async () => {
+    // Two entries with the same SHA satisfy the reported total but prove
+    // nothing about completeness: uniqueness is required.
+    const dup = {
+      sha: G,
+      parents: [{ sha: B }, { sha: H }],
+      commit: { message: "Merge pull request #12 from alice/feature" },
+    };
+    expect(
+      await reader({
+        total_commits: 2,
+        commits: [dup, { ...dup }],
+      }).getCompare(B, G),
+    ).toBeNull();
+  });
+
+  it.each([
+    "../unreviewed.ts",
+    "/absolute.ts",
+    "a//b.ts",
+    "a/./b.ts",
+    "nul\0byte.ts",
+    "a/../b.ts",
+  ])("rejects malformed tree path %j", async (path) => {
+    expect(await treeOf([{ ...validEntry, path }])).toBeNull();
+  });
+
+  it("preserves valid leaf modes and whitespace filenames", async () => {
+    expect(
+      await treeOf([
+        { path: "run.sh", type: "blob", mode: "100755", sha: H },
+        { path: "link", type: "blob", mode: "120000", sha: H },
+        { path: "vendor/lib", type: "commit", mode: "160000", sha: H },
+        { path: "dir with space/a b.ts", type: "blob", mode: "100644", sha: H },
+      ]),
+    ).not.toBeNull();
+  });
+
+  it("rejects non-positive or unsafe check-run ids", async () => {
+    for (const id of [-1, 0, 9007199254740992]) {
+      await expect(
+        readMergeGroupCheckRuns(
+          (async () => ({
+            total_count: 1,
+            check_runs: [
+              {
+                id,
+                status: "completed",
+                external_id: "carry:e:g",
+                app: { id: 5191093 },
+              },
+            ],
+          })) as MergeGroupGitHubRequest,
+          G,
+        ),
+      ).rejects.toThrow(/could not be listed/);
+    }
+  });
+
+  it("rejects coerced app identities without String() coercion", async () => {
+    // A raw array App ID must not coerce to the expected producer identity.
+    expect(
+      await reader({
+        total_count: 1,
+        check_runs: [
+          {
+            id: 7,
+            status: "completed",
+            conclusion: "success",
+            external_id: "x",
+            app: { id: ["5191093"] },
+          },
+        ],
+      }).listReviewChecks(H),
+    ).toBeNull();
+    await expect(
+      readMergeGroupCheckRuns(
+        (async () => ({
+          total_count: 1,
+          check_runs: [
+            {
+              id: 7,
+              status: "completed",
+              external_id: "x",
+              app: { id: ["5191093"] },
+            },
+          ],
+        })) as MergeGroupGitHubRequest,
+        G,
+      ),
+    ).rejects.toThrow(/could not be listed/);
+    // Numeric and digit-string App IDs remain valid evidence.
+    expect(
+      await reader({
+        total_count: 1,
+        check_runs: [
+          {
+            id: 7,
+            status: "completed",
+            conclusion: "success",
+            external_id: "x",
+            app: { id: 5191093 },
+          },
+        ],
+      }).listReviewChecks(H),
+    ).toHaveLength(1);
+    expect(
+      await reader({
+        total_count: 1,
+        check_runs: [
+          {
+            id: 7,
+            status: "completed",
+            conclusion: "success",
+            external_id: "x",
+            app: { id: "5191093" },
+          },
+        ],
+      }).listReviewChecks(H),
+    ).toHaveLength(1);
   });
 });
