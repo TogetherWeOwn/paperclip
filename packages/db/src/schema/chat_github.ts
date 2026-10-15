@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   check,
   foreignKey,
   index,
@@ -155,6 +156,62 @@ export const chatGitHubReviews = pgTable(
     check(
       "chat_github_review_state_check",
       sql`${t.state} in ('queued', 'running', 'completed', 'incomplete', 'error', 'superseded', 'manual_required')`,
+    ),
+  ],
+);
+
+/** One verdict per merge-queue group key (endpoint + group SHA). The insert
+ * claim serializes concurrent deliveries; a processed row answers redelivery
+ * without new provider writes, and any group change is a new key. */
+export const chatGithubCarryRuns = pgTable(
+  "chat_github_carry_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull(),
+    endpointId: uuid("endpoint_id").notNull(),
+    repositoryId: text("repository_id").notNull(),
+    repository: text("repository").notNull(),
+    groupSha: text("group_sha").notNull(),
+    baseSha: text("base_sha").notNull(),
+    heads: jsonb("heads")
+      .$type<Array<{ pullNumber: number; headSha: string }>>()
+      .notNull()
+      .default([]),
+    deliveryId: text("delivery_id").notNull(),
+    configurationRevision: integer("configuration_revision").notNull(),
+    status: text("status")
+      .$type<"processing" | "processed" | "failed" | "cancelled">()
+      .notNull()
+      .default("processing"),
+    verdictOk: boolean("verdict_ok"),
+    code: text("code"),
+    detail: text("detail"),
+    checkId: text("check_id"),
+    externalId: text("external_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    foreignKey({
+      columns: [t.companyId, t.endpointId],
+      foreignColumns: [chatEndpoints.companyId, chatEndpoints.id],
+    }).onDelete("cascade"),
+    uniqueIndex("chat_github_carry_runs_group_uq").on(
+      t.endpointId,
+      t.groupSha,
+    ),
+    index("chat_github_carry_runs_endpoint_idx").on(
+      t.endpointId,
+      t.status,
+      t.createdAt,
+    ),
+    check(
+      "chat_github_carry_runs_status_check",
+      sql`${t.status} in ('processing', 'processed', 'failed', 'cancelled')`,
     ),
   ],
 );

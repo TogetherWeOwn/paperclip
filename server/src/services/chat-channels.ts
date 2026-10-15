@@ -13,7 +13,9 @@ import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js
 function githubPolicyRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
-import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment } from "./chat-github-events.js";
+import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubMergeGroupAdmission } from "./chat-github-events.js";
+import { parseMergeGroupEvent } from "./chat-github-merge-group.js";
+import { githubMergeGroupCarryService } from "./chat-github-merge-group-carry.js";
 import { githubReviewPrompt } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
@@ -808,6 +810,7 @@ const UNAVOIDABLE_GITHUB_EVENTS = [
 
 const SUPPORTED_GITHUB_WEBHOOK_EVENTS = new Set<string>([
   "pull_request",
+  "merge_group",
   "ping",
   ...REQUIRED_GITHUB_EVENTS,
   ...UNAVOIDABLE_GITHUB_EVENTS,
@@ -27220,6 +27223,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       await processMessage(endpoint, thread, message, "mention", true, `https://github.com/${event.repository}/pull/${event.pullNumber}`, { ...runtimeContext, endpointRuntime }, undefined, null, false);
       return new Response("accepted", { status: 202 });
     }
+    if (provider === "github" && request.headers.get("x-github-event") === "merge_group") {
+      // Merge-queue groups never start agent work here. The carry outbox owns
+      // the group verdict; it stays inert until the endpoint opts in, so the
+      // host bridge remains the single writer until native release.
+      const event = parseMergeGroupEvent(await request.clone().json(), request.headers.get("x-github-delivery") ?? "");
+      if (!event) return new Response("ignored", { status: 200 });
+      const admission = await githubMergeGroupAdmission(db, endpoint, event);
+      if (admission) await githubMergeGroupCarryService(db, fetchImpl).enqueue(endpoint, event, admission.allowed, admission.reason, admission.revision);
+      if (!admission?.allowed) return new Response("ignored", { status: 200 });
+      return new Response("accepted", { status: 202 });
+    }
     const response = await endpointRuntime.handleWebhook(
       request,
       undefined,
@@ -38162,6 +38176,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // Provider I/O must not block Slack, Teams, or ordinary message receipts.
         await githubChatReviewService(db, fetchImpl).processPending();
         await githubReviewCheckService(db, fetchImpl).processPending();
+        await githubMergeGroupCarryService(db, fetchImpl).processPending();
       } finally {
         githubMaintenancePending = false;
       }

@@ -178,6 +178,49 @@ export async function githubAutomaticAdmission(
   };
 }
 
+/** Merge-queue admission: the queued repository must be enabled on this
+ * endpoint. Unlike PR admission there is no author to link — the queue bot is
+ * never a member — so only the repository gate applies. Called only after
+ * signature and installed-repository admission. */
+export async function githubMergeGroupAdmission(
+  db: Db | Parameters<Parameters<Db["transaction"]>[0]>[0],
+  endpoint: typeof chatEndpoints.$inferSelect,
+  ctx: { repository: string; repositoryId: string },
+) {
+  const [saved] = await db
+    .select()
+    .from(chatGitHubConfigurations)
+    .where(
+      and(
+        eq(chatGitHubConfigurations.companyId, endpoint.companyId),
+        eq(chatGitHubConfigurations.endpointId, endpoint.id),
+      ),
+    );
+  if (!saved) return null;
+  const [resource] = await db
+    .select()
+    .from(chatEndpointResources)
+    .where(
+      and(
+        eq(chatEndpointResources.companyId, endpoint.companyId),
+        eq(chatEndpointResources.endpointId, endpoint.id),
+        eq(
+          chatEndpointResources.providerResourceId,
+          ctx.repository.toLowerCase(),
+        ),
+      ),
+    );
+  const allowed =
+    !!resource?.enabled &&
+    resource.availability === "available" &&
+    String(resource.metadata?.providerRepositoryId) === ctx.repositoryId;
+  return {
+    allowed,
+    reason: allowed ? "repository_enabled" : "repository_not_enabled",
+    revision: saved.revision,
+  };
+}
+
 export async function githubPreviousAssessment(
   db: Db,
   endpoint: typeof chatEndpoints.$inferSelect,

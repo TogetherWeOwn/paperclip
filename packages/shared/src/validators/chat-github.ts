@@ -72,6 +72,7 @@ export const githubChatConfigurationSchema = z
   .object({
     version: z.literal(1),
     toolsEnabled: z.boolean(),
+    mergeGroupCarryEnabled: z.boolean().optional(),
     responsibleUserId: z.string().min(1),
     memberAccess: z.enum(["all_linked", "selected"]),
     people: z.array(githubAllowedPersonSchema).max(500),

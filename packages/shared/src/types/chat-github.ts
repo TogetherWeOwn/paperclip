@@ -45,6 +45,10 @@ export interface GitHubChatConfiguration {
   version: 1;
   /** Enabling the feature and bot tools is explicit for existing endpoints. */
   toolsEnabled: boolean;
+  /** Native merge-queue carry. Off unless the rollout explicitly enables it;
+   * the host bridge owns carry until native support is released, and two
+   * simultaneous check writers must never exist. */
+  mergeGroupCarryEnabled?: boolean;
   responsibleUserId: string;
   memberAccess: "all_linked" | "selected";
   people: GitHubAllowedPerson[];
