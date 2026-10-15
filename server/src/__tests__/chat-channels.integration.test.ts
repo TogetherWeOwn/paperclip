@@ -6364,6 +6364,85 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
+  it("tolerates the opt-in merge_group subscription (with contents:read, checks:write) while still rejecting other extra events", async () => {
+    const fixture = await seedCompany();
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+      .privateKey.export({ type: "pkcs8", format: "pem" })
+      .toString();
+    const { service } = createService(new FakeChatSdkRuntime(), (async (
+      input: string | URL | Request,
+    ) => {
+      if (String(input) !== "https://api.github.com/app") {
+        throw new Error(`Unexpected provider request: ${String(input)}`);
+      }
+      return new Response(
+        JSON.stringify({
+          id: 991124,
+          slug: "maya-merge-group",
+          name: "Maya Over-scoped",
+          owner: { login: "paperclipai" },
+          permissions: {
+            contents: "read",
+            checks: "write",
+            issues: "write",
+            metadata: "read",
+            pull_requests: "write",
+          },
+          events: [
+            "github_app_authorization",
+            "installation",
+            "installation_repositories",
+            "issue_comment",
+            "pull_request_review_comment",
+            "pull_request",
+            "merge_group",
+            "push",
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof globalThis.fetch);
+    const endpoint = await service.create(
+      fixture.companyId,
+      { provider: "github", assignedAgentId: fixture.assignedAgentId },
+      "owner-user",
+    );
+    const { webhookSecret } = await service.generateSetupSecret(
+      endpoint.id,
+      "owner-user",
+    );
+    await recordGitHubWebhookVerification(
+      service,
+      endpoint.publicId,
+      webhookSecret,
+    );
+
+    await expect(
+      service.configure(
+        endpoint.id,
+        { action: "configure", credentials: { appId: "991124", privateKey } },
+        "owner-user",
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "chat_provider_permissions_missing",
+        provider: "github",
+        missingPermissions: [],
+        excessivePermissions: [],
+        missingEvents: [],
+        excessiveEvents: ["push"],
+      },
+    });
+    const [connection] = await db
+      .select({ refs: toolConnections.credentialSecretRefs })
+      .from(toolConnections)
+      .where(eq(toolConnections.id, endpoint.connectionId));
+    expect(connection!.refs).toEqual([
+      expect.objectContaining({ configPath: "credentials.webhookSecret" }),
+    ]);
+  });
+
   it("rejects under-scoped Slack and GitHub apps before saving provider credentials", async () => {
     const fixture = await seedCompany();
     const slack = createService(new FakeChatSdkRuntime(), (async (

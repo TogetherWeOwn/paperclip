@@ -119,7 +119,9 @@ export type MergeGroupPull = {
 };
 export type MergeGroupCompareCommit = {
   sha: string;
-  parents: number;
+  /** Parent commit SHAs in order. Merge-method groups carry the PR head as the
+   * second parent; squash groups have one parent and no PR-head reference. */
+  parents: string[];
   message: string;
 };
 export type MergeGroupCompare = {
@@ -147,6 +149,11 @@ export type MergeGroupHeadCheck = {
 export type MergeGroupGitHub = {
   getPull(pullNumber: number): Promise<MergeGroupPull | null>;
   getCompare(baseSha: string, headSha: string): Promise<MergeGroupCompare | null>;
+  /** True merge base of a pull request head against its target branch tip.
+   * `pull.base.sha` is the moving target tip, never the diff baseline. */
+  getMergeBase(baseSha: string, headSha: string): Promise<string | null>;
+  /** Live commit SHA of the queue ref, or null when it cannot be read. */
+  getRefSha(groupRef: string): Promise<string | null>;
   getTree(sha: string): Promise<MergeGroupTree | null>;
   listReviewChecks(headSha: string): Promise<MergeGroupHeadCheck[] | null>;
 };
@@ -167,6 +174,9 @@ export type MergeGroupCarryInput = {
   appId: string;
   eventAgeMs: number;
   maxEventAgeMs: number;
+  /** Exact current policy revision. A review recorded under any other
+   * revision was judged by obsolete policy and must not carry. */
+  configurationRevision: number;
   reviews: MergeGroupReviewRecord[];
 };
 
@@ -175,6 +185,7 @@ export type MergeGroupCarryFailCode =
   | "stale_head"
   | "missing_review"
   | "weak_review"
+  | "stale_policy"
   | "check_mismatch"
   | "truncated_evidence"
   | "evidence_unavailable"
@@ -237,20 +248,36 @@ export function sameMergeGroupCarryFingerprint(
 const MERGE_SUBJECT = /^Merge pull request #(\d{1,9}) from \S+/;
 const SQUASH_SUFFIX = /\(#(\d{1,9})\)\s*$/;
 
-/** PR numbers from queue-generated commit subjects. Titles are hints only. */
-function prsFromCompareCommits(commits: MergeGroupCompareCommit[]): number[] {
-  const found: number[] = [];
+export type MergeGroupCommitPr = {
+  pullNumber: number;
+  /** PR head named by an immutable merge-commit parent; null for squash. */
+  pinnedHeadSha: string | null;
+};
+
+/** PR numbers from queue-generated commit subjects. Titles are hints only; a
+ * merge-method commit additionally pins the PR head through its second parent. */
+export function prsFromCompareCommits(
+  commits: MergeGroupCompareCommit[],
+): MergeGroupCommitPr[] {
+  const found = new Map<number, MergeGroupCommitPr>();
   for (const commit of commits) {
     const firstLine = commit.message.split("\n", 1)[0] ?? "";
     const merge = MERGE_SUBJECT.exec(firstLine);
-    if (merge && commit.parents === 2) {
-      found.push(Number(merge[1]));
+    if (merge && commit.parents.length === 2) {
+      found.set(Number(merge[1]), {
+        pullNumber: Number(merge[1]),
+        pinnedHeadSha: commit.parents[1]!.toLowerCase(),
+      });
       continue;
     }
     const squash = SQUASH_SUFFIX.exec(firstLine);
-    if (squash && commit.parents === 1) found.push(Number(squash[1]));
+    if (squash && commit.parents.length === 1 && !found.has(Number(squash[1])))
+      found.set(Number(squash[1]), {
+        pullNumber: Number(squash[1]),
+        pinnedHeadSha: null,
+      });
   }
-  return [...new Set(found)];
+  return [...found.values()];
 }
 
 function treeKey(entry: MergeGroupTreeEntry | undefined): string | null {
@@ -260,7 +287,9 @@ function treeKey(entry: MergeGroupTreeEntry | undefined): string | null {
 
 function treeMap(tree: MergeGroupTree): Map<string, MergeGroupTreeEntry> {
   const map = new Map<string, MergeGroupTreeEntry>();
-  for (const entry of tree.entries) map.set(entry.path, entry);
+  // Directory nodes change whenever any descendant changes, so disjoint files
+  // under one directory would look like an overlap. Leaves carry the proof.
+  for (const entry of tree.entries) if (entry.type !== "tree") map.set(entry.path, entry);
   return map;
 }
 
@@ -287,6 +316,19 @@ export function verifyMergeGroupTreeOwnership(args: {
     headTree: Map<string, MergeGroupTreeEntry>;
   }>;
 }): MergeGroupOwnership {
+  // Directory nodes change with any descendant; only leaves carry ownership.
+  // Callers normally pass leaf-only maps, but direct callers must not trip.
+  const leaves = (tree: Map<string, MergeGroupTreeEntry>) =>
+    new Map([...tree].filter(([, entry]) => entry.type !== "tree"));
+  args = {
+    groupTree: leaves(args.groupTree),
+    baseTree: leaves(args.baseTree),
+    prs: args.prs.map((pr) => ({
+      pullNumber: pr.pullNumber,
+      baseTree: leaves(pr.baseTree),
+      headTree: leaves(pr.headTree),
+    })),
+  };
   const paths = new Set<string>();
   for (const tree of [
     args.groupTree,
@@ -351,6 +393,23 @@ export async function decideMergeGroupCarry(
       `the queue ref "${ctx.groupRef}" names no pull request, so the group membership cannot be determined`,
     );
 
+  let liveGroupSha: string | null = null;
+  try {
+    liveGroupSha = await github.getRefSha(ctx.groupRef);
+  } catch {
+    liveGroupSha = null;
+  }
+  if (!liveGroupSha)
+    return fail(
+      "evidence_unavailable",
+      `the queue ref "${ctx.groupRef}" could not be read, so the group cannot be confirmed as current`,
+    );
+  if (liveGroupSha.toLowerCase() !== ctx.groupSha.toLowerCase())
+    return fail(
+      "stale_head",
+      `the queue ref "${ctx.groupRef}" now points at ${liveGroupSha}, not the delivered group ${ctx.groupSha}; the group was regenerated`,
+    );
+
   let compare: MergeGroupCompare | null = null;
   try {
     compare = await github.getCompare(ctx.baseSha, ctx.groupSha);
@@ -372,9 +431,30 @@ export async function decideMergeGroupCarry(
       "ambiguous_group",
       "the group comparison lists no commits, so queued pull requests cannot be determined",
     );
+  // Real queue refs name the newest PR and the group's parent commit (the
+  // previous queue state), never a PR head. Bind that suffix to the actual
+  // group commit instead of trusting the ref text.
+  const groupCommit = compare.commits[compare.commits.length - 1]!;
+  if (groupCommit.sha.toLowerCase() !== ctx.groupSha.toLowerCase())
+    return fail(
+      "ambiguous_group",
+      "the group comparison does not end at the delivered group commit, so its membership cannot be determined",
+    );
+  const groupParent = groupCommit.parents[0]?.toLowerCase() ?? "";
+  for (const refPr of refPrs) {
+    if (!groupParent.startsWith(refPr.shortSha.toLowerCase()))
+      return fail(
+        "ambiguous_group",
+        `the queue ref names ${refPr.shortSha} for pull request #${refPr.pullNumber}, which is not the parent of the group commit; the group identity cannot be confirmed`,
+        refPr.pullNumber,
+      );
+  }
   const commitPrs = prsFromCompareCommits(compare.commits);
+  const pinnedHeads = new Map<number, string>();
+  for (const entry of commitPrs)
+    if (entry.pinnedHeadSha) pinnedHeads.set(entry.pullNumber, entry.pinnedHeadSha);
   const candidates = [...refPrs];
-  for (const pullNumber of commitPrs) {
+  for (const { pullNumber } of commitPrs) {
     if (candidates.some((candidate) => candidate.pullNumber === pullNumber))
       continue;
     candidates.push({ pullNumber, shortSha: "" });
@@ -408,13 +488,17 @@ export async function decideMergeGroupCarry(
         `pull request #${candidate.pullNumber} returned invalid commits, so its queued head cannot be confirmed`,
         candidate.pullNumber,
       );
-    if (
-      candidate.shortSha &&
-      !headSha.startsWith(candidate.shortSha.toLowerCase())
-    )
+    if (pull.state !== "open" || pull.merged)
       return fail(
         "stale_head",
-        `pull request #${candidate.pullNumber} now points at ${headSha}, which no longer matches the queued group; the group is superseded`,
+        `pull request #${candidate.pullNumber} is ${pull.merged ? "already merged" : `not open (${pull.state})`}, so it is no longer a queued entry`,
+        candidate.pullNumber,
+      );
+    const pinned = pinnedHeads.get(candidate.pullNumber);
+    if (pinned && pinned !== headSha)
+      return fail(
+        "stale_head",
+        `pull request #${candidate.pullNumber} now points at ${headSha}, which no longer matches the head ${pinned} merged into the queued group; the group is superseded`,
         candidate.pullNumber,
       );
     pulls.push({ ...pull, headSha, baseSha });
@@ -430,6 +514,12 @@ export async function decideMergeGroupCarry(
       return fail(
         "missing_review",
         `pull request #${pull.number} has no completed review for its exact queued head ${pull.headSha}`,
+        pull.number,
+      );
+    if (record.configurationRevision !== input.configurationRevision)
+      return fail(
+        "stale_policy",
+        `pull request #${pull.number} head ${pull.headSha} was reviewed under policy revision ${record.configurationRevision}, not the current revision ${input.configurationRevision}`,
         pull.number,
       );
     if (
@@ -471,11 +561,29 @@ export async function decideMergeGroupCarry(
       );
   }
 
+  const mergeBases = new Map<number, string>();
+  for (const pull of pulls) {
+    let mergeBase: string | null = null;
+    try {
+      mergeBase = await github.getMergeBase(pull.baseSha, pull.headSha);
+    } catch {
+      mergeBase = null;
+    }
+    mergeBase = mergeBase?.toLowerCase() ?? null;
+    if (!mergeBase || !/^[0-9a-f]{40}$/.test(mergeBase))
+      return fail(
+        "evidence_unavailable",
+        `the merge base of pull request #${pull.number} could not be read, so its diff baseline cannot be determined`,
+        pull.number,
+      );
+    mergeBases.set(pull.number, mergeBase);
+  }
+
   const trees = new Map<string, MergeGroupTree>();
   for (const sha of [
     ctx.groupSha,
     ctx.baseSha,
-    ...pulls.flatMap((pull) => [pull.headSha, pull.baseSha]),
+    ...pulls.flatMap((pull) => [pull.headSha, mergeBases.get(pull.number)!]),
   ]) {
     if (trees.has(sha)) continue;
     let tree: MergeGroupTree | null = null;
@@ -502,7 +610,7 @@ export async function decideMergeGroupCarry(
     baseTree: treeMap(trees.get(ctx.baseSha)!),
     prs: pulls.map((pull) => ({
       pullNumber: pull.number,
-      baseTree: treeMap(trees.get(pull.baseSha.toLowerCase())!),
+      baseTree: treeMap(trees.get(mergeBases.get(pull.number)!)!),
       headTree: treeMap(trees.get(pull.headSha)!),
     })),
   });

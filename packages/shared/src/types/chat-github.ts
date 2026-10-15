@@ -47,7 +47,10 @@ export interface GitHubChatConfiguration {
   toolsEnabled: boolean;
   /** Native merge-queue carry. Off unless the rollout explicitly enables it;
    * the host bridge owns carry until native support is released, and two
-   * simultaneous check writers must never exist. */
+   * simultaneous check writers must never exist. Opt-in only: the review App
+   * must additionally subscribe to `merge_group` and hold contents:read and
+   * checks:write. These are not part of any App's required subscriptions;
+   * `merge_group` is merely tolerated by App verification. */
   mergeGroupCarryEnabled?: boolean;
   responsibleUserId: string;
   memberAccess: "all_linked" | "selected";

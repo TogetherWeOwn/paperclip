@@ -1,4 +1,4 @@
-import { and, desc, eq, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
   chatActions,
   chatEndpointResources,
@@ -15,11 +15,16 @@ import {
   githubBotRequest,
 } from "./chat-github-client.js";
 import {
+  GitHubPublicationLeaseLost,
+  withGitHubPublicationLease,
+} from "./chat-github-publication-lease.js";
+import {
   PAPERCLIP_REVIEW_CHECK_NAME,
   decideMergeGroupCarry,
   mergeGroupCarryCheckBody,
   mergeGroupCarryExternalId,
   parseMergeGroupQueuedPrs,
+  prsFromCompareCommits,
   type MergeGroupCarryInput,
   type MergeGroupCarryVerdict,
   type MergeGroupContext,
@@ -40,6 +45,14 @@ export function mergeGroupCarryEnabled(
 ): boolean {
   return configuration?.mergeGroupCarryEnabled === true;
 }
+
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+const REF_SEGMENT = /^[A-Za-z0-9._-]+$/;
+const CHECK_RUN_PAGE = 100;
+
+type PublicationLease = Parameters<
+  Parameters<typeof withGitHubPublicationLease<void>>[3]
+>[0];
 
 export type MergeGroupGitHubRequest = <T>(
   path: string,
@@ -97,7 +110,7 @@ export function createMergeGroupGitHubReader(
         commits?: unknown;
       };
       if (!Array.isArray(compare.commits)) return null;
-      const commits: { sha: string; parents: number; message: string }[] = [];
+      const commits: { sha: string; parents: string[]; message: string }[] = [];
       for (const entry of compare.commits) {
         if (!entry || typeof entry !== "object") return null;
         const commit = entry as {
@@ -111,9 +124,15 @@ export function createMergeGroupGitHubReader(
           typeof commit.commit?.message !== "string"
         )
           return null;
+        const parents: string[] = [];
+        for (const parent of commit.parents) {
+          const parentSha = (parent as { sha?: unknown } | null)?.sha;
+          if (typeof parentSha !== "string") return null;
+          parents.push(parentSha.toLowerCase());
+        }
         commits.push({
           sha: commit.sha,
-          parents: commit.parents.length,
+          parents,
           message: commit.commit.message,
         });
       }
@@ -122,6 +141,55 @@ export function createMergeGroupGitHubReader(
           ? compare.total_commits
           : commits.length;
       return { truncated: total > commits.length, commits };
+    },
+    async getMergeBase(baseSha, headSha) {
+      if (!FULL_SHA.test(baseSha) || !FULL_SHA.test(headSha)) return null;
+      let raw: unknown;
+      try {
+        raw = await request<unknown>(`/compare/${baseSha}...${headSha}`);
+      } catch {
+        return null;
+      }
+      const mergeBase = (
+        raw as { merge_base_commit?: { sha?: unknown } } | null
+      )?.merge_base_commit?.sha;
+      return typeof mergeBase === "string" && FULL_SHA.test(mergeBase)
+        ? mergeBase.toLowerCase()
+        : null;
+    },
+    async getRefSha(groupRef) {
+      const segments = groupRef.startsWith("refs/heads/")
+        ? groupRef.slice("refs/heads/".length).split("/")
+        : null;
+      if (
+        !segments ||
+        !segments.every(
+          (segment) =>
+            REF_SEGMENT.test(segment) && segment !== "." && segment !== "..",
+        )
+      )
+        return null;
+      let raw: unknown;
+      try {
+        raw = await request<unknown>(
+          `/git/ref/heads/${segments.map(encodeURIComponent).join("/")}`,
+        );
+      } catch {
+        return null;
+      }
+      const ref = raw as {
+        ref?: unknown;
+        object?: { sha?: unknown; type?: unknown };
+      } | null;
+      if (
+        !ref ||
+        ref.ref !== groupRef ||
+        ref.object?.type !== "commit" ||
+        typeof ref.object.sha !== "string" ||
+        !FULL_SHA.test(ref.object.sha)
+      )
+        return null;
+      return ref.object.sha.toLowerCase();
     },
     async getTree(sha) {
       let raw: unknown;
@@ -167,8 +235,12 @@ export function createMergeGroupGitHubReader(
         return null;
       }
       if (!raw || typeof raw !== "object") return null;
-      const { check_runs: runs } = raw as { check_runs?: unknown };
-      if (!Array.isArray(runs)) return null;
+      const { check_runs: runs, total_count: total } = raw as {
+        check_runs?: unknown;
+        total_count?: unknown;
+      };
+      if (!Array.isArray(runs) || !completeCheckRunPage(total, runs.length))
+        return null;
       const checks: {
         appId: string;
         externalId: string;
@@ -204,12 +276,68 @@ export function createMergeGroupGitHubReader(
   };
 }
 
+/** A check-run page is only evidence when the provider-reported total is an
+ * integer that exactly matches this single page. A missing, malformed, short
+ * or paginated total means unseen runs may exist: never "no success". */
+function completeCheckRunPage(total: unknown, returned: number): boolean {
+  return (
+    typeof total === "number" &&
+    Number.isInteger(total) &&
+    total >= 0 &&
+    total <= CHECK_RUN_PAGE &&
+    total === returned
+  );
+}
+
 export type MergeGroupCheckRunRef = {
   id: number;
   status: string;
   externalId: string;
   appId: string;
 };
+
+/** Strict listing of the Paperclip Review runs on the group head. Throws when
+ * the listing is unavailable, malformed or truncated so the caller can never
+ * POST a duplicate on top of runs it could not see. */
+export async function readMergeGroupCheckRuns(
+  request: MergeGroupGitHubRequest,
+  groupSha: string,
+): Promise<MergeGroupCheckRunRef[]> {
+  const unavailable = () =>
+    new Error("carried check runs could not be listed completely");
+  const raw = await request<unknown>(
+    `/commits/${groupSha}/check-runs?check_name=Paperclip%20Review&per_page=${CHECK_RUN_PAGE}`,
+  );
+  if (!raw || typeof raw !== "object") throw unavailable();
+  const { check_runs: runs, total_count: total } = raw as {
+    check_runs?: unknown;
+    total_count?: unknown;
+  };
+  if (!Array.isArray(runs) || !completeCheckRunPage(total, runs.length))
+    throw unavailable();
+  return runs.map((entry): MergeGroupCheckRunRef => {
+    const run = entry as {
+      id?: unknown;
+      status?: unknown;
+      external_id?: unknown;
+      app?: { id?: unknown };
+    } | null;
+    if (
+      !run ||
+      typeof run.id !== "number" ||
+      !Number.isInteger(run.id) ||
+      typeof run.status !== "string" ||
+      typeof run.external_id !== "string"
+    )
+      throw unavailable();
+    return {
+      id: run.id,
+      status: run.status,
+      externalId: run.external_id,
+      appId: String(run.app?.id ?? ""),
+    };
+  });
+}
 
 export type MergeGroupCheckPublication = {
   method: "POST" | "PATCH";
@@ -341,7 +469,13 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
         },
         updatedAt: new Date(),
       })
-      .where(eq(chatActions.id, id));
+      // Never regress an action another owner already finished.
+      .where(
+        and(
+          eq(chatActions.id, id),
+          inArray(chatActions.status, ["received", "failed"]),
+        ),
+      );
   }
 
   async function dispatch(id: string) {
@@ -372,290 +506,236 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       await failAction(id, "carry_payload_invalid", 1, false);
       return;
     }
-    let attempts = Number(
+    const prior = Number(
       (action.result as { attempts?: unknown } | null)?.attempts ?? 0,
     );
     try {
-      const [source] = await db
-        .select({
-          endpoint: chatEndpoints,
-          resource: chatEndpointResources,
-          configuration: chatGitHubConfigurations.configuration,
-          companyPrefix: companies.issuePrefix,
-        })
-        .from(chatEndpoints)
-        .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
-        .innerJoin(
-          chatGitHubConfigurations,
-          eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
-        )
-        .innerJoin(
-          chatEndpointResources,
-          eq(chatEndpointResources.endpointId, chatEndpoints.id),
-        )
-        .where(
-          and(
-            eq(chatEndpoints.id, action.endpointId),
-            eq(chatEndpoints.companyId, action.companyId),
-            eq(chatEndpointResources.providerResourceId, ctx.repository),
-          ),
-        );
-      if (
-        !source ||
-        !["active", "verifying"].includes(source.endpoint.status) ||
-        !source.resource.enabled ||
-        source.resource.availability !== "available" ||
-        String(source.resource.metadata?.providerRepositoryId) !==
-          ctx.repositoryId ||
-        ((source.endpoint.setup as { runtimeGeneration?: number })
-          .runtimeGeneration ?? 0) !== payload.runtimeGeneration
-      ) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "cancelled",
-            result: { code: "connection_changed" },
-            updatedAt: new Date(),
-          })
-          .where(eq(chatActions.id, id));
-        return;
-      }
-      if (!mergeGroupCarryEnabled(source.configuration)) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "cancelled",
-            result: { code: "carry_disabled" },
-            updatedAt: new Date(),
-          })
-          .where(eq(chatActions.id, id));
-        return;
-      }
-      if (payload.admitted === false) {
-        await db
-          .update(chatActions)
-          .set({
-            status: "cancelled",
-            result: { code: "not_admitted", reason: payload.reason ?? null },
-            updatedAt: new Date(),
-          })
-          .where(eq(chatActions.id, id));
-        return;
-      }
-
-      const externalId = mergeGroupCarryExternalId(
-        action.endpointId,
-        ctx.groupSha,
-      );
-      const [claimed] = await db
-        .insert(chatGithubCarryRuns)
-        .values({
+      // One writer per endpoint/repo/group across deliveries and processes. A
+      // crashed owner's lease expires and the action is retried by the outbox.
+      await withGitHubPublicationLease(
+        db,
+        {
           companyId: action.companyId,
           endpointId: action.endpointId,
           repositoryId: ctx.repositoryId,
-          repository: ctx.repository,
-          groupSha: ctx.groupSha,
-          baseSha: ctx.baseSha,
-          heads: [],
-          deliveryId: ctx.deliveryId,
-          configurationRevision:
-            typeof payload.revision === "number" ? payload.revision : 0,
-          status: "processing",
-          externalId,
-        })
-        .onConflictDoNothing()
-        .returning({ id: chatGithubCarryRuns.id });
-      if (!claimed) {
-        const [existing] = await db
-          .select()
-          .from(chatGithubCarryRuns)
+          groupKey: ctx.groupSha,
+        },
+        fetchImpl,
+        (lease) => runLocked(lease, id, ctx, payload),
+      );
+    } catch (error) {
+      if (error instanceof GitHubPublicationLeaseLost) return;
+      const attempts = prior + 1;
+      const retryable = attempts < 8;
+      await failAction(id, "carry_publication_failed", attempts, retryable).catch(
+        () => {},
+      );
+      if (!retryable) {
+        await db
+          .update(chatGithubCarryRuns)
+          .set({ status: "failed", updatedAt: new Date() })
           .where(
             and(
               eq(chatGithubCarryRuns.endpointId, action.endpointId),
               eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
+              ne(chatGithubCarryRuns.status, "processed"),
             ),
           )
-          .limit(1);
-        if (existing?.status === "processed") {
-          // Same group key already has a verdict: return it without new writes.
-          await db
-            .update(chatActions)
-            .set({
-              status: "processed",
-              result: {
-                code: existing.code,
-                carryRunId: existing.id,
-                replayed: true,
-              },
-              updatedAt: new Date(),
-            })
-            .where(eq(chatActions.id, id));
-          return;
-        }
-        if (existing?.status === "processing") return;
-        if (existing) {
-          await db
-            .update(chatGithubCarryRuns)
-            .set({ status: "processing", updatedAt: new Date() })
-            .where(eq(chatGithubCarryRuns.id, existing.id));
-        }
+          .catch(() => {});
       }
+    }
+  }
 
-      const token = await githubBotRepositoryToken(
-        db,
-        action.companyId,
-        action.endpointId,
-        ctx.repositoryId,
-        fetchImpl,
+  async function runLocked(
+    lease: PublicationLease,
+    id: string,
+    ctx: MergeGroupContext,
+    payload: { admitted?: boolean; reason?: string; runtimeGeneration?: number },
+  ) {
+    // Re-read under the lease: another delivery may have finished first.
+    const [action] = await db
+      .select()
+      .from(chatActions)
+      .where(eq(chatActions.id, id))
+      .limit(1);
+    if (!action || ["processed", "cancelled"].includes(action.status)) return;
+    const settle = (
+      status: "processed" | "cancelled",
+      result: Record<string, unknown>,
+    ) =>
+      lease.commit(async (tx) => {
+        await tx
+          .update(chatActions)
+          .set({ status, result, updatedAt: new Date() })
+          .where(eq(chatActions.id, id));
+      });
+
+    const [source] = await db
+      .select({
+        endpoint: chatEndpoints,
+        resource: chatEndpointResources,
+        configuration: chatGitHubConfigurations.configuration,
+        revision: chatGitHubConfigurations.revision,
+        companyPrefix: companies.issuePrefix,
+      })
+      .from(chatEndpoints)
+      .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
+      .innerJoin(
+        chatGitHubConfigurations,
+        eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
+      )
+      .innerJoin(
+        chatEndpointResources,
+        eq(chatEndpointResources.endpointId, chatEndpoints.id),
+      )
+      .where(
+        and(
+          eq(chatEndpoints.id, action.endpointId),
+          eq(chatEndpoints.companyId, action.companyId),
+          eq(chatEndpointResources.providerResourceId, ctx.repository),
+        ),
       );
-      const prefix = `/repos/${ctx.repository.split("/").map(encodeURIComponent).join("/")}`;
-      const request: MergeGroupGitHubRequest = <T,>(
-        path: string,
-        options?: { method?: string; body?: unknown },
-      ) => githubBotRequest<T>(fetchImpl, token, `${prefix}${path}`, options);
-      const github = createMergeGroupGitHubReader(request);
-      const cache = new Map<string, Promise<unknown>>();
-      const cached: MergeGroupGitHub = {
-        getPull: (n) => {
-          const key = `pull:${n}`;
-          if (!cache.has(key)) cache.set(key, github.getPull(n));
-          return cache.get(key) as ReturnType<MergeGroupGitHub["getPull"]>;
-        },
-        getCompare: (base, head) => {
-          const key = `compare:${base}:${head}`;
-          if (!cache.has(key)) cache.set(key, github.getCompare(base, head));
-          return cache.get(key) as ReturnType<MergeGroupGitHub["getCompare"]>;
-        },
-        getTree: (sha) => {
-          const key = `tree:${sha}`;
-          if (!cache.has(key)) cache.set(key, github.getTree(sha));
-          return cache.get(key) as ReturnType<MergeGroupGitHub["getTree"]>;
-        },
-        listReviewChecks: (sha) => {
-          const key = `checks:${sha}`;
-          if (!cache.has(key)) cache.set(key, github.listReviewChecks(sha));
-          return cache.get(key) as ReturnType<
-            MergeGroupGitHub["listReviewChecks"]
-          >;
-        },
-      };
+    if (
+      !source ||
+      !["active", "verifying"].includes(source.endpoint.status) ||
+      !source.resource.enabled ||
+      source.resource.availability !== "available" ||
+      String(source.resource.metadata?.providerRepositoryId) !==
+        ctx.repositoryId ||
+      ((source.endpoint.setup as { runtimeGeneration?: number })
+        .runtimeGeneration ?? 0) !== payload.runtimeGeneration
+    ) {
+      await settle("cancelled", { code: "connection_changed" });
+      return;
+    }
+    if (!mergeGroupCarryEnabled(source.configuration)) {
+      await settle("cancelled", { code: "carry_disabled" });
+      return;
+    }
+    if (payload.admitted === false) {
+      await settle("cancelled", {
+        code: "not_admitted",
+        reason: payload.reason ?? null,
+      });
+      return;
+    }
 
-      // Discover the queued set once so the review lookup and the decision
-      // observe identical evidence; tree ownership (not enumeration) is proof.
-      const refPrs = parseMergeGroupQueuedPrs(ctx.groupRef) ?? [];
-      const compare = await cached.getCompare(ctx.baseSha, ctx.groupSha);
-      const commitPrs = new Set<number>();
-      for (const commit of compare?.commits ?? []) {
-        const firstLine = commit.message.split("\n", 1)[0] ?? "";
-        const merge = /^Merge pull request #(\d{1,9}) from \S+/.exec(firstLine);
-        if (merge && commit.parents === 2) {
-          commitPrs.add(Number(merge[1]));
-          continue;
-        }
-        const squash = /\(#(\d{1,9})\)\s*$/.exec(firstLine);
-        if (squash && commit.parents === 1) commitPrs.add(Number(squash[1]));
-      }
-      const pullNumbers = new Set<number>();
-      for (const pr of refPrs) pullNumbers.add(pr.pullNumber);
-      for (const n of commitPrs) pullNumbers.add(n);
-
-      const confirmed = new Map<number, { headSha: string }>();
-      for (const n of [...pullNumbers].sort((a, b) => a - b)) {
-        const pull = await cached.getPull(n);
-        if (pull) confirmed.set(n, { headSha: pull.headSha });
-      }
-      const reviewRows = await db
+    const externalId = mergeGroupCarryExternalId(
+      action.endpointId,
+      ctx.groupSha,
+    );
+    const [claimed] = await db
+      .insert(chatGithubCarryRuns)
+      .values({
+        companyId: action.companyId,
+        endpointId: action.endpointId,
+        repositoryId: ctx.repositoryId,
+        repository: ctx.repository,
+        groupSha: ctx.groupSha,
+        baseSha: ctx.baseSha,
+        heads: [],
+        deliveryId: ctx.deliveryId,
+        configurationRevision: source.revision,
+        status: "processing",
+        externalId,
+      })
+      .onConflictDoNothing()
+      .returning({ id: chatGithubCarryRuns.id });
+    if (!claimed) {
+      const [existing] = await db
         .select()
-        .from(chatGitHubReviews)
+        .from(chatGithubCarryRuns)
         .where(
           and(
-            eq(chatGitHubReviews.endpointId, action.endpointId),
-            eq(chatGitHubReviews.repositoryId, ctx.repositoryId),
+            eq(chatGithubCarryRuns.endpointId, action.endpointId),
+            eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
           ),
         )
-        .orderBy(desc(chatGitHubReviews.createdAt))
-        .limit(500);
-      const reviews: MergeGroupReviewRecord[] = [];
-      for (const [pullNumber, head] of confirmed) {
-        const row = reviewRows.find(
-          (candidate) =>
-            candidate.pullNumber === pullNumber &&
-            candidate.headSha.toLowerCase() === head.headSha.toLowerCase(),
-        );
-        if (row) reviews.push(toReviewRecord(row));
+        .limit(1);
+      if (
+        existing?.status === "processed" &&
+        existing.configurationRevision === source.revision
+      ) {
+        // Same group, same policy, already published: no new provider write.
+        await settle("processed", {
+          code: existing.code,
+          carryRunId: existing.id,
+          replayed: true,
+        });
+        return;
       }
+      // processing/failed/cancelled rows are a prior owner that never
+      // finished (the lease proves it is gone); a processed row under an
+      // older policy revision is re-judged. Take it over.
+      if (existing)
+        await lease.commit(async (tx) => {
+          await tx
+            .update(chatGithubCarryRuns)
+            .set({
+              status: "processing",
+              configurationRevision: source.revision,
+              updatedAt: new Date(),
+            })
+            .where(eq(chatGithubCarryRuns.id, existing.id));
+        });
+    }
 
-      const appId = source.endpoint.botExternalId ?? "";
-      const input: MergeGroupCarryInput = {
-        endpointId: action.endpointId,
-        appId,
-        eventAgeMs: Date.now() - new Date(action.createdAt).getTime(),
-        maxEventAgeMs: MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS,
-        reviews,
-      };
-      const verdict = await decideMergeGroupCarry(ctx, cached, input);
+    const token = await githubBotRepositoryToken(
+      db,
+      action.companyId,
+      action.endpointId,
+      ctx.repositoryId,
+      lease.fetch,
+    );
+    const prefix = `/repos/${ctx.repository.split("/").map(encodeURIComponent).join("/")}`;
+    const request: MergeGroupGitHubRequest = <T,>(
+      path: string,
+      options?: { method?: string; body?: unknown },
+    ) => githubBotRequest<T>(lease.fetch, token, `${prefix}${path}`, options);
+    const appId = source.endpoint.botExternalId ?? "";
 
-      // Publication is idempotent by construction: an existing run carrying
-      // this key is adopted, so a crash between POST and row update replays
-      // into a PATCH instead of a duplicate run. The decision projection
-      // drops run ids, so the group head is listed raw to resolve ids here.
-      const rawGroupChecks = await request<{
-        check_runs?: Array<{
-          id?: unknown;
-          status?: unknown;
-          conclusion?: unknown;
-          external_id?: unknown;
-          app?: { id?: unknown };
-        }>;
-      }>(
-        `/commits/${ctx.groupSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
-      ).catch(() => null);
-      const existingChecks: MergeGroupCheckRunRef[] = [];
-      if (Array.isArray(rawGroupChecks?.check_runs)) {
-        for (const run of rawGroupChecks.check_runs) {
-          if (
-            typeof run?.id !== "number" ||
-            !Number.isInteger(run.id) ||
-            typeof run?.status !== "string" ||
-            typeof run?.external_id !== "string"
-          )
-            throw new Error("carried check runs could not be listed");
-          existingChecks.push({
-            id: run.id,
-            status: run.status,
-            externalId: run.external_id,
-            appId: String(run.app?.id ?? ""),
-          });
-        }
-      }
-      const origin = runtimePublicOrigin();
-      const detailsUrl = origin
-        ? `${origin}/${encodeURIComponent(source.companyPrefix)}/apps/chat/${action.endpointId}/reviews`
+    // Read the group head's existing runs first and strictly: an unavailable,
+    // malformed or truncated listing throws here and nothing is ever POSTed.
+    const existingChecks = await readMergeGroupCheckRuns(request, ctx.groupSha);
+
+    // Evidence is read fresh, uncached, immediately before the single write.
+    const evaluation = await evaluateCarry(request, action, ctx, appId);
+    if (!evaluation) {
+      await settle("cancelled", { code: "carry_disabled" });
+      return;
+    }
+    const { verdict } = evaluation;
+
+    const origin = runtimePublicOrigin();
+    const detailsUrl = origin
+      ? `${origin}/${encodeURIComponent(source.companyPrefix)}/apps/chat/${action.endpointId}/reviews`
+      : null;
+    const plan = planMergeGroupCheckPublication({
+      ctx,
+      endpointId: action.endpointId,
+      appId,
+      verdict,
+      existingChecks,
+      detailsUrl,
+    });
+    // A lost POST response replays into a PATCH of the run carrying this
+    // external id; the listing above is what makes that replay safe.
+    const posted = await request<{ id?: unknown }>(plan.path, {
+      method: plan.method,
+      body: plan.body,
+    });
+    const checkId =
+      typeof posted?.id === "number" || typeof posted?.id === "string"
+        ? String(posted.id)
         : null;
-      const plan = planMergeGroupCheckPublication({
-        ctx,
-        endpointId: action.endpointId,
-        appId,
-        verdict,
-        existingChecks,
-        detailsUrl,
-      });
-      const posted = await request<{ id?: unknown; html_url?: unknown }>(
-        plan.path,
-        { method: plan.method, body: plan.body },
-      );
-      const checkId =
-        typeof posted?.id === "number" || typeof posted?.id === "string"
-          ? String(posted.id)
-          : null;
 
-      await db
+    await lease.commit(async (tx) => {
+      await tx
         .update(chatGithubCarryRuns)
         .set({
           baseSha: ctx.baseSha,
           heads: verdict.ok ? verdict.carried : [],
-          configurationRevision:
-            typeof payload.revision === "number" ? payload.revision : 0,
+          configurationRevision: evaluation.revision,
           status: "processed",
           verdictOk: verdict.ok,
           code: verdict.code,
@@ -669,40 +749,106 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
             eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
           ),
         );
-      await db
+      await tx
         .update(chatActions)
         .set({
           status: "processed",
-          result: {
-            code: verdict.ok ? "carry" : verdict.code,
-            attempts: 0,
-          },
+          result: { code: verdict.ok ? "carry" : verdict.code, attempts: 0 },
           updatedAt: new Date(),
         })
         .where(eq(chatActions.id, id));
-    } catch (error) {
-      attempts++;
-      const retryable = attempts < 8;
-      await failAction(
-        id,
-        "carry_publication_failed",
-        attempts,
-        retryable,
-      ).catch(() => {});
-      if (!retryable) {
-        await db
-          .update(chatGithubCarryRuns)
-          .set({ status: "failed", updatedAt: new Date() })
-          .where(
-            and(
-              eq(chatGithubCarryRuns.endpointId, action.endpointId),
-              eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
-            ),
-          )
-          .catch(() => {});
-      }
-      void error;
+    });
+  }
+
+  /** One uncached evidence pass. Returns null when carry was disabled after
+   * admission. The policy revision is read at this moment, not at delivery. */
+  async function evaluateCarry(
+    request: MergeGroupGitHubRequest,
+    action: typeof chatActions.$inferSelect,
+    ctx: MergeGroupContext,
+    appId: string,
+  ): Promise<{ verdict: MergeGroupCarryVerdict; revision: number } | null> {
+    const [config] = await db
+      .select({
+        revision: chatGitHubConfigurations.revision,
+        configuration: chatGitHubConfigurations.configuration,
+      })
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, action.endpointId));
+    if (!config || !mergeGroupCarryEnabled(config.configuration)) return null;
+
+    const github = createMergeGroupGitHubReader(request);
+    const cache = new Map<string, Promise<unknown>>();
+    const memo = <K extends keyof MergeGroupGitHub>(
+      name: K,
+      key: string,
+      load: () => ReturnType<MergeGroupGitHub[K]>,
+    ) => {
+      const cacheKey = `${name}:${key}`;
+      if (!cache.has(cacheKey)) cache.set(cacheKey, load());
+      return cache.get(cacheKey) as ReturnType<MergeGroupGitHub[K]>;
+    };
+    // The cache only dedupes within this single pass.
+    const cached: MergeGroupGitHub = {
+      getPull: (n) => memo("getPull", String(n), () => github.getPull(n)),
+      getCompare: (base, head) =>
+        memo("getCompare", `${base}:${head}`, () => github.getCompare(base, head)),
+      getMergeBase: (base, head) =>
+        memo("getMergeBase", `${base}:${head}`, () =>
+          github.getMergeBase(base, head),
+        ),
+      getRefSha: (ref) => memo("getRefSha", ref, () => github.getRefSha(ref)),
+      getTree: (sha) => memo("getTree", sha, () => github.getTree(sha)),
+      listReviewChecks: (sha) =>
+        memo("listReviewChecks", sha, () => github.listReviewChecks(sha)),
+    };
+
+    // Discover the queued set once so the review lookup and the decision
+    // observe identical evidence; tree ownership (not enumeration) is proof.
+    const pullNumbers = new Set<number>();
+    for (const pr of parseMergeGroupQueuedPrs(ctx.groupRef) ?? [])
+      pullNumbers.add(pr.pullNumber);
+    const compare = await cached.getCompare(ctx.baseSha, ctx.groupSha);
+    for (const pr of prsFromCompareCommits(compare?.commits ?? []))
+      pullNumbers.add(pr.pullNumber);
+
+    const confirmed = new Map<number, { headSha: string }>();
+    for (const n of [...pullNumbers].sort((a, b) => a - b)) {
+      const pull = await cached.getPull(n);
+      if (pull) confirmed.set(n, { headSha: pull.headSha });
     }
+    const reviewRows = await db
+      .select()
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.endpointId, action.endpointId),
+          eq(chatGitHubReviews.repositoryId, ctx.repositoryId),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(500);
+    const reviews: MergeGroupReviewRecord[] = [];
+    for (const [pullNumber, head] of confirmed) {
+      const row = reviewRows.find(
+        (candidate) =>
+          candidate.pullNumber === pullNumber &&
+          candidate.headSha.toLowerCase() === head.headSha.toLowerCase(),
+      );
+      if (row) reviews.push(toReviewRecord(row));
+    }
+    const input: MergeGroupCarryInput = {
+      endpointId: action.endpointId,
+      appId,
+      eventAgeMs: Date.now() - new Date(action.createdAt).getTime(),
+      maxEventAgeMs: MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS,
+      configurationRevision: config.revision,
+      reviews,
+    };
+    return {
+      verdict: await decideMergeGroupCarry(ctx, cached, input),
+      revision: config.revision,
+    };
   }
 
   async function processPending(limit = 10) {

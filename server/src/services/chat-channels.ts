@@ -6311,6 +6311,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ...REQUIRED_GITHUB_EVENTS,
         ...UNAVOIDABLE_GITHUB_EVENTS,
         "pull_request",
+        // Opt-in merge-queue review carry; not required for any App. It needs
+        // merge_group + contents:read + checks:write on the review App.
+        "merge_group",
       ]);
       const excessiveEvents = [...configuredEvents].filter(
         (event) => !allowedEvents.has(event),

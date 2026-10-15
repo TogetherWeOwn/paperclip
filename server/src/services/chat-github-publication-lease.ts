@@ -11,7 +11,7 @@ export class GitHubPublicationLeaseLost extends Error {
   }
 }
 
-/** Serialize provider writes for one PR without holding a database connection
+/** Serialize provider writes for one PR (or one merge group) without holding a database connection
  * during network I/O. A crashed worker leaves the existing outbox retryable.
  * The token fences receipt commits; losing renewal aborts in-flight requests.
  * Provider markers still recover a write whose response was lost. */
@@ -21,8 +21,7 @@ export async function withGitHubPublicationLease<T>(
     companyId: string;
     endpointId: string;
     repositoryId: string;
-    number: number;
-  },
+  } & ({ number: number } | { groupKey: string }),
   fetchImpl: typeof fetch,
   operation: (lease: {
     fetch: typeof fetch;
@@ -30,7 +29,11 @@ export async function withGitHubPublicationLease<T>(
   }) => Promise<T>,
 ): Promise<T | undefined> {
   const token = randomUUID();
-  const leaseKey = `github-publication:${scope.repositoryId}:${scope.number}`;
+  // PR keys are unchanged; merge-group keys live in a disjoint namespace.
+  const leaseKey =
+    "groupKey" in scope
+      ? `github-publication:${scope.repositoryId}:merge-group:${scope.groupKey}`
+      : `github-publication:${scope.repositoryId}:${scope.number}`;
   const expiresAt = sql`now() + interval '90 seconds'`;
   const [claimed] = await db
     .insert(chatEndpointLeases)

@@ -5,6 +5,7 @@ import {
   mergeGroupCarryExternalId,
   parseMergeGroupEvent,
   parseMergeGroupQueuedPrs,
+  verifyMergeGroupTreeOwnership,
   sameMergeGroupCarryFingerprint,
   type MergeGroupCarryInput,
   type MergeGroupContext,
@@ -14,7 +15,7 @@ import {
 
 const ENDPOINT = "endpoint-1";
 const APP_ID = "5191093";
-const REPO = "togetherweown/nntunev2";
+const REPO = "example-org/example-repo";
 const REPO_ID = "987654321";
 
 const HEAD_A = "a".repeat(40);
@@ -22,6 +23,10 @@ const HEAD_B = "b".repeat(40);
 const BASE_NEW = "c".repeat(40);
 const BASE_OLD = "d".repeat(40);
 const GROUP = "e".repeat(40);
+/** Real queue form: the ref suffix and the group commit's single parent are
+ * the previous queue state (base or earlier group), never the PR head. */
+const PARENT = "6".repeat(40);
+const GROUP_REF = `refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`;
 
 function context(overrides: Partial<MergeGroupContext> = {}): MergeGroupContext {
   return {
@@ -29,7 +34,7 @@ function context(overrides: Partial<MergeGroupContext> = {}): MergeGroupContext 
     repositoryId: REPO_ID,
     repository: REPO,
     groupSha: GROUP,
-    groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 12)}`,
+    groupRef: GROUP_REF,
     baseSha: BASE_NEW,
     baseRef: "refs/heads/main",
     installationId: "167976984",
@@ -58,6 +63,7 @@ function input(overrides: Partial<MergeGroupCarryInput> = {}): MergeGroupCarryIn
     appId: APP_ID,
     eventAgeMs: 1_000,
     maxEventAgeMs: 30 * 60_000,
+    configurationRevision: 3,
     reviews: [review()],
     ...overrides,
   };
@@ -95,11 +101,13 @@ function github(overrides: Partial<MergeGroupGitHub> = {}): MergeGroupGitHub {
       commits: [
         {
           sha: GROUP,
-          parents: 2,
-          message: "Merge pull request #12 from alice/feature",
+          parents: [PARENT],
+          message: "docs: queued change (#12)",
         },
       ],
     }),
+    getMergeBase: async () => BASE_OLD,
+    getRefSha: async () => GROUP,
     getTree: async (sha: string) => {
       if (sha === GROUP)
         return tree(GROUP, [
@@ -138,12 +146,12 @@ function github(overrides: Partial<MergeGroupGitHub> = {}): MergeGroupGitHub {
 function webhookPayload(overrides: Record<string, unknown> = {}) {
   return {
     action: "checks_requested",
-    repository: { id: 987654321, full_name: "TogetherWeOwn/nntunev2" },
+    repository: { id: 987654321, full_name: "Example-Org/example-repo" },
     installation: { id: 167976984 },
     sender: { id: 42, login: "github-merge-queue[bot]" },
     merge_group: {
       head_sha: GROUP,
-      head_ref: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 12)}`,
+      head_ref: GROUP_REF,
       base_sha: BASE_NEW,
       base_ref: "refs/heads/main",
       head_commit: { id: GROUP, message: "Merge branch" },
@@ -160,7 +168,7 @@ describe("parseMergeGroupEvent", () => {
       repositoryId: REPO_ID,
       repository: REPO,
       groupSha: GROUP,
-      groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 12)}`,
+      groupRef: GROUP_REF,
       baseSha: BASE_NEW,
       baseRef: "refs/heads/main",
       installationId: "167976984",
@@ -252,23 +260,196 @@ describe("decideMergeGroupCarry", () => {
     }
   });
 
-  it("fails closed on a stale head (PR moved after the group was cut)", async () => {
-    const moved = HEAD_B;
+  it("pins the group to the real queue form, where the ref suffix is the parent and not the PR head", async () => {
+    expect(PARENT.startsWith(HEAD_A.slice(0, 12))).toBe(false);
+    const verdict = await decideMergeGroupCarry(context(), github(), input());
+    expect(verdict.ok).toBe(true);
+
+    const wrongParent = await decideMergeGroupCarry(
+      context({
+        groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${"5".repeat(40)}`,
+      }),
+      github(),
+      input(),
+    );
+    expect(wrongParent.ok).toBe(false);
+    expect(wrongParent.code).toBe("ambiguous_group");
+
+    const notTheGroup = await decideMergeGroupCarry(
+      context(),
+      github({
+        getCompare: async () => ({
+          truncated: false,
+          commits: [
+            { sha: "1".repeat(40), parents: [PARENT], message: "docs (#12)" },
+          ],
+        }),
+      }),
+      input(),
+    );
+    expect(notTheGroup.ok).toBe(false);
+    expect(notTheGroup.code).toBe("ambiguous_group");
+  });
+
+  it("fails closed when the live queue ref no longer resolves to the group sha", async () => {
+    const regenerated = await decideMergeGroupCarry(
+      context(),
+      github({ getRefSha: async () => "9".repeat(40) }),
+      input(),
+    );
+    expect(regenerated.ok).toBe(false);
+    expect(regenerated.code).toBe("stale_head");
+    const unreadable = await decideMergeGroupCarry(
+      context(),
+      github({ getRefSha: async () => null }),
+      input(),
+    );
+    expect(unreadable.ok).toBe(false);
+    expect(unreadable.code).toBe("evidence_unavailable");
+    const threw = await decideMergeGroupCarry(
+      context(),
+      github({
+        getRefSha: async () => {
+          throw new Error("boom");
+        },
+      }),
+      input(),
+    );
+    expect(threw.code).toBe("evidence_unavailable");
+  });
+
+  it("pins merge-method groups to the immutable second parent", async () => {
+    const mergeCompare = (second: string) => async () => ({
+      truncated: false,
+      commits: [
+        {
+          sha: GROUP,
+          parents: [PARENT, second],
+          message: "Merge pull request #12 from alice/feature",
+        },
+      ],
+    });
+    const pinned = await decideMergeGroupCarry(
+      context(),
+      github({ getCompare: mergeCompare(HEAD_A) }),
+      input(),
+    );
+    expect(pinned.ok).toBe(true);
+    const moved = await decideMergeGroupCarry(
+      context(),
+      github({ getCompare: mergeCompare(HEAD_B) }),
+      input(),
+    );
+    expect(moved.ok).toBe(false);
+    expect(moved.code).toBe("stale_head");
+  });
+
+  it("fails closed when a squashed head moved to different content", async () => {
     const verdict = await decideMergeGroupCarry(
       context(),
       github({
         getPull: async () => ({
           number: 12,
-          headSha: moved,
+          headSha: HEAD_B,
           baseSha: BASE_OLD,
           state: "open",
           merged: false,
         }),
+        getTree: async (sha: string) =>
+          sha === HEAD_B
+            ? tree(HEAD_B, [
+                ["src/a.ts", "7".repeat(40)],
+                ["src/b.ts", OTHER],
+              ])
+            : github().getTree(sha),
+        listReviewChecks: async () => [
+          {
+            appId: APP_ID,
+            externalId: `${ENDPOINT}:12:${HEAD_B}`,
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
+      }),
+      input({ reviews: [review({ headSha: HEAD_B })] }),
+    );
+    expect(verdict.ok).toBe(false);
+    expect(verdict.code).toBe("nonempty_delta");
+  });
+
+  it("fails closed when a queued pull request is closed or already merged", async () => {
+    for (const patch of [{ state: "closed" }, { merged: true }]) {
+      const verdict = await decideMergeGroupCarry(
+        context(),
+        github({
+          getPull: async () => ({
+            number: 12,
+            headSha: HEAD_A,
+            baseSha: BASE_OLD,
+            state: "open",
+            merged: false,
+            ...patch,
+          }),
+        }),
+        input(),
+      );
+      expect(verdict.ok).toBe(false);
+      expect(verdict.code).toBe("stale_head");
+    }
+  });
+
+  it("fails closed when the review came from an obsolete policy revision", async () => {
+    for (const revision of [2, 4]) {
+      const verdict = await decideMergeGroupCarry(
+        context(),
+        github(),
+        input({ reviews: [review({ configurationRevision: revision })] }),
+      );
+      expect(verdict.ok).toBe(false);
+      expect(verdict.code).toBe("stale_policy");
+      expect(verdict).toMatchObject({ failedPullNumber: 12 });
+    }
+    const current = await decideMergeGroupCarry(
+      context(),
+      github(),
+      input({ configurationRevision: 9, reviews: [review({ configurationRevision: 9 })] }),
+    );
+    expect(current.ok).toBe(true);
+  });
+
+  it("diffs each pull request against its merge base, not the moving target tip", async () => {
+    const drift = "5".repeat(40);
+    const verdict = await decideMergeGroupCarry(
+      context(),
+      github({
+        getPull: async () => ({
+          number: 12,
+          headSha: HEAD_A,
+          baseSha: BASE_NEW,
+          state: "open",
+          merged: false,
+        }),
+        getMergeBase: async (baseSha: string, headSha: string) =>
+          baseSha === BASE_NEW && headSha === HEAD_A ? BASE_OLD : null,
+        getTree: async (sha: string) => {
+          if (sha === GROUP || sha === BASE_NEW)
+            return tree(sha, [
+              ["src/a.ts", sha === GROUP ? FILE_V2 : FILE],
+              ["src/b.ts", drift],
+            ]);
+          return github().getTree(sha);
+        },
       }),
       input(),
     );
-    expect(verdict.ok).toBe(false);
-    expect(verdict.code).toBe("stale_head");
+    expect(verdict.ok).toBe(true);
+    const noMergeBase = await decideMergeGroupCarry(
+      context(),
+      github({ getMergeBase: async () => null }),
+      input(),
+    );
+    expect(noMergeBase.ok).toBe(false);
+    expect(noMergeBase.code).toBe("evidence_unavailable");
   });
 
   it("fails closed when the live success check run is absent on the head", async () => {
@@ -325,7 +506,7 @@ describe("decideMergeGroupCarry", () => {
 
   it("carries a multi-PR group when every head is reviewed and trees partition", async () => {
     const ctx = context({
-      groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 8)}-pr-13-${HEAD_B.slice(0, 8)}`,
+      groupRef: `refs/heads/gh-readonly-queue/main/pr-13-${"1".repeat(40)}`,
     });
     const gh = github({
       getPull: async (n: number) =>
@@ -335,8 +516,8 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
-          { sha: "1".repeat(40), parents: 2, message: "Merge pull request #12 from alice/a" },
-          { sha: GROUP, parents: 2, message: "Merge pull request #13 from bob/b" },
+          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
+          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
         ],
       }),
       getTree: async (sha: string) => {
@@ -389,7 +570,7 @@ describe("decideMergeGroupCarry", () => {
 
   it("fails closed when two queued PRs touch the same file", async () => {
     const ctx = context({
-      groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 8)}-pr-13-${HEAD_B.slice(0, 8)}`,
+      groupRef: `refs/heads/gh-readonly-queue/main/pr-13-${"1".repeat(40)}`,
     });
     const gh = github({
       getPull: async (n: number) =>
@@ -399,8 +580,8 @@ describe("decideMergeGroupCarry", () => {
       getCompare: async () => ({
         truncated: false,
         commits: [
-          { sha: "1".repeat(40), parents: 2, message: "Merge pull request #12 from alice/a" },
-          { sha: GROUP, parents: 2, message: "Merge pull request #13 from bob/b" },
+          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
+          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
         ],
       }),
       getTree: async (sha: string) => {
@@ -429,6 +610,73 @@ describe("decideMergeGroupCarry", () => {
     );
     expect(verdict.ok).toBe(false);
     expect(verdict.code).toBe("pr_overlap");
+  });
+
+  it("ignores directory tree nodes so disjoint files under one directory do not overlap", async () => {
+    const dir = (sha: string, dirSha: string) => {
+      const base = tree(sha, []);
+      return {
+        ...base,
+        entries: [
+          { path: "src", mode: "040000", type: "tree", sha: dirSha },
+          ...base.entries,
+        ],
+      };
+    };
+    const ctx = context({
+      groupRef: `refs/heads/gh-readonly-queue/main/pr-13-${"1".repeat(40)}`,
+    });
+    const gh = github({
+      getPull: async (n: number) => ({
+        number: n,
+        headSha: n === 12 ? HEAD_A : HEAD_B,
+        baseSha: BASE_OLD,
+        state: "open",
+        merged: false,
+      }),
+      getCompare: async () => ({
+        truncated: false,
+        commits: [
+          { sha: "1".repeat(40), parents: [PARENT], message: "docs a (#12)" },
+          { sha: GROUP, parents: ["1".repeat(40)], message: "docs b (#13)" },
+        ],
+      }),
+      getTree: async (sha: string) => {
+        const file = (path: string, blob: string) => ({
+          path,
+          mode: "100644",
+          type: "blob",
+          sha: blob,
+        });
+        const withDir = (dirSha: string, files: ReturnType<typeof file>[]) => ({
+          ...dir(sha, dirSha),
+          entries: [...dir(sha, dirSha).entries, ...files],
+        });
+        if (sha === GROUP)
+          return withDir("t3", [file("src/a.ts", FILE_V2), file("src/c.ts", FILE_V2)]);
+        if (sha === HEAD_A)
+          return withDir("t1", [file("src/a.ts", FILE_V2), file("src/c.ts", FILE)]);
+        if (sha === HEAD_B)
+          return withDir("t2", [file("src/a.ts", FILE), file("src/c.ts", FILE_V2)]);
+        if (sha === BASE_OLD || sha === BASE_NEW)
+          return withDir("t0", [file("src/a.ts", FILE), file("src/c.ts", FILE)]);
+        return null;
+      },
+      listReviewChecks: async (headSha: string) => [
+        {
+          appId: APP_ID,
+          externalId: `${ENDPOINT}:${headSha === HEAD_A ? 12 : 13}:${headSha}`,
+          status: "completed",
+          conclusion: "success",
+        },
+      ],
+    });
+    const verdict = await decideMergeGroupCarry(
+      ctx,
+      gh,
+      input({ reviews: [review(), review({ pullNumber: 13, headSha: HEAD_B })] }),
+    );
+    expect(verdict.ok).toBe(true);
   });
 
   it("fails closed on truncated trees, failed lookups, and empty groups", async () => {
@@ -535,5 +783,121 @@ describe("mergeGroupCarryCheckBody", () => {
     expect(body.summary).toContain("#12");
     expect(body.summary).not.toContain("TOG-");
     expect(body.summary).not.toContain(ENDPOINT);
+  });
+});
+
+// Compact, sanitized reduction of a real squash queue group: base drift added
+// docs/queue-proof-a.md after the PR branched, the PR added
+// docs/queue-proof-c.md, and the shared "docs" directory hash differs in all
+// four trees. Only leaf blobs may decide ownership; directory nodes are noise.
+describe("real queue group tree shape", () => {
+  const sha = (char: string) => char.repeat(40);
+  const blob = (path: string, blobSha: string) => ({
+    path,
+    mode: "100644",
+    type: "blob",
+    sha: blobSha,
+  });
+  const dir = (path: string, dirSha: string) => ({
+    path,
+    mode: "040000",
+    type: "tree",
+    sha: dirSha,
+  });
+  const SRC = [dir("src", sha("1")), blob("src/main.ts", sha("2"))];
+  const A = blob("docs/queue-proof-a.md", sha("a"));
+  const C = blob("docs/queue-proof-c.md", sha("c"));
+  const trees: Record<string, ReturnType<typeof blob>[]> = {
+    [sha("d")]: [...SRC, dir("docs", sha("3")), A, C],
+    [sha("b")]: [...SRC, dir("docs", sha("4")), A],
+    [sha("e")]: [...SRC, dir("docs", sha("5")), C],
+    [sha("f")]: [...SRC, dir("docs", sha("6"))],
+  };
+  const PR = 21;
+
+  it("carries a squash group whose base drifted, ignoring directory nodes", async () => {
+    const verdict = await decideMergeGroupCarry(
+      context({
+        groupSha: sha("d"),
+        groupRef: `refs/heads/gh-readonly-queue/main/pr-${PR}-${sha("b")}`,
+        baseSha: sha("b"),
+      }),
+      github({
+        getPull: async () => ({
+          number: PR,
+          headSha: sha("e"),
+          baseSha: sha("9"),
+          state: "open",
+          merged: false,
+        }),
+        getCompare: async () => ({
+          truncated: false,
+          commits: [
+            {
+              sha: sha("d"),
+              parents: [sha("b")],
+              message: `queued change (#${PR})`,
+            },
+          ],
+        }),
+        getMergeBase: async () => sha("f"),
+        getRefSha: async () => sha("d"),
+        getTree: async (treeSha) =>
+          trees[treeSha]
+            ? { sha: treeSha, truncated: false, entries: trees[treeSha]! }
+            : null,
+        listReviewChecks: async () => [
+          {
+            appId: APP_ID,
+            externalId: `${ENDPOINT}:${PR}:${sha("e")}`,
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
+      }),
+      input({ reviews: [review({ pullNumber: PR, headSha: sha("e") })] }),
+    );
+    expect(verdict).toMatchObject({ ok: true, code: "carry" });
+  });
+});
+
+describe("verifyMergeGroupTreeOwnership directory nodes", () => {
+  const node = (path: string, type: string, sha: string) => ({
+    path,
+    mode: type === "tree" ? "040000" : "100644",
+    type,
+    sha,
+  });
+  const map = (entries: ReturnType<typeof node>[]) =>
+    new Map(entries.map((entry) => [entry.path, entry]));
+  it("ignores directory nodes passed directly by a caller", () => {
+    // Base drift touched docs/other.md; the PR only touched src/a.ts. The
+    // docs directory hash differs between group and PR trees, which is noise.
+    const result = verifyMergeGroupTreeOwnership({
+      groupTree: map([
+        node("docs", "tree", "1".repeat(40)),
+        node("docs/other.md", "blob", "2".repeat(40)),
+        node("src/a.ts", "blob", FILE_V2),
+      ]),
+      baseTree: map([
+        node("docs", "tree", "3".repeat(40)),
+        node("docs/other.md", "blob", "2".repeat(40)),
+        node("src/a.ts", "blob", FILE),
+      ]),
+      prs: [
+        {
+          pullNumber: 12,
+          baseTree: map([
+            node("docs", "tree", "4".repeat(40)),
+            node("src/a.ts", "blob", FILE),
+          ]),
+          headTree: map([
+            node("docs", "tree", "5".repeat(40)),
+            node("src/a.ts", "blob", FILE_V2),
+          ]),
+        },
+      ],
+    });
+    expect(result).toEqual({ ok: true });
   });
 });

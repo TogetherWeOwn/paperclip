@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createMergeGroupGitHubReader,
   mergeGroupCarryEnabled,
+  readMergeGroupCheckRuns,
   planMergeGroupCheckPublication,
   type MergeGroupCheckRunRef,
   type MergeGroupGitHubRequest,
@@ -13,9 +14,10 @@ import {
 
 const ENDPOINT = "endpoint-1";
 const APP_ID = "5191093";
-const REPO = "togetherweown/nntunev2";
+const REPO = "example-org/example-repo";
 const GROUP = "e".repeat(40);
 const HEAD_A = "a".repeat(40);
+const PARENT = "6".repeat(40);
 
 function context(): MergeGroupContext {
   return {
@@ -23,7 +25,7 @@ function context(): MergeGroupContext {
     repositoryId: "987654321",
     repository: REPO,
     groupSha: GROUP,
-    groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${HEAD_A.slice(0, 12)}`,
+    groupRef: `refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`,
     baseSha: "c".repeat(40),
     baseRef: "refs/heads/main",
     installationId: "167976984",
@@ -76,7 +78,7 @@ describe("createMergeGroupGitHubReader", () => {
         commits: [
           {
             sha: GROUP,
-            parents: [{ sha: "1".repeat(40) }, { sha: "2".repeat(40) }],
+            parents: [{ sha: PARENT }, { sha: HEAD_A }],
             commit: { message: "Merge pull request #12 from alice/feature" },
           },
         ],
@@ -86,7 +88,15 @@ describe("createMergeGroupGitHubReader", () => {
         truncated: false,
         tree: [treeEntry],
       },
+      [`/git/ref/heads/gh-readonly-queue/main/pr-12-${PARENT}`]: {
+        ref: `refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`,
+        object: { sha: GROUP, type: "commit" },
+      },
+      [`/compare/${"d".repeat(40)}...${HEAD_A}`]: {
+        merge_base_commit: { sha: "7".repeat(40) },
+      },
       "/commits/aaa/check-runs?check_name=Paperclip%20Review&per_page=100": {
+        total_count: 1,
         check_runs: [
           {
             id: 7,
@@ -109,9 +119,15 @@ describe("createMergeGroupGitHubReader", () => {
     expect(compare).toEqual({
       truncated: false,
       commits: [
-        { sha: GROUP, parents: 2, message: "Merge pull request #12 from alice/feature" },
+        {
+          sha: GROUP,
+          parents: [PARENT, HEAD_A],
+          message: "Merge pull request #12 from alice/feature",
+        },
       ],
     });
+    expect(await reader.getRefSha(`refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`)).toBe(GROUP);
+    expect(await reader.getMergeBase("d".repeat(40), HEAD_A)).toBe("7".repeat(40));
     expect(await reader.getTree("eee")).toEqual({
       sha: GROUP,
       truncated: false,
@@ -136,7 +152,7 @@ describe("createMergeGroupGitHubReader", () => {
         commits: [
           {
             sha: GROUP,
-            parents: [{ sha: "1".repeat(40) }],
+            parents: [{ sha: PARENT }],
             commit: { message: "squash (#12)" },
           },
         ],
@@ -160,6 +176,105 @@ describe("createMergeGroupGitHubReader", () => {
   });
 });
 
+describe("check-run evidence completeness", () => {
+  const run = (id: number, externalId = `${ENDPOINT}:12:${HEAD_A}`) => ({
+    id,
+    status: "completed",
+    conclusion: "success",
+    external_id: externalId,
+    app: { id: Number(APP_ID) },
+  });
+  const path = "/commits/aaa/check-runs?check_name=Paperclip%20Review&per_page=100";
+  function readerFor(value: unknown) {
+    const request: MergeGroupGitHubRequest = (async () =>
+      value) as MergeGroupGitHubRequest;
+    return createMergeGroupGitHubReader(request);
+  }
+
+  it("fails closed when total_count is missing, malformed, or exceeds the page", async () => {
+    expect(await readerFor({ check_runs: [run(1)] }).listReviewChecks("aaa")).toBeNull();
+    expect(
+      await readerFor({ total_count: "1", check_runs: [run(1)] }).listReviewChecks("aaa"),
+    ).toBeNull();
+    expect(
+      await readerFor({ total_count: -1, check_runs: [] }).listReviewChecks("aaa"),
+    ).toBeNull();
+    // 150 exist; only the first page was returned: truncated, never "no success".
+    expect(
+      await readerFor({ total_count: 150, check_runs: [run(1)] }).listReviewChecks("aaa"),
+    ).toBeNull();
+    // Fewer than the page claims is equally unreliable evidence.
+    expect(
+      await readerFor({ total_count: 0, check_runs: [run(1)] }).listReviewChecks("aaa"),
+    ).toBeNull();
+    expect(
+      await readerFor({ total_count: 1, check_runs: [run(1)] }).listReviewChecks("aaa"),
+    ).toHaveLength(1);
+    expect(path).toContain("per_page=100");
+  });
+
+  it("reads group check runs strictly and never degrades an error to an empty list", async () => {
+    const ok = await readMergeGroupCheckRuns(
+      (async () => ({
+        total_count: 1,
+        check_runs: [run(9, `carry:${ENDPOINT}:${GROUP}`)],
+      })) as MergeGroupGitHubRequest,
+      GROUP,
+    );
+    expect(ok).toEqual([
+      { id: 9, status: "completed", externalId: `carry:${ENDPOINT}:${GROUP}`, appId: APP_ID },
+    ]);
+    const bad: unknown[] = [
+      null,
+      "nope",
+      {},
+      { total_count: 1 },
+      { total_count: 1, check_runs: [{ ...run(1), id: "1" }] },
+      { total_count: 1, check_runs: [{ ...run(1), external_id: undefined }] },
+      { total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => run(i + 1)) },
+      { total_count: 2, check_runs: [run(1)] },
+    ];
+    for (const value of bad)
+      await expect(
+        readMergeGroupCheckRuns((async () => value) as MergeGroupGitHubRequest, GROUP),
+      ).rejects.toThrow(/could not be listed/);
+    await expect(
+      readMergeGroupCheckRuns(
+        (async () => {
+          throw new Error("HTTP 502");
+        }) as MergeGroupGitHubRequest,
+        GROUP,
+      ),
+    ).rejects.toThrow("HTTP 502");
+  });
+
+  it("rejects unsafe queue refs and merge-base inputs before any request", async () => {
+    const request = vi.fn(async () => ({}));
+    const reader = createMergeGroupGitHubReader(
+      request as unknown as MergeGroupGitHubRequest,
+    );
+    for (const ref of [
+      "refs/heads/../x",
+      "refs/tags/v1",
+      "refs/heads/a b",
+      "refs/heads/a//b",
+      "refs/heads/a?x=1",
+    ])
+      expect(await reader.getRefSha(ref)).toBeNull();
+    expect(await reader.getMergeBase("main", HEAD_A)).toBeNull();
+    expect(await reader.getMergeBase(HEAD_A, "x/../y")).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+    // A different ref in the body, or a non-commit object, is not the group.
+    const wrong = createMergeGroupGitHubReader((async () => ({
+      ref: "refs/heads/gh-readonly-queue/main/other",
+      object: { sha: GROUP, type: "commit" },
+    })) as MergeGroupGitHubRequest);
+    expect(
+      await wrong.getRefSha(`refs/heads/gh-readonly-queue/main/pr-12-${PARENT}`),
+    ).toBeNull();
+  });
+});
+
 describe("planMergeGroupCheckPublication", () => {
   const existing: MergeGroupCheckRunRef[] = [
     { id: 9, status: "completed", externalId: `carry:${ENDPOINT}:${GROUP}`, appId: APP_ID },
@@ -172,8 +287,10 @@ describe("planMergeGroupCheckPublication", () => {
         getPull: async () => ({ number: 12, headSha: HEAD_A, baseSha: "d".repeat(40), state: "open", merged: false }),
         getCompare: async () => ({
           truncated: false,
-          commits: [{ sha: GROUP, parents: 2, message: "Merge pull request #12 from alice/feature" }],
+          commits: [{ sha: GROUP, parents: [PARENT], message: "docs (#12)" }],
         }),
+        getMergeBase: async () => "d".repeat(40),
+        getRefSha: async () => GROUP,
         getTree: async (sha: string) =>
           sha === "c".repeat(40) || sha === "d".repeat(40)
             ? { sha, truncated: false, entries: [{ path: "src/a.ts", mode: "100644", type: "blob", sha: "f".repeat(40) }] }
@@ -187,6 +304,7 @@ describe("planMergeGroupCheckPublication", () => {
         appId: APP_ID,
         eventAgeMs: 1_000,
         maxEventAgeMs: 30 * 60_000,
+        configurationRevision: 3,
         reviews: [
           { pullNumber: 12, headSha: HEAD_A, state: "completed", complete: true, score: 5, conclusion: "success", configurationRevision: 3 },
         ],
@@ -236,6 +354,8 @@ describe("planMergeGroupCheckPublication", () => {
         getPull: async () => null,
         getCompare: async () => null,
         getTree: async () => null,
+        getMergeBase: async () => null,
+        getRefSha: async () => null,
         listReviewChecks: async () => [],
       },
       {
@@ -243,6 +363,7 @@ describe("planMergeGroupCheckPublication", () => {
         appId: APP_ID,
         eventAgeMs: 1_000,
         maxEventAgeMs: 30 * 60_000,
+        configurationRevision: 3,
         reviews: [],
       },
     );
