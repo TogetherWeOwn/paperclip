@@ -287,7 +287,7 @@ export function loadConfig(): Config {
       && Number.isFinite(workspaceReaperCooldownDaysRaw)
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
-      : 7;
+      : 1;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,

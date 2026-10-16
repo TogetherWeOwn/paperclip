@@ -575,7 +575,7 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked", "cancelled"]),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
@@ -611,12 +611,13 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }
