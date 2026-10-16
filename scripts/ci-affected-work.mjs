@@ -8,11 +8,10 @@ const KNOWN_SCOPES = ["docker", "smoke", "release", "workflows", "pr"];
 
 export function affectedWork(event, scope, files) {
   if (!KNOWN_SCOPES.includes(scope)) {
-    // Fail open: the changes job checks out this selector from the PR base,
-    // so a stale base predates scopes added later (e.g. "pr"). Throwing here
-    // fails the changes job and cascades to e2e/verify/ci-ok, and no push to
-    // the PR branch can fix it. Running the work is always safe, so an
-    // unknown scope warns and reports affected instead of throwing.
+    // Fail open if the caller's scope is newer than this trusted selector.
+    // Throwing fails the changes job and cascades to e2e/verify/ci-ok. Running
+    // the work is always safe, so an unknown scope warns and reports affected
+    // instead of throwing.
     console.warn(`Unknown CI scope: ${scope} - failing open to affected=true`);
     return true;
   }

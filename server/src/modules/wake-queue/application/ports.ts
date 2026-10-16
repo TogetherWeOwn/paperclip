@@ -429,6 +429,8 @@ export interface WakeAdmissionWriter {
       source: string;
       triggerDetail: string | null;
       payload: Record<string, unknown> | null;
+      /** Trigger wake reason, preserved on the receipt so coalesced demand stays attributable. */
+      requestedReason?: string | null;
       requestedByActorType: string | null;
       requestedByActorId: string | null;
       idempotencyKey: string | null;

@@ -881,6 +881,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         source: input.source,
         triggerDetail: input.triggerDetail,
         payload: input.payload,
+        // Keep the trigger reason on the receipt. The receipt row
+        // carries the mechanism reason (`issue_execution_same_name`), so
+        // without this the coalesced demand is unattributable in
+        // `agent_wakeup_requests` and before/after measurement is impossible.
+        requestedReason: input.reason ?? null,
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
         idempotencyKey: input.idempotencyKey,
@@ -916,10 +921,19 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           preserveExistingInteractionContinuation: true,
         },
       );
+      const carriedRequestedReason =
+        input.reason ??
+        readNonEmptyString(existingDeferred.payload.requestedReason);
       const mergedPayload = {
         ...existingDeferred.payload,
         ...(input.payload ?? {}),
         issueId: input.issueId,
+        // Latest trigger wins, so the deferred row stays
+        // attributable to the demand that most recently fed it. Omitted
+        // when unknown so the deferred payload shape is unchanged.
+        ...(carriedRequestedReason
+          ? { requestedReason: carriedRequestedReason }
+          : {}),
         [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
       };
       await deps.writer.mergeIntoExistingDeferredWake(scope, {
@@ -954,6 +968,10 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     const deferredPayload = {
       ...(input.payload ?? {}),
       issueId: input.issueId,
+      // Keep the trigger reason on the deferred row so held
+      // demand stays attributable in `agent_wakeup_requests`. Omitted when
+      // unknown so the deferred payload shape is unchanged.
+      ...(input.reason ? { requestedReason: input.reason } : {}),
       [DEFERRED_WAKE_CONTEXT_KEY]: input.contextSnapshot,
     };
     await deps.writer.insertNewDeferredWake(scope, {

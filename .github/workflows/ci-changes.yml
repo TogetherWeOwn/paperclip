@@ -23,8 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.ref || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout trusted classifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: master
+          path: .trusted-ci
+          sparse-checkout: scripts/ci-affected-work.mjs
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -41,4 +49,7 @@ jobs:
           CI_SCOPE: ${{ inputs.scope }}
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: node scripts/ci-affected-work.mjs
+        run: |
+          classifier=.trusted-ci/scripts/ci-affected-work.mjs
+          test -f "$classifier" || { echo "::error title=Trusted CI classifier missing::master has no $classifier; refusing to select work from the PR base"; exit 1; }
+          node "$classifier"

@@ -23,6 +23,21 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+## Affected PR CI
+
+The reusable `changes` job (`ci-changes.yml`, scope `pr`) selects work with
+`scripts/ci-affected-work.mjs`. Documentation-only PRs skip the heavy lanes,
+but policy always runs. Manifest, lockfile, pnpm configuration, patches, and
+`.github` changes run all lanes. Non-PR invocations select full work.
+
+The `ci / ci-ok` check (the `ci-ok` job in `pr-trusted.yml`, reported through
+the `ci` caller job in `pr.yml`) requires successful classification, policy,
+the existing `verify` and `e2e` aggregates, serialized-server suites, and
+canary verification. Only an explicit unaffected decision admits skipped heavy
+lanes. Adding `ci / ci-ok` does not change repository protection settings;
+that switch is a repo-admin step. It is distinct from Workflow Health's bare
+`ci-ok` check, which only aggregates `changes` and `validate`.
+
 ## Trusted PR Workflow
 
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
@@ -1450,11 +1465,12 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_ALERT_FILE=/path/to/failure-marker` lets external cron
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
-  terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
-  the work inside this window. The default is `7`. A value of `0` disables the
-  cooldown and restores immediate reaping. A negative or non-numeric value falls
-  back to the default.
+  terminal-workspace reaper waits after every card referencing an execution
+  workspace is terminal before it archives the workspace and deletes the worktree.
+  A person can reopen the work inside this window. The default is `1` day. A value
+  of `0` disables the cooldown and restores immediate reaping. A negative or
+  non-numeric value falls back to the default. Dirty, untracked, or undelivered
+  work is not deleted.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

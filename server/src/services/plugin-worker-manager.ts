@@ -66,6 +66,7 @@ import {
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
+import { runOutsideRequestAuditContext } from "./audit-context.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -3104,9 +3105,19 @@ export function createPluginWorkerHandle(
     setStatus("starting");
     stderrExcerpt = "";
 
-    const child = spawnProcess();
-    childProcess = child;
-    attachStdioHandlers(child);
+    // Fork and attach handlers outside the request audit context. The stdout
+    // readline handler and the exit handler are created here, so without this
+    // any worker started during a request (enable, restart, install) would
+    // capture that request's AsyncLocalStorage context and every later
+    // worker-to-host activity row would be stamped with the enabling human's
+    // provenance. This covers start, crash-restart and reinstall paths because
+    // they all funnel through startInternal.
+    const child = runOutsideRequestAuditContext(() => {
+      const spawned = spawnProcess();
+      childProcess = spawned;
+      attachStdioHandlers(spawned);
+      return spawned;
+    });
     startedAt = Date.now();
 
     // Send the initialize RPC call

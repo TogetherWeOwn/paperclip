@@ -54,6 +54,7 @@ import {
   REPO_ROOT,
 } from "../services/plugin-loader.js";
 import { logActivity } from "../services/activity-log.js";
+import { hashJsonValue } from "../services/audit-context.js";
 import { runBudgetSpentFraction } from "../services/budgets.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
@@ -2382,11 +2383,14 @@ export function pluginRoutes(
         { replaceAll: true },
       );
 
+      const previousConfig = await registry.getConfig(plugin.id, companyId);
       const result = await registry.upsertConfig(plugin.id, companyId, {
         companyId,
         configJson: body.configJson,
       });
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
+        configHashBefore: previousConfig ? hashJsonValue(previousConfig.configJson) : null,
+        configHashAfter: hashJsonValue(body.configJson),
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
         companyId,

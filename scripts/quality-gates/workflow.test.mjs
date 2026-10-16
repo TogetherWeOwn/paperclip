@@ -106,7 +106,8 @@ function runVerify(overrides = {}) {
     encoding: "utf8",
     env: {
       ...process.env,
-      FULL_CI: "true",
+      AFFECTED: "true",
+      CHANGES_RESULT: "success",
       POLICY_RESULT: "success",
       TYPECHECK_RELEASE_REGISTRY_RESULT: "success",
       GENERAL_TESTS_RESULT: "success",
@@ -140,7 +141,11 @@ test("policy decides gate availability from the merge base parent and fails clos
   assert.match(detectScript, /rev-list --parents/);
   assert.match(
     qualityGates,
-    /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
+    /^ {4}needs: \[gate, policy, changes\]$/m,
+  );
+  assert.match(
+    qualityGates,
+    /^ {4}if: \$\{\{ needs\.changes\.outputs\.affected == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
   );
   assert.doesNotMatch(qualityGates, /steps\.detect_gates/);
   assert.match(

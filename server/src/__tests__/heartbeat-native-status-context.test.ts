@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { mergeCoalescedContextSnapshot } from "../services/heartbeat.ts";
+import {
+  WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS,
+  WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+} from "../modules/run-dispatch/domain/wake-context.ts";
 
 describe("native status wake context provenance", () => {
   it("preserves a verified chat source when status control flow coalesces into the run", () => {
@@ -118,5 +122,21 @@ describe("native status wake context provenance", () => {
     const merged = mergeCoalescedContextSnapshot({}, reviewedContext);
     expect(merged.paperclipExternalChatExecutionBound).toBeUndefined();
     expect(merged.paperclipWake).toBeUndefined();
+  });
+
+  it("caps coalesced wake comment ids to the snapshot budget", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeCommentIds: ["comment-0"] },
+      {
+        issueId: "issue-1",
+        wakeReason: "issue_commented",
+        wakeCommentIds: Array.from({ length: 1000 }, (_, i) => `comment-${i}-${"0".repeat(32)}`),
+      },
+    );
+    expect(merged.wakeCommentIds as string[]).toHaveLength(WAKE_CONTEXT_SNAPSHOT_KEPT_COMMENT_IDS);
+    expect((merged.wakeCommentIds as string[]).at(-1)).toBe(`comment-999-${"0".repeat(32)}`);
+    expect(Buffer.byteLength(JSON.stringify(merged), "utf8")).toBeLessThanOrEqual(
+      WAKE_CONTEXT_SNAPSHOT_MAX_BYTES,
+    );
   });
 });

@@ -28,6 +28,7 @@ import {
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { modelDecisionCardRevision } from "../services/run-model-decision.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentTaskRun = vi.hoisted(() => vi.fn());
@@ -653,6 +654,307 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+  });
+
+  // Model-decision retries cool down instead of looping hot.
+  async function seedModelDecisionFixture(input?: {
+    fingerprint?: Record<string, unknown> | null;
+    decisionReason?: string;
+    issueStatus?: string;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ModelRouter",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Needs a model decision",
+      status: input?.issueStatus ?? "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const issueRow = await db
+      .select({
+        status: issues.status,
+        title: issues.title,
+        description: issues.description,
+        priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        projectId: issues.projectId,
+        goalId: issues.goalId,
+        parentId: issues.parentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      // Model-decision deferrals cancel the run before parking the retry.
+      status: "cancelled",
+      error: "no account has headroom",
+      errorCode: "model_decision_pending",
+      resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        modelDecision: { outcome: "deferred", reason: input?.decisionReason ?? "no account has headroom" },
+        ...(input?.fingerprint === undefined
+          ? {}
+          : input.fingerprint === null
+            ? {}
+            : { modelDecisionDeferralFingerprint: input.fingerprint }),
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    return { companyId, agentId, issueId, runId, now, issueRow };
+  }
+
+  function scheduleModelDecisionRetry(f: Awaited<ReturnType<typeof seedModelDecisionFixture>>) {
+    return heartbeat.scheduleBoundedRetry(f.runId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+    });
+  }
+
+  it("drops a model-decision retry at the backoff ceiling when the card has not changed since the last attempt", async () => {
+    const f = await seedModelDecisionFixture();
+    const currentFingerprint = {
+      reason: "no account has headroom",
+      issueStatus: f.issueRow.status,
+      cardRevision: modelDecisionCardRevision(f.issueRow),
+      lastCommentAt: null,
+    };
+    await db
+      .update(heartbeatRuns)
+      .set({
+        scheduledRetryReason: "model_decision_pending",
+        scheduledRetryAttempt: 9,
+        contextSnapshot: {
+          issueId: f.issueId,
+          wakeReason: "issue_assigned",
+          modelDecision: { outcome: "deferred", reason: "no account has headroom" },
+          modelDecisionDeferralFingerprint: currentFingerprint,
+        },
+      })
+      .where(eq(heartbeatRuns.id, f.runId));
+
+    const result = await heartbeat.scheduleBoundedRetry(f.runId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_800_000,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_issue_unchanged",
+    });
+    const retries = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, f.companyId),
+          eq(heartbeatRuns.retryOfRunId, f.runId),
+        ),
+      );
+    expect(retries).toHaveLength(0);
+  });
+
+  it("drops the next model-decision retry after the successor claims the unchanged card at the backoff ceiling", async () => {
+    const f = await seedModelDecisionFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryReason: "model_decision_pending", scheduledRetryAttempt: 8 })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const first = await heartbeat.scheduleBoundedRetry(f.runId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_280_000,
+    });
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") return;
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        errorCode: "model_decision_pending",
+        resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+        finishedAt: f.now,
+      })
+      .where(eq(heartbeatRuns.id, first.run.id));
+    // Claiming the successor's execution lock bumps issues.updatedAt without changing the card.
+    await db
+      .update(issues)
+      .set({ executionRunId: first.run.id, updatedAt: new Date("2026-04-20T12:05:00.000Z") })
+      .where(eq(issues.id, f.issueId));
+
+    const second = await heartbeat.scheduleBoundedRetry(first.run.id, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_800_000,
+    });
+
+    expect(second).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_issue_unchanged",
+    });
+  });
+
+  it("retries an unchanged card on the growing backoff before dropping it at the ceiling", async () => {
+    const f = await seedModelDecisionFixture();
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const backoffMs = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 1_280_000];
+    let deferredRunId = f.runId;
+    for (const [index, delayMs] of backoffMs.entries()) {
+      const retry = await heartbeat.scheduleBoundedRetry(deferredRunId, {
+        now: f.now,
+        random: () => 0.5,
+        retryReason: "model_decision_pending",
+        wakeReason: "model_decision_pending_retry",
+        maxAttempts: 12,
+        delayMs,
+      });
+      expect(retry).toMatchObject({ outcome: "scheduled" });
+      if (retry.outcome !== "scheduled") return;
+      expect(retry.run.scheduledRetryAttempt).toBe(index + 1);
+      expect(retry.run.scheduledRetryAt?.getTime()).toBe(f.now.getTime() + delayMs);
+      deferredRunId = retry.run.id;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          errorCode: "model_decision_pending",
+          resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+          finishedAt: f.now,
+        })
+        .where(eq(heartbeatRuns.id, deferredRunId));
+      // Claiming the successor's execution lock bumps issues.updatedAt without changing the card.
+      await db
+        .update(issues)
+        .set({ executionRunId: deferredRunId, updatedAt: new Date("2026-04-20T12:05:00.000Z") })
+        .where(eq(issues.id, f.issueId));
+    }
+
+    const atCeiling = await heartbeat.scheduleBoundedRetry(deferredRunId, {
+      now: f.now,
+      random: () => 0.5,
+      retryReason: "model_decision_pending",
+      wakeReason: "model_decision_pending_retry",
+      maxAttempts: 12,
+      delayMs: 1_800_000,
+    });
+    expect(atCeiling).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_issue_unchanged",
+    });
+  });
+
+  it("schedules a model-decision retry with a fresh fingerprint when the card changed", async () => {
+    const f = await seedModelDecisionFixture({
+      fingerprint: {
+        reason: "no account has headroom",
+        issueStatus: "in_progress",
+        cardRevision: "stale-card-revision",
+        lastCommentAt: null,
+      },
+    });
+
+    const result = await scheduleModelDecisionRetry(f);
+
+    expect(result.outcome).toBe("scheduled");
+    if (result.outcome !== "scheduled") return;
+    const stamped = (
+      result.run.contextSnapshot as Record<string, unknown>
+    ).modelDecisionDeferralFingerprint as Record<string, unknown>;
+    expect(stamped).toMatchObject({
+      reason: "no account has headroom",
+      issueStatus: "in_progress",
+      cardRevision: modelDecisionCardRevision(f.issueRow),
+    });
+  });
+
+  it("surfaces the card instead of requeueing past the daily model-decision cap", async () => {
+    const f = await seedModelDecisionFixture();
+    for (let i = 0; i < 12; i += 1) {
+      const predecessorId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        companyId: f.companyId,
+        agentId: f.agentId,
+        invocationSource: "assignment",
+        status: "cancelled",
+        errorCode: "model_decision_pending",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned" },
+        createdAt: f.now,
+        id: predecessorId,
+      });
+      await db.insert(heartbeatRuns).values({
+        companyId: f.companyId,
+        agentId: f.agentId,
+        invocationSource: "automation",
+        status: "cancelled",
+        retryOfRunId: predecessorId,
+        scheduledRetryReason: "model_decision_pending",
+        scheduledRetryAttempt: 1,
+        contextSnapshot: { issueId: f.issueId, wakeReason: "model_decision_pending_retry" },
+        createdAt: f.now,
+      });
+    }
+
+    const result = await scheduleModelDecisionRetry(f);
+
+    expect(result).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "model_decision_retry_daily_cap",
+    });
   });
 
   it.each([1, 2])("ACCT-01 a failed disposition repair %s receives its own first infrastructure retry", async repairAttempt => {
