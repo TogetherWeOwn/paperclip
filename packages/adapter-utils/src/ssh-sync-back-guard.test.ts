@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readdir, readFile, rm, lstat, symlink, writeFile } from
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   assertSshSyncBackSizeWithinCap,
   measureDirectoryFileBytes,
@@ -123,8 +123,14 @@ function buildStubSpec(fixtureDir: string): SshRemoteExecutionSpec {
   };
 }
 
-async function listSyncBackStagingDirs(): Promise<string[]> {
-  const entries = await readdir(os.tmpdir()).catch(() => []);
+async function createSyncBackStagingRoot(): Promise<string> {
+  const root = await createFixtureRootDir("paperclip-sync-back-staging-root-");
+  vi.spyOn(os, "tmpdir").mockReturnValue(root);
+  return root;
+}
+
+async function listSyncBackStagingDirs(root = os.tmpdir()): Promise<string[]> {
+  const entries = await readdir(root).catch(() => []);
   return entries.filter((entry) => entry.startsWith("paperclip-ssh-sync-back-")).sort();
 }
 
@@ -137,6 +143,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   process.env.PATH = originalPath;
   delete process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES;
   delete process.env.STUB_SSH_REMOTE_ROOT;
@@ -412,14 +419,15 @@ exit 99
     const spec = buildStubSpec(remoteDir);
     const localDir = await createFixtureRootDir("paperclip-unknown-tar-local-");
     await writeFile(path.join(localDir, "keep.txt"), "local work");
-    const stagingBefore = await listSyncBackStagingDirs();
+    const stagingRoot = await createSyncBackStagingRoot();
+    const stagingBefore = await listSyncBackStagingDirs(stagingRoot);
 
     await expect(syncDirectoryFromSsh({
       spec, remoteDir: FAKE_REMOTE_ROOT, localDir,
       exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
     })).rejects.toThrow("Unsupported tar");
     await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("local work");
-    expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+    expect(await listSyncBackStagingDirs(stagingRoot)).toEqual(stagingBefore);
   }, TEST_TIMEOUT_MS);
 
   it("identifies the creating tar and refuses unknown implementations", () => {
@@ -630,7 +638,8 @@ describe("SSH sync-back size cap", () => {
     const spec = buildStubSpec(fixtureDir);
     const localDir = await createFixtureRootDir("paperclip-sync-back-cap-");
     process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(Math.max(1, Math.floor(keepBytes / 2)));
-    const stagingBefore = await listSyncBackStagingDirs();
+    const stagingRoot = await createSyncBackStagingRoot();
+    const stagingBefore = await listSyncBackStagingDirs(stagingRoot);
 
     const failure = await syncDirectoryFromSsh({
       spec,
@@ -647,7 +656,7 @@ describe("SSH sync-back size cap", () => {
     // The workspace is untouched: the refusal lands before clear/copy.
     expect(await readdir(localDir)).toEqual([]);
     // No staging directory is left behind in the container temp dir.
-    expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+    expect(await listSyncBackStagingDirs(stagingRoot)).toEqual(stagingBefore);
   }, TEST_TIMEOUT_MS);
 });
 
