@@ -282,7 +282,7 @@ export const issuesApi = {
       executionReconciliation?: ExecutionReconciliation;
       actionId?: string;
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked" | "cancelled";
       resolutionNote?: string | null;
     },
   ) =>
