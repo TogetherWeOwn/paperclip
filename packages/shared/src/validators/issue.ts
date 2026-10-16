@@ -622,12 +622,13 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }

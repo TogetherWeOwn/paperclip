@@ -7,6 +7,7 @@ import {
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
 } from "./ssh.js";
+import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES } from "./ssh-workspace-excludes.js";
 import {
   mergeExcludes,
   referencedSourceIgnoreExcludeEntries,
@@ -146,15 +147,25 @@ export async function prepareRemoteManagedRuntime(input: {
       })
     : null;
   const projectRepositories = preparedWorkspace?.repositories ?? [];
+  const excludeAgentLocalScratch = input.workspaceFileMode !== "all";
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
+        // Task workspaces keep agent-local scratch out of the baseline, so the
+        // restore merge leaves local copies alone and skips hashing large trees.
+        // Plain-directory syncs explicitly include all files, so retain those
+        // paths in both the baseline and the transfer.
         exclude: preparedWorkspace.gitBacked
           ? [
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
+              ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
             ]
-          : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          : [
+              ".paperclip-runtime",
+              ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : []),
+              ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
+            ],
       })
     : null;
   const repositoryBaselines: Array<{ path: string; baselineSnapshot: DirectorySnapshot }> = [];
@@ -190,6 +201,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        excludeAgentLocalScratch,
         onProgress: input.onProgress,
         repositories: repositoryBaselines,
       });
@@ -258,6 +270,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          excludeAgentLocalScratch,
           onProgress,
           repositories: repositoryBaselines,
         });

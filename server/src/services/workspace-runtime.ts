@@ -3158,6 +3158,32 @@ async function recordGitOperation(
   return stdout.trim();
 }
 
+const gitWorktreeAddLocks = new Map<string, Promise<void>>();
+
+async function withGitWorktreeAddLock<T>(repoRoot: string, operation: () => Promise<T>): Promise<T> {
+  const key = path.resolve(repoRoot);
+  const previous = gitWorktreeAddLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  gitWorktreeAddLocks.set(key, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (gitWorktreeAddLocks.get(key) === current) gitWorktreeAddLocks.delete(key);
+  }
+}
+
+async function recordGitWorktreeAddOperation(
+  recorder: WorkspaceOperationRecorder | null | undefined,
+  input: Parameters<typeof recordGitOperation>[1],
+): Promise<string> {
+  return withGitWorktreeAddLock(input.cwd, () => recordGitOperation(recorder, input));
+}
+
 async function recordWorkspaceCommandOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
@@ -3611,7 +3637,7 @@ export async function realizeExecutionWorkspace(input: {
 
   if (requestedExistingBranch) {
     try {
-      await recordGitOperation(input.recorder, {
+      await recordGitWorktreeAddOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
         cwd: repoRoot,
@@ -3685,7 +3711,7 @@ export async function realizeExecutionWorkspace(input: {
 
   let branchCreatedByRuntime = true;
   try {
-    await recordGitOperation(input.recorder, {
+    await recordGitWorktreeAddOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
       cwd: repoRoot,
@@ -3705,7 +3731,7 @@ export async function realizeExecutionWorkspace(input: {
       throw error;
     }
     try {
-      await recordGitOperation(input.recorder, {
+      await recordGitWorktreeAddOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
         cwd: repoRoot,
@@ -3951,7 +3977,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 
   let created = false;
   try {
-    await recordGitOperation(input.recorder, {
+    await recordGitWorktreeAddOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", worktreePath, branchName],
       cwd: repoRoot,
@@ -3982,7 +4008,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     }
     const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
-    await recordGitOperation(input.recorder, {
+    await recordGitWorktreeAddOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
       cwd: repoRoot,

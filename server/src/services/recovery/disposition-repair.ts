@@ -98,7 +98,10 @@ export async function collectDispositionRepairSourceState(
             eq(issueRelations.companyId, issue.companyId),
             eq(issueRelations.relatedIssueId, issue.id),
             eq(issueRelations.type, "blocks"),
-            notInArray(issues.status, ["done", "cancelled"]),
+            // A cancelled blocker remains an unresolved prerequisite. Keep it in
+            // the durable source fingerprint so repair retries are not admitted
+            // only to be rejected by the dependency gate.
+            notInArray(issues.status, ["done"]),
             sql`${issues.hiddenAt} is null`,
           ),
         ),

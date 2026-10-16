@@ -229,9 +229,9 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
-  // The terminal-workspace reaper waits this many days after an issue tree
-  // becomes terminal before it archives the workspace. A value of 0 disables
-  // the cooldown. The default is 7 days.
+  // The terminal-workspace reaper waits this many days after every issue
+  // referencing the workspace becomes terminal before it archives the workspace.
+  // A value of 0 disables the cooldown. The default is 1 day.
   workspaceReaperCooldownDays?: number;
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
@@ -1282,13 +1282,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const resolvePullRequestDetails = opts.resolvePullRequestDetails ?? createPullRequestMergeDetailsResolver(db);
   const now = opts.now ?? (() => new Date());
-  // The reaper waits this long after an issue tree becomes terminal before it
-  // archives the workspace. A value of 0 disables the cooldown, so the reaper
-  // archives a terminal workspace on the same sweep. A negative value also
-  // disables the cooldown.
+  // The reaper waits this long after every issue referencing a workspace
+  // becomes terminal before it archives the workspace. A value of 0 disables
+  // the cooldown, so the reaper archives a terminal workspace on the same sweep.
   const workspaceReaperCooldownMs = Math.max(
     0,
-    (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
+    (opts.workspaceReaperCooldownDays ?? 1) * 24 * 60 * 60 * 1000,
   );
   const pullRequestStateCache = new Map<
     string,
@@ -1322,7 +1321,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
 
-  async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
+  async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
     return db
       .select({
@@ -1338,10 +1337,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         sql<boolean>`
           ${issues.id} IN (
             WITH RECURSIVE issue_tree(id) AS (
-              SELECT ${issues.id}
-              FROM ${issues}
-              WHERE ${issues.companyId} = ${workspace.companyId}
-                AND ${issues.id} = ${workspace.sourceIssueId}
+              SELECT root.id
+              FROM ${issues} root
+              WHERE root.company_id = ${workspace.companyId}
+                AND (
+                  root.id = ${workspace.sourceIssueId}
+                  OR root.execution_workspace_id = ${workspace.id}
+                )
               UNION ALL
               SELECT child.id
               FROM ${issues} child
@@ -2796,6 +2798,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
+                  UNION
+                  SELECT linked.id, linked.status
+                  FROM ${issues} linked
+                  WHERE linked.company_id = ${workspace.companyId}
+                    AND linked.execution_workspace_id = ${workspace.id}
+                    AND linked.id <> ${workspace.sourceIssueId}
                   UNION ALL
                   SELECT child.id, child.status
                   FROM ${issues} child
@@ -2816,6 +2824,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
+                  UNION
+                  SELECT linked.id, linked.status, linked.completed_at, linked.cancelled_at, linked.updated_at
+                  FROM ${issues} linked
+                  WHERE linked.company_id = ${workspace.companyId}
+                    AND linked.execution_workspace_id = ${workspace.id}
+                    AND linked.id <> ${workspace.sourceIssueId}
                   UNION ALL
                   SELECT child.id, child.status, child.completed_at, child.cancelled_at, child.updated_at
                   FROM ${issues} child

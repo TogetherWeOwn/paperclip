@@ -4233,7 +4233,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     mutationFn: (data: {
       actionId?: string;
       outcome: ResolveRecoveryActionOutcome;
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked" | "cancelled";
       resolutionNote?: string | null;
     }) => issuesApi.resolveRecoveryAction(issueId!, data),
     onSuccess: ({ issue: nextIssue }) => {

@@ -7415,6 +7415,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it("does not admit disposition repair while a cancelled prerequisite remains unresolved", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const blockerId = randomUUID();
+    const [sourceIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    if (!sourceIssue) throw new Error("Expected stranded source issue");
+
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Cancelled prerequisite",
+      status: "cancelled",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: `${sourceIssue.identifier?.split("-")[0]}-2`,
+      cancelledAt: new Date("2026-03-18T00:00:00.000Z"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const sourceState = await collectDispositionRepairSourceState(db, {
+      issue: sourceIssue,
+    });
+    expect(sourceState).toMatchObject({
+      dependencyIssueIds: [blockerId],
+      hasDurableWaitingPath: true,
+      durablePathReason: "blocker",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    const repairRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = 'issue_disposition_repair'`,
+        ),
+      );
+    expect(actions).toHaveLength(0);
+    expect(repairRuns).toHaveLength(0);
+  });
+
   it("folds a persisted disposition-repair action when a current typed wait appears", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

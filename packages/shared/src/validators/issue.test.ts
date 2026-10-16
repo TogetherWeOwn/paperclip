@@ -359,6 +359,16 @@ describe("issue validators", () => {
     });
 
     expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "cancelled",
+    });
+
+    expect(
       resolveIssueRecoveryActionSchema.safeParse({
         outcome: "cancelled",
         sourceIssueStatus: "blocked",
