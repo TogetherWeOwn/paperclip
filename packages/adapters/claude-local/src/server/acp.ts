@@ -373,13 +373,19 @@ const CLAUDE_ACP_AUTH_FAILURE_PATTERNS = [
   /\b(?:authentication|authorization|auth)[\s_-]*(?:required|failed|failure|error|invalid|expired|revoked|missing|denied|rejected)\b/i,
   /\b(?:failed|unable|could\s+not|cannot)\s+(?:to\s+)?authenticate\b/i,
   /\bcould\s+not\s+resolve\s+authentication\s+method\b/i,
-  /\b(?:missing|required|invalid|expired|revoked|rejected)\b[\s\S]{0,40}\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b/i,
-  /\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b[\s\S]{0,40}\b(?:missing|required|invalid|expired|revoked|rejected)\b/i,
   /\bentitlements?\b.{0,40}\b(?:denied|missing|required|insufficient)\b/i,
   /\binsufficient\b.{0,40}\bentitlements?\b/i,
   /\bplease\s+(?:log\s+in|login)\b/i,
   /\b(?:log\s+in|login)\b.{0,40}\b(?:required|first|needed|to\s+authenticate)\b/i,
   /\b(?:requires?|needs?|must)\s+(?:you\s+to\s+)?(?:log\s+in|login|authenticate)\b/i,
+];
+
+// Credential-status wording also occurs in local cache/file diagnostics
+// (e.g. "Invalid file permissions on credentials file"), so these patterns
+// are only evidence on a surface without a local-permission failure.
+const CLAUDE_ACP_CREDENTIAL_STATUS_PATTERNS = [
+  /\b(?:missing|required|invalid|expired|revoked|rejected)\b[\s\S]{0,40}\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b/i,
+  /\b(?:credentials?|(?:api|bearer|oauth|access)\s+token|api[\s_-]?key)\b[\s\S]{0,40}\b(?:missing|required|invalid|expired|revoked|rejected)\b/i,
 ];
 
 const CLAUDE_ACP_AUTHORIZATION_FAILURE_PATTERNS = [
@@ -413,11 +419,14 @@ function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
   if (messages.some((surface) =>
     CLAUDE_ACP_AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(surface)),
   )) return true;
-  // A local cache/file denial is not provider authorization. Check each surface
-  // separately so independent evidence in a cause still preserves the auth gate.
+  // A local cache/file denial is not provider authorization, and credential
+  // nouns in such a diagnostic are not credential-status evidence either.
+  // Check each surface separately so independent evidence in a cause still
+  // preserves the auth gate.
   if (messages.some((surface) =>
     !CLAUDE_ACP_LOCAL_PERMISSION_FAILURE_PATTERN.test(surface) &&
-    CLAUDE_ACP_AUTHORIZATION_FAILURE_PATTERNS.some((pattern) => pattern.test(surface)),
+    (CLAUDE_ACP_CREDENTIAL_STATUS_PATTERNS.some((pattern) => pattern.test(surface)) ||
+      CLAUDE_ACP_AUTHORIZATION_FAILURE_PATTERNS.some((pattern) => pattern.test(surface))),
   )) return true;
   const normalizedAuthName = authName.replace(/[^a-z]/gi, "").toLowerCase();
   if (/^(?:auth|authentication|authorization|credential|credentials)(?:error|exception)$/.test(normalizedAuthName)) {

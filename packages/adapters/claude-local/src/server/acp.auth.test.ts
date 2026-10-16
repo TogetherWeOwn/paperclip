@@ -212,6 +212,10 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     "API credential cache: EACCES: permission denied while opening '/tmp/.claude/credentials.json'",
     "Provider credential cache: permission denied while opening file",
     "Account credential cache: EPERM: permission denied while opening file",
+    "Missing credentials cache directory (EACCES)",
+    "Invalid file permissions on credentials file",
+    "Permission denied reading invalid credentials cache",
+    "OAuth credential cache: required file permission denied",
   ])("does not turn incidental diagnostics into authentication evidence: %s", (errorMessage) => {
     const result: AdapterExecutionResult = {
       exitCode: 1,
@@ -297,6 +301,7 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     "Authentication failed",
     "Provider permission denied",
     "Insufficient account permissions",
+    "Invalid credentials",
   ])("preserves independent cause evidence despite local permission text: %s", (causeMessage) => {
     const result: AdapterExecutionResult = {
       exitCode: 1,
