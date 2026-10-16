@@ -172,6 +172,9 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     "authentication_required",
     "Cannot authenticate",
     "Please login.",
+    "Not logged in · Please run /login",
+    "Session expired. Please run /login to sign in again.",
+    "Not logged in",
     "HTTP 403 Forbidden",
     "API Error: 401",
     "HTTP/1.1 401",
@@ -223,6 +226,24 @@ describe("mapClaudeAcpAuthErrorCode", () => {
 
     expect(mapped.errorCode).toBe("acpx_turn_failed");
     expect(mapped.errorMeta?.category).toBe("runtime");
+  });
+
+  it("does not combine unrelated message and cause fragments into auth evidence", () => {
+    const result: AdapterExecutionResult = {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "The operation was rejected",
+      errorCode: "acpx_auth_required",
+      errorMeta: {
+        category: "auth",
+        errorName: "Error",
+        causeMessage: "credentials cache unavailable",
+        phase: "turn",
+      },
+    };
+
+    expect(mapClaudeAcpAuthErrorCode(result).errorCode).toBe("acpx_turn_failed");
   });
 
   it.each([

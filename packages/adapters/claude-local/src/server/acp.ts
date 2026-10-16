@@ -392,6 +392,8 @@ const CLAUDE_ACP_LOCAL_PERMISSION_FAILURE_PATTERN =
   /\b(?:EACCES|EPERM|credentials?[\s_-]+(?:cache|file)|file[\s_-]+permissions?|(?:opening|reading|writing|accessing)\s+(?:a\s+|the\s+)?file)\b|\b(?:open(?:ing)?|read(?:ing)?|writ(?:e|ing)|stat|mkdir|chmod|unlink)\s+(?:["']|\/|[a-z]:\\)/i;
 
 function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
+  // Keep this typed access signal for runtimes that provide it, although the
+  // current fork's ACP engine does not yet populate terminalSessionFailure.
   const terminalFailure = result.resultJson?.terminalSessionFailure;
   const terminalFailureCategory =
     terminalFailure && typeof terminalFailure === "object"
@@ -404,10 +406,13 @@ function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
     result.errorMessage ?? "",
     asString(errorMeta.causeMessage, ""),
   ].filter(Boolean);
-  const message = messages.join("\n");
   const authName = asString(errorMeta.errorName, "");
 
-  if (CLAUDE_ACP_AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(message))) return true;
+  // Keep each diagnostic surface independent. Joining message and cause text can
+  // synthesize auth evidence from unrelated fragments at their boundary.
+  if (messages.some((surface) =>
+    CLAUDE_ACP_AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(surface)),
+  )) return true;
   // A local cache/file denial is not provider authorization. Check each surface
   // separately so independent evidence in a cause still preserves the auth gate.
   if (messages.some((surface) =>
@@ -419,11 +424,11 @@ function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
     return true;
   }
 
-  return detectClaudeLoginRequired({
-    parsed: { is_error: true, result: message },
+  return messages.some((surface) => detectClaudeLoginRequired({
+    parsed: { is_error: true, result: surface },
     stdout: "",
     stderr: "",
-  }).requiresLogin;
+  }).requiresLogin);
 }
 
 function acpxNonAuthFailureCode(result: AdapterExecutionResult): string {
