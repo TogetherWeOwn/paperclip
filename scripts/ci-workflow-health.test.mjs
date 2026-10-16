@@ -152,7 +152,17 @@ test("PR selection runs all non-docs work while master, nightly and explicit cal
   assert.equal(affectedWork("pull_request", "docker", ["Dockerfile"]), true);
   assert.equal(affectedWork("pull_request", "workflows", ["scripts/source-onboard-smoke.test.mjs"]), true);
   assert.equal(affectedWork("pull_request", "workflows", ["ui/src/App.tsx"]), true);
-  assert.throws(() => affectedWork("schedule", "unknown", []), /Unknown CI scope/);
+});
+
+test("unknown CI scope fails open instead of failing the changes job", () => {
+  // Before ci-changes checked out the trusted master classifier, the selector
+  // on TogetherWeOwn paperclip PR #120's base lacked the "pr" scope and threw,
+  // cascading to e2e/verify/ci-ok. Unknown scopes now warn and run all work.
+  for (const event of ["pull_request", "push", "schedule", "workflow_dispatch", "workflow_call"]) {
+    assert.doesNotThrow(() => affectedWork(event, "some-future-scope", ["doc/PRODUCT.md"]), `${event} must not throw`);
+    assert.equal(affectedWork(event, "some-future-scope", ["doc/PRODUCT.md"]), true, `${event} fails open even for docs-only diffs`);
+  }
+  assert.equal(affectedWork("pull_request", "some-future-scope", []), true, "empty diff fails open");
 });
 
 test("only docs-only paths are unaffected; every other path fails closed", () => {
