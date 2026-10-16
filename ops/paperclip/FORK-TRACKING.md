@@ -55,4 +55,4 @@ Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkou
 | 1c470343 | fix(chat-github): search all check runs before replacement (#100) | keep-for-tog.9 | Follow-up port: latest-only lookup caused duplicate POSTs. Deploy-tip #105 does not cover it (different change). |
 | 99868069 | ci(workflows): repair validation and prevent fork publication (#40) | not-needed | CI-only validation + publication guard. |
 
-Counts (audit range only; the supplemental ports #109 and #110 are outside it): keep-for-tog.9: 24 (1 ported here, 23 as follow-up small PRs) · already-equivalent: 10 · not-needed: 7.
+Counts (audit range only; the supplemental ports #109 and #110 are outside it): keep-for-tog.9: 23 (1 ported here, 22 as follow-up small PRs) · already-equivalent: 11 · not-needed: 7.
