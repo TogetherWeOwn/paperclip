@@ -981,6 +981,60 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
   });
 
+  it("waits for the last workspace-linked issue and archives at the 24-hour boundary", async () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+    const cooldownService = (cooldownDays: number) => executionWorkspaceService(db, {
+      resolvePullRequestDetails: async (companyId, reference) =>
+        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+        ?? { state: "unknown", headRef: null, headSha: null },
+      now: () => new Date(nowMs),
+      workspaceReaperCooldownDays: cooldownDays,
+    });
+    const statusOf = async (executionWorkspaceId: string) => {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    };
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(issues)
+      .set({ completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    const linkedIssueId = randomUUID();
+    const linkedIdentifier = `${seeded.identifier.split("-")[0]}-2`;
+    await db.insert(issues).values({
+      id: linkedIssueId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      executionWorkspaceId: seeded.executionWorkspaceId,
+      identifier: linkedIdentifier,
+      title: "Independent card using the isolated workspace",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ updatedAt: new Date(nowMs - 2 * DAY_MS) })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const blockedSweep = await cooldownService(1).sweepTerminalWorkspaces();
+    expect(blockedSweep).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, linkedIssueId));
+    const eligibleSweep = await cooldownService(1).sweepTerminalWorkspaces();
+
+    expect(eligibleSweep).toMatchObject({ archived: 1, skippedCooldown: 0 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+  }, 20_000);
+
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
     const unrelatedIssueId = randomUUID();
