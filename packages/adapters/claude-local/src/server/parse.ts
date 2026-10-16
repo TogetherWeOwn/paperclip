@@ -277,6 +277,7 @@ export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
+  ignoreTokenFailure?: boolean;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
   const evidence = collectClaudeLoginEvidence({
@@ -290,6 +291,7 @@ export function detectClaudeLoginRequired(input: {
   // a failed run. The raw stdout is untrusted, so a model that prints a token
   // phrase, or a successful run that repeats one, does not flip the classifier.
   const tokenFailure =
+    !input.ignoreTokenFailure &&
     parsed !== null &&
     claudeResultIndicatesAuthFailure(parsed) &&
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));

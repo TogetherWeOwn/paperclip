@@ -437,6 +437,9 @@ function hasClaudeAcpAuthEvidence(result: AdapterExecutionResult): boolean {
     parsed: { is_error: true, result: surface },
     stdout: "",
     stderr: "",
+    // Keep explicit login prompts, but do not let token wording turn a local
+    // credential-file permission problem into an authentication failure.
+    ignoreTokenFailure: CLAUDE_ACP_LOCAL_PERMISSION_FAILURE_PATTERN.test(surface),
   }).requiresLogin);
 }
 

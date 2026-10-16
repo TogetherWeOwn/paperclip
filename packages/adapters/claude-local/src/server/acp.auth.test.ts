@@ -184,6 +184,12 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     "Provider permission denied",
     "Insufficient account permissions",
     "Required entitlement missing",
+    "Credentials expired",
+    "Your credentials are invalid or expired",
+    "Invalid API key",
+    "Missing API key",
+    "Invalid API token",
+    "Credentials file not found. Please run /login",
   ])("preserves explicit authentication evidence: %s", (errorMessage) => {
     const result: AdapterExecutionResult = {
       exitCode: 1,
@@ -216,6 +222,11 @@ describe("mapClaudeAcpAuthErrorCode", () => {
     "Invalid file permissions on credentials file",
     "Permission denied reading invalid credentials cache",
     "OAuth credential cache: required file permission denied",
+    "Invalid file permissions on OAuth token file",
+    "Cannot read OAuth token file: invalid file permissions",
+    "Invalid bearer token file permissions (EPERM)",
+    "Invalid OAuth token cache: permission denied while opening file",
+    "Expired OAuth token cache: EACCES permission denied",
   ])("does not turn incidental diagnostics into authentication evidence: %s", (errorMessage) => {
     const result: AdapterExecutionResult = {
       exitCode: 1,
