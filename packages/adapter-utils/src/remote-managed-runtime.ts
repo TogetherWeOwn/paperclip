@@ -146,16 +146,18 @@ export async function prepareRemoteManagedRuntime(input: {
         workspaceExclude: input.workspaceExclude,
       })
     : null;
+  const excludeAgentLocalScratch = input.workspaceFileMode !== "all";
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
-        // The SSH transfer never carries the agent-local scratch, so keep it
-        // out of the baseline: the restore merge then leaves the local copies
-        // alone and skips walking and hashing huge dependency trees.
+        // Task workspaces keep agent-local scratch out of the baseline, so the
+        // restore merge leaves local copies alone and skips hashing large trees.
+        // Plain-directory syncs explicitly include all files, so retain those
+        // paths in both the baseline and the transfer.
         exclude: preparedWorkspace.gitBacked
           ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES]
           : [
               ".paperclip-runtime",
-              ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+              ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : []),
               ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
             ],
       })
@@ -184,6 +186,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        excludeAgentLocalScratch,
         onProgress: input.onProgress,
       });
     }
@@ -251,6 +254,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          excludeAgentLocalScratch,
           onProgress,
         });
       }

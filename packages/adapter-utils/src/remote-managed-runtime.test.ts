@@ -32,7 +32,7 @@ import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 describe("remote managed runtime", () => {
   const cleanupDirs: string[] = [];
 
-  it("preserves agent-local files while restoring the remote baseline", async () => {
+  it("keeps agent-local paths in the plain-directory baseline", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-plain-"));
     cleanupDirs.push(root);
     await mkdir(path.join(root, "node_modules"));
@@ -50,12 +50,13 @@ describe("remote managed runtime", () => {
     await prepared.restoreWorkspace();
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       restoreGitHistory: false, baselineSnapshot: expect.objectContaining({
-        exclude: [".paperclip-runtime", ".claude/worktrees", "node_modules", "target", "explicitly-excluded"],
+        exclude: [".paperclip-runtime", "explicitly-excluded"],
         entries: expect.any(Map),
       }),
+      excludeAgentLocalScratch: false,
     }));
     const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
-    expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(false);
+    expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(true);
   });
 
 

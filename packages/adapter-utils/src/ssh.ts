@@ -1840,7 +1840,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     remoteDir,
     exclude: [
       ".paperclip-runtime",
-      ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
+      ...(input.workspaceFileMode === "all" ? [] : SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES),
       ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
     ],
     onProgress: input.onProgress,
@@ -1855,13 +1855,18 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  /** Keep the default scratch exclusions for task workspaces, but not all-files directories. */
+  excludeAgentLocalScratch?: boolean;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
+  const excludeAgentLocalScratch = input.excludeAgentLocalScratch !== false;
   if (input.baselineSnapshot) {
-    // The sync-back never carries the agent-local scratch, so the merge must
-    // not read its absence as a remote deletion of the local copies.
-    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
+    // The sync-back never carries agent-local scratch in task-workspace mode,
+    // so the merge must not mistake its absence for a remote deletion.
+    const baseline = excludeAgentLocalScratch
+      ? withSshAgentLocalExcludes(input.baselineSnapshot)
+      : input.baselineSnapshot;
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -1929,9 +1934,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      exclude: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : [])],
       // Excluded from the download, so nothing replaces them: keep the local copies.
-      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      preserveLocalEntries: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : [])],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1942,8 +1947,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
-    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    exclude: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES] : [],
+    preserveLocalEntries: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES] : [],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

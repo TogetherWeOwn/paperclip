@@ -704,12 +704,16 @@ describe("persistent agent directories", () => {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
       const target = { kind: "remote" as const, transport: "ssh" as const, environmentId: randomUUID(), remoteCwd,
         spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd } };
+      await fs.mkdir(path.join(root, "target"), { recursive: true });
+      await fs.writeFile(path.join(root, "target", "plan.md"), "baseline plan");
       const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target }))!;
       expect(stage).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot }));
       expect(await fs.readFile(path.join(copy.executionRoot, entryFile), "utf8")).toBe(initial);
       await fs.writeFile(path.join(copy.executionRoot, "ssh-note.txt"), "persistent SSH file");
+      await fs.writeFile(path.join(copy.executionRoot, "target", "plan.md"), "edited remotely");
       expect((await copies.collectStopped({ companyId, runId, target }))?.state).toBe("saved");
-      expect(restore).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot, restoreGitHistory: false }));
+      expect(restore).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot, restoreGitHistory: false, excludeAgentLocalScratch: false }));
+      expect(await fs.readFile(path.join(root, "target", "plan.md"), "utf8")).toBe("edited remotely");
       expect(await fs.readFile(path.join(root, "ssh-note.txt"), "utf8")).toBe("persistent SSH file");
     } finally { stage.mockRestore(); restore.mockRestore(); exclude.mockRestore(); }
   });

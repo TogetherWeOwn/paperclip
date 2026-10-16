@@ -19,6 +19,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 let sshEnvLabUnsupportedReason: string | null = null;
@@ -712,26 +713,53 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toContain("{\"token\":\"secret\"}");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("round-trips root target files in all-files SSH mode", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localDir = path.join(rootDir, "plain-local");
+    await mkdir(path.join(localDir, "target"), { recursive: true });
+    await mkdir(path.join(localDir, "node_modules"), { recursive: true });
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH all-files round trip");
+    if (!started) return;
+    const spec = { ...(await buildSshEnvLabFixtureConfig(started)), remoteCwd: started.workspaceDir };
+    const input = { spec, localDir, remoteDir: started.workspaceDir, workspaceFileMode: "all" as const };
+    await writeFile(path.join(localDir, "target", "plan.md"), "before\n");
+    await writeFile(path.join(localDir, "node_modules", "personal.bin"), Buffer.from([0, 255, 1]));
+
+    await prepareWorkspaceForSshExecution(input);
+    const baselineSnapshot = await captureDirectorySnapshot(localDir, { exclude: [".paperclip-runtime"] });
+    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(Buffer.from([0, 255, 1]));
+    await writeFile(path.join(started.workspaceDir, "target", "plan.md"), "edited remotely\n");
+
+    await restoreWorkspaceFromSshExecution({
+      ...input,
+      baselineSnapshot,
+      restoreGitHistory: false,
+      excludeAgentLocalScratch: false,
+    });
+
+    expect(await readFile(path.join(localDir, "target", "plan.md"), "utf8")).toBe("edited remotely\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("clears stale files when plain SSH preparation is retried", async () => {
     const rootDir = await createFixtureRootDir();
     const localDir = path.join(rootDir, "plain-local");
-    await mkdir(path.join(localDir, "ignored"), { recursive: true });
+    await mkdir(path.join(localDir, "node_modules"), { recursive: true });
     await git(localDir, ["init"]);
-    await writeFile(path.join(localDir, ".gitignore"), "ignored/\nnode_modules/\n");
+    await writeFile(path.join(localDir, ".gitignore"), "node_modules/\n");
     await writeFile(path.join(localDir, "removed.txt"), "remove on retry");
     const binary = Buffer.from([0, 255, 1]);
-    await writeFile(path.join(localDir, "ignored", "personal.bin"), binary);
+    await writeFile(path.join(localDir, "node_modules", "personal.bin"), binary);
     const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH plain retry");
     if (!started) return;
     const config = await buildSshEnvLabFixtureConfig(started);
     const input = { spec: { ...config, remoteCwd: started.workspaceDir }, localDir,
       remoteDir: started.workspaceDir, workspaceFileMode: "all" as const };
     expect(await prepareWorkspaceForSshExecution(input)).toEqual({ gitBacked: false });
-    expect(await readFile(path.join(started.workspaceDir, "ignored", "personal.bin"))).toEqual(binary);
+    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
     await rm(path.join(localDir, "removed.txt"));
     await prepareWorkspaceForSshExecution(input);
     await expect(stat(path.join(started.workspaceDir, "removed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect(await readFile(path.join(started.workspaceDir, "ignored", "personal.bin"))).toEqual(binary);
+    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("round-trips a git workspace through the SSH fixture", async () => {
