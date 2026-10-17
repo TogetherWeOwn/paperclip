@@ -8,6 +8,8 @@ import {
 } from "@/api/githubChat";
 import { chatEndpointsApi, type ChatEndpoint } from "@/api/chatEndpoints";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Link } from "@/lib/router";
 import { formatDateTime } from "@/lib/utils";
 import {
@@ -239,6 +241,42 @@ export function GitHubBotManagement({
               This repository follows the connection defaults.
             </p>
           )}
+          <div className="space-y-2 border-t border-border pt-4">
+            <GitHubToggle
+              label="Shadow reviews (never publish)"
+              description="The agent reviews and stores its assessment in Paperclip, but nothing is written to GitHub: no check, summary, findings, or review. Use a second endpoint on its own GitHub App to compare another reviewer on the same PRs."
+              checked={config.shadow?.enabled ?? false}
+              onChange={(enabled) =>
+                edit({
+                  ...config,
+                  shadow: {
+                    enabled,
+                    label: config.shadow?.label ?? "shadow",
+                  },
+                })
+              }
+            />
+            {config.shadow?.enabled && (
+              <div className="space-y-2">
+                <Label htmlFor="github-shadow-label">Shadow label</Label>
+                <Input
+                  id="github-shadow-label"
+                  value={config.shadow.label}
+                  onChange={(e) =>
+                    edit({
+                      ...config,
+                      shadow: { enabled: true, label: e.target.value },
+                    })
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  Stored on each shadow assessment so reviewers can be told
+                  apart. Short slug: letters, digits, dots, dashes,
+                  underscores.
+                </p>
+              </div>
+            )}
+          </div>
         </>
       )}
       {error && (
@@ -344,6 +382,7 @@ export function GitHubReviews({ endpointId }: { endpointId: string }) {
           </p>
           <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <code>{review.headSha.slice(0, 12)}</code>
+            {review.shadowLabel && <span>Shadow: {review.shadowLabel}</span>}
             <span>{formatDateTime(review.updatedAt)}</span>
             <Link className="underline" to={`/issues/${review.issueId}`}>
               Paperclip task

@@ -26,6 +26,7 @@ import {
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
+import { githubShadowLabel } from "./chat-github-review-policy.js";
 
 /** Check status follows the ordinary chat delivery/task/run. This outbox never
  * schedules an agent. Assessments are published by the governed review tool. */
@@ -41,6 +42,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
       .from(chatGitHubConfigurations)
       .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
     if (!config?.configuration.toolsEnabled) return;
+    // Shadow endpoints never create check runs, so no intent is staged.
+    if (githubShadowLabel(config.configuration)) return;
     const policy = {
       ...config.configuration.defaults,
       ...config.configuration.repositories[event.repositoryId],
@@ -141,6 +144,21 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
+          // Defense in depth: an intent staged before shadow mode was
+          // enabled must still never become a GitHub check run.
+          if (githubShadowLabel(source.configuration)) {
+            await lease.commit(async (tx) => {
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: { code: "shadow_mode" },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
           const [review] = await db
             .select()
             .from(chatGitHubReviews)
@@ -161,6 +179,21 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               desc(chatGitHubReviews.createdAt),
             )
             .limit(1);
+          if (review?.shadowLabel) {
+            // The label is pinned at review creation: disabling shadow in
+            // config later must not let an in-flight shadow review publish.
+            await lease.commit(async (tx) => {
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: { code: "shadow_mode", reviewId: review.id },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
           if (review?.assessment) {
             // The assessment outbox owns the terminal score and its retries.
             await lease.commit(async (tx) => {
@@ -325,6 +358,25 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
           const staleChecks = checks.filter(
             (candidate) => candidate.details_url !== detailsUrl,
           );
+          // Final shadow re-check after the check-run reads, immediately
+          // before the first write: enabling shadow mid-dispatch cancels.
+          const [freshConfig] = await db
+            .select({ configuration: chatGitHubConfigurations.configuration })
+            .from(chatGitHubConfigurations)
+            .where(eq(chatGitHubConfigurations.endpointId, action.endpointId));
+          if (!freshConfig || githubShadowLabel(freshConfig.configuration)) {
+            await lease.commit(async (tx) => {
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: { code: "shadow_mode" },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
           for (const staleCheck of staleChecks)
             await request(`/check-runs/${staleCheck.id}`, {
               method: "PATCH",

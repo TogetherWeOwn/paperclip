@@ -2276,6 +2276,7 @@ const githubBotOperations: Array<{
       assessment: githubReviewAssessmentSchema.nullable(),
       conclusion: z.enum(["success", "failure", "neutral", "action_required"]).nullable(),
       checkUrl: z.string().nullable(), summaryUrl: z.string().nullable(),
+      shadowLabel: z.string().nullable(),
       createdAt: z.string(), updatedAt: z.string(),
     }).passthrough()),
   },

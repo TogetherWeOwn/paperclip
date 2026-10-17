@@ -20,6 +20,7 @@ import {
 import {
   effectiveGitHubReviewPolicy,
   githubReviewSchedulingDecision,
+  githubShadowLabel,
 } from "./chat-github-review-policy.js";
 
 const id = z.union([
@@ -165,6 +166,7 @@ export async function githubAutomaticAdmission(
       allowed: false,
       reason: "identity_revoked",
       revision: saved.revision,
+      shadowLabel: githubShadowLabel(saved.configuration),
       policy: effectiveGitHubReviewPolicy(
         saved.configuration,
         context.repositoryId,
@@ -173,6 +175,7 @@ export async function githubAutomaticAdmission(
   return {
     ...decision,
     revision: saved.revision,
+    shadowLabel: githubShadowLabel(saved.configuration),
     policy: effectiveGitHubReviewPolicy(
       saved.configuration,
       context.repositoryId,
