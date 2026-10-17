@@ -20,17 +20,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import {
+  runSourceBoundTransportValidation,
+  type SourceBoundTransportValidationDeps,
+  type SourceBoundWorkspaceFacts,
+} from "../services/source-bound-transport-validation-operation.js";
+import {
   markAllocatedWorkspaceRealized,
   type SourceBoundAllocationIssueFacts,
   type SourceBoundAllocationWorkspaceRecord,
   type SourceBoundWorkspaceAllocationDeps,
   type SourceBoundWorkspaceAllocationTx,
 } from "../services/source-bound-workspace-allocation.js";
-import {
-  runSourceBoundTransportValidation,
-  type SourceBoundTransportValidationDeps,
-  type SourceBoundWorkspaceFacts,
-} from "../services/source-bound-transport-validation-operation.js";
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -51,7 +51,12 @@ const mockWorkspaceOperationService = vi.hoisted(() => ({
 }));
 
 const mockWorkspaceRuntimeLeaseService = vi.hoisted(() => ({
-  claim: vi.fn(async () => ({ outcome: "created", ownerKey: "issue:issue-1", lease: null, reclaimedFrom: null })),
+  claim: vi.fn(async () => ({
+    outcome: "created",
+    ownerKey: "issue:issue-1",
+    lease: null,
+    reclaimedFrom: null,
+  })),
   release: vi.fn(async () => ({ released: false, ownerKey: null })),
   get: vi.fn(async () => null),
 }));
@@ -91,16 +96,21 @@ vi.mock("../services/environment-runtime.js", () => ({
 
 const mockWorkspaceRuntimeTeardown = vi.hoisted(() => ({
   stopRuntimeServicesForExecutionWorkspace: vi.fn(async () => undefined),
-  cleanupExecutionWorkspaceArtifacts: vi.fn(async () => ({ cleaned: true, warnings: [] as string[] })),
+  cleanupExecutionWorkspaceArtifacts: vi.fn(async () => ({
+    cleaned: true,
+    warnings: [] as string[],
+  })),
 }));
 
 vi.mock("../services/workspace-runtime.js", async (importActual) => {
-  const actual = await importActual<typeof import("../services/workspace-runtime.js")>();
+  const actual =
+    await importActual<typeof import("../services/workspace-runtime.js")>();
   return {
     ...actual,
     stopRuntimeServicesForExecutionWorkspace:
       mockWorkspaceRuntimeTeardown.stopRuntimeServicesForExecutionWorkspace,
-    cleanupExecutionWorkspaceArtifacts: mockWorkspaceRuntimeTeardown.cleanupExecutionWorkspaceArtifacts,
+    cleanupExecutionWorkspaceArtifacts:
+      mockWorkspaceRuntimeTeardown.cleanupExecutionWorkspaceArtifacts,
   };
 });
 
@@ -176,11 +186,13 @@ describe("reviewfix: PATCH cannot realize an allocated record", () => {
       state: "ready",
       blockingReasons: [],
     });
-    mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock.mockResolvedValue({
-      outcome: "archived",
-      workspace: archivedWorkspace,
-      capturedGeneration: 3,
-    });
+    mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock.mockResolvedValue(
+      {
+        outcome: "archived",
+        workspace: archivedWorkspace,
+        capturedGeneration: 3,
+      },
+    );
     mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction.mockImplementation(
       async ({ destroy }: { destroy: () => Promise<unknown> }) => ({
         skippedReopened: false,
