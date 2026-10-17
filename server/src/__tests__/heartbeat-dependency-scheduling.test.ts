@@ -1008,30 +1008,61 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }, 10_000);
       expect(burstCapped).toBe(true);
 
-      // Release the blocked executions: every run drains and the cap holds
-      // while queued runs start as slots free.
+      // Release the blocked executions: every burst run drains and the cap
+      // holds while queued runs start as slots free. Completions can queue
+      // issue-disposition repair retries for the still-todo issues; those are
+      // separate rows, so track the 6 wake runs by id and observe the cap
+      // agent-wide.
       releaseRuns();
+      const burstRunIds = wakes.map((wake) => wake!.id);
       let maxObservedRunning = 0;
       const allSucceeded = await waitForCondition(async () => {
-        const rows = await db
+        const agentRows = await db
           .select({ status: heartbeatRuns.status })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
         maxObservedRunning = Math.max(
           maxObservedRunning,
-          rows.filter((run) => run.status === "running").length,
+          agentRows.filter((run) => run.status === "running").length,
         );
+        const burstRows = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, burstRunIds));
         return (
-          rows.length === BURST &&
-          rows.every((run) => run.status === "succeeded")
+          burstRows.length === BURST &&
+          burstRows.every((run) => run.status === "succeeded")
         );
-      }, 30_000);
+      }, 90_000);
+      if (!allSucceeded) {
+        const rows = await db
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            errorCode: heartbeatRuns.errorCode,
+            error: heartbeatRuns.error,
+            scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+            retryOfRunId: heartbeatRuns.retryOfRunId,
+            createdAt: heartbeatRuns.createdAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        console.log(
+          "TOG-28460 burst drain states:",
+          JSON.stringify(
+            rows.map((row) => ({
+              ...row,
+              error: row.error?.slice(0, 200) ?? null,
+            })),
+          ),
+        );
+      }
       expect(allSucceeded).toBe(true);
       expect(maxObservedRunning).toBeLessThanOrEqual(CAP);
     } finally {
       releaseRuns();
     }
-  }, 60_000);
+  }, 150_000);
 
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();

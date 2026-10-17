@@ -20639,9 +20639,9 @@ export function heartbeatService(
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      // Fast path without taking the cross-process start lock: already at cap.
-      // The claim loop below re-verifies under the agents row lock, so a stale
-      // read here can only under-claim (a later wake or drain pass retries).
+      // Fast path: already at cap. The claim loop below recounts before
+      // every claim, so a stale read here can only under-claim (a later wake
+      // or drain pass retries).
       if (
         (await countRunningRunsForAgent(agentId)) >= policy.maxConcurrentRuns
       ) {
@@ -20734,42 +20734,41 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      // Cross-process start lock (TOG-28460): withAgentStartLock only chains
-      // callers in this process, so concurrent schedulers on other processes
-      // could read the same running count and each claim a full batch of
-      // slots. Holding the agents row for the claim loop serializes batches;
-      // the per-iteration recount covers direct executeRun claims that never
-      // take this lock. Excess wakes stay queued; drain passes start them as
-      // slots free.
-      const claimedRuns = await db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-        );
-        const claimed: Array<typeof heartbeatRuns.$inferSelect> = [];
-        for (const queuedRun of prioritizedRuns) {
-          const liveRunningCount = await countRunningRunsForAgent(agentId);
-          if (claimed.length + liveRunningCount >= policy.maxConcurrentRuns) {
-            break;
-          }
-          let claimedRun: typeof heartbeatRuns.$inferSelect | null;
-          try {
-            claimedRun = await claimQueuedRun(queuedRun, companyAgents);
-          } catch (err) {
-            if (isPermanentClaimRejection(err)) {
-              rejectedClaims.push({ run: queuedRun, err });
-              continue;
-            }
-            if (!isDeferrableClaimRejection(err)) throw err;
-            logger.warn(
-              { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
-              "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
-            );
+      // Cross-process note (TOG-28460): withAgentStartLock only chains
+      // callers in this process. The per-iteration recount below keeps each
+      // batch within the live cap for sequential bursts and for direct
+      // executeRun claims that never take this lock; a later wake or drain
+      // pass retries anything left queued. Deliberately no agents-row lock
+      // around the loop: claimQueuedRun performs its own pooled writes, and
+      // holding one transaction across them risks pool starvation.
+      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      for (const queuedRun of prioritizedRuns) {
+        // A successful claim flips its row to running synchronously, so the
+        // live count already includes this batch's claims. Claims that cancel
+        // or defer return null and must not consume the budget: later queued
+        // runs still need their claim attempt (e.g. blocked-dependency
+        // cancellation).
+        const liveRunningCount = await countRunningRunsForAgent(agentId);
+        if (liveRunningCount >= policy.maxConcurrentRuns) {
+          break;
+        }
+        let claimedRun: typeof heartbeatRuns.$inferSelect | null;
+        try {
+          claimedRun = await claimQueuedRun(queuedRun, companyAgents);
+        } catch (err) {
+          if (isPermanentClaimRejection(err)) {
+            rejectedClaims.push({ run: queuedRun, err });
             continue;
           }
-          if (claimedRun) claimed.push(claimedRun);
+          if (!isDeferrableClaimRejection(err)) throw err;
+          logger.warn(
+            { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+            "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
+          );
+          continue;
         }
-        return claimed;
-      });
+        if (claimedRun) claimedRuns.push(claimedRun);
+      }
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
