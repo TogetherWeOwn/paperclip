@@ -27,6 +27,8 @@ function receiptStatus(receipt: SourceBoundTransportValidationReceipt): number {
         return 409;
       case "low_trust_preflight_denied":
         return 403;
+      case "workspace_not_realized":
+        return 409;
       case "workspace_transport_mismatch":
         return 409;
     }

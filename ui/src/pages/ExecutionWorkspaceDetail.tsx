@@ -1506,7 +1506,7 @@ export function ExecutionWorkspaceDetail() {
               <DetailRow label="Branch">
                 {workspace.branchName ? <MonoValue value={workspace.branchName} copy /> : "None"}
               </DetailRow>
-              <DetailRow label="Opened">{formatDateTime(workspace.openedAt)}</DetailRow>
+              <DetailRow label="Opened">{workspace.openedAt ? formatDateTime(workspace.openedAt) : "Not opened yet"}</DetailRow>
               <DetailRow label="Last used">{formatDateTime(workspace.lastUsedAt)}</DetailRow>
               <DetailRow label="Cleanup">
                 {workspace.cleanupEligibleAt

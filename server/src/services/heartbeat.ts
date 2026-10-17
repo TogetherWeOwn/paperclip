@@ -6083,7 +6083,11 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      input.existingExecutionWorkspaceStatus !== "archived" &&
+      // An unrealized source-bound allocation has no worktree to restore:
+      // presence of the binding is not proof of realization. Dispatch
+      // realizes fresh and adopts the record at persistence instead.
+      input.existingExecutionWorkspaceStatus !== "unrealized",
   };
 }
 
@@ -21859,6 +21863,15 @@ export function heartbeatService(
         workspaceReuseRequest.existingExecutionWorkspaceAvailable
           ? existingExecutionWorkspace
           : null;
+      // A Board-allocated unrealized record bound to this issue is adopted
+      // at persistence: realization flips that exact record instead of
+      // inserting a second source-bound workspace.
+      const allocatedUnrealizedExecutionWorkspace =
+        existingExecutionWorkspace?.status === "unrealized" &&
+        issueRef?.id &&
+        existingExecutionWorkspace.sourceIssueId === issueRef.id
+          ? existingExecutionWorkspace
+          : null;
       const requestedReusableExecutionWorkspaceConfig =
         reusableExistingExecutionWorkspace?.config ?? null;
       const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
@@ -22799,7 +22812,9 @@ export function heartbeatService(
           existingMetadata:
             resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
               ? (reusableExistingExecutionWorkspace?.metadata ?? null)
-              : null,
+              : // Adoption keeps the allocation provenance recorded on the
+                // unrealized record (actor, selection, prior binding).
+                (allocatedUnrealizedExecutionWorkspace?.metadata ?? null),
           source: executionWorkspace.source,
           // Attaching a new worktree to a pre-existing branch reports a fresh
           // workspace, but must not make cleanup own the operator's branch.
@@ -22891,8 +22906,30 @@ export function heartbeatService(
                     ),
                 },
               )
-            : resolvedProjectId
-              ? await executionWorkspacesSvc.create({
+            : allocatedUnrealizedExecutionWorkspace
+              ? // Realization adoption: flip the Board-allocated record
+                // (same id) to active with the realized facts instead of
+                // inserting a second source-bound workspace.
+                await executionWorkspacesSvc.update(
+                  allocatedUnrealizedExecutionWorkspace.id,
+                  {
+                    cwd: executionWorkspace.cwd,
+                    repoUrl: executionWorkspace.repoUrl,
+                    baseRef: executionWorkspace.repoRef,
+                    branchName: branchNameForInitialPersistence,
+                    providerType:
+                      executionWorkspace.strategy === "git_worktree"
+                        ? "git_worktree"
+                        : "local_fs",
+                    providerRef: executionWorkspace.worktreePath,
+                    status: "active",
+                    lastUsedAt: new Date(),
+                    openedAt: new Date(),
+                    metadata: nextExecutionWorkspaceMetadata,
+                  },
+                )
+              : resolvedProjectId
+                ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,
                   projectWorkspaceId: resolvedProjectWorkspaceId,

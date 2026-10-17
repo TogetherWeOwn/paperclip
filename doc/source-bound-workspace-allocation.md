@@ -1,0 +1,114 @@
+# Source-bound workspace allocation (Board-authorized, no-wake)
+
+Allocates a durable but **unrealized** execution-workspace record bound to
+one source issue, without waking the issue, checking out code, creating a
+branch or worktree, or starting any runtime. It is the supported way to
+pre-bind the workspace identity that a later heartbeat run realizes into,
+so transport validation (see
+[`source-bound-transport-validation.md`](./source-bound-transport-validation.md))
+can be reasoned about against a stable record — while still denying that
+record until realization actually happens.
+
+Implementation: `server/src/services/source-bound-workspace-allocation.ts`
+(operation version `source-bound-workspace-allocation/v1`), routes in
+`server/src/routes/execution-workspaces.ts`.
+
+## Supported invocation
+
+```
+POST /api/issues/{sourceIssueId}/source-bound-workspace-allocation
+Authorization: <Board session/key for a user with runtime:manage>
+Content-Type: application/json
+
+{ }
+```
+
+- **Authorization.** Board principal + `runtime:manage` on the issue's
+  company, resolved server-side (`assertBoard` + `access.decide`).
+  Agent keys are denied before anything resolves. A board actor without
+  the capability, a missing issue, and a cross-company issue all deny as
+  `unauthorized_principal` (403) without revealing which.
+- **No caller-supplied fields.** The body may carry an optional
+  `requested` object, which is ignored. Every persisted field is derived
+  server-side from the issue's stored selection
+  (`executionWorkspacePreference` / `executionWorkspaceSettings` +
+  `projectWorkspaceId`). Only `isolated_workspace` + `git_worktree`
+  allocates: an absent selection denies `selection_missing` (422); any
+  other mode/strategy, or a preference/settings disagreement, denies
+  `selection_not_isolated` (422).
+- **The record.** Status `unrealized`; `sourceIssueId` = the issue;
+  `cwd`, `providerRef`, `branchName`, `openedAt`, and `closedAt` are all
+  null; `providerType`/`baseRef` come from the stored selection. The
+  insert, the `issue.executionWorkspaceId` bind, and the
+  `issue.source_bound_workspace_allocated` activity-log audit entry
+  (actor, company, source issue, workspace id, selected project
+  workspace, strategy/base-ref/branch-template inputs, prior binding,
+  disposition, timestamp) commit in **one transaction**. Issue status,
+  assignee, blockers, execution policy, and monitor fields are not
+  reachable from the operation and never change.
+- **Idempotency.** A repeat call returns `200` with
+  `disposition: "existing"` and the same record (audited) only when
+  company, source issue, and selected project workspace all still
+  match. Conflicting, archived-bound, ambiguous, or malformed bindings
+  deny `binding_conflict` (409) — never a silent rebind. First creation
+  returns `201` with `disposition: "created"`. Pre-existing workspace
+  records are never mutated by allocation.
+- **Allocation is not validation.** Transport validation denies an
+  unrealized record as `workspace_not_realized` (409) before attestation
+  is evaluated. Only heartbeat realization — which adopts the allocated
+  record (same id, no second insert) and flips it to `active` with
+  cwd/providerRef/branch/openedAt set — makes the record eligible. The
+  terminal-workspace reaper never sweeps an unrealized record, and
+  closing one plans no worktree/branch deletion (none exists).
+
+## Rollback
+
+```
+POST /api/issues/{sourceIssueId}/source-bound-workspace-allocation/rollback
+Authorization: <Board session/key for a user with runtime:manage>
+Content-Type: application/json
+
+{ "workspaceId": "<allocated workspace id>" }
+```
+
+Archives only the allocated **unrealized** record and restores
+`issue.executionWorkspaceId` to the exact prior value recorded in the
+record's allocation metadata, in one transaction, audited as
+`issue.source_bound_workspace_allocation_rolled_back`. It refuses
+(`binding_conflict`, 409) if the issue's binding changed in between,
+and refuses realized workspaces (`workspace_not_unrealized`, 409) —
+those close through the normal workspace lifecycle. No workspace,
+branch, or history is deleted.
+
+## Verification procedure
+
+1. Unit/E2E:
+   `pnpm exec vitest run --root server src/__tests__/source-bound-workspace-allocation.contract.test.ts src/__tests__/source-bound-workspace-allocation-db.test.ts src/__tests__/source-transport-validation-unrealized.contract.test.ts`
+   These cover board-only authorization, server-derived selection,
+   atomicity (zero residue on failure/denial), idempotent replay,
+   binding-conflict fail-closed cases, realization adoption of the same
+   row, rollback, reaper exemption, and the validator's
+   `workspace_not_realized` denial before attestation.
+2. Live check: allocate for an issue with an isolated git-worktree
+   selection as a board user with `runtime:manage`. Confirm the record
+   exists with status `unrealized` and null cwd/openedAt, the issue's
+   `executionWorkspaceId` points at it, one
+   `issue.source_bound_workspace_allocated` activity entry exists, and
+   **no** heartbeat run, runtime service, branch, or worktree was
+   created (issue status/assignee/monitor unchanged). Repeat the call
+   and confirm `disposition: "existing"` with the same id. Run transport
+   validation as the assignee and confirm
+   `workspace_not_realized` (409). Roll back and confirm the record is
+   `archived` and the prior binding restored.
+3. Agent denial: repeat the allocation call with an agent key and
+   confirm 403 with no record created.
+
+## Code rollback
+
+Remove the two routes from `server/src/routes/execution-workspaces.ts`
+and delete `server/src/services/source-bound-workspace-allocation.ts`.
+Allocated records remain readable as ordinary workspace rows (status
+`unrealized`); archive them and clear the issue selection via the
+rollback semantics above before removing the code if a clean state is
+required. The `opened_at` nullability migration is backward compatible
+and can stay.
