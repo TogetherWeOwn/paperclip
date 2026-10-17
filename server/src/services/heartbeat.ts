@@ -21868,6 +21868,7 @@ export function heartbeatService(
       // inserting a second source-bound workspace.
       const allocatedUnrealizedExecutionWorkspace =
         existingExecutionWorkspace?.status === "unrealized" &&
+        existingExecutionWorkspace.companyId === agent.companyId &&
         issueRef?.id &&
         existingExecutionWorkspace.sourceIssueId === issueRef.id
           ? existingExecutionWorkspace
@@ -22880,6 +22881,24 @@ export function heartbeatService(
       const branchNameForInitialPersistence =
         pendingForwardBranchReconcile?.recordedBranchName ??
         executionWorkspace.branchName;
+      // Re-read the allocated record at persistence time: it was captured
+      // before realization, and a Board rollback in between (archived +
+      // binding restored) must not be resurrected by this run. Only a
+      // record still unrealized and still bound to this issue is adopted;
+      // anything else falls through to a fresh insert.
+      const adoptableAllocatedExecutionWorkspace =
+        allocatedUnrealizedExecutionWorkspace &&
+        !resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
+          ? await executionWorkspacesSvc
+              .getById(allocatedUnrealizedExecutionWorkspace.id)
+              .then((fresh) =>
+                fresh?.status === "unrealized" &&
+                fresh.companyId === agent.companyId &&
+                fresh.sourceIssueId === issueRef?.id
+                  ? fresh
+                  : null,
+              )
+          : null;
       try {
         persistedExecutionWorkspace =
           resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
@@ -22906,12 +22925,12 @@ export function heartbeatService(
                     ),
                 },
               )
-            : allocatedUnrealizedExecutionWorkspace
+            : adoptableAllocatedExecutionWorkspace
               ? // Realization adoption: flip the Board-allocated record
                 // (same id) to active with the realized facts instead of
                 // inserting a second source-bound workspace.
                 await executionWorkspacesSvc.update(
-                  allocatedUnrealizedExecutionWorkspace.id,
+                  adoptableAllocatedExecutionWorkspace.id,
                   {
                     cwd: executionWorkspace.cwd,
                     repoUrl: executionWorkspace.repoUrl,

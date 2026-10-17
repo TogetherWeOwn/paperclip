@@ -5,9 +5,11 @@
  * source issue, without waking the issue, checking out code, creating a
  * branch/worktree, or starting any runtime. It exists so a Board principal
  * can pre-bind the workspace identity a later heartbeat run will realize
- * into (adoption: `markAllocatedWorkspaceRealized` flips the same record),
- * while transport validation keeps denying the record as
- * `workspace_not_realized` until realization actually happens.
+ * into: heartbeat persistence flips that exact record to `active` (after
+ * re-checking it is still unrealized and bound), and
+ * `markAllocatedWorkspaceRealized` below is the same guarded transition
+ * as a standalone operation. Transport validation keeps denying the
+ * record as `workspace_not_realized` until realization actually happens.
  *
  * Safety shape (fail closed everywhere):
  * - Principal: an authenticated Board actor with server-resolved

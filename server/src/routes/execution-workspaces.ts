@@ -1188,9 +1188,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             .limit(1)
             .then((rows) => rows[0] ?? null)
         : null;
-    if (!issue) {
-      // Missing and cross-company issues deny identically, without
-      // revealing which (mirrors the operation's unauthorized deny).
+    // Missing and cross-company issues deny identically (same status and
+    // body), without revealing which: a company-access failure is mapped
+    // onto the same operation-shaped deny instead of the generic error,
+    // so the two cases are indistinguishable to the caller.
+    const denyUnauthorized = () => {
       res.status(403).json({
         ok: false,
         operationVersion: SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
@@ -1199,18 +1201,25 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         wakeInvoked: false,
       });
       return null;
+    };
+    if (!issue) return denyUnauthorized();
+    try {
+      assertCompanyAccess(req, issue.companyId);
+    } catch {
+      return denyUnauthorized();
     }
-    assertCompanyAccess(req, issue.companyId);
     const decision = await access.decide({
       actor: req.actor,
       action: "runtime:manage",
       resource: { type: "company", companyId: issue.companyId },
     });
-    const actorInfo = getActorInfo(req);
     return {
       actor: {
         type: "board",
-        userId: actorInfo.actorId,
+        // The authenticated board identity itself (never the synthetic
+        // "board" fallback): a principal with no user identity denies in
+        // the operation, so the audit always names a real actor.
+        userId: req.actor.userId ?? null,
         companyId: issue.companyId,
         hasRuntimeManage: decision.allowed,
       },
