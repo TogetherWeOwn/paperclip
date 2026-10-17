@@ -1,6 +1,9 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import {
+  isReviewWaitNeverStartedCancellation,
+  legacyExecutionNeedsReconciliation,
+} from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -119,4 +122,45 @@ it("permits model-decision waits only with explicit evidence that provider work 
   expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {
     executionRecovery: { kind: "model_decision_pending", providerWorkStarted: true },
   } })).toBe(true);
+});
+
+const reviewWait = {
+  runtimeMode: "legacy", status: "cancelled", errorCode: "issue_continuation_waiting_on_review",
+  startedAt: null, processStartedAt: null, processPid: null, processGroupId: null,
+  lastOutputAt: null, lastOutputSeq: 0, scheduledRetryAttempt: 4,
+  resultJson: {
+    stopReason: "issue_continuation_waiting_on_review",
+    timeoutSource: "stale_queued_run_gate", effectiveTimeoutSec: 0, timeoutFired: false,
+  },
+};
+
+it("does not reopen a gate-cancelled review-wait continuation that never started a provider", () => {
+  expect(isReviewWaitNeverStartedCancellation(reviewWait)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation(reviewWait)).toBe(false);
+});
+
+it.each([
+  ["a process identity", { processPid: 4321 }],
+  ["a process start", { processStartedAt: new Date() }],
+  ["a run start", { startedAt: new Date() }],
+  ["emitted output", { lastOutputSeq: 3 }],
+  ["output timing", { lastOutputAt: new Date(), lastOutputSeq: 1 }],
+  ["a non-cancelled status", { status: "failed" }],
+])("keeps the reconciliation hold for a review-wait run with %s", (_label, patch) => {
+  expect(legacyExecutionNeedsReconciliation({ ...reviewWait, ...patch })).toBe(true);
+});
+
+it.each([
+  ["missing gate marker", { stopReason: "issue_continuation_waiting_on_review" }],
+  ["missing stop reason", { timeoutSource: "stale_queued_run_gate" }],
+  ["empty result", {}],
+])("keeps the reconciliation hold when the review-wait evidence is incomplete: %s", (_label, resultJson) => {
+  expect(legacyExecutionNeedsReconciliation({ ...reviewWait, resultJson })).toBe(true);
+});
+
+it("keeps the unsafe-archive hold ahead of the review-wait exemption", () => {
+  expect(legacyExecutionNeedsReconciliation({
+    ...reviewWait,
+    resultJson: { ...reviewWait.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" },
+  })).toBe(true);
 });
