@@ -59,13 +59,13 @@ import {
   markAllocatedWorkspaceRealized,
   rollbackSourceBoundWorkspaceAllocation,
   SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
-  UNREALIZED_EXECUTION_WORKSPACE_STATUS,
   type SourceBoundAllocationActor,
   type SourceBoundAllocationAuditEntry,
   type SourceBoundAllocationIssueFacts,
   type SourceBoundAllocationWorkspaceRecord,
   type SourceBoundWorkspaceAllocationDeps,
   type SourceBoundWorkspaceAllocationTx,
+  UNREALIZED_EXECUTION_WORKSPACE_STATUS,
 } from "../services/source-bound-workspace-allocation.js";
 
 const COMPANY_ID = "11111111-1111-4111-8111-111111111111";
@@ -192,7 +192,8 @@ function makeDeps(
     },
     async listWorkspacesForSourceIssue(companyId, sourceIssueId) {
       return [...store.workspaces.values()].filter(
-        (ws) => ws.companyId === companyId && ws.sourceIssueId === sourceIssueId,
+        (ws) =>
+          ws.companyId === companyId && ws.sourceIssueId === sourceIssueId,
       );
     },
     async getWorkspace(companyId, workspaceId) {
@@ -661,9 +662,9 @@ describe("source-bound workspace allocation (contract)", () => {
         },
       },
     );
-    await expect(allocateSourceBoundWorkspace(deps, baseInput())).rejects.toThrow(
-      "bind failed",
-    );
+    await expect(
+      allocateSourceBoundWorkspace(deps, baseInput()),
+    ).rejects.toThrow("bind failed");
     expect(store.workspaces.size).toBe(0);
     expect(store.issues.get(SOURCE_ISSUE_ID)?.executionWorkspaceId).toBeNull();
     expect(store.audits).toEqual([]);
@@ -675,7 +676,10 @@ describe("source-bound workspace allocation realization adoption (contract)", ()
   function seededAllocated() {
     return makeDeps({
       issues: new Map([
-        [SOURCE_ISSUE_ID, baseIssue({ executionWorkspaceId: ALLOCATED_WORKSPACE_ID })],
+        [
+          SOURCE_ISSUE_ID,
+          baseIssue({ executionWorkspaceId: ALLOCATED_WORKSPACE_ID }),
+        ],
       ]),
       workspaces: new Map([[ALLOCATED_WORKSPACE_ID, workspaceRecord()]]),
     });
@@ -717,29 +721,38 @@ describe("source-bound workspace allocation realization adoption (contract)", ()
     { name: "empty cwd", patch: { cwd: "" } },
     { name: "empty providerRef", patch: { providerRef: "" } },
     { name: "empty branchName", patch: { branchName: "" } },
-  ])("denies incomplete realization ($name) and keeps the record unrealized", async ({ patch }) => {
-    const { deps, store } = seededAllocated();
-    const result = await markAllocatedWorkspaceRealized(deps, {
-      companyId: COMPANY_ID,
-      sourceIssueId: SOURCE_ISSUE_ID,
-      workspaceId: ALLOCATED_WORKSPACE_ID,
-      cwd: "/repo/.paperclip/worktrees/TST-42",
-      providerRef: "/repo/.paperclip/worktrees/TST-42",
-      branchName: "TST-42-source-transport",
-      ...patch,
-    });
-    expect(result).toMatchObject({ ok: false, errorCode: "realization_incomplete" });
-    expect(store.workspaces.get(ALLOCATED_WORKSPACE_ID)).toMatchObject({
-      status: "unrealized",
-      cwd: null,
-      openedAt: null,
-    });
-  });
+  ])(
+    "denies incomplete realization ($name) and keeps the record unrealized",
+    async ({ patch }) => {
+      const { deps, store } = seededAllocated();
+      const result = await markAllocatedWorkspaceRealized(deps, {
+        companyId: COMPANY_ID,
+        sourceIssueId: SOURCE_ISSUE_ID,
+        workspaceId: ALLOCATED_WORKSPACE_ID,
+        cwd: "/repo/.paperclip/worktrees/TST-42",
+        providerRef: "/repo/.paperclip/worktrees/TST-42",
+        branchName: "TST-42-source-transport",
+        ...patch,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        errorCode: "realization_incomplete",
+      });
+      expect(store.workspaces.get(ALLOCATED_WORKSPACE_ID)).toMatchObject({
+        status: "unrealized",
+        cwd: null,
+        openedAt: null,
+      });
+    },
+  );
 
   it("denies realization when the issue is no longer bound to the allocated record", async () => {
     const { deps, store } = makeDeps({
       issues: new Map([
-        [SOURCE_ISSUE_ID, baseIssue({ executionWorkspaceId: SECOND_WORKSPACE_ID })],
+        [
+          SOURCE_ISSUE_ID,
+          baseIssue({ executionWorkspaceId: SECOND_WORKSPACE_ID }),
+        ],
       ]),
       workspaces: new Map([[ALLOCATED_WORKSPACE_ID, workspaceRecord()]]),
     });
@@ -752,13 +765,18 @@ describe("source-bound workspace allocation realization adoption (contract)", ()
       branchName: "TST-42-source-transport",
     });
     expect(result).toMatchObject({ ok: false, errorCode: "binding_conflict" });
-    expect(store.workspaces.get(ALLOCATED_WORKSPACE_ID)?.status).toBe("unrealized");
+    expect(store.workspaces.get(ALLOCATED_WORKSPACE_ID)?.status).toBe(
+      "unrealized",
+    );
   });
 
   it("denies realization of a record that is not unrealized (already active)", async () => {
     const { deps } = makeDeps({
       issues: new Map([
-        [SOURCE_ISSUE_ID, baseIssue({ executionWorkspaceId: ALLOCATED_WORKSPACE_ID })],
+        [
+          SOURCE_ISSUE_ID,
+          baseIssue({ executionWorkspaceId: ALLOCATED_WORKSPACE_ID }),
+        ],
       ]),
       workspaces: new Map([
         [
@@ -775,7 +793,10 @@ describe("source-bound workspace allocation realization adoption (contract)", ()
       providerRef: "/repo/.paperclip/worktrees/TST-42",
       branchName: "TST-42-source-transport",
     });
-    expect(result).toMatchObject({ ok: false, errorCode: "workspace_not_unrealized" });
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: "workspace_not_unrealized",
+    });
   });
 });
 describe("source-bound workspace allocation rollback (contract)", () => {

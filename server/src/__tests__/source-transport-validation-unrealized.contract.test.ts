@@ -139,7 +139,10 @@ describe("transport validation denial for unrealized allocations (contract)", ()
         typeof validateSourceTransportOnly
       >[0],
     );
-    expect(result).toMatchObject({ ok: true, validatedWorkspaceId: WORKSPACE_ID });
+    expect(result).toMatchObject({
+      ok: true,
+      validatedWorkspaceId: WORKSPACE_ID,
+    });
   });
 
   it("pure core reports unrealized before comparing transports", () => {
@@ -234,7 +237,10 @@ describe("transport validation denial for unrealized allocations (contract)", ()
       };
       next();
     });
-    app.use("/api", sourceTransportValidationRoutes({} as Db, { deps: deps() }));
+    app.use(
+      "/api",
+      sourceTransportValidationRoutes({} as Db, { deps: deps() }),
+    );
     app.use(errorHandler);
 
     const res = await request(app)
