@@ -185,15 +185,23 @@ describeEmbeddedPostgres(
           "paperclip-chat-ingress-pool-",
         );
         const db = createDb(tempDb.connectionString);
+        // Pool of exactly 1: the outer transaction holds the only
+        // connection, so any nested pooled read inside update stalls and
+        // hits the timeout below. A pool of 2 would mask the regression —
+        // the transaction holds one connection and the nested read takes
+        // the free second one, so the test passes even with the update
+        // fix reverted.
         const smallDb = createDb(tempDb.connectionString, {
-          maxConnections: 2,
+          maxConnections: 1,
         });
         const { companyId } = await seedCompanyWithAgent(db);
         const svc = issueService(smallDb);
-        const issue = await svc.create(companyId, {
+        // Seed outside the bounded pool so the pre-transaction create can
+        // never borrow the single connection the test relies on.
+        const issue = await issueService(db).create(companyId, {
           title: `Reopen target ${randomUUID()}`,
           description: null,
-          status: "todo",
+          status: "done",
           priority: "medium",
         });
 
@@ -204,13 +212,15 @@ describeEmbeddedPostgres(
               .from(companies)
               .where(eq(companies.id, companyId))
               .for("update");
-            // Touching assigneeUserId exercises the membership check and the
-            // isolated-workspaces settings read inside update.
+            // Chat-ingress reopen shape (done -> todo) plus assignee change:
+            // exercises the isolated-workspaces settings read and the
+            // membership check inside update, both of which must stay on tx.
             const updated = await svc.update(
               issue.id,
-              { assigneeUserId: "board-user" },
+              { status: "todo", assigneeUserId: "board-user" },
               tx,
             );
+            expect(updated?.status).toBe("todo");
             expect(updated?.assigneeUserId).toBe("board-user");
           }),
           15_000,
