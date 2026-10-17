@@ -993,6 +993,161 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   }, 40_000);
 
+  it("caps a burst of simultaneous wakes at maxConcurrentRuns (TOG-28460)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const CAP = 2;
+    const BURST = 6;
+    const issueIds = Array.from({ length: BURST }, () => randomUUID());
+    let releaseRuns!: () => void;
+    const runsReleased = new Promise<void>((resolve) => {
+      releaseRuns = resolve;
+    });
+
+    // Block every adapter execution until released, so claimed runs stay
+    // running while the burst lands and the queued remainder is observable.
+    mockAdapterExecute.mockImplementation(async () => {
+      await runsReleased;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Burst run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BurstCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: CAP,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values(
+      issueIds.map((issueId, index) => ({
+        id: issueId,
+        companyId,
+        title: `Burst assignment ${index}`,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      })),
+    );
+
+    try {
+      // Fire all wakes at once, like a batch of issue_blockers_resolved wakes
+      // landing together when one card resolves many blockers.
+      const wakes = await Promise.all(
+        issueIds.map((issueId) =>
+          heartbeat.wakeup(agentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: { issueId },
+            contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+          }),
+        ),
+      );
+      expect(wakes.every((wake) => wake !== null)).toBe(true);
+      for (const [index, wake] of wakes.entries()) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId: issueIds[index]!,
+          authorAgentId: agentId,
+          authorType: "agent",
+          createdByRunId: wake!.id,
+          body: `Burst assignment ${index} run completed.`,
+        });
+      }
+
+      // Exactly CAP running and the rest queued: no burst overrun.
+      const burstCapped = await waitForCondition(async () => {
+        const rows = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        const running = rows.filter((run) => run.status === "running").length;
+        const queued = rows.filter((run) => run.status === "queued").length;
+        return rows.length === BURST && running === CAP && queued === BURST - CAP;
+      }, 10_000);
+      expect(burstCapped).toBe(true);
+
+      // Release the blocked executions: every burst run drains and the cap
+      // holds while queued runs start as slots free. Completions can queue
+      // issue-disposition repair retries for the still-todo issues; those are
+      // separate rows, so track the 6 wake runs by id and observe the cap
+      // agent-wide.
+      releaseRuns();
+      const burstRunIds = wakes.map((wake) => wake!.id);
+      let maxObservedRunning = 0;
+      const allSucceeded = await waitForCondition(async () => {
+        const agentRows = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        maxObservedRunning = Math.max(
+          maxObservedRunning,
+          agentRows.filter((run) => run.status === "running").length,
+        );
+        const burstRows = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, burstRunIds));
+        return (
+          burstRows.length === BURST &&
+          burstRows.every((run) => run.status === "succeeded")
+        );
+      }, 90_000);
+      if (!allSucceeded) {
+        const rows = await db
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            errorCode: heartbeatRuns.errorCode,
+            error: heartbeatRuns.error,
+            scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+            retryOfRunId: heartbeatRuns.retryOfRunId,
+            createdAt: heartbeatRuns.createdAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        console.log(
+          "TOG-28460 burst drain states:",
+          JSON.stringify(
+            rows.map((row) => ({
+              ...row,
+              error: row.error?.slice(0, 200) ?? null,
+            })),
+          ),
+        );
+      }
+      expect(allSucceeded).toBe(true);
+      expect(maxObservedRunning).toBeLessThanOrEqual(CAP);
+    } finally {
+      releaseRuns();
+    }
+  }, 150_000);
+
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

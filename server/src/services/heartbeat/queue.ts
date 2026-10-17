@@ -734,6 +734,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        // TOG-28460: agents row first (FOR NO KEY UPDATE, NOWAIT) so this
+        // gate matches the claim transactions' agents-then-issue order.
+        // Reverse order deadlocks (40P01) with concurrent claims that hold
+        // the agents row and wait on the issue row. NOWAIT preserves the
+        // gate's non-blocking contract: contention defers to the queue.
+        await tx.execute(
+          sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update nowait`,
+        );
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -984,6 +992,36 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       );
       return null;
     }
+    const maxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
+
+    // TOG-28460: per-agent start gate. Every queued->running transition
+    // funnels through the claim transactions below, so the cap is enforced
+    // there — on the SAME connection that performs the claim — instead of in
+    // the scheduler loop or at the executeRun entry. Lock order is uniform in
+    // every claim tx: agents row first, then the issue/wake/run rows the
+    // existing claim code already locks. The agents lock is FOR NO KEY UPDATE
+    // (not FOR UPDATE) so FK KEY SHARE checks from comment/run inserts still
+    // commit — FOR UPDATE deadlocks with those (40P01) while NO KEY UPDATE
+    // still serializes concurrent claimants. Each claim tx stays short (a
+    // lock, a count, the claim) and never awaits another scheduler, so an
+    // overlapping scheduler that outlives the in-process start lock only waits
+    // briefly instead of wedging. At cap the run stays queued for a later
+    // drain pass.
+    async function isAtStartConcurrencyCap(tx: Db): Promise<boolean> {
+      await tx.execute(
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update`,
+      );
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        );
+      return Number(count ?? 0) >= maxConcurrentRuns;
+    }
 
     const context = parseObject(run.contextSnapshot);
     const budgetBlock = await budgets.getInvocationBlock(
@@ -1219,6 +1257,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              // TOG-28460: agents row first (see isAtStartConcurrencyCap),
+              // then the issue/wake/run order below. At cap the run stays
+              // queued for a later drain pass.
+              if (await isAtStartConcurrencyCap(tx as unknown as Db)) {
+                return { kind: "stale" as const, run: null };
+              }
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -1542,9 +1586,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              maxConcurrentRuns,
             });
           }
           return tx.transaction(async (claimTx) => {
+            // TOG-28460: agents row first (see isAtStartConcurrencyCap);
+            // at cap the run stays queued for a later drain pass.
+            if (await isAtStartConcurrencyCap(claimTx as unknown as Db)) {
+              return null;
+            }
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
@@ -1871,6 +1921,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return err instanceof HttpError && err.status >= 400 && err.status < 500;
   }
 
+  // TOG-28460: a 40P01 deadlock aborts only the losing claim transaction.
+  // The run stays queued and a later pass retries it. Crucially the drain
+  // loop must NOT rethrow: already-claimed runs in this batch still need
+  // their execute loop below, otherwise they sit running with no executor
+  // until the orphan reaper. Walk the cause chain like
+  // isExternalChatWaitAuthorizationContention (55P03) does.
+  function isPostgresDeadlock(err: unknown): boolean {
+    let current: unknown = err;
+    for (let depth = 0; depth < 4 && current; depth += 1) {
+      if (typeof current !== "object" || current === null) return false;
+      const record = current as Record<string, unknown>;
+      const code = record.code;
+      if (typeof code === "string" && code.toUpperCase() === "40P01") return true;
+      current = (record as { cause?: unknown }).cause;
+    }
+    return false;
+  }
+
   // Settle runs that can never be claimed. Letting the error escape stalls the
   // agent's queue and, during startup recovery, stops the server from booting.
   async function cancelRejectedQueuedRuns(
@@ -1916,12 +1984,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
-      );
-      if (availableSlots <= 0) return [];
+      // Fast path: already at cap. The claim loop below recounts before
+      // every claim, so a stale read here can only under-claim (a later wake
+      // or drain pass retries).
+      if (
+        (await countRunningRunsForAgent(agentId)) >= policy.maxConcurrentRuns
+      ) {
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -2009,15 +2079,40 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // TOG-28460: withAgentStartLock only chains callers in this process
+      // and lapses 30 s after registration, so overlapping schedulers (other
+      // processes, or a lapsed lock) can both pass the recount below. The
+      // recount is only a fast-path break to avoid wasted claims; the real
+      // gate is the agents-row lock inside claimQueuedRun's claim
+      // transactions, which serializes the recount with the queued->running
+      // flip on one connection. Deliberately no agents-row lock around the
+      // loop: claimQueuedRun performs its own pooled writes, and holding one
+      // transaction across them risks pool starvation. A later wake or drain
+      // pass retries anything left queued.
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        let claimed: typeof heartbeatRuns.$inferSelect | null;
+        // A successful claim flips its row to running synchronously, so the
+        // live count already includes this batch's claims. Claims that cancel,
+        // defer, or hit the atomic cap return null and must not consume the
+        // budget: later queued runs still need their claim attempt (e.g.
+        // blocked-dependency cancellation).
+        const liveRunningCount = await countRunningRunsForAgent(agentId);
+        if (liveRunningCount >= policy.maxConcurrentRuns) {
+          break;
+        }
+        let claimedRun: typeof heartbeatRuns.$inferSelect | null;
         try {
-          claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
+          claimedRun = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
+            continue;
+          }
+          if (isPostgresDeadlock(err)) {
+            logger.warn(
+              { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+              "queued heartbeat run claim deadlocked; leaving it queued for the next recovery pass",
+            );
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
@@ -2027,7 +2122,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           );
           continue;
         }
-        if (claimed) claimedRuns.push(claimed);
+        if (claimedRun) claimedRuns.push(claimedRun);
       }
       if (claimedRuns.length === 0) return [];
 

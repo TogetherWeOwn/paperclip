@@ -1979,6 +1979,10 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // TOG-28460: the cap is enforced atomically inside claimQueuedRun's
+      // claim transactions (agents-row lock + recount on the claim
+      // connection), so direct executeRun callers are gated there too. At cap
+      // the claim leaves the run queued for a later drain pass.
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
