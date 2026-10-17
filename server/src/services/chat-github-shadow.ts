@@ -30,7 +30,7 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   endpoint: Endpoint; repositoryId: string; repository: string; threadId: string;
   eventId: string; principal: { externalId: string; handle: string | null };
   automatic?: GitHubReviewEventContext; manualEvent?: "mention" | "comment";
-}, fetchImpl: typeof fetch): Promise<{ event: GitHubReviewEventContext; snapshot?: GitHubReviewEnrollmentEnvelope["snapshot"]; snapshotFailure?: string } | null> {
+}, fetchImpl: typeof fetch): Promise<Pick<GitHubReviewEnrollmentEnvelope, "event" | "unavailableEvent" | "snapshot" | "snapshotFailure"> | null> {
   if (!(await githubShadowEnabled(db))) return null;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
   if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
@@ -38,28 +38,36 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   const boundedFetch: typeof fetch = (url, init) => fetchImpl(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline });
   const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(input.threadId);
   if (!match || match[1]!.toLowerCase() !== input.repository.toLowerCase()) return null;
-  const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
-  const pr = await githubBotRequest<{
-    title: string; body: string | null; draft: boolean;
-    head: { sha: string }; base: { sha: string; ref: string };
-    user: { id: number; login: string; type?: string }; labels?: Array<{ name: string }>;
-  }>(boundedFetch, token, `/repos/${input.repository}/pulls/${match[2]}`);
-  const event: GitHubReviewEventContext = input.automatic ?? {
+  const unavailableEvent: NonNullable<GitHubReviewEnrollmentEnvelope["unavailableEvent"]> = {
     event: input.manualEvent ?? "mention", deliveryId: input.eventId,
     repositoryId: input.repositoryId, repository: input.repository.toLowerCase(), pullNumber: Number(match[2]),
-    headSha: githubCommitSchema.parse(pr.head.sha), baseSha: githubCommitSchema.parse(pr.base.sha),
-    baseBranch: pr.base.ref, title: pr.title, body: pr.body ?? "", draft: pr.draft,
-    author: { id: String(pr.user.id), login: pr.user.login, isBot: pr.user.type === "Bot" },
     sender: { id: input.principal.externalId, login: input.principal.handle ?? input.principal.externalId },
-    labels: (pr.labels ?? []).map(l => l.name),
   };
+  let event: GitHubReviewEventContext | null = input.automatic ?? null;
+  let prepared = false;
   try {
+    const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
+    const pr = await githubBotRequest<{
+      title: string; body: string | null; draft: boolean;
+      head: { sha: string }; base: { sha: string; ref: string };
+      user: { id: number; login: string; type?: string }; labels?: Array<{ name: string }>;
+    }>(boundedFetch, token, `/repos/${input.repository}/pulls/${match[2]}`);
+    event ??= {
+      ...unavailableEvent,
+      headSha: githubCommitSchema.parse(pr.head.sha), baseSha: githubCommitSchema.parse(pr.base.sha),
+      baseBranch: pr.base.ref, title: pr.title, body: pr.body ?? "", draft: pr.draft,
+      author: { id: String(pr.user.id), login: pr.user.login, isBot: pr.user.type === "Bot" },
+      labels: (pr.labels ?? []).map(l => l.name),
+    };
+    prepared = true;
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event);
     return { event, snapshot };
   } catch {
-    // Preserve enrollment/accounting, but NEVER reconstruct admission bytes at
-    // recovery time. Primary can proceed live; candidate fails closed.
-    return { event, snapshotFailure: "admission_snapshot_unavailable" };
+    // Selection/denominator survive token and metadata failure too. Automatic
+    // events keep their authenticated head; manual unknowns stay explicitly null.
+    // Recovery only projects these bytes, never reconstructs a later live view.
+    return { event, ...(!event ? { unavailableEvent } : {}),
+      snapshotFailure: prepared ? "admission_snapshot_unavailable" : "source_preparation_failed" };
   }
 }
 
@@ -75,12 +83,13 @@ interface Seed {
 
 async function projectSeed(tx: Tx, delivery: typeof chatDeliveries.$inferSelect, seed: Seed) {
   if (!delivery.principalId) throw new Error("paired_review_principal_missing");
-  const e = seed.envelope.event;
+  const e = seed.envelope.event ?? seed.envelope.unavailableEvent;
+  if (!e) throw new Error("paired_review_event_identity_missing");
   await tx.insert(chatGitHubReviewEnrollments).values({
     id: seed.id, companyId: delivery.companyId, endpointId: delivery.endpointId,
     originDeliveryId: delivery.id, originEventId: delivery.providerEventId, principalId: delivery.principalId,
     repositoryId: e.repositoryId, repository: e.repository, pullNumber: e.pullNumber,
-    headSha: e.headSha, baseSha: e.baseSha, roundOrdinal: seed.roundOrdinal,
+    headSha: seed.envelope.event?.headSha ?? null, baseSha: seed.envelope.event?.baseSha ?? null, roundOrdinal: seed.roundOrdinal,
     configurationRevision: seed.revision, pairKey: seed.pairKey, envelope: seed.envelope,
   }).onConflictDoNothing();
   for (const arm of seed.arms) await tx.insert(chatGitHubReviewCandidates).values({
@@ -93,7 +102,8 @@ async function projectSeed(tx: Tx, delivery: typeof chatDeliveries.$inferSelect,
  * is the durable fallback outbox if optional projection fails in its savepoint. */
 export async function admitGitHubPair(tx: Tx, input: {
   endpoint: Endpoint; deliveryId: string; conversation: typeof chatConversations.$inferSelect;
-  event: GitHubReviewEventContext; request: string; policy: GitHubReviewPolicy; revision: number;
+  event: GitHubReviewEventContext | null; unavailableEvent?: GitHubReviewEnrollmentEnvelope["unavailableEvent"];
+  request: string; policy: GitHubReviewPolicy; revision: number;
   authority: GitHubReviewEnrollmentEnvelope["authority"];
   snapshot?: GitHubReviewEnrollmentEnvelope["snapshot"];
   snapshotFailure?: string;
@@ -112,12 +122,13 @@ export async function admitGitHubPair(tx: Tx, input: {
     return route && draw < route.sampleRate;
   });
   if (!selected.length) return;
-  const e = input.event;
+  const e = input.event ?? input.unavailableEvent;
+  if (!e) throw new Error("paired_review_event_identity_missing");
   // Endpoint lock serializes allocation, including seeds not yet projected.
   const [prior] = await tx.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
     .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpoint.id),
-      sql`${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId' = ${e.repositoryId}`,
-      sql`${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber' = ${String(e.pullNumber)}`));
+      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${e.repositoryId}`,
+      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(e.pullNumber)}`));
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;
   const [primaryIssue] = await tx.select({ sourceTrust: issues.sourceTrust }).from(issues).where(eq(issues.id, input.conversation.issueId));
   const previousAssessments: NonNullable<GitHubReviewEnrollmentEnvelope["previousAssessments"]> = {};
@@ -147,8 +158,12 @@ export async function admitGitHubPair(tx: Tx, input: {
   }
   const seed: Seed = {
     version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
-    pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, e.headSha, e.baseSha, roundOrdinal, input.revision, digest(input.policy)]),
-    envelope: { version: 1, event: e, request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
+    pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, input.event?.headSha ?? null, input.event?.baseSha ?? null, roundOrdinal, input.revision, digest(input.policy)]),
+    envelope: { version: 1, event: input.event, unavailableEvent: input.unavailableEvent,
+      comparisonEligibility: { certifiedClean: false, reasons: ["primary_namespace_not_isolated", "candidate_runtime_not_certified",
+        ...(!input.snapshot ? ["admission_snapshot_unavailable"] : []),
+        ...(roundOrdinal > 1 ? ["longitudinal_arm_history"] : [])] },
+      request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
       snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
       normalizedEvent: delivery.normalizedEvent,
       conversation: { resourceId: input.conversation.resourceId, externalConversationId: input.conversation.externalConversationId,
@@ -195,7 +210,7 @@ export async function githubRunCapability(db: Store, session: {
     // The immutable source seed is authoritative even if its optional table
     // projection failed. Both arms must see the same admission-time bytes.
     const seed = source.delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
-    const enrollment = seed ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
+    const enrollment = seed?.envelope.event ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
       baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
     return { ...source, candidate: null, enrollment };
   }
@@ -203,7 +218,8 @@ export async function githubRunCapability(db: Store, session: {
     agentId: session.agentId, issueId: session.issueId, deliveryId: source.delivery.id, conversationId: source.conversation.id, commentId });
   if (!candidate || source.delivery.githubShadowLabel !== candidate.shadowLabel || source.conversation.githubShadowLabel !== candidate.shadowLabel) return null;
   const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(and(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId), eq(chatGitHubReviewEnrollments.companyId, session.companyId)));
-  return enrollment ? { ...source, candidate, enrollment } : null;
+  return enrollment?.envelope.event && enrollment.headSha && enrollment.baseSha
+    ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha } } : null;
 }
 
 export async function githubCandidateMayWake(db: Store, candidate: Candidate): Promise<boolean> {
@@ -247,7 +263,7 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         // Keep the admitted denominator and retry if authority is restored.
         if (!(await githubCandidateMayWake(tx, candidate))) return defer("candidate_unavailable");
         const [enrollment] = await tx.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId));
-        if (!enrollment?.envelope.snapshot) {
+        if (!enrollment?.envelope.snapshot || !enrollment.envelope.event || !enrollment.headSha || !enrollment.baseSha) {
           await tx.update(chatGitHubReviewCandidates).set({ state: "unavailable", lastError: "candidate_snapshot_unavailable", nextAttemptAt: null, updatedAt: new Date() })
             .where(eq(chatGitHubReviewCandidates.id, candidate.id));
           return null;
@@ -257,9 +273,10 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         if (!enrollment || !endpoint || !["active", "verifying"].includes(endpoint.status)) return defer("candidate_endpoint_unavailable");
         if (!(await githubChatPrincipalAccess(tx, endpoint, enrollment.principalId))?.allowed) return defer("candidate_principal_unavailable");
         const e = enrollment.envelope;
+        const event = enrollment.envelope.event;
         const scope = `shadow:${candidate.armId}:${enrollment.id}`;
         const issue = await issueService(db).create(candidate.companyId, {
-          title: `PR #${enrollment.pullNumber}: ${e.event.title}`, description: `Started from GitHub: ${e.conversation.externalLabel}`,
+          title: `PR #${enrollment.pullNumber}: ${event.title}`, description: `Started from GitHub: ${e.conversation.externalLabel}`,
           status: "todo", priority: "medium", assigneeAgentId: candidate.agentId,
           createdByUserId: e.authority.responsibleUserId ?? e.authority.sponsorUserId,
           responsibleUserId: e.authority.responsibleUserId ?? e.authority.sponsorUserId,
@@ -293,7 +310,7 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
           .where(eq(chatGitHubReviewCandidates.id, candidate.id)).returning();
         await tx.insert(chatGitHubReviews).values({ companyId: candidate.companyId, endpointId: endpoint.id, issueId: issue.id,
           repositoryId: enrollment.repositoryId, repository: enrollment.repository, pullNumber: enrollment.pullNumber, headSha: enrollment.headSha,
-          deliveryId: candidate.nativeDeliveryId, configurationRevision: enrollment.configurationRevision, policySnapshot: e.policy, event: e.event,
+          deliveryId: candidate.nativeDeliveryId, configurationRevision: enrollment.configurationRevision, policySnapshot: e.policy, event,
           state: "queued", shadowLabel: candidate.shadowLabel });
         await input.stage(tx, { endpoint, deliveryId: candidate.nativeDeliveryId, conversation: conversation!, commentId: comment.id,
           principalId: enrollment.principalId, actorUserId: e.authority.responsibleUserId, agentId: candidate.agentId });

@@ -16568,7 +16568,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (pairedEvent && !taskShadowLabel && (githubManual || githubAutomatic)) {
           await admitGitHubPair(taskTx as DbTransaction, {
             endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent.event,
-            snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure,
+            snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure, unavailableEvent: pairedEvent.unavailableEvent,
             request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
             revision: (githubManual ?? githubAutomatic)!.revision,
             authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,

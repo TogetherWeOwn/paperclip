@@ -46,7 +46,9 @@ suite("GitHub pairing forward migration", () => {
       await db`insert into chat_conversations (id, company_id, endpoint_id, issue_id, external_conversation_id, external_thread_id, external_label) values (${conversation}, ${company}, ${endpoint}, ${issue}, 'example/repo', 'github:example/repo:1', 'PR 1')`;
       const [before] = await db`select * from chat_conversations where id = ${conversation}`;
       const [beforeEndpoint] = await db`select * from chat_endpoints where id = ${endpoint}`;
-      await apply(tag);
+      // Exercise the current forward path too, including run-only fencing and
+      // explicit unavailable-source enrollment, against existing primary data.
+      for (const entry of journal.entries.slice(index)) await apply(entry.tag);
       expect((await db`select * from chat_conversations where id = ${conversation}`)[0]).toEqual({ ...before, execution_scope: "primary" });
       expect((await db`select * from chat_endpoints where id = ${endpoint}`)[0]).toEqual(beforeEndpoint);
       expect(await db`select * from chat_github_review_enrollments`).toHaveLength(0);

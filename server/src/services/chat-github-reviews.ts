@@ -609,6 +609,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This task is bound to a GitHub issue. Pull request review tools require a PR conversation.",
       );
+    // A legacy capture label proves publication denial, not blinded inputs.
+    // No admission snapshot exists for these tasks. Refuse source reads before
+    // constructing any live client (also after configuration is switched off).
+    if ((name === "read_pull_request" || name === "read_file")
+      && (source.shadowLabel ?? await pinnedShadowLabel(session, source))
+      && !source.enrollment?.envelope.snapshot) {
+      throw conflict("Capture-only review reads require a sealed admission snapshot", { code: "github_review_snapshot_required" });
+    }
     const useSnapshot = !!source.candidate || !!source.enrollment?.envelope.snapshot;
     const api: GitHubReviewReader = useSnapshot
       ? githubSnapshotReader(source.enrollment?.envelope.snapshot, {

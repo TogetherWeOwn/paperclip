@@ -2080,6 +2080,27 @@
       "when": 1792262673181,
       "tag": "0298_green_kingpin",
       "breakpoints": true
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1792270590287,
+      "tag": "0299_chat_capture_native_run_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 300,
+      "version": "7",
+      "when": 1792270950753,
+      "tag": "0300_parallel_bloodstrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 301,
+      "version": "7",
+      "when": 1792271532579,
+      "tag": "0301_luxuriant_annihilus",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+CREATE INDEX "chat_github_candidates_agent_idx" ON "chat_github_review_candidates" USING btree ("company_id","agent_id");

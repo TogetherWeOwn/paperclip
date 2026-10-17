@@ -46,9 +46,23 @@ export async function githubCandidateRunBoundary(db: Db, session: {
  * that gateway independently limits both discovery AND dispatch to native tools.
  * This is defense in depth, not a filesystem/network sandbox certificate. */
 export async function assertGitHubCandidateApiBoundary(db: Db, session: {
-  companyId: string; agentId: string; runId: string;
+  companyId: string; agentId: string; runId: string | null; credential?: "agent_jwt" | "agent_key";
 }, request: { method: string; originalUrl: string }) {
-  if (!(await githubCandidateRunBoundary(db, session))) return;
-  if (request.method === "POST" && request.originalUrl.split("?")[0] === "/api/tool-gateway/sessions") return;
+  // Durable candidate admission is only a DENY signal, never a capability grant.
+  // Configuration alone changes no authority. Once admitted, retirement or the
+  // kill switch must not restore a clone's broader long-lived credentials.
+  const [admission] = await db.select({ id: chatGitHubReviewCandidates.id }).from(chatGitHubReviewCandidates).where(and(
+    eq(chatGitHubReviewCandidates.companyId, session.companyId), eq(chatGitHubReviewCandidates.agentId, session.agentId),
+  )).limit(1);
+  if (admission && session.credential === "agent_key")
+    throw forbidden("Paired candidates require signed run-bound credentials", { code: "github_candidate_api_denied" });
+  const boundary = await githubCandidateRunBoundary(db, session);
+  if (!boundary) {
+    if (admission) throw forbidden("Paired candidate credentials have no verified native run capability", { code: "github_candidate_api_denied" });
+    return;
+  }
+  // An API key's run header is caller-controlled and proves no run authority.
+  if (session.credential !== "agent_key" && request.method === "POST"
+    && request.originalUrl.split("?")[0] === "/api/tool-gateway/sessions") return;
   throw forbidden("Paired candidates may access only their snapshot-backed review gateway", { code: "github_candidate_api_denied" });
 }

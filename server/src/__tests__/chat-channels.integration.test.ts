@@ -3436,7 +3436,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", { section: "metadata" });
+      // Legacy capture-only storage still works, but unsealed reads no longer
+      // qualify as blinded comparison input (even for the metadata surface).
+      await expect(service.execute(session, "read_pull_request", { section: "metadata" })).rejects.toThrow("sealed admission snapshot");
       const begun = await service.execute(session, "begin_review", { reviewedCommit: head });
       expect(begun).toMatchObject({ reviewId: admitted.id });
       await githubReviewCheckService(db, f.providerFetch).processPending();
@@ -3805,6 +3807,175 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
       const { githubBotConnectionIdsForRun } = await import("../services/chat-github-tools.js");
       expect([...(await githubBotConnectionIdsForRun(db, f.companyId, f.assignedAgentId, run!.id))]).toContain(f.endpoint.connectionId);
+    });
+    it.each(["nativeIssueId", "taskId"] as const)("paired regression fences failed run-only output bound by %s before begin_review", async (binding) => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `run-only-${binding}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        invocationSource: "assignment", status: "failed",
+        nativeIssueId: binding === "nativeIssueId" ? candidate.issue.id : null,
+        contextSnapshot: binding === "taskId" ? { taskId: candidate.issue.id } : {} }).returning();
+      const { insertChatActions } = await import("../services/chat-publication-authority.js");
+      const intent = { companyId: f.companyId, endpointId: f.endpoint.id, kind: "github_review_publication",
+        providerActionId: randomUUID(), payload: { runId: run!.id }, status: "received" };
+      expect(await insertChatActions(db, intent)).toHaveLength(0);
+      await expect(db.insert(chatActions).values(intent)).rejects.toMatchObject({ cause: { code: "23514", constraint_name: "chat_outbound_capture_only" } });
+      expect(await db.select().from(chatActions).where(eq(chatActions.providerActionId, intent.providerActionId))).toHaveLength(0);
+    });
+    it("paired regression rejects long-lived candidate keys with missing forged and valid run headers", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "candidate-key-history", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_KEY_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const token = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        name: "candidate fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(token).digest("hex") });
+      const app = express();
+      app.use(express.json());
+      app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+      app.use("/api", issueRoutes(db, createStorageService().storage));
+      app.post("/api/tool-gateway/sessions", (_req, res) => res.json({ reached: true }));
+      app.use(errorHandler);
+      for (const runId of [undefined, session.runId, primarySession.runId, randomUUID()]) {
+        const query = request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${token}`);
+        if (runId) query.set("X-Paperclip-Run-Id", runId);
+        const response = await query;
+        expect(response.status).toBe(403);
+        expect(JSON.stringify(response.body)).not.toContain("PRIMARY_KEY_HISTORY_CANARY");
+      }
+      expect((await request(app).post("/api/tool-gateway/sessions").set("Authorization", `Bearer ${token}`)
+        .set("X-Paperclip-Run-Id", session.runId).send({ issueId: candidate.issue.id })).status).toBe(403);
+      // A primary agent's existing long-lived key retains its ordinary behavior.
+      const primaryKey = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        name: "primary fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(primaryKey).digest("hex") });
+      const control = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${primaryKey}`);
+      expect(control.status).toBe(200);
+      expect(JSON.stringify(control.body)).toContain("PRIMARY_KEY_HISTORY_CANARY");
+    });
+    it("paired regression preserves unadmitted agent keys when the global flag is off", async () => {
+      const f = await pairedReviewFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const primary = await deliverShadowTestMention(f, "configured-but-off", "@maya review this", 81);
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const token = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        name: "unadmitted fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(token).digest("hex") });
+      const app = express();
+      app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+      app.use("/api", issueRoutes(db, createStorageService().storage));
+      app.use(errorHandler);
+      expect((await request(app).get(`/api/issues/${primary.issueId}/comments`).set("Authorization", `Bearer ${token}`)).status).toBe(200);
+      expect([...await db.execute(sql`select id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`)]).toHaveLength(0);
+    });
+    it("paired regression rejects signed but unbound candidate credentials after enrollment is disabled", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "unbound-signed-candidate", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_UNBOUND_JWT_CANARY", { agentId: f.assignedAgentId });
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-unbound-jwt-fixture";
+      try {
+        const token = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", randomUUID(), "owner-user")!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.use("/api", issueRoutes(db, createStorageService().storage));
+        app.use(errorHandler);
+        const response = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${token}`);
+        expect(response.status).toBe(403);
+        expect(JSON.stringify(response.body)).not.toContain("PRIMARY_UNBOUND_JWT_CANARY");
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired regression records automatic metadata failure against the authenticated event head", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      installShadowRecorder(f, head, async url => url.endsWith("/pulls/81") ? new Response("temporary failure", { status: 503 }) : undefined);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      await expect.poll(() => f.wakeup.mock.calls.filter(c => c[0] === f.assignedAgentId).length, { timeout: 10000 }).toBeGreaterThan(0);
+      await f.service.processPendingDeliveries();
+      const rows = [...await db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ head_sha: admitted.headSha, state: "unavailable",
+        envelope: { event: { deliveryId: admitted.event.deliveryId, headSha: head }, snapshotFailure: "source_preparation_failed" } });
+      expect(f.wakeup.mock.calls.every(c => c[0] === f.assignedAgentId)).toBe(true);
+    });
+    it.each(["metadata", "token"])("paired regression records unavailable manual %s without inventing or recapturing admission bytes", async (failure) => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url =>
+        (failure === "metadata" ? url.endsWith("/pulls/81") : url.includes("/access_tokens"))
+          ? new Response("temporary failure", { status: 503 }) : undefined);
+      await deliverShadowTestMention(f, `source-failure-${failure}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const rows = [...await db.execute(sql`select e.head_sha, e.base_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ head_sha: null, base_sha: null, state: "unavailable", envelope: {
+        event: null, unavailableEvent: { repository: "paperclipai/paperclip", repositoryId: "97531", pullNumber: 81 },
+        snapshotFailure: "source_preparation_failed", request: expect.stringContaining("review this"),
+      } });
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, `source-failure-${failure}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect([...await db.execute(sql`select e.head_sha, e.base_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)]).toEqual(rows);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("paired regression excludes primary history carryover from the certified clean cohort", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "primary-head-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_PRIOR_HEAD_ANSWER_CANARY", { agentId: f.assignedAgentId });
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, "primary-head-two", "@maya review new head", 81);
+      await f.service.processPendingDeliveries();
+      // Preserve normal primary behavior; do not silently make the live gate a new experiment.
+      const primaries = (await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.assignedAgentId);
+      expect(primaries.map(t => t.issue.id)).toEqual([primary.issue.id]);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      expect(JSON.stringify(comments)).toContain("PRIMARY_PRIOR_HEAD_ANSWER_CANARY");
+      const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
+      expect(rows).toHaveLength(2);
+      for (const row of rows) expect(row.envelope).toMatchObject({ comparisonEligibility: {
+        certifiedClean: false, reasons: expect.arrayContaining(["primary_namespace_not_isolated", "candidate_runtime_not_certified"]),
+      } });
+    });
+    it("paired regression fails closed on legacy mutable reads even after shadow mode is disabled", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      let answer = "admission text";
+      const recorder = installShadowRecorder(f, "b".repeat(40), async url => url.includes("/comments?")
+        ? Response.json([{ id: 7, created_at: "2020-01-01T00:00:00Z", body: answer }]) : undefined);
+      const conversation = await deliverShadowTestMention(f, "legacy-blind", "@maya review this", 81);
+      const session = await shadowTestSession(f, conversation);
+      answer = "PRIMARY_LEGACY_EDITED_ANSWER_CANARY";
+      await saveShadowMode(f, false);
+      const start = recorder.fetches.length;
+      const service = githubChatReviewService(db, f.providerFetch);
+      for (const section of ["comments", "reviews", "checks", "metadata", "changes_since_review", "diff"]) {
+        await expect(service.execute(session, "read_pull_request", { section })).rejects.toThrow("sealed admission snapshot");
+      }
+      await expect(service.execute(session, "read_file", { path: "src/math.ts", revision: "head" })).rejects.toThrow("sealed admission snapshot");
+      expect(recorder.fetches.slice(start)).toEqual([]);
     });
     it("paired admission creates one primary and one candidate with exact request and native capabilities", async () => {
       const f = await pairedReviewFixture();
@@ -4839,7 +5010,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = await shadowTestSession(f, admitted);
       await saveShadowMode(f, false);
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await expect(service.execute(session, "read_pull_request", { section: "metadata" })).rejects.toThrow("sealed admission snapshot");
       await service.execute(session, "begin_review", { reviewedCommit: head });
       expect(await service.execute(
         session,

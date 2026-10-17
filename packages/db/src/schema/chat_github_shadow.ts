@@ -22,7 +22,11 @@ export interface GitHubReviewInputSnapshot {
 
 export interface GitHubReviewEnrollmentEnvelope {
   version: 1;
-  event: GitHubReviewEventContext;
+  /** Null when manual metadata was unavailable at admission; never recaptured. */
+  event: GitHubReviewEventContext | null;
+  unavailableEvent?: Pick<GitHubReviewEventContext, "event" | "deliveryId" | "repositoryId" | "repository" | "pullNumber" | "sender">;
+  /** Missing certification on older rows is also ineligible, never implicit approval. */
+  comparisonEligibility?: { certifiedClean: false; reasons: string[] };
   request: string;
   lowTrust: boolean;
   snapshot?: GitHubReviewInputSnapshot;
@@ -53,8 +57,8 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
   repositoryId: text("repository_id").notNull(),
   repository: text("repository").notNull(),
   pullNumber: integer("pull_number").notNull(),
-  headSha: text("head_sha").notNull(),
-  baseSha: text("base_sha").notNull(),
+  headSha: text("head_sha"),
+  baseSha: text("base_sha"),
   roundOrdinal: integer("round_ordinal").notNull(),
   configurationRevision: integer("configuration_revision").notNull(),
   pairKey: text("pair_key").notNull(),
@@ -96,6 +100,7 @@ export const chatGitHubReviewCandidates = pgTable("chat_github_review_candidates
   uniqueIndex("chat_github_candidates_arm_uq").on(t.enrollmentId, t.armId),
   uniqueIndex("chat_github_candidates_delivery_uq").on(t.nativeDeliveryId),
   index("chat_github_candidates_work_idx").on(t.state, t.nextAttemptAt),
+  index("chat_github_candidates_agent_idx").on(t.companyId, t.agentId),
   foreignKey({ columns: [t.companyId, t.endpointId], foreignColumns: [chatEndpoints.companyId, chatEndpoints.id] }),
   foreignKey({ columns: [t.companyId, t.enrollmentId], foreignColumns: [chatGitHubReviewEnrollments.companyId, chatGitHubReviewEnrollments.id] }),
   foreignKey({ columns: [t.companyId, t.armId], foreignColumns: [chatGitHubReviewArms.companyId, chatGitHubReviewArms.id] }),

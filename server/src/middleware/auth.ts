@@ -437,7 +437,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         source: "agent_jwt",
       };
       await assertGitHubCandidateApiBoundary(db, {
-        companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
+        companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id, credential: "agent_jwt",
       }, req);
       next();
       return;
@@ -481,6 +481,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       }));
       return;
     }
+
+    await assertGitHubCandidateApiBoundary(db, {
+      companyId: key.companyId, agentId: key.agentId, runId: normalizeOptionalString(runIdHeader), credential: "agent_key",
+    }, req);
 
     req.actor = {
       type: "agent",
