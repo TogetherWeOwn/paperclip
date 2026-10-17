@@ -1,5 +1,5 @@
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
 import { claimNativeReviewExecutionLock, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
@@ -9,11 +9,37 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
   agentNameKey: string | null;
   claimedAt: Date;
   claimValues: PgUpdateSetSource<typeof heartbeatRuns>;
+  // TOG-28460: the production claim path (heartbeat claimQueuedRun) passes
+  // the agent's cap so burst wakes serialize here. Optional so direct
+  // callers (tests, tooling) keep the historical uncapped behavior.
+  maxConcurrentRuns?: number;
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
   if (typeof issueId !== "string" || !readNativeReviewAssignmentContext(context)) return null;
   return db.transaction(async (tx) => {
+    // TOG-28460: agents row first, matching the ordinary/comment claim
+    // paths in heartbeat claimQueuedRun. The recount and the claim below
+    // share this connection, so concurrent schedulers on other processes
+    // serialize here. At cap the run stays queued for a later drain pass.
+    await tx.execute(
+      sql`select id from agents where id = ${input.run.agentId} and company_id = ${input.run.companyId} for update`,
+    );
+    const [{ count }] = await tx
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, input.run.agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    if (
+      input.maxConcurrentRuns !== undefined &&
+      Number(count ?? 0) >= input.maxConcurrentRuns
+    ) {
+      return null;
+    }
     // Match the queue editor's lock order: issue, wake, then run.
     const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, input.run.companyId),

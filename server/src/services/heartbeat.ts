@@ -17945,6 +17945,32 @@ export function heartbeatService(
       );
       return null;
     }
+    const maxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
+
+    // TOG-28460: per-agent start gate. Every queued->running transition
+    // funnels through the claim transactions below, so the cap is enforced
+    // there — on the SAME connection that performs the claim — instead of in
+    // the scheduler loop or at the executeRun entry. Lock order is uniform in
+    // every claim tx: agents row first, then the issue/wake/run rows the
+    // existing claim code already locks. Each claim tx stays short (a lock, a
+    // count, the claim) and never awaits another scheduler, so an overlapping
+    // scheduler that outlives the in-process start lock only waits briefly
+    // instead of wedging. At cap the run stays queued for a later drain pass.
+    async function isAtStartConcurrencyCap(tx: Db): Promise<boolean> {
+      await tx.execute(
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
+      );
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        );
+      return Number(count ?? 0) >= maxConcurrentRuns;
+    }
 
     const context = parseObject(run.contextSnapshot);
     const budgetBlock = await budgets.getInvocationBlock(
@@ -18169,6 +18195,12 @@ export function heartbeatService(
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              // TOG-28460: agents row first (see isAtStartConcurrencyCap),
+              // then the issue/wake/run order below. At cap the run stays
+              // queued for a later drain pass.
+              if (await isAtStartConcurrencyCap(tx as unknown as Db)) {
+                return { kind: "stale" as const, run: null };
+              }
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -18488,9 +18520,15 @@ export function heartbeatService(
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              maxConcurrentRuns,
             });
           }
           return tx.transaction(async (claimTx) => {
+            // TOG-28460: agents row first (see isAtStartConcurrencyCap);
+            // at cap the run stays queued for a later drain pass.
+            if (await isAtStartConcurrencyCap(claimTx as unknown as Db)) {
+              return null;
+            }
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
@@ -20734,20 +20772,23 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      // Cross-process note (TOG-28460): withAgentStartLock only chains
-      // callers in this process. The per-iteration recount below keeps each
-      // batch within the live cap for sequential bursts and for direct
-      // executeRun claims that never take this lock; a later wake or drain
-      // pass retries anything left queued. Deliberately no agents-row lock
-      // around the loop: claimQueuedRun performs its own pooled writes, and
-      // holding one transaction across them risks pool starvation.
+      // TOG-28460: withAgentStartLock only chains callers in this process
+      // and lapses 30 s after registration, so overlapping schedulers (other
+      // processes, or a lapsed lock) can both pass the recount below. The
+      // recount is only a fast-path break to avoid wasted claims; the real
+      // gate is the agents-row lock inside claimQueuedRun's claim
+      // transactions, which serializes the recount with the queued->running
+      // flip on one connection. Deliberately no agents-row lock around the
+      // loop: claimQueuedRun performs its own pooled writes, and holding one
+      // transaction across them risks pool starvation. A later wake or drain
+      // pass retries anything left queued.
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         // A successful claim flips its row to running synchronously, so the
-        // live count already includes this batch's claims. Claims that cancel
-        // or defer return null and must not consume the budget: later queued
-        // runs still need their claim attempt (e.g. blocked-dependency
-        // cancellation).
+        // live count already includes this batch's claims. Claims that cancel,
+        // defer, or hit the atomic cap return null and must not consume the
+        // budget: later queued runs still need their claim attempt (e.g.
+        // blocked-dependency cancellation).
         const liveRunningCount = await countRunningRunsForAgent(agentId);
         if (liveRunningCount >= policy.maxConcurrentRuns) {
           break;
@@ -20909,16 +20950,10 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      // Concurrency guard (TOG-28460): direct executeRun callers bypass
-      // startNextQueuedRunForAgent's slot budget. Never start a queued run
-      // while the agent is already at maxConcurrentRuns; leave it queued so
-      // a drain pass starts it when a slot frees.
-      const guardAgent = await getAgent(run.agentId);
-      if (guardAgent) {
-        const guardPolicy = parseHeartbeatPolicy(guardAgent);
-        const guardRunningCount = await countRunningRunsForAgent(run.agentId);
-        if (guardRunningCount >= guardPolicy.maxConcurrentRuns) return;
-      }
+      // TOG-28460: the cap is enforced atomically inside claimQueuedRun's
+      // claim transactions (agents-row lock + recount on the claim
+      // connection), so direct executeRun callers are gated there too. At cap
+      // the claim leaves the run queued for a later drain pass.
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
