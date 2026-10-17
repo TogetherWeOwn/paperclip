@@ -1,0 +1,1 @@
+ALTER TABLE "execution_workspaces" ALTER COLUMN "opened_at" DROP NOT NULL;

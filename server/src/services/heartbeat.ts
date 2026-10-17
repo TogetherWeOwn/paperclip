@@ -457,6 +457,10 @@ import {
   mergeExecutionWorkspaceConfig,
 } from "./execution-workspaces.js";
 import {
+  createDbSourceBoundWorkspaceAllocationDeps,
+  markAllocatedWorkspaceRealized,
+} from "./source-bound-workspace-allocation.js";
+import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
@@ -6113,7 +6117,11 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      input.existingExecutionWorkspaceStatus !== "archived" &&
+      // An unrealized source-bound allocation has no worktree to restore:
+      // presence of the binding is not proof of realization. Dispatch
+      // realizes fresh and adopts the record at persistence instead.
+      input.existingExecutionWorkspaceStatus !== "unrealized",
   };
 }
 
@@ -22019,6 +22027,16 @@ export function heartbeatService(
         workspaceReuseRequest.existingExecutionWorkspaceAvailable
           ? existingExecutionWorkspace
           : null;
+      // A Board-allocated unrealized record bound to this issue is adopted
+      // at persistence: realization flips that exact record instead of
+      // inserting a second source-bound workspace.
+      const allocatedUnrealizedExecutionWorkspace =
+        existingExecutionWorkspace?.status === "unrealized" &&
+        existingExecutionWorkspace.companyId === agent.companyId &&
+        issueRef?.id &&
+        existingExecutionWorkspace.sourceIssueId === issueRef.id
+          ? existingExecutionWorkspace
+          : null;
       const requestedReusableExecutionWorkspaceConfig =
         reusableExistingExecutionWorkspace?.config ?? null;
       const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
@@ -22987,7 +23005,9 @@ export function heartbeatService(
           existingMetadata:
             resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
               ? (reusableExistingExecutionWorkspace?.metadata ?? null)
-              : null,
+              : // Adoption keeps the allocation provenance recorded on the
+                // unrealized record (actor, selection, prior binding).
+                (allocatedUnrealizedExecutionWorkspace?.metadata ?? null),
           source: executionWorkspace.source,
           // Attaching a new worktree to a pre-existing branch reports a fresh
           // workspace, but must not make cleanup own the operator's branch.
@@ -23053,7 +23073,71 @@ export function heartbeatService(
       const branchNameForInitialPersistence =
         pendingForwardBranchReconcile?.recordedBranchName ??
         executionWorkspace.branchName;
+      // Guarded adoption: the allocated record was captured before
+      // realization, and a Board rollback in between (archived + binding
+      // restored) must not be resurrected by this run. The flip runs inside
+      // the allocation transaction (issue FOR UPDATE lock with status and
+      // binding re-checked), so a rollback that commits first makes the
+      // adoption deny and this run falls through to a fresh insert. This
+      // replaces a getById-then-update sequence whose window between the
+      // two awaits let a rollback be overwritten back to active.
+      const tryAdoptAllocatedExecutionWorkspace = async () => {
+        if (
+          !allocatedUnrealizedExecutionWorkspace ||
+          resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace ||
+          !issueRef?.id
+        ) {
+          return null;
+        }
+        const adoption = await markAllocatedWorkspaceRealized(
+          createDbSourceBoundWorkspaceAllocationDeps(db),
+          {
+            companyId: agent.companyId,
+            sourceIssueId: issueRef.id,
+            workspaceId: allocatedUnrealizedExecutionWorkspace.id,
+            cwd: executionWorkspace.cwd,
+            // A null worktree path fails the helper's completeness check
+            // with `realization_incomplete` (handled below).
+            providerRef: executionWorkspace.worktreePath ?? "",
+            branchName:
+              branchNameForInitialPersistence ??
+              executionWorkspace.branchName ??
+              "",
+            repoUrl: executionWorkspace.repoUrl,
+            providerType:
+              executionWorkspace.strategy === "git_worktree"
+                ? "git_worktree"
+                : "local_fs",
+            baseRef: executionWorkspace.repoRef,
+            metadata: nextExecutionWorkspaceMetadata,
+          },
+        );
+        if (!adoption.ok) {
+          // Fail closed when the allocation is still open and bound but
+          // this run cannot realize into it (e.g. it resolved to
+          // project_primary with no worktree path). Falling through to a
+          // fresh insert here would rebind the issue and orphan the
+          // allocation with a second open source-bound row. Other denies
+          // (binding_conflict / workspace_not_unrealized) mean the
+          // allocation is already gone, so falling through is correct.
+          if (adoption.errorCode === "realization_incomplete") {
+            throw new Error(
+              "Source-bound allocation exists but this run cannot realize into it; failing instead of orphaning the allocation with a second record",
+            );
+          }
+          return null;
+        }
+        return executionWorkspacesSvc.getById(
+          allocatedUnrealizedExecutionWorkspace.id,
+        );
+      };
       try {
+        // Attempted inside persistence so a thrown error still runs the
+        // worktree cleanup below; a denial (rollback won the race) returns
+        // null and falls through to insert, while incomplete facts throw
+        // above instead of orphaning the allocation.
+        const adoptedAllocatedExecutionWorkspace =
+          await tryAdoptAllocatedExecutionWorkspace();
         persistedExecutionWorkspace =
           resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
           reusableExistingExecutionWorkspace
@@ -23079,8 +23163,9 @@ export function heartbeatService(
                     ),
                 },
               )
-            : resolvedProjectId
-              ? await executionWorkspacesSvc.create({
+            : (adoptedAllocatedExecutionWorkspace ??
+              (resolvedProjectId
+                ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,
                   projectWorkspaceId: resolvedProjectWorkspaceId,
@@ -23115,7 +23200,7 @@ export function heartbeatService(
                   openedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
                 })
-              : null;
+              : null));
       } catch (error) {
         if (executionWorkspace.created) {
           try {

@@ -584,7 +584,9 @@ export {
 
 export {
   executionWorkspaceConfigSchema,
+  allocateSourceBoundWorkspaceSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   executionWorkspaceDeliveryStateSchema,

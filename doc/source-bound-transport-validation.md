@@ -37,13 +37,20 @@ Content-Type: application/json
   must be bound to the source issue: the workspace's source issue, or the
   issue's selected execution workspace). A closed workspace (`closedAt`
   set, or status `archived` / `cleanup_failed`) denies as
-  `workspace_transport_mismatch`.
+  `workspace_transport_mismatch`. A bound but **unrealized** allocation
+  (status `unrealized`, see
+  [`source-bound-workspace-allocation.md`](./source-bound-workspace-allocation.md))
+  denies as `workspace_not_realized` before transports are compared and
+  before attestation is evaluated — allocation alone never passes. An
+  unbound or cross-company unrealized record still denies as
+  `workspace_transport_mismatch`, so realization state never leaks.
 - `requestedToolClass` (optional, nullable) is passed to the low-trust
   preflight. Under low trust the validation always denies.
 
 Responses: `200` with an `ok: true` receipt; `403` for
 `unauthorized_principal` / `low_trust_preflight_denied`; `409` for
-`issue_dependencies_blocked` / `workspace_transport_mismatch`; `422` when
+`issue_dependencies_blocked` / `workspace_not_realized` /
+`workspace_transport_mismatch`; `422` when
 transport validation passed but deployed-image attestation did not.
 Every response is the same receipt shape and records an
 `issue.source_transport_validation` activity entry with the result
