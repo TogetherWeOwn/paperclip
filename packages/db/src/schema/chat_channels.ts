@@ -372,6 +372,7 @@ export const chatConversations = pgTable(
       .references(() => issues.id, { onDelete: "restrict" }),
     externalConversationId: text("external_conversation_id").notNull(),
     externalThreadId: text("external_thread_id").notNull().default(""),
+    executionScope: text("execution_scope").notNull().default("primary"),
     // Providers with linear conversations (DMs, Telegram groups, Teams group
     // chats) reuse one native thread id. A generation preserves the native id
     // used for replies while allowing completed Paperclip tasks to roll over.
@@ -404,6 +405,7 @@ export const chatConversations = pgTable(
       table.externalConversationId,
       table.externalThreadId,
       table.sessionGeneration,
+      table.executionScope,
     ),
     unique("chat_conversations_company_id_uq").on(table.companyId, table.id),
     foreignKey({

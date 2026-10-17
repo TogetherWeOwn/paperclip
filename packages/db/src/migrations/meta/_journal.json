@@ -2073,6 +2073,13 @@
       "when": 1792260537358,
       "tag": "0297_chat_capture_outbound_fence",
       "breakpoints": true
+    },
+    {
+      "idx": 298,
+      "version": "7",
+      "when": 1792262673181,
+      "tag": "0298_green_kingpin",
+      "breakpoints": true
     }
   ]
 }
