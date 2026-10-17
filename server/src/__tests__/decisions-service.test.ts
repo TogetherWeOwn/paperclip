@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -24,6 +25,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { conflict } from "../errors.js";
 import { attentionService } from "../services/attention.js";
 import { decisionService } from "../services/decisions.js";
+import { createDecisionWakeOriginAgent } from "../services/decision-wakeup.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
 import type { AttentionArchiveManifestEntry, AttentionArchiveTargetSnapshot } from "@paperclipai/shared";
 
@@ -73,7 +76,7 @@ describePg("decisionService", () => {
     delete process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE;
     delete process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS;
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-    await db.delete(decisionEffectExecutions); await db.delete(decisionTargetIssues); await db.delete(decisions); await db.delete(decisionRetention); await db.delete(activityLog);
+    await db.delete(agentWakeupRequests); await db.delete(decisionEffectExecutions); await db.delete(decisionTargetIssues); await db.delete(decisions); await db.delete(decisionRetention); await db.delete(activityLog);
     await db.delete(issueComments); await db.delete(issueRelations); await db.delete(heartbeatRuns); await db.delete(issues); await db.delete(agents); await db.delete(companyMemberships); await db.delete(authUsers); await db.delete(companies);
   });
   afterAll(async () => tempDb?.cleanup());
@@ -460,6 +463,32 @@ describePg("decisionService", () => {
     await pausableService.sweepExpired();
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "expired" }]);
     expect((await pausableService.get(created.id))?.metadata).toMatchObject({ continuationPending: false });
+  });
+
+  it("coalesces repeated deferred decision wakes through the heartbeat runtime", async () => {
+    const created = await createCommentDecision("lenient", { expiresAt: nearFutureExpiry() });
+    await expireDecisionNow(created.id);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    const decisionWakes = createDecisionWakeOriginAgent(heartbeat.wakeup);
+    const pausableService = decisionService(db, { wakeOriginAgent: decisionWakes });
+    const inWorktree = process.env.PAPERCLIP_IN_WORKTREE;
+    delete process.env.PAPERCLIP_IN_WORKTREE;
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) await pausableService.sweepExpired();
+
+      const wakeRequests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeRequests).toHaveLength(1);
+      expect(wakeRequests[0]).toMatchObject({
+        reason: "agent.not_invokable",
+        status: "skipped",
+        requestedByActorType: "system",
+        coalescedCount: 4,
+      });
+      expect(wakeRequests[0]?.payload).toMatchObject({ issueId: originIssueId });
+    } finally {
+      if (inWorktree !== undefined) process.env.PAPERCLIP_IN_WORKTREE = inWorktree;
+    }
   });
 
   it("does not let a held continuation starve later pending continuations", async () => {
