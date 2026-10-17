@@ -66,6 +66,23 @@ export type SourceBoundWorkspaceFacts = {
   sourceIssueId: string | null;
   status: string;
   closedAt: Date | string | null;
+  /**
+   * Row-level realization facts. Optional so older callers that resolve
+   * only the status keep compiling; an absent field skips that sub-check,
+   * while an explicit null denies. The DB resolver below always returns
+   * explicit values, so a status-only spoof (e.g. a generic PATCH flipping
+   * `unrealized` to `active` with null row facts) still denies.
+   */
+  openedAt?: Date | string | null;
+  cwd?: string | null;
+  providerRef?: string | null;
+  /**
+   * Workspace mode/strategy for reference-completeness checks. Optional
+   * so older callers keep compiling; when absent the reference check
+   * falls back to the historical one-reference behavior.
+   */
+  mode?: string | null;
+  strategyType?: string | null;
 };
 
 export type DeployedImageAttestationRecord = {
@@ -264,6 +281,38 @@ export async function runSourceBoundTransportValidation(
     issue,
   });
 
+  // Realization is a row-level fact, not a status label alone: a generic
+  // PATCH could flip `unrealized` to `active` while cwd, providerRef and
+  // openedAt stay null, so the status check alone would then pass. Require
+  // the realized row facts as well. Each sub-check skips only when the
+  // resolver did not provide the field at all (older callers); an explicit
+  // null denies. The DB resolver always provides explicit values.
+  const workspaceStatusRealized =
+    workspaceBoundToIssue && workspace.status !== "unrealized";
+  const workspaceOpenedAtRealized =
+    !workspaceBoundToIssue || workspace.openedAt === undefined
+      ? true
+      : workspace.openedAt != null;
+  // Reference completeness is mode-dependent: an isolated git_worktree
+  // workspace is only usable with BOTH a worktree path (providerRef) and
+  // a cwd, so a partial row (e.g. left by a nullable PATCH of one field)
+  // still denies. Other modes keep the historical one-reference behavior.
+  // workspaceBoundToIssue first: it is false when no workspace resolved,
+  // so the mode access below never touches null (a non-UUID id denies as
+  // a transport mismatch without reaching the reference checks).
+  const requiresBothRefs =
+    workspaceBoundToIssue &&
+    workspace.mode === "isolated_workspace" &&
+    workspace.strategyType === "git_worktree";
+  const workspaceRefRealized =
+    !workspaceBoundToIssue ||
+    (workspace.providerRef === undefined && workspace.cwd === undefined)
+      ? true
+      : requiresBothRefs
+        ? isNonEmptyString(workspace.providerRef) &&
+          isNonEmptyString(workspace.cwd)
+        : isNonEmptyString(workspace.providerRef) ||
+          isNonEmptyString(workspace.cwd);
   const transport = validateSourceTransportOnly({
     sourceIssueId: issue.id,
     principalAgentId: input.principalAgentId,
@@ -271,6 +320,15 @@ export async function runSourceBoundTransportValidation(
     workspaceId: workspaceBoundToIssue ? workspace.id : "",
     transport: input.transport,
     workspaceTransport: workspaceBoundToIssue ? workspace.transport : "",
+    // Realization state is reported only for a workspace already proven
+    // bound to this issue in this company; an unbound or cross-company
+    // unrealized record denies as a transport mismatch above, so its
+    // realization state never leaks to a caller who may not see it.
+    workspaceRealized: workspaceBoundToIssue
+      ? workspaceStatusRealized &&
+        workspaceOpenedAtRealized &&
+        workspaceRefRealized
+      : true,
     dependenciesBlocked: { unresolvedBlockerIssueIds },
     isLowTrust,
     requestedToolClass: input.requestedToolClass ?? null,
@@ -400,6 +458,11 @@ export function createDbSourceBoundTransportValidationDeps(
           sourceIssueId: executionWorkspaces.sourceIssueId,
           status: executionWorkspaces.status,
           closedAt: executionWorkspaces.closedAt,
+          openedAt: executionWorkspaces.openedAt,
+          cwd: executionWorkspaces.cwd,
+          providerRef: executionWorkspaces.providerRef,
+          mode: executionWorkspaces.mode,
+          strategyType: executionWorkspaces.strategyType,
         })
         .from(executionWorkspaces)
         .where(
