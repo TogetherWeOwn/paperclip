@@ -3994,6 +3994,122 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
       expect([...(await db.execute(sql`select head_sha from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`))]).toEqual([{ head_sha: "b".repeat(40) }]);
     });
+    it("paired snapshot seals edited comments reviews checks and body before either arm runs", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      let answer = "admission bytes";
+      const recorder = installShadowRecorder(f, head, async (url) => {
+        if (url.endsWith("/pulls/81")) return Response.json({ number: 81, title: "Frozen title", body: answer, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (/\/(comments|reviews)\?/.test(url)) return Response.json([{ id: 7, created_at: "2020-01-01T00:00:00Z", body: answer }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [{ id: 8, output: { summary: answer } }] });
+        return undefined;
+      });
+      await deliverShadowTestMention(f, "snapshot-blinding", "@maya review this", 81);
+      answer = "PRIMARY_ANSWER_EDITED_AFTER_ADMISSION_CANARY";
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      // Negative control: a live read sees an edited old comment despite its old created_at.
+      expect(await (await f.providerFetch("https://api.github.com/repos/paperclipai/paperclip/issues/81/comments?per_page=100&page=1")).json()).toEqual([expect.objectContaining({ body: answer })]);
+      const start = recorder.fetches.length;
+      const service = githubChatReviewService(db, f.providerFetch);
+      for (const section of ["metadata", "comments", "reviews", "inline_comments", "checks"]) {
+        const candidateResult = await service.execute(candidateSession, "read_pull_request", { section });
+        const primaryResult = await service.execute(primarySession, "read_pull_request", { section });
+        expect(JSON.stringify(candidateResult)).toContain("admission bytes");
+        expect(JSON.stringify(candidateResult)).not.toContain(answer);
+        expect(primaryResult).toEqual(candidateResult);
+      }
+      expect(recorder.fetches.slice(start)).toEqual([]);
+      const [enrollment] = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`)];
+      expect(JSON.stringify(enrollment)).toContain("admission bytes");
+      await expect(db.execute(sql`update chat_github_review_enrollments set envelope = jsonb_set(envelope, '{snapshot}', '{}') where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+    });
+    it("paired snapshot first round excludes a newer unlabelled assessment and issue history canary", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-history", "@maya review this", 81);
+      const primary = (await pairedTasks(f.endpoint.id))[0]!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_ISSUE_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      await db.insert(chatGitHubReviews).values({ companyId: f.companyId, endpointId: f.endpoint.id, issueId: primary.issue.id,
+        repositoryId: "97531", repository: "paperclipai/paperclip", pullNumber: 81, headSha: head,
+        deliveryId: randomUUID(), configurationRevision: 1, policySnapshot: (await f.management.configuration(f.endpoint.id, "owner-user")).configuration.defaults,
+        event: { event: "mention", deliveryId: "unlabelled", repositoryId: "97531", repository: "paperclipai/paperclip", pullNumber: 81,
+          headSha: head, baseSha: "a".repeat(40), baseBranch: "master", title: "Late result", body: "", draft: false,
+          author: { id: "42", login: "octocat", isBot: false }, sender: { id: "42", login: "octocat" }, labels: [] },
+        state: "completed", assessment: { ...shadowTestAssessment(head), summary: "PRIMARY_UNLABELLED_ASSESSMENT_CANARY" } });
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" });
+      expect(result).toMatchObject({ previousAssessment: null });
+      expect(JSON.stringify(result)).not.toContain("CANARY");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, candidate.issue.id));
+      expect(JSON.stringify(comments)).not.toContain("PRIMARY_ISSUE_HISTORY_CANARY");
+    });
+    it("paired snapshot validates and reads original commits after the live head advances", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-pinned-head", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const recorder = installShadowRecorder(f, "c".repeat(40), async (url) => {
+        if (url.includes("/contents/")) return Response.json({ encoding: "base64", content: Buffer.from("pinned source").toString("base64"),
+          size: 13, sha: createHash("sha1").update("blob 13\0pinned source").digest("hex") });
+        return undefined;
+      });
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "begin_review", { reviewedCommit: head })).toMatchObject({ reviewedCommit: head });
+      expect(await service.execute(session, "read_file", { path: "src/math.ts", revision: "head" })).toMatchObject({ content: Buffer.from("pinned source").toString("base64") });
+      expect(await service.execute(session, "read_file", { path: "src/math.ts", revision: "base" })).toMatchObject({ content: Buffer.from("pinned source").toString("base64") });
+      expect(await service.execute(session, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "shadow_stored" });
+      expect(recorder.fetches.filter(r => r.url.includes("/repos/")).map(r => r.url)).toEqual([
+        expect.stringContaining(`/contents/src/math.ts?ref=${head}`), expect.stringContaining(`/contents/src/math.ts?ref=${"e".repeat(40)}`),
+      ]);
+      expect(recorder.mutations).toEqual([]);
+    });
+    it("paired snapshot freezes only earlier own-arm assessments across rounds", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-own-round-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const service = githubChatReviewService(db, f.providerFetch);
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      await service.execute(candidateSession, "submit_review", { ...shadowTestAssessment(head), summary: "Own prior reasoning" });
+      await service.execute(primarySession, "submit_review", { ...shadowTestAssessment(head), summary: "PRIMARY_PREVIOUS_ANSWER_CANARY" });
+      await deliverShadowTestMention(f, "snapshot-own-round-two", "@maya re-review", 81);
+      // A later DB mutation cannot change the already-frozen previous bytes.
+      await db.update(chatGitHubReviews).set({ assessment: { ...shadowTestAssessment(head), summary: "LATE_MUTATION_CANARY" } }).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      await f.service.processPendingDeliveries();
+      const second = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId && t.issue.id !== candidate.issue.id)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: second.issue.id });
+      const result = await service.execute(session, "read_pull_request", { section: "metadata" });
+      expect(result).toMatchObject({ previousAssessment: { reviewedCommit: head, assessment: { summary: "Own prior reasoning" } } });
+      expect(JSON.stringify(result)).not.toContain("CANARY");
+      expect(second.conversation.executionScope).not.toBe(candidate.conversation.executionScope);
+    });
+    it("paired snapshot capture failure preserves primary progress without waking a live-reading candidate", async () => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.includes("/reviews?") ? new Response("unavailable", { status: 503 }) : undefined);
+      await deliverShadowTestMention(f, "snapshot-failure", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const rows = [...await db.execute(sql`select e.envelope, c.state, c.last_error from chat_github_review_enrollments e join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ last_error: "candidate_snapshot_unavailable", envelope: { snapshotFailure: "admission_snapshot_unavailable" } });
+      const primary = (await pairedTasks(f.endpoint.id))[0]!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
+    });
     it("paired admission never retargets candidate review to an advanced provider head", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "paired-advanced", "@maya review this", 81);

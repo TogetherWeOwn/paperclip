@@ -16258,7 +16258,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
       // Optional source preparation is outside SQL locks and before either arm
       // wakes. A provider failure cannot discard the primary's accepted input.
-      let pairedEvent: GitHubReviewEventContext | null = null;
+      let pairedEvent: Awaited<ReturnType<typeof prepareGitHubPairEvent>> = null;
       if (endpoint.provider === "github" && !activeDelivery.githubShadowLabel) {
         try {
           pairedEvent = await prepareGitHubPairEvent(db, {
@@ -16567,7 +16567,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         if (pairedEvent && !taskShadowLabel && (githubManual || githubAutomatic)) {
           await admitGitHubPair(taskTx as DbTransaction, {
-            endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent,
+            endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent.event,
+            snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure,
             request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
             revision: (githubManual ?? githubAutomatic)!.revision,
             authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,

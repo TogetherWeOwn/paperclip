@@ -7,11 +7,28 @@ import { agents } from "./agents.js";
 import { issues } from "./issues.js";
 import { issueComments } from "./issue_comments.js";
 
+/** Exact pre-wake provider responses. Stored inside the immutable enrollment
+ * and its durable source seed; no late recapture can rewrite an admitted view. */
+export interface GitHubReviewInputSnapshot {
+  version: 1;
+  startedAt: string;
+  finishedAt: string;
+  headSha: string;
+  baseSha: string;
+  diffBaseSha: string;
+  responses: Record<string, unknown>;
+  digest: string;
+}
+
 export interface GitHubReviewEnrollmentEnvelope {
   version: 1;
   event: GitHubReviewEventContext;
   request: string;
   lowTrust: boolean;
+  snapshot?: GitHubReviewInputSnapshot;
+  snapshotFailure?: string;
+  /** Frozen by stable arm ID, never a latest-row lookup at tool execution. */
+  previousAssessments?: Record<string, { headSha: string; assessment: import("@paperclipai/shared").GitHubReviewAssessment; issueId: string; runId: string | null } | null>;
   policy: GitHubReviewPolicy;
   authority: { guest: boolean; responsibleUserId: string | null; sponsorUserId: string | null };
   normalizedEvent: Record<string, unknown>;

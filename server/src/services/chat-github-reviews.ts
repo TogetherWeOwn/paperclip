@@ -16,6 +16,7 @@ import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { primaryGitHubReview } from "./chat-github-primary.js";
 import { githubRunCapability } from "./chat-github-shadow.js";
+import { githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -115,6 +116,8 @@ const readSchema = z
       "files",
       "comments",
       "reviews",
+      "inline_comments",
+      "checks",
       "changes_since_review",
     ]),
     page: z.number().int().min(1).max(100).default(1),
@@ -312,6 +315,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       isIssue: !!match[2],
       replyId: match[4] ?? null,
       enrollment: capability.enrollment,
+      candidate: capability.candidate,
+      previousAssessment: capability.enrollment?.envelope.previousAssessments?.[capability.candidate?.armId ?? "primary"] ?? null,
       policy: capability.enrollment?.envelope.policy ?? effectiveGitHubReviewPolicy(
         source.config.configuration,
         repositoryId,
@@ -365,7 +370,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     };
   }
   async function diffBaseSha(
-    api: Awaited<ReturnType<typeof client>>,
+    api: GitHubReviewReader,
     baseSha: string,
     headSha: string,
   ) {
@@ -387,6 +392,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           eq(chatGitHubReviews.endpointId, source.endpoint.id),
           eq(chatGitHubReviews.issueId, source.issue.id),
           eq(chatGitHubReviews.headSha, pull.head.sha),
+          source.enrollment ? eq(chatGitHubReviews.deliveryId, source.delivery.id) : undefined,
         ),
       )
       .orderBy(desc(chatGitHubReviews.createdAt))
@@ -461,10 +467,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         repository: source.repository,
         pullNumber: source.number,
         headSha: pull.head.sha,
-        deliveryId: `run:${source.run.id}:${pull.head.sha}`,
+        deliveryId: source.enrollment ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
         configurationRevision:
-          manual?.revision ?? automatic?.revision ?? source.config.revision,
-        policySnapshot: manual?.policy ?? automatic?.policy ?? source.policy,
+          source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
+        policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,
         event: context,
         state: "running",
         shadowLabel: source.shadowLabel,
@@ -491,7 +497,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           eq(chatGitHubReviews.endpointId, source.endpoint.id),
           eq(
             chatGitHubReviews.deliveryId,
-            `run:${source.run.id}:${pull.head.sha}`,
+            source.enrollment ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
           ),
         ),
       );
@@ -576,7 +582,6 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     invocationId?: string,
   ) {
     const source = await scope(session);
-    const api = await client(source);
     if (name === "comment") {
       const parsed = commentSchema.parse(input);
       const shadowLabel =
@@ -604,11 +609,18 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This task is bound to a GitHub issue. Pull request review tools require a PR conversation.",
       );
+    const useSnapshot = !!source.candidate || !!source.enrollment?.envelope.snapshot;
+    const api: GitHubReviewReader = useSnapshot
+      ? githubSnapshotReader(source.enrollment?.envelope.snapshot, {
+          headSha: source.enrollment!.headSha, baseSha: source.enrollment!.baseSha, pullNumber: source.number,
+        }, async path => {
+          // This closure is invoked ONLY after the snapshot reader validates an
+          // exact commit-addressed object. No general live client exists here.
+          const token = await githubBotRepositoryToken(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, fetchImpl, "read");
+          return githubBotRequest(fetchImpl, token, `/repos/${source.repository}${path}`);
+        }, source.previousAssessment?.headSha)
+      : await client(source);
     const pull = await api.request<Pull>(`/pulls/${source.number}`);
-    // Until the snapshot reader can serve the frozen objects, an advanced
-    // provider head/base is unavailable, never permission to retarget this arm.
-    if (source.enrollment && (source.enrollment.headSha !== pull.head.sha || source.enrollment.baseSha !== pull.base.sha))
-      throw conflict("This candidate is bound to an earlier immutable head/base; live retargeting is forbidden");
     const automatic = source.delivery.normalizedEvent.githubAutomatic as
       { context: GitHubReviewEventContext } | undefined;
     if (automatic && automatic.context.headSha !== pull.head.sha)
@@ -621,7 +633,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         const configuration = (source.delivery.normalizedEvent.githubManual ??
           source.delivery.normalizedEvent.githubAutomatic) as
           { policy: GitHubReviewPolicy; revision: number } | undefined;
-        const previous = await githubPreviousAssessment(
+        const previous = source.enrollment ? source.previousAssessment : await githubPreviousAssessment(
           db,
           source.endpoint,
           source.repositoryId,
@@ -631,9 +643,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           untrusted: true,
           pull,
           diffBaseSha: await diffBaseSha(api, pull.base.sha, pull.head.sha),
-          reviewPolicy: configuration?.policy ?? source.policy,
+          reviewPolicy: source.enrollment?.envelope.policy ?? configuration?.policy ?? source.policy,
           configurationRevision:
-            configuration?.revision ?? source.config.revision,
+            source.enrollment?.configurationRevision ?? configuration?.revision ?? source.config.revision,
           previousAssessment: previous
             ? {
                 reviewedCommit: previous.headSha,
@@ -645,7 +657,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         };
       }
       if (parsed.section === "changes_since_review") {
-        const previous = await githubPreviousAssessment(
+        const previous = source.enrollment ? source.previousAssessment : await githubPreviousAssessment(
           db,
           source.endpoint,
           source.repositoryId,
@@ -685,10 +697,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             "GitHub limits comparison files to 300. This delta is supporting context; read all current PR files before claiming complete coverage. Force pushes can change ancestry.",
         };
       }
+      if (parsed.section === "checks") {
+        const checks = await api.request<{ check_runs: unknown[] }>(`/commits/${pull.head.sha}/check-runs?per_page=100&page=${parsed.page}`);
+        const statuses = await api.request<unknown[]>(`/commits/${pull.head.sha}/statuses?per_page=100&page=${parsed.page}`);
+        return { untrusted: true, items: checks.check_runs, statuses,
+          hasMore: checks.check_runs.length === 100 || statuses.length === 100, page: parsed.page, reviewedCommit: pull.head.sha };
+      }
       const route =
         parsed.section === "comments"
           ? `/issues/${source.number}/comments`
-          : `/pulls/${source.number}/${parsed.section}`;
+          : `/pulls/${source.number}/${parsed.section === "inline_comments" ? "comments" : parsed.section}`;
       const rows = await api.request<Array<Record<string, unknown>>>(
         `${route}?per_page=100&page=${parsed.page}`,
       );

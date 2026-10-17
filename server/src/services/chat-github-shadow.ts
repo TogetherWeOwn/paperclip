@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { captureGitHubReviewSnapshot } from "./chat-github-review-snapshot.js";
 import {
   agents, chatActions, chatConversations, chatDeliveries, chatEndpoints, chatGitHubConfigurations,
   chatGitHubReviewArms, chatGitHubReviewCandidates, chatGitHubReviewEnrollments,
@@ -29,20 +30,21 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   endpoint: Endpoint; repositoryId: string; repository: string; threadId: string;
   eventId: string; principal: { externalId: string; handle: string | null };
   automatic?: GitHubReviewEventContext; manualEvent?: "mention" | "comment";
-}, fetchImpl: typeof fetch): Promise<GitHubReviewEventContext | null> {
+}, fetchImpl: typeof fetch): Promise<{ event: GitHubReviewEventContext; snapshot?: GitHubReviewEnrollmentEnvelope["snapshot"]; snapshotFailure?: string } | null> {
   if (!(await githubShadowEnabled(db))) return null;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
   if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
-  if (input.automatic) return input.automatic;
+  const captureDeadline = AbortSignal.timeout(15_000);
+  const boundedFetch: typeof fetch = (url, init) => fetchImpl(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline });
   const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(input.threadId);
   if (!match || match[1]!.toLowerCase() !== input.repository.toLowerCase()) return null;
-  const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, fetchImpl, "read");
+  const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
   const pr = await githubBotRequest<{
     title: string; body: string | null; draft: boolean;
     head: { sha: string }; base: { sha: string; ref: string };
     user: { id: number; login: string; type?: string }; labels?: Array<{ name: string }>;
-  }>(fetchImpl, token, `/repos/${input.repository}/pulls/${match[2]}`);
-  return {
+  }>(boundedFetch, token, `/repos/${input.repository}/pulls/${match[2]}`);
+  const event: GitHubReviewEventContext = input.automatic ?? {
     event: input.manualEvent ?? "mention", deliveryId: input.eventId,
     repositoryId: input.repositoryId, repository: input.repository.toLowerCase(), pullNumber: Number(match[2]),
     headSha: githubCommitSchema.parse(pr.head.sha), baseSha: githubCommitSchema.parse(pr.base.sha),
@@ -51,6 +53,14 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     sender: { id: input.principal.externalId, login: input.principal.handle ?? input.principal.externalId },
     labels: (pr.labels ?? []).map(l => l.name),
   };
+  try {
+    const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event);
+    return { event, snapshot };
+  } catch {
+    // Preserve enrollment/accounting, but NEVER reconstruct admission bytes at
+    // recovery time. Primary can proceed live; candidate fails closed.
+    return { event, snapshotFailure: "admission_snapshot_unavailable" };
+  }
 }
 
 interface Seed {
@@ -85,6 +95,8 @@ export async function admitGitHubPair(tx: Tx, input: {
   endpoint: Endpoint; deliveryId: string; conversation: typeof chatConversations.$inferSelect;
   event: GitHubReviewEventContext; request: string; policy: GitHubReviewPolicy; revision: number;
   authority: GitHubReviewEnrollmentEnvelope["authority"];
+  snapshot?: GitHubReviewEnrollmentEnvelope["snapshot"];
+  snapshotFailure?: string;
 }) {
   if (!(await githubShadowEnabled(tx))) return;
   const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, input.deliveryId));
@@ -108,10 +120,36 @@ export async function admitGitHubPair(tx: Tx, input: {
       sql`${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber' = ${String(e.pullNumber)}`));
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;
   const [primaryIssue] = await tx.select({ sourceTrust: issues.sourceTrust }).from(issues).where(eq(issues.id, input.conversation.issueId));
+  const previousAssessments: NonNullable<GitHubReviewEnrollmentEnvelope["previousAssessments"]> = {};
+  for (const armId of ["primary", ...selected.map(a => a.id)]) {
+    previousAssessments[armId] = null;
+    if (roundOrdinal === 1 || !input.snapshot) continue;
+    const [priorReview] = await tx.select({ review: chatGitHubReviews }).from(chatGitHubReviews)
+      .innerJoin(chatGitHubReviewEnrollments, and(
+        eq(chatGitHubReviewEnrollments.companyId, input.endpoint.companyId),
+        eq(chatGitHubReviewEnrollments.endpointId, input.endpoint.id),
+        eq(chatGitHubReviewEnrollments.repositoryId, e.repositoryId),
+        eq(chatGitHubReviewEnrollments.pullNumber, e.pullNumber),
+        lt(chatGitHubReviewEnrollments.roundOrdinal, roundOrdinal),
+        armId === "primary"
+          ? sql`${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text`
+          : sql`exists (select 1 from chat_github_review_candidates c where c.company_id = ${input.endpoint.companyId}
+              and c.enrollment_id = ${chatGitHubReviewEnrollments.id} and c.arm_id = ${armId}
+              and c.native_delivery_id::text = ${chatGitHubReviews.deliveryId})`,
+      )).where(and(eq(chatGitHubReviews.companyId, input.endpoint.companyId), eq(chatGitHubReviews.endpointId, input.endpoint.id),
+        isNotNull(chatGitHubReviews.assessment), lte(chatGitHubReviews.updatedAt, new Date(input.snapshot.startedAt)),
+        armId === "primary" ? isNull(chatGitHubReviews.shadowLabel) : isNotNull(chatGitHubReviews.shadowLabel)))
+      .orderBy(desc(chatGitHubReviewEnrollments.roundOrdinal), desc(chatGitHubReviews.createdAt)).limit(1);
+    if (priorReview?.review.assessment) previousAssessments[armId] = {
+      headSha: priorReview.review.headSha, assessment: priorReview.review.assessment,
+      issueId: priorReview.review.issueId, runId: priorReview.review.runId,
+    };
+  }
   const seed: Seed = {
     version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
     pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, e.headSha, e.baseSha, roundOrdinal, input.revision, digest(input.policy)]),
     envelope: { version: 1, event: e, request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
+      snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
       normalizedEvent: delivery.normalizedEvent,
       conversation: { resourceId: input.conversation.resourceId, externalConversationId: input.conversation.externalConversationId,
         externalThreadId: input.conversation.externalThreadId, externalLabel: input.conversation.externalLabel,
@@ -153,7 +191,14 @@ export async function githubRunCapability(db: Store, session: {
     .where(and(eq(chatMessageLinks.companyId, session.companyId), eq(chatMessageLinks.commentId, commentId),
       eq(chatMessageLinks.direction, "inbound"), eq(chatConversations.issueId, session.issueId), eq(chatEndpoints.provider, "github"), eq(issues.assigneeAgentId, session.agentId)));
   if (!source || source.delivery.companyId !== session.companyId || source.delivery.endpointId !== source.endpoint.id || source.delivery.conversationId !== source.conversation.id) return null;
-  if (source.conversation.executionScope === "primary" && source.endpoint.assignedAgentId === session.agentId) return { ...source, candidate: null, enrollment: null };
+  if (source.conversation.executionScope === "primary" && source.endpoint.assignedAgentId === session.agentId) {
+    // The immutable source seed is authoritative even if its optional table
+    // projection failed. Both arms must see the same admission-time bytes.
+    const seed = source.delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
+    const enrollment = seed ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
+      baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
+    return { ...source, candidate: null, enrollment };
+  }
   const candidate = await githubCandidateBinding(db, { companyId: session.companyId, endpointId: source.endpoint.id,
     agentId: session.agentId, issueId: session.issueId, deliveryId: source.delivery.id, conversationId: source.conversation.id, commentId });
   if (!candidate || source.delivery.githubShadowLabel !== candidate.shadowLabel || source.conversation.githubShadowLabel !== candidate.shadowLabel) return null;
@@ -201,8 +246,13 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         // A paused/disabled oldest arm must not monopolize a bounded sweep.
         // Keep the admitted denominator and retry if authority is restored.
         if (!(await githubCandidateMayWake(tx, candidate))) return defer("candidate_unavailable");
-        if (candidate.state === "materialized") return candidate;
         const [enrollment] = await tx.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId));
+        if (!enrollment?.envelope.snapshot) {
+          await tx.update(chatGitHubReviewCandidates).set({ state: "unavailable", lastError: "candidate_snapshot_unavailable", nextAttemptAt: null, updatedAt: new Date() })
+            .where(eq(chatGitHubReviewCandidates.id, candidate.id));
+          return null;
+        }
+        if (candidate.state === "materialized") return candidate;
         const [endpoint] = await tx.select().from(chatEndpoints).where(and(eq(chatEndpoints.id, candidate.endpointId), eq(chatEndpoints.companyId, candidate.companyId)));
         if (!enrollment || !endpoint || !["active", "verifying"].includes(endpoint.status)) return defer("candidate_endpoint_unavailable");
         if (!(await githubChatPrincipalAccess(tx, endpoint, enrollment.principalId))?.allowed) return defer("candidate_principal_unavailable");

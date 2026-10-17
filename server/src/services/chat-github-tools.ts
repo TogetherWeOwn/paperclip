@@ -44,6 +44,8 @@ export const GITHUB_BOT_TOOLS = [
             "files",
             "comments",
             "reviews",
+            "inline_comments",
+            "checks",
             "changes_since_review",
           ],
         },
