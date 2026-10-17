@@ -20639,12 +20639,14 @@ export function heartbeatService(
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
-      );
-      if (availableSlots <= 0) return [];
+      // Fast path without taking the cross-process start lock: already at cap.
+      // The claim loop below re-verifies under the agents row lock, so a stale
+      // read here can only under-claim (a later wake or drain pass retries).
+      if (
+        (await countRunningRunsForAgent(agentId)) >= policy.maxConcurrentRuns
+      ) {
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -20732,26 +20734,42 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        let claimed: typeof heartbeatRuns.$inferSelect | null;
-        try {
-          claimed = await claimQueuedRun(queuedRun, companyAgents);
-        } catch (err) {
-          if (isPermanentClaimRejection(err)) {
-            rejectedClaims.push({ run: queuedRun, err });
+      // Cross-process start lock (TOG-28460): withAgentStartLock only chains
+      // callers in this process, so concurrent schedulers on other processes
+      // could read the same running count and each claim a full batch of
+      // slots. Holding the agents row for the claim loop serializes batches;
+      // the per-iteration recount covers direct executeRun claims that never
+      // take this lock. Excess wakes stay queued; drain passes start them as
+      // slots free.
+      const claimedRuns = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
+        );
+        const claimed: Array<typeof heartbeatRuns.$inferSelect> = [];
+        for (const queuedRun of prioritizedRuns) {
+          const liveRunningCount = await countRunningRunsForAgent(agentId);
+          if (claimed.length + liveRunningCount >= policy.maxConcurrentRuns) {
+            break;
+          }
+          let claimedRun: typeof heartbeatRuns.$inferSelect | null;
+          try {
+            claimedRun = await claimQueuedRun(queuedRun, companyAgents);
+          } catch (err) {
+            if (isPermanentClaimRejection(err)) {
+              rejectedClaims.push({ run: queuedRun, err });
+              continue;
+            }
+            if (!isDeferrableClaimRejection(err)) throw err;
+            logger.warn(
+              { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+              "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
+            );
             continue;
           }
-          if (!isDeferrableClaimRejection(err)) throw err;
-          logger.warn(
-            { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
-            "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
-          );
-          continue;
+          if (claimedRun) claimed.push(claimedRun);
         }
-        if (claimed) claimedRuns.push(claimed);
-      }
+        return claimed;
+      });
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
@@ -20892,6 +20910,16 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // Concurrency guard (TOG-28460): direct executeRun callers bypass
+      // startNextQueuedRunForAgent's slot budget. Never start a queued run
+      // while the agent is already at maxConcurrentRuns; leave it queued so
+      // a drain pass starts it when a slot frees.
+      const guardAgent = await getAgent(run.agentId);
+      if (guardAgent) {
+        const guardPolicy = parseHeartbeatPolicy(guardAgent);
+        const guardRunningCount = await countRunningRunsForAgent(run.agentId);
+        if (guardRunningCount >= guardPolicy.maxConcurrentRuns) return;
+      }
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
