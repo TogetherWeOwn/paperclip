@@ -434,39 +434,65 @@ describePg("decisionService", () => {
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
   });
 
-  it("skips an expired decision continuation when its origin agent is paused", async () => {
+  it("holds an expired decision continuation while its origin agent is paused and delivers after resume", async () => {
     const created = await createCommentDecision("lenient", { expiresAt: nearFutureExpiry() });
     await expireDecisionNow(created.id);
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
-    const wakeOriginAgent = vi.fn(async () => {
-      throw conflict("Agent is not invokable in its current state", {
-        status: "paused", reason: "paused", invalidOrgChain: false, agentId, agentStatus: "paused",
-      });
-    });
-    const unavailableService = decisionService(db, { wakeOriginAgent });
+    const pausableService = decisionService(db, { wakeOriginAgent: async (input) => {
+      const [origin] = await db.select({ status: agents.status }).from(agents).where(eq(agents.id, agentId));
+      if (origin?.status !== "active") {
+        throw conflict("Agent is not invokable in its current state", {
+          status: origin?.status, reason: origin?.status, invalidOrgChain: false, agentId, agentStatus: origin?.status,
+        });
+      }
+      wakes.push(input);
+    } });
 
-    await expect(unavailableService.sweepExpired()).resolves.toMatchObject({ expired: 1 });
-    expect((await unavailableService.get(created.id))?.metadata).toMatchObject({
-      continuationPending: false,
-      continuationSkippedReason: "origin_agent_not_invokable",
-    });
-    await unavailableService.sweepExpired();
-    expect(wakeOriginAgent).toHaveBeenCalledTimes(1);
-    expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]?.status).toBe("paused");
+    await expect(pausableService.sweepExpired()).resolves.toMatchObject({ expired: 1 });
+    const held = await pausableService.get(created.id);
+    expect(held?.metadata).toMatchObject({ continuationPending: true });
+    expect(held?.metadata).toHaveProperty("continuationDeferredAt");
+    expect(held?.metadata).not.toHaveProperty("continuationSkippedReason");
+    await pausableService.sweepExpired();
+    expect(wakes).toEqual([]);
+
+    await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+    await pausableService.sweepExpired();
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "expired" }]);
+    expect((await pausableService.get(created.id))?.metadata).toMatchObject({ continuationPending: false });
   });
 
-  it.each([
-    { status: "paused", reason: "paused", invalidOrgChain: false },
-    { status: "terminated", reason: "terminated", invalidOrgChain: false },
-    { status: "pending_approval", reason: "pending_approval", invalidOrgChain: false },
-    { status: "active", reason: "manager_terminated", invalidOrgChain: true },
-  ] as const)("skips a pending continuation after restart for $reason without claiming delivery", async ({ status, reason, invalidOrgChain }) => {
+  it("does not let a held continuation starve later pending continuations", async () => {
+    process.env.PAPERCLIP_DECISIONS_SWEEP_BATCH_SIZE = "1";
+    const held = await createCommentDecision();
+    const healthy = await createCommentDecision();
+    await db.update(decisions).set({ status: "expired", metadata: { expiredReason: "ttl", continuationPending: true }, updatedAt: new Date(Date.now() - 2_000) })
+      .where(eq(decisions.id, held.id));
+    await db.update(decisions).set({ status: "expired", metadata: { expiredReason: "ttl", continuationPending: true }, updatedAt: new Date(Date.now() - 1_000) })
+      .where(eq(decisions.id, healthy.id));
+    const partiallyPaused = decisionService(db, { wakeOriginAgent: async (input) => {
+      if (input.decisionId === held.id) {
+        throw conflict("Agent is not invokable in its current state", {
+          status: "paused", reason: "paused", invalidOrgChain: false, agentId, agentStatus: "paused",
+        });
+      }
+      wakes.push(input);
+    } });
+
+    await expect(partiallyPaused.sweepExpired()).resolves.toEqual({ expired: 0, resumed: 0 });
+    await expect(partiallyPaused.sweepExpired()).resolves.toEqual({ expired: 0, resumed: 0 });
+    expect(wakes.map((wake) => wake.decisionId)).toEqual([healthy.id]);
+  });
+
+  it("skips a pending continuation for a terminated origin agent without claiming delivery", async () => {
     const created = await createCommentDecision();
     await db.update(decisions).set({ status: "expired", metadata: { expiredReason: "ttl", continuationPending: true } })
       .where(eq(decisions.id, created.id));
-    await db.update(agents).set({ status }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
     const wakeOriginAgent = vi.fn(async () => {
-      throw conflict("Invocation denied", { status, reason, invalidOrgChain, agentId });
+      throw conflict("Agent is not invokable in its current state", {
+        status: "terminated", reason: "terminated", invalidOrgChain: false, agentId, agentStatus: "terminated",
+      });
     });
     const unavailableService = decisionService(db, { wakeOriginAgent });
 
@@ -480,6 +506,29 @@ describePg("decisionService", () => {
     expect(recovered?.metadata).not.toHaveProperty("continuationDeliveredAt");
     await unavailableService.sweepExpired();
     expect(wakeOriginAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { status: "pending_approval", reason: "pending_approval", invalidOrgChain: false },
+    { status: "active", reason: "manager_terminated", invalidOrgChain: true },
+  ] as const)("keeps a pending continuation for $reason and retries it on the next sweep", async ({ status, reason, invalidOrgChain }) => {
+    const created = await createCommentDecision();
+    await db.update(decisions).set({ status: "expired", metadata: { expiredReason: "ttl", continuationPending: true } })
+      .where(eq(decisions.id, created.id));
+    await db.update(agents).set({ status }).where(eq(agents.id, agentId));
+    const wakeOriginAgent = vi.fn(async () => {
+      throw conflict("Invocation denied", { status, reason, invalidOrgChain, agentId });
+    });
+    const unavailableService = decisionService(db, { wakeOriginAgent });
+
+    await expect(unavailableService.sweepExpired()).resolves.toEqual({ expired: 0, resumed: 0 });
+    const recovered = await unavailableService.get(created.id);
+    expect(recovered?.metadata).toMatchObject({ expiredReason: "ttl", continuationPending: true });
+    expect(recovered?.metadata).toHaveProperty("continuationDeferredAt");
+    expect(recovered?.metadata).not.toHaveProperty("continuationSkippedReason");
+    expect(recovered?.metadata).not.toHaveProperty("continuationDeliveredAt");
+    await unavailableService.sweepExpired();
+    expect(wakeOriginAgent).toHaveBeenCalledTimes(2);
   });
 
   it.each(["message_only", "budget_conflict", "other_agent"])("retains the continuation for an unrelated %s wake failure", async (kind) => {

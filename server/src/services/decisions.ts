@@ -629,8 +629,22 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         (details.invalidOrgChain === true || (typeof details.reason === "string" &&
           ["paused", "terminated", "pending_approval", "unknown_status"].includes(details.reason)));
       if (!originNotInvokable) throw error;
+      if (details?.reason !== "terminated") {
+        // Paused, pending-approval and broken-chain origins can be repaired, so the
+        // continuation stays pending. Bumping updatedAt moves it behind other rows in
+        // the oldest-first sweep batch so it cannot starve them.
+        logger.info({ companyId: decision.companyId, decisionId: decision.id, originAgentId: decision.originAgentId, reason: details?.reason },
+          "decision continuation deferred because origin agent is not invokable");
+        await db.update(decisions).set({
+          metadata: sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
+            'continuationDeferredAt', ${new Date().toISOString()}::text
+          )`,
+          updatedAt: new Date(),
+        }).where(and(eq(decisions.id, decision.id), sql`${decisions.metadata} ->> 'continuationPending' = 'true'`));
+        return;
+      }
       logger.warn({ companyId: decision.companyId, decisionId: decision.id, originAgentId: decision.originAgentId },
-        "decision continuation skipped because origin agent is not invokable");
+        "decision continuation skipped because origin agent is terminated");
       await db.update(decisions).set({
         metadata: sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
           'continuationPending', false,
