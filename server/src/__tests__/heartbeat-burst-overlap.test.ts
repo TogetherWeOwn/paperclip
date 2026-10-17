@@ -28,6 +28,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { claimQueuedNativeReviewRun } from "../services/native-runtime/native-review-dispatch.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 // TOG-28460: force overlapping schedulers. The in-process start lock lapses
@@ -65,6 +66,25 @@ vi.mock("../adapters/index.ts", async () => {
     })),
   };
 });
+
+// TOG-28460 info nit: the native-review claim path has its own agents-row
+// cap guard copy (native-review-dispatch.ts). Mock the review admission lock
+// to always succeed so this test isolates the cap guard: at cap the claim
+// must return null before touching the review lock; with headroom it claims.
+const mockClaimNativeReviewLock = vi.hoisted(() => vi.fn(async () => true));
+
+vi.mock(
+  "../services/native-runtime/native-review-participant.js",
+  async () => {
+    const actual = await vi.importActual<
+      typeof import("../services/native-runtime/native-review-participant.js")
+    >("../services/native-runtime/native-review-participant.js");
+    return {
+      ...actual,
+      claimNativeReviewExecutionLock: mockClaimNativeReviewLock,
+    };
+  },
+);
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -328,4 +348,119 @@ describeEmbeddedPostgres("heartbeat burst overlap (TOG-28460)", () => {
       releaseRuns();
     }
   }, 150_000);
+
+  it("holds maxConcurrentRuns on the native-review claim path", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runningRunId = randomUUID();
+    const queuedRunId = randomUUID();
+    const wakeId = randomUUID();
+    const interactionId = randomUUID();
+    const decisionId = randomUUID();
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BurstReviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Native review burst",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+    // Fill the cap with one running run.
+    await db.insert(heartbeatRuns).values({
+      id: runningRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      contextSnapshot: { issueId },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      status: "queued",
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      runId: queuedRunId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const [queued] = await db
+      .insert(heartbeatRuns)
+      .values({
+        id: queuedRunId,
+        companyId,
+        agentId,
+        status: "queued",
+        invocationSource: "automation",
+        wakeupRequestId: wakeId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+          nativeReviewInteractionId: interactionId,
+          nativeReviewDecisionId: decisionId,
+        },
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+    expect(queued?.status).toBe("queued");
+
+    mockClaimNativeReviewLock.mockClear();
+    // At cap the guard returns null before the review admission lock.
+    const atCap = await claimQueuedNativeReviewRun(db as never, {
+      run: queued!,
+      agentNameKey: "burstreviewer",
+      claimedAt: new Date(),
+      claimValues: { updatedAt: new Date() } as never,
+      maxConcurrentRuns: 1,
+    });
+    expect(atCap).toBeNull();
+    expect(mockClaimNativeReviewLock).not.toHaveBeenCalled();
+    const stillQueued = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]?.status);
+    expect(stillQueued).toBe("queued");
+
+    // With headroom the same run claims and reaches the review lock.
+    const withRoom = await claimQueuedNativeReviewRun(db as never, {
+      run: queued!,
+      agentNameKey: "burstreviewer",
+      claimedAt: new Date(),
+      claimValues: { updatedAt: new Date() } as never,
+      maxConcurrentRuns: 2,
+    });
+    expect(withRoom?.status).toBe("running");
+    expect(mockClaimNativeReviewLock).toHaveBeenCalledTimes(1);
+  });
 });

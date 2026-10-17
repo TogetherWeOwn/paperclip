@@ -17724,6 +17724,14 @@ export function heartbeatService(
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        // TOG-28460: agents row first (FOR NO KEY UPDATE, NOWAIT) so this
+        // gate matches the claim transactions' agents-then-issue order.
+        // Reverse order deadlocks (40P01) with concurrent claims that hold
+        // the agents row and wait on the issue row. NOWAIT preserves the
+        // gate's non-blocking contract: contention defers to the queue.
+        await tx.execute(
+          sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update nowait`,
+        );
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -17952,13 +17960,17 @@ export function heartbeatService(
     // there — on the SAME connection that performs the claim — instead of in
     // the scheduler loop or at the executeRun entry. Lock order is uniform in
     // every claim tx: agents row first, then the issue/wake/run rows the
-    // existing claim code already locks. Each claim tx stays short (a lock, a
-    // count, the claim) and never awaits another scheduler, so an overlapping
-    // scheduler that outlives the in-process start lock only waits briefly
-    // instead of wedging. At cap the run stays queued for a later drain pass.
+    // existing claim code already locks. The agents lock is FOR NO KEY UPDATE
+    // (not FOR UPDATE) so FK KEY SHARE checks from comment/run inserts still
+    // commit — FOR UPDATE deadlocks with those (40P01) while NO KEY UPDATE
+    // still serializes concurrent claimants. Each claim tx stays short (a
+    // lock, a count, the claim) and never awaits another scheduler, so an
+    // overlapping scheduler that outlives the in-process start lock only waits
+    // briefly instead of wedging. At cap the run stays queued for a later
+    // drain pass.
     async function isAtStartConcurrencyCap(tx: Db): Promise<boolean> {
       await tx.execute(
-        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update`,
       );
       const [{ count }] = await tx
         .select({ count: sql<number>`count(*)` })
@@ -20631,6 +20643,24 @@ export function heartbeatService(
     return err instanceof HttpError && err.status >= 400 && err.status < 500;
   }
 
+  // TOG-28460: a 40P01 deadlock aborts only the losing claim transaction.
+  // The run stays queued and a later pass retries it. Crucially the drain
+  // loop must NOT rethrow: already-claimed runs in this batch still need
+  // their execute loop below, otherwise they sit running with no executor
+  // until the orphan reaper. Walk the cause chain like
+  // isExternalChatWaitAuthorizationContention (55P03) does.
+  function isPostgresDeadlock(err: unknown): boolean {
+    let current: unknown = err;
+    for (let depth = 0; depth < 4 && current; depth += 1) {
+      if (typeof current !== "object" || current === null) return false;
+      const record = current as Record<string, unknown>;
+      const code = record.code;
+      if (typeof code === "string" && code.toUpperCase() === "40P01") return true;
+      current = (record as { cause?: unknown }).cause;
+    }
+    return false;
+  }
+
   // Settle runs that can never be claimed. Letting the error escape stalls the
   // agent's queue and, during startup recovery, stops the server from booting.
   async function cancelRejectedQueuedRuns(
@@ -20799,6 +20829,13 @@ export function heartbeatService(
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
+            continue;
+          }
+          if (isPostgresDeadlock(err)) {
+            logger.warn(
+              { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+              "queued heartbeat run claim deadlocked; leaving it queued for the next recovery pass",
+            );
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
