@@ -37,7 +37,11 @@
  *   workspace records are never mutated by allocation.
  * - Rollback archives only the allocated unrealized record and restores
  *   the exact prior `executionWorkspaceId` recorded in its allocation
- *   metadata, refusing if the binding changed in between.
+ *   metadata when the issue is still bound to it. When the binding was
+ *   cleared (or moved to another open record of the same issue),
+ *   rollback archives that same open record as an orphan without touching
+ *   the issue binding, so the orphan never blocks a later allocation.
+ *   Any other binding change keeps the `binding_conflict` deny.
  */
 
 import { randomUUID } from "node:crypto";
@@ -621,12 +625,97 @@ export async function rollbackSourceBoundWorkspaceAllocation(
     const workspace = isNonEmptyString(input.workspaceId)
       ? await tx.getWorkspace(input.companyId, input.workspaceId)
       : null;
-    if (
-      !workspace ||
-      workspace.sourceIssueId !== issue.id ||
-      issue.executionWorkspaceId !== workspace.id
-    ) {
+    if (!workspace || workspace.sourceIssueId !== issue.id) {
       return deny("binding_conflict");
+    }
+    const boundToIssue = issue.executionWorkspaceId === workspace.id;
+    if (!boundToIssue) {
+      // Orphan cleanup (round-4 review): the issue binding moved on,
+      // leaving this open allocation unbound. Archive it without touching
+      // the issue binding, so the orphan never blocks a later allocation.
+      // Narrowly scoped so the contract's binding-changed deny still
+      // holds: the record must still be an open allocation, and the
+      // current binding must be either cleared (null) or another open
+      // record of the same issue (e.g. a heartbeat fresh row). A binding
+      // to a missing, closed, or foreign record keeps the legacy
+      // `binding_conflict` deny and writes nothing. A closed unbound
+      // record likewise stays `binding_conflict` (it no longer blocks
+      // allocation, so there is nothing to clean up).
+      if (
+        workspace.status !== UNREALIZED_EXECUTION_WORKSPACE_STATUS ||
+        workspace.closedAt != null
+      ) {
+        return deny("binding_conflict");
+      }
+      if (issue.executionWorkspaceId !== null) {
+        const bound = await tx.getWorkspace(
+          input.companyId,
+          issue.executionWorkspaceId,
+        );
+        const boundIsOpenSibling =
+          !!bound &&
+          bound.companyId === input.companyId &&
+          bound.sourceIssueId === issue.id &&
+          !isClosedWorkspace(bound);
+        if (!boundIsOpenSibling) {
+          return deny("binding_conflict");
+        }
+      }
+      const orphanMeta = asRecord(
+        asRecord(workspace.metadata)?.sourceBoundAllocation,
+      );
+      const orphanSelection = asRecord(orphanMeta?.selection);
+      const orphanPrior =
+        typeof orphanMeta?.priorExecutionWorkspaceId === "string" ||
+        orphanMeta?.priorExecutionWorkspaceId === null
+          ? (orphanMeta.priorExecutionWorkspaceId as string | null)
+          : null;
+      const orphanNow = deps.now?.() ?? new Date();
+      // Conditional write: a concurrent adoption that realized the record
+      // first matches zero rows, so rollback denies instead of archiving
+      // a live workspace.
+      const orphanArchived = await tx.updateWorkspace(
+        input.companyId,
+        workspace.id,
+        {
+          status: "archived",
+          closedAt: orphanNow,
+        },
+        { expectUnrealizedOpen: true },
+      );
+      if (!orphanArchived) return deny("workspace_not_unrealized");
+      await tx.logActivity({
+        action: "issue.source_bound_workspace_allocation_rolled_back",
+        companyId: input.companyId,
+        sourceIssueId: issue.id,
+        workspaceId: workspace.id,
+        actor: { type: "board", userId: actor.userId },
+        projectWorkspaceId: workspace.projectWorkspaceId,
+        selection:
+          orphanSelection?.mode === "isolated_workspace" &&
+          orphanSelection?.strategyType === "git_worktree"
+            ? {
+                mode: "isolated_workspace",
+                strategyType: "git_worktree",
+                baseRef: readNonEmptyString(orphanSelection.baseRef),
+                branchTemplate: readNonEmptyString(
+                  orphanSelection.branchTemplate,
+                ),
+              }
+            : null,
+        priorExecutionWorkspaceId: orphanPrior,
+        disposition: "rolled_back",
+        allocatedAt: orphanNow.toISOString(),
+      });
+      return {
+        ok: true as const,
+        operationVersion: SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
+        workspace: orphanArchived,
+        // The issue binding was already elsewhere; it is left untouched.
+        restoredExecutionWorkspaceId: issue.executionWorkspaceId,
+        runtimeInvoked: false as const,
+        wakeInvoked: false as const,
+      };
     }
     if (workspace.status !== UNREALIZED_EXECUTION_WORKSPACE_STATUS) {
       return deny("workspace_not_unrealized");

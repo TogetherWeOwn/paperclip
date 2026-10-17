@@ -1303,7 +1303,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     // An allocated-but-unrealized record leaves this state only via
     // heartbeat realization (which adopts the same row with realized facts)
     // or via the rollback route (which archives it and restores the exact
-    // prior issue binding under the issue lock). A generic PATCH flipping
+    // prior issue binding under the issue lock, or archives an unbound
+    // orphan without touching the issue binding). A generic PATCH flipping
     // `unrealized` to another status would leave cwd/providerRef/openedAt
     // null while transport validation reads only the status, so it must be
     // refused here; the validator also denies null row facts as defense in

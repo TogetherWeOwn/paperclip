@@ -79,6 +79,10 @@ Content-Type: application/json
   commits first makes the write match zero rows, so adoption denies with
   `workspace_not_unrealized`/`binding_conflict`, and the run falls
   through to a fresh insert instead of resurrecting the archived row.
+  When the allocation is still open and bound but the run cannot realize
+  into it (`realization_incomplete`, e.g. it resolved to `project_primary`
+  with no worktree path), the run fails instead of inserting a second
+  source-bound row that would orphan the allocation.
 
 ## Rollback
 
@@ -90,14 +94,20 @@ Content-Type: application/json
 { "workspaceId": "<allocated workspace id>" }
 ```
 
-Archives only the allocated **unrealized** record and restores
+Archives only the allocated **unrealized** record, in one transaction,
+audited as `issue.source_bound_workspace_allocation_rolled_back`. When
+the issue is still bound to the record, it restores
 `issue.executionWorkspaceId` to the exact prior value recorded in the
-record's allocation metadata, in one transaction, audited as
-`issue.source_bound_workspace_allocation_rolled_back`. It refuses
-(`binding_conflict`, 409) if the issue's binding changed in between,
-and refuses realized workspaces (`workspace_not_unrealized`, 409) —
-those close through the normal workspace lifecycle. No workspace,
-branch, or history is deleted.
+record's allocation metadata. When the binding was cleared — or moved
+to another open record of the same issue — it archives the unbound
+orphan with a conditional write (`status = 'unrealized'` and
+`closed_at IS NULL`) and leaves the issue binding untouched, so the
+orphan never blocks a later allocation; this is also the cleanup path
+the PATCH 409 points at. Any other binding change keeps the
+`binding_conflict` deny (409), as do records that are not this issue's
+open allocation. Realized workspaces refuse with
+`workspace_not_unrealized` (409) and close through the normal workspace
+lifecycle. No workspace, branch, or history is deleted.
 
 ## Verification procedure
 

@@ -18,6 +18,11 @@
  * (`status = 'unrealized'` and `closed_at IS NULL`), which denies —
  * instead of resurrecting — a record archived between the read and the
  * write.
+ * Finding 3 (round 4): an unbound orphaned allocation must keep an exit.
+ * Rollback archives a still-open record whose issue binding moved on
+ * without touching the issue binding, so re-allocation succeeds after
+ * the cleanup; heartbeat fails closed on `realization_incomplete`
+ * instead of inserting a second source-bound row.
  */
 import express from "express";
 import request from "supertest";
@@ -30,7 +35,9 @@ import {
   type SourceBoundWorkspaceFacts,
 } from "../services/source-bound-transport-validation-operation.js";
 import {
+  allocateSourceBoundWorkspace,
   markAllocatedWorkspaceRealized,
+  rollbackSourceBoundWorkspaceAllocation,
   type SourceBoundAllocationIssueFacts,
   type SourceBoundAllocationWorkspaceRecord,
   type SourceBoundWorkspaceAllocationDeps,
@@ -518,5 +525,192 @@ describe("reviewfix: guarded adoption never resurrects a rolled-back record", ()
       ok: false,
       errorCode: "workspace_not_unrealized",
     });
+  });
+});
+
+describe("reviewfix: orphaned allocation keeps a rollback exit", () => {
+  const orphanActor = {
+    type: "board",
+    userId: "99999999-9999-4999-8999-999999999999",
+    companyId: ALLOC_COMPANY_ID,
+    hasRuntimeManage: true,
+  };
+
+  function orphanHarness() {
+    const issue = allocIssue({ executionWorkspaceId: null });
+    const workspaces = new Map<string, SourceBoundAllocationWorkspaceRecord>();
+    const audits: unknown[] = [];
+    let counter = 0;
+    const tx: SourceBoundWorkspaceAllocationTx = {
+      async loadIssue(companyId, issueId) {
+        return issue.id === issueId && issue.companyId === companyId
+          ? issue
+          : null;
+      },
+      async listWorkspacesForSourceIssue(companyId, sourceIssueId) {
+        return [...workspaces.values()].filter(
+          (w) => w.companyId === companyId && w.sourceIssueId === sourceIssueId,
+        );
+      },
+      async getWorkspace(companyId, workspaceId) {
+        const found = workspaces.get(workspaceId);
+        return found && found.companyId === companyId ? found : null;
+      },
+      async insertWorkspace(record) {
+        workspaces.set(record.id, record);
+        return record;
+      },
+      async updateWorkspace(_companyId, workspaceId, patch, options) {
+        const current = workspaces.get(workspaceId);
+        if (!current) {
+          if (options?.expectUnrealizedOpen) return null;
+          throw new Error("unexpected updateWorkspace on missing row");
+        }
+        if (
+          options?.expectUnrealizedOpen &&
+          (current.status !== "unrealized" || current.closedAt != null)
+        ) {
+          return null;
+        }
+        const next = { ...current, ...patch };
+        workspaces.set(workspaceId, next);
+        return next;
+      },
+      async bindIssueExecutionWorkspace(_companyId, _issueId, workspaceId) {
+        issue.executionWorkspaceId = workspaceId;
+      },
+      async logActivity(entry) {
+        audits.push(entry);
+      },
+    };
+    const deps: SourceBoundWorkspaceAllocationDeps = {
+      async transact(work) {
+        return work(tx);
+      },
+      now: () => new Date("2026-02-01T00:00:00.000Z"),
+      newWorkspaceId: () => `orphan-workspace-${++counter}`,
+    };
+    return { deps, issue, workspaces, audits };
+  }
+
+  async function allocateOrThrow(
+    deps: SourceBoundWorkspaceAllocationDeps,
+  ): Promise<string> {
+    const result = await allocateSourceBoundWorkspace(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      actor: orphanActor,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(`allocate denied: ${result.errorCode}`);
+    return result.workspace.id;
+  }
+
+  it("rolls back a cleared-binding orphan without touching the issue, then re-allocates", async () => {
+    const { deps, issue, workspaces } = orphanHarness();
+    const first = await allocateOrThrow(deps);
+    expect(issue.executionWorkspaceId).toBe(first);
+    // The Board clears the binding through the issue update path.
+    await deps.transact((tx) =>
+      tx.bindIssueExecutionWorkspace(ALLOC_COMPANY_ID, ALLOC_ISSUE_ID, null),
+    );
+    expect(issue.executionWorkspaceId).toBeNull();
+
+    const rolled = await rollbackSourceBoundWorkspaceAllocation(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      workspaceId: first,
+      actor: orphanActor,
+    });
+    expect(rolled).toMatchObject({
+      ok: true,
+      restoredExecutionWorkspaceId: null,
+    });
+    expect(workspaces.get(first)?.status).toBe("archived");
+    expect(issue.executionWorkspaceId).toBeNull();
+
+    // A repeat rollback of the now-closed orphan denies.
+    const repeat = await rollbackSourceBoundWorkspaceAllocation(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      workspaceId: first,
+      actor: orphanActor,
+    });
+    expect(repeat.ok).toBe(false);
+
+    // Re-allocation succeeds with a fresh record bound to the issue.
+    const second = await allocateOrThrow(deps);
+    expect(second).not.toBe(first);
+    expect(issue.executionWorkspaceId).toBe(second);
+    expect(workspaces.get(second)?.status).toBe("unrealized");
+  });
+
+  it("rolls back an orphan rebound to another open record of the same issue", async () => {
+    const { deps, issue, workspaces } = orphanHarness();
+    const first = await allocateOrThrow(deps);
+    const sibling = allocWorkspace({
+      id: "orphan-sibling-workspace",
+      status: "active",
+      cwd: "/repo/.paperclip/worktrees/TST-1",
+      providerRef: "/repo/.paperclip/worktrees/TST-1",
+      openedAt: new Date("2026-02-01T00:00:00.000Z"),
+      closedAt: null,
+    });
+    await deps.transact(async (tx) => {
+      await tx.insertWorkspace(sibling);
+      await tx.bindIssueExecutionWorkspace(
+        ALLOC_COMPANY_ID,
+        ALLOC_ISSUE_ID,
+        sibling.id,
+      );
+    });
+
+    const rolled = await rollbackSourceBoundWorkspaceAllocation(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      workspaceId: first,
+      actor: orphanActor,
+    });
+    expect(rolled).toMatchObject({
+      ok: true,
+      restoredExecutionWorkspaceId: sibling.id,
+    });
+    expect(workspaces.get(first)?.status).toBe("archived");
+    expect(issue.executionWorkspaceId).toBe(sibling.id);
+
+    // Allocation now resolves to the still-bound sibling, not a new row.
+    const again = await allocateSourceBoundWorkspace(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      actor: orphanActor,
+    });
+    expect(again).toMatchObject({ ok: true, disposition: "existing" });
+    if (again.ok) expect(again.workspace.id).toBe(sibling.id);
+  });
+
+  it("keeps binding_conflict when rebound to an unknown record (contract shape)", async () => {
+    const { deps, issue, workspaces } = orphanHarness();
+    const first = await allocateOrThrow(deps);
+    const unknownId = "44444444-4444-4444-8444-444444444444";
+    await deps.transact((tx) =>
+      tx.bindIssueExecutionWorkspace(
+        ALLOC_COMPANY_ID,
+        ALLOC_ISSUE_ID,
+        unknownId,
+      ),
+    );
+
+    const denied = await rollbackSourceBoundWorkspaceAllocation(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      workspaceId: first,
+      actor: orphanActor,
+    });
+    expect(denied).toMatchObject({
+      ok: false,
+      errorCode: "binding_conflict",
+    });
+    expect(workspaces.get(first)?.status).toBe("unrealized");
+    expect(issue.executionWorkspaceId).toBe(unknownId);
   });
 });

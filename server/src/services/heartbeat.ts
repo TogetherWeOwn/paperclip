@@ -22909,7 +22909,7 @@ export function heartbeatService(
             workspaceId: allocatedUnrealizedExecutionWorkspace.id,
             cwd: executionWorkspace.cwd,
             // A null worktree path fails the helper's completeness check
-            // and falls through to a fresh insert below.
+            // with `realization_incomplete` (handled below).
             providerRef: executionWorkspace.worktreePath ?? "",
             branchName:
               branchNameForInitialPersistence ??
@@ -22924,15 +22924,30 @@ export function heartbeatService(
             metadata: nextExecutionWorkspaceMetadata,
           },
         );
-        if (!adoption.ok) return null;
+        if (!adoption.ok) {
+          // Fail closed when the allocation is still open and bound but
+          // this run cannot realize into it (e.g. it resolved to
+          // project_primary with no worktree path). Falling through to a
+          // fresh insert here would rebind the issue and orphan the
+          // allocation with a second open source-bound row. Other denies
+          // (binding_conflict / workspace_not_unrealized) mean the
+          // allocation is already gone, so falling through is correct.
+          if (adoption.errorCode === "realization_incomplete") {
+            throw new Error(
+              "Source-bound allocation exists but this run cannot realize into it; failing instead of orphaning the allocation with a second record",
+            );
+          }
+          return null;
+        }
         return executionWorkspacesSvc.getById(
           allocatedUnrealizedExecutionWorkspace.id,
         );
       };
       try {
         // Attempted inside persistence so a thrown error still runs the
-        // worktree cleanup below; a denial (rollback won the race, or
-        // incomplete facts) returns null and falls through to insert.
+        // worktree cleanup below; a denial (rollback won the race) returns
+        // null and falls through to insert, while incomplete facts throw
+        // above instead of orphaning the allocation.
         const adoptedAllocatedExecutionWorkspace =
           await tryAdoptAllocatedExecutionWorkspace();
         persistedExecutionWorkspace =
