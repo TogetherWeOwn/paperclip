@@ -44,7 +44,7 @@ import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { activityLog, executionWorkspaces, issues } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 
 export const SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION =
   "source-bound-workspace-allocation/v1";
@@ -148,7 +148,14 @@ export type SourceBoundWorkspaceAllocationTx = {
     companyId: string,
     workspaceId: string,
     patch: Partial<SourceBoundAllocationWorkspaceRecord>,
-  ) => Promise<SourceBoundAllocationWorkspaceRecord>;
+    /**
+     * When set, the write matches only while the record is still an open
+     * allocation (`status = 'unrealized'` and `closed_at IS NULL`) and
+     * returns null when no row matches instead of throwing, so the caller
+     * can deny and let the heartbeat fall through to a fresh insert.
+     */
+    options?: { expectUnrealizedOpen?: boolean },
+  ) => Promise<SourceBoundAllocationWorkspaceRecord | null>;
   bindIssueExecutionWorkspace: (
     companyId: string,
     issueId: string,
@@ -541,24 +548,38 @@ export async function markAllocatedWorkspaceRealized(
     ) {
       return deny("realization_incomplete");
     }
-    const realized = await tx.updateWorkspace(input.companyId, workspace.id, {
-      status: "active",
-      cwd: input.cwd,
-      providerRef: input.providerRef,
-      branchName: input.branchName,
-      repoUrl: input.repoUrl ?? workspace.repoUrl,
-      // Heartbeat adoption carries the remaining realized facts; each is
-      // applied only when explicitly provided so older callers keep the
-      // stored allocation values.
-      ...(input.providerType !== undefined
-        ? { providerType: input.providerType ?? workspace.providerType }
-        : {}),
-      ...(input.baseRef !== undefined
-        ? { baseRef: input.baseRef ?? workspace.baseRef }
-        : {}),
-      ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
-      openedAt: deps.now?.() ?? new Date(),
-    });
+    // Conditional write: the UPDATE matches only while the record is still
+    // an open allocation. A Board rollback (or any other archiver) that
+    // commits between the read above and this write matches zero rows, so
+    // adoption denies with `workspace_not_unrealized` and the heartbeat
+    // falls through to a fresh insert instead of resurrecting the archived
+    // row as `active` with `closedAt` still set. The issue `FOR UPDATE`
+    // lock serializes this with rollback; the status predicate closes the
+    // remaining window against writers that take a different lock.
+    const realized = await tx.updateWorkspace(
+      input.companyId,
+      workspace.id,
+      {
+        status: "active",
+        cwd: input.cwd,
+        providerRef: input.providerRef,
+        branchName: input.branchName,
+        repoUrl: input.repoUrl ?? workspace.repoUrl,
+        // Heartbeat adoption carries the remaining realized facts; each is
+        // applied only when explicitly provided so older callers keep the
+        // stored allocation values.
+        ...(input.providerType !== undefined
+          ? { providerType: input.providerType ?? workspace.providerType }
+          : {}),
+        ...(input.baseRef !== undefined
+          ? { baseRef: input.baseRef ?? workspace.baseRef }
+          : {}),
+        ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+        openedAt: deps.now?.() ?? new Date(),
+      },
+      { expectUnrealizedOpen: true },
+    );
+    if (!realized) return deny("workspace_not_unrealized");
     return {
       ok: true as const,
       operationVersion: SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
@@ -621,10 +642,19 @@ export async function rollbackSourceBoundWorkspaceAllocation(
     const selection = asRecord(allocationMeta?.selection);
     const now = deps.now?.() ?? new Date();
 
-    const archived = await tx.updateWorkspace(input.companyId, workspace.id, {
-      status: "archived",
-      closedAt: now,
-    });
+    // The status predicate re-asserts the pre-check above at write time,
+    // so a concurrent adoption that realized the record first makes
+    // rollback deny instead of archiving a live workspace.
+    const archived = await tx.updateWorkspace(
+      input.companyId,
+      workspace.id,
+      {
+        status: "archived",
+        closedAt: now,
+      },
+      { expectUnrealizedOpen: true },
+    );
+    if (!archived) return deny("workspace_not_unrealized");
     await tx.bindIssueExecutionWorkspace(
       input.companyId,
       issue.id,
@@ -799,7 +829,7 @@ export function createDbSourceBoundWorkspaceAllocationDeps(
               .returning();
             return toAllocationWorkspaceRecord(rows[0]!);
           },
-          async updateWorkspace(companyId, workspaceId, patch) {
+          async updateWorkspace(companyId, workspaceId, patch, options) {
             const rows = await tx
               .update(executionWorkspaces)
               .set({
@@ -832,13 +862,26 @@ export function createDbSourceBoundWorkspaceAllocationDeps(
                 updatedAt: new Date(),
               })
               .where(
-                and(
-                  eq(executionWorkspaces.id, workspaceId),
-                  eq(executionWorkspaces.companyId, companyId),
-                ),
+                options?.expectUnrealizedOpen
+                  ? and(
+                      eq(executionWorkspaces.id, workspaceId),
+                      eq(executionWorkspaces.companyId, companyId),
+                      eq(
+                        executionWorkspaces.status,
+                        UNREALIZED_EXECUTION_WORKSPACE_STATUS,
+                      ),
+                      isNull(executionWorkspaces.closedAt),
+                    )
+                  : and(
+                      eq(executionWorkspaces.id, workspaceId),
+                      eq(executionWorkspaces.companyId, companyId),
+                    ),
               )
               .returning();
             if (!rows[0]) {
+              // Conditional adoption/rollback writes report no match so
+              // the caller can deny; unconditional writes still throw.
+              if (options?.expectUnrealizedOpen) return null;
               throw new Error(
                 "Source-bound workspace allocation update matched no row",
               );

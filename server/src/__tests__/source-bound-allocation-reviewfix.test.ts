@@ -1,18 +1,23 @@
 /**
- * Builder-owned regression tests for the Paperclip Review round-2 findings
+ * Builder-owned regression tests for the Paperclip Review round-2/3 findings
  * on PR #163 (source-bound workspace allocation).
  *
- * These are NOT Test Author contract tests: they pin the two review fixes
- * only (PATCH-guard, row-level validator denial, guarded adoption denial)
- * with mocked or in-memory harnesses. The contract suites remain the
- * acceptance authority and are untouched.
+ * These are NOT Test Author contract tests: they pin the review fixes only
+ * (PATCH-guard, row-level validator denial, guarded adoption denial) with
+ * mocked or in-memory harnesses. The contract suites remain the acceptance
+ * authority and are untouched.
  *
- * Finding 1: a generic PATCH must not move an `unrealized` record to
- * `active`, and transport validation must deny a status-flipped row whose
- * row facts (openedAt / providerRef / cwd) are still null.
+ * Finding 1: a generic PATCH must not move an `unrealized` record to any
+ * other status — including `archived`, which would strand the isolated
+ * issue binding where rollback can no longer repair it. Transport
+ * validation must deny a status-flipped row whose row facts are still
+ * null, requiring both providerRef and cwd for isolated git_worktree
+ * rows while keeping one-reference behavior for other modes.
  * Finding 2: heartbeat adoption must go through the guarded
- * `markAllocatedWorkspaceRealized` transition, which denies (instead of
- * resurrecting) a record a Board rollback already archived or unbound.
+ * `markAllocatedWorkspaceRealized` transition with a conditional write
+ * (`status = 'unrealized'` and `closed_at IS NULL`), which denies —
+ * instead of resurrecting — a record archived between the read and the
+ * write.
  */
 import express from "express";
 import request from "supertest";
@@ -155,7 +160,7 @@ describe("reviewfix: PATCH cannot realize an allocated record", () => {
     });
   });
 
-  it.each(["active", "idle", "in_review", "cleanup_failed"])(
+  it.each(["active", "idle", "in_review", "cleanup_failed", "archived"])(
     "refuses PATCH status %s on an unrealized record (409, no update)",
     async (status) => {
       mockExecutionWorkspaceService.getById.mockResolvedValue({
@@ -174,40 +179,19 @@ describe("reviewfix: PATCH cannot realize an allocated record", () => {
     },
   );
 
-  it("still allows archiving an unrealized record through PATCH", async () => {
-    const archivedWorkspace = {
-      ...UNREALIZED_RECORD,
-      status: "archived",
-    };
+  it("points PATCH archive callers at the rollback route", async () => {
     mockExecutionWorkspaceService.getById.mockResolvedValue({
       ...UNREALIZED_RECORD,
     });
-    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
-      state: "ready",
-      blockingReasons: [],
-    });
-    mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock.mockResolvedValue(
-      {
-        outcome: "archived",
-        workspace: archivedWorkspace,
-        capturedGeneration: 3,
-      },
-    );
-    mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction.mockImplementation(
-      async ({ destroy }: { destroy: () => Promise<unknown> }) => ({
-        skippedReopened: false,
-        result: await destroy(),
-      }),
-    );
 
     const res = await request(createApp())
       .patch("/api/execution-workspaces/workspace-1")
       .send({ status: "archived" });
 
-    expect(res.status).toBe(200);
-    expect(
-      mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock,
-    ).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain(
+      "source-bound-workspace-allocation/rollback",
+    );
   });
 });
 
@@ -291,6 +275,56 @@ describe("reviewfix: validator denies status-flipped rows with null row facts", 
     expect(receipt.ok).toBe(true);
     expect(receipt.transport).toMatchObject({ ok: true });
   });
+
+  it.each([
+    ["cwd only", "/repo/.paperclip/worktrees/TST-1", null],
+    ["providerRef only", null, "/repo/.paperclip/worktrees/TST-1"],
+  ])(
+    "denies workspace_not_realized for a partial isolated git_worktree row (%s)",
+    async (_label, cwd, providerRef) => {
+      const receipt = await runSourceBoundTransportValidation(
+        validationDeps({
+          id: WORKSPACE_ID,
+          companyId: COMPANY_ID,
+          transport: "git_worktree",
+          sourceIssueId: SOURCE_ISSUE_ID,
+          status: "active",
+          closedAt: null,
+          openedAt: new Date("2026-01-02T00:00:00.000Z"),
+          cwd,
+          providerRef,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+        }),
+        validationInput(),
+      );
+      expect(receipt.transport).toMatchObject({
+        ok: false,
+        errorCode: "workspace_not_realized",
+      });
+    },
+  );
+
+  it("keeps one-reference behavior for a non-git_worktree mode", async () => {
+    const receipt = await runSourceBoundTransportValidation(
+      validationDeps({
+        id: WORKSPACE_ID,
+        companyId: COMPANY_ID,
+        transport: "git_worktree",
+        sourceIssueId: SOURCE_ISSUE_ID,
+        status: "active",
+        closedAt: null,
+        openedAt: new Date("2026-01-02T00:00:00.000Z"),
+        cwd: "/repo/.paperclip/worktrees/TST-1",
+        providerRef: null,
+        mode: "shared_workspace",
+        strategyType: "git_worktree",
+      }),
+      validationInput(),
+    );
+    expect(receipt.ok).toBe(true);
+    expect(receipt.transport).toMatchObject({ ok: true });
+  });
 });
 
 const ALLOC_COMPANY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -347,6 +381,13 @@ function allocWorkspace(
 function allocDeps(
   issue: SourceBoundAllocationIssueFacts,
   workspace: SourceBoundAllocationWorkspaceRecord,
+  hooks: {
+    /** Runs inside the fake write before its match check, emulating a
+     * concurrent archiver that commits between adoption's read and write. */
+    beforeUpdate?: (store: {
+      workspace: SourceBoundAllocationWorkspaceRecord;
+    }) => void;
+  } = {},
 ): SourceBoundWorkspaceAllocationDeps {
   const store = {
     issue,
@@ -371,7 +412,19 @@ function allocDeps(
     async insertWorkspace(record) {
       throw new Error(`unexpected insertWorkspace for ${record.id}`);
     },
-    async updateWorkspace(_companyId, _workspaceId, patch) {
+    async updateWorkspace(_companyId, _workspaceId, patch, options) {
+      hooks.beforeUpdate?.(store);
+      // Faithful in-memory emulation of the conditional write: with
+      // expectUnrealizedOpen the update matches only while the record is
+      // still an open allocation, otherwise zero rows match (null).
+      if (
+        options?.expectUnrealizedOpen &&
+        (store.workspace.status !== "unrealized" ||
+          store.workspace.closedAt != null)
+      ) {
+        store.mutations.push("updateWorkspace:matched-no-row");
+        return null;
+      }
       store.mutations.push("updateWorkspace");
       store.workspace = { ...store.workspace, ...patch };
       return store.workspace;
@@ -424,6 +477,46 @@ describe("reviewfix: guarded adoption never resurrects a rolled-back record", ()
     expect(result).toMatchObject({
       ok: false,
       errorCode: "binding_conflict",
+    });
+  });
+
+  it("denies (no resurrect) when an archiver commits between adoption read and write", async () => {
+    let seenOptions: { expectUnrealizedOpen?: boolean } | undefined;
+    const inner = allocDeps(allocIssue(), allocWorkspace(), {
+      beforeUpdate: (store) => {
+        // Interleaved Board archiver: commits before adoption's write.
+        store.workspace = {
+          ...store.workspace,
+          status: "archived",
+          closedAt: new Date(),
+        };
+      },
+    });
+    // Capture the write options while delegating to the conditional fake.
+    const deps: SourceBoundWorkspaceAllocationDeps = {
+      async transact(work) {
+        return inner.transact(async (tx) => {
+          const orig = tx.updateWorkspace.bind(tx);
+          tx.updateWorkspace = async (c, w, p, o) => {
+            seenOptions = o;
+            return orig(c, w, p, o);
+          };
+          return work(tx);
+        });
+      },
+    };
+    const result = await markAllocatedWorkspaceRealized(deps, {
+      companyId: ALLOC_COMPANY_ID,
+      sourceIssueId: ALLOC_ISSUE_ID,
+      workspaceId: ALLOC_WORKSPACE_ID,
+      ...REALIZED_FACTS,
+    });
+    // The write must be conditional, and the lost race must deny so the
+    // heartbeat falls through to a fresh insert.
+    expect(seenOptions).toMatchObject({ expectUnrealizedOpen: true });
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: "workspace_not_unrealized",
     });
   });
 });

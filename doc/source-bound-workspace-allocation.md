@@ -57,25 +57,28 @@ Content-Type: application/json
   unrealized record as `workspace_not_realized` (409) before attestation
   is evaluated. The denial is row-level, not status-label-only: besides
   `status !== "unrealized"` the validator requires a non-null `openedAt`
-  and a non-null `providerRef` or `cwd`, so a generic PATCH that flips
-  the status while the row facts stay null still denies. Only heartbeat
-  realization — which adopts the allocated record (same id, no second
-  insert) and flips it to `active` with
+  and non-null references — both `providerRef` and `cwd` for an isolated
+  git_worktree workspace, one of the two for other modes — so a generic
+  PATCH that flips the status while the row facts stay null still denies.
+  Only heartbeat realization — which adopts the allocated record (same
+  id, no second insert) and flips it to `active` with
   cwd/providerRef/branch/openedAt set — makes the record eligible. The
   terminal-workspace reaper never sweeps an unrealized record, and
   closing one plans no worktree/branch deletion (none exists).
-- **PATCH cannot realize.** `PATCH /api/execution-workspaces/:id` refuses
-  (409) any status change on a record whose current status is
-  `unrealized`, except archiving. Realization happens only through
-  heartbeat adoption (`markAllocatedWorkspaceRealized`); archiving an
-  allocation outside the rollback route leaves the issue binding for the
-  rollback to reconcile, so prefer the rollback route.
+- **PATCH cannot realize or archive.** `PATCH /api/execution-workspaces/:id`
+  refuses (409) any status change on a record whose current status is
+  `unrealized`, including archiving: the PATCH archive path does not
+  restore the isolated issue binding, which would strand the issue on a
+  closed record the rollback can no longer repair. Realization happens
+  only through heartbeat adoption (`markAllocatedWorkspaceRealized`);
+  archiving an allocation happens only through the rollback route below.
 - **Adoption is atomic.** Heartbeat persistence flips the allocated
   record inside the allocation transaction (issue `FOR UPDATE` lock with
-  status and binding re-checked). A Board rollback that commits first
-  makes adoption deny with `workspace_not_unrealized`/`binding_conflict`,
-  and the run falls through to a fresh insert instead of resurrecting
-  the archived row.
+  status and binding re-checked, plus a conditional write matching only
+  `status = 'unrealized'` and `closed_at IS NULL`). A Board rollback that
+  commits first makes the write match zero rows, so adoption denies with
+  `workspace_not_unrealized`/`binding_conflict`, and the run falls
+  through to a fresh insert instead of resurrecting the archived row.
 
 ## Rollback
 

@@ -1302,19 +1302,20 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!(await assertRuntimeManageAllowed(req, res, existing.companyId))) return;
     // An allocated-but-unrealized record leaves this state only via
     // heartbeat realization (which adopts the same row with realized facts)
-    // or via archive (rollback, or the archive path below). A generic PATCH
-    // flipping `unrealized` to `active` would leave cwd/providerRef/openedAt
+    // or via the rollback route (which archives it and restores the exact
+    // prior issue binding under the issue lock). A generic PATCH flipping
+    // `unrealized` to another status would leave cwd/providerRef/openedAt
     // null while transport validation reads only the status, so it must be
     // refused here; the validator also denies null row facts as defense in
-    // depth. Only archiving is allowed through PATCH.
-    if (
-      existing.status === "unrealized" &&
-      req.body.status !== undefined &&
-      req.body.status !== "archived"
-    ) {
+    // depth. Archiving is refused too: the PATCH archive path clears the
+    // issue binding only for shared_workspace, so an isolated allocation
+    // would stay bound to a closed record the rollback can no longer
+    // repair (it requires status `unrealized`), and a PATCH archive racing
+    // heartbeat adoption could be resurrected by an unconditional write.
+    if (existing.status === "unrealized" && req.body.status !== undefined) {
       res.status(409).json({
         error:
-          "Unrealized source-bound workspaces cannot change status via PATCH (only archive); realize via heartbeat adoption or roll back the allocation",
+          "Unrealized source-bound workspaces cannot change status via PATCH; realize via heartbeat adoption or roll back the allocation with POST /api/issues/:id/source-bound-workspace-allocation/rollback",
       });
       return;
     }

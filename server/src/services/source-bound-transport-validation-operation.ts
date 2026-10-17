@@ -76,6 +76,13 @@ export type SourceBoundWorkspaceFacts = {
   openedAt?: Date | string | null;
   cwd?: string | null;
   providerRef?: string | null;
+  /**
+   * Workspace mode/strategy for reference-completeness checks. Optional
+   * so older callers keep compiling; when absent the reference check
+   * falls back to the historical one-reference behavior.
+   */
+  mode?: string | null;
+  strategyType?: string | null;
 };
 
 export type DeployedImageAttestationRecord = {
@@ -286,12 +293,26 @@ export async function runSourceBoundTransportValidation(
     !workspaceBoundToIssue || workspace.openedAt === undefined
       ? true
       : workspace.openedAt != null;
+  // Reference completeness is mode-dependent: an isolated git_worktree
+  // workspace is only usable with BOTH a worktree path (providerRef) and
+  // a cwd, so a partial row (e.g. left by a nullable PATCH of one field)
+  // still denies. Other modes keep the historical one-reference behavior.
+  // workspaceBoundToIssue first: it is false when no workspace resolved,
+  // so the mode access below never touches null (a non-UUID id denies as
+  // a transport mismatch without reaching the reference checks).
+  const requiresBothRefs =
+    workspaceBoundToIssue &&
+    workspace.mode === "isolated_workspace" &&
+    workspace.strategyType === "git_worktree";
   const workspaceRefRealized =
     !workspaceBoundToIssue ||
     (workspace.providerRef === undefined && workspace.cwd === undefined)
       ? true
-      : isNonEmptyString(workspace.providerRef) ||
-        isNonEmptyString(workspace.cwd);
+      : requiresBothRefs
+        ? isNonEmptyString(workspace.providerRef) &&
+          isNonEmptyString(workspace.cwd)
+        : isNonEmptyString(workspace.providerRef) ||
+          isNonEmptyString(workspace.cwd);
   const transport = validateSourceTransportOnly({
     sourceIssueId: issue.id,
     principalAgentId: input.principalAgentId,
@@ -440,6 +461,8 @@ export function createDbSourceBoundTransportValidationDeps(
           openedAt: executionWorkspaces.openedAt,
           cwd: executionWorkspaces.cwd,
           providerRef: executionWorkspaces.providerRef,
+          mode: executionWorkspaces.mode,
+          strategyType: executionWorkspaces.strategyType,
         })
         .from(executionWorkspaces)
         .where(
