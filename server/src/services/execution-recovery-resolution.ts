@@ -25,7 +25,7 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 import {
   isReviewWaitNeverStartedCancellation,
   LEGACY_RECOVERY_CAUSE,
-} from "./legacy-execution-recovery.js";
+} from "./review-wait-cancellation.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
