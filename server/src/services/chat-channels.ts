@@ -3571,6 +3571,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return config ? githubShadowLabel(config.configuration) : null;
   }
 
+  /** The shadow label pinned on a review row for this task, if any. A pinned
+   * shadow review must never publish generic chat output either, even after
+   * shadow mode is disabled in config; mirrors the review tools' lookup. */
+  async function githubPinnedShadowLabel(input: {
+    companyId: string;
+    endpointId: string;
+    issueId: string;
+  }): Promise<string | null> {
+    const [row] = await db
+      .select({ shadowLabel: chatGitHubReviews.shadowLabel })
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.companyId, input.companyId),
+          eq(chatGitHubReviews.endpointId, input.endpointId),
+          eq(chatGitHubReviews.issueId, input.issueId),
+          isNotNull(chatGitHubReviews.shadowLabel),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(1);
+    return row?.shadowLabel ?? null;
+  }
+
   async function addReceiptReaction(input: {
     deliveryId: string;
     endpoint: EndpointRow;
@@ -37517,10 +37541,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           throw new Error("Chat publication binding is unavailable");
         if (
           endpoint.provider === "github" &&
-          (await githubEndpointShadowLabel(endpoint.id))
+          ((await githubEndpointShadowLabel(endpoint.id)) ||
+            (await githubPinnedShadowLabel({
+              companyId: publication.companyId,
+              endpointId: endpoint.id,
+              issueId: publication.issueId,
+            })))
         ) {
           // Shadow review endpoints never create GitHub objects: agent
           // replies, milestones and interaction prompts stay in Paperclip.
+          // The pinned row label keeps suppressing this review task's
+          // output even after shadow mode is disabled in config.
           await publicationLease.assertOwned();
           await db
             .update(chatPublications)

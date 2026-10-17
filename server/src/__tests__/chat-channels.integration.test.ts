@@ -59,6 +59,7 @@ import {
   chatEndpointResources,
   chatEndpoints,
   chatExternalPrincipals,
+  chatGitHubConfigurations,
   chatIdentityLinks,
   joinRequests,
   chatMessageLinks,
@@ -3544,6 +3545,604 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       })).toMatchObject({ status: "shadow_stored", shadowLabel: "meta-shadow" });
       await service.processPending();
       expect(mutations).toHaveLength(0);
+    });
+    async function saveShadowMode(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      enabled: boolean,
+    ) {
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: current.revision,
+          configuration: {
+            ...current.configuration,
+            shadow: { enabled, label: "meta-shadow" },
+          },
+        },
+        "owner-user",
+      );
+    }
+    async function flipShadowModeInDb(endpointId: string, enabled: boolean) {
+      // Direct row update: lands an operator toggle while a dispatch sits
+      // between its provider reads and writes, without the management
+      // API's own provider calls interleaving with the fetch recorder.
+      const [row] = await db
+        .select()
+        .from(chatGitHubConfigurations)
+        .where(eq(chatGitHubConfigurations.endpointId, endpointId));
+      await db
+        .update(chatGitHubConfigurations)
+        .set({
+          configuration: {
+            ...row.configuration,
+            shadow: { enabled, label: "meta-shadow" },
+          },
+        })
+        .where(eq(chatGitHubConfigurations.endpointId, endpointId));
+    }
+    async function admitShadowTestPullRequest(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      head: string,
+    ) {
+      const payload = {
+        action: "opened",
+        installation: { id: 2468 },
+        repository: {
+          id: 97531,
+          full_name: "paperclipai/paperclip",
+          name: "paperclip",
+          owner: { id: 1357, login: "paperclipai" },
+        },
+        sender: { id: 77, login: "maintainer" },
+        pull_request: {
+          number: 81,
+          title: "Check review routing",
+          body: "Untrusted PR body",
+          draft: false,
+          base: { sha: "a".repeat(40), ref: "master" },
+          head: { sha: head },
+          user: { id: 42, login: "octocat", type: "User" },
+          labels: [],
+        },
+      };
+      expect((await f.service.handleWebhook(
+        f.endpoint.publicId,
+        "github",
+        signedGitHubWebhookRequest({
+          event: "pull_request",
+          delivery: randomUUID(),
+          payload,
+          webhookSecret: f.webhookSecret,
+        }),
+      )).status).toBeLessThan(300);
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select()
+                .from(chatGitHubReviews)
+                .where(eq(chatGitHubReviews.endpointId, f.endpoint.id))
+            ).length,
+          { timeout: 10000 },
+        )
+        .toBe(1);
+      const [admitted] = await db
+        .select()
+        .from(chatGitHubReviews)
+        .where(eq(chatGitHubReviews.endpointId, f.endpoint.id));
+      return admitted;
+    }
+    async function shadowTestSession(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      admitted: { issueId: string },
+    ) {
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, admitted.issueId));
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        invocationSource: "assignment",
+        status: "running",
+        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: comments[0].id },
+      }).returning();
+      return {
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        issueId: admitted.issueId,
+        runId: run.id,
+      };
+    }
+    function shadowTestAssessment(head: string) {
+      return {
+        reviewedCommit: head,
+        score: 2,
+        complete: true,
+        summary: "Addition subtracts",
+        rationale: "Returning a minus b is incorrect.",
+        coverage: {
+          reviewedPaths: ["src/math.ts"],
+          omittedPaths: [],
+          limitations: [],
+        },
+        findings: [
+          {
+            key: "wrong-operator",
+            path: "src/math.ts",
+            line: 1,
+            side: "RIGHT",
+            severity: "error",
+            category: "correctness",
+            title: "Incorrect operator",
+            body: "Use addition.",
+          },
+        ],
+      };
+    }
+    function installShadowRecorder(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      head: string,
+      hook?: (url: string, method: string) => Promise<Response | undefined>,
+    ) {
+      const recorder = {
+        mutations: [] as Array<{ url: string; method: string }>,
+        fetches: [] as Array<{ url: string; method: string }>,
+      };
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        recorder.fetches.push({ url, method });
+        const hooked = hook ? await hook(url, method) : undefined;
+        if (hooked) return hooked;
+        if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
+        if (method !== "GET") {
+          recorder.mutations.push({ url, method });
+          return Response.json({ id: 1, html_url: "https://github.com/test/unexpected" });
+        }
+        if (url.endsWith("/pulls/81"))
+          return Response.json({
+            number: 81,
+            title: "Check review routing",
+            body: "Untrusted PR body",
+            state: "open",
+            draft: false,
+            head: { sha: head },
+            base: { sha: "a".repeat(40), ref: "master" },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: "e".repeat(40) },
+            status: "ahead",
+            total_commits: 1,
+            files: [],
+          });
+        if (url.includes("/files?"))
+          return Response.json([
+            {
+              filename: "src/math.ts",
+              status: "modified",
+              patch: "@@ -1 +1 @@\n-return a + b\n+return a - b",
+              additions: 1,
+              deletions: 1,
+            },
+          ]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        return Response.json([]);
+      });
+      return recorder;
+    }
+    async function shadowTestActions(endpointId: string, kind: string) {
+      return db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, endpointId),
+        eq(chatActions.kind, kind),
+      ));
+    }
+    async function deliverShadowTestMention(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      messageId: string,
+      text: string,
+    ) {
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:97",
+        name: "Shadow gate mention",
+      }).thread;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread,
+        message: makeMessage({
+          id: messageId,
+          text,
+          userId: "42",
+          userName: "octocat",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.externalThreadId, thread.id));
+      return conversation;
+    }
+    it("shadow mode cancels generic chat publications for live and pinned shadow reviews", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const head = "b".repeat(40);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      expect(admitted).toMatchObject({ state: "queued", shadowLabel: "meta-shadow" });
+      const [reviewConversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.issueId, admitted.issueId));
+      // A plain mention conversation on the same endpoint has no review
+      // row, so only the live shadow config can suppress its publications.
+      const mentionConversation = await deliverShadowTestMention(
+        f,
+        "910001",
+        "@maya hello from a mention",
+      );
+      if (!mentionConversation) throw new Error("Expected mention conversation");
+      expect(mentionConversation.issueId).not.toBe(admitted.issueId);
+      const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
+      const stageProbe = async (conversation: typeof mentionConversation) => {
+        const [row] = await db.insert(chatPublications).values({
+          companyId: f.companyId,
+          endpointId: f.endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          idempotencyKey: `shadow-gate-probe:${randomUUID()}`,
+          payload: { text: "Shadow gate probe" },
+          state: "pending",
+        }).returning();
+        return row;
+      };
+      const liveProbe = await stageProbe(mentionConversation);
+      await f.service.processPendingPublications();
+      const [liveResult] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.id, liveProbe.id));
+      expect(liveResult).toMatchObject({
+        state: "cancelled",
+        redactedError: "Shadow review endpoint does not publish to GitHub",
+      });
+      // Disabling shadow must not resurrect output from the pinned shadow
+      // review task, while ordinary conversations publish again.
+      await saveShadowMode(f, false);
+      const pinnedProbe = await stageProbe(reviewConversation);
+      await f.service.processPendingPublications();
+      const [pinnedResult] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.id, pinnedProbe.id));
+      expect(pinnedResult).toMatchObject({
+        state: "cancelled",
+        redactedError: "Shadow review endpoint does not publish to GitHub",
+      });
+      const resumedProbe = await stageProbe(mentionConversation);
+      await f.service.processPendingPublications();
+      const [resumedResult] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.id, resumedProbe.id));
+      expect(resumedResult.state).toBe("published");
+      expect(
+        endpointRuntime?.posts.filter((post) => post.text === "Shadow gate probe"),
+      ).toHaveLength(1);
+      await f.service.shutdown();
+    });
+    it("shadow mode stages no receipt reaction for GitHub mentions", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(
+        f,
+        "910002",
+        "@maya no receipt in shadow mode",
+      );
+      // The mention itself was admitted; only its receipt is suppressed.
+      expect(conversation).toBeDefined();
+      expect(await shadowTestActions(f.endpoint.id, "receipt_reaction")).toHaveLength(0);
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.reactions).toEqual([]);
+      await f.service.shutdown();
+    });
+    it("shadow mode cancels a receipt reaction staged before it was enabled", async () => {
+      const f = await reviewBotFixture();
+      const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
+      if (!endpointRuntime) throw new Error("Expected GitHub runtime");
+      endpointRuntime.reactionErrors.push(
+        Object.assign(new Error("GitHub reaction rate limited"), {
+          status: 429,
+          retryAfterMs: 1,
+        }),
+      );
+      const conversation = await deliverShadowTestMention(
+        f,
+        "910003",
+        "@maya receipt staged before shadow mode",
+      );
+      expect(conversation).toBeDefined();
+      const [staged] = await shadowTestActions(f.endpoint.id, "receipt_reaction");
+      expect(staged).toBeDefined();
+      await saveShadowMode(f, true);
+      await db
+        .update(chatActions)
+        .set({
+          result: { ...staged.result, retryAt: new Date(0).toISOString() },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatActions.id, staged.id));
+      await f.service.processPendingReceiptReactions(1, staged.id);
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "receipt_reaction_shadow_mode" });
+      expect(endpointRuntime.reactions).toEqual([]);
+      await f.service.shutdown();
+    });
+    it("cancels a check intent staged before shadow mode was enabled without any provider call", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const recorder = installShadowRecorder(f, head);
+      await admitShadowTestPullRequest(f, head);
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(staged?.status).toBe("received");
+      await saveShadowMode(f, true);
+      recorder.fetches.length = 0;
+      recorder.mutations.length = 0;
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "shadow_mode" });
+      expect(recorder.fetches).toHaveLength(0);
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels a check intent whose review row carries a pinned shadow label", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const recorder = installShadowRecorder(f, head);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(staged?.status).toBe("received");
+      // Admission pins the label when shadow is on; pin it directly to
+      // model an intent already in flight for that review while the
+      // live config has shadow off again.
+      await db
+        .update(chatGitHubReviews)
+        .set({ shadowLabel: "meta-shadow" })
+        .where(eq(chatGitHubReviews.id, admitted.id));
+      recorder.fetches.length = 0;
+      recorder.mutations.length = 0;
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "shadow_mode", reviewId: admitted.id });
+      expect(recorder.fetches).toHaveLength(0);
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels a check dispatch when shadow mode is enabled mid-flight", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      let armed = false;
+      let flipped = false;
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (armed && !flipped && method === "GET" && url.endsWith("/pulls/81")) {
+          flipped = true;
+          await flipShadowModeInDb(f.endpoint.id, true);
+        }
+        return undefined;
+      });
+      await admitShadowTestPullRequest(f, head);
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(staged?.status).toBe("received");
+      recorder.mutations.length = 0;
+      armed = true;
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      expect(flipped).toBe(true);
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "shadow_mode" });
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels an assessment publication staged before shadow mode was enabled without any provider call", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      let failMarkerRead = true;
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
+          failMarkerRead = false;
+          return new Response("temporary", { status: 500 });
+        }
+        return undefined;
+      });
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const session = await shadowTestSession(f, admitted);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      // The marker-read failure leaves the staged publication retryable.
+      expect(await service.execute(
+        session,
+        "submit_review",
+        shadowTestAssessment(head),
+        "prestaged-publication",
+      )).toMatchObject({ status: "failed" });
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_publication");
+      expect(staged?.status).toBe("failed");
+      await saveShadowMode(f, true);
+      await db
+        .update(chatActions)
+        .set({ result: { ...staged.result, retryAt: new Date(0).toISOString() } })
+        .where(eq(chatActions.id, staged.id));
+      recorder.fetches.length = 0;
+      recorder.mutations.length = 0;
+      await service.processPending();
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "authorization_changed" });
+      expect(recorder.fetches).toHaveLength(0);
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("stores a pinned shadow assessment after shadow mode is disabled", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const head = "b".repeat(40);
+      const recorder = installShadowRecorder(f, head);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      expect(admitted).toMatchObject({ shadowLabel: "meta-shadow" });
+      const session = await shadowTestSession(f, admitted);
+      await saveShadowMode(f, false);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(
+        session,
+        "submit_review",
+        shadowTestAssessment(head),
+        "pinned-submit",
+      )).toMatchObject({ status: "shadow_stored", shadowLabel: "meta-shadow" });
+      expect(await shadowTestActions(f.endpoint.id, "github_review_publication")).toHaveLength(0);
+      await service.processPending();
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels an assessment dispatch when shadow mode is enabled mid-flight", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      let failMarkerRead = true;
+      let armed = false;
+      let flipped = false;
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
+          failMarkerRead = false;
+          return new Response("temporary", { status: 500 });
+        }
+        if (armed && !flipped && method === "POST" && url.includes("/access_tokens")) {
+          flipped = true;
+          await flipShadowModeInDb(f.endpoint.id, true);
+        }
+        return undefined;
+      });
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const session = await shadowTestSession(f, admitted);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(
+        session,
+        "submit_review",
+        shadowTestAssessment(head),
+        "midflight-publication",
+      )).toMatchObject({ status: "failed" });
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_publication");
+      expect(staged?.status).toBe("failed");
+      await db
+        .update(chatActions)
+        .set({ result: { ...staged.result, retryAt: new Date(0).toISOString() } })
+        .where(eq(chatActions.id, staged.id));
+      recorder.mutations.length = 0;
+      armed = true;
+      await service.processPending();
+      // The flip landed after the dispatch scoped with shadow off, so the
+      // pre-write head re-check is what must stop the publication.
+      expect(flipped).toBe(true);
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "authorization_changed" });
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels a comment dispatch when shadow mode is enabled mid-flight", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      let flipped = false;
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (!flipped && method === "GET" && url.includes("/issues/81/comments?")) {
+          flipped = true;
+          await flipShadowModeInDb(f.endpoint.id, true);
+        }
+        return undefined;
+      });
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const session = await shadowTestSession(f, admitted);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const receipt = await service.execute(session, "comment", {
+        body: "Mid-flight toggle",
+        idempotencyKey: "midflight-comment",
+      });
+      expect(flipped).toBe(true);
+      expect(receipt).toMatchObject({ status: "cancelled" });
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("cancels a formal review dispatch when shadow mode is enabled mid-flight", async () => {
+      const f = await reviewBotFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: current.revision,
+          configuration: {
+            ...current.configuration,
+            defaults: { ...current.configuration.defaults, allowApprove: true },
+          },
+        },
+        "owner-user",
+      );
+      const head = "b".repeat(40);
+      let armed = false;
+      let flipped = false;
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (armed && !flipped && method === "GET" && url.includes("/pulls/81/reviews?")) {
+          flipped = true;
+          await flipShadowModeInDb(f.endpoint.id, true);
+        }
+        return undefined;
+      });
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const session = await shadowTestSession(f, admitted);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(
+        session,
+        "submit_review",
+        { ...shadowTestAssessment(head), score: 5, findings: [] },
+        "formal-base-assessment",
+      )).toMatchObject({ status: "processed" });
+      recorder.mutations.length = 0;
+      armed = true;
+      const receipt = await service.execute(session, "formal_review", {
+        event: "APPROVE",
+        reviewedCommit: head,
+        body: "Approved",
+        idempotencyKey: "midflight-formal",
+      });
+      expect(flipped).toBe(true);
+      expect(receipt).toMatchObject({ status: "cancelled" });
+      expect(recorder.mutations).toHaveLength(0);
     });
   });
 
