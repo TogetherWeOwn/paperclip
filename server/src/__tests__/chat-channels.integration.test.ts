@@ -3889,6 +3889,64 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(endpointRuntime.reactions).toEqual([]);
       await f.service.shutdown();
     });
+    it("cancels a receipt reaction for a task with a pinned shadow review after shadow is disabled", async () => {
+      const f = await reviewBotFixture();
+      const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
+      if (!endpointRuntime) throw new Error("Expected GitHub runtime");
+      const head = "b".repeat(40);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      endpointRuntime.reactionErrors.push(
+        Object.assign(new Error("GitHub reaction rate limited"), {
+          status: 429,
+          retryAfterMs: 1,
+        }),
+      );
+      await deliverShadowTestMention(
+        f,
+        "910004",
+        "@maya receipt for a pinned shadow task",
+      );
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(and(
+          eq(chatConversations.endpointId, f.endpoint.id),
+          eq(chatConversations.externalThreadId, "github:paperclipai/paperclip:97"),
+        ));
+      expect(conversation).toBeDefined();
+      const [staged] = await shadowTestActions(f.endpoint.id, "receipt_reaction");
+      expect(staged).toBeDefined();
+      // Admission pins the label when shadow is on; pin a clone of the
+      // admitted review row onto the mention's task directly to model a
+      // receipt already in flight for that task while the live config has
+      // shadow off again.
+      await db.insert(chatGitHubReviews).values({
+        companyId: admitted.companyId, endpointId: admitted.endpointId,
+        issueId: conversation!.issueId,
+        repositoryId: admitted.repositoryId, repository: admitted.repository,
+        pullNumber: admitted.pullNumber, headSha: admitted.headSha,
+        deliveryId: randomUUID(),
+        configurationRevision: admitted.configurationRevision,
+        policySnapshot: admitted.policySnapshot, event: admitted.event,
+        state: "queued", shadowLabel: "meta-shadow",
+      });
+      await db
+        .update(chatActions)
+        .set({
+          result: { ...staged.result, retryAt: new Date(0).toISOString() },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatActions.id, staged.id));
+      await f.service.processPendingReceiptReactions(1, staged.id);
+      const [settled] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, staged.id));
+      expect(settled.status).toBe("cancelled");
+      expect(settled.result).toMatchObject({ code: "receipt_reaction_shadow_mode" });
+      expect(endpointRuntime.reactions).toEqual([]);
+      await f.service.shutdown();
+    });
     it("cancels a check intent staged before shadow mode was enabled without any provider call", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);

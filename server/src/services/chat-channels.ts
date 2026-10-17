@@ -3595,6 +3595,61 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return row?.shadowLabel ?? null;
   }
 
+  /** The pinned shadow label for the task a receipt-reaction action belongs
+   * to, resolved through its delivery's conversation (or the conversation
+   * recorded on the action itself for terminal removals). */
+  async function githubPinnedShadowLabelForReceiptAction(action: {
+    companyId: string;
+    endpointId: string;
+    deliveryId: string | null;
+    conversationId: string | null;
+  }): Promise<string | null> {
+    let issueId: string | null = null;
+    if (action.deliveryId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatDeliveries)
+        .innerJoin(
+          chatConversations,
+          and(
+            eq(chatConversations.id, chatDeliveries.conversationId),
+            eq(chatConversations.companyId, chatDeliveries.companyId),
+            eq(chatConversations.endpointId, chatDeliveries.endpointId),
+          ),
+        )
+        .where(
+          and(
+            eq(chatDeliveries.id, action.deliveryId),
+            eq(chatDeliveries.companyId, action.companyId),
+            eq(chatDeliveries.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    if (!issueId && action.conversationId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.id, action.conversationId),
+            eq(chatConversations.companyId, action.companyId),
+            eq(chatConversations.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    return issueId
+      ? githubPinnedShadowLabel({
+          companyId: action.companyId,
+          endpointId: action.endpointId,
+          issueId,
+        })
+      : null;
+  }
+
   async function addReceiptReaction(input: {
     deliveryId: string;
     endpoint: EndpointRow;
@@ -3925,7 +3980,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
       if (
         record.endpoint.provider === "github" &&
-        (await githubEndpointShadowLabel(record.endpoint.id))
+        ((await githubEndpointShadowLabel(record.endpoint.id)) ||
+          (await githubPinnedShadowLabelForReceiptAction(action)))
       ) {
         await db.transaction(async (tx) => {
           await credentialLease.assertOwned(tx);
