@@ -22,6 +22,10 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  isReviewWaitNeverStartedCancellation,
+  LEGACY_RECOVERY_CAUSE,
+} from "./legacy-execution-recovery.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -348,6 +352,62 @@ export async function settleUnrecoverableExecutions(
         entityType: "issue",
         entityId: action.sourceIssueId,
         details: { recoveryActionId: action.id, outcome: "cancelled", continuation: "conversation" },
+      });
+    }
+  });
+  // Fold recovery holds minted for gate-cancelled review-wait continuations
+  // that never reached a provider. Earlier sweeps treated that intentional
+  // park as an unknown outcome and re-blocked the task on every pass; the
+  // run evidence proves no provider work started, so retire the hold (and
+  // any settled no-replay verdict for the same run) without touching the
+  // task's current review wait. Runs with a process identity, output, or a
+  // different cause keep their gates below.
+  const reviewWaitHold = and(
+    eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+    or(
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    ),
+  );
+  await db.transaction(async tx => {
+    const candidates = await tx.select({ action: issueRecoveryActions, run: heartbeatRuns })
+      .from(issueRecoveryActions)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+          sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
+          sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
+          eq(heartbeatRuns.errorCode, "issue_continuation_waiting_on_review"),
+        ),
+      )
+      .where(reviewWaitHold)
+      .limit(25);
+    for (const { action: candidate, run } of candidates) {
+      if (!isReviewWaitNeverStartedCancellation(run)) continue;
+      const [action] = await tx.update(issueRecoveryActions).set({
+        status: "resolved",
+        outcome: "false_positive",
+        resolvedAt: now,
+        updatedAt: now,
+        nextAction: "Continuation was parked for review before provider execution started. Normal reviewer feedback wakes the task.",
+        resolutionNote: "Gate-cancelled review-wait continuation never started a provider; there is no action outcome to reconcile.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb)
+          else ${issueRecoveryActions.evidence} end ||
+          ${JSON.stringify({ reviewWaitNeverStartedAt: now.toISOString() })}::jsonb`,
+      }).where(and(reviewWaitHold, eq(issueRecoveryActions.id, candidate.id))).returning();
+      if (!action) continue;
+      await persistActivity(tx as unknown as Db, {
+        companyId: action.companyId,
+        actorType: "system",
+        actorId: "execution-recovery",
+        action: "issue.execution_recovery_settled",
+        entityType: "issue",
+        entityId: action.sourceIssueId,
+        details: { recoveryActionId: action.id, outcome: "false_positive", continuation: "review_wait_never_started" },
       });
     }
   });
