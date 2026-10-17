@@ -3912,6 +3912,33 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/transport-validation",
+  tags: ["issues"],
+  summary: "Validate source-bound transport only",
+  description:
+    "Validates the authenticated agent principal against server-resolved source issue assignee, unresolved blockers, low-trust preflight and selected workspace transport, plus deployed-image digest pinning for the running build from the trusted deployment record. Terminates under a transport-only boundary: no wake, checkout, workspace realization or runtime start. Returns a validation receipt, which grants no execution authority.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        workspaceId: z.string().uuid(),
+        transport: z.string().min(1),
+        requestedToolClass: z.string().nullable().optional(),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
   method: "delete",
   path: "/api/issues/{id}",
   tags: ["issues"],
