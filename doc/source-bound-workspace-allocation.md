@@ -55,11 +55,27 @@ Content-Type: application/json
   records are never mutated by allocation.
 - **Allocation is not validation.** Transport validation denies an
   unrealized record as `workspace_not_realized` (409) before attestation
-  is evaluated. Only heartbeat realization — which adopts the allocated
-  record (same id, no second insert) and flips it to `active` with
+  is evaluated. The denial is row-level, not status-label-only: besides
+  `status !== "unrealized"` the validator requires a non-null `openedAt`
+  and a non-null `providerRef` or `cwd`, so a generic PATCH that flips
+  the status while the row facts stay null still denies. Only heartbeat
+  realization — which adopts the allocated record (same id, no second
+  insert) and flips it to `active` with
   cwd/providerRef/branch/openedAt set — makes the record eligible. The
   terminal-workspace reaper never sweeps an unrealized record, and
   closing one plans no worktree/branch deletion (none exists).
+- **PATCH cannot realize.** `PATCH /api/execution-workspaces/:id` refuses
+  (409) any status change on a record whose current status is
+  `unrealized`, except archiving. Realization happens only through
+  heartbeat adoption (`markAllocatedWorkspaceRealized`); archiving an
+  allocation outside the rollback route leaves the issue binding for the
+  rollback to reconcile, so prefer the rollback route.
+- **Adoption is atomic.** Heartbeat persistence flips the allocated
+  record inside the allocation transaction (issue `FOR UPDATE` lock with
+  status and binding re-checked). A Board rollback that commits first
+  makes adoption deny with `workspace_not_unrealized`/`binding_conflict`,
+  and the run falls through to a fresh insert instead of resurrecting
+  the archived row.
 
 ## Rollback
 

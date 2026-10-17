@@ -66,6 +66,16 @@ export type SourceBoundWorkspaceFacts = {
   sourceIssueId: string | null;
   status: string;
   closedAt: Date | string | null;
+  /**
+   * Row-level realization facts. Optional so older callers that resolve
+   * only the status keep compiling; an absent field skips that sub-check,
+   * while an explicit null denies. The DB resolver below always returns
+   * explicit values, so a status-only spoof (e.g. a generic PATCH flipping
+   * `unrealized` to `active` with null row facts) still denies.
+   */
+  openedAt?: Date | string | null;
+  cwd?: string | null;
+  providerRef?: string | null;
 };
 
 export type DeployedImageAttestationRecord = {
@@ -264,6 +274,24 @@ export async function runSourceBoundTransportValidation(
     issue,
   });
 
+  // Realization is a row-level fact, not a status label alone: a generic
+  // PATCH could flip `unrealized` to `active` while cwd, providerRef and
+  // openedAt stay null, so the status check alone would then pass. Require
+  // the realized row facts as well. Each sub-check skips only when the
+  // resolver did not provide the field at all (older callers); an explicit
+  // null denies. The DB resolver always provides explicit values.
+  const workspaceStatusRealized =
+    workspaceBoundToIssue && workspace.status !== "unrealized";
+  const workspaceOpenedAtRealized =
+    !workspaceBoundToIssue || workspace.openedAt === undefined
+      ? true
+      : workspace.openedAt != null;
+  const workspaceRefRealized =
+    !workspaceBoundToIssue ||
+    (workspace.providerRef === undefined && workspace.cwd === undefined)
+      ? true
+      : isNonEmptyString(workspace.providerRef) ||
+        isNonEmptyString(workspace.cwd);
   const transport = validateSourceTransportOnly({
     sourceIssueId: issue.id,
     principalAgentId: input.principalAgentId,
@@ -276,7 +304,9 @@ export async function runSourceBoundTransportValidation(
     // unrealized record denies as a transport mismatch above, so its
     // realization state never leaks to a caller who may not see it.
     workspaceRealized: workspaceBoundToIssue
-      ? workspace.status !== "unrealized"
+      ? workspaceStatusRealized &&
+        workspaceOpenedAtRealized &&
+        workspaceRefRealized
       : true,
     dependenciesBlocked: { unresolvedBlockerIssueIds },
     isLowTrust,
@@ -407,6 +437,9 @@ export function createDbSourceBoundTransportValidationDeps(
           sourceIssueId: executionWorkspaces.sourceIssueId,
           status: executionWorkspaces.status,
           closedAt: executionWorkspaces.closedAt,
+          openedAt: executionWorkspaces.openedAt,
+          cwd: executionWorkspaces.cwd,
+          providerRef: executionWorkspaces.providerRef,
         })
         .from(executionWorkspaces)
         .where(

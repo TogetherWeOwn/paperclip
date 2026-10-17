@@ -207,6 +207,15 @@ export type MarkAllocatedWorkspaceRealizedInput = {
   providerRef: string;
   branchName: string;
   repoUrl?: string | null;
+  /**
+   * Full realized facts carried by heartbeat adoption. Optional so older
+   * callers (and the contract suite) keep compiling; when provided they
+   * are persisted atomically with the status flip inside the same
+   * issue-locked transaction.
+   */
+  providerType?: string | null;
+  baseRef?: string | null;
+  metadata?: Record<string, unknown> | null;
 };
 
 export type MarkAllocatedWorkspaceRealizedResult =
@@ -538,6 +547,16 @@ export async function markAllocatedWorkspaceRealized(
       providerRef: input.providerRef,
       branchName: input.branchName,
       repoUrl: input.repoUrl ?? workspace.repoUrl,
+      // Heartbeat adoption carries the remaining realized facts; each is
+      // applied only when explicitly provided so older callers keep the
+      // stored allocation values.
+      ...(input.providerType !== undefined
+        ? { providerType: input.providerType ?? workspace.providerType }
+        : {}),
+      ...(input.baseRef !== undefined
+        ? { baseRef: input.baseRef ?? workspace.baseRef }
+        : {}),
+      ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
       openedAt: deps.now?.() ?? new Date(),
     });
     return {

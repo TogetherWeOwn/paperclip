@@ -434,6 +434,10 @@ import {
   mergeExecutionWorkspaceConfig,
 } from "./execution-workspaces.js";
 import {
+  createDbSourceBoundWorkspaceAllocationDeps,
+  markAllocatedWorkspaceRealized,
+} from "./source-bound-workspace-allocation.js";
+import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
@@ -22881,25 +22885,56 @@ export function heartbeatService(
       const branchNameForInitialPersistence =
         pendingForwardBranchReconcile?.recordedBranchName ??
         executionWorkspace.branchName;
-      // Re-read the allocated record at persistence time: it was captured
-      // before realization, and a Board rollback in between (archived +
-      // binding restored) must not be resurrected by this run. Only a
-      // record still unrealized and still bound to this issue is adopted;
-      // anything else falls through to a fresh insert.
-      const adoptableAllocatedExecutionWorkspace =
-        allocatedUnrealizedExecutionWorkspace &&
-        !resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
-          ? await executionWorkspacesSvc
-              .getById(allocatedUnrealizedExecutionWorkspace.id)
-              .then((fresh) =>
-                fresh?.status === "unrealized" &&
-                fresh.companyId === agent.companyId &&
-                fresh.sourceIssueId === issueRef?.id
-                  ? fresh
-                  : null,
-              )
-          : null;
+      // Guarded adoption: the allocated record was captured before
+      // realization, and a Board rollback in between (archived + binding
+      // restored) must not be resurrected by this run. The flip runs inside
+      // the allocation transaction (issue FOR UPDATE lock with status and
+      // binding re-checked), so a rollback that commits first makes the
+      // adoption deny and this run falls through to a fresh insert. This
+      // replaces a getById-then-update sequence whose window between the
+      // two awaits let a rollback be overwritten back to active.
+      const tryAdoptAllocatedExecutionWorkspace = async () => {
+        if (
+          !allocatedUnrealizedExecutionWorkspace ||
+          resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace ||
+          !issueRef?.id
+        ) {
+          return null;
+        }
+        const adoption = await markAllocatedWorkspaceRealized(
+          createDbSourceBoundWorkspaceAllocationDeps(db),
+          {
+            companyId: agent.companyId,
+            sourceIssueId: issueRef.id,
+            workspaceId: allocatedUnrealizedExecutionWorkspace.id,
+            cwd: executionWorkspace.cwd,
+            // A null worktree path fails the helper's completeness check
+            // and falls through to a fresh insert below.
+            providerRef: executionWorkspace.worktreePath ?? "",
+            branchName:
+              branchNameForInitialPersistence ??
+              executionWorkspace.branchName ??
+              "",
+            repoUrl: executionWorkspace.repoUrl,
+            providerType:
+              executionWorkspace.strategy === "git_worktree"
+                ? "git_worktree"
+                : "local_fs",
+            baseRef: executionWorkspace.repoRef,
+            metadata: nextExecutionWorkspaceMetadata,
+          },
+        );
+        if (!adoption.ok) return null;
+        return executionWorkspacesSvc.getById(
+          allocatedUnrealizedExecutionWorkspace.id,
+        );
+      };
       try {
+        // Attempted inside persistence so a thrown error still runs the
+        // worktree cleanup below; a denial (rollback won the race, or
+        // incomplete facts) returns null and falls through to insert.
+        const adoptedAllocatedExecutionWorkspace =
+          await tryAdoptAllocatedExecutionWorkspace();
         persistedExecutionWorkspace =
           resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
           reusableExistingExecutionWorkspace
@@ -22925,29 +22960,8 @@ export function heartbeatService(
                     ),
                 },
               )
-            : adoptableAllocatedExecutionWorkspace
-              ? // Realization adoption: flip the Board-allocated record
-                // (same id) to active with the realized facts instead of
-                // inserting a second source-bound workspace.
-                await executionWorkspacesSvc.update(
-                  adoptableAllocatedExecutionWorkspace.id,
-                  {
-                    cwd: executionWorkspace.cwd,
-                    repoUrl: executionWorkspace.repoUrl,
-                    baseRef: executionWorkspace.repoRef,
-                    branchName: branchNameForInitialPersistence,
-                    providerType:
-                      executionWorkspace.strategy === "git_worktree"
-                        ? "git_worktree"
-                        : "local_fs",
-                    providerRef: executionWorkspace.worktreePath,
-                    status: "active",
-                    lastUsedAt: new Date(),
-                    openedAt: new Date(),
-                    metadata: nextExecutionWorkspaceMetadata,
-                  },
-                )
-              : resolvedProjectId
+            : (adoptedAllocatedExecutionWorkspace ??
+              (resolvedProjectId
                 ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,
@@ -22983,7 +22997,7 @@ export function heartbeatService(
                   openedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
                 })
-              : null;
+              : null));
       } catch (error) {
         if (executionWorkspace.created) {
           try {

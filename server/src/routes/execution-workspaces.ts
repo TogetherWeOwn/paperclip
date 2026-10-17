@@ -1300,6 +1300,24 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
     if (!existing) return;
     if (!(await assertRuntimeManageAllowed(req, res, existing.companyId))) return;
+    // An allocated-but-unrealized record leaves this state only via
+    // heartbeat realization (which adopts the same row with realized facts)
+    // or via archive (rollback, or the archive path below). A generic PATCH
+    // flipping `unrealized` to `active` would leave cwd/providerRef/openedAt
+    // null while transport validation reads only the status, so it must be
+    // refused here; the validator also denies null row facts as defense in
+    // depth. Only archiving is allowed through PATCH.
+    if (
+      existing.status === "unrealized" &&
+      req.body.status !== undefined &&
+      req.body.status !== "archived"
+    ) {
+      res.status(409).json({
+        error:
+          "Unrealized source-bound workspaces cannot change status via PATCH (only archive); realize via heartbeat adoption or roll back the allocation",
+      });
+      return;
+    }
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectExecutionWorkspaceCommandPaths({
