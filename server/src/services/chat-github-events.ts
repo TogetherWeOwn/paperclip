@@ -267,6 +267,7 @@ export async function reuseOpenGitHubPullConversation(
         eq(chatConversations.companyId, input.companyId),
         eq(chatConversations.endpointId, input.endpointId),
         sql`lower(${chatConversations.externalThreadId}) = ${key}`,
+        eq(chatConversations.executionScope, "primary"),
         inArray(chatConversations.state, ["active", "waiting"]),
         inArray(issues.status, [...GITHUB_PULL_REUSABLE_ISSUE_STATUSES]),
       ),

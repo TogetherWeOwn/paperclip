@@ -15,6 +15,7 @@ import {
 import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { primaryGitHubReview } from "./chat-github-primary.js";
+import { githubRunCapability } from "./chat-github-shadow.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -159,6 +160,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       (publishing && !["running", "succeeded"].includes(run.status))
     )
       throw forbidden("This task run is no longer authorized");
+    const capability = await githubRunCapability(db, session);
+    if (!capability) throw forbidden("This run has no exact GitHub admission capability");
     const commentId = run.contextSnapshot?.wakeCommentId;
     const [source] =
       typeof commentId === "string"
@@ -196,7 +199,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 eq(chatMessageLinks.companyId, session.companyId),
                 eq(chatMessageLinks.commentId, commentId),
                 eq(chatConversations.issueId, session.issueId),
-                eq(chatEndpoints.assignedAgentId, session.agentId),
+                eq(chatEndpoints.id, capability.endpoint.id),
                 eq(chatEndpoints.provider, "github"),
               ),
             )
@@ -308,7 +311,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       number: Number(match[3]),
       isIssue: !!match[2],
       replyId: match[4] ?? null,
-      policy: effectiveGitHubReviewPolicy(
+      enrollment: capability.enrollment,
+      policy: capability.enrollment?.envelope.policy ?? effectiveGitHubReviewPolicy(
         source.config.configuration,
         repositoryId,
       ),
@@ -601,6 +605,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         "This task is bound to a GitHub issue. Pull request review tools require a PR conversation.",
       );
     const pull = await api.request<Pull>(`/pulls/${source.number}`);
+    // Until the snapshot reader can serve the frozen objects, an advanced
+    // provider head/base is unavailable, never permission to retarget this arm.
+    if (source.enrollment && (source.enrollment.headSha !== pull.head.sha || source.enrollment.baseSha !== pull.base.sha))
+      throw conflict("This candidate is bound to an earlier immutable head/base; live retargeting is forbidden");
     const automatic = source.delivery.normalizedEvent.githubAutomatic as
       { context: GitHubReviewEventContext } | undefined;
     if (automatic && automatic.context.headSha !== pull.head.sha)

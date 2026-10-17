@@ -8,11 +8,10 @@ import { rememberVerifiedSlackSearchEvent, slackSearchActionToken } from "./conn
 import { slackAuthorizationRevision } from "./connectors/slack-revision.js";
 import { slackPublicationAllowed } from "./connectors/slack-access.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { admitGitHubPair, prepareGitHubPairEvent, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake } from "./chat-github-shadow.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
-function githubPolicyRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
-
 // Secret-bearing model-provider credential env keys whose agent-scoped secret
 // bindings a low-trust GitHub review may use. A low-trust review runs the
 // assigned review agent with no Paperclip user principal, so the heartbeat
@@ -21,78 +20,8 @@ function githubPolicyRecord(value: unknown): Record<string, unknown> { return va
 // exactly these bindings lets the reviewer start while every other secret
 // (GitHub tokens, unrelated env, other agents' bindings) stays refused.
 // Paths and base URLs stay out: they are configuration, not credentials.
-export const LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS = [
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "OPENAI_API_KEY",
-  "CODEX_API_KEY",
-  "OPENROUTER_API_KEY",
-  "XAI_API_KEY",
-  "GROK_API_KEY",
-] as const;
-
-export function lowTrustModelCredentialConfigPaths(): string[] {
-  return LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS.map((key) => `env.${key}`);
-}
-
-type LowTrustSecretBindingRow = {
-  id: string;
-  targetType: string;
-  targetId: string;
-  configPath: string;
-};
-
-export function filterLowTrustModelBindingIds(
-  bindings: readonly LowTrustSecretBindingRow[],
-  agentId: string,
-): string[] {
-  if (!agentId) return [];
-  const allowedPaths = new Set(lowTrustModelCredentialConfigPaths());
-  const ids = new Set<string>();
-  for (const binding of bindings) {
-    if (binding.targetType !== "agent") continue;
-    if (binding.targetId !== agentId) continue;
-    if (!allowedPaths.has(binding.configPath)) continue;
-    if (!binding.id) continue;
-    ids.add(binding.id);
-  }
-  return [...ids].sort();
-}
-
-async function resolveLowTrustModelBindingIds(
-  tx: DbOrTransaction,
-  input: { companyId: string; agentId: string },
-): Promise<string[]> {
-  if (!input.agentId) return [];
-  const rows = await tx
-    .select({
-      id: companySecretBindings.id,
-      targetType: companySecretBindings.targetType,
-      targetId: companySecretBindings.targetId,
-      configPath: companySecretBindings.configPath,
-    })
-    .from(companySecretBindings)
-    .where(
-      and(
-        eq(companySecretBindings.companyId, input.companyId),
-        eq(companySecretBindings.targetType, "agent"),
-        eq(companySecretBindings.targetId, input.agentId),
-        inArray(
-          companySecretBindings.configPath,
-          lowTrustModelCredentialConfigPaths(),
-        ),
-      ),
-    );
-  return filterLowTrustModelBindingIds(rows, input.agentId);
-}
-
-function readLowTrustAllowedBindingIds(value: unknown): string[] {
-  const record = githubPolicyRecord(value);
-  const ids = (record as { allowedSecretBindingIds?: unknown }).allowedSecretBindingIds;
-  if (!Array.isArray(ids)) return [];
-  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
-}
+export { LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS, lowTrustModelCredentialConfigPaths, filterLowTrustModelBindingIds } from "./chat-github-task-trust.js";
+import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
@@ -223,8 +152,6 @@ import {
   CHAT_PROVIDERS,
   isUuidLike,
   LOW_TRUST_REVIEW_PRESET,
-  LOW_TRUST_REVIEW_PRESET_VERSION,
-  LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION,
 } from "@paperclipai/shared";
 import {
   formatAttachmentSize,
@@ -11869,8 +11796,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       commentId: string;
       principalId: string;
       actorUserId: string | null;
+      agentId?: string;
     },
   ) {
+    if (input.agentId && input.agentId !== input.endpoint.assignedAgentId && !(await githubCandidateBinding(tx, {
+      companyId: input.endpoint.companyId, endpointId: input.endpoint.id, agentId: input.agentId,
+      issueId: input.conversation.issueId, deliveryId: input.deliveryId, conversationId: input.conversation.id, commentId: input.commentId,
+    }))) throw forbidden("Candidate wake has no exact admission binding");
     await insertChatActions(tx, {
         companyId: input.endpoint.companyId,
         endpointId: input.endpoint.id,
@@ -11883,7 +11815,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         payload: {
           version: 1,
           issueId: input.conversation.issueId,
-          agentId: input.endpoint.assignedAgentId,
+          agentId: input.agentId ?? input.endpoint.assignedAgentId,
           commentId: input.commentId,
           sessionGeneration: input.conversation.sessionGeneration,
           requestedByActorType: input.actorUserId ? "user" : "system",
@@ -11960,9 +11892,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     const fence = delivery ? lifecycleRuntimeFence(delivery) : null;
+    const candidateBinding = endpoint && delivery ? await githubCandidateBinding(tx, {
+      companyId: action.companyId, endpointId: endpoint.id, agentId: payload.agentId,
+      issueId: issue.id, deliveryId: delivery.id, conversationId: action.conversationId, commentId: payload.commentId,
+    }) : null;
+    if (candidateBinding && !(await githubCandidateMayWake(tx, candidateBinding))) throw deny();
     if (
       !endpoint ||
-      endpoint.assignedAgentId !== payload.agentId ||
+      (endpoint.assignedAgentId !== payload.agentId && !candidateBinding) ||
+      (delivery?.normalizedEvent.githubPairedCandidate && !candidateBinding) ||
       !delivery ||
       telegramDeliveryHasZeroMessageId(delivery, endpoint.provider) ||
       delivery.endpointId !== endpoint.id ||
@@ -15819,6 +15757,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     thread.channelId,
                   ),
                   eq(chatConversations.externalThreadId, thread.id),
+                  eq(chatConversations.executionScope, "primary"),
                 ),
               )
               .orderBy(desc(chatConversations.sessionGeneration))
@@ -16317,6 +16256,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return;
       }
 
+      // Optional source preparation is outside SQL locks and before either arm
+      // wakes. A provider failure cannot discard the primary's accepted input.
+      let pairedEvent: GitHubReviewEventContext | null = null;
+      if (endpoint.provider === "github" && !activeDelivery.githubShadowLabel) {
+        try {
+          pairedEvent = await prepareGitHubPairEvent(db, {
+            endpoint, repositoryId: String(resource.metadata?.providerRepositoryId ?? ""), repository: resource.providerResourceId,
+            threadId: thread.id, eventId: activeDelivery.providerEventId, principal: principalResolution.principal,
+            automatic: githubAutomatic?.context, manualEvent: githubManual?.event,
+          }, options.fetch ?? fetch);
+        } catch {
+          await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"source_preparation_failed"}'::jsonb` }).where(eq(chatDeliveries.id, activeDelivery.id));
+        }
+      }
       const inboundActivityPublications: ActivityPublication[] = [];
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
@@ -16402,6 +16355,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 eq(chatConversations.endpointId, endpoint.id),
                 eq(chatConversations.externalConversationId, thread.channelId),
                 eq(chatConversations.externalThreadId, thread.id),
+                eq(chatConversations.executionScope, "primary"),
                 eq(chatConversations.sessionGeneration, sessionGeneration),
               ),
             )
@@ -16423,77 +16377,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!issue) throw notFound("Bound task not found");
           const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
         if (!taskUserId || (githubAutomatic && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
-            // Low-trust reviews run with no user principal, so the heartbeat
-            // refuses every agent secret binding by default. Allow exactly
-            // the assigned review agent's own model-provider credential
-            // binding(s) so the reviewer can start; every other secret stays
-            // refused. The lookup is scoped to this endpoint's assigned
-            // agent by construction, and any operator-set allowlist entries
-            // already on the issue boundary are preserved.
-            const lowTrustReviewAgentId =
-              taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId;
-            const lowTrustModelBindingIds = await resolveLowTrustModelBindingIds(
-              taskTx,
-              {
-                companyId: endpoint.companyId,
-                agentId: lowTrustReviewAgentId,
-              },
-            );
-            const lowTrustAllowedSecretBindingIds = [
-              ...new Set([
-                ...readLowTrustAllowedBindingIds(
-                  githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary,
-                ),
-                ...lowTrustModelBindingIds,
-              ]),
-            ].sort();
-            const reviewPreset = {
-              id: LOW_TRUST_REVIEW_PRESET,
-              version: LOW_TRUST_REVIEW_PRESET_VERSION,
-              rawOutputDisposition: LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION,
-            } as const;
-            await taskTx
-              .update(issues)
-              .set({
-                sourceTrust: {
-                  preset: LOW_TRUST_REVIEW_PRESET,
-                  disposition: "quarantined",
-                  sourceIssueId: issue.id,
-                },
-                executionPolicy: {
-                  mode: "normal",
-                  commentRequired: true,
-                  stages: [],
-                  ...issue.executionPolicy,
-                  reviewPreset,
-                  authorizationPolicy: {
-                    ...githubPolicyRecord(issue.executionPolicy?.authorizationPolicy),
-                    trustPreset: LOW_TRUST_REVIEW_PRESET,
-                    reviewPreset,
-                    trustBoundary: {
-                      mode: LOW_TRUST_REVIEW_PRESET,
-                      companyId: endpoint.companyId,
-                      rootIssueId: issue.id,
-                      issueIds: [issue.id],
-                      allowedAgentIds: [endpoint.assignedAgentId],
-                      allowedToolClasses: [
-                        "git.read",
-                        "github.pr.read",
-                        "tests.local",
-                      ],
-                      ...githubPolicyRecord(githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary),
-                      allowedSecretBindingIds: lowTrustAllowedSecretBindingIds,
-                    },
-                  },
-                },
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(issues.id, issue.id),
-                  eq(issues.companyId, endpoint.companyId),
-                ),
-              );
+            await initializeGitHubReviewTaskTrust(taskTx, issue, taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId);
           }
 
         if (issue.status === "done" || issue.status === "cancelled") {
@@ -16680,6 +16564,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             policySnapshot: githubAutomatic.policy, event: githubAutomatic.context, state: "queued",
             shadowLabel: taskShadowLabel,
           }).onConflictDoNothing();
+        }
+        if (pairedEvent && !taskShadowLabel && (githubManual || githubAutomatic)) {
+          await admitGitHubPair(taskTx as DbTransaction, {
+            endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent,
+            request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
+            revision: (githubManual ?? githubAutomatic)!.revision,
+            authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,
+              sponsorUserId: !principalResolution.userId ? taskEndpoint.sponsorUserId : null },
+          });
         }
         await stageInboundWakeup(taskTx, {
           endpoint: taskEndpoint,
@@ -17263,6 +17156,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .where(
         and(
           eq(chatDeliveries.endpointId, endpointId),
+          sql`not (${chatDeliveries.normalizedEvent} ? 'githubPairedCandidate')`,
           or(
             inArray(chatDeliveries.state, ["received", "retry", "processing"]),
             and(
@@ -28151,6 +28045,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       : Promise.allSettled([
           processPendingSlackBoardMessages(limit),
           processPendingGitHubWebhookIngress(limit),
+          recoverGitHubReviewCandidates(db, { limit: Math.min(limit, 5), stage: stageInboundWakeup, wake: processInboundWakeup }),
           processPendingProviderEffects(limit),
           processPendingReceiptReactions(limit),
           processPendingSlackSessionStops(limit),
@@ -28186,6 +28081,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           and(
             sql`not exists (select 1 from chat_endpoints e where e.id = ${chatDeliveries.endpointId} and e.provider = 'agentmail')`,
             onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
+            sql`not (${chatDeliveries.normalizedEvent} ? 'githubPairedCandidate')`,
             notInArray(chatDeliveries.eventKind, [
               "reaction_added",
               "reaction_removed",

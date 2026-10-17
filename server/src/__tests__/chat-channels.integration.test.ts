@@ -3777,6 +3777,256 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ));
       return conversation;
     }
+    async function pairedReviewFixture(overrides: Parameters<typeof reviewBotFixture>[0] = {}) {
+      const f = await reviewBotFixture(overrides);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: true });
+      onTestFinished(async () => { await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false }); });
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate: 1 }] },
+      }, "owner-user");
+      installShadowRecorder(f, "b".repeat(40));
+      return f;
+    }
+    async function pairedTasks(endpointId: string) {
+      return db.select({ conversation: chatConversations, issue: issues }).from(chatConversations)
+        .innerJoin(issues, eq(issues.id, chatConversations.issueId))
+        .where(eq(chatConversations.endpointId, endpointId));
+    }
+    it("primary tool discovery preserves task-bound continuations with pairing off", async () => {
+      const f = await reviewBotFixture();
+      const conversation = await deliverShadowTestMention(f, "primary-continuation", "@maya review this", 81);
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId, agentId: f.assignedAgentId, invocationSource: "assignment", status: "queued",
+        nativeIssueId: conversation.issueId, contextSnapshot: { issueId: conversation.issueId },
+      }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run!.id };
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      const { githubBotConnectionIdsForRun } = await import("../services/chat-github-tools.js");
+      expect([...(await githubBotConnectionIdsForRun(db, f.companyId, f.assignedAgentId, run!.id))]).toContain(f.endpoint.connectionId);
+    });
+    it("paired admission creates one primary and one candidate with exact request and native capabilities", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-first", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.conversation.githubShadowLabel).toBe("paired-meta");
+      const primaryComments = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      const candidateComments = await db.select().from(issueComments).where(eq(issueComments.issueId, candidate.issue.id));
+      expect(candidateComments.map(c => c.body)).toEqual(primaryComments.map(c => c.body));
+      const candidateWake = (await shadowTestActions(f.endpoint.id, "inbound_wakeup")).find(a => a.conversationId === candidate.conversation.id);
+      expect({ status: candidateWake?.status, result: candidateWake?.result }).toEqual({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+      // Crash after the durable scheduler acknowledgement but before updating
+      // the local outbox: native receipt reconciliation must not wake twice.
+      await db.execute(sql`update chat_github_review_candidates set state = 'materialized', next_attempt_at = null where issue_id = ${candidate.issue.id}`);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+      expect([...(await db.execute(sql`select state from chat_github_review_candidates where issue_id = ${candidate.issue.id}`))]).toEqual([{ state: "dispatched" }]);
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" })).toBeDefined();
+      expect(await githubBotToolsForSession(db, { ...session, issueId: primary.issue.id })).toEqual([]);
+      await expect(githubChatReviewService(db, f.providerFetch).execute({ ...session, issueId: primary.issue.id }, "read_pull_request", { section: "metadata" })).rejects.toThrow();
+      const intents = await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate.issue.id));
+      expect(intents).toEqual([]);
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      for (const unauthorized of [
+        { ...session, agentId: f.assignedAgentId },
+        { ...session, runId: primarySession.runId },
+        { ...session, companyId: randomUUID() },
+      ]) expect(await githubBotToolsForSession(db, unauthorized)).toEqual([]);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id, wakeCommentId: primaryComments[0]!.id } }).where(eq(heartbeatRuns.id, session.runId));
+      expect(await githubBotToolsForSession(db, session)).toEqual([]);
+    });
+    it("paired admission enrolls authenticated automatic PR events with the same guest authority", async () => {
+      const f = await pairedReviewFixture();
+      await db.delete(chatIdentityLinks).where(eq(chatIdentityLinks.principalId, f.principal.id));
+      const config = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: config.revision,
+        configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, invocation: "allowed_authors" }, people: [{ kind: "guest", githubUserId: "42", login: "octocat", sponsorUserId: "owner-user", permissionProfile: "restricted", automaticReviews: true }] },
+      }, "owner-user");
+      await admitShadowTestPullRequest(f, "b".repeat(40));
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.issue.sourceTrust?.preset).toBe("low_trust_review");
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { githubBotConnectionIdsForRun, githubGuestBotConnectionForSession } = await import("../services/chat-github-tools.js");
+      expect([...(await githubBotConnectionIdsForRun(db, f.companyId, f.replacementAgentId, session.runId))]).toContain(f.endpoint.connectionId);
+      expect(await githubGuestBotConnectionForSession(db, session)).toBe(f.endpoint.connectionId);
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" })).toBeDefined();
+      expect(f.wakeup.mock.calls.some(c => c[0] === f.replacementAgentId)).toBe(true);
+    });
+    it("paired admission deduplicates delivery and freezes head across independent rounds", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-duplicate", "@maya review this", 81);
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, "paired-duplicate", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      await deliverShadowTestMention(f, "paired-next-head", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks.filter(t => t.issue.assigneeAgentId === f.assignedAgentId)).toHaveLength(1);
+      expect(tasks.filter(t => t.issue.assigneeAgentId === f.replacementAgentId)).toHaveLength(2);
+      const rows = await db.execute(sql`select head_sha, round_ordinal from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`);
+      expect([...rows]).toMatchObject([{ head_sha: "b".repeat(40), round_ordinal: 1 }, { head_sha: "c".repeat(40), round_ordinal: 2 }]);
+      await deliverShadowTestMention(f, "paired-same-head", "@maya another request at the same head", 81);
+      await f.service.processPendingDeliveries();
+      const rounds = await db.execute(sql`select head_sha, round_ordinal from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`);
+      expect([...rounds]).toMatchObject([{ round_ordinal: 1 }, { round_ordinal: 2 }, { head_sha: "c".repeat(40), round_ordinal: 3 }]);
+      expect((await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.replacementAgentId)).toHaveLength(3);
+    });
+    it("paired admission kill switch blocks new admission and pending recovery without touching primary", async () => {
+      const f = await pairedReviewFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      await deliverShadowTestMention(f, "paired-off", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: true });
+      await deliverShadowTestMention(f, "paired-before-stop", "@maya review again", 81);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+      expect(f.wakeup.mock.calls.every(c => c[0] === f.assignedAgentId)).toBe(true);
+    });
+    it("paired admission recovers interrupted enqueue and candidate failure leaves primary unaffected", async () => {
+      let cloneId = "";
+      const f = await pairedReviewFixture({ wakeup: async (agentId) => { if (agentId === cloneId) throw new Error("candidate unavailable"); return { accepted: true }; } });
+      cloneId = f.replacementAgentId;
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      await deliverShadowTestMention(f, "paired-crash", "@maya review this", 81);
+      // No in-memory scheduling is needed: a new service drains the durable outbox.
+      const restarted = createService(new FakeChatSdkRuntime(), f.providerFetch, { wakeup: async (agentId) => { if (agentId === cloneId) throw new Error("candidate unavailable"); return { accepted: true }; } });
+      await restarted.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      await restarted.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      const review = githubChatReviewService(db, f.providerFetch);
+      await review.execute(session, "begin_review", { reviewedCommit: "b".repeat(40) });
+      expect(await review.execute(session, "submit_review", shadowTestAssessment("b".repeat(40)))).toMatchObject({ score: 2, conclusion: "failure" });
+      const publications = await shadowTestActions(f.endpoint.id, "github_review_publication");
+      expect(publications).toHaveLength(1);
+      expect(publications[0]!.status).toBe("processed");
+      expect(recorder.mutations.some(m => m.url.includes("/check-runs"))).toBe(true);
+      expect(recorder.mutations.some(m => m.url.includes("/comments"))).toBe(true);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect([...(await db.execute(sql`select state from chat_github_review_candidates where issue_id = ${candidate.issue.id}`))]).toEqual([{ state: "materialized" }]);
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate.issue.id))).toHaveLength(0);
+    });
+    it("paired admission defers unavailable clones without starving the recovery queue", async () => {
+      const blocked = await pairedReviewFixture();
+      await deliverShadowTestMention(blocked, "paired-paused", "@maya review this", 81);
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, blocked.replacementAgentId));
+      const runnable = await pairedReviewFixture();
+      await deliverShadowTestMention(runnable, "paired-runnable", "@maya review this", 81);
+      await runnable.service.processPendingDeliveries(1);
+      await runnable.service.processPendingDeliveries(1);
+      expect(await pairedTasks(blocked.endpoint.id)).toHaveLength(1);
+      expect(await pairedTasks(runnable.endpoint.id)).toHaveLength(2);
+      expect(runnable.wakeup.mock.calls.some(c => c[0] === blocked.replacementAgentId)).toBe(false);
+      expect(runnable.wakeup.mock.calls.some(c => c[0] === runnable.replacementAgentId)).toBe(true);
+    });
+    it("paired admission rolls back partial materialization and retries the reserved delivery", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-materialize-crash", "@maya review this", 81);
+      const before = [...(await db.execute(sql`select native_delivery_id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`))];
+      await db.execute(sql`create function test_fail_pair_materialization() returns trigger language plpgsql as $$ begin
+        if NEW.execution_scope <> 'primary' then raise exception 'injected materialization crash'; end if; return NEW; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_materialization before insert on chat_conversations for each row execute function test_fail_pair_materialization()`);
+      try {
+        await f.service.processPendingDeliveries();
+        expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+        expect(await db.select().from(issues).where(and(eq(issues.companyId, f.companyId), eq(issues.assigneeAgentId, f.replacementAgentId)))).toHaveLength(0);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_materialization on chat_conversations`);
+        await db.execute(sql`drop function test_fail_pair_materialization()`);
+      }
+      await db.execute(sql`update chat_github_review_candidates set next_attempt_at = null where endpoint_id = ${f.endpoint.id}`);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect([...(await db.execute(sql`select native_delivery_id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`))]).toEqual(before);
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+    });
+    it("paired admission rechecks kill switch immediately before wake after materialization", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_stop_paired_wake() returns trigger language plpgsql as $$ begin
+        if NEW.state = 'materialized' then update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb; end if;
+        return NEW; end $$`);
+      await db.execute(sql`create trigger test_stop_paired_wake after update on chat_github_review_candidates for each row execute function test_stop_paired_wake()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger test_stop_paired_wake on chat_github_review_candidates`);
+        await db.execute(sql`drop function test_stop_paired_wake()`);
+      });
+      await deliverShadowTestMention(f, "paired-midflight-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const candidates = await db.execute(sql`select state from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "materialized" }]);
+    });
+    it("paired admission recovers an enrollment projection failure from immutable source seed", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_fail_pair_projection() returns trigger language plpgsql as $$ begin raise exception 'injected projection failure'; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_projection before insert on chat_github_review_enrollments for each row execute function test_fail_pair_projection()`);
+      try {
+        await deliverShadowTestMention(f, "paired-projection-crash", "@maya frozen request", 81);
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        expect([...(await db.execute(sql`select id from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`))]).toEqual([]);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_projection on chat_github_review_enrollments`);
+        await db.execute(sql`drop function test_fail_pair_projection()`);
+      }
+      installShadowRecorder(f, "c".repeat(40));
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect([...(await db.execute(sql`select head_sha from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`))]).toEqual([{ head_sha: "b".repeat(40) }]);
+    });
+    it("paired admission never retargets candidate review to an advanced provider head", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-advanced", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      installShadowRecorder(f, "c".repeat(40));
+      await expect(githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "c".repeat(40) })).rejects.toThrow();
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      expect(reviews.map(r => r.headSha)).toEqual(["b".repeat(40)]);
+    });
+    it("paired admission preserves low-trust boundaries without lending primary task authority", async () => {
+      const f = await pairedReviewFixture();
+      await db.update(agents).set({ permissions: { trustPreset: "low_trust_review" } }).where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+      await deliverShadowTestMention(f, "paired-trust", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.issue.sourceTrust?.preset).toBe("low_trust_review");
+      expect(candidate.issue.executionPolicy?.authorizationPolicy).toMatchObject({ trustBoundary: {
+        companyId: f.companyId, rootIssueId: candidate.issue.id, issueIds: [candidate.issue.id], allowedAgentIds: [f.replacementAgentId],
+      } });
+    });
+    it("paired admission identities and capture authority cannot be rewritten", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-immutable", "@maya review this", 81);
+      const primary = (await pairedTasks(f.endpoint.id))[0]!;
+      const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      await expect(db.execute(sql`update chat_github_review_candidates set issue_id = ${primary.issue.id}, conversation_id = ${primary.conversation.id}, comment_id = ${comment!.id} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await f.service.processPendingDeliveries();
+      await expect(db.execute(sql`update chat_github_review_enrollments set head_sha = ${"c".repeat(40)} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await expect(db.execute(sql`update chat_github_review_candidates set agent_id = ${f.assignedAgentId} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await expect(db.execute(sql`update chat_deliveries set normalized_event = normalized_event - 'githubPairingSeed' where endpoint_id = ${f.endpoint.id} and normalized_event ? 'githubPairingSeed'`)).rejects.toThrow();
+    });
     it("shadow final replies stay internal before begin_review and after config changes", async () => {
       const f = await reviewBotFixture();
       await saveShadowMode(f, true);
