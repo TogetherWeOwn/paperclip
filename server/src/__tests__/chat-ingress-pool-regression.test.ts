@@ -231,6 +231,52 @@ describeEmbeddedPostgres(
     );
 
     it(
+      "creates with a user assignee stay on the caller transaction",
+      async () => {
+        tempDb ??= await startEmbeddedPostgresTestDatabase(
+          "paperclip-chat-ingress-pool-",
+        );
+        const db = createDb(tempDb.connectionString);
+        // Pool of exactly 1: the outer transaction holds the only
+        // connection, so a nested pooled membership read inside create
+        // stalls and hits the timeout below. A larger pool would mask the
+        // regression — the nested read would take a spare connection.
+        const smallDb = createDb(tempDb.connectionString, {
+          maxConnections: 1,
+        });
+        const { companyId } = await seedCompanyWithAgent(db);
+        const svc = issueService(smallDb);
+
+        await withTimeout(
+          smallDb.transaction(async (tx) => {
+            await tx
+              .select({ id: companies.id })
+              .from(companies)
+              .where(eq(companies.id, companyId))
+              .for("update");
+            // Exercises the create-path membership check, which must stay
+            // on tx. seedCompanyWithAgent seeds the board-user membership.
+            const created = await svc.create(
+              companyId,
+              {
+                title: `User-assigned ingress ${randomUUID()}`,
+                description: null,
+                status: "todo",
+                priority: "medium",
+                assigneeUserId: "board-user",
+              },
+              tx,
+            );
+            expect(created?.assigneeUserId).toBe("board-user");
+          }),
+          15_000,
+          "lock-holding create with user assignee",
+        );
+      },
+      30_000,
+    );
+
+    it(
       "rolled-back ingress leaves nothing behind and retry is idempotent",
       async () => {
         tempDb ??= await startEmbeddedPostgresTestDatabase(
