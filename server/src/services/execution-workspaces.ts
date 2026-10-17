@@ -800,6 +800,12 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   statusInspectionSucceeded: boolean;
 }> {
   const warnings: string[] = [];
+  // An unrealized source-bound allocation has no worktree, branch, or
+  // local path by construction: there is nothing to inspect and close
+  // must never plan worktree/branch deletion for it.
+  if (workspace.status === "unrealized") {
+    return { git: null, warnings, statusInspectionSucceeded: true };
+  }
   const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
   const createdByRuntime = workspace.providerType === "git_worktree"
     ? isRuntimeOwnedGitBranch(workspace.metadata)

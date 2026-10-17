@@ -34,7 +34,8 @@ export type ExecutionWorkspaceStatus =
   | "idle"
   | "in_review"
   | "archived"
-  | "cleanup_failed";
+  | "cleanup_failed"
+  | "unrealized";
 
 export type ExecutionWorkspaceDeliveryState =
   | "merged_via_pr"
@@ -278,7 +279,8 @@ export interface ExecutionWorkspace {
   providerRef: string | null;
   derivedFromExecutionWorkspaceId: string | null;
   lastUsedAt: Date;
-  openedAt: Date;
+  /** Null while the record is an unrealized source-bound allocation. */
+  openedAt: Date | null;
   closedAt: Date | null;
   cleanupEligibleAt: Date | null;
   cleanupReason: string | null;

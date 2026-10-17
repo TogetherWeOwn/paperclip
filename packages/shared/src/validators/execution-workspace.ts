@@ -10,6 +10,10 @@ export const executionWorkspaceStatusSchema = z.enum([
   "in_review",
   "archived",
   "cleanup_failed",
+  // Allocated source-bound record that has never been realized: no cwd,
+  // providerRef, branch, or openedAt exists yet. Heartbeat realization
+  // adopts the record (same id) instead of inserting a second one.
+  "unrealized",
 ]);
 
 export const executionWorkspaceDeliveryStateSchema = z.enum([
@@ -144,6 +148,18 @@ export const executionWorkspaceCloseReadinessSchema = z.object({
   runtimeServices: z.array(workspaceRuntimeServiceSchema),
 }).strict();
 
+// PATCH must never move a workspace into (or out of) the allocation-only
+// `unrealized` state: that lifecycle belongs to allocation and heartbeat
+// realization, not generic updates. Kept as a separate enum so
+// `executionWorkspaceStatusSchema` stays the full lifecycle set.
+const updateExecutionWorkspaceStatusSchema = z.enum([
+  "active",
+  "idle",
+  "in_review",
+  "archived",
+  "cleanup_failed",
+]);
+
 export const updateExecutionWorkspaceSchema = z.object({
   name: z.string().min(1).optional(),
   cwd: z.string().optional().nullable(),
@@ -151,7 +167,7 @@ export const updateExecutionWorkspaceSchema = z.object({
   baseRef: z.string().optional().nullable(),
   branchName: z.string().optional().nullable(),
   providerRef: z.string().optional().nullable(),
-  status: executionWorkspaceStatusSchema.optional(),
+  status: updateExecutionWorkspaceStatusSchema.optional(),
   cleanupEligibleAt: z.string().datetime().optional().nullable(),
   cleanupReason: z.string().optional().nullable(),
   config: executionWorkspaceConfigSchema.optional().nullable(),
@@ -175,6 +191,22 @@ export const reconcileExecutionWorkspaceBranchSchema = z.discriminatedUnion("mod
   }).strict(),
 ]);
 
+/**
+ * Board-authorized source-bound workspace allocation. The caller supplies
+ * nothing that influences the record: every field is derived server-side
+ * from the issue's stored isolated selection. `requested` is accepted for
+ * forward compatibility and ignored.
+ */
+export const allocateSourceBoundWorkspaceSchema = z.object({
+  requested: z.record(z.string(), z.unknown()).optional().nullable(),
+}).strict();
+
+export const rollbackSourceBoundWorkspaceAllocationSchema = z.object({
+  workspaceId: z.string().guid(),
+}).strict();
+
 export type UpdateExecutionWorkspace = z.infer<typeof updateExecutionWorkspaceSchema>;
+export type AllocateSourceBoundWorkspace = z.infer<typeof allocateSourceBoundWorkspaceSchema>;
+export type RollbackSourceBoundWorkspaceAllocation = z.infer<typeof rollbackSourceBoundWorkspaceAllocationSchema>;
 export type ReconcileExecutionWorkspaceBranch = z.infer<typeof reconcileExecutionWorkspaceBranchSchema>;
 export type WorkspaceOverviewQuery = z.infer<typeof workspaceOverviewQuerySchema>;
