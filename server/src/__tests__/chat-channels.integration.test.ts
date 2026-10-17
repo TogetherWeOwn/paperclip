@@ -3852,6 +3852,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, invocation: "allowed_authors" }, people: [{ kind: "guest", githubUserId: "42", login: "octocat", sponsorUserId: "owner-user", permissionProfile: "restricted", automaticReviews: true }] },
       }, "owner-user");
       await admitShadowTestPullRequest(f, "b".repeat(40));
+      // The webhook helper observes admission, not dispatch completion. Wait for
+      // the committed primary wake before racing the endpoint's NOWAIT lock.
+      await expect.poll(async () => (await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup"), eq(chatActions.status, "processed"),
+      ))).length, { timeout: 10000 }).toBeGreaterThan(0);
       await f.service.processPendingDeliveries();
       const tasks = await pairedTasks(f.endpoint.id);
       expect(tasks).toHaveLength(2);
@@ -4050,6 +4055,126 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(result)).not.toContain("CANARY");
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, candidate.issue.id));
       expect(JSON.stringify(comments)).not.toContain("PRIMARY_ISSUE_HISTORY_CANARY");
+    });
+    it("paired isolation denies primary issue history through a candidate signed run", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "isolation-history", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_API_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-isolation-test-secret";
+      try {
+        const token = createLocalAgentJwt(session.agentId, session.companyId, "claude_local", session.runId, null)!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/issues/:id/comments", async (req, res) => {
+          res.json(await db.select().from(issueComments).where(eq(issueComments.issueId, req.params.id)));
+        });
+        app.use(errorHandler);
+        for (const route of [`/api/issues/${primary.issue.id}/comments`, `/api/issues/${candidate.issue.id}/comments`,
+          `/api/heartbeat-runs/${session.runId}/log`, `/api/agents/${f.assignedAgentId}`, `/api/companies/${f.companyId}/issues?q=CANARY`]) {
+          const response = await request(app).get(route).set("Authorization", `Bearer ${token}`);
+          expect(response.status).toBe(403);
+          expect(JSON.stringify(response.body)).not.toContain("PRIMARY_API_HISTORY_CANARY");
+        }
+        const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+        const primaryToken = createLocalAgentJwt(primarySession.agentId, f.companyId, "claude_local", primarySession.runId, null)!;
+        const positive = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${primaryToken}`);
+        expect(positive.status).toBe(200);
+        expect(JSON.stringify(positive.body)).toContain("PRIMARY_API_HISTORY_CANARY");
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired isolation exposes only snapshot tools and rejects context retargeting", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "isolation-gateway", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const { toolPolicies } = await import("@paperclipai/db");
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+      const gateway = createToolGatewayService(db);
+      const access = await gateway.createSession(session);
+      const tools = await gateway.listToolsForSession(access.token);
+      expect(tools.length).toBeGreaterThan(0);
+      expect(tools.every(t => t.providerType === "paperclip_github_chat")).toBe(true);
+      const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
+      expect(readTool).toBeDefined();
+      expect(await gateway.executeTool({ sessionToken: access.token, tool: readTool.name, parameters: { section: "metadata" } }))
+        .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+      const primaryRun = await shadowTestSession(f, { issueId: primary.issue.id });
+      const primaryAccess = await gateway.createSession(primaryRun);
+      const generic = (await gateway.listToolsForSession(primaryAccess.token)).find(t => t.providerType !== "paperclip_github_chat")!;
+      expect(generic).toBeDefined(); // Positive control: the generic catalog exists.
+      await expect(gateway.executeTool({ sessionToken: access.token, tool: generic.name, parameters: { issueId: primary.issue.id } })).rejects.toThrow("snapshot-backed");
+      await expect(gateway.createSession({ ...session, issueId: primary.issue.id })).rejects.toThrow();
+      const { toolProfiles } = await import("@paperclipai/db");
+      const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: randomUUID(), name: "Candidate MCP", defaultAction: "deny" }).returning();
+      const named = await gateway.createNamedGateway({ companyId: f.companyId, body: { name: "Candidate MCP", profileId: profile!.id, agentId: session.agentId, issueId: session.issueId } });
+      const namedToken = await gateway.createNamedGatewayToken({ companyId: f.companyId, gatewayId: named.id,
+        body: { name: "Candidate run", subjectType: "heartbeat_run", subjectId: session.runId } });
+      for (const method of ["resources/list", "resources/read", "prompts/list", "prompts/get"] as const) {
+        await expect(gateway.executeContextForNamedGateway({ gatewayId: named.id, bearerToken: namedToken.token, method })).rejects.toThrow("cannot read MCP");
+      }
+      const { githubCandidateRunBoundary } = await import("../services/chat-github-isolation.js");
+      await expect(githubCandidateRunBoundary(db, { ...session, issueId: primary.issue.id })).rejects.toThrow("retargeted");
+      const scope = await githubCandidateRunBoundary(db, session);
+      const retry = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect((await githubCandidateRunBoundary(db, retry))!.namespace).not.toBe(scope!.namespace);
+      // Tampering with the wake binding must not downgrade a candidate to a normal run.
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id } }).where(eq(heartbeatRuns.id, session.runId));
+      await expect(gateway.listToolsForSession(access.token)).rejects.toThrow("capability is invalid");
+    });
+    it("paired isolation fails closed before an unsupported adapter can read primary session scratch", async () => {
+      const heartbeat = heartbeatService(db);
+      const f = await pairedReviewFixture({ wakeup: heartbeat.wakeup });
+      const oldApiUrl = process.env.PAPERCLIP_API_URL;
+      process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+      const adapterType = `paired-isolation-test-${randomUUID()}`;
+      const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-primary-scratch-"));
+      const canaryPath = path.join(scratch, "primary-session.txt");
+      writeFileSync(canaryPath, "PRIMARY_SESSION_SCRATCH_CANARY");
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(canaryPath, "utf8")).toBe("PRIMARY_SESSION_SCRATCH_CANARY");
+      const candidateReads: string[] = [];
+      const execute = vi.fn(async (input: { agent: { id: string } }) => {
+        if (input.agent.id === f.replacementAgentId) candidateReads.push(readFileSync(canaryPath, "utf8"));
+        return { exitCode: 0, signal: null, timedOut: false, summary: "test result", provider: "test", model: "test" };
+      });
+      registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false, execute,
+        testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+      try {
+        await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+        await db.update(agents).set({ adapterType, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+          .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+        await deliverShadowTestMention(f, "isolation-runtime", "@maya review this", 81);
+        await heartbeat.drainActiveRunExecutions();
+        await f.service.processPendingDeliveries();
+        await heartbeat.drainActiveRunExecutions();
+        expect(candidateReads).toEqual([]);
+        expect(execute.mock.calls.some(([input]) => input.agent.id === f.assignedAgentId)).toBe(true);
+        const candidateRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.replacementAgentId));
+        expect(candidateRuns).toHaveLength(1);
+        expect(candidateRuns[0]).toMatchObject({ status: "failed", errorCode: "configuration_incomplete" });
+        expect(candidateRuns[0]!.error).toContain("github_candidate_isolation_unavailable");
+      } finally {
+        await heartbeat.drainActiveRunExecutions();
+        unregisterServerAdapter(adapterType);
+        if (oldApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+        else process.env.PAPERCLIP_API_URL = oldApiUrl;
+        rmSync(scratch, { recursive: true, force: true });
+      }
     });
     it("paired snapshot validates and reads original commits after the live head advances", async () => {
       const f = await pairedReviewFixture();

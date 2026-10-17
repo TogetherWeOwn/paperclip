@@ -1,4 +1,5 @@
 import { externalObjectService } from "./external-objects.js";
+import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -21020,6 +21021,20 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
+      const candidateBoundary = await githubCandidateRunBoundary(db, {
+        companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      });
+      if (candidateBoundary) {
+        // A fresh issue or isolateRuntime env filtering is NOT a certified
+        // filesystem/network/session/memory boundary. Until an adapter supplies
+        // that contract, fail before session restore, workspace setup, plugins,
+        // MCP construction or model dispatch. No agent-config escape hatch.
+        throw new ConfigurationIncompleteFailure(
+          "github_candidate_isolation_unavailable: paired candidate runtime isolation is not implemented; no provider work started",
+          { configurationIncomplete: { reason: "github_candidate_isolation_unavailable",
+            namespace: candidateBoundary.namespace, required: ["fresh_session", "filesystem", "network", "scoped_memory_retention"] } },
+        );
+      }
       const agent = await getAgent(run.agentId);
       if (!agent) {
         await setRunStatus(runId, "failed", {

@@ -21,6 +21,7 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { assertGitHubCandidateApiBoundary } from "../services/chat-github-isolation.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -435,6 +436,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         onBehalfOfMemberships,
         source: "agent_jwt",
       };
+      await assertGitHubCandidateApiBoundary(db, {
+        companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
+      }, req);
       next();
       return;
     }

@@ -10,6 +10,7 @@ import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
+import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
 import { runIdentityContexts } from "@paperclipai/db";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
@@ -2657,6 +2658,13 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
+    if (await githubCandidateRunBoundary(db, session)) {
+      // Dispatch (including approval replay) must enforce the same boundary as
+      // discovery, before building generic clients or resolving credentials.
+      const tool = (await githubBotToolsForSession(db, session)).find(t => t.name === toolName);
+      if (!tool) throw new ToolGatewayHttpError(403, "Paired candidates can only use snapshot-backed review tools", "github_candidate_tool_denied");
+      return tool;
+    }
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
@@ -2873,15 +2881,16 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
-    const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
-    const allConnectedTools = (await connectedMcpToolsForCompany(
+    const isolated = await githubCandidateRunBoundary(db, session);
+    const guestBotConnection = isolated ? null : await githubGuestBotConnectionForSession(db, session);
+    const allConnectedTools = isolated ? [] : (await connectedMcpToolsForCompany(
       session.companyId,
     )).filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
     const tools = [
-      ...allTools(),
+      ...(isolated ? [] : allTools()),
       ...await githubBotToolsForSession(db, session),
-      ...await slackToolsForSession(db, session),
+      ...(isolated ? [] : await slackToolsForSession(db, session)),
       ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool)),
     ].filter(
       (tool) =>
@@ -5316,6 +5325,8 @@ export function createToolGatewayService(
       callerHeaders: input.callerHeaders,
     });
     await assertGatewayTokenAction(session, input.method);
+    if (await githubCandidateRunBoundary(db, session))
+      throw new ToolGatewayHttpError(403, "Paired candidates cannot read MCP resources or prompts", "github_candidate_context_denied");
     const connections = await fullyAssignedMcpConnections(session);
     if (input.method === "resources/list") {
       const resources = [] as Array<Record<string, unknown>>;
