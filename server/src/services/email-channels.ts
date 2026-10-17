@@ -1,3 +1,4 @@
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -1557,7 +1558,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         if (!reply)
           throw badRequest("Reply target is not in this inbox conversation");
       }
-      await tx.insert(chatPublications).values({
+      await insertChatPublications(tx, {
         id: input.idempotencyKey,
         companyId,
         endpointId: endpoint.id,

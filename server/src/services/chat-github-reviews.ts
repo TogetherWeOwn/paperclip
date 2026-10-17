@@ -1,3 +1,4 @@
+import { insertChatActions } from "./chat-publication-authority.js";
 import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
@@ -13,6 +14,7 @@ import {
 } from "./chat-github-review-template.js";
 import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
+import { primaryGitHubReview } from "./chat-github-primary.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -473,6 +475,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           context,
           true,
           "authorized_manual_request",
+          source.delivery.id,
         );
       return review;
     }
@@ -528,11 +531,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       },
       status: "received",
     };
-    const [action] = await writer
-      .insert(chatActions)
-      .values(values)
-      .onConflictDoNothing()
-      .returning();
+    const [action] = await insertChatActions(writer, values, { onConflictDoNothing: true });
     if (!action) {
       const [existing] = await writer
         .select()
@@ -1168,6 +1167,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                   eq(chatGitHubReviews.endpointId, source.endpoint.id),
                   eq(chatGitHubReviews.repositoryId, source.repositoryId),
                   eq(chatGitHubReviews.pullNumber, source.number),
+                  eq(chatGitHubReviews.companyId, session.companyId),
+                  primaryGitHubReview(),
                   gt(chatGitHubReviews.createdAt, source.run.createdAt),
                   sql`${chatGitHubReviews.runId} is distinct from ${source.run.id}`,
                   sql`${chatGitHubReviews.assessment} is not null`,

@@ -163,6 +163,26 @@ suite("GitHub green-gate persistence (real PostgreSQL, no network)", () => {
     return { companyId, endpointId, review, stateOf, delivery };
   }
 
+  it.each(["review", "delivery"] as const)("primary deduplication and head supersession ignore shadow %s authority", async (authority) => {
+    const f = await fixture();
+    const completed = await f.review(NEW, "completed", { assessed: true, deliveryId: await f.delivery(randomUUID()) });
+    const queued = await f.review(OLD, "queued", { deliveryId: await f.delivery(randomUUID()) });
+    for (const row of [completed, queued]) {
+      if (authority === "review") {
+        await db.update(chatGitHubReviews).set({ shadowLabel: "candidate" }).where(eq(chatGitHubReviews.id, row.id));
+      } else {
+        await db.update(chatDeliveries).set({ githubShadowLabel: "candidate" }).where(eq(chatDeliveries.id, row.deliveryId));
+      }
+    }
+    expect(await githubGreenReviewAttempt(db, {
+      companyId: f.companyId, endpointId: f.endpointId, repositoryId: REPO, pullNumber: PR, headSha: NEW,
+    })).toMatchObject({ kind: "ready", attempt: 1 });
+    expect(await supersedeQueuedGitHubReviews(db, {
+      companyId: f.companyId, endpointId: f.endpointId, repositoryId: REPO, pullNumber: PR, beforeHeadSha: OLD,
+    })).toBe(0);
+    expect(await f.stateOf(queued.id)).toBe("queued");
+  });
+
   it("supersedes only never-started queued rows of older heads on synchronize", async () => {
     const f = await fixture();
     const stale = await f.review(OLD, "queued");

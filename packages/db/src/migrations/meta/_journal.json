@@ -2066,6 +2066,13 @@
       "when": 1792258530244,
       "tag": "0296_steep_patriot",
       "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1792260537358,
+      "tag": "0297_chat_capture_outbound_fence",
+      "breakpoints": true
     }
   ]
 }

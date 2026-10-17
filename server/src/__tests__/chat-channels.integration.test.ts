@@ -3777,6 +3777,127 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ));
       return conversation;
     }
+    it("shadow final replies stay internal before begin_review and after config changes", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-final-intent", "@maya review this");
+      const session = await shadowTestSession(f, conversation);
+      await db.update(heartbeatRuns).set({ contextSnapshot: await chatWakeContext({
+        endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: "shadow-final-intent",
+      }) }).where(eq(heartbeatRuns.id, session.runId));
+      await saveShadowMode(f, false);
+      const { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } = await import("../services/chat-run-publications.js");
+      const comment = await issueService(db).addComment(
+        conversation.issueId, "Private candidate answer",
+        { agentId: session.agentId, runId: session.runId },
+        { authorType: "agent", authorizationReason: CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON },
+      );
+      expect(comment.body).toBe("Private candidate answer");
+      const storage = createStorageService();
+      const stored = await storage.storage.putFile({
+        companyId: f.companyId, namespace: `issues/${conversation.issueId}`,
+        originalFilename: "candidate.txt", contentType: "text/plain", body: Buffer.from("Private attachment"),
+      });
+      await issueService(db).createAttachment({
+        issueId: conversation.issueId, issueCommentId: comment.id,
+        provider: stored.provider, objectKey: stored.objectKey, contentType: stored.contentType,
+        byteSize: stored.byteSize, sha256: stored.sha256, originalFilename: stored.originalFilename,
+        createdByAgentId: session.agentId, createdByRunId: session.runId,
+      });
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      await f.service.processPendingPublications();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it("shadow explicit sends return a capture outcome without a publication row", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-explicit-intent", "@maya review this");
+      await saveShadowMode(f, false);
+      const comment = await issueService(db).addComment(conversation.issueId, "Private board reply", { userId: "owner-user" });
+      expect(await f.service.publishComment(f.endpoint.id, conversation.id, comment.id)).toMatchObject({ status: "shadow_stored" });
+      expect(await f.service.publishBoardMessage(f.endpoint.id, conversation.id, "Private explicit reply", "capture-send", "owner-user")).toMatchObject({ status: "shadow_stored" });
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it.each(["running", "failed", "timed_out", "cancelled", "succeeded"] as const)(
+      "shadow %s milestones create zero intents after disabling shadow",
+      async (status) => {
+        const f = await reviewBotFixture();
+        await saveShadowMode(f, true);
+        const conversation = await deliverShadowTestMention(f, `shadow-milestone-${status}`, "@maya review this");
+        const session = await shadowTestSession(f, conversation);
+        await db.update(heartbeatRuns).set({ status, contextSnapshot: {
+          ...await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: `shadow-milestone-${status}` }),
+        } }).where(eq(heartbeatRuns.id, session.runId));
+        await saveShadowMode(f, false);
+        await enqueueChatRunMilestones(db);
+        expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      },
+    );
+    it("shadow database tripwires reject direct outbound inserts but permit local wake bookkeeping", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-db-tripwire", "@maya review this");
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id));
+      await saveShadowMode(f, false);
+      await expect(db.insert(chatPublications).values({
+        companyId: f.companyId, endpointId: f.endpoint.id, conversationId: conversation.id,
+        issueId: conversation.issueId, idempotencyKey: randomUUID(), payload: { text: "Bypass" },
+      })).rejects.toThrow();
+      for (const kind of ["github_review_publication", "github_review_check", "receipt_reaction", "provider_effect", "future_outbound_kind"]) {
+        await expect(db.insert(chatActions).values({
+          companyId: f.companyId, endpointId: f.endpoint.id, deliveryId: delivery.id,
+          kind, providerActionId: randomUUID(), payload: {}, status: "received",
+        })).rejects.toThrow();
+      }
+      await expect(db.insert(chatActions).values({
+        companyId: f.companyId, endpointId: f.endpoint.id, deliveryId: delivery.id,
+        kind: "inbound_wakeup", providerActionId: randomUUID(), payload: {}, status: "processed",
+      })).resolves.toBeDefined();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it("cancels a legacy check bound only to a captured admission without a review row", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      // Model an intent from before the insertion tripwire. Its exact delivery
+      // has capture authority, even if no review record survived the old run.
+      await db.update(chatDeliveries).set({ githubShadowLabel: "meta-shadow" }).where(eq(chatDeliveries.id, admitted.deliveryId));
+      await db.delete(chatGitHubReviews).where(eq(chatGitHubReviews.id, admitted.id));
+      const recorder = installShadowRecorder(f, head);
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      const [action] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(action).toMatchObject({ status: "cancelled", result: { code: "shadow_mode" } });
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("shadow interaction prompts and exact event/run-only actions create no intents", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-interaction-intent", "@maya review this");
+      const session = await shadowTestSession(f, conversation);
+      const context = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: "shadow-interaction-intent" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, session.runId));
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id));
+      await saveShadowMode(f, false);
+      await issueThreadInteractionService(db).create(
+        { id: conversation.issueId, companyId: f.companyId },
+        { kind: "request_confirmation", continuationPolicy: "wake_assignee", sourceRunId: session.runId,
+          title: "Candidate question", payload: { version: 1, prompt: "Private question?", acceptLabel: "Yes", rejectLabel: "No" } },
+        { agentId: session.agentId, runId: session.runId },
+      );
+      const { insertChatActions } = await import("../services/chat-publication-authority.js");
+      for (const payload of [
+        { event: { deliveryId: delivery.providerEventId } },
+        { runId: session.runId },
+        { session: { issueId: conversation.issueId, runId: session.runId } },
+      ]) {
+        const value = { companyId: f.companyId, endpointId: f.endpoint.id, kind: "future_outbound_kind", providerActionId: randomUUID(), payload };
+        expect(await insertChatActions(db, value)).toEqual([]);
+        await expect(db.insert(chatActions).values(value)).rejects.toThrow();
+      }
+      await f.service.processPendingPublications();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      expect(await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), inArray(chatActions.kind, ["future_outbound_kind", "confirmation_response", "receipt_reaction"])))).toHaveLength(0);
+    });
     it("keeps manual shadow admission capture-only before begin_review after disabling shadow", async () => {
       const f = await reviewBotFixture();
       await saveShadowMode(f, true);
@@ -3881,8 +4002,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       if (!mentionConversation) throw new Error("Expected mention conversation");
       expect(mentionConversation.issueId).not.toBe(admitted.issueId);
       const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
-      const stageProbe = async (conversation: typeof mentionConversation) => {
-        const [row] = await db.insert(chatPublications).values({
+      // Seed pre-migration rows in the disposable database only. Transactional
+      // DDL holds the table lock and restores the tripwire even on rollback.
+      const stageProbe = async (conversation: typeof mentionConversation, legacy = true) => db.transaction(async (tx) => {
+        if (legacy) await tx.execute(sql`ALTER TABLE chat_publications DISABLE TRIGGER chat_publication_capture_only`);
+        const [row] = await tx.insert(chatPublications).values({
           companyId: f.companyId,
           endpointId: f.endpoint.id,
           conversationId: conversation.id,
@@ -3891,8 +4015,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           payload: { text: "Shadow gate probe" },
           state: "pending",
         }).returning();
+        if (legacy) await tx.execute(sql`ALTER TABLE chat_publications ENABLE TRIGGER chat_publication_capture_only`);
         return row;
-      };
+      });
       const liveProbe = await stageProbe(mentionConversation);
       await f.service.processPendingPublications();
       const [liveResult] = await db
@@ -3925,7 +4050,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(endpointRuntime?.posts.filter((post) => post.text === "Shadow gate probe")).toHaveLength(0);
       // Positive control: a new task admitted after disabling shadow can publish.
       const primaryConversation = await deliverShadowTestMention(f, "primary-after-toggle", "@maya new review", 98);
-      const primaryProbe = await stageProbe(primaryConversation);
+      const primaryProbe = await stageProbe(primaryConversation, false);
       await f.service.processPendingPublications();
       const [primaryResult] = await db.select().from(chatPublications).where(eq(chatPublications.id, primaryProbe.id));
       expect(primaryResult.state).toBe("published");
@@ -4040,6 +4165,64 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(endpointRuntime.reactions).toEqual([]);
       await f.service.shutdown();
     });
+    it.each([
+      { outcome: "blocking", state: "completed", score: 2, primaryScore: 5 },
+      { outcome: "passing", state: "completed", score: 5, primaryScore: 2 },
+      { outcome: "error", state: "error", score: 2, primaryScore: 5 },
+      { outcome: "incomplete", state: "incomplete", score: 2, primaryScore: 5 },
+      { outcome: "timeout", state: "running", score: 2, primaryScore: 5 },
+    ] as const)(
+      "primary gate ignores a newer same-head shadow $outcome outcome",
+      async ({ state: candidateState, score: candidateScore, primaryScore }) => {
+        const f = await reviewBotFixture();
+        const head = "b".repeat(40);
+        const recorder = installShadowRecorder(f, head);
+        const admitted = await admitShadowTestPullRequest(f, head);
+        const session = await shadowTestSession(f, admitted);
+        const [candidateTask] = await db.insert(issues).values({
+          companyId: f.companyId, title: "Isolated candidate", assigneeAgentId: f.assignedAgentId,
+        }).returning();
+        const [candidateRun] = await db.insert(heartbeatRuns).values({
+          companyId: f.companyId, agentId: f.assignedAgentId,
+          status: candidateState === "running" ? "timed_out" : "failed",
+          contextSnapshot: { issueId: candidateTask.id },
+        }).returning();
+        const [primaryDelivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, admitted.deliveryId));
+        const [candidateDelivery] = await db.insert(chatDeliveries).values({
+          ...primaryDelivery, id: randomUUID(), conversationId: null,
+          providerEventId: `candidate:${randomUUID()}`, deduplicationKey: randomUUID(),
+          githubShadowLabel: "meta-shadow",
+          // Paired arms can carry the same canonical provider event, but never
+          // borrow authority through that copied event's deliveryId string.
+        }).returning();
+        const [candidate] = await db.insert(chatGitHubReviews).values({
+          ...admitted, id: randomUUID(), issueId: candidateTask.id,
+          deliveryId: candidateDelivery.id, runId: candidateRun.id,
+          shadowLabel: "meta-shadow", state: candidateState,
+          assessment: candidateState === "completed" ? { ...shadowTestAssessment(head), score: candidateScore } : null,
+          createdAt: new Date(Date.now() + 1000),
+        }).returning();
+        const checks = githubReviewCheckService(db, f.providerFetch);
+        await checks.processPending();
+        const [check] = await shadowTestActions(f.endpoint.id, "github_review_check");
+        expect(check.status).toBe("received");
+        expect(check.result).toMatchObject({ state: "running" });
+        expect(recorder.mutations.some((call) => call.url.endsWith("/check-runs"))).toBe(true);
+        const reviewService = githubChatReviewService(db, f.providerFetch);
+        expect(await reviewService.execute(session, "submit_review", {
+          ...shadowTestAssessment(head), score: primaryScore,
+          ...(primaryScore === 5 ? { findings: [] } : {}),
+          summary: "Primary result", rationale: "Primary result is independent",
+        })).toMatchObject({ status: "processed", conclusion: primaryScore === 5 ? "success" : "failure" });
+        await db.update(chatActions).set({ result: { retryAt: new Date(0).toISOString() } })
+          .where(eq(chatActions.id, check.id));
+        await checks.processPending();
+        const [settled] = await shadowTestActions(f.endpoint.id, "github_review_check");
+        expect(settled).toMatchObject({ status: "processed", result: { code: "assessment_owns_check", reviewId: admitted.id } });
+        const [storedCandidate] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, candidate.id));
+        expect(storedCandidate).toEqual(candidate);
+      },
+    );
     it("cancels a check intent staged before shadow mode was enabled without any provider call", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
