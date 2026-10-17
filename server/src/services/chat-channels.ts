@@ -130,7 +130,7 @@ import {
   githubExplicitMentionEvent,
   githubMessageAddressesAnotherBot,
 } from "./chat-github-events.js";
-import { githubReviewPrompt, githubManualMessagePrompt, GITHUB_CONFIGURED_SKILL_GUIDANCE } from "./chat-github-review-policy.js";
+import { githubReviewPrompt, githubManualMessagePrompt, githubShadowLabel, GITHUB_CONFIGURED_SKILL_GUIDANCE } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubIssueEventContext, GitHubAutomaticEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
 import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
@@ -3070,7 +3070,7 @@ export async function hydrateOutboundAttachment(input: {
 export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const runtime = options.runtime ?? createChatRuntime();
   const githubManualMessages = new WeakMap<object, { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" }>();
-  const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy }>();
+  const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy; shadowLabel?: string | null }>();
   const githubIssueMessages = new WeakMap<object, { context: GitHubIssueEventContext; revision: number; policy: GitHubReviewPolicy }>();
   const runtimeVersions = new Map<string, string>();
   const runtimeLocalEpochs = new Map<string, number>();
@@ -3544,6 +3544,98 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  /** Shadow GitHub endpoints store review assessments but must never create
+   * GitHub objects. Every generic-egress seam consults this before staging
+   * or dispatching a provider write. Returns the shadow label, else null. */
+  async function githubEndpointShadowLabel(
+    endpointId: string,
+  ): Promise<string | null> {
+    const [config] = await db
+      .select({ configuration: chatGitHubConfigurations.configuration })
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpointId));
+    return config ? githubShadowLabel(config.configuration) : null;
+  }
+
+  /** The shadow label pinned on a review row for this task, if any. A pinned
+   * shadow review must never publish generic chat output either, even after
+   * shadow mode is disabled in config; mirrors the review tools' lookup. */
+  async function githubPinnedShadowLabel(input: {
+    companyId: string;
+    endpointId: string;
+    issueId: string;
+  }): Promise<string | null> {
+    const [row] = await db
+      .select({ shadowLabel: chatGitHubReviews.shadowLabel })
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.companyId, input.companyId),
+          eq(chatGitHubReviews.endpointId, input.endpointId),
+          eq(chatGitHubReviews.issueId, input.issueId),
+          isNotNull(chatGitHubReviews.shadowLabel),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(1);
+    return row?.shadowLabel ?? null;
+  }
+
+  /** The pinned shadow label for the task a receipt-reaction action belongs
+   * to, resolved through its delivery's conversation (or the conversation
+   * recorded on the action itself for terminal removals). */
+  async function githubPinnedShadowLabelForReceiptAction(action: {
+    companyId: string;
+    endpointId: string;
+    deliveryId: string | null;
+    conversationId: string | null;
+  }): Promise<string | null> {
+    let issueId: string | null = null;
+    if (action.deliveryId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatDeliveries)
+        .innerJoin(
+          chatConversations,
+          and(
+            eq(chatConversations.id, chatDeliveries.conversationId),
+            eq(chatConversations.companyId, chatDeliveries.companyId),
+            eq(chatConversations.endpointId, chatDeliveries.endpointId),
+          ),
+        )
+        .where(
+          and(
+            eq(chatDeliveries.id, action.deliveryId),
+            eq(chatDeliveries.companyId, action.companyId),
+            eq(chatDeliveries.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    if (!issueId && action.conversationId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.id, action.conversationId),
+            eq(chatConversations.companyId, action.companyId),
+            eq(chatConversations.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    return issueId
+      ? githubPinnedShadowLabel({
+          companyId: action.companyId,
+          endpointId: action.endpointId,
+          issueId,
+        })
+      : null;
+  }
+
   async function addReceiptReaction(input: {
     deliveryId: string;
     endpoint: EndpointRow;
@@ -3868,6 +3960,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               result: {
                 attempts: attempt,
                 code: "receipt_reaction_runtime_superseded",
+              },
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatActions.id, action!.id),
+                eq(chatActions.status, "processing"),
+                sql`(${chatActions.result}->>'attempts')::int = ${attempt}`,
+              ),
+            );
+          await credentialLease.assertOwned(tx);
+        });
+        return;
+      }
+      if (
+        record.endpoint.provider === "github" &&
+        ((await githubEndpointShadowLabel(record.endpoint.id)) ||
+          (await githubPinnedShadowLabelForReceiptAction(action)))
+      ) {
+        await db.transaction(async (tx) => {
+          await credentialLease.assertOwned(tx);
+          await tx
+            .update(chatActions)
+            .set({
+              status: "cancelled",
+              result: {
+                attempts: attempt,
+                code: "receipt_reaction_shadow_mode",
               },
               updatedAt: new Date(),
             })
@@ -16559,6 +16679,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             pullNumber: githubAutomatic.context.pullNumber, headSha: githubAutomatic.context.headSha,
             deliveryId: activeDelivery.id, configurationRevision: githubAutomatic.revision,
             policySnapshot: githubAutomatic.policy, event: githubAutomatic.context, state: "queued",
+            shadowLabel: githubAutomatic.shadowLabel ?? null,
           }).onConflictDoNothing();
         }
         await stageInboundWakeup(taskTx, {
@@ -17468,7 +17589,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (endpointRuntime.provider === "github" && githubManual && typeof githubManual === "object") githubManualMessages.set(message, githubManual as { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" });
     const githubAutomatic = delivery.normalizedEvent.githubAutomatic;
     if (endpointRuntime.provider === "github" && githubAutomatic && typeof githubAutomatic === "object") {
-      githubAutomaticMessages.set(message, githubAutomatic as { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy });
+      githubAutomaticMessages.set(message, githubAutomatic as { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy; shadowLabel?: string | null });
     }
     const githubIssue = delivery.normalizedEvent.githubIssue;
     if (endpointRuntime.provider === "github" && githubIssue && typeof githubIssue === "object") {
@@ -27663,7 +27784,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         author: { userId: event.author.id, userName: event.author.login, fullName: event.author.login, isBot: false, isMe: false, isSystem: false },
         metadata: { dateSent: new Date(), edited: false }, attachments: [], links: [], isMention: true,
       } as unknown as Message;
-      githubAutomaticMessages.set(message, { context: event, revision: admission.revision, policy: admission.policy });
+      githubAutomaticMessages.set(message, { context: event, revision: admission.revision, policy: admission.policy, shadowLabel: admission.shadowLabel });
       await processMessage(endpoint, thread, message, "mention", true, `https://github.com/${event.repository}/pull/${event.pullNumber}`, { ...runtimeContext, endpointRuntime }, undefined, null, false);
       return new Response("accepted", { status: 202 });
     }
@@ -29717,6 +29838,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       context: event,
       revision: admission.revision,
       policy: admission.policy,
+      shadowLabel: admission.shadowLabel,
     });
     await processMessage(
       endpoint,
@@ -37730,6 +37852,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ]);
         if (!endpoint || !conversation)
           throw new Error("Chat publication binding is unavailable");
+        if (
+          endpoint.provider === "github" &&
+          ((await githubEndpointShadowLabel(endpoint.id)) ||
+            (await githubPinnedShadowLabel({
+              companyId: publication.companyId,
+              endpointId: endpoint.id,
+              issueId: publication.issueId,
+            })))
+        ) {
+          // Shadow review endpoints never create GitHub objects: agent
+          // replies, milestones and interaction prompts stay in Paperclip.
+          // The pinned row label keeps suppressing this review task's
+          // output even after shadow mode is disabled in config.
+          await publicationLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({
+              state: "cancelled",
+              redactedError: "Shadow review endpoint does not publish to GitHub",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, publication.id),
+                eq(chatPublications.state, "streaming"),
+                eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+            );
+          return;
+        }
         const providerVisibleCompletion =
           conversation.state === "completed" &&
           !isExplicitOperatorPublication(publication) &&

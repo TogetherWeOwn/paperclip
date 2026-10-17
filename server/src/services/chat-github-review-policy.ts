@@ -22,6 +22,18 @@ export function effectiveGitHubReviewPolicy(
   };
 }
 
+/**
+ * The endpoint's shadow label when shadow review mode is enabled, else null.
+ * Shadow reviews run and store assessments exactly like normal reviews but
+ * must never publish to GitHub; every publication seam checks this (or the
+ * label pinned on the review row) before any provider write.
+ */
+export function githubShadowLabel(
+  configuration: GitHubChatConfiguration,
+): string | null {
+  return configuration.shadow?.enabled ? configuration.shadow.label : null;
+}
+
 /** Small deterministic glob grammar: *, **, ?. No regexp or expression execution. */
 export function matchesGitHubReviewPattern(
   value: string,

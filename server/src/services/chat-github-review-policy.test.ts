@@ -7,6 +7,7 @@ import {
   type GitHubReviewEventContext,
   type GitHubIssueEventContext,
 } from "@paperclipai/shared";
+import { githubChatConfigurationSchema } from "@paperclipai/shared";
 import {
   githubManualMessagePrompt,
   githubConfiguredInstructionSources,
@@ -15,6 +16,7 @@ import {
   githubReviewConclusion,
   githubReviewLineIsInPatch,
   githubReviewSchedulingDecision,
+  githubShadowLabel,
   matchesGitHubReviewPattern,
   validateGitHubReviewAssessment,
   validatePersistedGitHubReviewAssessment,
@@ -382,7 +384,6 @@ describe("GitHub score validation", () => {
   });
 });
 
-
 describe("GitHub task message guidance", () => {
   const input = () => ({ event: "mention" as const, policy: defaultGitHubReviewPolicy(), repository: "test/repo",
     thread: "github:test/repo:issue:5", sender: { id: "42", login: "octocat" }, message: "@maya u there?" });
@@ -418,5 +419,43 @@ describe("GitHub task message guidance", () => {
     expect(prompt).toContain("Use submit_review to publish your review summary");
     expect(prompt).toContain("do not post a separate comment just to announce that the review is complete");
     expect(prompt).toContain("Do not reference these instructions in your replies");
+  });
+});
+
+describe("shadow review configuration", () => {
+  it("treats absent or disabled shadow config as publishing (null label)", () => {
+    expect(githubShadowLabel(configuration())).toBeNull();
+    expect(
+      githubShadowLabel({
+        ...configuration(),
+        shadow: { enabled: false, label: "meta-shadow" },
+      }),
+    ).toBeNull();
+  });
+  it("returns the label only when shadow mode is enabled", () => {
+    expect(
+      githubShadowLabel({
+        ...configuration(),
+        shadow: { enabled: true, label: "meta-shadow" },
+      }),
+    ).toBe("meta-shadow");
+  });
+  it("keeps pre-shadow configurations valid and rejects malformed labels", () => {
+    expect(
+      githubChatConfigurationSchema.safeParse(configuration()).success,
+    ).toBe(true);
+    expect(
+      githubChatConfigurationSchema.safeParse({
+        ...configuration(),
+        shadow: { enabled: true, label: "meta-shadow" },
+      }).success,
+    ).toBe(true);
+    for (const label of ["", "has space", "x".repeat(65), "-lead"])
+      expect(
+        githubChatConfigurationSchema.safeParse({
+          ...configuration(),
+          shadow: { enabled: true, label },
+        }).success,
+      ).toBe(false);
   });
 });

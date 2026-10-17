@@ -17,7 +17,7 @@ import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { createHash } from "node:crypto";
 import { githubResponseCommentService, writeGitHubResponseComment } from "./chat-github-response-comments.js";
-import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   toolInvocations,
@@ -52,6 +52,7 @@ import {
   githubReviewConclusion,
   githubReviewPathIsExcluded,
   githubReviewLineIsInPatch,
+  githubShadowLabel,
   validateGitHubReviewAssessment,
   validatePersistedGitHubReviewAssessment,
 } from "./chat-github-review-policy.js";
@@ -313,7 +314,30 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         source.config.configuration,
         repositoryId,
       ),
+      shadowLabel: githubShadowLabel(source.config.configuration),
     };
+  }
+  /** The shadow label pinned on this task's newest review row, if any. A
+   * labelled review must never publish, even if shadow mode is later
+   * disabled in config, so write tools consult the row as well as config. */
+  async function pinnedShadowLabel(
+    session: Session,
+    source: Awaited<ReturnType<typeof scope>>,
+  ): Promise<string | null> {
+    const [row] = await db
+      .select({ shadowLabel: chatGitHubReviews.shadowLabel })
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.companyId, session.companyId),
+          eq(chatGitHubReviews.endpointId, source.endpoint.id),
+          eq(chatGitHubReviews.issueId, source.issue.id),
+          isNotNull(chatGitHubReviews.shadowLabel),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(1);
+    return row?.shadowLabel ?? null;
   }
   async function client(
     source: Awaited<ReturnType<typeof scope>>,
@@ -439,16 +463,19 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         policySnapshot: manual?.policy ?? automatic?.policy ?? source.policy,
         event: context,
         state: "running",
+        shadowLabel: source.shadowLabel,
       })
       .onConflictDoNothing()
       .returning();
     if (review) {
-      await githubReviewCheckService(db, fetchImpl).enqueue(
-        source.endpoint,
-        context,
-        true,
-        "authorized_manual_request",
-      );
+      // Shadow reviews never create a check run (enqueue also guards).
+      if (!source.shadowLabel)
+        await githubReviewCheckService(db, fetchImpl).enqueue(
+          source.endpoint,
+          context,
+          true,
+          "authorized_manual_request",
+        );
       return review;
     }
     const [existing] = await db
@@ -551,6 +578,15 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     const api = await client(source);
     if (name === "comment" || name === "update_comment") {
       const parsed = commentSchema.parse(input);
+      const shadowLabel =
+        source.shadowLabel ?? (await pinnedShadowLabel(session, source));
+      if (shadowLabel)
+        return {
+          actionId: null,
+          status: "shadow_stored",
+          receipt: null,
+          shadowLabel,
+        };
       const actionId = await stage(
         source,
         name,
@@ -797,8 +833,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         throw conflict(
           "A complete assessment must cover every non-excluded changed file",
         );
+      // Shadow if the label was pinned at review creation or shadow mode is
+      // enabled in the current config; either direction suppresses, so
+      // toggling config mid-review can never leak a shadow assessment.
+      const shadowLabel = review.shadowLabel ?? source.shadowLabel;
       // Commit the immutable assessment and its publication together. A restart
       // must never leave a stored result with no durable publication intent.
+      // Shadow reviews are the one exception: the stored assessment is the
+      // whole result, and no publication intent is ever staged.
       const actionId = await db.transaction(async (tx) => {
         const [current] = await tx
           .select()
@@ -824,6 +866,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               review.policySnapshot.ratingThreshold,
             ),
             state: assessment.complete ? "completed" : "incomplete",
+            shadowLabel: current.shadowLabel ?? shadowLabel,
             updatedAt: new Date(),
           })
           .where(
@@ -832,6 +875,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               eq(chatGitHubReviews.companyId, session.companyId),
             ),
           );
+        if (shadowLabel) return null;
         return stage(
           source,
           "assessment",
@@ -843,21 +887,36 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           tx,
         );
       });
+      const conclusion = githubReviewConclusion(
+        assessment,
+        review.policySnapshot.ratingThreshold,
+      );
+      if (!actionId)
+        return {
+          reviewId: review.id,
+          actionId: null,
+          status: "shadow_stored",
+          receipt: null,
+          score: assessment.score,
+          conclusion,
+          shadowLabel,
+        };
       await processPublication(actionId);
       return {
         reviewId: review.id,
         ...(await receipt(actionId)),
         score: assessment.score,
-        conclusion: githubReviewConclusion(
-          assessment,
-          review.policySnapshot.ratingThreshold,
-        ),
+        conclusion,
       };
     }
     if (name === "formal_review") {
       const parsed = formalSchema.parse(input);
       if (parsed.reviewedCommit !== pull.head.sha)
         throw conflict("The PR head changed. Review the new commits first.");
+      if (source.shadowLabel)
+        throw forbidden(
+          "Shadow review endpoints never publish formal GitHub reviews",
+        );
       assertFormalPermission(source.policy, parsed.event);
       const [assessed] = await db
         .select()
@@ -873,6 +932,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         );
       if (!assessed?.assessment?.complete)
         throw conflict("Submit a complete assessment before a formal review");
+      if (assessed.shadowLabel)
+        throw forbidden(
+          "Shadow review endpoints never publish formal GitHub reviews",
+        );
       const actionId = await stage(
         source,
         "formal_review",
@@ -1054,6 +1117,11 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             source.delivery.id !== action.deliveryId
           )
             throw forbidden("GitHub publication context changed");
+          // Defense in depth for intents staged before shadow mode was
+          // enabled: a 403 settles the action as cancelled, never retried,
+          // and no provider write has happened yet at this point.
+          if (source.shadowLabel)
+            throw forbidden("Shadow review endpoints do not publish to GitHub");
           await assertPublicationAuthority(source, action);
           const providerApi = await client(source, lease.fetch);
           const api: typeof providerApi = { ...providerApi, request: async (path, options) => {
@@ -1095,6 +1163,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           };
           const currentHead = async (expected: string) => {
             const currentSource = await scope(session, true);
+            // Called immediately before each write group, so this also stops
+            // a dispatch whose endpoint entered shadow mode mid-flight.
+            if (currentSource.shadowLabel)
+              throw forbidden("Shadow reviews are never published to GitHub");
             await assertPublicationAuthority(currentSource, action);
             if (action.payload.operation === "formal_review")
               assertFormalPermission(
@@ -1124,6 +1196,11 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           const operation = action.payload.operation;
           let receipt: Record<string, unknown>;
           if (operation === "comment" || operation === "update_comment") {
+            const fresh = await scope(session, true);
+            // Re-check before the write: shadow enabled, or a label pinned,
+            // while this dispatch was in flight still suppresses the write.
+            if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
+              throw forbidden("Shadow reviews are never published to GitHub");
             receipt = await writeGitHubResponseComment(db, source, api, lease, {
               body: publicReviewText(String(action.payload.body)), final: operation === "comment", versionAt: action.createdAt,
             }, async () => assertPublicationAuthority(await scope(session, true), action));
@@ -1142,6 +1219,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               `/pulls/${source.number}/reviews`,
               publicationMarker,
             );
+            const fresh = await scope(session, true);
+            if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
+              throw forbidden("Shadow reviews are never published to GitHub");
             const posted =
               prior ??
               (await api.request<{ id: number; html_url: string }>(
@@ -1171,6 +1251,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               .limit(1);
             if (!review?.assessment)
               throw conflict("Review assessment is unavailable");
+            if (review.shadowLabel)
+              throw forbidden("Shadow reviews are never published to GitHub");
             await currentHead(review.headSha);
             const assessment = validatePersistedGitHubReviewAssessment(
               review.assessment,
