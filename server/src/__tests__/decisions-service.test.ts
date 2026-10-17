@@ -21,6 +21,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { conflict } from "../errors.js";
 import { attentionService } from "../services/attention.js";
 import { decisionService } from "../services/decisions.js";
 import { hashAttentionArchiveManifest } from "../services/decision-retention.js";
@@ -431,6 +432,106 @@ describePg("decisionService", () => {
     expect((await service().get(created.id))?.executionStatus).toBe("succeeded");
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+  });
+
+  it("skips an expired decision continuation when its origin agent is paused", async () => {
+    const created = await createCommentDecision("lenient", { expiresAt: nearFutureExpiry() });
+    await expireDecisionNow(created.id);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const wakeOriginAgent = vi.fn(async () => {
+      throw conflict("Agent is not invokable in its current state", {
+        status: "paused", reason: "paused", invalidOrgChain: false, agentId, agentStatus: "paused",
+      });
+    });
+    const unavailableService = decisionService(db, { wakeOriginAgent });
+
+    await expect(unavailableService.sweepExpired()).resolves.toMatchObject({ expired: 1 });
+    expect((await unavailableService.get(created.id))?.metadata).toMatchObject({
+      continuationPending: false,
+      continuationSkippedReason: "origin_agent_not_invokable",
+    });
+    await unavailableService.sweepExpired();
+    expect(wakeOriginAgent).toHaveBeenCalledTimes(1);
+    expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]?.status).toBe("paused");
+  });
+
+  it.each([
+    { status: "paused", reason: "paused", invalidOrgChain: false },
+    { status: "terminated", reason: "terminated", invalidOrgChain: false },
+    { status: "pending_approval", reason: "pending_approval", invalidOrgChain: false },
+    { status: "active", reason: "manager_terminated", invalidOrgChain: true },
+  ] as const)("skips a pending continuation after restart for $reason without claiming delivery", async ({ status, reason, invalidOrgChain }) => {
+    const created = await createCommentDecision();
+    await db.update(decisions).set({ status: "expired", metadata: { expiredReason: "ttl", continuationPending: true } })
+      .where(eq(decisions.id, created.id));
+    await db.update(agents).set({ status }).where(eq(agents.id, agentId));
+    const wakeOriginAgent = vi.fn(async () => {
+      throw conflict("Invocation denied", { status, reason, invalidOrgChain, agentId });
+    });
+    const unavailableService = decisionService(db, { wakeOriginAgent });
+
+    await expect(unavailableService.sweepExpired()).resolves.toEqual({ expired: 0, resumed: 0 });
+    const recovered = await unavailableService.get(created.id);
+    expect(recovered?.metadata).toMatchObject({
+      expiredReason: "ttl",
+      continuationPending: false,
+      continuationSkippedReason: "origin_agent_not_invokable",
+    });
+    expect(recovered?.metadata).not.toHaveProperty("continuationDeliveredAt");
+    await unavailableService.sweepExpired();
+    expect(wakeOriginAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["message_only", "budget_conflict", "other_agent"])("retains the continuation for an unrelated %s wake failure", async (kind) => {
+    const created = await createCommentDecision();
+    const error = kind === "message_only" ? new Error("Agent is not invokable")
+      : kind === "budget_conflict" ? conflict("Budget exceeded", { scopeType: "agent", scopeId: agentId })
+        : conflict("Invocation denied", { agentId: randomUUID(), reason: "paused", invalidOrgChain: false });
+    const unavailableService = decisionService(db, { wakeOriginAgent: async () => { throw error; } });
+
+    await expect(unavailableService.cancel(created.id, { actorType: "agent", actorId: agentId, runId })).rejects.toBe(error);
+    const cancelled = await service().get(created.id);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(cancelled?.metadata).toMatchObject({ continuationPending: true });
+    expect(cancelled?.metadata).not.toHaveProperty("continuationSkippedReason");
+    expect(cancelled?.metadata).not.toHaveProperty("continuationDeliveredAt");
+    await service().sweepExpired();
+    expect(wakes).toHaveLength(1);
+  });
+
+  it.each(["running", "pending", "expiring"])("continues past a failed %s recovery item and retains its retry", async (phase) => {
+    const failed = await createCommentDecision();
+    const healthy = await createCommentDecision();
+    const earlier = new Date(Date.now() - 2_000);
+    const later = new Date(Date.now() - 1_000);
+    for (const [decision, time] of [[failed, earlier], [healthy, later]] as const) {
+      await db.update(decisions).set(phase === "running"
+        ? { status: "decided", executionStatus: "running", chosenOptionId: "yes", decidedByUserId, inputValues: {}, updatedAt: time }
+        : phase === "pending"
+          ? { status: "expired", metadata: { continuationPending: true }, updatedAt: time }
+          : { expiresAt: time }).where(eq(decisions.id, decision.id));
+    }
+    process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS = "0";
+    const flakyService = decisionService(db, { wakeOriginAgent: async (input) => {
+      if (input.decisionId === failed.id) throw new Error("temporary wake transport failure");
+      wakes.push(input);
+    } });
+
+    await expect(flakyService.sweepExpired()).resolves.toEqual({
+      expired: phase === "expiring" ? 2 : 0,
+      resumed: phase === "running" ? 2 : 0,
+    });
+    expect(wakes.map((wake) => wake.decisionId)).toEqual([healthy.id]);
+    expect((await service().get(failed.id))?.metadata).toMatchObject({ continuationPending: true });
+    expect((await service().get(failed.id))?.metadata).not.toHaveProperty("continuationSkippedReason");
+    expect((await service().get(healthy.id))?.metadata).toMatchObject({ continuationPending: false });
+
+    await service().sweepExpired();
+    expect(wakes.map((wake) => wake.decisionId)).toEqual([healthy.id, failed.id]);
+    expect((await service().get(failed.id))?.metadata).toMatchObject({ continuationPending: false });
+    if (phase === "running") {
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(2);
+    }
   });
 
   it("retries a terminal continuation after a crash between effects and wake delivery", async () => {

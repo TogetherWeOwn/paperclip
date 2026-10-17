@@ -4,7 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { companyMemberships, decisionBundles, decisionEffectExecutions, decisionRetention, decisions, decisionTargetIssues, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import { ATTENTION_SOURCE_KINDS, decisionEffectTargetIssueIds } from "@paperclipai/shared";
 import type { AttentionArchiveManifestEntry, DecisionEffect, DecisionInput, DecisionOption, DecisionStatsCounts, DecisionStatsResponse } from "@paperclipai/shared";
-import { conflict, forbidden, notFound, tooManyRequests, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
@@ -13,6 +13,7 @@ import {
   type IssuePostCommitAction,
 } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
+import { logger } from "../middleware/logger.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
   descendantCount?: number; descendantIds?: string[]; childCount?: number; attentionArchive?: unknown };
@@ -618,8 +619,27 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     // Delivery is intentionally at-least-once: a crash after wakeup but before
     // this acknowledgement can retry, while a crash before wakeup cannot lose
     // the continuation. Heartbeat wakeups coalesce concurrent queued work.
-    await options.wakeOriginAgent({ companyId: decision.companyId, agentId: decision.originAgentId,
-      issueId: decision.originIssueId, decisionId: decision.id, outcome });
+    try {
+      await options.wakeOriginAgent({ companyId: decision.companyId, agentId: decision.originAgentId,
+        issueId: decision.originIssueId, decisionId: decision.id, outcome });
+    } catch (error) {
+      const details = error instanceof HttpError && error.status === 409 && error.details && typeof error.details === "object"
+        ? error.details as Record<string, unknown> : null;
+      const originNotInvokable = details?.agentId === decision.originAgentId &&
+        (details.invalidOrgChain === true || (typeof details.reason === "string" &&
+          ["paused", "terminated", "pending_approval", "unknown_status"].includes(details.reason)));
+      if (!originNotInvokable) throw error;
+      logger.warn({ companyId: decision.companyId, decisionId: decision.id, originAgentId: decision.originAgentId },
+        "decision continuation skipped because origin agent is not invokable");
+      await db.update(decisions).set({
+        metadata: sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
+          'continuationPending', false,
+          'continuationSkippedReason', 'origin_agent_not_invokable'
+        )`,
+        updatedAt: new Date(),
+      }).where(and(eq(decisions.id, decision.id), sql`${decisions.metadata} ->> 'continuationPending' = 'true'`));
+      return;
+    }
     await db.update(decisions).set({
       metadata: sql`coalesce(${decisions.metadata}, '{}'::jsonb) || jsonb_build_object(
         'continuationPending', false,
@@ -733,11 +753,16 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     let resumed = 0;
     for (const decision of runningRows) {
-      if (!decision.decidedByUserId) continue;
-      const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
-      if (recovered.executionStatus === "running") continue;
-      resumed += 1;
-      await deliverContinuation(recovered, "decided");
+      try {
+        if (!decision.decidedByUserId) continue;
+        const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
+        if (recovered.executionStatus === "running") continue;
+        resumed += 1;
+        await deliverContinuation(recovered, "decided");
+      } catch (error) {
+        logger.error({ err: error, companyId: decision.companyId, decisionId: decision.id },
+          "decision startup recovery item failed; continuing");
+      }
     }
     const pendingContinuations = await db.select().from(decisions)
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
@@ -746,7 +771,12 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     for (const decision of pendingContinuations) {
-      await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided");
+      try {
+        await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled" : "decided");
+      } catch (error) {
+        logger.error({ err: error, companyId: decision.companyId, decisionId: decision.id },
+          "decision continuation recovery item failed; continuing");
+      }
     }
     const ttlRows = await db.select().from(decisions)
       .where(and(eq(decisions.status, "open"), lte(decisions.expiresAt, now)))
@@ -759,26 +789,34 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       : [];
     targetSweepCursor = targetRows.length === remaining && targetRows.length > 0 ? targetRows[targetRows.length - 1]!.id : null;
     const rows = [...new Map([...ttlRows, ...targetRows].map((row) => [row.id, row])).values()]; let expired = 0;
-    for (const decision of rows) { const strictTargetIds = new Set(decision.options.flatMap((option) => option.effects.filter((effect) => effect.staleness === "strict").flatMap(decisionEffectTargetIssueIds)));
-      const targets = strictTargetIds.size > 0
-        ? await db.select({ id: issues.id, status: issues.status }).from(issues).where(and(eq(issues.companyId, decision.companyId), inArray(issues.id, [...strictTargetIds])))
-        : [];
-      const targetGone = targets.length !== strictTargetIds.size || targets.some((target) => target.status === "cancelled");
-      // A decision whose strict targets all completed after it was proposed is moot:
-      // the strict guard would skip its effects anyway, so retire it instead of
-      // leaving it pending until TTL. Targets that were already done at proposal
-      // time don't count — those decisions intentionally act on a done issue.
-      const snapshots = decision.targetSnapshots as Record<string, Snapshot>;
-      const targetsCompleted = !targetGone && strictTargetIds.size > 0 &&
-        targets.every((target) => target.status === "done") &&
-        targets.some((target) => snapshots[target.id]?.status !== "done");
-      if (!targetGone && !targetsCompleted && decision.expiresAt >= now) continue;
-      const reason = targetGone ? "target_gone" : targetsCompleted ? "target_completed" : "ttl";
-      const [updated] = await db.update(decisions).set({ status: "expired", updatedAt: now, metadata: { ...decision.metadata, expiredReason: reason,
-        ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, decision.id), eq(decisions.status, "open"))).returning();
-      if (!updated) continue; expired += 1;
-      await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
-      await deliverContinuation(updated, "expired"); }
+    for (const decision of rows) {
+      try {
+        const strictTargetIds = new Set(decision.options.flatMap((option) => option.effects.filter((effect) => effect.staleness === "strict").flatMap(decisionEffectTargetIssueIds)));
+        const targets = strictTargetIds.size > 0
+          ? await db.select({ id: issues.id, status: issues.status }).from(issues).where(and(eq(issues.companyId, decision.companyId), inArray(issues.id, [...strictTargetIds])))
+          : [];
+        const targetGone = targets.length !== strictTargetIds.size || targets.some((target) => target.status === "cancelled");
+        // A decision whose strict targets all completed after it was proposed is moot:
+        // the strict guard would skip its effects anyway, so retire it instead of
+        // leaving it pending until TTL. Targets that were already done at proposal
+        // time don't count — those decisions intentionally act on a done issue.
+        const snapshots = decision.targetSnapshots as Record<string, Snapshot>;
+        const targetsCompleted = !targetGone && strictTargetIds.size > 0 &&
+          targets.every((target) => target.status === "done") &&
+          targets.some((target) => snapshots[target.id]?.status !== "done");
+        if (!targetGone && !targetsCompleted && decision.expiresAt >= now) continue;
+        const reason = targetGone ? "target_gone" : targetsCompleted ? "target_completed" : "ttl";
+        const [updated] = await db.update(decisions).set({ status: "expired", updatedAt: now, metadata: { ...decision.metadata, expiredReason: reason,
+          ...(decision.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, decision.id), eq(decisions.status, "open"))).returning();
+        if (!updated) continue;
+        expired += 1;
+        await logActivity(db, { companyId: updated.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: updated.originAgentId, runId: updated.originRunId, action: "decision.expired", entityType: "decision", entityId: updated.id, details: { expiredReason: reason } });
+        await deliverContinuation(updated, "expired");
+      } catch (error) {
+        logger.error({ err: error, companyId: decision.companyId, decisionId: decision.id },
+          "decision expiry recovery item failed; continuing");
+      }
+    }
     return { expired, resumed };
   }
 
