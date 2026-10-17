@@ -271,6 +271,13 @@ export async function runSourceBoundTransportValidation(
     workspaceId: workspaceBoundToIssue ? workspace.id : "",
     transport: input.transport,
     workspaceTransport: workspaceBoundToIssue ? workspace.transport : "",
+    // Realization state is reported only for a workspace already proven
+    // bound to this issue in this company; an unbound or cross-company
+    // unrealized record denies as a transport mismatch above, so its
+    // realization state never leaks to a caller who may not see it.
+    workspaceRealized: workspaceBoundToIssue
+      ? workspace.status !== "unrealized"
+      : true,
     dependenciesBlocked: { unresolvedBlockerIssueIds },
     isLowTrust,
     requestedToolClass: input.requestedToolClass ?? null,

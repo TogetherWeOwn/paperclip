@@ -7,9 +7,13 @@ import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
+  allocateSourceBoundWorkspaceSchema,
   findWorkspaceCommandDefinition,
+  isUuidLike,
   matchWorkspaceRuntimeServiceToCommand,
+  normalizeIssueIdentifier,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -33,6 +37,13 @@ import {
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
+import {
+  allocateSourceBoundWorkspace,
+  createDbSourceBoundWorkspaceAllocationDeps,
+  rollbackSourceBoundWorkspaceAllocation,
+  SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
+  type SourceBoundAllocationActor,
+} from "../services/source-bound-workspace-allocation.js";
 import { sweepWorkspaceValidationRecoveries } from "../services/workspace-validation-sweep.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
@@ -1140,6 +1151,130 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     }
 
     res.json(result);
+  });
+
+  /**
+   * Board-authorized source-bound workspace allocation (no-wake).
+   *
+   * Allocates (or idempotently returns) an UNREALIZED execution-workspace
+   * record bound to the issue, derived entirely from the issue's stored
+   * isolated selection. Board principal + `runtime:manage` only; agent
+   * keys are denied by `assertBoard` before anything resolves. This route
+   * performs no wake, run, checkout, branch/worktree creation, or runtime
+   * start, and changes no issue status/assignee/blocker/monitor field:
+   * the effect of allocation alone never passes transport validation
+   * (`workspace_not_realized`) until a later heartbeat run realizes into
+   * the same record. See `services/source-bound-workspace-allocation.ts`.
+   */
+  async function resolveSourceBoundAllocationActor(
+    req: Request,
+    res: Response,
+    issueIdParam: string,
+  ): Promise<{ actor: SourceBoundAllocationActor; issueId: string } | null> {
+    assertBoard(req);
+    const identifier = isUuidLike(issueIdParam)
+      ? null
+      : normalizeIssueIdentifier(issueIdParam);
+    const issue =
+      isUuidLike(issueIdParam) || identifier !== null
+        ? await db
+            .select({ id: issues.id, companyId: issues.companyId })
+            .from(issues)
+            .where(
+              identifier === null
+                ? eq(issues.id, issueIdParam)
+                : eq(issues.identifier, identifier),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+        : null;
+    // Missing and cross-company issues deny identically (same status and
+    // body), without revealing which: a company-access failure is mapped
+    // onto the same operation-shaped deny instead of the generic error,
+    // so the two cases are indistinguishable to the caller.
+    const denyUnauthorized = () => {
+      res.status(403).json({
+        ok: false,
+        operationVersion: SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
+        errorCode: "unauthorized_principal",
+        runtimeInvoked: false,
+        wakeInvoked: false,
+      });
+      return null;
+    };
+    if (!issue) return denyUnauthorized();
+    try {
+      assertCompanyAccess(req, issue.companyId);
+    } catch {
+      return denyUnauthorized();
+    }
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "runtime:manage",
+      resource: { type: "company", companyId: issue.companyId },
+    });
+    return {
+      actor: {
+        type: "board",
+        // The authenticated board identity itself (never the synthetic
+        // "board" fallback): a principal with no user identity denies in
+        // the operation, so the audit always names a real actor.
+        userId: req.actor.userId ?? null,
+        companyId: issue.companyId,
+        hasRuntimeManage: decision.allowed,
+      },
+      issueId: issue.id,
+    };
+  }
+
+  function sourceBoundAllocationStatus(result: {
+    ok: boolean;
+    errorCode?: string;
+    disposition?: string;
+  }): number {
+    if (result.ok) return result.disposition === "created" ? 201 : 200;
+    switch (result.errorCode) {
+      case "unauthorized_principal":
+        return 403;
+      case "binding_conflict":
+      case "workspace_not_unrealized":
+        return 409;
+      case "selection_missing":
+      case "selection_not_isolated":
+        return 422;
+      default:
+        return 422;
+    }
+  }
+
+  router.post("/issues/:id/source-bound-workspace-allocation", validate(allocateSourceBoundWorkspaceSchema), async (req, res) => {
+    const resolved = await resolveSourceBoundAllocationActor(req, res, req.params.id as string);
+    if (!resolved) return;
+    const result = await allocateSourceBoundWorkspace(
+      createDbSourceBoundWorkspaceAllocationDeps(db),
+      {
+        companyId: resolved.actor.companyId,
+        sourceIssueId: resolved.issueId,
+        actor: resolved.actor,
+        requested: req.body.requested ?? null,
+      },
+    );
+    res.status(sourceBoundAllocationStatus(result)).json(result);
+  });
+
+  router.post("/issues/:id/source-bound-workspace-allocation/rollback", validate(rollbackSourceBoundWorkspaceAllocationSchema), async (req, res) => {
+    const resolved = await resolveSourceBoundAllocationActor(req, res, req.params.id as string);
+    if (!resolved) return;
+    const result = await rollbackSourceBoundWorkspaceAllocation(
+      createDbSourceBoundWorkspaceAllocationDeps(db),
+      {
+        companyId: resolved.actor.companyId,
+        sourceIssueId: resolved.issueId,
+        workspaceId: req.body.workspaceId,
+        actor: resolved.actor,
+      },
+    );
+    res.status(sourceBoundAllocationStatus(result)).json(result);
   });
 
   router.post("/companies/:companyId/execution-workspaces/sweep-branch-incoherence", async (req, res) => {

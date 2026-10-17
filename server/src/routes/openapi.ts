@@ -3939,6 +3939,57 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation",
+  tags: ["issues"],
+  summary: "Allocate a source-bound unrealized execution workspace",
+  description:
+    "Board principal with runtime:manage only (agent keys are denied). Allocates — or idempotently returns — an unrealized execution-workspace record bound to the issue, with every field derived server-side from the issue's stored isolated_workspace + git_worktree selection. No wake, run, checkout, branch/worktree creation, or runtime start; no issue status, assignee, blocker, or monitor change. Allocation alone never passes transport validation (workspace_not_realized) until a later heartbeat run realizes into the same record.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        requested: z.record(z.string(), z.unknown()).nullable().optional(),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    201: { description: "Allocation created" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation/rollback",
+  tags: ["issues"],
+  summary: "Roll back a source-bound workspace allocation",
+  description:
+    "Board principal with runtime:manage only. Archives the allocated unrealized record and restores the issue's exact prior executionWorkspaceId recorded at allocation, refusing if the binding changed in between. Realized workspaces cannot be rolled back through this path. Audited as a separate attributed activity entry.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        workspaceId: z.string().uuid(),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
   method: "delete",
   path: "/api/issues/{id}",
   tags: ["issues"],
