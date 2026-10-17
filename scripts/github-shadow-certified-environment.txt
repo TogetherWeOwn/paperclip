@@ -1,0 +1,127 @@
+Certified GitHub candidate execution — operator contract (default OFF)
+
+This code does not provision a host, change production config, enable the shadow
+switch, or certify the primary. PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS is
+an operator-owned server environment variable, default []. Invalid JSON or an
+invalid entry rejects the entire list. Agent/issue environment variables cannot
+set this server-side grant. Do not enable PR #167 merely because unit tests pass.
+
+Scope
+  Only claude_local with explicit adapterConfig.engine="cli", command="claude"
+  (or unset), no args/extraArgs, Chrome, managed-AI config seed, or isolateRuntime.
+  ACP/default-engine and other adapters remain unsupported, not silently changed.
+  The candidate keeps its configured model/effort/instruction text and sealed
+  review request/tools. Use muse-wonder-full-1.0-contributor, effort low as planned.
+  Primary adapter/session/environment behavior is unchanged.
+  Ordinary worktree reuse, provisioning hooks, GitHub launchers and persistent
+  agent-directory restores are bypassed for candidates. Only instruction text
+  and selected skills may stage, not primary memory or the previous worktree.
+  comparisonEligibility.certifiedClean remains false: this is NOT a certified
+  fair comparison or permission to replace the production Claude gate.
+
+1. Provision ONLY after host-operator review, on staging first
+  scripts/provision-github-shadow-host.sh is a new-account template, not an
+  automatically executed installer. With no --apply it prints usage and exits.
+  It refuses to repurpose an existing paperclip-shadow account. It creates no
+  private keys, rotates no credentials and does not edit server config.
+  Review every PRIMARY_ROOT: include primary run/session/config/worktree storage,
+  controller home/credentials and any alternate mounts exposing those bytes.
+  The script adds a deny ACL at each root, saving the prior ACL for rollback.
+  Ensure there are no accessible bind-mount aliases, hard links or shared groups.
+  Use a dedicated staging host with /proc hidepid=2 already configured. The
+  script refuses to change global /proc behavior, which could affect primary.
+  Root owns the login HOME, profiles and SSH authorized_keys; only work and the
+  isolated runtime parent are writable. Do not give this user sudo, Docker,
+  containerd, primary groups, writable login profiles or readable service keys.
+  Audit Unix sockets and setuid helpers too; an IP firewall does not confine them.
+  Preinstall the same root-owned Claude CLI version as primary at
+  /usr/local/bin/claude, plus /usr/bin/python3, sh, tar and git. Candidate bootstrap
+  cannot download packages. No primary config/credential seeding is permitted.
+
+2. Review and persist the network boundary
+  The template installs IPv4/IPv6 owner-match OUTPUT rules for this UID only.
+  Only IPv4 loopback TCP 3100 (Paperclip) and 8317 (model proxy) are allowed.
+  All other TCP/UDP, Internet, DNS, IPv6 and other loopback destinations reject.
+  Persist these rules using the existing host-managed firewall mechanism before
+  certification. Do not certify an ephemeral rule which disappears on reboot.
+  SSH keys use 'restrict': no forwarding, PTY, agent forwarding or user rc.
+  Audit effective sshd settings and all keys; no password login/user env bypass.
+  Certified runs DO NOT create the normal SSH reverse API tunnel (that could
+  bypass owner-match egress via sshd). The two approved services must actually be
+  bound to these loopback endpoints on the SSH host.
+  Paperclip MUST require authentication even from loopback; local_trusted or an
+  unauthenticated admin/UI route is disqualifying. The model proxy MUST expose
+  inference only to candidate credentials, not management, logs or other users'
+  transcripts. Probe both anonymously and with the candidate's scoped token.
+  Runtime API/tool-gateway confinement from I4 remains required. Candidates are
+  not given the connection-intent broker token, project-tools endpoint, or generic
+  managed-MCP configuration. Their signed run JWT can mint a snapshot-only session
+  via POST /api/tool-gateway/sessions; assigned MCP gateways use the same run-bound
+  confinement and the fixed loopback API URL. No connection-request capability is
+  necessary for reviewing the sealed head.
+
+3. Plant and map real primary canaries; do not accept 'file missing'
+  Place random nonempty canary files inside actual primary run and worktree
+  storage protected by the same access controls as primary answers.
+  Keep an operator/controller-readable path to the SAME files (e.g. a mounted
+  path inside the controller). Record each file's SHA256, remote host path and
+  controller path. EACCES/EPERM is required remotely; ENOENT is not a pass.
+  Independently prove the primary can read them. Never put primary answers into
+  canaries. The runtime probe verifies their hashes locally before SSH.
+  A certificate's serverPath/remotePath mapping is an operator attestation:
+  two different files at those paths are not a valid test.
+
+4. Configure an existing SSH environment, then build a certificate
+  Environment: driver ssh, status active, username paperclip-shadow, explicit
+  pinned knownHosts, strictHostKeyChecking=true, remoteWorkspacePath normally
+  /home/paperclip-shadow/work. Store a scoped SSH key via the existing
+  privateKeySecretRef mechanism; do not inline a private key into the certificate.
+  Pin the secret version rather than 'latest'; changing resolved key material
+  requires re-certification even if a secret reference did not change.
+  Set candidate.defaultEnvironmentId to this environment. Leave primary alone.
+  Each certificate binds companyId, environmentId and the digest returned by
+  githubIsolationConfigurationDigest({driver, config, envVars}) in
+  server/src/services/chat-github-runtime-isolation.ts. Pass the STORED environment
+  representation, not a redacted API representation or resolved secret bytes.
+  The digest is SHA256 of recursively key-sorted JSON for those three fields.
+  Server environment value schema (replace placeholders, never paste as-is):
+  [{"companyId":"UUID","environmentId":"UUID","configurationDigest":"64-lowercase-hex",
+    "primaryCanaries":[
+      {"kind":"run","serverPath":"/controller/path/run-canary","remotePath":"/host/primary/run/canary","sha256":"64-lowercase-hex"},
+      {"kind":"worktree","serverPath":"/controller/path/worktree-canary","remotePath":"/host/primary/worktree/canary","sha256":"64-lowercase-hex"}
+    ]}]
+  No public keys, tokens, private keys, answers or canary contents enter receipts.
+  Only explicit ANTHROPIC_AUTH_TOKEN/API_KEY/MODEL config env is forwarded, with
+  fixed ANTHROPIC_BASE_URL=http://127.0.0.1:8317 and fresh HOME/config/XDG/TMP.
+  Ambient controller process credentials are not sent to SSH command probes.
+  Use the normal signed run JWT for Paperclip, not a long-lived agent API key.
+
+5. Stage, verify, and retain evidence before any enablement
+  Each run uses the persisted arm/head/run namespace, creates HOME atomically,
+  tests canary denial and GitHub TCP/443 denial, and appends an immutable receipt
+  to chat_github_review_enrollments.isolation_tests[runId]. A failed probe marks
+  the candidate voided; neither recovery nor tools can revive it. A missing grant
+  starts no probe/provider. Replay cannot overwrite a previous receipt.
+  The kill switch and certificate are rechecked after setup at adapter dispatch.
+  Each receipt also binds the complete certificate digest, including canary path
+  mappings and hashes; replacing a grant invalidates an in-flight preparation.
+  The probes are checks of an independently certified boundary, not a substitute
+  for it: an ordinary network outage also makes a TCP connect fail.
+  Tests use disposable PostgreSQL, fake SSH/provider I/O and deterministic Python
+  syscall fixtures. They are NOT evidence of a live firewall, SSH identity, CLI
+  install, authenticated API, real tool delivery or successful model inference.
+  Run a staging end-to-end canary review and prove primary unaffected before
+  certifying any live environment. Review canary receipts and verify no primary
+  answer appears in candidate inputs/output. Keep the production review gate.
+
+Rollback and failure handling
+  First clear the certification list and/or disable githubReviewShadowEnabled;
+  that prevents subsequent dispatch but is not a cancellation of already-running
+  provider processes. Drain/cancel candidate runs through normal host lifecycle.
+  Preserve append-only receipts and voided rows; do not downgrade the migration.
+  Revoke the dedicated SSH key, then (only after candidate processes have exited)
+  remove the UID-specific OUTPUT jump for each of iptables/ip6tables, flush and
+  delete PC_SHADOW_EGRESS. Restore only the recorded ACL entries via the saved
+  primary-roots.acl after checking intervening operator changes. Do not remove
+  another user's rules, reset the host firewall, delete the account's evidence
+  or remove primary storage. Partial provisioning must leave certification EMPTY.

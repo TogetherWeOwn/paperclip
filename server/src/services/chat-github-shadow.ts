@@ -187,7 +187,7 @@ export async function githubCandidateBinding(db: Store, input: {
     eq(chatGitHubReviewCandidates.nativeDeliveryId, input.deliveryId), eq(chatGitHubReviewCandidates.conversationId, input.conversationId),
     eq(chatGitHubReviewCandidates.commentId, input.commentId),
   ));
-  return row ?? null;
+  return row?.state === "voided" ? null : row ?? null;
 }
 
 export async function githubRunCapability(db: Store, session: {
@@ -223,7 +223,7 @@ export async function githubRunCapability(db: Store, session: {
 }
 
 export async function githubCandidateMayWake(db: Store, candidate: Candidate): Promise<boolean> {
-  if (!(await githubShadowEnabled(db))) return false;
+  if (candidate.state === "voided" || !(await githubShadowEnabled(db))) return false;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, candidate.endpointId));
   const [arm] = await db.select().from(chatGitHubReviewArms).where(and(eq(chatGitHubReviewArms.id, candidate.armId), eq(chatGitHubReviewArms.companyId, candidate.companyId), isNull(chatGitHubReviewArms.retiredAt)));
   const [agent] = await db.select().from(agents).where(and(eq(agents.id, candidate.agentId), eq(agents.companyId, candidate.companyId)));
@@ -327,16 +327,16 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         await db.update(chatGitHubReviewCandidates).set({
           state: dispatched ? "dispatched" : "unavailable", nextAttemptAt: null,
           lastError: dispatched ? null : "candidate_wake_denied", updatedAt: new Date(),
-        }).where(eq(chatGitHubReviewCandidates.id, materialized.id));
+        }).where(and(eq(chatGitHubReviewCandidates.id, materialized.id), sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
       } else {
         // Native wake receipt recovery owns retry/idempotency. A retrying arm
         // must yield its bounded outbox slot to other admitted events meanwhile.
         await db.update(chatGitHubReviewCandidates).set({
           lastError: "candidate_wake_pending", nextAttemptAt: new Date(Date.now() + 30_000), updatedAt: new Date(),
-        }).where(eq(chatGitHubReviewCandidates.id, materialized.id));
+        }).where(and(eq(chatGitHubReviewCandidates.id, materialized.id), sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
       }
     } catch {
-      await db.update(chatGitHubReviewCandidates).set({ lastError: "candidate_materialization_or_wake_failed", nextAttemptAt: new Date(Date.now() + 30_000), updatedAt: new Date() }).where(eq(chatGitHubReviewCandidates.id, row.id));
+      await db.update(chatGitHubReviewCandidates).set({ lastError: "candidate_materialization_or_wake_failed", nextAttemptAt: new Date(Date.now() + 30_000), updatedAt: new Date() }).where(and(eq(chatGitHubReviewCandidates.id, row.id), sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
     }
   }
   return rows.length;

@@ -4307,6 +4307,230 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id } }).where(eq(heartbeatRuns.id, session.runId));
       await expect(gateway.listToolsForSession(access.token)).rejects.toThrow("capability is invalid");
     });
+    it.each(["certified", "uncertified", "contaminated", "disabled", "disabled-after-probe"] as const)(
+      "paired certified runtime %s gates dispatch independently of the primary",
+      async (scenario) => {
+        const { environments, chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+        const ssh = await import("@paperclipai/adapter-utils/ssh");
+        const isolation = await import("../services/chat-github-runtime-isolation.js");
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `certified-runtime-${scenario}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const tasks = await pairedTasks(f.endpoint.id);
+        const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+        const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-runtime-canary-"));
+        const canaryPath = path.join(scratch, "primary-answer");
+        writeFileSync(canaryPath, "PRIMARY_CANARY", { mode: 0o600 });
+        const [environment] = await db.insert(environments).values({ name: `Certified shadow SSH ${randomUUID()}`,
+          driver: "ssh", config: { host: "127.0.0.1", port: 22, username: "paperclip-shadow",
+            remoteWorkspacePath: "/home/paperclip-shadow/work", privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true } }).returning();
+        await db.update(agents).set({ adapterType: "claude_local", defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+        const old = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(scenario === "uncertified" ? [] : [{
+          environmentId: environment!.id, companyId: f.companyId,
+          configurationDigest: isolation.githubIsolationConfigurationDigest(environment!),
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath,
+            remotePath: `/primary/${kind}/canary`, sha256: createHash("sha256").update("PRIMARY_CANARY").digest("hex") })),
+        }]);
+        const { default: dns } = await import("node:dns/promises");
+        const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, _command, options) => {
+          const input = JSON.parse(options!.stdin!);
+          if (scenario === "disabled-after-probe") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home,
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
+        });
+        try {
+          if (scenario === "disabled") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+          const dispatch = vi.fn();
+          if (scenario === "certified") {
+            const prepared = await isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! });
+            expect(prepared).not.toBeNull();
+            await isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target);
+            dispatch();
+            expect(dispatch).toHaveBeenCalledOnce();
+            expect(prepared!.env.HOME).toBe(prepared!.home);
+            expect(prepared!.env.CLAUDE_CONFIG_DIR).toBe(`${prepared!.home}/.claude`);
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, remoteCwd: "/primary" })).rejects.toThrow();
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, githubCandidateIsolation: undefined })).rejects.toThrow();
+            const originalCertificate = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS!;
+            const replacement = JSON.parse(originalCertificate);
+            replacement[0].primaryCanaries[0].remotePath = "/changed-primary/run/canary";
+            process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(replacement);
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target)).rejects.toThrow();
+            process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = originalCertificate;
+            await db.update(environments).set({ status: "disabled" }).where(eq(environments.id, environment!.id));
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target)).rejects.toThrow();
+          } else {
+            await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow(/github_candidate_/);
+            expect(dispatch).not.toHaveBeenCalled();
+          }
+          expect(probe).toHaveBeenCalledTimes(["uncertified", "disabled"].includes(scenario) ? 0 : 1);
+          const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+          const receipt = enrollment!.isolationTests[run!.id];
+          if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe") {
+            expect(receipt).toMatchObject({ runId: run!.id, environmentId: environment!.id,
+              status: scenario === "contaminated" ? "failed" : "passed" });
+          } else expect(receipt).toBeUndefined();
+          if (receipt) {
+            await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: {} })
+              .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
+            await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: { [run!.id]: { ...receipt, status: "forged" } } })
+              .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
+            expect(enrollment!.envelope.comparisonEligibility.certifiedClean).toBe(false);
+          }
+          const [stored] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+          if (scenario === "contaminated") {
+            expect(stored!.state).toBe("voided");
+            expect(stored!.lastError).toBe("github_candidate_contaminated");
+            await expect(db.update(chatGitHubReviewCandidates).set({ state: "dispatched" })
+              .where(eq(chatGitHubReviewCandidates.id, stored!.id))).rejects.toThrow();
+            await expect(githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).rejects.toThrow();
+            await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow();
+          }
+          const [primaryAgent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+          const [primaryRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, primarySession.runId));
+          expect(await isolation.prepareGitHubCandidateRuntime(db, { run: primaryRun!, agent: primaryAgent! })).toBeNull();
+          expect(await githubChatReviewService(db, f.providerFetch).execute(primarySession, "begin_review", { reviewedCommit: "b".repeat(40) })).toMatchObject({ reviewedCommit: "b".repeat(40) });
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, primarySession.runId)))[0]!.status).toBe("running");
+        } finally {
+          probe.mockRestore();
+          dnsProbe.mockRestore();
+          if (old === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+          else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = old;
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      },
+    );
+    it.each(["certified", "disabled-at-dispatch", "contaminated"] as const)(
+      "paired certified heartbeat %s reaches only the permitted adapter",
+      async scenario => {
+        const { environments, chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+        const ssh = await import("@paperclipai/adapter-utils/ssh");
+        const { default: dns } = await import("node:dns/promises");
+        const runtimeModule = await import("../services/environment-runtime.js");
+        const { getServerAdapter } = await import("../adapters/registry.js");
+        const { githubIsolationConfigurationDigest } = await import("../services/chat-github-runtime-isolation.js");
+        const originalRuntime = runtimeModule.environmentRuntimeService;
+        const runtimeSpy = vi.spyOn(runtimeModule, "environmentRuntimeService").mockImplementation((...args) => {
+          const runtime = originalRuntime(...args);
+          // Keep real disposable-DB leases, replacing only host SSH I/O.
+          runtime.getDriver("ssh")!.acquireRunLease = runtime.getDriver("local")!.acquireRunLease;
+          return { ...runtime, execute: async input => {
+            if (input.environment.driver === "ssh") throw new Error("Unexpected SSH command outside the isolated adapter");
+            return runtime.execute(input);
+          }, realizeWorkspace: async input => {
+            if (input.environment.driver !== "ssh") return runtime.realizeWorkspace(input);
+            if (scenario === "disabled-at-dispatch") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+            return { cwd: "/home/paperclip-shadow/work", metadata: {} };
+          } };
+        });
+        const heartbeat = heartbeatService(db);
+        const f = await pairedReviewFixture({ wakeup: heartbeat.wakeup });
+        const scratch = mkdtempSync(path.join(os.tmpdir(), "certified-heartbeat-"));
+        const canaryPath = path.join(scratch, "primary-answer");
+        const provisionMarker = path.join(scratch, "UNSAFE_PROVISION_RAN");
+        writeFileSync(canaryPath, "PRIMARY_HEARTBEAT_CANARY", { mode: 0o600 });
+        const [environment] = await db.insert(environments).values({ name: `Shadow heartbeat ${randomUUID()}`, driver: "ssh",
+          config: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/work", privateKey: null,
+            knownHosts: "fixture", strictHostKeyChecking: true } }).returning();
+        const oldCertificate = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        const oldApi = process.env.PAPERCLIP_API_URL;
+        const oldJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        process.env.PAPERCLIP_AGENT_JWT_SECRET = "certified-heartbeat-test-secret";
+        process.env.PAPERCLIP_API_URL = "https://controller.example.test";
+        process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify([{
+          companyId: f.companyId, environmentId: environment!.id, configurationDigest: githubIsolationConfigurationDigest(environment!),
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath, remotePath: `/primary/${kind}/canary`,
+            sha256: createHash("sha256").update("PRIMARY_HEARTBEAT_CANARY").digest("hex") })),
+        }]);
+        const lookup = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+          if (!options?.stdin || !command.includes("python3")) return { stdout: "", stderr: "" };
+          const input = JSON.parse(options.stdin);
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home,
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
+        });
+        const originalAdapter = getServerAdapter("claude_local");
+        const execute = vi.fn(async (input: Parameters<typeof originalAdapter.execute>[0]) => {
+          if (input.agent.id === f.replacementAgentId) {
+            expect(input.executionTarget).toMatchObject({ kind: "remote", transport: "ssh", spec: { username: "paperclip-shadow" },
+              githubCandidateIsolation: { home: expect.stringContaining("/.paperclip-runtime/isolated/") } });
+            const env = input.config.env as Record<string, string>;
+            expect(env.CLAUDE_CONFIG_DIR).toBe(`${env.HOME}/.claude`);
+            expect(input.runtime.sessionId).toBeNull();
+            expect(input.runtime.sessionParams).toBeNull();
+            expect(input.authToken).toBeTruthy();
+            // The connection broker is NOT the review gateway: it can request
+            // new external access and is mounted before the normal API boundary.
+            expect(input.runtimeTools).toBeUndefined();
+            expect(input.context.paperclipManagedMcp).toBeUndefined();
+            expect((input.runtimeMcp?.getServers() ?? []).every(s => s.url.startsWith("http://127.0.0.1:3100/mcp/gateways/"))).toBe(true);
+            expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+            const { actorMiddleware } = await import("../middleware/auth.js");
+            const { toolGatewayRoutes } = await import("../routes/tool-gateway.js");
+            const { createToolGatewayService } = await import("../services/tool-gateway.js");
+            const { toolPolicies } = await import("@paperclipai/db");
+            await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Certified review reads", policyType: "allow", selectors: { riskLevel: "read" } });
+            const gateway = createToolGatewayService(db);
+            const app = express();
+            app.use(express.json());
+            app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+            app.use("/api", toolGatewayRoutes(db, gateway));
+            app.use(errorHandler);
+            const sessionResponse = await request(app).post("/api/tool-gateway/sessions")
+              .set("Authorization", `Bearer ${input.authToken}`).send({});
+            expect(sessionResponse.status).toBe(201);
+            const tools = await gateway.listToolsForSession(sessionResponse.body.token);
+            expect(tools.length).toBeGreaterThan(0);
+            expect(tools.every(t => t.providerType === "paperclip_github_chat")).toBe(true);
+            const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
+            expect(await gateway.executeTool({ sessionToken: sessionResponse.body.token, tool: readTool.name, parameters: { section: "metadata" } }))
+              .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+            expect(input.config.cwd).not.toBe(scratch);
+            expect(existsSync(provisionMarker)).toBe(false);
+          }
+          return { exitCode: 0, signal: null, timedOut: false, summary: "isolated test result", provider: "test", model: "test" };
+        });
+        registerServerAdapter({ ...originalAdapter, execute });
+        try {
+          await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+          await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { engine: "cli" },
+            runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+            .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+          await db.update(agents).set({ defaultEnvironmentId: environment!.id, adapterConfig: { engine: "cli", cwd: scratch,
+            workspaceStrategy: { type: "project_primary", provisionCommand: `touch '${provisionMarker}'` } } }).where(eq(agents.id, f.replacementAgentId));
+          await deliverShadowTestMention(f, `certified-heartbeat-${scenario}`, "@maya review this", 81);
+          await heartbeat.drainActiveRunExecutions();
+          await f.service.processPendingDeliveries();
+          await heartbeat.drainActiveRunExecutions();
+          expect(execute.mock.calls.filter(([input]) => input.agent.id === f.assignedAgentId)).toHaveLength(1);
+          expect(execute.mock.calls.filter(([input]) => input.agent.id === f.replacementAgentId)).toHaveLength(scenario === "certified" ? 1 : 0);
+          const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.replacementAgentId));
+          expect(runs).toHaveLength(1);
+          expect(runs[0]).toMatchObject(scenario === "certified" ? { status: "succeeded" } : { status: "failed", errorCode: "configuration_incomplete" });
+          const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+          expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed" });
+          expect(existsSync(provisionMarker)).toBe(false);
+        } finally {
+          await heartbeat.drainActiveRunExecutions();
+          registerServerAdapter(originalAdapter);
+          probe.mockRestore(); lookup.mockRestore(); runtimeSpy.mockRestore();
+          if (oldCertificate === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+          else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = oldCertificate;
+          if (oldApi === undefined) delete process.env.PAPERCLIP_API_URL;
+          else process.env.PAPERCLIP_API_URL = oldApi;
+          if (oldJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+          else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldJwtSecret;
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      },
+    );
     it("paired isolation fails closed before an unsupported adapter can read primary session scratch", async () => {
       const heartbeat = heartbeatService(db);
       const f = await pairedReviewFixture({ wakeup: heartbeat.wakeup });

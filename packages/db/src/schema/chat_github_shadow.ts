@@ -63,6 +63,12 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
   configurationRevision: integer("configuration_revision").notNull(),
   pairKey: text("pair_key").notNull(),
   envelope: jsonb("envelope").$type<GitHubReviewEnrollmentEnvelope>().notNull(),
+  /** Append-only per-run self-test receipts. Admission bytes remain immutable. */
+  isolationTests: jsonb("isolation_tests").$type<Record<string, {
+    version: number; runId: string; candidateId: string; armId: string; environmentId: string;
+    namespace: string; configurationDigest: string; certificateDigest: string; home: string; checkedAt: string;
+    status: string; checks: { primaryCanariesDenied: boolean; githubDenied: boolean; configFresh: boolean };
+  }>>().notNull().default({}),
   admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => [
   unique("chat_github_enrollments_company_id_uq").on(t.companyId, t.id),
@@ -90,7 +96,7 @@ export const chatGitHubReviewCandidates = pgTable("chat_github_review_candidates
   conversationId: uuid("conversation_id"),
   issueId: uuid("issue_id"),
   commentId: uuid("comment_id").references(() => issueComments.id),
-  state: text("state").$type<"pending" | "materialized" | "dispatched" | "unavailable">().notNull().default("pending"),
+  state: text("state").$type<"pending" | "materialized" | "dispatched" | "unavailable" | "voided">().notNull().default("pending"),
   attempts: integer("attempts").notNull().default(0),
   nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
   lastError: text("last_error"),
@@ -108,5 +114,5 @@ export const chatGitHubReviewCandidates = pgTable("chat_github_review_candidates
   foreignKey({ columns: [t.companyId, t.conversationId], foreignColumns: [chatConversations.companyId, chatConversations.id] }),
   foreignKey({ columns: [t.companyId, t.issueId], foreignColumns: [issues.companyId, issues.id] }),
   check("chat_github_candidates_label_check", sql`${t.shadowLabel} <> ''`),
-  check("chat_github_candidates_state_check", sql`${t.state} in ('pending', 'materialized', 'dispatched', 'unavailable')`),
+  check("chat_github_candidates_state_check", sql`${t.state} in ('pending', 'materialized', 'dispatched', 'unavailable', 'voided')`),
 ]);

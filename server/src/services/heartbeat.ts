@@ -1,5 +1,7 @@
 import { externalObjectService } from "./external-objects.js";
-import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
+import { tmpdir } from "node:os";
+import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig } from "./chat-github-runtime-isolation.js";
+import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -977,16 +979,7 @@ export class WorkspaceValidationFailure extends Error {
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
 // run must not be dispatched. Surfaced as a configuration-incomplete blocker
 // routed to a human owner instead of N opaque dispatched-then-failed runs.
-export class ConfigurationIncompleteFailure extends Error {
-  code = CONFIGURATION_INCOMPLETE_FAILURE_CODE;
-  resultJson: Record<string, unknown>;
-
-  constructor(message: string, resultJson: Record<string, unknown>) {
-    super(message);
-    this.name = "ConfigurationIncompleteFailure";
-    this.resultJson = resultJson;
-  }
-}
+export { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
 
 // Build the configuration-incomplete result payload for a workspace base ref
 // that never resolved to a commit. The setup catch maps this to errorCode
@@ -4719,6 +4712,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
   expectedAssignmentDigest?: string | null;
+  /** Host-selected endpoint for a certified SSH principal; never agent config. */
+  apiBaseUrl?: string;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const access = toolAccessService(input.db);
   const effective = await access.getEffectiveProfilesForAgent(
@@ -4981,7 +4976,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   return [
     {
       name: "paperclip-assigned",
-      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
+      url: `${input.apiBaseUrl ?? paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
     },
@@ -20991,6 +20986,7 @@ export function heartbeatService(
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    let candidateWorkspaceDir: string | null = null;
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -21021,20 +21017,6 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
-      const candidateBoundary = await githubCandidateRunBoundary(db, {
-        companyId: run.companyId, agentId: run.agentId, runId: run.id,
-      });
-      if (candidateBoundary) {
-        // A fresh issue or isolateRuntime env filtering is NOT a certified
-        // filesystem/network/session/memory boundary. Until an adapter supplies
-        // that contract, fail before session restore, workspace setup, plugins,
-        // MCP construction or model dispatch. No agent-config escape hatch.
-        throw new ConfigurationIncompleteFailure(
-          "github_candidate_isolation_unavailable: paired candidate runtime isolation is not implemented; no provider work started",
-          { configurationIncomplete: { reason: "github_candidate_isolation_unavailable",
-            namespace: candidateBoundary.namespace, required: ["fresh_session", "filesystem", "network", "scoped_memory_retention"] } },
-        );
-      }
       const agent = await getAgent(run.agentId);
       if (!agent) {
         await setRunStatus(runId, "failed", {
@@ -21050,6 +21032,10 @@ export function heartbeatService(
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
       }
+
+      // Before session restoration, workspace setup, plugins or model work.
+      // Only a server-certified SSH environment with fresh per-run proof enters.
+      const candidateRuntime = await prepareGitHubCandidateRuntime(db, { run, agent });
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -21930,9 +21916,9 @@ export function heartbeatService(
             existingExecutionWorkspace?.status ?? null,
         });
       const requestedShouldReuseExisting =
-        workspaceReuseRequest.requestedShouldReuseExisting;
+        !candidateRuntime && workspaceReuseRequest.requestedShouldReuseExisting;
       const reusableExistingExecutionWorkspace =
-        workspaceReuseRequest.existingExecutionWorkspaceAvailable
+        !candidateRuntime && workspaceReuseRequest.existingExecutionWorkspaceAvailable
           ? existingExecutionWorkspace
           : null;
       const requestedReusableExecutionWorkspaceConfig =
@@ -22049,6 +22035,11 @@ export function heartbeatService(
           : selectedEnvironmentId
             ? await environmentsSvc.getById(selectedEnvironmentId)
             : null;
+      if (candidateRuntime && selectedEnvironmentForConfig?.id !== candidateRuntime.target.environmentId) {
+        throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: selected environment changed", {
+          configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+        });
+      }
       const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
         adapterType: agent.adapterType,
         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -22244,7 +22235,7 @@ export function heartbeatService(
         },
       );
       const useHostGitHub =
-        !githubSelection.configured &&
+        !candidateRuntime && !githubSelection.configured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -22451,11 +22442,11 @@ export function heartbeatService(
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
       });
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        Boolean(candidateRuntime) || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const previousSessionParams =
+      const previousSessionParams = candidateRuntime ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
           agent.adapterType,
@@ -22497,6 +22488,15 @@ export function heartbeatService(
           return preflightEnvironment.driver;
         },
         resolveWorkspace: async () => {
+          if (candidateRuntime) {
+            // Never synchronize an agent home, prior worktree, or cached answer.
+            // Repository reads remain the sealed, commit-addressed gateway tools.
+            candidateWorkspaceDir = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-workspace-"));
+            return { cwd: candidateWorkspaceDir, source: "task_session" as const,
+              projectId: null, workspaceId: null, repoUrl: null, repoRef: null,
+              workspaceHints: [], warnings: [], baseCwdFallback: false,
+              materializationFailures: [], additionalWorkspaces: [], referencedProjectFailures: [] };
+          }
           if (useIsolatedTaskDirectory && issueRef) {
             const cwd = await materializeIsolatedTaskDirectory({
               companyId: agent.companyId,
@@ -22575,8 +22575,11 @@ export function heartbeatService(
             : workspace;
         },
       });
-      const hostExecutionWorkspaceConfig =
-        stripHostWorkspaceProvisionForLowTrustSandbox({
+      // The candidate reviews the sealed snapshot through tools, not a host
+      // checkout. Never execute host provisioning or restore a previous tree.
+      const hostExecutionWorkspaceConfig = candidateRuntime
+        ? { workspaceStrategy: { type: "project_primary" } }
+        : stripHostWorkspaceProvisionForLowTrustSandbox({
           config: mergedConfig,
           trustPreset,
           selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
@@ -23285,7 +23288,24 @@ export function heartbeatService(
       // and lease scope instead of silently creating a per-run replacement.
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
-      const executionTarget = realizationResult.executionTarget;
+      const realizedTarget = realizationResult.executionTarget;
+      if (candidateRuntime && (realizedTarget?.kind !== "remote" || realizedTarget.transport !== "ssh"
+        || realizedTarget.environmentId !== candidateRuntime.target.environmentId
+        || realizedTarget.spec.host !== candidateRuntime.target.spec.host
+        || realizedTarget.spec.username !== candidateRuntime.target.spec.username)) {
+        throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: SSH realization changed", {
+          configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+        });
+      }
+      const executionTarget = candidateRuntime ? { ...candidateRuntime.target, leaseId: realizedTarget?.leaseId } : realizedTarget;
+      if (candidateRuntime) {
+        if (executionWorkspace.cwd !== candidateWorkspaceDir) {
+          throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: workspace changed", {
+            configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+          });
+        }
+        runtimeConfig = githubCandidateAdapterConfig(candidateRuntime, runtimeConfig, executionWorkspace.cwd);
+      }
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
@@ -23317,7 +23337,7 @@ export function heartbeatService(
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
-      const remoteExecution = realizationResult.remoteExecution;
+      const remoteExecution = candidateRuntime ? candidateRuntime.target.spec : realizationResult.remoteExecution;
       if (
         nativeChatWorkspaceScope &&
         (executionTarget?.kind === "remote" ||
@@ -23371,6 +23391,7 @@ export function heartbeatService(
           (!isResolvedInteractionContinuationWakeContext(context) &&
             run.scheduledRetryReason !== "native_safe_replacement")
         ) {
+          if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
@@ -23382,6 +23403,7 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
+        if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
         const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
           runId: run.id,
           companyId: run.companyId,
@@ -23443,7 +23465,9 @@ export function heartbeatService(
       } else {
         delete context.paperclipScratch;
       }
-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
+      const gitExecutionEnv = candidateRuntime ? Object.fromEntries(
+        Object.entries(parseObject(runtimeConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ) : await prepareGitHubExecutionEnvironment({
         target: executionTarget,
         cwd: executionWorkspace.cwd,
         env: Object.fromEntries(
@@ -23461,7 +23485,7 @@ export function heartbeatService(
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
-      if (!useHostGitHub) {
+      if (!useHostGitHub && !candidateRuntime) {
         const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
           githubConfigured: githubSelection.configured,
@@ -23700,6 +23724,14 @@ export function heartbeatService(
           previousSessionDisplayId = null;
           delete executionContinuation?.resumeDelta;
         }
+      }
+      if (candidateRuntime) {
+        runtimeSessionIdForAdapter = null;
+        runtimeSessionParamsForAdapter = null;
+        previousSessionDisplayId = null;
+        delete executionContinuation?.resumeDelta;
+        delete context.paperclipSessionHandoffMarkdown;
+        delete context.paperclipPreviousSessionId;
       }
       const runtimeForAdapter = {
         sessionId: runtimeSessionIdForAdapter,
@@ -24125,7 +24157,9 @@ export function heartbeatService(
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
           : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
-        if (hasInstructionFilesystem) {
+        // Preserve the same instruction text, but do not restore an agent-home
+        // directory (which may include primary memory or previous answers).
+        if (hasInstructionFilesystem && !candidateRuntime) {
           try {
             // Missing contract fields on a restored session mean the deployed
             // legacy format. New sessions opt into whole-directory persistence.
@@ -25483,7 +25517,10 @@ export function heartbeatService(
             const isolatedRuntime =
               agent.adapterType === "codex_local" &&
               parseObject(runtimeConfig).isolateRuntime === true;
-            const runtimeTools = isolatedRuntime
+            // Connection-intent brokers and generic managed MCP credentials are
+            // not snapshot review tools. Candidates get only the run-bound API
+            // credential and gateways whose discovery/dispatch enforce I4.
+            const runtimeTools = isolatedRuntime || candidateRuntime
               ? undefined
               : createAdapterRuntimeToolAccess({
                   agentId: agent.id,
@@ -25491,7 +25528,12 @@ export function heartbeatService(
                   runId: run.id,
                   responsibleUserId: run.responsibleUserId,
                 });
-            if (!runtimeTools && !isolatedRuntime) {
+            if (candidateRuntime && !authToken) {
+              throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: scoped tools unavailable", {
+                configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+              });
+            }
+            if (!runtimeTools && !isolatedRuntime && !candidateRuntime) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25507,6 +25549,7 @@ export function heartbeatService(
                   db,
                   agent,
                   runId: run.id,
+                  apiBaseUrl: candidateRuntime ? "http://127.0.0.1:3100" : undefined,
                 });
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
@@ -25518,7 +25561,7 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            if (!isolatedRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+            if (!isolatedRuntime && !candidateRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
               runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
                 token: authToken, connectionId: "paperclip-project-tools" });
             }
@@ -25526,7 +25569,7 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = isolatedRuntime
+            const managedMcpConfig = isolatedRuntime || candidateRuntime
               ? null
               : await createManagedMcpRunConfig({
                   db,
@@ -27448,6 +27491,7 @@ export function heartbeatService(
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
       } finally {
+        if (candidateWorkspaceDir) await fs.rm(candidateWorkspaceDir, { recursive: true, force: true }).catch(() => {});
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
