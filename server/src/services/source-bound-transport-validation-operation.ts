@@ -32,6 +32,7 @@
 
 import type { Db } from "@paperclipai/db";
 import { agents, executionWorkspaces, issues, projects } from "@paperclipai/db";
+import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { issueService } from "./issues.js";
 import {
@@ -63,6 +64,8 @@ export type SourceBoundWorkspaceFacts = {
   /** Transport name the workspace record is bound to (its provider type). */
   transport: string;
   sourceIssueId: string | null;
+  status: string;
+  closedAt: Date | string | null;
 };
 
 export type DeployedImageAttestationRecord = {
@@ -164,6 +167,11 @@ export async function runSourceBoundTransportValidation(
   input: RunSourceBoundTransportValidationInput,
 ): Promise<SourceBoundTransportValidationReceipt> {
   const validatedAt = (deps.now?.() ?? new Date()).toISOString();
+  // The caller may address the source issue by identifier; once resolved,
+  // the receipt and audit entry carry the canonical issue id.
+  let resolvedSourceIssueId = isNonEmptyString(input?.sourceIssueId)
+    ? input.sourceIssueId
+    : "";
   const finish = async (
     transport: ValidateSourceTransportOnlyResult,
     attestation: SourceBoundTransportValidationReceipt["attestation"],
@@ -173,9 +181,7 @@ export async function runSourceBoundTransportValidation(
       operationVersion: SOURCE_BOUND_TRANSPORT_VALIDATION_OPERATION_VERSION,
       boundary: "transport-only",
       runtimeInvoked: false,
-      sourceIssueId: isNonEmptyString(input?.sourceIssueId)
-        ? input.sourceIssueId
-        : "",
+      sourceIssueId: resolvedSourceIssueId,
       principalAgentId: isNonEmptyString(input?.principalAgentId)
         ? input.principalAgentId
         : "",
@@ -223,16 +229,24 @@ export async function runSourceBoundTransportValidation(
       errorCode: "not_evaluated",
     });
   }
+  resolvedSourceIssueId = issue.id;
 
   // Resolve the selected workspace in the same company and require it to be
   // bound to the source issue (its source issue, or the issue's selected
-  // execution workspace). Unbound or missing workspaces fail closed as a
-  // transport mismatch, matching the pure validator's empty-workspace deny.
+  // execution workspace) and still open. Unbound, missing, or closed
+  // workspaces fail closed as a transport mismatch, matching the pure
+  // validator's empty-workspace deny.
   const workspace = isNonEmptyString(input.workspaceId)
     ? await deps.resolveWorkspace(input.companyId, input.workspaceId)
     : null;
+  const workspaceClosed =
+    workspace !== null &&
+    (workspace.closedAt != null ||
+      workspace.status === "archived" ||
+      workspace.status === "cleanup_failed");
   const workspaceBoundToIssue =
     workspace !== null &&
+    !workspaceClosed &&
     workspace.companyId === input.companyId &&
     (workspace.sourceIssueId === issue.id ||
       issue.executionWorkspaceId === workspace.id);
@@ -294,6 +308,15 @@ export function createDbSourceBoundTransportValidationDeps(
   const svc = issueService(db);
   return {
     async resolveSourceIssue(companyId, sourceIssueId) {
+      // Accept the identifier form sibling `/issues/:id` routes accept.
+      // Anything that is neither a UUID nor an identifier resolves to null
+      // (denied as unauthorized) instead of reaching a uuid column, where
+      // Postgres would raise 22P02 and surface as a 500.
+      if (!isUuidLike(companyId)) return null;
+      const identifier = isUuidLike(sourceIssueId)
+        ? null
+        : normalizeIssueIdentifier(sourceIssueId);
+      if (!isUuidLike(sourceIssueId) && identifier === null) return null;
       const rows = await db
         .select({
           id: issues.id,
@@ -305,7 +328,12 @@ export function createDbSourceBoundTransportValidationDeps(
         })
         .from(issues)
         .where(
-          and(eq(issues.id, sourceIssueId), eq(issues.companyId, companyId)),
+          and(
+            identifier === null
+              ? eq(issues.id, sourceIssueId)
+              : eq(issues.identifier, identifier),
+            eq(issues.companyId, companyId),
+          ),
         )
         .limit(1);
       return rows[0] ?? null;
@@ -317,6 +345,9 @@ export function createDbSourceBoundTransportValidationDeps(
       return readiness.get(sourceIssueId)?.unresolvedBlockerIssueIds ?? [];
     },
     async resolveIsLowTrust({ companyId, principalAgentId, issue }) {
+      // A non-UUID principal cannot be looked up and cannot prove standard
+      // trust: fail closed without sending it into a uuid column.
+      if (!isUuidLike(principalAgentId) || !isUuidLike(companyId)) return true;
       const [agent, project] = await Promise.all([
         db
           .select({
@@ -360,12 +391,15 @@ export function createDbSourceBoundTransportValidationDeps(
       return resolution.kind !== "standard";
     },
     async resolveWorkspace(companyId, workspaceId) {
+      if (!isUuidLike(workspaceId) || !isUuidLike(companyId)) return null;
       const rows = await db
         .select({
           id: executionWorkspaces.id,
           companyId: executionWorkspaces.companyId,
           transport: executionWorkspaces.providerType,
           sourceIssueId: executionWorkspaces.sourceIssueId,
+          status: executionWorkspaces.status,
+          closedAt: executionWorkspaces.closedAt,
         })
         .from(executionWorkspaces)
         .where(

@@ -51,6 +51,8 @@ function baseDeps(
       companyId: COMPANY_ID,
       transport: "local_fs",
       sourceIssueId: SOURCE_ISSUE_ID,
+      status: "active",
+      closedAt: null,
     }),
     resolveDeployedImageAttestation: () => validRecord,
     now: () => new Date("2026-01-01T00:00:00.000Z"),
@@ -190,10 +192,33 @@ describe("source-bound transport validation operation", () => {
           companyId: COMPANY_ID,
           transport: "local_fs",
           sourceIssueId: "77777777-7777-4777-8777-777777777777",
+          status: "active",
+          closedAt: null,
         }),
       }),
       baseInput(),
     );
+    expect(receipt.transport).toMatchObject({
+      ok: false,
+      errorCode: "workspace_transport_mismatch",
+    });
+  });
+
+  it("denies a closed workspace bound to the source issue", async () => {
+    const receipt = await runSourceBoundTransportValidation(
+      baseDeps({
+        resolveWorkspace: async () => ({
+          id: WORKSPACE_ID,
+          companyId: COMPANY_ID,
+          transport: "local_fs",
+          sourceIssueId: SOURCE_ISSUE_ID,
+          status: "archived",
+          closedAt: new Date("2026-01-01T00:00:00.000Z"),
+        }),
+      }),
+      baseInput(),
+    );
+    expect(receipt.ok).toBe(false);
     expect(receipt.transport).toMatchObject({
       ok: false,
       errorCode: "workspace_transport_mismatch",

@@ -12,7 +12,7 @@ import {
 import { getActorInfo } from "./authz.js";
 
 const sourceTransportValidationSchema = z.object({
-  workspaceId: z.string().min(1),
+  workspaceId: z.string().uuid(),
   transport: z.string().min(1),
   requestedToolClass: z.string().nullable().optional(),
 });

@@ -23,13 +23,21 @@ Content-Type: application/json
   from the actor, never from the request body; body fields claiming a
   principal are ignored. Board (non-agent) actors have no agent principal
   and are denied.
+- `{sourceIssueId}` accepts the issue UUID or its human-readable
+  identifier, like sibling issue routes; the receipt always carries the
+  canonical issue UUID. `workspaceId` must be a UUID. Ids that match
+  neither form deny as `unauthorized_principal` /
+  `workspace_transport_mismatch` (or `400` for a malformed body), never a
+  server error.
 - Every compared fact is resolved server-side at invocation time, inside
   the principal's company: the source issue's current assignee, the
   current unresolved-blocker set (dependency readiness), low-trust status
   (trust-preset resolution over agent/project/issue policy), and the
   selected workspace's transport (its execution-workspace record, which
   must be bound to the source issue: the workspace's source issue, or the
-  issue's selected execution workspace).
+  issue's selected execution workspace). A closed workspace (`closedAt`
+  set, or status `archived` / `cleanup_failed`) denies as
+  `workspace_transport_mismatch`.
 - `requestedToolClass` (optional, nullable) is passed to the low-trust
   preflight. Under low trust the validation always denies.
 

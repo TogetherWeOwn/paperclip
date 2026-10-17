@@ -40,6 +40,8 @@ function deps(
       companyId: COMPANY_ID,
       transport: "local_fs",
       sourceIssueId: SOURCE_ISSUE_ID,
+      status: "active",
+      closedAt: null,
     }),
     resolveDeployedImageAttestation: () => ({
       sourceRevision: "a".repeat(40),
@@ -159,6 +161,13 @@ describe("POST /api/issues/:id/transport-validation", () => {
       ok: false,
       errorCode: "image_attestation_unavailable",
     });
+  });
+
+  it("rejects a non-UUID workspaceId with 400 instead of reaching the database", async () => {
+    const res = await request(createApp(agentActor))
+      .post(`/api/issues/${SOURCE_ISSUE_ID}/transport-validation`)
+      .send({ workspaceId: "nope", transport: "local_fs" });
+    expect(res.status).toBe(400);
   });
 
   it("rejects a malformed body", async () => {

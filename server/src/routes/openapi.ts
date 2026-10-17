@@ -3922,7 +3922,7 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(
       z.object({
-        workspaceId: z.string().min(1),
+        workspaceId: z.string().uuid(),
         transport: z.string().min(1),
         requestedToolClass: z.string().nullable().optional(),
       }),
