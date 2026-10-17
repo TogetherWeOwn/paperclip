@@ -140,7 +140,10 @@ import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import {
+  instanceSettingsService,
+  type InstanceSettingsWriteDb,
+} from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -7114,8 +7117,16 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(
+    companyId: string,
+    userId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    // Keep this read on the caller's transaction connection. The chat ingress
+    // task-mutation transaction calls create/update while holding the endpoint
+    // row lock; re-entering the outer pool here can deadlock when concurrent
+    // transactions fill the pool while waiting on the same endpoint row.
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -9763,8 +9774,12 @@ export function issueService(db: Db) {
       // A prompt prefix is not a task identity: distinct requests can share it.
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
+      // All reads below stay on the caller's connection. Create is called
+      // from the chat ingress task-mutation transaction while it holds the
+      // endpoint row lock; acquiring a second pooled connection here can
+      // exhaust the pool under concurrent ingress and freeze the API.
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9775,12 +9790,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -10660,8 +10675,12 @@ export function issueService(db: Db) {
           );
         }
       }
+      // Keep this read on the caller's connection: update runs inside the
+      // chat ingress task-mutation transaction while it holds the endpoint
+      // row lock, so a pooled read here can exhaust the pool under ingress
+      // fanout and freeze the API (see create above).
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
@@ -10783,6 +10802,7 @@ export function issueService(db: Db) {
         await assertAssignableUser(
           existing.companyId,
           issueData.assigneeUserId,
+          dbOrTx,
         );
       }
       let nextProjectId =
