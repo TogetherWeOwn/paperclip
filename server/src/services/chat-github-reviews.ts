@@ -310,7 +310,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         source.config.configuration,
         repositoryId,
       ),
-      shadowLabel: githubShadowLabel(source.config.configuration),
+      shadowLabel: source.conversation.githubShadowLabel
+        ?? source.delivery.githubShadowLabel
+        ?? githubShadowLabel(source.config.configuration),
     };
   }
   /** The shadow label pinned on this task's newest review row, if any. A

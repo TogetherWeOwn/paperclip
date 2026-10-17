@@ -3571,14 +3571,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return config ? githubShadowLabel(config.configuration) : null;
   }
 
-  /** The shadow label pinned on a review row for this task, if any. A pinned
-   * shadow review must never publish generic chat output either, even after
-   * shadow mode is disabled in config; mirrors the review tools' lookup. */
+  /** Admission authority exists before begin_review. Retain the review-row
+   * fallback for legacy tasks admitted before delivery authority was stored. */
   async function githubPinnedShadowLabel(input: {
     companyId: string;
     endpointId: string;
     issueId: string;
   }): Promise<string | null> {
+    const [conversation] = await db.select({ label: chatConversations.githubShadowLabel })
+      .from(chatConversations).where(and(
+        eq(chatConversations.companyId, input.companyId),
+        eq(chatConversations.endpointId, input.endpointId),
+        eq(chatConversations.issueId, input.issueId),
+        isNotNull(chatConversations.githubShadowLabel),
+      )).limit(1);
+    if (conversation?.label) return conversation.label;
     const [row] = await db
       .select({ shadowLabel: chatGitHubReviews.shadowLabel })
       .from(chatGitHubReviews)
@@ -3606,6 +3613,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }): Promise<string | null> {
     let issueId: string | null = null;
     if (action.deliveryId) {
+      const [delivery] = await db.select({ label: chatDeliveries.githubShadowLabel })
+        .from(chatDeliveries).where(and(
+          eq(chatDeliveries.id, action.deliveryId),
+          eq(chatDeliveries.companyId, action.companyId),
+          eq(chatDeliveries.endpointId, action.endpointId),
+        )).limit(1);
+      if (delivery?.label) return delivery.label;
       const [row] = await db
         .select({ issueId: chatConversations.issueId })
         .from(chatDeliveries)
@@ -3659,7 +3673,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }): Promise<void> {
     if (
       input.endpoint.provider === "github" &&
-      (await githubEndpointShadowLabel(input.endpoint.id))
+      ((await githubEndpointShadowLabel(input.endpoint.id)) ||
+        (await githubPinnedShadowLabelForReceiptAction({
+          companyId: input.endpoint.companyId,
+          endpointId: input.endpoint.id,
+          deliveryId: input.deliveryId,
+          conversationId: null,
+        })))
     )
       return;
     const record = await endpointRecord(input.endpoint.id);
@@ -15269,6 +15289,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             .then((rows) => rows[0] ?? null)
         : null;
       if (!admittedDeliveryId) {
+        // The endpoint row is locked above, as it is during configuration saves.
+        // Pin capture-only authority on initial ingress, not at begin_review.
+        // Duplicate deliveries retain the original row and recovery never repins it.
+        const [githubConfig] = endpoint.provider === "github"
+          ? await tx.select().from(chatGitHubConfigurations).where(and(
+              eq(chatGitHubConfigurations.endpointId, endpoint.id),
+              eq(chatGitHubConfigurations.companyId, endpoint.companyId),
+            ))
+          : [];
+        const admittedShadowLabel = githubConfig
+          ? githubShadowLabel(githubConfig.configuration)
+          : null;
         const [delivery] = await tx
           .insert(chatDeliveries)
           .values({
@@ -15279,6 +15311,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .update(providerEventId)
               .digest("hex"),
             eventKind,
+            githubShadowLabel: admittedShadowLabel,
             normalizedEvent: redactDestinationDelivery
               ? redactedDestinationNormalized
               : deferDrainUntilFollowup && accepting
@@ -16617,6 +16650,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           },
           taskTx,
         );
+        const [taskGitHubConfig] = endpoint.provider === "github"
+          ? await taskTx.select().from(chatGitHubConfigurations).where(and(
+              eq(chatGitHubConfigurations.endpointId, endpoint.id),
+              eq(chatGitHubConfigurations.companyId, endpoint.companyId),
+            ))
+          : [];
+        const taskShadowLabel = conversation!.githubShadowLabel
+          ?? activeDelivery.githubShadowLabel
+          ?? githubAutomatic?.shadowLabel
+          ?? (taskGitHubConfig ? githubShadowLabel(taskGitHubConfig.configuration) : null);
+        if (taskShadowLabel) {
+          // A later primary message must not promote a shadow-origin task.
+          await taskTx.update(chatConversations).set({
+            githubShadowLabel: taskShadowLabel,
+          }).where(eq(chatConversations.id, conversation!.id));
+        }
         await taskTx
           .update(chatDeliveries)
           .set({
@@ -16670,7 +16719,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             pullNumber: githubAutomatic.context.pullNumber, headSha: githubAutomatic.context.headSha,
             deliveryId: activeDelivery.id, configurationRevision: githubAutomatic.revision,
             policySnapshot: githubAutomatic.policy, event: githubAutomatic.context, state: "queued",
-            shadowLabel: githubAutomatic.shadowLabel ?? null,
+            shadowLabel: taskShadowLabel,
           }).onConflictDoNothing();
         }
         await stageInboundWakeup(taskTx, {
