@@ -148,6 +148,18 @@ export const executionWorkspaceCloseReadinessSchema = z.object({
   runtimeServices: z.array(workspaceRuntimeServiceSchema),
 }).strict();
 
+// PATCH must never move a workspace into (or out of) the allocation-only
+// `unrealized` state: that lifecycle belongs to allocation and heartbeat
+// realization, not generic updates. Kept as a separate enum so
+// `executionWorkspaceStatusSchema` stays the full lifecycle set.
+const updateExecutionWorkspaceStatusSchema = z.enum([
+  "active",
+  "idle",
+  "in_review",
+  "archived",
+  "cleanup_failed",
+]);
+
 export const updateExecutionWorkspaceSchema = z.object({
   name: z.string().min(1).optional(),
   cwd: z.string().optional().nullable(),
@@ -155,7 +167,7 @@ export const updateExecutionWorkspaceSchema = z.object({
   baseRef: z.string().optional().nullable(),
   branchName: z.string().optional().nullable(),
   providerRef: z.string().optional().nullable(),
-  status: executionWorkspaceStatusSchema.optional(),
+  status: updateExecutionWorkspaceStatusSchema.optional(),
   cleanupEligibleAt: z.string().datetime().optional().nullable(),
   cleanupReason: z.string().optional().nullable(),
   config: executionWorkspaceConfigSchema.optional().nullable(),

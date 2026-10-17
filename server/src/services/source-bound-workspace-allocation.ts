@@ -714,6 +714,12 @@ export function createDbSourceBoundWorkspaceAllocationDeps(
               .where(
                 and(eq(issues.id, issueId), eq(issues.companyId, companyId)),
               )
+              // Row-level lock: allocation, rollback, and realization all
+              // read-modify-write this issue row inside one transaction, so
+              // concurrent operations on the same issue serialize here
+              // instead of inserting duplicate unrealized records or
+              // interleaving with a rollback.
+              .for("update")
               .limit(1);
             return rows[0] ?? null;
           },

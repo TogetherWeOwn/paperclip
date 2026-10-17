@@ -56,7 +56,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -1202,7 +1202,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       });
       return null;
     };
-    if (!issue) return denyUnauthorized();
+    // Existence-oracle gate: missing and cross-tenant issues deny identically
+    // (same 403 status and body), so callers cannot distinguish them. The
+    // `hasCompanyAccess` check satisfies the static existence-oracle guard;
+    // `assertCompanyAccess` still runs for authorized tenants to enforce the
+    // write-path membership checks.
+    if (!issue || !hasCompanyAccess(req, issue.companyId)) {
+      return denyUnauthorized();
+    }
     try {
       assertCompanyAccess(req, issue.companyId);
     } catch {

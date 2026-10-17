@@ -124,7 +124,9 @@ import {
   announcementSchema,
   dismissAnnouncementSchema,
   // Execution workspaces
+  allocateSourceBoundWorkspaceSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -1398,6 +1400,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/source-bound-workspace-allocation",
+  "POST /api/issues/{id}/source-bound-workspace-allocation/rollback",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -3947,11 +3951,7 @@ registry.registerPath({
     "Board principal with runtime:manage only (agent keys are denied). Allocates — or idempotently returns — an unrealized execution-workspace record bound to the issue, with every field derived server-side from the issue's stored isolated_workspace + git_worktree selection. No wake, run, checkout, branch/worktree creation, or runtime start; no issue status, assignee, blocker, or monitor change. Allocation alone never passes transport validation (workspace_not_realized) until a later heartbeat run realizes into the same record.",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(
-      z.object({
-        requested: z.record(z.string(), z.unknown()).nullable().optional(),
-      }),
-    ),
+    body: jsonBody(allocateSourceBoundWorkspaceSchema),
   },
   responses: {
     200: r.ok(),
@@ -3973,11 +3973,7 @@ registry.registerPath({
     "Board principal with runtime:manage only. Archives the allocated unrealized record and restores the issue's exact prior executionWorkspaceId recorded at allocation, refusing if the binding changed in between. Realized workspaces cannot be rolled back through this path. Audited as a separate attributed activity entry.",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(
-      z.object({
-        workspaceId: z.string().uuid(),
-      }),
-    ),
+    body: jsonBody(rollbackSourceBoundWorkspaceAllocationSchema),
   },
   responses: {
     200: r.ok(),
