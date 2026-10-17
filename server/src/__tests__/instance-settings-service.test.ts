@@ -44,6 +44,7 @@ describe("instance settings service", () => {
     enableMcpAggregators: true,
       enableAgentChat: false,
       enableChatConnectors: false,
+      githubReviewShadowEnabled: false,
       enableMemoryConnectors: false,
       enableConferenceRoomChat: false,
       enableClassicTaskInterface: false,

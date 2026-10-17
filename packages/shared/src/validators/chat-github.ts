@@ -76,6 +76,14 @@ export const githubAllowedPersonSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
 ]);
+const githubReviewShadowRouteSchema = z.object({
+  label: z.string().trim().min(1).max(64)
+    .regex(/^[a-z0-9][a-z0-9._-]*$/, "Shadow route label must be a lowercase slug"),
+  agentId: z.string().uuid().transform((value) => value.toLowerCase()),
+  enabled: z.boolean().default(false),
+  sampleRate: z.number().finite().min(0).max(1).default(1),
+}).strict();
+
 export const githubChatConfigurationSchema = z
   .object({
     version: z.literal(1),
@@ -87,6 +95,7 @@ export const githubChatConfigurationSchema = z
     repositories: z
       .record(githubIdSchema, githubReviewPolicySchema.partial())
       .refine((value) => Object.keys(value).length <= 500),
+    shadowRoutes: z.array(githubReviewShadowRouteSchema).max(8).default([]),
     // Optional so configurations saved before shadow mode existed stay valid.
     shadow: z
       .object({
@@ -103,6 +112,14 @@ export const githubChatConfigurationSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    for (const field of ["label", "agentId"] as const) {
+      if (new Set(value.shadowRoutes.map((route) => route[field])).size !== value.shadowRoutes.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["shadowRoutes"], message: `Shadow route ${field} must be unique.` });
+      }
+    }
+    if (value.shadow?.enabled && value.shadowRoutes.some((route) => route.enabled)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["shadowRoutes"], message: "A shadow-only endpoint cannot enable paired shadow routes." });
+    }
     if (
       new Set(value.people.map((person) => person.githubUserId)).size !==
       value.people.length

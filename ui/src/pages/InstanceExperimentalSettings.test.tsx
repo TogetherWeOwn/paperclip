@@ -80,6 +80,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableApps: true,
     enableMcpAggregators: true,
     enableChatConnectors: false,
+    githubReviewShadowEnabled: false,
     enableMemoryConnectors: false,
     enablePipelines: false,
     enableCases: false,

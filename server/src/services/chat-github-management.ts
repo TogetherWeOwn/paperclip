@@ -2,7 +2,7 @@ import { githubBotCredentials } from "./chat-github-client.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { agents, toolCatalogEntries } from "@paperclipai/db";
 import { GITHUB_BOT_TOOLS, syncGitHubBotTools } from "./chat-github-tools.js";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   chatEndpoints,
   chatEndpointResources,
@@ -10,6 +10,7 @@ import {
   chatIdentityLinks,
   chatGitHubConfigurations,
   chatGitHubReviews,
+  chatGitHubReviewArms,
   companyMemberships,
   connectionGrants,
   toolConnections,
@@ -70,7 +71,13 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         ),
       );
     return (
-      saved ?? {
+      (saved ? {
+        ...saved,
+        configuration: {
+          ...saved.configuration,
+          shadowRoutes: saved.configuration.shadowRoutes ?? [],
+        },
+      } : null) ?? {
         endpointId,
         companyId: bot.companyId,
         revision: 0,
@@ -82,6 +89,7 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
           people: [],
           defaults: defaultGitHubReviewPolicy(),
           repositories: {},
+          shadowRoutes: [],
         } satisfies GitHubChatConfiguration,
       }
     );
@@ -142,11 +150,12 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         "Repository overrides must refer to this App installation",
       );
     await db.transaction(async (tx) => {
-      await tx
-        .select({ id: chatEndpoints.id })
+      const [lockedBot] = await tx
+        .select()
         .from(chatEndpoints)
-        .where(eq(chatEndpoints.id, endpointId))
+        .where(and(eq(chatEndpoints.id, endpointId), eq(chatEndpoints.companyId, bot.companyId)))
         .for("update");
+      if (!lockedBot || lockedBot.status === "archived") throw notFound("GitHub bot not found");
       await tx.execute(
         sql`select pg_advisory_xact_lock(hashtextextended(${`github-config:${endpointId}`}, 0))`,
       );
@@ -157,6 +166,60 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         .for("update");
       if ((current?.revision ?? 0) !== parsed.expectedRevision)
         throw conflict("This configuration changed. Refresh before saving.");
+      // Configuration never lends the endpoint's authority to another agent.
+      // These are durable identities only; per-event execution needs its own
+      // authenticated binding (and the global admission switch).
+      const armRows = await tx
+        .select()
+        .from(chatGitHubReviewArms)
+        .where(and(
+          eq(chatGitHubReviewArms.companyId, bot.companyId),
+          eq(chatGitHubReviewArms.endpointId, endpointId),
+        ));
+      const configuredLabels = new Set(config.shadowRoutes.map((route) => route.label));
+      const targets = config.shadowRoutes.length === 0 ? [] : await tx
+        .select()
+        .from(agents)
+        .where(and(
+          eq(agents.companyId, bot.companyId),
+          inArray(agents.id, config.shadowRoutes.map((route) => route.agentId)),
+        ))
+        .orderBy(asc(agents.id))
+        .for("share");
+      for (const route of config.shadowRoutes) {
+        const target = targets.find((agent) => agent.id === route.agentId);
+        if (!target || target.id === lockedBot.assignedAgentId || target.status === "terminated") {
+          throw badRequest("Shadow route must target a different, non-terminated agent in this company");
+        }
+        const existing = armRows.find((arm) => arm.label === route.label);
+        if (existing && (existing.agentId !== route.agentId || existing.retiredAt !== null)) {
+          throw conflict("Shadow route identity is immutable. Use a new label for a new arm.");
+        }
+      }
+      // Retire before inserting replacements so an agent can move to a new
+      // label in one revision, while old event bindings keep their identity.
+      const retiring = armRows.filter((arm) => arm.retiredAt === null && !configuredLabels.has(arm.label));
+      if (retiring.length > 0) {
+        await tx
+          .update(chatGitHubReviewArms)
+          .set({ retiredAt: new Date() })
+          .where(and(
+            eq(chatGitHubReviewArms.companyId, bot.companyId),
+            eq(chatGitHubReviewArms.endpointId, endpointId),
+            inArray(chatGitHubReviewArms.id, retiring.map((arm) => arm.id)),
+          ));
+      }
+      for (const route of config.shadowRoutes) {
+        if (!armRows.some((arm) => arm.label === route.label)) {
+          await tx.insert(chatGitHubReviewArms).values({
+            companyId: bot.companyId,
+            endpointId,
+            label: route.label,
+            agentId: route.agentId,
+            configurationRevision: parsed.expectedRevision + 1,
+          });
+        }
+      }
       const values = {
         companyId: bot.companyId,
         endpointId,
