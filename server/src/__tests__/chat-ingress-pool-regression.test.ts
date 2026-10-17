@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -187,6 +188,12 @@ describeEmbeddedPostgres(
         maxConnections: 1,
       });
       const { companyId } = await seedCompanyWithAgent(db);
+      // update() drops executionWorkspaceId when isolated workspaces are
+      // disabled, so enable the gate or the workspace assertions below see
+      // null and the pool-regression intent is lost.
+      await instanceSettingsService(db).updateExperimental({
+        enableIsolatedWorkspaces: true,
+      });
       const svc = issueService(smallDb);
       const projectId = randomUUID();
       await db.insert(projects).values({
