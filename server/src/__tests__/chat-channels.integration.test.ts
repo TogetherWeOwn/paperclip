@@ -3306,6 +3306,245 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(published).toContain("https://github.com/paperclipai/paperclip/pull/91");
       expect(published).not.toMatch(/vanity\.example/);
     });
+    it("shadow mode stores a full assessment with zero GitHub writes or publication intents", async () => {
+      const f = await reviewBotFixture();
+      const shadowed = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: shadowed.revision,
+          configuration: {
+            ...shadowed.configuration,
+            shadow: { enabled: true, label: "meta-shadow" },
+          },
+        },
+        "owner-user",
+      );
+      const head = "b".repeat(40);
+      const payload = {
+        action: "opened",
+        installation: { id: 2468 },
+        repository: {
+          id: 97531,
+          full_name: "paperclipai/paperclip",
+          name: "paperclip",
+          owner: { id: 1357, login: "paperclipai" },
+        },
+        sender: { id: 77, login: "maintainer" },
+        pull_request: {
+          number: 81,
+          title: "Check review routing",
+          body: "Untrusted PR body",
+          draft: false,
+          base: { sha: "a".repeat(40), ref: "master" },
+          head: { sha: head },
+          user: { id: 42, login: "octocat", type: "User" },
+          labels: [],
+        },
+      };
+      expect((await f.service.handleWebhook(
+        f.endpoint.publicId,
+        "github",
+        signedGitHubWebhookRequest({
+          event: "pull_request",
+          delivery: randomUUID(),
+          payload,
+          webhookSecret: f.webhookSecret,
+        }),
+      )).status).toBeLessThan(300);
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select()
+                .from(chatGitHubReviews)
+                .where(eq(chatGitHubReviews.endpointId, f.endpoint.id))
+            ).length,
+          { timeout: 10000 },
+        )
+        .toBe(1);
+      const [admitted] = await db
+        .select()
+        .from(chatGitHubReviews)
+        .where(eq(chatGitHubReviews.endpointId, f.endpoint.id));
+      expect(admitted).toMatchObject({ state: "queued", shadowLabel: "meta-shadow" });
+      // Admission staged no check intent for the shadow endpoint.
+      expect(await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.kind, "github_review_check"),
+      ))).toHaveLength(0);
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, admitted.issueId));
+      // Prompt parity: the shadow reviewer is never told it is shadow.
+      expect(comments[0].body).not.toContain("meta-shadow");
+      expect(comments[0].body.toLowerCase()).not.toContain("shadow");
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        invocationSource: "assignment",
+        status: "running",
+        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: comments[0].id },
+      }).returning();
+      const session = {
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        issueId: admitted.issueId,
+        runId: run.id,
+      };
+      const mutations: Array<{ url: string; method: string }> = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
+        if (init?.method && init.method !== "GET") {
+          mutations.push({ url, method: init.method });
+          return Response.json({ id: 1, html_url: "https://github.com/test/unexpected" });
+        }
+        if (url.endsWith("/pulls/81"))
+          return Response.json({
+            number: 81,
+            title: "Check review routing",
+            body: "Untrusted PR body",
+            state: "open",
+            draft: false,
+            head: { sha: head },
+            base: { sha: "a".repeat(40), ref: "master" },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: "e".repeat(40) },
+            status: "ahead",
+            total_commits: 1,
+            files: [],
+          });
+        if (url.includes("/files?"))
+          return Response.json([
+            {
+              filename: "src/math.ts",
+              status: "modified",
+              patch: "@@ -1 +1 @@\n-return a + b\n+return a - b",
+              additions: 1,
+              deletions: 1,
+            },
+          ]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        return Response.json([]);
+      });
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(session, "read_pull_request", { section: "metadata" });
+      const begun = await service.execute(session, "begin_review", { reviewedCommit: head });
+      expect(begun).toMatchObject({ reviewId: admitted.id });
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      await service.processPending();
+      expect(mutations).toHaveLength(0);
+      expect(await service.execute(session, "comment", {
+        body: "Queued",
+        idempotencyKey: "shadow-queued",
+      })).toMatchObject({ status: "shadow_stored", shadowLabel: "meta-shadow" });
+      const assessment = {
+        reviewedCommit: head,
+        score: 2,
+        complete: true,
+        summary: "Addition subtracts",
+        rationale: "Returning a minus b is incorrect.",
+        coverage: {
+          reviewedPaths: ["src/math.ts"],
+          omittedPaths: [],
+          limitations: [],
+        },
+        findings: [
+          {
+            key: "wrong-operator",
+            path: "src/math.ts",
+            line: 1,
+            side: "RIGHT",
+            severity: "error",
+            category: "correctness",
+            title: "Incorrect operator",
+            body: "Use addition.",
+          },
+        ],
+      };
+      const submitted = await service.execute(session, "submit_review", assessment, "shadow-invocation");
+      expect(submitted).toMatchObject({
+        status: "shadow_stored",
+        score: 2,
+        conclusion: "failure",
+        shadowLabel: "meta-shadow",
+      });
+      // Idempotent retry stores nothing twice and still publishes nothing.
+      expect(await service.execute(session, "submit_review", assessment, "shadow-retry")).toMatchObject({
+        status: "shadow_stored",
+        score: 2,
+      });
+      await expect(
+        service.execute(session, "submit_review", { ...assessment, score: 5 }),
+      ).rejects.toThrow("already submitted its assessment");
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      await service.processPending();
+      expect(mutations).toHaveLength(0);
+      const [stored] = await db
+        .select()
+        .from(chatGitHubReviews)
+        .where(eq(chatGitHubReviews.id, admitted.id));
+      expect(stored).toMatchObject({
+        state: "completed",
+        conclusion: "failure",
+        shadowLabel: "meta-shadow",
+        checkId: null,
+        checkUrl: null,
+        summaryId: null,
+        summaryUrl: null,
+        publicationReceipts: {},
+      });
+      expect(stored.assessment).toMatchObject({
+        reviewedCommit: head,
+        score: 2,
+        complete: true,
+        findings: [{ key: "wrong-operator", path: "src/math.ts", line: 1 }],
+      });
+      expect(await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.kind, "github_review_publication"),
+      ))).toHaveLength(0);
+      expect(await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.kind, "github_review_check"),
+      ))).toHaveLength(0);
+      // Even with formal reviews enabled in policy, and even after shadow is
+      // later disabled in config, the pinned shadow assessment never publishes.
+      const formal = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: formal.revision,
+          configuration: {
+            ...formal.configuration,
+            shadow: { enabled: false, label: "meta-shadow" },
+            defaults: { ...formal.configuration.defaults, allowApprove: true },
+          },
+        },
+        "owner-user",
+      );
+      await expect(service.execute(session, "formal_review", {
+        event: "APPROVE",
+        reviewedCommit: head,
+        body: "Approved",
+        idempotencyKey: "shadow-formal",
+      })).rejects.toThrow("Shadow review endpoints never publish");
+      // The pinned label also suppresses plain comments from the same
+      // shadow review session after shadow mode is disabled in config.
+      expect(await service.execute(session, "comment", {
+        body: "Must not publish",
+        idempotencyKey: "shadow-pinned-comment",
+      })).toMatchObject({ status: "shadow_stored", shadowLabel: "meta-shadow" });
+      await service.processPending();
+      expect(mutations).toHaveLength(0);
+    });
   });
 
   async function configuredTelegramEndpoint(

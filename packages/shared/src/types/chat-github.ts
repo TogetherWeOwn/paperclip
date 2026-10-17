@@ -53,6 +53,18 @@ export interface GitHubChatConfiguration {
   defaults: GitHubReviewPolicy;
   /** Keys are stable GitHub repository IDs; labels never grant access. */
   repositories: Record<string, Partial<GitHubReviewPolicy>>;
+  /**
+   * Shadow review mode: the endpoint runs the reviewer exactly as normal —
+   * same prompts, task-scoped tools, and assessment validation — but never
+   * publishes anything to GitHub (no check run, summary, inline findings,
+   * formal review, comments, reactions, or chat replies) and creates no
+   * publication intents. Assessments are stored tagged with `label` so a
+   * shadow reviewer seat (e.g. a cloned agent on another model) can be
+   * compared against the publishing reviewer on identical PR heads.
+   * Absent means disabled, so configurations saved before this field existed
+   * keep publishing as before.
+   */
+  shadow?: { enabled: boolean; label: string };
 }
 
 export interface GitHubReviewEventContext {
@@ -138,6 +150,9 @@ export interface GitHubTaskReview {
   conclusion: GitHubReviewConclusion | null;
   checkUrl: string | null;
   summaryUrl: string | null;
+  /** Non-null only for shadow reviews: the endpoint config's shadow label,
+   * pinned when the review row was created. Shadow reviews never publish. */
+  shadowLabel: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -118,6 +118,9 @@ export const chatGitHubReviews = pgTable(
     checkUrl: text("check_url"),
     summaryId: text("summary_id"),
     summaryUrl: text("summary_url"),
+    /** Non-null only for shadow reviews; pinned from endpoint config at
+     * creation. A labelled row must never be published to GitHub. */
+    shadowLabel: text("shadow_label"),
     /** Receipts are also recovered from provider markers before retrying writes. */
     publicationReceipts: jsonb("publication_receipts")
       .$type<Record<string, { id: string; url: string; digest: string }>>()
@@ -155,6 +158,12 @@ export const chatGitHubReviews = pgTable(
     check(
       "chat_github_review_state_check",
       sql`${t.state} in ('queued', 'running', 'completed', 'incomplete', 'error', 'superseded', 'manual_required')`,
+    ),
+    // Publication gates test label truthiness; an empty string must never
+    // be storable, or it would silently read as "not shadow".
+    check(
+      "chat_github_review_shadow_label_check",
+      sql`${t.shadowLabel} is null or ${t.shadowLabel} <> ''`,
     ),
   ],
 );

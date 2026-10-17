@@ -1,0 +1,2 @@
+ALTER TABLE "chat_github_reviews" ADD COLUMN "shadow_label" text;--> statement-breakpoint
+ALTER TABLE "chat_github_reviews" ADD CONSTRAINT "chat_github_review_shadow_label_check" CHECK ("chat_github_reviews"."shadow_label" is null or "chat_github_reviews"."shadow_label" <> '');

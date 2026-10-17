@@ -87,6 +87,19 @@ export const githubChatConfigurationSchema = z
     repositories: z
       .record(githubIdSchema, githubReviewPolicySchema.partial())
       .refine((value) => Object.keys(value).length <= 500),
+    // Optional so configurations saved before shadow mode existed stay valid.
+    shadow: z
+      .object({
+        enabled: z.boolean(),
+        label: z
+          .string()
+          .trim()
+          .min(1)
+          .max(64)
+          .regex(/^[a-z0-9][a-z0-9._-]*$/i, "Shadow label must be a short slug"),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
