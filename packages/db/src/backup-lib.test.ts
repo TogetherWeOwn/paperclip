@@ -75,6 +75,56 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("preserves named checks and NOT VALID checks in JavaScript backups", async () => {
+    const cluster = await createTempDatabase();
+    const sourceConnectionString = await createSiblingDatabase(cluster, "checks_source");
+    const restoreConnectionString = await createSiblingDatabase(cluster, "checks_restore");
+    const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+    const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE SCHEMA checks;
+        CREATE FUNCTION checks.nonnegative(value integer) RETURNS boolean
+          LANGUAGE sql IMMUTABLE AS 'SELECT value >= 0';
+        CREATE TABLE checks.records (
+          id integer PRIMARY KEY,
+          value integer NOT NULL,
+          CONSTRAINT "value\"\"check" CHECK (checks.nonnegative(value)) NO INHERIT
+        );
+        INSERT INTO checks.records VALUES (1, 0);
+        ALTER TABLE checks.records ADD CONSTRAINT positive_check CHECK (value > 0) NOT VALID;
+      `);
+      const result = await runDatabaseBackup({
+        connectionString: sourceConnectionString,
+        backupDir: createTempDir("paperclip-db-backup-checks-"),
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        backupEngine: "javascript",
+      });
+      await runDatabaseRestore({
+        connectionString: restoreConnectionString,
+        backupFile: result.backupFile,
+      });
+      const checksQuery = `
+        SELECT conname, convalidated, connoinherit, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint WHERE conrelid = 'checks.records'::regclass AND contype = 'c'
+        ORDER BY conname
+      `;
+      expect(await restoreSql.unsafe(checksQuery)).toEqual(await sourceSql.unsafe(checksQuery));
+      // Existing rows may violate a NOT VALID check, but new rows may not.
+      expect(await restoreSql`SELECT value FROM checks.records`).toEqual([{ value: 0 }]);
+      await expect(restoreSql`INSERT INTO checks.records VALUES (2, 0)`)
+        .rejects.toMatchObject({ code: "23514", constraint_name: "positive_check" });
+      await restoreSql.unsafe('ALTER TABLE checks.records DROP CONSTRAINT positive_check');
+      await expect(restoreSql`INSERT INTO checks.records VALUES (2, -1)`)
+        .rejects.toMatchObject({ code: "23514", constraint_name: 'value"check' });
+      // A subsequent migration must be able to replace the original named check.
+      await restoreSql.unsafe('ALTER TABLE checks.records DROP CONSTRAINT "value""check"');
+    } finally {
+      await sourceSql.end();
+      await restoreSql.end();
+    }
+  }, 30_000);
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
