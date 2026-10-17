@@ -1629,7 +1629,9 @@ async function startServerWithDatabaseTeardown(
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
-    await decisionExecutor.sweepExpired();
+    await decisionExecutor.sweepExpired().catch((err: unknown) => {
+      logger.error({ err }, "startup decision recovery failed; continuing startup");
+    });
 
     // Run the adapter login reaper once at startup, so a login sandbox that
     // outlived a server restart is deleted before timer ticks start.

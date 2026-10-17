@@ -21,6 +21,7 @@ const {
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
+  decisionServiceMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
@@ -64,6 +65,9 @@ const {
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
+  const decisionServiceMock = {
+    sweepExpired: vi.fn(async () => ({ expired: 0 })),
+  };
   const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
@@ -161,6 +165,7 @@ const {
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
+    decisionServiceMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
@@ -297,9 +302,7 @@ vi.mock("../services/index.js", () => ({
   attentionService: vi.fn(() => ({
     list: vi.fn(async () => ({ items: [], nextCursor: null })),
   })),
-  decisionService: vi.fn(() => ({
-    sweepExpired: vi.fn(async () => ({ expired: 0 })),
-  })),
+  decisionService: vi.fn(() => decisionServiceMock),
   createDecisionRetentionSweep: vi.fn((input: {
     archiveIdleItems: () => Promise<number>;
     deliverNotifications: () => Promise<unknown>;
@@ -709,6 +712,17 @@ describe("startServer feedback export wiring", () => {
     completionSweepMock.mockClear();
     publishLiveEvent({ companyId: "company-two", type: "activity.logged", payload: { action: "issue.updated" } });
     expect(completionSweepMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["Agent is not invokable", "decision query failed"])("continues startup when decision recovery rejects with %s", async (message) => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    decisionServiceMock.sweepExpired.mockRejectedValueOnce(new Error(message));
+
+    const started = await startServer();
+
+    expect(started.server).toBe(fakeServer);
+    expect(decisionServiceMock.sweepExpired).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).not.toHaveBeenCalled();
   });
 
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {
