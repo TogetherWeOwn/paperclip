@@ -4,7 +4,10 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   issues,
+  projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
@@ -176,11 +179,41 @@ describeEmbeddedPostgres(
         "paperclip-chat-ingress-pool-",
       );
       const db = createDb(tempDb.connectionString);
+      // Single-connection pool: the transaction holds the only connection,
+      // so any nested pooled read hangs until withTimeout fires. With two
+      // connections a stray pooled read takes the free second one and the
+      // test can never catch pool re-entry.
       const smallDb = createDb(tempDb.connectionString, {
-        maxConnections: 2,
+        maxConnections: 1,
       });
       const { companyId } = await seedCompanyWithAgent(db);
       const svc = issueService(smallDb);
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Ingress project",
+        status: "in_progress",
+      });
+      const projectWorkspaceId = randomUUID();
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary workspace",
+        isPrimary: true,
+      });
+      const executionWorkspaceId = randomUUID();
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Issue worktree",
+        status: "active",
+      });
       const issue = await svc.create(companyId, {
         title: `Reopen target ${randomUUID()}`,
         description: null,
@@ -196,13 +229,32 @@ describeEmbeddedPostgres(
             .where(eq(companies.id, companyId))
             .for("update");
           // Touching assigneeUserId exercises the membership check and the
-          // isolated-workspaces settings read inside update.
+          // isolated-workspaces settings read inside update; patching the
+          // workspace ids pins the update workspace validations on the
+          // caller transaction too.
           const updated = await svc.update(
             issue.id,
-            { assigneeUserId: "board-user" },
+            {
+              assigneeUserId: "board-user",
+              projectWorkspaceId,
+              executionWorkspaceId,
+            },
             tx,
           );
           expect(updated?.assigneeUserId).toBe("board-user");
+          expect(updated?.projectWorkspaceId).toBe(projectWorkspaceId);
+          expect(updated?.executionWorkspaceId).toBe(executionWorkspaceId);
+          // With the project now resolved from the workspaces, a second
+          // update exercises the project-scoped workspace validation
+          // branch as well, so all four update validators run on this
+          // single connection.
+          const revalidated = await svc.update(
+            issue.id,
+            { projectWorkspaceId, executionWorkspaceId },
+            tx,
+          );
+          expect(revalidated?.projectWorkspaceId).toBe(projectWorkspaceId);
+          expect(revalidated?.executionWorkspaceId).toBe(executionWorkspaceId);
         }),
         15_000,
         "lock-holding update with assignee change",
