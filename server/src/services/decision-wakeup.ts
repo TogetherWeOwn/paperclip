@@ -6,6 +6,7 @@ type HeartbeatWakeup = (
   options: {
     source: "automation";
     triggerDetail: "system";
+    requestedByActorType?: "system";
     reason: string;
     payload: Record<string, unknown>;
   },
@@ -23,6 +24,7 @@ export function createDecisionWakeOriginAgent(
   return async (input) => wakeup(input.agentId, {
     source: "automation",
     triggerDetail: "system",
+    requestedByActorType: "system",
     reason: `decision_${input.outcome}`,
     payload: {
       issueId: input.issueId,
