@@ -10791,6 +10791,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextProjectWorkspaceId,
+          dbOrTx,
         );
         validatedProjectWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -10801,6 +10802,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextExecutionWorkspaceId,
+          dbOrTx,
         );
         validatedExecutionWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -10812,6 +10814,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextProjectWorkspaceId,
+            dbOrTx,
           );
         }
       }
@@ -10821,6 +10824,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextExecutionWorkspaceId,
+            dbOrTx,
           );
         }
       }

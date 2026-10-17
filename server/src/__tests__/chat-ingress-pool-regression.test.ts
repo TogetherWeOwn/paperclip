@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
-import { afterAll, describe, expect, it } from "vitest";
 import {
   agents,
   companies,
@@ -8,11 +6,13 @@ import {
   createDb,
   issues,
 } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, describe, expect, it } from "vitest";
+import { issueService } from "../services/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -100,195 +100,180 @@ describeEmbeddedPostgres(
       return { companyId, agentId };
     }
 
-    it(
-      "concurrent creates inside lock-holding transactions share one pool",
-      async () => {
-        tempDb = await startEmbeddedPostgresTestDatabase(
-          "paperclip-chat-ingress-pool-",
-        );
-        const db = createDb(tempDb.connectionString);
-        // Bounded pool: production runs at 10; this test uses 3 to prove the
-        // fix holds with far less headroom than production has.
-        const smallDb = createDb(tempDb.connectionString, {
-          maxConnections: 3,
-        });
-        const { companyId, agentId } = await seedCompanyWithAgent(db);
-        const svc = issueService(smallDb);
+    it("concurrent creates inside lock-holding transactions share one pool", async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase(
+        "paperclip-chat-ingress-pool-",
+      );
+      const db = createDb(tempDb.connectionString);
+      // Bounded pool: production runs at 10; this test uses 3 to prove the
+      // fix holds with far less headroom than production has.
+      const smallDb = createDb(tempDb.connectionString, {
+        maxConnections: 3,
+      });
+      const { companyId, agentId } = await seedCompanyWithAgent(db);
+      const svc = issueService(smallDb);
 
-        const concurrency = 6;
-        const creations = Array.from({ length: concurrency }, (_, index) =>
-          smallDb.transaction(async (tx) => {
-            // Stand-in for the chat task-mutation transaction's endpoint
-            // FOR UPDATE lock: the row lock is held for the whole body.
-            const [fence] = await tx
-              .select({ id: companies.id })
-              .from(companies)
-              .where(eq(companies.id, companyId))
-              .for("update");
-            expect(fence?.id).toBe(companyId);
-            const issue = await svc.create(
-              companyId,
-              {
-                title: `Ingress message ${index} ${randomUUID()}`,
-                description: "Started from chat ingress",
-                status: "todo",
-                priority: "medium",
-                assigneeAgentId: agentId,
-                idempotencyKey: `chat:pool-regression:${companyId}:${index}`,
-              },
-              tx,
-            );
-            const comment = await svc.addComment(
-              issue.id,
-              `Inbound body ${index}`,
-              {},
-              undefined,
-              tx,
-            );
-            return { issueId: issue.id, commentId: comment.id };
-          }),
-        );
-
-        // A health/model-capacity style read must stay responsive while the
-        // ingress fanout runs: it needs only one free connection, which the
-        // fix guarantees because transactions never hold two at once.
-        const healthRead = (async () => {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-          return smallDb
+      const concurrency = 6;
+      const creations = Array.from({ length: concurrency }, (_, index) =>
+        smallDb.transaction(async (tx) => {
+          // Stand-in for the chat task-mutation transaction's endpoint
+          // FOR UPDATE lock: the row lock is held for the whole body.
+          const [fence] = await tx
             .select({ id: companies.id })
             .from(companies)
             .where(eq(companies.id, companyId))
-            .then((rows) => rows[0]?.id ?? null);
-        })();
+            .for("update");
+          expect(fence?.id).toBe(companyId);
+          const issue = await svc.create(
+            companyId,
+            {
+              title: `Ingress message ${index} ${randomUUID()}`,
+              description: "Started from chat ingress",
+              status: "todo",
+              priority: "medium",
+              assigneeAgentId: agentId,
+              idempotencyKey: `chat:pool-regression:${companyId}:${index}`,
+            },
+            tx,
+          );
+          const comment = await svc.addComment(
+            issue.id,
+            `Inbound body ${index}`,
+            {},
+            undefined,
+            tx,
+          );
+          return { issueId: issue.id, commentId: comment.id };
+        }),
+      );
 
-        const [results, healthCompanyId] = await withTimeout(
-          Promise.all([
-            Promise.all(creations),
-            healthRead,
-          ]) as Promise<[Array<{ issueId: string; commentId: string }>, string | null]>,
-          25_000,
-          "concurrent lock-holding creates + health read",
-        );
-        expect(healthCompanyId).toBe(companyId);
-        expect(results).toHaveLength(concurrency);
-        expect(new Set(results.map((row) => row.issueId)).size).toBe(
-          concurrency,
-        );
-      },
-      40_000,
-    );
+      // A health/model-capacity style read must stay responsive while the
+      // ingress fanout runs: it needs only one free connection, which the
+      // fix guarantees because transactions never hold two at once.
+      const healthRead = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return smallDb
+          .select({ id: companies.id })
+          .from(companies)
+          .where(eq(companies.id, companyId))
+          .then((rows) => rows[0]?.id ?? null);
+      })();
 
-    it(
-      "updates with assignee changes stay on the caller transaction",
-      async () => {
-        tempDb ??= await startEmbeddedPostgresTestDatabase(
-          "paperclip-chat-ingress-pool-",
-        );
-        const db = createDb(tempDb.connectionString);
-        const smallDb = createDb(tempDb.connectionString, {
-          maxConnections: 2,
-        });
-        const { companyId } = await seedCompanyWithAgent(db);
-        const svc = issueService(smallDb);
-        const issue = await svc.create(companyId, {
-          title: `Reopen target ${randomUUID()}`,
-          description: null,
-          status: "todo",
-          priority: "medium",
-        });
+      const [results, healthCompanyId] = await withTimeout(
+        Promise.all([Promise.all(creations), healthRead]) as Promise<
+          [Array<{ issueId: string; commentId: string }>, string | null]
+        >,
+        25_000,
+        "concurrent lock-holding creates + health read",
+      );
+      expect(healthCompanyId).toBe(companyId);
+      expect(results).toHaveLength(concurrency);
+      expect(new Set(results.map((row) => row.issueId)).size).toBe(concurrency);
+    }, 40_000);
 
-        await withTimeout(
-          smallDb.transaction(async (tx) => {
-            await tx
-              .select({ id: companies.id })
-              .from(companies)
-              .where(eq(companies.id, companyId))
-              .for("update");
-            // Touching assigneeUserId exercises the membership check and the
-            // isolated-workspaces settings read inside update.
-            const updated = await svc.update(
-              issue.id,
-              { assigneeUserId: "board-user" },
-              tx,
-            );
-            expect(updated?.assigneeUserId).toBe("board-user");
-          }),
-          15_000,
-          "lock-holding update with assignee change",
-        );
-      },
-      30_000,
-    );
+    it("updates with assignee changes stay on the caller transaction", async () => {
+      tempDb ??= await startEmbeddedPostgresTestDatabase(
+        "paperclip-chat-ingress-pool-",
+      );
+      const db = createDb(tempDb.connectionString);
+      const smallDb = createDb(tempDb.connectionString, {
+        maxConnections: 2,
+      });
+      const { companyId } = await seedCompanyWithAgent(db);
+      const svc = issueService(smallDb);
+      const issue = await svc.create(companyId, {
+        title: `Reopen target ${randomUUID()}`,
+        description: null,
+        status: "todo",
+        priority: "medium",
+      });
 
-    it(
-      "rolled-back ingress leaves nothing behind and retry is idempotent",
-      async () => {
-        tempDb ??= await startEmbeddedPostgresTestDatabase(
-          "paperclip-chat-ingress-pool-",
-        );
-        const db = createDb(tempDb.connectionString);
-        const smallDb = createDb(tempDb.connectionString, {
-          maxConnections: 2,
-        });
-        const { companyId, agentId } = await seedCompanyWithAgent(db);
-        const svc = issueService(smallDb);
-        const idempotencyKey = `chat:pool-regression-rollback:${randomUUID()}`;
-        const countIssues = () =>
-          db
-            .select({ count: sql<number>`count(*)::int` })
-            .from(issues)
-            .where(eq(issues.companyId, companyId))
-            .then((rows) => rows[0]?.count ?? 0);
-        const beforeCount = await countIssues();
+      await withTimeout(
+        smallDb.transaction(async (tx) => {
+          await tx
+            .select({ id: companies.id })
+            .from(companies)
+            .where(eq(companies.id, companyId))
+            .for("update");
+          // Touching assigneeUserId exercises the membership check and the
+          // isolated-workspaces settings read inside update.
+          const updated = await svc.update(
+            issue.id,
+            { assigneeUserId: "board-user" },
+            tx,
+          );
+          expect(updated?.assigneeUserId).toBe("board-user");
+        }),
+        15_000,
+        "lock-holding update with assignee change",
+      );
+    }, 30_000);
 
-        // An interrupted uncommitted request (lock timeout, crash, deploy)
-        // must not leave a partial issue behind.
-        await expect(
-          smallDb.transaction(async (tx) => {
-            await tx
-              .select({ id: companies.id })
-              .from(companies)
-              .where(eq(companies.id, companyId))
-              .for("update");
-            await svc.create(
-              companyId,
-              {
-                title: `Interrupted ingress ${randomUUID()}`,
-                description: null,
-                status: "todo",
-                priority: "medium",
-                assigneeAgentId: agentId,
-                idempotencyKey,
-              },
-              tx,
-            );
-            throw new Error("simulated ingress interruption");
-          }),
-        ).rejects.toThrow("simulated ingress interruption");
+    it("rolled-back ingress leaves nothing behind and retry is idempotent", async () => {
+      tempDb ??= await startEmbeddedPostgresTestDatabase(
+        "paperclip-chat-ingress-pool-",
+      );
+      const db = createDb(tempDb.connectionString);
+      const smallDb = createDb(tempDb.connectionString, {
+        maxConnections: 2,
+      });
+      const { companyId, agentId } = await seedCompanyWithAgent(db);
+      const svc = issueService(smallDb);
+      const idempotencyKey = `chat:pool-regression-rollback:${randomUUID()}`;
+      const countIssues = () =>
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(issues)
+          .where(eq(issues.companyId, companyId))
+          .then((rows) => rows[0]?.count ?? 0);
+      const beforeCount = await countIssues();
 
-        expect(await countIssues()).toBe(beforeCount);
+      // An interrupted uncommitted request (lock timeout, crash, deploy)
+      // must not leave a partial issue behind.
+      await expect(
+        smallDb.transaction(async (tx) => {
+          await tx
+            .select({ id: companies.id })
+            .from(companies)
+            .where(eq(companies.id, companyId))
+            .for("update");
+          await svc.create(
+            companyId,
+            {
+              title: `Interrupted ingress ${randomUUID()}`,
+              description: null,
+              status: "todo",
+              priority: "medium",
+              assigneeAgentId: agentId,
+              idempotencyKey,
+            },
+            tx,
+          );
+          throw new Error("simulated ingress interruption");
+        }),
+      ).rejects.toThrow("simulated ingress interruption");
 
-        // Retrying the same durable delivery reuses the idempotency key and
-        // converges on exactly one issue.
-        const first = await svc.create(companyId, {
-          title: `Retried ingress ${randomUUID()}`,
-          description: null,
-          status: "todo",
-          priority: "medium",
-          assigneeAgentId: agentId,
-          idempotencyKey,
-        });
-        const second = await svc.create(companyId, {
-          title: `Retried ingress ${randomUUID()}`,
-          description: null,
-          status: "todo",
-          priority: "medium",
-          assigneeAgentId: agentId,
-          idempotencyKey,
-        });
-        expect(second.id).toBe(first.id);
-      },
-      30_000,
-    );
+      expect(await countIssues()).toBe(beforeCount);
+
+      // Retrying the same durable delivery reuses the idempotency key and
+      // converges on exactly one issue.
+      const first = await svc.create(companyId, {
+        title: `Retried ingress ${randomUUID()}`,
+        description: null,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        idempotencyKey,
+      });
+      const second = await svc.create(companyId, {
+        title: `Retried ingress ${randomUUID()}`,
+        description: null,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        idempotencyKey,
+      });
+      expect(second.id).toBe(first.id);
+    }, 30_000);
   },
 );
