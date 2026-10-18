@@ -1,4 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GITHUB_ISOLATION_PROBE,
@@ -51,6 +54,34 @@ socket.socket = lambda *args: FakeSocket()
       if (scenario === "reused-home") expect(proof.checks.configFresh).toBe(false);
     },
   );
+  it("materializes the exact hook bundle into a fresh config using the shipped Python probe", () => {
+    const scratch = mkdtempSync(join(tmpdir(), "shadow-hooks-"));
+    const home = join(scratch, "fresh");
+    const files = { ".claude/settings.json": '{"hooks":{}}', "hooks/guard.mjs": "// immutable guard" };
+    const fixture = `import builtins, errno, pwd, socket, types, os
+os.geteuid = lambda: 12345
+pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
+real_open = builtins.open
+def controlled_open(path, *args, **kwargs):
+    if str(path).startswith("/primary/"): raise OSError(errno.EACCES, "denied")
+    return real_open(path, *args, **kwargs)
+builtins.open = controlled_open
+class FakeSocket:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def settimeout(self, value): pass
+    def connect(self, address): raise OSError(errno.EACCES, "denied")
+socket.socket = lambda *args: FakeSocket()
+`;
+    try {
+      const proof = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
+        input: JSON.stringify({ nonce: "nonce", home, canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"], hooks: { files, digest: "fixture-digest" } }),
+        encoding: "utf8", timeout: 5000,
+      }));
+      expect(proof).toMatchObject({ hooksDigest: "fixture-digest", checks: { configFresh: true } });
+      for (const [file, contents] of Object.entries(files)) expect(readFileSync(join(home, file), "utf8")).toBe(contents);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
   it("is empty by default and rejects malformed certification", () => {
     for (const value of [undefined, "", "{}", "not json", '[{"environmentId":"fake"}]']) {
       vi.stubEnv("PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS", value);
@@ -73,6 +104,26 @@ socket.socket = lambda *args: FakeSocket()
     expect(JSON.stringify(config)).not.toContain("primary-secret");
     expect(JSON.stringify(config)).not.toContain("primary-db");
     expect(JSON.stringify(config)).not.toContain("NODE_OPTIONS");
+  });
+  it("preserves only explicit non-secret context timeout and model alias settings", () => {
+    const settings = { API_TIMEOUT_MS: "1800000", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
+      ANTHROPIC_SMALL_FAST_MODEL: "muse-wonder-full-1.0-contributor", CLAUDE_CODE_SUBAGENT_MODEL: "muse-wonder-full-1.0-contributor",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "muse-wonder-full-1.0-contributor", ANTHROPIC_DEFAULT_HAIKU_MODEL: "muse-wonder-full-1.0-contributor",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "muse-wonder-full-1.0-contributor" };
+    const config = githubCandidateAdapterConfig(prepared, { engine: "cli", env: { ...settings,
+      AWS_SECRET_ACCESS_KEY: "secret", ANTHROPIC_CUSTOM_HEADERS: "unsafe", NODE_OPTIONS: "unsafe" } }, "/fresh");
+    expect(config.env).toMatchObject(settings);
+    expect(JSON.stringify(config)).not.toMatch(/secret|unsafe/);
+  });
+  it("derives model-guard and hook scratch inputs from the isolated run rather than host env", () => {
+    const config = githubCandidateAdapterConfig(prepared, { engine: "cli", model: "muse-wonder-full-1.0-contributor",
+      env: { PAPERCLIP_ASSIGNED_MODEL: "wrong-primary-model", PAPERCLIP_RUN_SCRATCH_DIR: "/primary" } }, "/fresh");
+    expect(config.env).toMatchObject({ PAPERCLIP_ASSIGNED_MODEL: "muse-wonder-full-1.0-contributor",
+      PAPERCLIP_RUN_SCRATCH_DIR: `${prepared.home}/tmp` });
+  });
+  it("unconditionally disables provider-side web tools without accepting user CLI arguments", () => {
+    expect(githubCandidateAdapterConfig(prepared, { engine: "cli" }, "/fresh").extraArgs)
+      .toEqual(["--disallowedTools", "WebSearch", "WebFetch"]);
   });
   it.each([
     {}, { engine: "acp" }, { engine: "cli", args: ["--resume", "primary"] },

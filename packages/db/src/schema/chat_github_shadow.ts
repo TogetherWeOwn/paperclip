@@ -26,7 +26,14 @@ export interface GitHubReviewEnrollmentEnvelope {
   event: GitHubReviewEventContext | null;
   unavailableEvent?: Pick<GitHubReviewEventContext, "event" | "deliveryId" | "repositoryId" | "repository" | "pullNumber" | "sender">;
   /** Missing certification on older rows is also ineligible, never implicit approval. */
-  comparisonEligibility?: { certifiedClean: false; reasons: string[] };
+  comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
+  /** Admission-time protocol, including explicit deviations and their provenance. */
+  protocol?: {
+    version: number; primaryBlindingVersion: number; eligibilitySource: string;
+    deviations: { webTools: { deniedTools: readonly string[]; reason: string; primaryChanged: boolean;
+      evidence: { successfulRuns: number; lookbackDays: number; webSearchRequests: number; webFetchRequests: number;
+        source: string; observedOn: string; verification: string } } };
+  };
   request: string;
   lowTrust: boolean;
   snapshot?: GitHubReviewInputSnapshot;
@@ -68,6 +75,9 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
     version: number; runId: string; candidateId: string; armId: string; environmentId: string;
     namespace: string; configurationDigest: string; certificateDigest: string; home: string; checkedAt: string;
     status: string; checks: { primaryCanariesDenied: boolean; githubDenied: boolean; configFresh: boolean };
+    comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
+    primaryBlindingVersion?: number;
+    hooksDigest?: string;
   }>>().notNull().default({}),
   admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => [

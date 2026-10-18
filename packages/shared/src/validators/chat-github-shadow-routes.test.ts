@@ -55,6 +55,14 @@ describe("GitHub shadow route configuration (A11)", () => {
     expect(() => parse([route, { ...route, label: "other", agentId: agentId.toUpperCase() }])).toThrow();
   });
 
+  it("accepts a case-normalized optional repository allowlist; empty means none", () => {
+    expect(parse([{ ...route, repos: ["TogetherWeOwn/nntunev2"] }]).shadowRoutes[0]).toMatchObject({ repos: ["togetherweown/nntunev2"] });
+    expect(parse([{ ...route, repos: [] }]).shadowRoutes[0]).toMatchObject({ repos: [] });
+    expect(parse([route]).shadowRoutes[0]).not.toHaveProperty("repos");
+  });
+  it.each([{ repos: ["*"] }, { repos: ["https://github.com/owner/repo"] }, { repos: ["o/r", "O/R"] }, { repos: ["o/../r"] }])("rejects invalid repository allowlist %j", ({ repos }) => {
+    expect(() => parse([{ ...route, repos }])).toThrow();
+  });
   it("bounds routes to eight", () => {
     const routes = Array.from({ length: 9 }, (_, i) => ({ label: `candidate-${i}`, agentId: `f0000000-0000-4000-8000-${String(i).padStart(12, "0")}` }));
     expect(() => parse(routes.slice(0, 8))).not.toThrow();

@@ -82,6 +82,9 @@ const githubReviewShadowRouteSchema = z.object({
   agentId: z.string().uuid().transform((value) => value.toLowerCase()),
   enabled: z.boolean().default(false),
   sampleRate: z.number().finite().min(0).max(1).default(1),
+  repos: z.array(z.string().trim().regex(/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/)
+    .transform(value => value.toLowerCase())).max(500)
+    .refine(repos => new Set(repos).size === repos.length, "Shadow route repositories must be unique").optional(),
 }).strict();
 
 export const githubChatConfigurationSchema = z

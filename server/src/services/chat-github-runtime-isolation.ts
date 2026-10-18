@@ -12,6 +12,8 @@ import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failu
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
 import { githubCandidateMayWake } from "./chat-github-shadow.js";
 import { resolveEnvironmentExecutionTarget } from "./environment-execution-target.js";
+import { githubComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
+import { githubCandidateHooks } from "./chat-github-hooks.js";
 
 const certificateSchema = z.object({
   environmentId: z.string().uuid(),
@@ -89,7 +91,20 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
         checks["configFresh"] = not os.listdir(os.path.join(p["home"], ".claude"))
     except OSError:
         pass
-print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks}))
+hooks_digest = None
+if all(checks.values()) and p.get("hooks"):
+    try:
+        for relative, content in p["hooks"]["files"].items():
+            target = os.path.join(p["home"], relative)
+            if os.path.isabs(relative) or ".." in relative.split("/"): raise ValueError("hook_path")
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            with open(target, "x", encoding="utf8") as f: f.write(content)
+            with open(target, "r", encoding="utf8") as f:
+                if f.read() != content: raise ValueError("hook_bytes")
+        hooks_digest = p["hooks"]["digest"]
+    except (OSError, ValueError):
+        checks["configFresh"] = False
+print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "hooksDigest": hooks_digest}))
 `;
 
 export interface PreparedGitHubCandidateRuntime {
@@ -121,11 +136,15 @@ export function githubCandidateAdapterConfig(
     refuse("github_candidate_isolation_unavailable");
   }
   const providerEnv = Object.fromEntries(
-    ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"].flatMap(key =>
+    ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+      "API_TIMEOUT_MS", "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"].flatMap(key =>
       typeof env[key] === "string" ? [[key, env[key]]] : []),
   );
-  return { ...config, cwd, env: { ...providerEnv, ...prepared.env,
+  return { ...config, cwd, extraArgs: ["--disallowedTools", "WebSearch", "WebFetch"], env: { ...providerEnv, ...prepared.env,
     PATH: "/usr/local/bin:/usr/bin:/bin", PAPERCLIP_API_URL: "http://127.0.0.1:3100",
+    PAPERCLIP_ASSIGNED_MODEL: typeof config.model === "string" ? config.model : providerEnv.ANTHROPIC_MODEL ?? "",
+    PAPERCLIP_RUN_SCRATCH_DIR: `${prepared.home}/tmp`,
     ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } };
 }
 
@@ -151,6 +170,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     refuse("github_candidate_isolation_unavailable");
   const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
   const nonce = randomUUID();
+  const hooks = await githubCandidateHooks(home);
   let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false };
   try {
     for (const canary of certificate.primaryCanaries) {
@@ -163,11 +183,11 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error("dns_timeout")), 3000); timer.unref(); }),
     ]);
     const result = await runSshCommand(target.spec, `python3 -c ${shellQuote(GITHUB_ISOLATION_PROBE)}`, {
-      stdin: JSON.stringify({ nonce, home, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
+      stdin: JSON.stringify({ nonce, home, hooks, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
       timeoutMs: 15_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
-    if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
+    if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home || proof.hooksDigest !== hooks.digest) throw new Error("probe_binding_mismatch");
     checks = { primaryCanariesDenied: proof.checks?.primaryCanariesDenied === true,
       githubDenied: proof.checks?.githubDenied === true, configFresh: proof.checks?.configFresh === true };
   } catch { /* A missing canary, transport failure, malformed proof or timeout voids this sample. */ }
@@ -175,7 +195,14 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   const receipt = { version: 1, runId: run.id, candidateId: boundary.candidate.id, armId: boundary.candidate.armId,
     environmentId: environment.id, namespace: boundary.namespace, configurationDigest: certificate.configurationDigest,
     certificateDigest: certificateDigest(certificate),
-    home, checkedAt: new Date().toISOString(), status: passed ? "passed" : "failed", checks };
+    home, checkedAt: new Date().toISOString(), status: passed ? "passed" : "failed", checks,
+    hooksDigest: hooks.digest,
+    primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
+    // Stored atomically WITH the evidence below. No receipt means no certification;
+    // a different run/arm can never borrow this verdict.
+    comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
+      selfTestPassed: passed, primaryBlindingActive: boundary.enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
+      snapshotAvailable: !!boundary.enrollment.envelope.snapshot, roundOrdinal: boundary.enrollment.roundOrdinal }) };
   await db.transaction(async tx => {
     // Append-once evidence. A retry cannot replace failed proof or reuse success.
     const rows = await tx.update(chatGitHubReviewEnrollments).set({

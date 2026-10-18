@@ -3956,7 +3956,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
       expect(rows).toHaveLength(2);
       for (const row of rows) expect(row.envelope).toMatchObject({ comparisonEligibility: {
-        certifiedClean: false, reasons: expect.arrayContaining(["primary_namespace_not_isolated", "candidate_runtime_not_certified"]),
+        certifiedClean: false, reasons: expect.arrayContaining(["candidate_isolation_self_test_not_recorded", "candidate_runtime_not_certified"]),
       } });
     });
     it("paired regression fails closed on legacy mutable reads even after shadow mode is disabled", async () => {
@@ -4264,6 +4264,144 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
       }
     });
+    it("paired primary blinding hides candidate issues comments assessments and run output over API and gateway", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "primary-blinding", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const secretComment = await issueService(db).addComment(candidate.issue.id, "CANDIDATE_COMMENT_SECRET", { agentId: f.replacementAgentId });
+      const { assets, issueAttachments, documents, issueDocuments } = await import("@paperclipai/db");
+      const [attachment] = await db.insert(assets).values({ companyId: f.companyId, provider: "local_disk", objectKey: randomUUID(),
+        contentType: "text/plain", byteSize: 20, sha256: "0".repeat(64) }).returning();
+      await db.insert(issueAttachments).values({ companyId: f.companyId, issueId: candidate.issue.id, assetId: attachment!.id });
+      const [document] = await db.insert(documents).values({ companyId: f.companyId, latestBody: "CANDIDATE_DOCUMENT_SECRET" }).returning();
+      await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: candidate.issue.id, documentId: document!.id, key: "plan" });
+      const { githubPrimaryBlinding } = await import("../services/chat-github-primary-blinding.js");
+      const visibility = await githubPrimaryBlinding(db, f.companyId);
+      expect(() => visibility.assertVisible({ documentId: document!.id })).toThrow(/not found/i);
+      expect(() => visibility.assertVisible({ assetId: attachment!.id })).toThrow(/not found/i);
+      expect(() => visibility.assertVisible(`${candidate.issue.identifier}0`)).not.toThrow();
+      expect(() => visibility.assertVisible({ commentId: secretComment.id })).toThrow(/not found/i);
+      expect(visibility.filter({ data: [{ id: primary.issue.id, title: "primary" }, { id: candidate.issue.id, title: "secret" }],
+        content: JSON.stringify([{ id: primary.issue.id }, { id: candidate.issue.id, body: "secret" }]) })).toEqual({
+          data: [{ id: primary.issue.id, title: "primary" }], content: JSON.stringify([{ id: primary.issue.id }]),
+        });
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      await db.update(heartbeatRuns).set({ resultJson: { text: "CANDIDATE_RUN_SECRET" } }).where(eq(heartbeatRuns.id, candidateSession.runId));
+      expect(await githubChatReviewService(db, f.providerFetch).execute(candidateSession, "submit_review", {
+        ...shadowTestAssessment("b".repeat(40)), summary: "CANDIDATE_ASSESSMENT_SECRET",
+      })).toMatchObject({ status: "shadow_stored" });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "primary-blinding-test-secret";
+      try {
+        const token = createLocalAgentJwt(primarySession.agentId, f.companyId, "claude_local", primarySession.runId, null)!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/companies/:companyId/issues", async (_req, res) => res.json(await db.select().from(issues).where(eq(issues.companyId, f.companyId))));
+        app.get("/api/issues/:id/comments", async (req, res) => res.json(await db.select().from(issueComments).where(eq(issueComments.issueId, req.params.id))));
+        app.get("/api/heartbeat-runs/:id/log", (_req, res) => res.send("CANDIDATE_RUN_SECRET"));
+        app.get("/api/companies/:companyId/reviews", async (_req, res) => res.json(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.companyId, f.companyId))));
+        app.use(errorHandler);
+        const listing = await request(app).get(`/api/companies/${f.companyId}/issues`).set("Authorization", `Bearer ${token}`);
+        expect(listing.status).toBe(200);
+        expect(listing.body.map((row: { id: string }) => row.id)).toEqual([primary.issue.id]);
+        for (const url of [`/api/issues/${candidate.issue.id}/comments`, `/api/heartbeat-runs/${candidateSession.runId}/log`]) {
+          const response = await request(app).get(url).set("Authorization", `Bearer ${token}`);
+          expect(response.status).toBe(404);
+          expect(JSON.stringify(response.body)).not.toContain("CANDIDATE_");
+        }
+        const { agentApiKeys } = await import("@paperclipai/db");
+        const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Unrelated reader", role: "engineer", status: "idle" }).returning();
+        for (const readerId of [primarySession.agentId, otherAgent!.id]) {
+          const key = `pc_test_${randomUUID()}`;
+          await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: readerId,
+            name: "blinding reader", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(key).digest("hex") });
+          const visible = await request(app).get(`/api/companies/${f.companyId}/issues`).set("Authorization", `Bearer ${key}`);
+          expect(visible.status).toBe(200);
+          expect(visible.body.map((row: { id: string }) => row.id)).toEqual([primary.issue.id]);
+          expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${key}`)).status).toBe(404);
+        }
+        const reviews = await request(app).get(`/api/companies/${f.companyId}/reviews`).set("Authorization", `Bearer ${token}`);
+        expect(reviews.body.every((r: { shadowLabel: string | null }) => !r.shadowLabel)).toBe(true);
+        const { createToolGatewayService } = await import("../services/tool-gateway.js");
+        const { toolPolicies } = await import("@paperclipai/db");
+        await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+        const gateway = createToolGatewayService(db);
+        const access = await gateway.createSession(primarySession);
+        const tools = await gateway.listToolsForSession(access.token);
+        const getIssue = tools.find(t => t.name === "paperclip-self:get_issue_context")!;
+        expect(getIssue).toBeDefined();
+        await expect(gateway.executeTool({ sessionToken: access.token, tool: getIssue.name, parameters: { issueId: candidate.issue.id } })).rejects.toThrow(/not found/i);
+        // Blinding survives the admission kill switch: results cannot be unsealed by disabling future work.
+        await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+        expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${token}`)).status).toBe(404);
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired primary blinding also seals the live API event stream", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "blinding-live-events", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const { createServer } = await import("node:http");
+      const { WebSocket } = await import("ws");
+      const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
+      const { publishLiveEvent } = await import("../services/live-events.js");
+      const keys: string[] = [];
+      for (const agentId of [f.assignedAgentId, f.replacementAgentId]) {
+        const key = `pc_test_${randomUUID()}`; keys.push(key);
+        await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId, name: "live reader", keyHash: createHash("sha256").update(key).digest("hex") });
+      }
+      const server = createServer();
+      const wss = setupLiveEventsWebSocketServer(server, db, { deploymentMode: "authenticated" });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address() as { port: number };
+      const clients: InstanceType<typeof WebSocket>[] = [];
+      const connect = (key: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/companies/${f.companyId}/events/ws`, { headers: { Authorization: `Bearer ${key}` } });
+        clients.push(socket); socket.once("open", () => resolve(socket)); socket.on("error", reject);
+      });
+      try {
+        const socket = await connect(keys[0]!);
+        const seen: string[] = [];
+        const primaryEvent = new Promise<void>(resolve => socket.on("message", data => {
+          const text = String(data); seen.push(text); if (text.includes("PRIMARY_VISIBLE")) resolve();
+        }));
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "CANDIDATE_LIVE_SECRET" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "PRIMARY_VISIBLE" } });
+        await primaryEvent;
+        expect(seen.join("\n")).not.toContain("CANDIDATE_LIVE_SECRET");
+        await expect(connect(keys[1]!)).rejects.toThrow("403");
+      } finally {
+        for (const client of clients) client.terminate();
+        await new Promise<void>(resolve => wss.close(() => resolve()));
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+    it.each([
+      { repos: ["TogetherWeOwn/nntunev2"], selected: false },
+      { repos: [], selected: false },
+      { repos: ["PAPERCLIPAI/PAPERCLIP"], selected: true },
+    ])("paired repository allowlist $repos selects only matching candidates without affecting primary admission", async ({ repos, selected }) => {
+      const f = await pairedReviewFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: current.configuration.shadowRoutes!.map(r => ({ ...r, repos })) } }, "owner-user");
+      await deliverShadowTestMention(f, "repo-filter", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(selected ? 2 : 1);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual(selected ? [f.assignedAgentId, f.replacementAgentId] : [f.assignedAgentId]);
+    });
     it("paired isolation exposes only snapshot tools and rejects context retargeting", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "isolation-gateway", "@maya review this", 81);
@@ -4342,7 +4480,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, _command, options) => {
           const input = JSON.parse(options!.stdin!);
           if (scenario === "disabled-after-probe") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
-          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home,
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
         });
         try {
@@ -4453,7 +4591,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
           if (!options?.stdin || !command.includes("python3")) return { stdout: "", stderr: "" };
           const input = JSON.parse(options.stdin);
-          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home,
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
         });
         const originalAdapter = getServerAdapter("claude_local");
@@ -4515,7 +4653,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(runs).toHaveLength(1);
           expect(runs[0]).toMatchObject(scenario === "certified" ? { status: "succeeded" } : { status: "failed", errorCode: "configuration_incomplete" });
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
-          expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed" });
+          expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed",
+            hooksDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+            comparisonEligibility: { certifiedClean: scenario !== "contaminated", reasons: scenario === "contaminated" ? ["candidate_isolation_self_test_failed"] : [] },
+          });
+          if (scenario === "certified") {
+            const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+            const capability = await githubRunCapability(db, { companyId: f.companyId, agentId: f.replacementAgentId,
+              issueId: runs[0]!.contextSnapshot!.issueId as string, runId: runs[0]!.id });
+            expect(capability?.enrollment?.envelope.comparisonEligibility).toEqual({ certifiedClean: true, reasons: [] });
+          }
           expect(existsSync(provisionMarker)).toBe(false);
         } finally {
           await heartbeat.drainActiveRunExecutions();

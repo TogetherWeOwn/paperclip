@@ -9,6 +9,7 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { githubPrimaryBlinding } from "../services/chat-github-primary-blinding.js";
 
 interface WsSocket {
   readyState: number;
@@ -23,6 +24,7 @@ interface WsSocket {
 
 interface WsServer {
   clients: Set<WsSocket>;
+  close(callback?: (err?: Error) => void): void;
   on(event: "connection", listener: (socket: WsSocket, req: IncomingMessage) => void): void;
   on(event: "close", listener: () => void): void;
   handleUpgrade(
@@ -212,6 +214,10 @@ async function authorizeUpgrade(
     return null;
   }
 
+  // Upgrades bypass Express actorMiddleware, so enforce candidate confinement here too.
+  const visibility = await githubPrimaryBlinding(db, companyId);
+  if (visibility.candidateAgentIds.includes(key.agentId)) return null;
+
   await db
     .update(agentApiKeys)
     .set({ lastUsedAt: new Date() })
@@ -260,9 +266,30 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    // Serialize agent deliveries so async visibility checks preserve event order.
+    // Refresh for every event: a candidate may be admitted after this socket opened.
+    let delivery = Promise.resolve();
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      if (context.actorType === "board") {
+        socket.send(JSON.stringify(event));
+        return;
+      }
+      delivery = delivery.then(async () => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        const visibility = await githubPrimaryBlinding(db, context.companyId);
+        if (visibility.candidateAgentIds.includes(context.actorId)) {
+          socket.close(1008, "forbidden");
+          return;
+        }
+        const payload = visibility.filter(event.payload);
+        if (payload !== undefined && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ ...event, payload }));
+        }
+      }).catch(() => {
+        // Never fall back to unfiltered events if visibility cannot be established.
+        socket.close(1011, "Review visibility unavailable");
+      });
     });
 
     cleanupByClient.set(socket, unsubscribe);

@@ -898,18 +898,19 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     expect(denied.body.error.data.reasonCode).toBe("deny_default");
   });
 
-  it("proxies namespaced resources and prompts only for fully assigned MCP connections", async () => {
+  it.each([false, true])("proxies namespaced resources and prompts only for fully assigned MCP connections (agent blinding=%s)", async agentScoped => {
     const company = await createCompany(db);
+    const agent = agentScoped ? await createAgent(db, company.id) : null;
     const remote = await startFakeRemoteMcpServer(async ({ body }) => {
       const method = body?.method;
       if (method === "resources/list") {
-        return { body: { jsonrpc: "2.0", id: body?.id, result: { resources: [{ uri: "notes://one", name: "Note one", mimeType: "text/plain" }] } } };
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { resources: [{ uri: "notes://one", name: "Note one", mimeType: "text/plain" }, { uri: "notes://candidate", name: "Candidate answer", shadowLabel: "paired-meta" }] } } };
       }
       if (method === "resources/read") {
         return { body: { jsonrpc: "2.0", id: body?.id, result: { contents: [{ uri: String((body?.params as Record<string, unknown>)?.uri), mimeType: "text/plain", text: "resource body" }] } } };
       }
       if (method === "prompts/list") {
-        return { body: { jsonrpc: "2.0", id: body?.id, result: { prompts: [{ name: "summarize", title: "Summarize note" }] } } };
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { prompts: [{ name: "summarize", title: "Summarize note" }, { name: "candidate", title: "Candidate answer", shadowLabel: "paired-meta" }] } } };
       }
       if (method === "prompts/get") {
         return { body: { jsonrpc: "2.0", id: body?.id, result: { description: "Summary prompt", messages: [{ role: "user", content: { type: "text", text: "Summarize it" } }] } } };
@@ -947,7 +948,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       const gateway = createTestToolGatewayService(db);
       const created = await gateway.createNamedGateway({
         companyId: company.id,
-        body: { name: "Context gateway", profileId: profile.id },
+        body: { name: "Context gateway", profileId: profile.id, agentId: agent?.id ?? null },
       });
       const token = await gateway.createNamedGatewayToken({
         companyId: company.id,
@@ -961,7 +962,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         .set("authorization", `Bearer ${token.token}`)
         .send({ jsonrpc: "2.0", id: 1, method: "resources/list" })
         .expect(200);
-      expect(resources.body.result.resources).toHaveLength(1);
+      expect(resources.body.result.resources).toHaveLength(agentScoped ? 1 : 2);
       expect(resources.body.result.resources[0]).toMatchObject({
         uri: expect.stringMatching(new RegExp(`^paperclip-resource://${assigned.connection.id}/`)),
         name: "Assigned context: Note one",
@@ -980,7 +981,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         .set("authorization", `Bearer ${token.token}`)
         .send({ jsonrpc: "2.0", id: 3, method: "prompts/list" })
         .expect(200);
-      expect(prompts.body.result.prompts).toHaveLength(1);
+      expect(prompts.body.result.prompts).toHaveLength(agentScoped ? 1 : 2);
       expect(prompts.body.result.prompts[0].title).toBe("Assigned context: Summarize note");
       const promptName = prompts.body.result.prompts[0].name as string;
 

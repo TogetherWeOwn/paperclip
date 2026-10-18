@@ -11,6 +11,7 @@ import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
+import { githubPrimaryBlinding } from "./chat-github-primary-blinding.js";
 import { runIdentityContexts } from "@paperclipai/db";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
@@ -5327,18 +5328,22 @@ export function createToolGatewayService(
     await assertGatewayTokenAction(session, input.method);
     if (await githubCandidateRunBoundary(db, session))
       throw new ToolGatewayHttpError(403, "Paired candidates cannot read MCP resources or prompts", "github_candidate_context_denied");
+    const visibility = session.agentId ? await githubPrimaryBlinding(db, session.companyId) : null;
+    visibility?.assertVisible(input.params);
+    const visibleContext = async (value: unknown) => session.agentId
+      ? (await githubPrimaryBlinding(db, session.companyId)).filter(value) : value;
     const connections = await fullyAssignedMcpConnections(session);
     if (input.method === "resources/list") {
       const resources = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
-        const result = asRecord(
+        const result = asRecord(await visibleContext(
           await callAssignedConnectionProtocol({
             ...input,
             session,
             connection,
             method: input.method,
           }),
-        );
+        ));
         for (const resource of Array.isArray(result?.resources)
           ? result.resources
           : []) {
@@ -5356,14 +5361,14 @@ export function createToolGatewayService(
     if (input.method === "prompts/list") {
       const prompts = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
-        const result = asRecord(
+        const result = asRecord(await visibleContext(
           await callAssignedConnectionProtocol({
             ...input,
             session,
             connection,
             method: input.method,
           }),
-        );
+        ));
         for (const prompt of Array.isArray(result?.prompts)
           ? result.prompts
           : []) {
@@ -5397,7 +5402,8 @@ export function createToolGatewayService(
       kind === "resource"
         ? { uri: handle.value }
         : { name: handle.value, arguments: input.params?.arguments ?? {} };
-    const result = asRecord(
+    visibility?.assertVisible(params); // Check the decoded handle, not only its base64 wrapper.
+    const result = asRecord(await visibleContext(
       await callAssignedConnectionProtocol({
         ...input,
         session,
@@ -5405,7 +5411,7 @@ export function createToolGatewayService(
         method: input.method,
         params,
       }),
-    );
+    ));
     if (kind === "resource" && Array.isArray(result?.contents)) {
       return {
         ...result,
@@ -9706,6 +9712,8 @@ export function createToolGatewayService(
         callerHeaders: input.callerHeaders,
       });
       await assertGatewayTokenAction(session, "tools/call");
+      const primaryBlinding = session.agentId && !(await githubCandidateRunBoundary(db, session));
+      if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(input.parameters);
       let invocationId = String(randomUUID());
       const startedAt = Date.now();
 
@@ -10420,6 +10428,7 @@ export function createToolGatewayService(
       });
 
       try {
+        if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(effectiveParameters);
         const executionTimeoutMs = timeoutMs(input.timeoutMs);
         if (
           tool.providerType === "paperclip_plugin" &&
@@ -10490,7 +10499,7 @@ export function createToolGatewayService(
             );
           }
         }
-        const result = connectedMcpExecution
+        const unfilteredResult = connectedMcpExecution
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
@@ -10512,6 +10521,9 @@ export function createToolGatewayService(
                 executeBuiltinTool(session, tool, effectiveParameters, invocationId),
                 executionTimeoutMs,
               );
+        const result = primaryBlinding
+          ? (await githubPrimaryBlinding(db, session.companyId)).filter(unfilteredResult) ?? { content: "Not found", data: null }
+          : unfilteredResult;
 
         const resultValidation = validateToolContent({
           value: result,

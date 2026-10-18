@@ -13,6 +13,7 @@ import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
+import { githubComparisonEligibility, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Store = Db | Tx;
@@ -33,7 +34,7 @@ export async function prepareGitHubPairEvent(db: Db, input: {
 }, fetchImpl: typeof fetch): Promise<Pick<GitHubReviewEnrollmentEnvelope, "event" | "unavailableEvent" | "snapshot" | "snapshotFailure"> | null> {
   if (!(await githubShadowEnabled(db))) return null;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
-  if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
+  if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0 && (r.repos === undefined || r.repos.some(repo => repo.toLowerCase() === input.repository.toLowerCase()))) || config.configuration.shadow?.enabled) return null;
   const captureDeadline = AbortSignal.timeout(15_000);
   const boundedFetch: typeof fetch = (url, init) => fetchImpl(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline });
   const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(input.threadId);
@@ -119,7 +120,9 @@ export async function admitGitHubPair(tx: Tx, input: {
   const selected = arms.filter(arm => {
     const route = config.configuration.shadowRoutes?.find(r => r.agentId === arm.agentId && r.label === arm.label && r.enabled);
     const draw = parseInt(digest([delivery.providerEventId, arm.id, config.revision]).slice(0, 13), 16) / 0x10000000000000;
-    return route && draw < route.sampleRate;
+    const repository = (input.event ?? input.unavailableEvent)?.repository.toLowerCase();
+    return route && draw < route.sampleRate
+      && (route.repos === undefined || route.repos.some(repo => repo.toLowerCase() === repository));
   });
   if (!selected.length) return;
   const e = input.event ?? input.unavailableEvent;
@@ -160,9 +163,9 @@ export async function admitGitHubPair(tx: Tx, input: {
     version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
     pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, input.event?.headSha ?? null, input.event?.baseSha ?? null, roundOrdinal, input.revision, digest(input.policy)]),
     envelope: { version: 1, event: input.event, unavailableEvent: input.unavailableEvent,
-      comparisonEligibility: { certifiedClean: false, reasons: ["primary_namespace_not_isolated", "candidate_runtime_not_certified",
-        ...(!input.snapshot ? ["admission_snapshot_unavailable"] : []),
-        ...(roundOrdinal > 1 ? ["longitudinal_arm_history"] : [])] },
+      protocol: GITHUB_SHADOW_PROTOCOL,
+      comparisonEligibility: githubComparisonEligibility({ environmentCertified: false, selfTestRecorded: false,
+        selfTestPassed: false, primaryBlindingActive: true, snapshotAvailable: !!input.snapshot, roundOrdinal }),
       request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
       snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
       normalizedEvent: delivery.normalizedEvent,
@@ -219,7 +222,8 @@ export async function githubRunCapability(db: Store, session: {
   if (!candidate || source.delivery.githubShadowLabel !== candidate.shadowLabel || source.conversation.githubShadowLabel !== candidate.shadowLabel) return null;
   const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(and(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId), eq(chatGitHubReviewEnrollments.companyId, session.companyId)));
   return enrollment?.envelope.event && enrollment.headSha && enrollment.baseSha
-    ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha } } : null;
+    ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha,
+        envelope: { ...enrollment.envelope, comparisonEligibility: githubRunComparisonEligibility(enrollment, candidate, session.runId) } } } : null;
 }
 
 export async function githubCandidateMayWake(db: Store, candidate: Candidate): Promise<boolean> {

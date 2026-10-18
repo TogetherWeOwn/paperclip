@@ -49,6 +49,8 @@ export interface GitHubReviewShadowRoute {
   agentId: string;
   enabled: boolean;
   sampleRate: number;
+  /** Omitted selects all repositories; an empty list selects none. */
+  repos?: string[];
 }
 
 export interface GitHubChatConfiguration {

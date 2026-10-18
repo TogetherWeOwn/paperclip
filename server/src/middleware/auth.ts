@@ -22,6 +22,7 @@ import {
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { assertGitHubCandidateApiBoundary } from "../services/chat-github-isolation.js";
+import { installGitHubPrimaryApiBlinding } from "../services/chat-github-primary-blinding.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -221,7 +222,7 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -401,7 +402,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const conversation = identityRun?.contextSnapshot?.conversationMode === true;
-        _res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
+        res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
           code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
       }
@@ -439,6 +440,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       await assertGitHubCandidateApiBoundary(db, {
         companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id, credential: "agent_jwt",
       }, req);
+      await installGitHubPrimaryApiBlinding(db, claims.company_id, req, res);
       next();
       return;
     }
@@ -501,6 +503,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       source: "agent_key",
     };
 
+    await installGitHubPrimaryApiBlinding(db, key.companyId, req, res);
     next();
   };
 }
