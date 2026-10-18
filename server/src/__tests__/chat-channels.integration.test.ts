@@ -38,6 +38,7 @@ import {
   desc,
   eq,
   inArray,
+  innerJoin,
   isNotNull,
   like,
   notInArray,
@@ -3375,10 +3376,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         eq(chatActions.endpointId, f.endpoint.id),
         eq(chatActions.kind, "github_review_check"),
       ))).toHaveLength(0);
+      // The mention is the earliest comment on a fresh review issue. Never let
+      // unspecified row ordering select a later comment for these assertions.
       const comments = await db
         .select()
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .where(eq(issueComments.issueId, admitted.issueId))
+        .orderBy(asc(issueComments.createdAt));
       // Prompt parity: the shadow reviewer is never told it is shadow.
       expect(comments[0].body).not.toContain("meta-shadow");
       expect(comments[0].body.toLowerCase()).not.toContain("shadow");
@@ -3640,16 +3644,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       f: Awaited<ReturnType<typeof reviewBotFixture>>,
       admitted: { issueId: string },
     ) {
-      const comments = await db
-        .select()
+      // The wake comment must be the admission mention: it is the only comment
+      // carrying the inbound message link the capability resolver requires.
+      // Never let unspecified row ordering select a later unlinked comment.
+      const [wakeComment] = await db
+        .select({ id: issueComments.id })
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, admitted.issueId), eq(chatMessageLinks.direction, "inbound")))
+        .orderBy(asc(issueComments.createdAt))
+        .limit(1);
+      if (!wakeComment) throw new Error(`shadow fixture has no linked wake comment for issue ${admitted.issueId}`);
       const [run] = await db.insert(heartbeatRuns).values({
         companyId: f.companyId,
         agentId: f.assignedAgentId,
         invocationSource: "assignment",
         status: "running",
-        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: comments[0].id },
+        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: wakeComment.id },
       }).returning();
       return {
         companyId: f.companyId,
@@ -19389,13 +19400,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId));
-      expect(rows).toHaveLength(8);
-    });
+    await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId));
+        expect(rows).toHaveLength(8);
+      },
+      // Eight comments plus eight durable wakes drain here. The default 1s
+      // waitFor budget flakes under full-shard CI load; the drain itself is
+      // asserted below, so wait generously for it to land.
+      { timeout: 15_000 },
+    );
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
@@ -19414,15 +19431,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Comment admission commits before the durable wake. Wait for this
     // company's last wake too, not merely its already-visible last comment.
     // The competing sweep may legitimately reconcile another fixture company.
-    await vi.waitFor(() => {
-      const calls = wakeup.mock.calls.filter(
-        (call) => call[0] === fixture.assignedAgentId,
-      );
-      expect(calls).toHaveLength(8);
-      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
-        comments.map((comment) => comment.id),
-      );
-    });
+    await vi.waitFor(
+      () => {
+        const calls = wakeup.mock.calls.filter(
+          (call) => call[0] === fixture.assignedAgentId,
+        );
+        expect(calls).toHaveLength(8);
+        expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+          comments.map((comment) => comment.id),
+        );
+      },
+      // Same eight-wake drain as above: generous budget under shard load.
+      { timeout: 15_000 },
+    );
     // The last comment and wakeup commit inside the lease. Under full-suite
     // load the assertions above can observe those effects one microtask before
     // the deferred owner's `finally` deletes its lease. Require prompt eventual
