@@ -4,16 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { githubComparisonEligibility, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "../services/chat-github-comparison.js";
-import { createGitHubRunEvidenceCollector, githubCliInitFacts, githubPairEquivalence, githubWorkspaceHead,
+import { createGitHubRunEvidenceCollector, githubCliInitFacts, githubPairEquivalence, githubWorkspaceHead, githubWorkspaceState,
   type GitHubReviewRunEvidence } from "../services/chat-github-run-evidence.js";
-import type { chatGitHubReviewEnrollments } from "@paperclipai/db";
+import type { chatGitHubReviewEnrollments, GitHubCandidateWorkspaceReceipt, GitHubReviewRepositoryArtifact } from "@paperclipai/db";
 
 const head = "a".repeat(40);
 const init = { type: "system", subtype: "init", claude_code_version: "2.1.284", tools: ["Read", "Bash", "WebSearch", "WebFetch"],
   mcp_servers: [{ name: "paperclip", status: "connected" }], permissionMode: "bypassPermissions", cwd: "/workspace" };
+const tree = "f".repeat(40), baseSha = "e".repeat(40), baseTree = "d".repeat(40), artifactSha = "c".repeat(64);
+const repository = (): GitHubReviewRepositoryArtifact => ({ version: 1, kind: "bundle", path: `${artifactSha}.bundle`, sha256: artifactSha, bytes: 1,
+  headSha: head, baseSha, headTree: tree, baseTree, refs: { base: "refs/heads/main", head: "refs/pull/7/head" }, commits: { base: baseSha, head } });
+const receipt = (): GitHubCandidateWorkspaceReceipt => ({ version: 1, status: "materialized", kind: "bundle", artifactSha256: artifactSha,
+  head, tree, baseCommit: baseSha, baseTree });
 const primary = (): GitHubReviewRunEvidence => ({ version: 1, cli: githubCliInitFacts(init), workspaceHead: head });
-const candidate = (): GitHubReviewRunEvidence => ({ ...primary(), cli: githubCliInitFacts({ ...init, tools: ["Bash", "Read"] }) });
-const pair = () => ({ admittedHead: head, primaryRuns: [[primary()]], candidateRun: [candidate()] });
+const candidate = (): GitHubReviewRunEvidence => ({ ...primary(), workspaceTree: tree, workspaceKind: "isolated_checkout",
+  cli: githubCliInitFacts({ ...init, tools: ["Bash", "Read"] }) });
+const pair = () => ({ admittedHead: head, admittedBase: baseSha, repository: repository(), candidateWorkspace: receipt(),
+  primaryRuns: [[primary()]], candidateRun: [candidate()] });
 const proof = { environmentCertified: true, selfTestRecorded: true, selfTestPassed: true, primaryBlindingActive: true,
   snapshotAvailable: true, roundOrdinal: 1, primaryInputSource: "snapshot" as const };
 
@@ -62,7 +69,7 @@ describe("observed per-run equivalence", () => {
     const runEvidence = pair();
     runEvidence.primaryRuns.push([{ ...primary(), workspaceHead: "b".repeat(40) }], [primary()]);
     runEvidence.candidateRun.unshift({ ...candidate(), cli: null });
-    expect(githubPairEquivalence(runEvidence)).toEqual({ tools: false, workspace: false });
+    expect(githubPairEquivalence(runEvidence)).toMatchObject({ tools: false, workspace: false });
   });
   it("does not erase primary tool differences using candidate-only deviations", () => {
     const runEvidence = pair();
@@ -77,9 +84,9 @@ describe("observed per-run equivalence", () => {
     expect(githubComparisonEligibility({ ...proof, roundOrdinal: 2, runEvidence: pair() }).certifiedClean).toBe(false);
   });
   it("binds positive equivalence to the exact isolation receipt and requires every new probe", () => {
-    const enrollment = { headSha: head, roundOrdinal: 1, envelope: { snapshot: {}, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
+    const enrollment = { headSha: head, baseSha, roundOrdinal: 1, envelope: { snapshot: { repository: repository() }, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
       run: { version: 1, runId: "run", candidateId: "candidate", armId: "arm", environmentId: "env", configurationDigest: "config",
-        certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed",
+        certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed", workspace: receipt(),
         checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true, providerToolsDenied: true,
           allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } },
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
@@ -92,9 +99,79 @@ describe("observed per-run equivalence", () => {
       }
       enrollment.isolationTests.run!.checks[key] = true;
     }
+    // The sealed artifact and this exact run's materialisation receipt are both required.
+    enrollment.isolationTests.run!.workspace = undefined;
+    expect(assess().reasons).toEqual(["workspace_equivalence_unverified"]);
+    enrollment.isolationTests.run!.workspace = receipt();
+    enrollment.envelope.snapshot = {} as never;
+    expect(assess().reasons).toEqual(["workspace_equivalence_unverified"]);
+    enrollment.envelope.snapshot = { repository: repository() } as never;
+    expect(assess()).toEqual({ certifiedClean: true, reasons: [] });
     enrollment.isolationTests.run!.armId = "other-arm";
     expect(assess().certifiedClean).toBe(false);
     expect(assess().reasons).toContain("effective_tool_equivalence_unverified");
+  });
+});
+
+describe("checkout capability equivalence", () => {
+  const reason = (runEvidence: ReturnType<typeof pair>) => githubPairEquivalence(runEvidence).workspaceReason;
+  it("accepts a primary reviewing from its agent home with network git instead of a checkout HEAD", () => {
+    const runEvidence = pair();
+    runEvidence.primaryRuns[0]![0] = { ...primary(), workspaceHead: null, workspaceKind: "agent_home_with_network_git" };
+    expect(githubComparisonEligibility({ ...proof, runEvidence })).toEqual({ certifiedClean: true, reasons: [] });
+    for (const kind of ["checkout", "isolated_checkout", null, undefined] as const) {
+      runEvidence.primaryRuns[0]![0] = { ...primary(), workspaceHead: null, workspaceKind: kind };
+      expect(reason(runEvidence)).toBe("primary_workspace_unverified");
+    }
+    // A primary checkout at another commit is not rescued by its kind.
+    runEvidence.primaryRuns[0]![0] = { ...primary(), workspaceHead: "b".repeat(40), workspaceKind: "agent_home_with_network_git" };
+    expect(reason(runEvidence)).toBe("primary_workspace_unverified");
+  });
+  it("accepts a synthetic checkout only by tree identity with the base tree present", () => {
+    const synthetic = { head: "1".repeat(40), base: "2".repeat(40) };
+    const runEvidence = pair();
+    runEvidence.repository = { ...repository(), kind: "synthetic", commits: synthetic };
+    runEvidence.candidateWorkspace = { ...receipt(), kind: "synthetic", head: synthetic.head, baseCommit: synthetic.base };
+    runEvidence.candidateRun[0]!.workspaceHead = synthetic.head;
+    expect(githubComparisonEligibility({ ...proof, runEvidence })).toEqual({ certifiedClean: true, reasons: [] });
+    runEvidence.candidateWorkspace.tree = "b".repeat(40);
+    expect(reason(runEvidence)).toBe("candidate_workspace_head_mismatch");
+    runEvidence.candidateWorkspace = { ...receipt(), kind: "synthetic", head: synthetic.head, baseCommit: synthetic.base, baseTree: null };
+    expect(reason(runEvidence)).toBe("candidate_workspace_head_mismatch");
+    // A bundle receipt must name the admitted head itself, not merely an equal tree.
+    const bundle = pair();
+    bundle.candidateWorkspace.head = synthetic.head;
+    bundle.candidateRun[0]!.workspaceHead = synthetic.head;
+    expect(reason(bundle)).toBe("candidate_workspace_head_mismatch");
+  });
+  it.each([
+    ["no artifact", (e: ReturnType<typeof pair>) => { e.repository = undefined as never; }, "repository_artifact_unavailable"],
+    ["no receipt", (e: ReturnType<typeof pair>) => { e.candidateWorkspace = undefined as never; }, "candidate_workspace_not_recorded"],
+    ["unavailable receipt", (e: ReturnType<typeof pair>) => { e.candidateWorkspace = { version: 1, status: "unavailable", kind: null, reason: "repository_artifact_late" }; }, "repository_artifact_late"],
+    ["errored receipt", (e: ReturnType<typeof pair>) => { e.candidateWorkspace.status = "error"; e.candidateWorkspace.reason = "workspace_transfer_failed"; }, "workspace_transfer_failed"],
+    ["artifact for another head", (e: ReturnType<typeof pair>) => { e.repository.headSha = "b".repeat(40); }, "repository_artifact_binding_mismatch"],
+    ["artifact for another base", (e: ReturnType<typeof pair>) => { e.repository.baseSha = "b".repeat(40); }, "repository_artifact_binding_mismatch"],
+    ["receipt for another artifact", (e: ReturnType<typeof pair>) => { e.candidateWorkspace.artifactSha256 = "b".repeat(64); }, "candidate_workspace_artifact_mismatch"],
+    ["receipt of another kind", (e: ReturnType<typeof pair>) => { e.candidateWorkspace.kind = "synthetic"; }, "candidate_workspace_artifact_mismatch"],
+    ["base commit absent", (e: ReturnType<typeof pair>) => { e.candidateWorkspace.baseCommit = null; }, "candidate_workspace_head_mismatch"],
+    ["base tree absent", (e: ReturnType<typeof pair>) => { e.candidateWorkspace.baseTree = null; }, "candidate_workspace_head_mismatch"],
+    ["CLI tree unobserved", (e: ReturnType<typeof pair>) => { e.candidateRun[0]!.workspaceTree = null; }, "candidate_cli_workspace_unobserved"],
+    ["CLI at another head", (e: ReturnType<typeof pair>) => { e.candidateRun[0]!.workspaceHead = "b".repeat(40); }, "candidate_cli_workspace_unobserved"],
+  ])("keeps the candidate workspace unverified for %s", (_name, mutate, expected) => {
+    const runEvidence = pair();
+    mutate(runEvidence);
+    expect(reason(runEvidence)).toBe(expected);
+    expect(githubComparisonEligibility({ ...proof, runEvidence })).toEqual({ certifiedClean: false, reasons: ["workspace_equivalence_unverified"] });
+  });
+  it("records each arm's workspace kind from the CLI's actual cwd", async () => {
+    const observed: GitHubReviewRunEvidence[] = [];
+    const record = async (e: GitHubReviewRunEvidence) => { observed.push(e); };
+    await createGitHubRunEvidenceCollector({ expectedCwd: "/workspace", role: "candidate", workspaceHead: async () => ({ head, tree }), record })("stdout", JSON.stringify(init) + "\n");
+    await createGitHubRunEvidenceCollector({ expectedCwd: "/workspace", role: "primary", workspaceHead: async () => ({ head: null, tree: null }), record })("stdout", JSON.stringify(init) + "\n");
+    await createGitHubRunEvidenceCollector({ expectedCwd: "/workspace", role: "primary", workspaceHead: async () => ({ head, tree }), record })("stdout", JSON.stringify(init) + "\n");
+    await createGitHubRunEvidenceCollector({ expectedCwd: "/elsewhere", role: "primary", workspaceHead: async () => ({ head: null, tree: null }), record })("stdout", JSON.stringify(init) + "\n");
+    expect(observed.map(e => [e.workspaceKind, e.workspaceHead, e.workspaceTree])).toEqual([
+      ["isolated_checkout", head, tree], ["agent_home_with_network_git", null, null], ["checkout", head, tree], [null, null, undefined]]);
   });
 });
 
@@ -159,10 +236,12 @@ it("observes actual local HEAD and leaves an empty workspace unverified", async 
   const input = { runId: "test", target: null, cwd, env: {} };
   try {
     expect(await githubWorkspaceHead(input)).toBeNull();
+    expect(await githubWorkspaceState(input)).toEqual({ head: null, tree: null });
     execFileSync("git", ["init", "--quiet", cwd]);
     execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-m", "fixture"], { cwd, stdio: "pipe" });
     const actual = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
     expect(await githubWorkspaceHead(input)).toBe(actual);
+    expect(await githubWorkspaceState(input)).toEqual({ head: actual, tree: execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd, encoding: "utf8" }).trim() });
     expect(actual).not.toBe(head);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
