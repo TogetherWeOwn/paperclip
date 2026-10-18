@@ -4083,6 +4083,29 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(current.normalizedEvent.githubPairingCapture).toEqual(claim);
       expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
     });
+    it("K6 a kick before the primary wake is durably recorded captures nothing", async () => {
+      const { kickGitHubPairCapture, settleGitHubPairCaptureKicks, setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "k6-not-durable", "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // Model a wake that is still retrying: no durable receipt exists yet.
+      await db.execute(sql`update chat_actions set status = 'issued', result = ${JSON.stringify({ code: "inbound_wakeup_retry",
+        retryAt: new Date(Date.now() + 60_000).toISOString(), attemptCount: 1 })}::jsonb
+        where delivery_id = ${delivery.id} and kind = 'inbound_wakeup'`);
+      setGitHubPairCaptureKickForTests(undefined);
+      const attempts = await captureAttempts();
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await settleGitHubPairCaptureKicks();
+      const current = await pairedDelivery(f);
+      expect(current.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(current.normalizedEvent.githubPairingCapture).toBeUndefined();
+      expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
+      expect(attempts()).toEqual([]);
+      expect(recorder.fetches).toEqual([]);
+    });
     it("P12 switch off at mention admission creates no enrollment or candidate", async () => {
       const f = await pairedReviewFixture();
       await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
