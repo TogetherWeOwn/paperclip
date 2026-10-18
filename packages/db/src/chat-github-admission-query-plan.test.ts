@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { describe, expect, it } from "vitest";
-import { githubPairPreviousAssessmentQuery } from "../../../server/src/services/chat-github-shadow.js";
+import { githubPairPreviousAssessmentQuery } from "./chat-github-pairing-queries.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 import * as schema from "./schema/index.js";
 

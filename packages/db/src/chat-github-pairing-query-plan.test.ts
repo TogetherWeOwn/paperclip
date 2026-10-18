@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "./schema/index.js";
-import { githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery } from "../../../server/src/services/chat-github-shadow.js";
+import { githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery } from "./chat-github-pairing-queries.js";
 import { describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 

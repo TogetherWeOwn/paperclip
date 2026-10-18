@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { captureGitHubReviewSnapshot } from "./chat-github-review-snapshot.js";
 import {
   agents, chatActions, chatConversations, chatDeliveries, chatEndpoints, chatGitHubConfigurations,
   chatGitHubReviewArms, chatGitHubReviewCandidates, chatGitHubReviewEnrollments,
   chatGitHubReviews, chatMessageLinks, chatEndpointResources, issueComments, heartbeatRuns, issues,
+  githubPairPreviousAssessmentQuery, githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery,
   type Db, type GitHubReviewEnrollmentEnvelope,
 } from "@paperclipai/db";
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
@@ -14,6 +15,10 @@ import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
 import { githubComparisonEligibility, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
+
+// Re-export the exact application builders; their implementation lives in the
+// DB package so its EXPLAIN tests remain within that package's TypeScript root.
+export { githubPairPreviousAssessmentQuery, githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery };
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Store = Db | Tx;
@@ -127,43 +132,6 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     return { event, ...(!event ? { unavailableEvent } : {}),
       snapshotFailure: prepared ? "admission_snapshot_unavailable" : "source_preparation_failed" };
   }
-}
-
-export function githubPairPreviousAssessmentQuery(db: Store, input: {
-  companyId: string; endpointId: string; repositoryId: string; pullNumber: number;
-  roundOrdinal: number; snapshotStartedAt: Date; armId: string;
-}) {
-  return db.select({ review: chatGitHubReviews }).from(chatGitHubReviews)
-    .innerJoin(chatGitHubReviewEnrollments, and(
-      eq(chatGitHubReviewEnrollments.companyId, input.companyId),
-      eq(chatGitHubReviewEnrollments.endpointId, input.endpointId),
-      eq(chatGitHubReviewEnrollments.repositoryId, input.repositoryId),
-      eq(chatGitHubReviewEnrollments.pullNumber, input.pullNumber),
-      lt(chatGitHubReviewEnrollments.roundOrdinal, input.roundOrdinal),
-      input.armId === "primary"
-        ? sql`(${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text
-            or ${chatGitHubReviews.admissionDeliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId})`
-        : sql`exists (select 1 from chat_github_review_candidates c where c.company_id = ${input.companyId}
-            and c.enrollment_id = ${chatGitHubReviewEnrollments.id} and c.arm_id = ${input.armId}
-            and c.native_delivery_id::text = ${chatGitHubReviews.deliveryId})`,
-    )).where(and(eq(chatGitHubReviews.companyId, input.companyId), eq(chatGitHubReviews.endpointId, input.endpointId),
-      isNotNull(chatGitHubReviews.assessment), lte(chatGitHubReviews.updatedAt, input.snapshotStartedAt),
-      input.armId === "primary" ? isNull(chatGitHubReviews.shadowLabel) : isNotNull(chatGitHubReviews.shadowLabel)))
-    .orderBy(desc(chatGitHubReviewEnrollments.roundOrdinal), desc(chatGitHubReviews.createdAt)).limit(1);
-}
-
-/** Keep seed-presence predicates literal so generic plans can prove the partial indexes apply. */
-export function githubPairRoundOrdinalQuery(db: Store, input: { endpointId: string; repositoryId: string; pullNumber: number }) {
-  return db.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
-    .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpointId),
-      sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'`,
-      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${input.repositoryId}`,
-      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(input.pullNumber)}`));
-}
-
-export function githubPairSeedRecoveryQuery(db: Store, limit: number) {
-  return db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'
-    and not exists (select 1 from chat_github_review_enrollments e where e.origin_delivery_id = ${chatDeliveries.id})`).limit(limit);
 }
 
 interface Seed {
