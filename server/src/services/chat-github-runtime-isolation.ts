@@ -65,16 +65,36 @@ function refuse(reason: string): never {
  * independently verifies each planted canary's bytes through its mounted path.
  * Numeric GitHub addresses bypass DNS (which the egress policy also denies).
  * TLS is deliberately unnecessary: any TCP connection can fetch public answers.
- * Probe, run and cleanup all hold the exclusive host-wide advisory lease, so a
- * home already under isolated/ belongs to a crashed run. Homes idle for
- * GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS are reclaimed (lstat only, rmtree never
- * follows symlinks, only direct children of the isolated parent); a younger
- * one still means namespaceBusy, the backstop should the lease ever be lost.
+ * Probe, run and cleanup all hold one of the host principal's runtime slot
+ * leases (PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT, default 1). Each home records
+ * its slot in .probe-slot and the controller sends the slots other sessions hold
+ * right now (liveSlots). Homes idle for GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS are
+ * reclaimed unless their slot is live (lstat only, rmtree never follows
+ * symlinks, only direct children of the isolated parent): however idle, a live
+ * slot's home is never deleted. Exclusive (N=1, unchanged): any remaining
+ * sibling means namespaceBusy, the backstop should the lease ever be lost.
+ * Concurrent (N>1): siblings are other slots' runs (sealed inputs plus their own
+ * work, never primary output), so namespaceBusy means THIS run's home exists.
+ * Reclaim refuses (deletes nothing) unless the parent is exactly
+ * GITHUB_ISOLATED_PARENT, so a malformed home can never widen it to "/".
+ * An allowed-model outage (timeout, 429, 5xx) is missing evidence only when
+ * every other check passed: the probe then exits without a proof. Any other
+ * failed check keeps the bound negative proof, so a breach is never hidden.
  */
 export const GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS = 30 * 60;
 export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, shutil, socket, stat, sys, time, urllib.request, urllib.error
 p = json.load(sys.stdin)
-def reclaim_orphans(parent, min_age):
+def home_slot(entry):
+    # Read-only, never through a symlink, never blocking on a FIFO.
+    try:
+        fd = os.open(os.path.join(entry, ".probe-slot"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try: return os.read(fd, 16).decode("ascii", "replace").strip()
+        finally: os.close(fd)
+    except OSError: return None
+def reclaim_orphans(parent, min_age, live_slots=()):
+    # Exact match only: never "/", an ancestor, a sibling or an unnormalised alias.
+    if parent != ISOLATED_PARENT: return 0
+    live = {str(slot) for slot in live_slots}
     reclaimed = 0
     now = time.time()
     for name in os.listdir(parent):
@@ -87,6 +107,8 @@ def reclaim_orphans(parent, min_age):
                 try: newest = max(newest, os.lstat(os.path.join(entry, ".probe-owner")).st_mtime)
                 except OSError: pass
             if now - newest < min_age: continue
+            # A home whose slot lease is held right now is a live run, however idle.
+            if stat.S_ISDIR(st.st_mode) and home_slot(entry) in live: continue
             if stat.S_ISDIR(st.st_mode): shutil.rmtree(entry)
             else: os.unlink(entry)
             reclaimed += 1
@@ -143,15 +165,19 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
         {"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]},
         {"mcp_servers": [{"type": "url", "url": "https://github.com"}]}]])
     try:
-        orphans_reclaimed = reclaim_orphans(os.path.dirname(p["home"]), ${GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS})
-        namespace_busy = bool(os.listdir(os.path.dirname(p["home"])))
+        concurrent = p.get("concurrent") is True
+        orphans_reclaimed = reclaim_orphans(os.path.dirname(p["home"]), ${GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS}, p.get("liveSlots") or ())
+        # Exclusive: any sibling left means a lost lease. Concurrent: only this home.
+        namespace_busy = os.path.lexists(p["home"]) if concurrent else bool(os.listdir(os.path.dirname(p["home"])))
         if namespace_busy: raise FileExistsError("candidate_namespace_busy")
         os.mkdir(p["home"], 0o700)
         with open(os.path.join(p["home"], ".probe-owner"), "x") as owner: owner.write(p["nonce"])
+        if type(p.get("slot")) is int:
+            with open(os.path.join(p["home"], ".probe-slot"), "x") as marker: marker.write(str(p["slot"]))
         for child in (".claude", ".config", ".cache", ".local", "tmp", "workspace"):
             os.mkdir(os.path.join(p["home"], child), 0o700)
         siblings = [name for name in os.listdir(os.path.dirname(p["home"])) if name != os.path.basename(p["home"])]
-        checks["configFresh"] = not siblings and not os.listdir(os.path.join(p["home"], ".claude"))
+        checks["configFresh"] = (concurrent or not siblings) and not os.listdir(os.path.join(p["home"], ".claude"))
     except OSError:
         pass
 hooks_digest = None
@@ -266,7 +292,7 @@ async function materializeArtifact(input: { target: AdapterSshExecutionTarget; h
   try {
     staging = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-artifact-"));
     await fs.symlink(file, path.join(staging, "repository.bundle"));
-    // Bounded: this runs while holding the host-wide candidate lease.
+    // Bounded: this runs while holding a runtime slot lease.
     try {
       await syncDirectoryToSsh({ spec: input.target.spec, localDir: staging, remoteDir: `${input.home}/.paperclip-review/artifact`,
         followSymlinks: true, timeoutMs: GITHUB_WORKSPACE_TRANSFER_TIMEOUT_MS });
@@ -304,30 +330,93 @@ async function materializeArtifact(input: { target: AdapterSshExecutionTarget; h
 /** Cross-controller lease on a reserved, dedicated SESSION, never a long idle
  * transaction. idle_in_transaction_session_timeout must not drop confinement
  * while the candidate runs. The normal primary pool is never borrowed. The key
- * is the SSH host/principal (same UID shares files across companies and arms).
- * The probe reclaims homes of crashed runs once idle for the orphan age; a
- * younger one still fails the independent namespaceBusy check. */
-export async function acquireGitHubCandidateRuntimeLease(db: Db, hostPrincipal: string): Promise<() => Promise<void>> {
-  let acquired!: () => void;
+ * is the SSH host/principal (same UID shares files across companies and arms)
+ * plus a slot: PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT slots (default 1) admit
+ * that many candidates at once, each in its own fresh run namespace. N=1 is the
+ * original exclusive lease: one blocking lock on the unchanged key. The probe
+ * reclaims homes of crashed runs once idle for the orphan age and never a home
+ * whose slot is live; see GITHUB_ISOLATION_PROBE. */
+export const GITHUB_SHADOW_MAX_CONCURRENT_LIMIT = 8;
+export function githubShadowMaxConcurrent(raw = process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT): number {
+  const value = raw?.trim() ?? "";
+  // Absent or malformed keeps the serial default; never fail open to the cap.
+  return /^\d+$/.test(value) ? Math.min(GITHUB_SHADOW_MAX_CONCURRENT_LIMIT, Math.max(1, Number(value))) : 1;
+}
+/** Slot 0 keeps the original key: N=1 takes exactly the pre-slot lock, and a
+ * controller still on the exclusive lease excludes slot 0 holders. */
+export function githubCandidateRuntimeSlotKey(hostPrincipal: string, slot: number): string {
+  return slot === 0 ? `github-shadow-runtime:${hostPrincipal}` : `github-shadow-runtime:${hostPrincipal}:${slot}`;
+}
+export type GitHubCandidateRuntimeLease = (() => Promise<void>) & {
+  slot: number;
+  /** Slots of this principal (up to the limit, any N) held now by other sessions. */
+  liveSlots: () => Promise<number[]>;
+};
+const SLOT_POLL_MIN_MS = 200;
+const SLOT_POLL_MAX_MS = 2_000;
+
+export async function acquireGitHubCandidateRuntimeLease(db: Db, hostPrincipal: string,
+  options: { maxConcurrent?: number } = {}): Promise<GitHubCandidateRuntimeLease> {
+  const slots = options.maxConcurrent ?? githubShadowMaxConcurrent();
+  let acquired!: (slot: number) => void;
   let failed!: (error: unknown) => void;
   let release!: () => void;
-  const ready = new Promise<void>((resolve, reject) => { acquired = resolve; failed = reject; });
+  const ready = new Promise<number>((resolve, reject) => { acquired = resolve; failed = reject; });
   const released = new Promise<void>(resolve => { release = resolve; });
+  let connection!: Awaited<ReturnType<Db["$client"]["reserve"]>>;
   const holding = withDedicatedDbConnection(db, async dedicated => {
     // reserve() pins the physical connection and prevents pool idle/lifetime
     // recycling between lock and unlock. Session locks do not span transactions.
-    const connection = await dedicated.$client.reserve();
-    const key = `github-shadow-runtime:${hostPrincipal}`;
+    connection = await dedicated.$client.reserve();
     try {
-      await connection`select pg_advisory_lock(hashtextextended(${key}, 0))`;
-      acquired();
+      let slot = 0;
+      if (slots <= 1) {
+        await connection`select pg_advisory_lock(hashtextextended(${githubCandidateRuntimeSlotKey(hostPrincipal, 0)}, 0))`;
+      } else {
+        // FIFO among waiters: only the queue head polls, so a long waiter is
+        // never starved by fresh arrivals. The head drops the queue lock as soon
+        // as it holds a slot; like every slot lock it dies with the session.
+        const queue = `github-shadow-runtime-queue:${hostPrincipal}`;
+        await connection`select pg_advisory_lock(hashtextextended(${queue}, 0))`;
+        try {
+          for (let delay = SLOT_POLL_MIN_MS; ; delay = Math.min(SLOT_POLL_MAX_MS, delay * 2)) {
+            const free = await firstFreeSlot(connection, hostPrincipal, slots);
+            if (free !== null) { slot = free; break; }
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        } finally { await connection`select pg_advisory_unlock(hashtextextended(${queue}, 0))`; }
+      }
+      const key = githubCandidateRuntimeSlotKey(hostPrincipal, slot);
+      acquired(slot);
       await released;
       await connection`select pg_advisory_unlock(hashtextextended(${key}, 0))`;
     } finally { connection.release(); }
   });
   void holding.catch(failed);
-  await ready;
-  return async () => { release(); await holding; };
+  const slot = await ready;
+  const keys = Array.from({ length: GITHUB_SHADOW_MAX_CONCURRENT_LIMIT }, (_, s) => githubCandidateRuntimeSlotKey(hostPrincipal, s));
+  return Object.assign(async () => { release(); await holding; }, {
+    slot,
+    // Read-only pg_locks view on this lease's own reserved session: the primary
+    // pool is still never borrowed. Every slot up to the limit is checked, so a
+    // home is protected even from a controller configured with a smaller N.
+    liveSlots: async () => {
+      const rows = await connection`select (k.ordinality - 1)::int as slot
+        from unnest(${connection.array(keys)}::text[]) with ordinality as k(key, ordinality)
+        where exists (select 1 from pg_locks l where l.locktype = 'advisory' and l.granted and l.objsubid = 1
+          and l.pid <> pg_backend_pid() and l.database = (select oid from pg_database where datname = current_database())
+          and l.classid = ((hashtextextended(k.key, 0) >> 32) & 4294967295)::oid
+          and l.objid = (hashtextextended(k.key, 0) & 4294967295)::oid)`;
+      return rows.map(row => Number(row.slot)).sort((a, b) => a - b);
+    },
+  });
+}
+async function firstFreeSlot(connection: Awaited<ReturnType<Db["$client"]["reserve"]>>, hostPrincipal: string, slots: number) {
+  for (let slot = 0; slot < slots; slot++) {
+    const [row] = await connection`select pg_try_advisory_lock(hashtextextended(${githubCandidateRuntimeSlotKey(hostPrincipal, slot)}, 0)) as locked`;
+    if (row?.locked === true) return slot;
+  }
+  return null;
 }
 const runtimeLeases = new Map<string, () => Promise<void>>();
 
@@ -430,15 +519,16 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
-  // Wait for the admission's checkout BEFORE taking the host-wide lease. The
+  // Wait for the admission's checkout BEFORE taking a runtime slot lease. The
   // wait is bounded relative to admission; late or lost production becomes a
   // precise reason and the candidate runs with equivalence unverified.
   // Pinned from resolution, not from materialisation (see holdGitHubCandidateCheckout).
   const { checkout, release: releasePin } = await holdGitHubCandidateCheckout(boundary.enrollment);
-  let releaseLease: () => Promise<void>;
-  try { releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`); }
+  const maxConcurrent = githubShadowMaxConcurrent();
+  let lease: GitHubCandidateRuntimeLease;
+  try { lease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`, { maxConcurrent }); }
   catch (error) { releasePin(); throw error; }
-  runtimeLeases.set(nonce, releaseLease);
+  runtimeLeases.set(nonce, lease);
   try {
   // A queued candidate may have been disabled while waiting for the prior arm.
   if (!(await githubCandidateMayWake(db, boundary.candidate))) refuse("github_candidate_disabled");
@@ -456,16 +546,20 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       dns.lookup("github.com", { all: true }),
       new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error("dns_timeout")), 3000); timer.unref(); }),
     ]);
+    // Taken just before the probe: a slot acquired after this read belongs to a
+    // home younger than the orphan age, which reclaim already never touches.
+    const liveSlots = await lease.liveSlots();
     const result = await runSshCommand(target.spec, `python3 -c ${shellQuote(GITHUB_ISOLATION_PROBE)}`, {
-      stdin: JSON.stringify({ nonce, home, hooks, proxyToken, model, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
-      timeoutMs: 40_000, maxBuffer: 8192,
+      stdin: JSON.stringify({ nonce, home, hooks, proxyToken, model, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address),
+        slot: lease.slot, liveSlots, concurrent: maxConcurrent > 1 }),
+      timeoutMs: 60_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
     if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
     if (Number.isSafeInteger(proof.orphansReclaimed) && proof.orphansReclaimed > 0) probeOrphansReclaimed = proof.orphansReclaimed;
     if (!proof.checks || Object.keys(checks).some(key => typeof proof.checks[key] !== "boolean")) throw new Error("probe_checks_malformed");
     // A stale/concurrent namespace is missing availability, not proof that this
-    // sample read a primary answer. The advisory lease handles healthy overlap.
+    // sample read a primary answer. The slot leases handle healthy overlap.
     if (proof.namespaceBusy === true) throw new Error("candidate_namespace_busy");
     checks = { primaryCanariesDenied: proof.checks.primaryCanariesDenied,
       githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh, providerToolsDenied: proof.checks.providerToolsDenied,
@@ -492,6 +586,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     primaryToolPolicy: boundary.enrollment.envelope.primaryToolPolicy ?? null,
     hooksDigest: hooks.digest,
     orphansReclaimed: probeOrphansReclaimed,
+    // Lets the comparison separate serial from concurrent samples.
+    runtimeSlot: lease.slot, runtimeMaxConcurrent: maxConcurrent,
     ...(workspace ? { workspace } : {}),
     primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
     comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
