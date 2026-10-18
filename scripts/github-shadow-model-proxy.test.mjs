@@ -11,6 +11,35 @@ test('provisioning template cannot grant the candidate direct access to the unre
 });
 import { createShadowModelProxy, SHADOW_PROXY_POLICY } from './github-shadow-model-proxy.mjs';
 
+test('proxy requires an explicit, nonempty model allowlist', () => {
+  for (const allowedModels of [undefined, [], [''], [' fixture '], [null], 'fixture']) {
+    assert.throws(() => createShadowModelProxy({ token: 'shadow', upstreamToken: 'upstream', allowedModels }), /model allowlist/);
+  }
+});
+
+test('replays the captured CLI body including context management without widening provider access', async () => {
+  // Verifier cli-proxy/cli-body.json (2.1.302); only free text/identity fields
+  // are redacted. This is also the clear_thinking shape emitted by pinned 2.1.284.
+  const body = JSON.parse(await readFile(new URL('./fixtures/github-shadow-cli-body.json', import.meta.url), 'utf8'));
+  let observed;
+  const upstream = createServer(async (req, res) => {
+    let bytes = ''; for await (const chunk of req) bytes += chunk;
+    observed = JSON.parse(bytes); res.end('{}');
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createShadowModelProxy({ token: 'shadow-only', upstreamToken: 'private-upstream', allowedModels: [body.model], upstreamUrl });
+  const url = await listen(proxy);
+  try {
+    for (const context_management of [body.context_management, { edits: [{ type: 'clear_tool_uses_20250919', keep: { type: 'tool_uses', value: 3 } }] }]) {
+      const replay = { ...body, context_management };
+      const response = await fetch(`${url}/v1/messages?beta=true`, { method: 'POST', headers: { 'x-api-key': 'shadow-only' }, body: JSON.stringify(replay) });
+      assert.equal(response.status, 200);
+      await response.text();
+      assert.deepEqual(observed, replay);
+    }
+  } finally { await Promise.all([new Promise(r => proxy.close(r)), new Promise(r => upstream.close(r))]); }
+});
+
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -20,7 +49,7 @@ test('restricted model route rejects provider tools and arbitrary endpoints befo
   let upstreamCalls = 0;
   const upstream = createServer((req, res) => { upstreamCalls++; res.end('{}'); });
   const upstreamUrl = await listen(upstream);
-  const proxy = createShadowModelProxy({ token: 'shadow-only', upstreamToken: 'private-upstream', upstreamUrl });
+  const proxy = createShadowModelProxy({ token: 'shadow-only', upstreamToken: 'private-upstream', allowedModels: ['fixture'], upstreamUrl });
   const url = await listen(proxy);
   try {
     const base = { model: 'fixture', max_tokens: 1, messages: [{ role: 'user', content: 'test' }] };
@@ -30,6 +59,16 @@ test('restricted model route rejects provider tools and arbitrary endpoints befo
       { tools: [{ type: 'computer_20250124', name: 'computer' }] },
       { mcp_servers: [{ type: 'url', url: 'https://github.com' }] },
       { unknown_provider_extension: true },
+      { model: 'another-model-with-built-in-tools' },
+      { model: '' },
+      { context_management: null },
+      { context_management: { edits: {} } },
+      { context_management: { edits: [{ type: 'clear_thinking_20251015' }, { type: 'compact_20260112' }] } },
+      { context_management: { edits: [{ type: 'clear_thinking_20251015_extra' }] } },
+      { context_management: { edits: [{ type: 'clear_thinking_2025101' }] } },
+      { context_management: { edits: [null] } },
+      { context_management: { edits: [], mcp_servers: [] } },
+      { tools: [{ type: 'web_search_20250305', name: 'web_search', input_schema: { type: 'object' } }] },
       { messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'url', url: 'https://github.com' } }] }] },
       { messages: [{ role: 'user', content: [{ type: 'server_tool_use', name: 'web_search', input: {} }] }] },
     ]) {
@@ -53,7 +92,7 @@ test('restricted model route forwards only client tools, preserving stream bytes
     res.end('event: message\ndata: {"ok":true}\n\n');
   });
   const upstreamUrl = await listen(upstream);
-  const proxy = createShadowModelProxy({ token: 'shadow-only', upstreamToken: 'private-upstream', upstreamUrl });
+  const proxy = createShadowModelProxy({ token: 'shadow-only', upstreamToken: 'private-upstream', allowedModels: ['fixture'], upstreamUrl });
   const url = await listen(proxy);
   const body = { model: 'fixture', stream: true, max_tokens: 1, messages: [], tools: [{ name: 'Bash', description: 'shell', input_schema: { type: 'object' } }] };
   try {

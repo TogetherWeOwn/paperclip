@@ -16,8 +16,9 @@ Scope
   Ordinary worktree reuse, provisioning hooks, GitHub launchers and persistent
   agent-directory restores are bypassed for candidates. Only instruction text
   and selected skills may stage, not primary memory or the previous worktree.
-  comparisonEligibility.certifiedClean remains false: this is NOT a certified
-  fair comparison or permission to replace the production Claude gate.
+  comparisonEligibility.certifiedClean is derived at read time from the exact
+  run receipts. Passing isolation alone is NOT a fair-comparison certificate or
+  permission to replace the production Claude gate.
 
 Primary input provenance
   Pair capture must not delay the production wake. A primary that started before
@@ -47,14 +48,38 @@ Primary input provenance
   NUL in PR title/body is accounted as admission_event_not_jsonb_safe, without
   altering its bytes or silently dropping the selected pair.
 
-Tool/workspace equivalence remains UNVERIFIED
-  Empty isolated candidate workspace is not equivalent to a primary worktree.
-  primaryToolPolicy is configuration evidence, not an effective tool inventory.
-  Eligibility explicitly includes effective_tool_equivalence_unverified and
-  workspace_equivalence_unverified even after successful isolation/sealed reads.
-  Do not report CLEAN_PAIRED until per-run effective tool/workspace inventories
-  are recorded and compared with justified deviations. This implementation does
-  not supply that missing equivalence proof.
+Evidence-based tool/workspace equivalence
+  Heartbeat records github_review.runtime_evidence for both Claude CLI arms when
+  the shadow switch is on. Only init-event version, tool names, MCP server names
+  and permission mode are retained, plus the actual execution target's git HEAD.
+  Prompts, model output, session IDs, MCP URLs and cwd are NOT in these receipts.
+  A CLI cwd differing from the execution target, an unsupported inner sandbox,
+  or an empty/non-git workspace has no verified head (never the admitted head by
+  assumption). The controller observes HEAD at CLI initialization, not a full
+  dirty-tree/content digest; this does not prove all filesystem bytes identical.
+  Effective_tool_equivalence_unverified clears only for equal CLI versions,
+  permission modes, MCP name sets and tool sets across every init and every
+  primary retry bound to this admission/head. Only candidate WebSearch/WebFetch
+  removals are allowed; model identity intentionally differs. Missing/malformed
+  evidence stays unverified. workspace_equivalence_unverified clears only if
+  both arms' observed heads equal the admitted head. An empty candidate workspace
+  therefore remains unverified; this change does not seed or clone that workspace.
+  Primary run IDs are joined through exact admission/head review rows; candidate
+  evidence is bound to the exact run and agent. Never reuse a previous good run.
+  Admission/pre-dispatch cached eligibility stays conservative; consumers use
+  the read-time comparisonEligibility returned by the run capability.
+
+Known deviations
+  The operator-provisioned host's /proc does not use hidepid. Other users'
+  command lines are visible; the audited command lines contain CLI flags and
+  denied file paths, not review output. This is an accepted, documented deviation,
+  not a claim that process metadata is isolated. The runtime self-test does NOT
+  check hidepid. Re-audit if launchers start putting prompts/output in arguments.
+  The new-account provisioning template still recommends/refuses absent hidepid=2;
+  it must not be rerun against the existing operator-provisioned account.
+  The operator pinned the candidate CLI to primary 2.1.284 (byte-identical binary)
+  before this code change. Per-run init receipts now detect version disagreement;
+  version equality is not a cryptographic binary-integrity attestation.
 
 Deferred capture failures and denominator accounting
   githubPairingCapture.attempts bounds recovery to three claims. Missing source,
@@ -96,6 +121,9 @@ Deferred capture failures and denominator accounting
   22+ under the host-managed service supervisor. It binds only 127.0.0.1:8318.
   Set PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN to a dedicated candidate token and
   PAPERCLIP_GITHUB_SHADOW_UPSTREAM_TOKEN to a DIFFERENT private upstream token.
+  Set PAPERCLIP_GITHUB_SHADOW_ALLOWED_MODELS to a JSON array containing only the
+  arm's configured model IDs, e.g. ["muse-wonder-full-1.0-contributor"]. No default
+  or wildcard is accepted. Other models are refused before upstream I/O.
   The controller needs the candidate token; candidates never receive upstream
   credentials. Do not run the proxy as paperclip-shadow or share its env/file.
   Provision credentials through the existing secret-management mechanism; this
@@ -104,8 +132,17 @@ Deferred capture failures and denominator accounting
   and inline inputs, rejecting provider
   web/MCP tools, URL sources and management routes before upstream I/O. It strips
   request headers except the fixed protocol headers and private upstream auth.
-  The runtime probes authenticated web-search, web-fetch and MCP denial and requires
-  HTTP 403 plus x-paperclip-shadow-policy: client-tools-only-v1. Outage is NOT a pass.
+  The proxy permits context_management only for edits with types matching
+  ^clear_(thinking|tool_uses)_\d{8}$; compaction and unknown extensions stay denied.
+  A sanitized recorded CLI request is replayed against a fake upstream in tests.
+  It drops anthropic-beta (existing upstream compatibility contract); the positive
+  runtime request also uses context_management, so upstream incompatibility fails
+  certification instead of being mistaken for isolation.
+  The runtime probes authenticated web-search, web-fetch and MCP denial USING THE
+  CONFIGURED MODEL, and another model's denial; each requires HTTP 403 plus
+  x-paperclip-shadow-policy: client-tools-only-v1. It also requires a normal request
+  for the configured model (max_tokens=1) to return 2xx, and TCP connect to raw
+  127.0.0.1:8317 to be refused for the candidate UID. Outage is NOT a pass.
   CLI --disallowedTools alone is not a network boundary.
   All other TCP/UDP, Internet, DNS, IPv6 and other loopback destinations reject.
   Persist these rules using the existing host-managed firewall mechanism before

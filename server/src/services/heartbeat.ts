@@ -2,6 +2,7 @@ import { externalObjectService } from "./external-objects.js";
 import { tmpdir } from "node:os";
 import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
+import { createGitHubRunEvidenceCollector, githubWorkspaceHead, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -24109,7 +24110,22 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
+        // Observe both arms before their first tool read. Default-off runs do no
+        // parsing, Git I/O, or evidence writes. A missing/error observation never
+        // fails a primary run; comparison eligibility remains fail-closed.
+        const collectGitHubEvidence = resolvedInstanceSettings.experimental.githubReviewShadowEnabled === true
+          && agent.adapterType === "claude_local" && typeof context.wakeCommentId === "string"
+          ? createGitHubRunEvidenceCollector({
+            expectedCwd: executionTarget?.kind === "remote" ? executionTarget.remoteCwd : executionWorkspace.cwd,
+            workspaceHead: () => runtimeConfig.isolateRuntime === true ? Promise.resolve(null)
+              : githubWorkspaceHead({ runId, target: executionTarget, cwd: executionWorkspace.cwd, env: gitExecutionEnv }),
+            record: async evidence => { await appendRunEvent(currentRun, { eventType: GITHUB_REVIEW_RUN_EVIDENCE,
+              stream: "system", payload: { ...evidence } }); },
+          }) : null;
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          if (collectGitHubEvidence) await collectGitHubEvidence(stream, chunk).catch(error => {
+            logger.warn({ err: error, runId }, "GitHub review runtime evidence unavailable");
+          });
           const sanitizedChunk = compactRunLogChunk(
             redactCurrentUserText(chunk, currentUserRedactionOptions),
           );

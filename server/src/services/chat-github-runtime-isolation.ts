@@ -63,7 +63,8 @@ function refuse(reason: string): never {
  */
 export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, socket, sys, urllib.request, urllib.error
 p = json.load(sys.stdin)
-checks = {"primaryCanariesDenied": False, "githubDenied": False, "configFresh": False, "providerToolsDenied": False}
+checks = {"primaryCanariesDenied": False, "githubDenied": False, "configFresh": False, "providerToolsDenied": False,
+          "allowedModelAccepted": False, "otherModelDenied": False, "rawProxyDenied": False}
 username = pwd.getpwuid(os.geteuid()).pw_name
 namespace_busy = False
 if username == "paperclip-shadow" and os.geteuid() != 0:
@@ -86,20 +87,30 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
             except OSError as e:
                 blocked.append(e.errno in (errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ETIMEDOUT) or isinstance(e, TimeoutError))
     checks["githubDenied"] = bool(blocked) and all(blocked)
-    refused = []
-    for extra in [{"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
-                  {"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]},
-                  {"mcp_servers": [{"type": "url", "url": "https://github.com"}]}]:
-        body = {"model": "isolation-probe", "max_tokens": 1, "messages": [], **extra}
-        request = urllib.request.Request("http://127.0.0.1:8318/v1/messages", data=json.dumps(body).encode(),
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        try:
+            sock.connect(("127.0.0.1", 8317))
+        except OSError as e:
+            checks["rawProxyDenied"] = e.errno in (errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ETIMEDOUT) or isinstance(e, TimeoutError)
+    base = {"model": p["model"], "max_tokens": 1, "messages": [{"role": "user", "content": "Reply OK"}],
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}}
+    def proxy_request(extra, expect_denied):
+        request = urllib.request.Request("http://127.0.0.1:8318/v1/messages", data=json.dumps({**base, **extra}).encode(),
             headers={"Authorization": "Bearer " + p.get("proxyToken", ""), "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=2): refused.append(False)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return not expect_denied and 200 <= response.status < 300
         except urllib.error.HTTPError as e:
-            refused.append(e.code == 403 and e.headers.get("x-paperclip-shadow-policy") == "client-tools-only-v1")
+            return expect_denied and e.code == 403 and e.headers.get("x-paperclip-shadow-policy") == "client-tools-only-v1"
         except OSError:
-            refused.append(False)
-    checks["providerToolsDenied"] = all(refused)
+            return False
+    checks["allowedModelAccepted"] = proxy_request({}, False)
+    checks["otherModelDenied"] = proxy_request({"model": "isolation-probe-" + p["nonce"]}, True)
+    checks["providerToolsDenied"] = all([proxy_request(extra, True) for extra in [
+        {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+        {"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]},
+        {"mcp_servers": [{"type": "url", "url": "https://github.com"}]}]])
     try:
         namespace_busy = bool(os.listdir(os.path.dirname(p["home"])))
         if namespace_busy: raise FileExistsError("candidate_namespace_busy")
@@ -200,6 +211,15 @@ export function githubCandidateAdapterConfig(
     ANTHROPIC_BASE_URL: "http://127.0.0.1:8318", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } };
 }
 
+/** Use the same explicit config-before-env precedence as the CLI adapter, but
+ * never infer a default provider/model for a certified shadow arm. */
+export function githubCandidateProbeModel(config: Record<string, unknown>): string | null {
+  const env = config.env && typeof config.env === "object" ? config.env as Record<string, unknown> : {};
+  const configured = typeof config.model === "string" ? config.model.trim() : "";
+  const environment = typeof env.ANTHROPIC_MODEL === "string" ? env.ANTHROPIC_MODEL.trim() : "";
+  return configured || environment || null;
+}
+
 export async function prepareGitHubCandidateRuntime(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
@@ -223,7 +243,10 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     || target.spec.strictHostKeyChecking !== true || !target.spec.knownHosts)
     refuse("github_candidate_isolation_unavailable");
   const proxyToken = process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN;
-  if (!proxyToken) refuse("github_candidate_isolation_unavailable");
+  const model = githubCandidateProbeModel(agent.adapterConfig as Record<string, unknown>);
+  // No synthetic model: both positive and tool-denial probes must exercise the
+  // arm's actual model, so a deny-all or model-only filter cannot certify.
+  if (!proxyToken || !model) refuse("github_candidate_isolation_unavailable");
   const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
@@ -232,7 +255,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   try {
   // A queued candidate may have been disabled while waiting for the prior arm.
   if (!(await githubCandidateMayWake(db, boundary.candidate))) refuse("github_candidate_disabled");
-  let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false, providerToolsDenied: false };
+  let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false, providerToolsDenied: false,
+    allowedModelAccepted: false, otherModelDenied: false, rawProxyDenied: false };
   let proofReceived = false;
   try {
     for (const canary of certificate.primaryCanaries) {
@@ -245,8 +269,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error("dns_timeout")), 3000); timer.unref(); }),
     ]);
     const result = await runSshCommand(target.spec, `python3 -c ${shellQuote(GITHUB_ISOLATION_PROBE)}`, {
-      stdin: JSON.stringify({ nonce, home, hooks, proxyToken, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
-      timeoutMs: 15_000, maxBuffer: 8192,
+      stdin: JSON.stringify({ nonce, home, hooks, proxyToken, model, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
+      timeoutMs: 40_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
     if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
@@ -255,7 +279,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     // sample read a primary answer. The advisory lease handles healthy overlap.
     if (proof.namespaceBusy === true) throw new Error("candidate_namespace_busy");
     checks = { primaryCanariesDenied: proof.checks.primaryCanariesDenied,
-      githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh, providerToolsDenied: proof.checks.providerToolsDenied };
+      githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh, providerToolsDenied: proof.checks.providerToolsDenied,
+      allowedModelAccepted: proof.checks.allowedModelAccepted, otherModelDenied: proof.checks.otherModelDenied, rawProxyDenied: proof.checks.rawProxyDenied };
     // The probe intentionally does not install hooks after failed confinement.
     // A bound negative proof remains contamination, not a missing-hook outage.
     if (Object.values(checks).every(Boolean) && proof.hooksDigest !== hooks.digest) throw new Error("probe_hooks_mismatch");
@@ -340,7 +365,9 @@ export async function assertGitHubCandidateDispatch(db: Db, prepared: PreparedGi
     || JSON.stringify(target.spec) !== JSON.stringify(prepared.target.spec)) refuse("github_candidate_isolation_unavailable");
   const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(and(eq(chatGitHubReviewEnrollments.id, prepared.enrollmentId), eq(chatGitHubReviewEnrollments.companyId, prepared.companyId)));
   const receipt = enrollment?.isolationTests[prepared.runId];
-  if (!receipt || receipt.status !== "passed" || receipt.checks.providerToolsDenied !== true || receipt.candidateId !== prepared.candidateId || receipt.namespace !== prepared.namespace
+  if (!receipt || receipt.status !== "passed" || receipt.checks.providerToolsDenied !== true
+    || receipt.checks.allowedModelAccepted !== true || receipt.checks.otherModelDenied !== true || receipt.checks.rawProxyDenied !== true
+    || receipt.candidateId !== prepared.candidateId || receipt.namespace !== prepared.namespace
     || receipt.configurationDigest !== prepared.configurationDigest || receipt.certificateDigest !== prepared.certificateDigest)
     refuse("github_candidate_isolation_unavailable");
 }

@@ -1,0 +1,672 @@
+{
+  "model": "muse-wonder-full-1.0-contributor",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "[redacted fixture text]"
+        },
+        {
+          "type": "text",
+          "text": "[redacted fixture text]"
+        },
+        {
+          "type": "text",
+          "text": "[redacted fixture text]"
+        }
+      ]
+    },
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "[redacted fixture text]",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "type": "text",
+      "text": "[redacted fixture text]"
+    },
+    {
+      "type": "text",
+      "text": "[redacted fixture text]",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "type": "text",
+      "text": "[redacted fixture text]",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "Agent",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "description": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "subagent_type": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "model": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "sonnet",
+              "opus",
+              "haiku",
+              "fable"
+            ]
+          },
+          "effort": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          "run_in_background": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          },
+          "isolation": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "worktree",
+              "remote"
+            ]
+          }
+        },
+        "required": [
+          "description",
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Bash",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "[redacted fixture text]",
+            "type": "number"
+          },
+          "description": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "run_in_background": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          },
+          "dangerouslyDisableSandbox": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CronCreate",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cron": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "recurring": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          },
+          "durable": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cron",
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CronDelete",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CronList",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Edit",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "new_string": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "[redacted fixture text]",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "EnterWorktree",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "name": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "path": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ExitWorktree",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "action": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "keep",
+              "remove"
+            ]
+          },
+          "discard_changes": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ListAgents",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "channel": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "maxLength": 256
+          },
+          "q": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "NotebookEdit",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "notebook_path": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "cell_id": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "new_source": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "cell_type": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "code",
+              "markdown"
+            ]
+          },
+          "edit_mode": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "replace",
+              "insert",
+              "delete"
+            ]
+          }
+        },
+        "required": [
+          "notebook_path",
+          "new_source"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Read",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "offset": {
+            "description": "[redacted fixture text]",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "limit": {
+            "description": "[redacted fixture text]",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "pages": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "allow_large": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ReportFindings",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "level": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          "findings": {
+            "description": "[redacted fixture text]",
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": {
+                  "description": "[redacted fixture text]",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "[redacted fixture text]",
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "summary": {
+                  "description": "[redacted fixture text]",
+                  "type": "string"
+                },
+                "short_summary": {
+                  "description": "[redacted fixture text]",
+                  "type": "string",
+                  "maxLength": 60
+                },
+                "failure_scenario": {
+                  "description": "[redacted fixture text]",
+                  "type": "string"
+                },
+                "category": {
+                  "description": "[redacted fixture text]",
+                  "type": "string",
+                  "maxLength": 40
+                },
+                "verdict": {
+                  "description": "[redacted fixture text]",
+                  "type": "string",
+                  "enum": [
+                    "CONFIRMED",
+                    "PLAUSIBLE"
+                  ]
+                },
+                "outcome": {
+                  "description": "[redacted fixture text]",
+                  "type": "string",
+                  "enum": [
+                    "fixed",
+                    "skipped",
+                    "no_change_needed"
+                  ]
+                }
+              },
+              "required": [
+                "file",
+                "summary",
+                "failure_scenario"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "findings"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ScheduleWakeup",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "delaySeconds": {
+            "description": "[redacted fixture text]",
+            "type": "number"
+          },
+          "reason": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "stop": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          },
+          "noop": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "SendMessage",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "to": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "allOf": [
+              {
+                "pattern": "^[^\\n\\r]*$"
+              },
+              {
+                "pattern": "^[\\s\\S]{0,300}$"
+              }
+            ]
+          },
+          "summary": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "maxLength": 200
+          },
+          "message": {
+            "default": "",
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "notify_when_idle": {
+            "description": "[redacted fixture text]",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "to",
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Skill",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "skill": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "args": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "TaskStop",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "shell_id": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Workflow",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "script": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "maxLength": 524288
+          },
+          "name": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "description": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "title": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "args": {
+            "description": "[redacted fixture text]"
+          },
+          "scriptPath": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "resumeFromRunId": {
+            "description": "[redacted fixture text]",
+            "type": "string",
+            "pattern": "^wf_[a-z0-9-]{6,}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Write",
+      "description": "[redacted fixture text]",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          },
+          "content": {
+            "description": "[redacted fixture text]",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "metadata": {
+    "user_id": "[redacted fixture text]"
+  },
+  "max_tokens": 32000,
+  "thinking": {
+    "type": "adaptive",
+    "display": "omitted"
+  },
+  "context_management": {
+    "edits": [
+      {
+        "type": "clear_thinking_20251015",
+        "keep": "all"
+      }
+    ]
+  },
+  "output_config": {
+    "effort": "high"
+  },
+  "stream": true
+}
