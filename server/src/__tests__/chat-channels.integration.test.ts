@@ -2832,6 +2832,577 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "github:paperclipai/paperclip:84",
       );
     });
+    it("admits an allow-listed workflow review-trigger bot comment and persists the marker", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:85",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "6235777120",
+        text: `@${reviewerHandle} review ${headSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:85:6235777120";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [delivery] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, f.endpoint.id),
+            eq(chatDeliveries.providerEventId, providerEventId),
+          ),
+        );
+      expect(delivery.normalizedEvent.githubWorkflowTrigger).toEqual({
+        headSha,
+        senderGithubUserId: "41898282",
+      });
+      expect(delivery.normalizedEvent.principal).toMatchObject({
+        externalId: "41898282",
+      });
+      const conversations = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, f.endpoint.id));
+      expect(conversations).toHaveLength(1);
+      expect(conversations[0]!.externalThreadId).toBe(
+        "github:paperclipai/paperclip:85",
+      );
+    });
+    it("suppresses workflow trigger lookalikes and non-allow-listed bot senders", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      async function sendBotComment(input: {
+        pr: number;
+        messageId: string;
+        text: string;
+        userId?: string;
+        userName?: string;
+        isMe?: boolean;
+        isSystem?: boolean;
+      }) {
+        const thread = makeThread({
+          channelId: "paperclipai/paperclip",
+          id: `github:paperclipai/paperclip:${input.pr}`,
+          name: "paperclipai/paperclip",
+        });
+        const message = makeMessage({
+          id: input.messageId,
+          text: input.text,
+          userId: input.userId ?? "41898282",
+          userName: input.userName ?? "github-actions[bot]",
+          mentioned: true,
+        });
+        (message.author as { isBot: boolean }).isBot = true;
+        if (input.isMe === true)
+          (message.author as { isMe: boolean }).isMe = true;
+        if (input.isSystem === true)
+          (message.author as { isSystem: boolean }).isSystem = true;
+        await deliverMessage({
+          callbacks: f.callbacks,
+          endpointId: f.endpoint.id,
+          provider: "github",
+          thread: thread.thread,
+          message,
+          trigger: "mention",
+        });
+        return `github:paperclipai/paperclip:${input.pr}:${input.messageId}`;
+      }
+      async function expectNoDelivery(providerEventId: string) {
+        const rows = await db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, f.endpoint.id),
+              eq(chatDeliveries.providerEventId, providerEventId),
+            ),
+          );
+        expect(rows).toHaveLength(0);
+      }
+      // Unknown bot identity is not on the allow-list.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 86,
+          messageId: "86001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          userId: "99999999",
+          userName: "other-bot[bot]",
+        }),
+      );
+      // Own-bot messages stay suppressed even with exact trigger text.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 87,
+          messageId: "87001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          isMe: true,
+        }),
+      );
+      // System messages stay suppressed even with exact trigger text.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 88,
+          messageId: "88001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          isSystem: true,
+        }),
+      );
+      // A mention without a head SHA is not a trigger.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 89,
+          messageId: "89001",
+          text: `@${reviewerHandle} please re-review`,
+        }),
+      );
+      // A trigger aimed at a different reviewer handle is not admitted here.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 90,
+          messageId: "90001",
+          text: `@other-reviewer review ${headSha}`,
+        }),
+      );
+      // Revoking the allow-list flag suppresses the same sender.
+      const configured = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 91,
+          messageId: "91001",
+          text: `@${reviewerHandle} review ${headSha}`,
+        }),
+      );
+      // An inactive sponsor suppresses the same sender.
+      const restored = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: restored.revision,
+          configuration: {
+            ...restored.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await db
+        .update(companyMemberships)
+        .set({ status: "inactive" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, f.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, "owner-user"),
+          ),
+        );
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 92,
+          messageId: "92001",
+          text: `@${reviewerHandle} review ${headSha}`,
+        }),
+      );
+      await db
+        .update(companyMemberships)
+        .set({ status: "active" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, f.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, "owner-user"),
+          ),
+        );
+      const deliveries = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries).toHaveLength(0);
+    });
+    it("fails closed when the workflow trigger allow-list is revoked before drain", async () => {
+      const fixture = await seedCompany();
+      const deferred: Array<() => void> = [];
+      const context = await configuredGitHubEndpoint(
+        fixture,
+        {
+          deferWebhookProcessing: true,
+          scheduleDeferredWork: (task) => deferred.push(task),
+        },
+        true,
+      );
+      const management = githubChatManagementService(
+        db,
+        context.providerFetch,
+      );
+      const initial = await management.configuration(
+        context.endpoint.id,
+        "owner-user",
+      );
+      await management.saveConfiguration(
+        context.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            toolsEnabled: true,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await context.service.update(
+        context.endpoint.id,
+        { allowGroupChats: true },
+        "owner-user",
+      );
+      const current = await context.service.get(context.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:93",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "93001",
+        text: `@${reviewerHandle} review ${headSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: context.callbacks,
+        endpointId: context.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      expect(deferred).toHaveLength(1);
+      const providerEventId = "github:paperclipai/paperclip:93:93001";
+      const [admitted] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, context.endpoint.id),
+            eq(chatDeliveries.providerEventId, providerEventId),
+          ),
+        );
+      expect(admitted.state).toBe("received");
+      expect(admitted.normalizedEvent.githubWorkflowTrigger).toEqual({
+        headSha,
+        senderGithubUserId: "41898282",
+      });
+      const configured = await management.configuration(
+        context.endpoint.id,
+        "owner-user",
+      );
+      await management.saveConfiguration(
+        context.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await db
+        .update(chatDeliveries)
+        .set({ nextAttemptAt: new Date() })
+        .where(eq(chatDeliveries.id, admitted.id));
+      // Restart simulation: a fresh service has no live-message shortcut, so
+      // the drain must restore the marker from the persisted delivery and
+      // recheck the now-revoked allow-list instead of re-entering ingress.
+      const restarted = createService(
+        new FakeChatSdkRuntime(),
+        context.providerFetch,
+      );
+      await restarted.service.processPendingDeliveries(25, admitted.id);
+      const [settled] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.id, admitted.id));
+      expect(settled.state).toBe("filtered");
+      const conversations = await db
+        .select({ id: chatConversations.id })
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, context.endpoint.id));
+      expect(conversations).toHaveLength(0);
+    });
+    it("rejects a workflow trigger review when the live pull request head moved on", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "a".repeat(40);
+      const liveHeadSha = "b".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:94",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "94001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:94:94001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:94",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      f.setSupplementalProviderFetch(async (input) =>
+        String(input).endsWith("/pulls/94")
+          ? Response.json({
+              number: 94,
+              title: "Trigger head moved on",
+              body: "",
+              draft: false,
+              base: { sha: "a".repeat(40), ref: "master" },
+              head: { sha: liveHeadSha },
+              user: { id: 42, login: "octocat", type: "User" },
+              labels: [],
+            })
+          : undefined,
+      );
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          {
+            companyId: f.companyId,
+            agentId: f.assignedAgentId,
+            issueId: conversation.issueId,
+            runId: run.id,
+          },
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow("older pull request head");
+    });
     it("supersedes a late review projection after its check already rejected the old head", async () => {
       const f = await reviewBotFixture();
       const deliveryId = randomUUID();
