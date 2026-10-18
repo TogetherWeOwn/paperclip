@@ -3403,6 +3403,327 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
       ).rejects.toThrow("older pull request head");
     });
+    it("rejects workflow trigger tool calls after the allow-list is revoked mid-run", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "c".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:95",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "95001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:95:95001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:95",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      // Revoke mid-run: the run and task already exist, so the only guard
+      // left for every bot tool call is the scope() recheck below.
+      const configured = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      // Live PR head matches the trigger SHA so the review-decision gates
+      // would allow; only the revoked allow-list must stop the call. The
+      // compare mock keeps the success path honest: with the scope() block
+      // removed this call would succeed instead of throwing.
+      const baseSha = "a".repeat(40);
+      f.setSupplementalProviderFetch(async (input) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/95"))
+          return Response.json({
+            number: 95,
+            title: "Mid-run revocation",
+            body: "",
+            draft: false,
+            base: { sha: baseSha, ref: "master" },
+            head: { sha: triggerHeadSha },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: baseSha },
+            status: "identical",
+            total_commits: 0,
+            files: [],
+          });
+        return undefined;
+      });
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          {
+            companyId: f.companyId,
+            agentId: f.assignedAgentId,
+            issueId: conversation.issueId,
+            runId: run.id,
+          },
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow(
+        "Workflow review-trigger authority is no longer available",
+      );
+    });
+    it("rejects workflow trigger tool calls when the live pull request is not reviewable", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "d".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:96",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "96001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:96:96001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:96",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      // Live head matches the trigger SHA but the PR is a draft, which the
+      // default policy does not review. Both the execute() gate (read tools)
+      // and the reviewForHead() gate (begin/submit) must reject.
+      const baseSha = "a".repeat(40);
+      f.setSupplementalProviderFetch(async (input) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/96"))
+          return Response.json({
+            number: 96,
+            title: "Draft trigger PR",
+            body: "",
+            draft: true,
+            base: { sha: baseSha, ref: "master" },
+            head: { sha: triggerHeadSha },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: baseSha },
+            status: "identical",
+            total_commits: 0,
+            files: [],
+          });
+        return undefined;
+      });
+      const session = {
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        issueId: conversation.issueId,
+        runId: run.id,
+      };
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          session,
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow("Workflow review trigger is not reviewable");
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", {
+          reviewedCommit: triggerHeadSha,
+        }),
+      ).rejects.toThrow("Workflow review trigger is not reviewable");
+    });
     it("supersedes a late review projection after its check already rejected the old head", async () => {
       const f = await reviewBotFixture();
       const deliveryId = randomUUID();
