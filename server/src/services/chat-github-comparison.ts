@@ -43,7 +43,7 @@ export function githubRunComparisonEligibility(
     roundOrdinal: enrollment.roundOrdinal,
     primaryInputSource,
     runEvidence: bound && runEvidence ? { ...runEvidence, admittedHead: enrollment.headSha, admittedBase: enrollment.baseSha,
-      repository: enrollment.envelope.snapshot?.repository, candidateWorkspace: receipt.workspace } : undefined,
+      repository: enrollment.envelope.snapshot?.repository ?? receipt.workspace?.artifact, candidateWorkspace: receipt.workspace } : undefined,
   });
   if (receipt && !bound) {
     result.certifiedClean = false;

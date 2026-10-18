@@ -141,6 +141,8 @@ function fetchIntoCache(request: GitHubRepositoryArtifactRequest, options: GitHu
       await git(["init", "-q", "--bare", pending]);
       await fs.rename(pending, cache).catch(async () => { await fs.rm(pending, { recursive: true, force: true }); });
     }
+    // LRU marker for the cache cap; the cache is pure derived state.
+    await fs.writeFile(path.join(cache, CACHE_LAST_USED), "").catch(() => undefined);
     const missing = [];
     for (const sha of new Set([request.headSha, request.baseSha])) if (!(await hasCommit(cache, sha))) missing.push(sha);
     if (missing.length === 0) return;
@@ -237,12 +239,250 @@ async function produceSynthetic(request: GitHubRepositoryArtifactRequest, option
   return { file, size, refs, commits: { base, head }, headTree, baseTree };
 }
 
-async function pruneArtifacts(root: string) {
-  const dir = path.join(root, "artifacts");
-  for (const name of await fs.readdir(dir).catch(() => [] as string[])) {
+const DEFAULT_TOTAL_MAX_BYTES = 10 * 1024 ** 3;
+const DEFAULT_CACHE_MAX_BYTES = 4 * 1024 ** 3;
+/** Crashed captures leave work directories; nothing live is older than this. */
+const STALE_WORK_MS = 60 * 60 * 1000;
+/** A manifest may precede its enrollment row; never treat it as terminal sooner. */
+const UNREFERENCED_GRACE_MS = 30 * 60 * 1000;
+const CACHE_LAST_USED = "paperclip-last-used";
+/** Production bound for one admission's artifact (bundle, then synthetic tail). */
+export const GITHUB_REPOSITORY_ARTIFACT_WINDOW_MS = 90_000;
+/** Candidate dispatch waits for the artifact at most this long after admission. */
+export const GITHUB_REPOSITORY_ARTIFACT_DISPATCH_WAIT_MS = 120_000;
+
+function envPositive(name: string, fallback: number) {
+  const value = Number(process.env[name]?.trim() || NaN);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+const pinned = new Map<string, number>();
+/** Hold an artifact against eviction while a candidate materialises it. */
+export function pinGitHubRepositoryArtifact(sha256: string) {
+  pinned.set(sha256, (pinned.get(sha256) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (pinned.get(sha256) ?? 1) - 1;
+    if (left > 0) pinned.set(sha256, left); else pinned.delete(sha256);
+  };
+}
+
+async function treeBytes(target: string): Promise<number> {
+  const stat = await fs.lstat(target).catch(() => null);
+  if (!stat) return 0;
+  if (!stat.isDirectory()) return stat.size;
+  let total = 0;
+  for (const name of await fs.readdir(target).catch(() => [] as string[])) total += await treeBytes(path.join(target, name));
+  return total;
+}
+
+async function entries(dir: string) {
+  const names = await fs.readdir(dir).catch(() => [] as string[]);
+  const rows = await Promise.all(names.map(async name => {
     const file = path.join(dir, name);
-    const stat = await fs.stat(file).catch(() => null);
-    if (stat && Date.now() - stat.mtimeMs > ARTIFACT_RETENTION_MS) await fs.rm(file, { force: true });
+    const stat = await fs.lstat(file).catch(() => null);
+    return stat ? { name, file, stat } : null;
+  }));
+  return rows.filter(row => row !== null);
+}
+
+export interface GitHubRepositoryArtifactPruneResult {
+  staleWork: number; manifests: number; artifacts: number; artifactBytes: number; caches: number; cacheBytes: number;
+}
+
+let pruning: Promise<GitHubRepositoryArtifactPruneResult> | null = null;
+
+/** Bounded disk for the shadow repository store. Oldest-first eviction above a
+ * total-bytes cap; artifacts of terminal admissions (not in `liveKeys`) go
+ * after a grace; crashed work and idle/oversized caches are removed. A pinned
+ * artifact (a candidate is materialising it) is never deleted. Without
+ * `liveKeys` only retention and the caps apply (no DB state is known). */
+export function pruneGitHubRepositoryArtifactStore(options: {
+  root?: string; maxBytes?: number; cacheMaxBytes?: number; retentionMs?: number; liveKeys?: ReadonlySet<string> | null;
+} = {}): Promise<GitHubRepositoryArtifactPruneResult> {
+  // Serialised, never coalesced: a sweep that started before this call may
+  // not have seen the latest write, and its options may differ.
+  if (pruning) return pruning.catch(() => undefined).then(() => pruneGitHubRepositoryArtifactStore(options));
+  const run = (async () => {
+    const root = options.root ?? githubRepositoryArtifactRoot();
+    const maxBytes = options.maxBytes ?? envPositive("PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES", DEFAULT_TOTAL_MAX_BYTES);
+    const cacheMaxBytes = options.cacheMaxBytes ?? envPositive("PAPERCLIP_GITHUB_SHADOW_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES);
+    const retentionMs = options.retentionMs ?? ARTIFACT_RETENTION_MS;
+    const live = options.liveKeys ?? null;
+    const now = Date.now();
+    const result: GitHubRepositoryArtifactPruneResult = { staleWork: 0, manifests: 0, artifacts: 0, artifactBytes: 0, caches: 0, cacheBytes: 0 };
+    const remove = async (target: string) => { await fs.rm(target, { recursive: true, force: true }); };
+    // 1. Crashed work: capture dirs, interrupted cache inits, half-written manifests.
+    const stale = [
+      ...(await entries(path.join(root, "tmp"))).filter(e => e.name.startsWith("capture-")),
+      ...(await entries(path.join(root, "cache"))).filter(e => /\.git\.init-/.test(e.name)),
+      ...(await entries(path.join(root, "manifests"))).filter(e => e.name.startsWith(".") && e.name.endsWith(".tmp")),
+    ];
+    for (const e of stale) if (now - e.stat.mtimeMs > STALE_WORK_MS) { await remove(e.file); result.staleWork++; }
+    // 2. Manifests: expired, or terminal (no live candidate) after the grace.
+    const referenced = new Set<string>();
+    for (const e of await entries(path.join(root, "manifests"))) {
+      if (!e.name.endsWith(".json") || e.name.startsWith(".")) continue;
+      const age = now - e.stat.mtimeMs;
+      const key = e.name.slice(0, -".json".length);
+      if (age > retentionMs || (live && !live.has(key) && age > UNREFERENCED_GRACE_MS)) {
+        await remove(e.file); result.manifests++; continue;
+      }
+      const manifest = await fs.readFile(e.file, "utf8").then(text => JSON.parse(text) as { repository?: { sha256?: unknown } }).catch(() => null);
+      if (typeof manifest?.repository?.sha256 === "string") referenced.add(manifest.repository.sha256);
+    }
+    // 3. Artifacts: expired, or unreferenced by any live manifest after the grace.
+    const kept: Array<{ file: string; sha256: string; size: number; mtimeMs: number }> = [];
+    for (const e of await entries(path.join(root, "artifacts"))) {
+      const sha256 = e.name.replace(/\.bundle$/, "");
+      const age = now - e.stat.mtimeMs;
+      if (!pinned.has(sha256) && (age > retentionMs || (live && !referenced.has(sha256) && age > UNREFERENCED_GRACE_MS))) {
+        await remove(e.file); result.artifacts++; result.artifactBytes += e.stat.size; continue;
+      }
+      kept.push({ file: e.file, sha256, size: e.stat.size, mtimeMs: e.stat.mtimeMs });
+    }
+    // 4. Total cap, oldest first; pinned artifacts are skipped, never deleted.
+    let total = kept.reduce((sum, a) => sum + a.size, 0);
+    for (const artifact of kept.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+      if (total <= maxBytes) break;
+      if (pinned.has(artifact.sha256)) continue;
+      await remove(artifact.file);
+      total -= artifact.size; result.artifacts++; result.artifactBytes += artifact.size;
+    }
+    // 5. Per-repository caches: idle past retention, then least-recently-used
+    // above the cache cap. A cache in use (locked) is skipped this sweep.
+    const caches = await Promise.all((await entries(path.join(root, "cache")))
+      .filter(e => e.stat.isDirectory() && e.name.endsWith(".git"))
+      .map(async e => ({ file: e.file, size: await treeBytes(e.file),
+        usedMs: (await fs.stat(path.join(e.file, CACHE_LAST_USED)).catch(() => e.stat)).mtimeMs })));
+    let cacheTotal = caches.reduce((sum, c) => sum + c.size, 0);
+    for (const cache of caches.sort((a, b) => a.usedMs - b.usedMs)) {
+      if (now - cache.usedMs <= retentionMs && cacheTotal <= cacheMaxBytes) continue;
+      if (cacheLocks.has(cache.file)) continue;
+      await withCacheLock(cache.file, () => remove(cache.file));
+      cacheTotal -= cache.size; result.caches++; result.cacheBytes += cache.size;
+    }
+    return result;
+  })();
+  pruning = run.finally(() => { pruning = null; });
+  return pruning;
+}
+
+export type GitHubRepositoryCheckout =
+  | { repository: GitHubRepositoryArtifact; repositoryFailure?: undefined }
+  | { repository?: undefined; repositoryFailure: string };
+export type GitHubRepositoryArtifactAdmission = Pick<GitHubRepositoryArtifactRequest, "repository" | "pullNumber" | "headSha" | "baseSha" | "baseBranch">;
+
+/** One admitted (repository, PR, head, base) names one manifest; the bytes it
+ * points to are content-addressed and commit-addressed. */
+export function githubRepositoryArtifactKey(admission: GitHubRepositoryArtifactAdmission) {
+  return createHash("sha256").update(JSON.stringify([admission.repository.toLowerCase(), admission.pullNumber,
+    admission.headSha, admission.baseSha, admission.baseBranch])).digest("hex");
+}
+
+async function writeManifest(root: string, key: string, checkout: GitHubRepositoryCheckout) {
+  const dir = path.join(root, "manifests");
+  await fs.mkdir(dir, { recursive: true });
+  const pending = path.join(dir, `.${key}.${randomUUID()}.tmp`);
+  await fs.writeFile(pending, JSON.stringify({ version: 1, key, writtenAt: new Date().toISOString(), ...checkout }));
+  await fs.rename(pending, path.join(dir, `${key}.json`));
+}
+
+async function readManifest(root: string, key: string): Promise<GitHubRepositoryCheckout | null> {
+  let text: string;
+  try { text = await fs.readFile(path.join(root, "manifests", `${key}.json`), "utf8"); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : { repositoryFailure: "repository_artifact_manifest_invalid" }; }
+  try {
+    const manifest = JSON.parse(text) as { version?: unknown; key?: unknown; repository?: GitHubRepositoryArtifact; repositoryFailure?: unknown };
+    if (manifest.version !== 1 || manifest.key !== key) return { repositoryFailure: "repository_artifact_manifest_invalid" };
+    if (manifest.repository && typeof manifest.repository === "object") return { repository: manifest.repository };
+    return { repositoryFailure: typeof manifest.repositoryFailure === "string" ? manifest.repositoryFailure : "repository_artifact_manifest_invalid" };
+  } catch { return { repositoryFailure: "repository_artifact_manifest_invalid" }; }
+}
+
+function boundFetch(fetchImpl: typeof fetch, bound: AbortSignal): typeof fetch {
+  return async (url, init) => {
+    const signal = init?.signal ? AbortSignal.any([init.signal, bound]) : bound;
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try { return await Promise.race([fetchImpl(url, { ...init, signal }), cancelled]); }
+    finally { signal.removeEventListener("abort", abort); }
+  };
+}
+
+const inflight = new Map<string, Promise<GitHubRepositoryCheckout>>();
+
+/** Produce an admission's checkout in the background. It never blocks the
+ * metadata seal and never throws: success or a precise failure is recorded in
+ * the admission manifest. The producer is raced against its own window, so
+ * post-abort work (hashing, renames, tree removal) can only cost the checkout. */
+export function startGitHubRepositoryArtifact(
+  request: Omit<GitHubRepositoryArtifactRequest, "signal" | "deadlineAt"> & { signal?: AbortSignal },
+  options: { producer: GitHubRepositoryArtifactProducer; root?: string; windowMs?: number },
+): Promise<GitHubRepositoryCheckout> {
+  const root = options.root ?? githubRepositoryArtifactRoot();
+  const key = githubRepositoryArtifactKey(request);
+  const existing = inflight.get(key);
+  if (existing) return existing;
+  const windowMs = options.windowMs ?? envPositive("PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS", GITHUB_REPOSITORY_ARTIFACT_WINDOW_MS);
+  const deadlineAt = Date.now() + windowMs;
+  const signal = AbortSignal.any([AbortSignal.timeout(windowMs), ...(request.signal ? [request.signal] : [])]);
+  let onAbort!: () => void;
+  const late = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new GitHubRepositoryArtifactError("repository_artifact_late"));
+    if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  late.catch(() => undefined);
+  const work = (async (): Promise<GitHubRepositoryCheckout> => {
+    let checkout: GitHubRepositoryCheckout;
+    try {
+      const produced = Promise.resolve().then(() => options.producer({ ...request, fetchImpl: boundFetch(request.fetchImpl, signal), signal, deadlineAt }));
+      produced.catch(() => undefined);
+      const repository = await Promise.race([produced, late]);
+      checkout = repository.headSha === request.headSha && repository.baseSha === request.baseSha
+        ? { repository } : { repositoryFailure: "repository_artifact_binding_mismatch" };
+    } catch (error) {
+      checkout = { repositoryFailure: error instanceof GitHubRepositoryArtifactError ? error.reason
+        : signal.aborted ? "repository_artifact_late" : "repository_artifact_unavailable" };
+    } finally { signal.removeEventListener("abort", onAbort); }
+    try { await writeManifest(root, key, checkout); }
+    catch { checkout = { repositoryFailure: "repository_artifact_manifest_unwritable" }; }
+    // Sweeps are serialised, so this write is always counted against the cap.
+    void pruneGitHubRepositoryArtifactStore({ root }).catch(() => undefined);
+    return checkout;
+  })().finally(() => { inflight.delete(key); });
+  inflight.set(key, work);
+  return work;
+}
+
+/** Resolve an admission's checkout for candidate dispatch, waiting no later
+ * than `deadlineAt`. A missing result is a precise reason, never a live read. */
+export async function awaitGitHubRepositoryArtifact(admission: GitHubRepositoryArtifactAdmission, options: {
+  deadlineAt: number; root?: string; pollMs?: number;
+}): Promise<GitHubRepositoryCheckout> {
+  const root = options.root ?? githubRepositoryArtifactRoot();
+  const key = githubRepositoryArtifactKey(admission);
+  const notReady: GitHubRepositoryCheckout = { repositoryFailure: "repository_artifact_not_ready" };
+  for (;;) {
+    const remaining = options.deadlineAt - Date.now();
+    const pending = inflight.get(key);
+    if (pending) {
+      if (remaining <= 0) return notReady;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([pending, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), remaining); })]);
+      clearTimeout(timer);
+      return result ?? notReady;
+    }
+    const manifest = await readManifest(root, key);
+    if (manifest) return manifest;
+    if (remaining <= 0) return notReady;
+    await new Promise(resolve => setTimeout(resolve, Math.min(options.pollMs ?? 500, remaining)));
   }
 }
 
@@ -256,7 +496,6 @@ export async function produceGitHubRepositoryArtifact(request: GitHubRepositoryA
     fail("repository_artifact_invalid");
   await fs.mkdir(path.join(options.root, "tmp"), { recursive: true });
   await fs.mkdir(path.join(options.root, "artifacts"), { recursive: true });
-  void pruneArtifacts(options.root).catch(() => undefined);
   const tmp = await fs.mkdtemp(path.join(options.root, "tmp", "capture-"));
   try {
     let produced: Awaited<ReturnType<typeof produceBundle>>;

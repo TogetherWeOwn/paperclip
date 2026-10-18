@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { captureGitHubReviewSnapshot } from "./chat-github-review-snapshot.js";
-import { GitHubRepositoryArtifactError, githubRepositoryArtifactProducer } from "./chat-github-repository-artifact.js";
+import { githubRepositoryArtifactKey, githubRepositoryArtifactProducer, pruneGitHubRepositoryArtifactStore, startGitHubRepositoryArtifact } from "./chat-github-repository-artifact.js";
 import {
   agents, chatActions, chatConversations, chatDeliveries, chatEndpoints, chatGitHubConfigurations,
   chatGitHubReviewArms, chatGitHubReviewCandidates, chatGitHubReviewEnrollments,
@@ -96,7 +96,6 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   const remaining = input.pending ? Date.parse(input.pending.admittedAt) + PAIR_CAPTURE_WINDOW_MS - Date.now() : PAIR_CAPTURE_WINDOW_MS;
   const captureWindowMs = Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0;
   const captureDeadline = AbortSignal.timeout(captureWindowMs);
-  const captureStartedAt = Date.now();
   // Also bound transports that ignore AbortSignal. Never let one candidate's
   // stalled read hold the recovery sweep forever; late responses are discarded.
   const boundedFetch: typeof fetch = async (url, init) => {
@@ -119,6 +118,7 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   };
   let event: GitHubReviewEventContext | null = input.automatic ?? null;
   let prepared = false;
+  const artifactAbort = new AbortController();
   let abortCapture!: () => void;
   const cancelled = new Promise<never>((_resolve, reject) => {
     abortCapture = () => reject(captureDeadline.reason);
@@ -151,30 +151,22 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     };
     prepared = true;
     if (!input.endpoint.botUsername || !input.endpoint.botExternalId) throw new Error("snapshot_bot_identity_missing");
-    // The checkout artifact shares the admission window and abort; it is
-    // commit-addressed, so it cannot see anything the primary publishes later.
+    // The checkout holds only immutable objects addressed by the admitted
+    // head/base SHAs, so nothing the primary publishes later can enter it and
+    // it need not block the metadata seal. It is produced in parallel, under
+    // its own window, into the admission manifest; candidate dispatch waits for
+    // it (bounded) and otherwise runs with workspace equivalence unverified.
     const producer = githubRepositoryArtifactProducer();
-    const admitted = event;
-    // The artifact closes before the admission window so a slow repository can
-    // only cost the checkout (precise reason), never the sealed snapshot itself.
-    const artifactWindowMs = Math.max(0, captureWindowMs - (Date.now() - captureStartedAt) - PAIR_ARTIFACT_MARGIN_MS);
-    const artifactSignal = AbortSignal.any([captureDeadline, AbortSignal.timeout(artifactWindowMs)]);
-    const repository = (async (): Promise<Pick<GitHubReviewInputSnapshot, "repository" | "repositoryFailure">> => {
-      if (!producer) return { repositoryFailure: "repository_artifact_disabled" };
-      try {
-        return { repository: await producer({ repository: input.repository, pullNumber: admitted.pullNumber,
-          headSha: admitted.headSha, baseSha: admitted.baseSha, baseBranch: admitted.baseBranch, token,
-          fetchImpl: boundedFetch, signal: artifactSignal, deadlineAt: Date.now() + artifactWindowMs }) };
-      } catch (error) {
-        return { repositoryFailure: error instanceof GitHubRepositoryArtifactError ? error.reason
-          : artifactSignal.aborted ? "repository_artifact_late" : "repository_artifact_unavailable" };
-      }
-    })();
+    if (producer) void startGitHubRepositoryArtifact({ repository: input.repository, pullNumber: event.pullNumber,
+      headSha: event.headSha, baseSha: event.baseSha, baseBranch: event.baseBranch, token, fetchImpl,
+      signal: artifactAbort.signal }, { producer });
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
-      { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, repository);
+      { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, producer ? undefined : "repository_artifact_disabled");
     return { event, snapshot };
     })()]);
   } catch {
+    // No admission will reference a checkout for a failed seal.
+    artifactAbort.abort();
     // Selection/denominator survive token and metadata failure too. Automatic
     // events keep their authenticated head; manual unknowns stay explicitly null.
     // Recovery only projects these bytes, never reconstructs a later live view.
@@ -447,7 +439,6 @@ async function failGitHubPairCapture(db: Store, deliveryId: string, capture: Pai
 }
 
 const PAIR_CAPTURE_WINDOW_MS = 15_000;
-const PAIR_ARTIFACT_MARGIN_MS = 2_000;
 
 async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$inferSelect, pending: PendingPair) {
   if (pending.disabled || !(await githubShadowEnabled(db))) return "admission_snapshot_disabled";
@@ -558,6 +549,35 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
   }
 }
 
+const ARTIFACT_SWEEP_INTERVAL_MS = 5 * 60_000;
+let lastArtifactSweepAt = 0;
+
+/** Admission keys whose checkout may still be materialised: some candidate is
+ * not terminal (voided/unavailable) and has not yet recorded a workspace
+ * receipt for a dispatched run. Everything else may be evicted. */
+export async function githubLiveRepositoryArtifactKeys(db: Store): Promise<Set<string>> {
+  const rows = await db.execute<{ event: GitHubReviewEventContext | null }>(sql`select e.envelope->'event' as event
+    from chat_github_review_enrollments e
+    where e.admitted_at > now() - interval '8 days' and e.envelope->'event' is not null
+      and exists (select 1 from chat_github_review_candidates c
+        where c.company_id = e.company_id and c.enrollment_id = e.id
+          and (c.state in ('pending', 'materialized') or (c.state = 'dispatched' and not exists (
+            select 1 from jsonb_each(e.isolation_tests) t
+            where t.value->>'candidateId' = c.id::text and t.value ? 'workspace'))))`);
+  const keys = new Set<string>();
+  for (const { event } of rows) if (event?.headSha && event.baseSha) keys.add(githubRepositoryArtifactKey(event));
+  return keys;
+}
+
+/** Periodic disk bound for the checkout store (cap, terminal, crash debris). */
+export async function sweepGitHubRepositoryArtifacts(db: Store, force = false) {
+  if (!force && Date.now() - lastArtifactSweepAt < ARTIFACT_SWEEP_INTERVAL_MS) return null;
+  lastArtifactSweepAt = Date.now();
+  // Disabled production still needs retention and the cap, but no DB read.
+  const liveKeys = githubRepositoryArtifactProducer() ? await githubLiveRepositoryArtifactKeys(db) : null;
+  return pruneGitHubRepositoryArtifactStore({ liveKeys });
+}
+
 export async function recoverGitHubReviewCandidates(db: Db, input: {
   limit: number;
   fetch?: typeof fetch;
@@ -572,6 +592,7 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
       .where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending' and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`);
   }
   await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
+  void sweepGitHubRepositoryArtifacts(db).catch(() => undefined);
   const seeds = await githubPairSeedRecoveryQuery(db, input.limit);
   for (const delivery of seeds) {
     try { await withGitHubPrimaryBlindingAdmission(db, delivery.companyId,

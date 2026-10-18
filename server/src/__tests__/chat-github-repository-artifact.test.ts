@@ -1,13 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as ssh from "@paperclipai/adapter-utils/ssh";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { produceGitHubRepositoryArtifact, githubRepositoryArtifactFile, type GitHubRepositoryArtifact,
-  type GitHubRepositoryArtifactRequest } from "../services/chat-github-repository-artifact.js";
-import { materializeGitHubCandidateWorkspace } from "../services/chat-github-runtime-isolation.js";
+import { awaitGitHubRepositoryArtifact, GitHubRepositoryArtifactError, githubRepositoryArtifactKey, pinGitHubRepositoryArtifact,
+  produceGitHubRepositoryArtifact, pruneGitHubRepositoryArtifactStore, startGitHubRepositoryArtifact, githubRepositoryArtifactFile,
+  type GitHubRepositoryArtifact, type GitHubRepositoryArtifactProducer, type GitHubRepositoryArtifactRequest } from "../services/chat-github-repository-artifact.js";
+import { materializeGitHubCandidateWorkspace, holdGitHubCandidateCheckout, resolveGitHubCandidateCheckout } from "../services/chat-github-runtime-isolation.js";
 import { captureGitHubReviewSnapshot, githubSnapshotReader } from "../services/chat-github-review-snapshot.js";
 
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -157,26 +158,239 @@ describe("sealed repository artifact", () => {
 });
 
 describe("sealed snapshot binding", () => {
-  const event = { headSha: head, baseSha: base, pullNumber: 7 } as never;
+  const ev = () => ({ headSha: head, baseSha: base, pullNumber: 7 }) as never;
   const provider = () => ({ request: async <T>(path: string) => (path === "/pulls/7" ? { head: { sha: head }, base: { sha: base } }
     : path.startsWith("/compare/") ? { merge_base_commit: { sha: base } } : path.includes("/check-runs") ? { check_runs: [] } : []) as T });
-  it("seals the artifact under the snapshot digest and records a precise failure otherwise", async () => {
-    const artifact = { version: 1, kind: "bundle", path: `${"c".repeat(64)}.bundle`, sha256: "c".repeat(64), bytes: 1, headSha: head, baseSha: base,
-      headTree: "d".repeat(40), baseTree: "e".repeat(40), refs: { base: "refs/heads/main", head: "refs/pull/7/head" }, commits: { base, head } } as const;
-    const sealed = await captureGitHubReviewSnapshot(provider(), { ...(event as object), headSha: head, baseSha: base } as never, undefined,
-      Promise.resolve({ repository: { ...artifact } }));
-    expect(sealed.repository).toEqual(artifact);
-    const reader = (snapshot: typeof sealed) => githubSnapshotReader(snapshot, { headSha: head, baseSha: base, pullNumber: 7 }, async () => { throw new Error("live"); });
-    expect(() => reader(sealed)).not.toThrow();
-    expect(() => reader({ ...sealed, repository: { ...artifact, headSha: later } })).toThrow("Invalid sealed review snapshot");
-    const mismatched = await captureGitHubReviewSnapshot(provider(), { headSha: head, baseSha: base, pullNumber: 7 } as never, undefined,
-      Promise.resolve({ repository: { ...artifact, headSha: later } }));
-    expect(mismatched).toMatchObject({ repositoryFailure: "repository_artifact_binding_mismatch" });
-    expect(mismatched.repository).toBeUndefined();
-    const late = await captureGitHubReviewSnapshot(provider(), { headSha: head, baseSha: base, pullNumber: 7 } as never, undefined,
-      Promise.resolve({ repositoryFailure: "repository_artifact_late" }));
-    expect(late).toMatchObject({ repositoryFailure: "repository_artifact_late" });
-    expect(late.repository).toBeUndefined();
+  it("seals only metadata: the checkout never blocks or enters the snapshot; an admission-time reason is digest-covered", async () => {
+    const plain = await captureGitHubReviewSnapshot(provider(), ev(), undefined);
+    expect(plain.repository).toBeUndefined();
+    expect(plain.repositoryFailure).toBeUndefined();
+    const disabled = await captureGitHubReviewSnapshot(provider(), ev(), undefined, "repository_artifact_disabled");
+    expect(disabled).toMatchObject({ repositoryFailure: "repository_artifact_disabled" });
+    const reader = (snapshot: typeof disabled) => githubSnapshotReader(snapshot, { headSha: head, baseSha: base, pullNumber: 7 }, async () => { throw new Error("live"); });
+    expect(() => reader(disabled)).not.toThrow();
+    expect(() => reader({ ...disabled, repositoryFailure: "forged" })).toThrow("Invalid sealed review snapshot");
+  });
+
+  it("reads one sweep's resources concurrently (a sequential seal took 5.5-7.1s against GitHub)", async () => {
+    const slow = provider();
+    let inFlight = 0, peak = 0;
+    const timed = { request: async <T>(path: string) => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 60));
+      inFlight--;
+      return slow.request<T>(path);
+    } };
+    const started = Date.now();
+    await captureGitHubReviewSnapshot(timed, ev(), undefined);
+    // 2 sweeps x 8 single-page reads: ~120ms concurrent vs ~960ms sequential.
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(peak).toBe(8);
+  });
+
+  it("still detects a head change observed in a concurrent sweep", async () => {
+    const moved = { request: async <T>(path: string) => (path === "/pulls/7" ? { head: { sha: later }, base: { sha: base } }
+      : provider().request<T>(path)) as T };
+    await expect(captureGitHubReviewSnapshot(moved, ev(), undefined)).rejects.toThrow("snapshot_capture_head_changed");
+  });
+});
+
+describe("admission checkout manifest", () => {
+  const admission = { repository: "Acme/Widgets", pullNumber: 7, baseBranch: "main" };
+  const fake = (overrides: Partial<GitHubRepositoryArtifact> = {}): GitHubRepositoryArtifact => ({ version: 1, kind: "bundle",
+    path: `${"c".repeat(64)}.bundle`, sha256: "c".repeat(64), bytes: 1, headSha: head, baseSha: base, headTree: "d".repeat(40),
+    baseTree: "e".repeat(40), refs: { base: "refs/heads/main", head: "refs/pull/7/head" }, commits: { base, head }, ...overrides });
+  const start = (dir: string, producer: GitHubRepositoryArtifactProducer, windowMs = 5_000, sha = head) =>
+    startGitHubRepositoryArtifact({ ...admission, headSha: sha, baseSha: base, token: "t", fetchImpl: githubFixture() }, { producer, root: dir, windowMs });
+
+  it("records a produced checkout for dispatch without a snapshot dependency", async () => {
+    const dir = root();
+    const seen: Array<{ deadlineAt?: number; signal: AbortSignal }> = [];
+    const result = await start(dir, async request => { seen.push(request); return fake(); });
+    expect(result).toEqual({ repository: fake() });
+    expect(seen[0]!.signal.aborted).toBe(false);
+    expect(seen[0]!.deadlineAt).toBeGreaterThan(Date.now());
+    const key = githubRepositoryArtifactKey({ ...admission, headSha: head, baseSha: base });
+    expect(JSON.parse(readFileSync(join(dir, "manifests", `${key}.json`), "utf8"))).toMatchObject({ version: 1, key, repository: fake() });
+    expect(await awaitGitHubRepositoryArtifact({ ...admission, repository: "acme/widgets", headSha: head, baseSha: base }, { root: dir, deadlineAt: Date.now() }))
+      .toEqual({ repository: fake() });
+  });
+
+  it("races a producer that ignores its signal: post-abort work only costs the checkout", async () => {
+    const dir = root();
+    let finish!: (artifact: GitHubRepositoryArtifact) => void;
+    const started = Date.now();
+    const result = await start(dir, () => new Promise(resolve => { finish = resolve; }), 200);
+    expect(result).toEqual({ repositoryFailure: "repository_artifact_late" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    finish(fake());
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(await awaitGitHubRepositoryArtifact({ ...admission, headSha: head, baseSha: base }, { root: dir, deadlineAt: Date.now() }))
+      .toEqual({ repositoryFailure: "repository_artifact_late" });
+  });
+
+  it("drops a checkout bound to other commits and reports producer failures precisely", async () => {
+    expect(await start(root(), async () => fake({ headSha: later }))).toEqual({ repositoryFailure: "repository_artifact_binding_mismatch" });
+    expect(await start(root(), async () => { throw new GitHubRepositoryArtifactError("bundle:x;synthetic:y"); }))
+      .toEqual({ repositoryFailure: "bundle:x;synthetic:y" });
+    expect(await start(root(), async () => { throw new Error("boom"); })).toEqual({ repositoryFailure: "repository_artifact_unavailable" });
+  });
+
+  it("waits for in-flight production, bounded, and reports not-ready past the dispatch deadline", async () => {
+    const dir = root();
+    let finish!: (artifact: GitHubRepositoryArtifact) => void;
+    const production = start(dir, () => new Promise(resolve => { finish = resolve; }));
+    const key = { ...admission, headSha: head, baseSha: base };
+    expect(await awaitGitHubRepositoryArtifact(key, { root: dir, deadlineAt: Date.now() + 50 })).toEqual({ repositoryFailure: "repository_artifact_not_ready" });
+    const waiting = awaitGitHubRepositoryArtifact(key, { root: dir, deadlineAt: Date.now() + 5_000 });
+    finish(fake());
+    expect(await waiting).toEqual({ repository: fake() });
+    await production;
+    // Nothing produced at all (e.g. production lost in a restart).
+    expect(await awaitGitHubRepositoryArtifact({ ...key, headSha: later }, { root: dir, deadlineAt: Date.now() + 60, pollMs: 10 }))
+      .toEqual({ repositoryFailure: "repository_artifact_not_ready" });
+    // Dispatch measures the bound from admission, not from when it runs.
+    const enrollment = { admittedAt: new Date(Date.now() - 200_000), envelope: { event: { ...key, headSha: later }, snapshot: { headSha: later } } } as never;
+    const t0 = Date.now();
+    expect(await resolveGitHubCandidateCheckout(enrollment, { root: dir })).toEqual({ repositoryFailure: "repository_artifact_not_ready" });
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(await resolveGitHubCandidateCheckout({ ...(enrollment as object), envelope: { event: key, snapshot: { repositoryFailure: "repository_artifact_disabled" } } } as never))
+      .toBeUndefined();
+  });
+
+  it("pins a resolved checkout until released, so the cap cannot evict it while the candidate queues for the lease", async () => {
+    const dir = root();
+    await start(dir, async () => fake());
+    mkdirSync(join(dir, "artifacts"), { recursive: true });
+    const file = join(dir, "artifacts", fake().path);
+    writeFileSync(file, Buffer.alloc(100));
+    const key = { ...admission, headSha: head, baseSha: base };
+    const enrollment = { admittedAt: new Date(), envelope: { event: key, snapshot: { headSha: head } } } as never;
+    const held = await holdGitHubCandidateCheckout(enrollment, { root: dir });
+    expect(held.checkout).toEqual({ repository: fake() });
+    try {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+      expect(existsSync(file)).toBe(true);
+    } finally { held.release(); held.release(); }
+    await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+    expect(existsSync(file)).toBe(false);
+  });
+});
+
+describe("repository store disk bound", () => {
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
+  function artifactFile(dir: string, sha: string, bytes: number, ageHours: number) {
+    mkdirSync(join(dir, "artifacts"), { recursive: true });
+    const file = join(dir, "artifacts", `${sha.repeat(64)}.bundle`);
+    writeFileSync(file, Buffer.alloc(bytes));
+    utimesSync(file, hoursAgo(ageHours), hoursAgo(ageHours));
+    return file;
+  }
+  function manifest(dir: string, key: string, sha: string, ageHours: number) {
+    mkdirSync(join(dir, "manifests"), { recursive: true });
+    const file = join(dir, "manifests", `${key}.json`);
+    writeFileSync(file, JSON.stringify({ version: 1, key, repository: { sha256: sha.repeat(64) } }));
+    utimesSync(file, hoursAgo(ageHours), hoursAgo(ageHours));
+    return file;
+  }
+
+  it("evicts oldest-first above the total cap and never a pinned (materialising) artifact", async () => {
+    const dir = root();
+    const [a, b, c] = [artifactFile(dir, "a", 100, 3), artifactFile(dir, "b", 100, 2), artifactFile(dir, "c", 100, 1)];
+    expect(await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 250 })).toMatchObject({ artifacts: 1, artifactBytes: 100 });
+    expect([existsSync(a), existsSync(b), existsSync(c)]).toEqual([false, true, true]);
+    const release = pinGitHubRepositoryArtifact("b".repeat(64));
+    try {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 50 });
+      expect([existsSync(b), existsSync(c)]).toEqual([true, false]);
+    } finally { release(); }
+    await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 50 });
+    expect(existsSync(b)).toBe(false);
+  });
+
+  it("never deletes a pinned artifact for age or terminal admission either", async () => {
+    const dir = root();
+    const old = artifactFile(dir, "f", 10, 24 * 8);
+    const release = pinGitHubRepositoryArtifact("f".repeat(64));
+    try {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, liveKeys: new Set() });
+      expect(existsSync(old)).toBe(true);
+    } finally { release(); }
+    await pruneGitHubRepositoryArtifactStore({ root: dir, liveKeys: new Set() });
+    expect(existsSync(old)).toBe(false);
+  });
+
+  it("serialises sweeps: a call during an in-flight sweep still applies its own cap", async () => {
+    const dir = root();
+    const file = artifactFile(dir, "9", 100, 1);
+    const first = pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 10_000 });
+    const second = pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+    expect(await first).toMatchObject({ artifacts: 0 });
+    expect(await second).toMatchObject({ artifacts: 1, artifactBytes: 100 });
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("reads the cap from PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES", async () => {
+    const dir = root();
+    const [a, b] = [artifactFile(dir, "a", 100, 2), artifactFile(dir, "b", 100, 1)];
+    vi.stubEnv("PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES", "150");
+    try { await pruneGitHubRepositoryArtifactStore({ root: dir }); } finally { vi.unstubAllEnvs(); }
+    expect([existsSync(a), existsSync(b)]).toEqual([false, true]);
+  });
+
+  it("deletes a terminal admission's checkout after the grace, keeps live and fresh ones, and expires by retention", async () => {
+    const dir = root();
+    const live = [manifest(dir, "live", "a", 2), artifactFile(dir, "a", 10, 2)];
+    const terminal = [manifest(dir, "done", "b", 2), artifactFile(dir, "b", 10, 2)];
+    const fresh = [manifest(dir, "fresh", "c", 0.1), artifactFile(dir, "c", 10, 0.1)];
+    const orphan = artifactFile(dir, "d", 10, 2);
+    const expired = artifactFile(dir, "e", 10, 8 * 24);
+    expect(await pruneGitHubRepositoryArtifactStore({ root: dir, liveKeys: new Set(["live"]) })).toMatchObject({ manifests: 1, artifacts: 3 });
+    expect([...live, ...fresh].every(existsSync)).toBe(true);
+    expect([...terminal, orphan, expired].some(existsSync)).toBe(false);
+    // Without DB state only retention applies to unreferenced artifacts.
+    const unknown = artifactFile(dir, "f", 10, 2);
+    await pruneGitHubRepositoryArtifactStore({ root: dir });
+    expect(existsSync(unknown)).toBe(true);
+  });
+
+  it("removes crashed capture/init/manifest debris older than an hour but not live work", async () => {
+    const dir = root();
+    const paths = { oldCapture: join(dir, "tmp", "capture-old"), newCapture: join(dir, "tmp", "capture-new"),
+      oldInit: join(dir, "cache", `${"9".repeat(64)}.git.init-x`), oldTmp: join(dir, "manifests", ".k.u.tmp") };
+    for (const p of [paths.oldCapture, paths.newCapture, paths.oldInit, join(dir, "manifests")]) mkdirSync(p, { recursive: true });
+    writeFileSync(paths.oldTmp, "{");
+    for (const p of [paths.oldCapture, paths.oldInit, paths.oldTmp]) utimesSync(p, hoursAgo(2), hoursAgo(2));
+    expect(await pruneGitHubRepositoryArtifactStore({ root: dir })).toMatchObject({ staleWork: 3 });
+    expect(Object.fromEntries(Object.entries(paths).map(([k, p]) => [k, existsSync(p)])))
+      .toEqual({ oldCapture: false, newCapture: true, oldInit: false, oldTmp: false });
+  });
+
+  it("bounds per-repository caches: idle past retention, then least-recently-used above the cache cap", async () => {
+    const dir = root();
+    const cache = (name: string, bytes: number, usedHoursAgo: number) => {
+      const p = join(dir, "cache", `${name.repeat(64)}.git`);
+      mkdirSync(join(p, "objects"), { recursive: true });
+      writeFileSync(join(p, "objects", "pack"), Buffer.alloc(bytes));
+      writeFileSync(join(p, "paperclip-last-used"), "");
+      utimesSync(join(p, "paperclip-last-used"), hoursAgo(usedHoursAgo), hoursAgo(usedHoursAgo));
+      return p;
+    };
+    const [idle, older, recent] = [cache("1", 10, 8 * 24), cache("2", 100, 2), cache("3", 100, 1)];
+    expect(await pruneGitHubRepositoryArtifactStore({ root: dir, cacheMaxBytes: 150 })).toMatchObject({ caches: 2 });
+    expect([existsSync(idle), existsSync(older), existsSync(recent)]).toEqual([false, false, true]);
+  });
+
+  it("marks cache use and prunes after every production write", async () => {
+    const dir = root();
+    artifactFile(dir, "a", 10, 8 * 24);
+    await startGitHubRepositoryArtifact({ repository: "acme/widgets", pullNumber: 7, headSha: head, baseSha: base, baseBranch: "main",
+      token: "fixture-token", fetchImpl: githubFixture() }, { root: dir, producer: request => produceGitHubRepositoryArtifact(request, { root: dir, remoteUrl: () => origin }) });
+    await pruneGitHubRepositoryArtifactStore({ root: dir });
+    expect(existsSync(join(dir, "artifacts", `${"a".repeat(64)}.bundle`))).toBe(false);
+    const caches = execFileSync("ls", [join(dir, "cache")], { encoding: "utf8" }).trim().split("\n");
+    expect(caches).toHaveLength(1);
+    expect(existsSync(join(dir, "cache", caches[0]!, "paperclip-last-used"))).toBe(true);
   });
 });
 
@@ -228,6 +442,30 @@ describe("candidate workspace materialisation over SSH", () => {
     // CRLF-under-`text` renormalisation notice, identical in any clone.
     expect(git(ws, "status", "--porcelain", "--untracked-files=all")).toBe("M legacy.txt");
     expect(() => git(ws, "cat-file", "-e", later)).toThrow();
+  });
+
+  it("materialises a manifest-resolved checkout, records its artifact facts, and pins it against eviction meanwhile", async () => {
+    const dir = root();
+    const artifact = await produceGitHubRepositoryArtifact(request(), { root: dir, remoteUrl: () => origin });
+    const { home } = fakeHost();
+    let survived: boolean | undefined;
+    const sync = vi.mocked(ssh.syncDirectoryToSsh).getMockImplementation()!;
+    vi.mocked(ssh.syncDirectoryToSsh).mockImplementationOnce(async input => {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1, liveKeys: new Set() });
+      survived = existsSync(join(dir, "artifacts", artifact.path));
+      return sync(input);
+    });
+    const receipt = await materializeGitHubCandidateWorkspace({ snapshot: {} as never, checkout: { repository: artifact }, target, home, nonce: "n", artifactRoot: dir });
+    expect(survived).toBe(true);
+    expect(receipt).toMatchObject({ status: "materialized", artifactSha256: artifact.sha256, artifact });
+    // A known admission-time failure wins over any later manifest.
+    expect(await materializeGitHubCandidateWorkspace({ snapshot: { repositoryFailure: "repository_artifact_disabled" } as never,
+      checkout: { repository: artifact }, target, home: "/h", nonce: "n" })).toMatchObject({ status: "unavailable", reason: "repository_artifact_disabled" });
+    expect(await materializeGitHubCandidateWorkspace({ snapshot: {} as never, checkout: { repositoryFailure: "repository_artifact_not_ready" },
+      target, home: "/h", nonce: "n" })).toMatchObject({ status: "unavailable", reason: "repository_artifact_not_ready" });
+    // Released after materialisation: the cap applies again.
+    await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+    expect(existsSync(join(dir, "artifacts", artifact.path))).toBe(false);
   });
 
   it("records precise reasons instead of a checkout when the artifact is absent, tampered, or misreported", async () => {
