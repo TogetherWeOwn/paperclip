@@ -152,6 +152,20 @@ export function githubPairPreviousAssessmentQuery(db: Store, input: {
     .orderBy(desc(chatGitHubReviewEnrollments.roundOrdinal), desc(chatGitHubReviews.createdAt)).limit(1);
 }
 
+/** Keep seed-presence predicates literal so generic plans can prove the partial indexes apply. */
+export function githubPairRoundOrdinalQuery(db: Store, input: { endpointId: string; repositoryId: string; pullNumber: number }) {
+  return db.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
+    .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpointId),
+      sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'`,
+      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${input.repositoryId}`,
+      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(input.pullNumber)}`));
+}
+
+export function githubPairSeedRecoveryQuery(db: Store, limit: number) {
+  return db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'
+    and not exists (select 1 from chat_github_review_enrollments e where e.origin_delivery_id = ${chatDeliveries.id})`).limit(limit);
+}
+
 interface Seed {
   version: 1;
   id: string;
@@ -201,11 +215,9 @@ export async function admitGitHubPair(tx: Tx, input: {
   const e = input.event ?? input.unavailableEvent;
   if (!e) throw new Error("paired_review_event_identity_missing");
   // Endpoint lock serializes allocation, including seeds not yet projected.
-  const [prior] = await tx.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
-    .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpoint.id),
-      sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'`,
-      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${e.repositoryId}`,
-      sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(e.pullNumber)}`));
+  const [prior] = await githubPairRoundOrdinalQuery(tx, {
+    endpointId: input.endpoint.id, repositoryId: e.repositoryId, pullNumber: e.pullNumber,
+  });
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;
   const [primaryIssue] = await tx.select({ sourceTrust: issues.sourceTrust }).from(issues).where(eq(issues.id, input.conversation.issueId));
   const previousAssessments: NonNullable<GitHubReviewEnrollmentEnvelope["previousAssessments"]> = {};
@@ -381,7 +393,7 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
 }) {
   if (!(await githubShadowEnabled(db))) return 0;
   await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
-  const seeds = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed' and not exists (select 1 from chat_github_review_enrollments e where e.origin_delivery_id = ${chatDeliveries.id})`).limit(input.limit);
+  const seeds = await githubPairSeedRecoveryQuery(db, input.limit);
   for (const delivery of seeds) {
     try { await db.transaction(tx => projectSeed(tx, delivery, delivery.normalizedEvent.githubPairingSeed as Seed)); }
     catch { /* Durable seed remains pending; primary recovery is independent. */ }

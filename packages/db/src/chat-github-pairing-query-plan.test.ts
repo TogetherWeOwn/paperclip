@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import * as schema from "./schema/index.js";
+import { githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery } from "../../../server/src/services/chat-github-shadow.js";
 import { describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 
@@ -31,22 +34,26 @@ suite("paired review seed query plans", () => {
           from generate_series(1, 100000) i`;
       await db.unsafe(`insert into chat_github_review_enrollments select id from chat_deliveries where normalized_event ? 'githubPairingSeed';
         analyze chat_deliveries; analyze chat_github_review_enrollments`);
-      const recovery = `select * from chat_deliveries d where d.normalized_event ? 'githubPairingSeed'
-        and not exists (select 1 from chat_github_review_enrollments e where e.origin_delivery_id = d.id) limit 5`;
-      const ordinal = `select coalesce(max((normalized_event->'githubPairingSeed'->>'roundOrdinal')::integer), 0) as ordinal
-        from chat_deliveries where endpoint_id = '${endpoint}'::uuid
-        and normalized_event ? 'githubPairingSeed'
-        and coalesce(normalized_event->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', normalized_event->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = '1'
-        and coalesce(normalized_event->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', normalized_event->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = '81'`;
-      const explain = async (query: string) => (await db.unsafe(`explain (analyze, buffers, format json) ${query}`))[0]!["QUERY PLAN"];
-      const before = { recovery: await explain(recovery), ordinal: await explain(ordinal) };
+      // Compile the production builders: copied SQL would stay green if the
+      // application's literal partial-index predicate were removed/parameterized.
+      const store = drizzle(db, { schema });
+      const recovery = githubPairSeedRecoveryQuery(store, 5).toSQL();
+      const ordinal = githubPairRoundOrdinalQuery(store, { endpointId: endpoint, repositoryId: "1", pullNumber: 81 }).toSQL();
+      await db.unsafe("set plan_cache_mode = force_generic_plan");
+      const explain = async (name: string, query: typeof recovery) => {
+        await db.unsafe(`prepare ${name} as ${query.sql}`);
+        const literals = query.params.map(value => typeof value === "number" ? String(value) : `'${String(value).replaceAll("'", "''")}'`).join(", ");
+        return (await db.unsafe(`explain (analyze, buffers, format json) execute ${name}(${literals})`))[0]!["QUERY PLAN"];
+      };
+      const before = { recovery: await explain("before_recovery", recovery), ordinal: await explain("before_ordinal", ordinal) };
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8"));
       const entry = journal.entries.find((e: { tag: string }) => e.tag.endsWith("_pairing_seed_lookup_indexes"));
-      if (entry) await db.unsafe(await readFile(new URL(`./migrations/${entry.tag}.sql`, import.meta.url), "utf8"));
+      expect(entry).toBeDefined();
+      await db.unsafe(await readFile(new URL(`./migrations/${entry.tag}.sql`, import.meta.url), "utf8"));
       await db.unsafe("analyze chat_deliveries");
-      const after = { recovery: await explain(recovery), ordinal: await explain(ordinal) };
+      const after = { recovery: await explain("after_recovery", recovery), ordinal: await explain("after_ordinal", ordinal) };
       if (process.env.PAIRING_PLAN_EVIDENCE) await writeFile(process.env.PAIRING_PLAN_EVIDENCE,
-        JSON.stringify({ rows: 100_000, payloadBytes: 5120, seeds: 20, postgres: await db`select version()`, before, after }, null, 2));
+        JSON.stringify({ rows: 100_000, payloadBytes: 5120, seeds: 20, postgres: await db`select version()`, queries: { recovery, ordinal }, before, after }, null, 2));
       console.log("F5 plans", JSON.stringify({ before, after }));
       for (const plan of Object.values(after)) {
         const nodes: Record<string, any>[] = [];
@@ -56,11 +63,11 @@ suite("paired review seed query plans", () => {
         expect(plan[0].Plan["Shared Hit Blocks"]).toBeLessThan(1000);
       }
       expect(JSON.stringify(after.ordinal)).toContain("chat_deliveries_pair_round_idx");
-      expect((await db.unsafe(ordinal))[0]!.ordinal).toBe(20);
-      expect(await db.unsafe(recovery)).toHaveLength(0);
+      expect((await githubPairRoundOrdinalQuery(store, { endpointId: endpoint, repositoryId: "1", pullNumber: 81 }))[0]!.ordinal).toBe(20);
+      expect(await githubPairSeedRecoveryQuery(store, 5)).toHaveLength(0);
       // Missing projection remains recoverable, including an unavailable-event seed.
       await db.unsafe("delete from chat_github_review_enrollments where origin_delivery_id = (select id from chat_deliveries where provider_event_id = '95000')");
-      expect((await db.unsafe(recovery)).map(r => r.provider_event_id)).toEqual(["95000"]);
+      expect((await githubPairSeedRecoveryQuery(store, 5)).map(r => r.providerEventId)).toEqual(["95000"]);
     } finally {
       await db.end();
       await temporary.cleanup();
