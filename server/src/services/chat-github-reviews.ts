@@ -15,7 +15,7 @@ import {
 import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { primaryGitHubReview } from "./chat-github-primary.js";
-import { githubRunCapability } from "./chat-github-shadow.js";
+import { githubRunCapability, sealGitHubPrimaryReviewInputs } from "./chat-github-shadow.js";
 import { githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
@@ -583,7 +583,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     input: unknown,
     invocationId?: string,
   ) {
-    const source = await scope(session);
+    let source = await scope(session);
     if (name === "comment") {
       const parsed = commentSchema.parse(input);
       const shadowLabel =
@@ -611,6 +611,15 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This task is bound to a GitHub issue. Pull request review tools require a PR conversation.",
       );
+    // Every remaining review tool reads PR inputs (including begin_review and
+    // read_file). Select once before constructing either reader. Candidate
+    // capture failure is optional work and must never fail the primary tool.
+    if (!source.candidate && source.conversation.executionScope === "primary") {
+      const enrollment = await sealGitHubPrimaryReviewInputs(db, source.run, source.delivery, fetchImpl).catch(() => null);
+      source = { ...source, enrollment,
+        previousAssessment: enrollment?.envelope.previousAssessments?.primary ?? null,
+        policy: enrollment?.envelope.policy ?? source.policy };
+    }
     // A legacy capture label proves publication denial, not blinded inputs.
     // No admission snapshot exists for these tasks. Refuse source reads before
     // constructing any live client (also after configuration is switched off).

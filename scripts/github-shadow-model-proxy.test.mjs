@@ -27,6 +27,9 @@ test('restricted model route rejects provider tools and arbitrary endpoints befo
     for (const extra of [
       { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
       { tools: [{ type: 'web_fetch_20250910', name: 'web_fetch' }] },
+      // A schema does not turn a provider-executed tool into a local tool (N12).
+      { tools: [{ type: 'web_search_20250305', name: 'web_search', input_schema: { type: 'object' } }] },
+      { tools: [{ type: 'web_fetch_20250910', name: 'web_fetch', input_schema: { type: 'object' } }] },
       { tools: [{ type: 'computer_20250124', name: 'computer' }] },
       { mcp_servers: [{ type: 'url', url: 'https://github.com' }] },
       { unknown_provider_extension: true },

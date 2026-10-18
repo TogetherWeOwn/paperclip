@@ -137,21 +137,29 @@ if os.path.isdir(home) and not os.path.islink(home):
     if owned: shutil.rmtree(home)
 `;
 
-/** Cross-controller lease; unlike a pool reservation this cannot starve primary
- * queries while candidates wait. Keep the transaction open until remote cleanup.
- * The key is the SSH host/principal, not a company or arm (same Unix UID shares
- * files across all of those). Stale remote homes still fail the independent probe. */
+/** Cross-controller lease on a reserved, dedicated SESSION, never a long idle
+ * transaction. idle_in_transaction_session_timeout must not drop confinement
+ * while the candidate runs. The normal primary pool is never borrowed. The key
+ * is the SSH host/principal (same UID shares files across companies and arms).
+ * Stale remote homes still fail the independent namespaceBusy probe. */
 export async function acquireGitHubCandidateRuntimeLease(db: Db, hostPrincipal: string): Promise<() => Promise<void>> {
   let acquired!: () => void;
   let failed!: (error: unknown) => void;
   let release!: () => void;
   const ready = new Promise<void>((resolve, reject) => { acquired = resolve; failed = reject; });
   const released = new Promise<void>(resolve => { release = resolve; });
-  const holding = withDedicatedDbConnection(db, dedicated => dedicated.transaction(async tx => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`github-shadow-runtime:${hostPrincipal}`}, 0))`);
-    acquired();
-    await released;
-  }));
+  const holding = withDedicatedDbConnection(db, async dedicated => {
+    // reserve() pins the physical connection and prevents pool idle/lifetime
+    // recycling between lock and unlock. Session locks do not span transactions.
+    const connection = await dedicated.$client.reserve();
+    const key = `github-shadow-runtime:${hostPrincipal}`;
+    try {
+      await connection`select pg_advisory_lock(hashtextextended(${key}, 0))`;
+      acquired();
+      await released;
+      await connection`select pg_advisory_unlock(hashtextextended(${key}, 0))`;
+    } finally { connection.release(); }
+  });
   void holding.catch(failed);
   await ready;
   return async () => { release(); await holding; };
