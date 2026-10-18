@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import { chatGitHubReviewCandidates, heartbeatRuns, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
+import { hasGitHubPrimaryBlinding } from "./chat-github-primary-blinding-state.js";
 import { githubRunCapability } from "./chat-github-shadow.js";
 
 /** Identify isolation from the persisted RUN, never a caller-selected issue or
@@ -52,6 +53,11 @@ export async function githubCandidateRunBoundary(db: Db, session: {
 export async function assertGitHubCandidateApiBoundary(db: Db, session: {
   companyId: string; agentId: string; runId: string | null; credential?: "agent_jwt" | "agent_key";
 }, request: { method: string; originalUrl: string }) {
+  // Runs on every agent request: companies that never admitted a candidate take a
+  // zero-query path. This is the same fail-closed in-memory set as the API
+  // blinding (admission barrier + startup bootstrap); while bootstrap is
+  // uncertain or an admission is pending, every company keeps querying.
+  if (!hasGitHubPrimaryBlinding(db, session.companyId)) return;
   // Durable candidate admission is only a DENY signal, never a capability grant.
   // Configuration alone changes no authority. Once admitted, retirement or the
   // kill switch must not restore a clone's broader long-lived credentials.

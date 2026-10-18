@@ -23,10 +23,7 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
     from(table: unknown) {
       return {
         where() {
-          const rows = rowsForTable(table);
-          return Object.assign(Promise.resolve(rows), {
-            limit: (count: number) => Promise.resolve(rows.slice(0, count)),
-          });
+          return Promise.resolve(rowsForTable(table));
         },
       };
     },
