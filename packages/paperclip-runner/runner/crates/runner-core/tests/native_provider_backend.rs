@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use paperclip_runner_core::durable::{
     AcpxLaunchProfile, Command, CommandExecutor, DurableRunnerConfig, OpenCodeLaunchProfile,
-    QualifiedLaunchArtifact,
+    PolledEvent, QualifiedLaunchArtifact,
 };
 use paperclip_runner_core::native_provider_backend::NativeProviderCommandExecutor;
 use paperclip_runner_core::provider_bridge::{authorized_tool_catalog_digest, AuthorizedTool};
@@ -160,6 +160,26 @@ fn assert_valid_terminal(payload: &Value) {
         .build(&schema)
         .unwrap();
     validator.validate(payload).unwrap();
+}
+
+fn poll_until_event(
+    executor: &mut NativeProviderCommandExecutor,
+    event_type: &str,
+) -> Vec<PolledEvent> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // Unacknowledged events are retained, so return the complete prefix
+        // without accumulating duplicate deliveries across polls.
+        let events = executor.poll_events().unwrap();
+        if events.iter().any(|event| event.event_type == event_type) {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {event_type}; retained events: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn command(sequence: u64, command_type: &str, payload: Value) -> Command {
@@ -976,7 +996,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
             json!({"text":"Finish", "turnId":"provider-turn-review"}),
         ))
         .unwrap();
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "semantic_tool.input");
     let first = events
         .iter()
         .find(|event| event.event_type == "semantic_tool.input")
@@ -991,7 +1011,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
         "result":{"success":false,"contentItems":[{"type":"inputText","text":"Name the reviewer and decision."}]},
     }))).unwrap();
     // The sidecar emits this correction only after receiving the exact reason.
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "semantic_tool.input");
     let corrected = events
         .iter()
         .find(|event| event.event_type == "semantic_tool.input")
@@ -1012,7 +1032,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
         "callId":"call-finish-2", "operationId":"paperclip_finish", "isError":false,
         "result":{"success":true,"contentItems":[{"type":"inputText","text":"Completion report accepted."}]},
     }))).unwrap();
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "turn.completed");
     assert_eq!(
         events
             .iter()
