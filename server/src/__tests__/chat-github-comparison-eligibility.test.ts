@@ -33,6 +33,17 @@ describe("evidence-derived paired review eligibility", () => {
     enrollment.isolationTests.run!.checks.githubDenied = false;
     expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run").reasons).toContain("candidate_isolation_self_test_failed");
   });
+  it.each(["receipt", "envelope"] as const)("rejects missing %s primary namespace evidence", (missing) => {
+    const enrollment = { roundOrdinal: 1, envelope: { snapshot: {}, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
+      run: { version: 1, runId: "run", candidateId: "candidate", armId: "arm", environmentId: "env", configurationDigest: "config",
+        certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed",
+        checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true } },
+    } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
+    if (missing === "receipt") delete enrollment.isolationTests.run!.primaryBlindingVersion;
+    else delete enrollment.envelope.protocol;
+    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run"))
+      .toEqual({ certifiedClean: false, reasons: ["primary_namespace_not_isolated"] });
+  });
   it("records the deliberate web-tools deviation and the supplied observational provenance", () => {
     expect(GITHUB_SHADOW_PROTOCOL.deviations.webTools).toMatchObject({ deniedTools: ["WebSearch", "WebFetch"],
       evidence: { successfulRuns: 3138, lookbackDays: 7, webSearchRequests: 0, webFetchRequests: 0,

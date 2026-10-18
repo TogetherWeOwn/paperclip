@@ -4442,6 +4442,104 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
       }
     });
+    it("primary blinding reuses versioned snapshots and refreshes newly written aliases", async () => {
+      const f = await pairedReviewFixture();
+      const { githubPrimaryBlinding } = await import("../services/chat-github-primary-blinding.js");
+      const empty = await githubPrimaryBlinding(db, f.companyId);
+      expect(empty.active).toBe(false);
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(empty);
+      await deliverShadowTestMention(f, "blinding-cache", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const snapshot = await githubPrimaryBlinding(db, f.companyId);
+      expect(snapshot.active).toBe(true);
+      const reads = vi.spyOn(db, "select");
+      try {
+        const cached = await Promise.all(Array.from({ length: 50 }, () => githubPrimaryBlinding(db, f.companyId)));
+        expect(cached.every(v => v === snapshot)).toBe(true);
+        expect(reads).not.toHaveBeenCalled();
+      } finally { reads.mockRestore(); }
+      const comment = await issueService(db).addComment(candidate.issue.id, "late alias", { agentId: f.replacementAgentId });
+      // Legacy issue-bound runs need the context indexes, including a non-candidate agent.
+      const runs = await db.insert(heartbeatRuns).values([
+        { companyId: f.companyId, agentId: f.assignedAgentId, nativeIssueId: candidate.issue.id },
+        { companyId: f.companyId, agentId: f.assignedAgentId, contextSnapshot: { issueId: candidate.issue.id } },
+        { companyId: f.companyId, agentId: f.assignedAgentId, contextSnapshot: { taskId: candidate.issue.id } },
+        { companyId: f.companyId, agentId: f.assignedAgentId, nativeIssueId: primary.issue.id, contextSnapshot: { issueId: candidate.issue.id } },
+      ]).returning();
+      const refreshed = await githubPrimaryBlinding(db, f.companyId);
+      expect(refreshed).not.toBe(snapshot);
+      for (const id of [comment.id, ...runs.slice(0, 3).map(r => r.id)]) {
+        expect(() => refreshed.assertVisible(`/api/resources/${id.toUpperCase()}`)).toThrow(/not found/i);
+        expect(() => refreshed.assertVisible(`prefix_${id}`)).not.toThrow();
+      }
+      expect(() => refreshed.assertVisible(runs[3]!.id)).not.toThrow();
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runs[0]!.id));
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      const failure = vi.spyOn(db, "execute").mockRejectedValueOnce(new Error("version unavailable"));
+      try { await expect(githubPrimaryBlinding(db, f.companyId)).rejects.toThrow("version unavailable"); }
+      finally { failure.mockRestore(); }
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      const retryAlias = await issueService(db).addComment(candidate.issue.id, "retry alias", { agentId: f.replacementAgentId });
+      const loadFailure = vi.spyOn(db, "select").mockImplementationOnce(() => { throw new Error("aliases unavailable"); });
+      try { await expect(githubPrimaryBlinding(db, f.companyId)).rejects.toThrow("aliases unavailable"); }
+      finally { loadFailure.mockRestore(); }
+      const recovered = await githubPrimaryBlinding(db, f.companyId);
+      expect(recovered).not.toBe(refreshed);
+      expect(() => recovered.assertVisible(retryAlias.id)).toThrow(/not found/i);
+    });
+    it("primary tools/call strips candidate rows from results with entirely visible parameters", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "blinding-tool-result", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { toolApplications, connectionGrants, toolPolicies } = await import("@paperclipai/db");
+      const [application] = await db.insert(toolApplications).values({ companyId: f.companyId,
+        applicationKey: `blind-${randomUUID()}`, name: "Result blinding", type: "mcp_http", status: "active" }).returning();
+      const [connection] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: application!.id,
+        name: "Result blinding", uid: `test/${randomUUID()}`, transport: "mcp_remote", status: "active", enabled: true,
+        healthStatus: "ok", credentialPolicy: "shared", config: { url: "https://8.8.8.8/mcp" } }).returning();
+      await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: connection!.id,
+        kind: "organization", credentialSecretRefs: [], status: "active", isDefault: true });
+      await db.insert(toolCatalogEntries).values({ companyId: f.companyId, applicationId: application!.id, connectionId: connection!.id,
+        entryKind: "tool", name: "list_rows", toolName: "list_rows", title: "List rows", riskLevel: "read", isReadOnly: true,
+        status: "active", versionHash: randomUUID(), schemaHash: randomUUID() });
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      let calls = 0;
+      const gateway = createToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+        const payload = JSON.parse(String(init.body));
+        if (payload.method === "initialize") return Response.json({ jsonrpc: "2.0", id: payload.id,
+          result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "test", version: "1" } } });
+        if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+        expect(payload.method).toBe("tools/call");
+        expect(payload.params.arguments).toEqual({});
+        calls++;
+        // Created after gateway ingress: response must revalidate, not reuse a stale snapshot.
+        const late = await issueService(db).addComment(candidate.issue.id, "late tool alias", { agentId: f.replacementAgentId });
+        const rows = [{ id: primary.issue.id, title: "VISIBLE_PRIMARY" },
+          { id: candidate.issue.id, title: "CANDIDATE_RESULT_CANARY" }, { id: late.id, title: "LATE_ALIAS_CANARY" }];
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: {
+          content: [{ type: "text", text: JSON.stringify(rows) }], structuredContent: { rows },
+        } });
+      } });
+      const access = await gateway.createSession(session);
+      const tool = (await gateway.listToolsForSession(access.token)).find(t => t.providerType === "mcp_remote_http")!;
+      expect(tool).toBeDefined();
+      const result = await gateway.executeTool({ sessionToken: access.token, tool: tool.name, parameters: {} });
+      expect(result.status).toBe("completed");
+      expect(calls).toBe(1);
+      expect(JSON.stringify(result)).toContain("VISIBLE_PRIMARY");
+      expect(JSON.stringify(result)).not.toContain(candidate.issue.id);
+      expect(JSON.stringify(result)).not.toContain("CANDIDATE_RESULT_CANARY");
+      expect(JSON.stringify(result)).not.toContain("LATE_ALIAS_CANARY");
+    });
     it("paired primary blinding also seals the live API event stream", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "blinding-live-events", "@maya review this", 81);
