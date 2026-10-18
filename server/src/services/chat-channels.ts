@@ -32,6 +32,7 @@ import { rememberVerifiedSlackSearchEvent, slackSearchActionToken } from "./conn
 import { slackAuthorizationRevision } from "./connectors/slack-revision.js";
 import { slackPublicationAllowed } from "./connectors/slack-access.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { stageGitHubPair, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake, kickGitHubPairCapture } from "./chat-github-shadow.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
@@ -14550,7 +14551,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const receiptDeclined = (row: typeof agentWakeupRequests.$inferSelect) =>
       ["skipped", "cancelled", "failed"].includes(row.status);
     const settle = async (status: string, result: Record<string, unknown>) => {
-      const changed = await db.transaction(async (tx) => {
+      const settled = await db.transaction(async (tx) => {
         await notifyChatDeliveryWork(tx);
         const changed = await tx
           .update(chatActions)
@@ -14585,13 +14586,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
       // A durable scheduler receipt must accept the work before GitHub shows
       // it as working. This also covers acceptance after a maintenance retry.
-      if (changed && status === "processed") {
+      if (settled && status === "processed") {
         const [endpoint] = await db.select({ provider: chatEndpoints.provider })
           .from(chatEndpoints).where(and(eq(chatEndpoints.id, claimed.endpointId),
             eq(chatEndpoints.companyId, claimed.companyId)));
         if (endpoint?.provider === "github")
           await githubResponseCommentService(db, fetchImpl).tryAcknowledge(deliveryId);
       }
+      // The primary wake is now durably recorded: the exact condition the
+      // deferred sweep waits for. Start paired capture for this delivery now
+      // (fire-and-forget, never awaited); the sweep stays the fallback.
+      if (
+        settled &&
+        status === "processed" &&
+        (result.code === "inbound_wakeup_durable" ||
+          result.code === "inbound_wakeup_already_durable")
+      )
+        kickGitHubPairCapture(db, deliveryId, fetchImpl);
     };
     let request: ReturnType<typeof createDurableChatWakeupRequest> | null =
       null;
