@@ -7,7 +7,7 @@ import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession } from "../services/chat-github-tools.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
-import { chatGitHubRegistrations, chatGitHubReviews, toolCatalogEntries } from "@paperclipai/db";
+import { chatGitHubRegistrations, chatGitHubReviewCandidates, chatGitHubReviews, toolCatalogEntries, toolMcpGateways, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as cloudRuntimeIdentity from "../services/cloud-runtime-identity.js";
 import {
@@ -4559,6 +4559,81 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id, wakeCommentId: primaryComments[0]!.id } }).where(eq(heartbeatRuns.id, session.runId));
       expect(await githubBotToolsForSession(db, session)).toEqual([]);
     });
+    it("paired candidate runtime MCP assignment is granted only by the exact candidate capability", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-runtime-mcp", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const { githubCandidateReviewAssignmentForRun } = await import("../services/chat-github-tools.js");
+      const { buildPaperclipRuntimeMcpServers } = await import("../services/heartbeat.js");
+      const { resolveNativeRuntimeMcpSnapshot } = await import("../services/native-runtime/runtime-context.js");
+      const [clone] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+      const [primaryAgent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+      const toolNames = async (ids: string[]) => ids.length ? (await db.select({ toolName: toolCatalogEntries.toolName })
+        .from(toolCatalogEntries).where(inArray(toolCatalogEntries.id, ids))).map(r => r.toolName).sort() : [];
+      const reviewTools = ["begin_review", "read_file", "read_pull_request", "submit_review"];
+      // Even a clone misconfigured with connection-wide access to the bot
+      // connection gets only the four catalog entries, never comment/formal_review.
+      const [wide] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `clone-wide:${randomUUID()}`, name: "Clone wide", defaultAction: "deny" }).returning();
+      const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: wide!.id, selectorType: "connection", effect: "include",
+        applicationId: connection!.applicationId, connectionId: connection!.id });
+      await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: wide!.id, targetType: "agent", targetId: f.replacementAgentId });
+
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const grant = await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      expect(grant?.connection.id).toBe(f.endpoint.connectionId);
+      expect(await toolNames(grant!.tools.map(t => t.id))).toEqual(reviewTools);
+      expect((await githubBotToolsForSession(db, session)).map(t => t.upstreamToolName).sort()).toEqual(reviewTools);
+      const servers = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId: session.runId, apiBaseUrl: "http://127.0.0.1:3100" });
+      expect(servers).toHaveLength(1);
+      const [gatewayRow] = (await db.select().from(toolMcpGateways).where(eq(toolMcpGateways.companyId, f.companyId)))
+        .filter(g => servers[0]!.url.endsWith(`/${g.gatewayPublicId}`));
+      const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, gatewayRow!.profileId!));
+      expect(entries.every(e => e.selectorType === "catalog_entry" && e.connectionId === f.endpoint.connectionId)).toBe(true);
+      expect(await toolNames(entries.map(e => e.catalogEntryId!))).toEqual(reviewTools);
+      // The native runtime snapshot pins the same assignment the gateway realizes.
+      expect((await resolveNativeRuntimeMcpSnapshot({ db, agent: clone!, runId: session.runId })).digest)
+        .toBe(gatewayRow!.metadata?.nativeRuntimeAssignmentDigest);
+
+      const primaryComment = (await db.select({ id: issueComments.id }).from(issueComments)
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, primary.issue.id), eq(chatMessageLinks.direction, "inbound"))))[0]!;
+      const cloneRun = async (contextSnapshot: Record<string, unknown>) => (await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+        agentId: f.replacementAgentId, invocationSource: "assignment", status: "running", contextSnapshot }).returning())[0]!.id;
+      for (const runId of [
+        await cloneRun({ issueId: candidate.issue.id }), // another run of the clone, no admitted wake
+        await cloneRun({ issueId: candidate.issue.id, wakeCommentId: primaryComment.id }), // wrong conversation
+        await cloneRun({ issueId: primary.issue.id, wakeCommentId: primaryComment.id }), // primary task
+      ]) {
+        expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, runId)).toBeNull();
+        const other = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId, apiBaseUrl: "http://127.0.0.1:3100" });
+        expect(other.map(s => s.url)).not.toContain(servers[0]!.url);
+      }
+      // The primary keeps its configured (non-candidate) assignment.
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.assignedAgentId, primarySession.runId)).toBeNull();
+      expect((await buildPaperclipRuntimeMcpServers({ db, agent: primaryAgent!, runId: primarySession.runId, apiBaseUrl: "http://127.0.0.1:3100" })).map(s => s.url))
+        .not.toContain(servers[0]!.url);
+      // Catalog and endpoint state still govern the grant.
+      const grantFor = () => githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      const [quarantined] = await db.update(toolCatalogEntries).set({ quarantinedAt: new Date() })
+        .where(and(eq(toolCatalogEntries.connectionId, f.endpoint.connectionId), eq(toolCatalogEntries.toolName, "read_file"))).returning();
+      expect(await toolNames((await grantFor())!.tools.map(t => t.id))).toEqual(reviewTools.filter(t => t !== "read_file"));
+      await db.update(toolCatalogEntries).set({ quarantinedAt: null }).where(eq(toolCatalogEntries.id, quarantined!.id));
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      expect(await grantFor()).toBeNull();
+      await db.update(toolConnections).set({ enabled: true }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": false}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).toBeNull();
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": true}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).not.toBeNull();
+      // A voided candidate loses the grant.
+      await db.update(chatGitHubReviewCandidates).set({ state: "voided" }).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId)).toBeNull();
+    });
     it("paired admission enrolls authenticated automatic PR events with the same guest authority", async () => {
       const f = await pairedReviewFixture();
       await db.delete(chatIdentityLinks).where(eq(chatIdentityLinks.principalId, f.principal.id));
@@ -5366,6 +5441,55 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const [after] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
       expect(after!.normalizedEvent.githubPairingSeed).toEqual(seed);
     });
+    /**
+     * The CLI sees only the MCP config written from runtimeMcp, so drive the
+     * exact per-run gateway bearer through the real MCP protocol route (named
+     * gateway session resolution, native profile policy and candidate
+     * boundary), never a hand-built session or an agent API session.
+     */
+    async function expectCandidateRuntimeMcpReviewTools(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      gateway: Parameters<typeof import("../routes/tool-gateway.js").mcpGatewayProtocolRoutes>[0],
+      servers: Array<{ url: string; token: string }>,
+    ) {
+      expect(servers).toHaveLength(1);
+      const { mcpGatewayProtocolRoutes } = await import("../routes/tool-gateway.js");
+      const app = express();
+      app.use(express.json());
+      app.use(mcpGatewayProtocolRoutes(gateway));
+      app.use(errorHandler);
+      const server = servers[0]!;
+      const rpc = (id: number, method: string, params?: Record<string, unknown>) => request(app)
+        .post(new URL(server.url).pathname).set("Authorization", `Bearer ${server.token}`)
+        .set("Accept", "application/json, text/event-stream").send({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+      const listed = await rpc(1, "tools/list");
+      expect(listed.status).toBe(200);
+      const names: string[] = listed.body.result.tools.map((t: { name: string }) => t.name);
+      const reviewTools = names.filter(n => n.startsWith(`github-bot.${f.endpoint.id}:`));
+      // Exactly the snapshot-backed review surface: no comment/formal_review,
+      // no live GitHub, Paperclip or other connected tools.
+      expect(reviewTools.map(n => n.split(":").pop()).sort()).toEqual(["begin_review", "read_file", "read_pull_request", "submit_review"]);
+      expect(names.filter(n => !reviewTools.includes(n) && !/^paperclip_(list|read|get)_(resources|resource|prompts|prompt)$/.test(n))).toEqual([]);
+      const tool = (name: string) => reviewTools.find(n => n.endsWith(`:${name}`))!;
+      const call = async (id: number, name: string, args: Record<string, unknown>) => {
+        const res = await rpc(id, "tools/call", { name, arguments: args });
+        expect({ status: res.status, error: res.body.error ?? null }).toEqual({ status: 200, error: null });
+        return res.body.result;
+      };
+      await call(2, tool("read_pull_request"), { section: "metadata" });
+      const head = "b".repeat(40);
+      await call(3, tool("begin_review"), { reviewedCommit: head });
+      expect(JSON.stringify(await call(4, tool("submit_review"), shadowTestAssessment(head)))).toContain("shadow_stored");
+      for (const denied of [`github-bot.${f.endpoint.id}:comment`, `github-bot.${f.endpoint.id}:formal_review`, "read_pull_request"]) {
+        const res = await rpc(5, "tools/call", { name: denied, arguments: { body: "x" } });
+        expect(res.body.error?.data?.reasonCode).toBe("github_candidate_tool_denied");
+      }
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.agentId, f.replacementAgentId));
+      const [stored] = await db.select().from(chatGitHubReviews).where(and(eq(chatGitHubReviews.issueId, candidate!.issueId), eq(chatGitHubReviews.state, "completed")));
+      expect(stored).toMatchObject({ shadowLabel: "paired-meta", headSha: head, assessment: expect.objectContaining({ reviewedCommit: head, score: 2, complete: true }) });
+      // I1: capture-only. The candidate stages no outbound publication intent.
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate!.issueId))).toEqual([]);
+    }
     it.each(["certified", "disabled-at-dispatch", "contaminated", "changed-realization"] as const)(
       "paired certified heartbeat %s reaches only the permitted adapter",
       async scenario => {
@@ -5477,6 +5601,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
             expect(await gateway.executeTool({ sessionToken: sessionResponse.body.token, tool: readTool.name, parameters: { section: "metadata" } }))
               .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+            await expectCandidateRuntimeMcpReviewTools(f, gateway, input.runtimeMcp?.getServers() ?? []);
             expect(input.config.cwd).not.toBe(scratch);
             expect(existsSync(provisionMarker)).toBe(false);
           }

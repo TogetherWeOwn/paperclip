@@ -22,7 +22,7 @@ import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slac
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
-import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
+import { githubBotConnectionIdsForRun, githubCandidateReviewAssignmentForRun } from "./chat-github-tools.js";
 import { isBrowserUseConnection } from "./browser-use-client.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
@@ -4784,7 +4784,10 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .map(({ id, name }) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const githubBotConnectionIds = await githubBotConnectionIdsForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
-  const assignedConnections = resolvedInstalledConnections.filter(
+  // A dispatched paired candidate is granted by its exact capability alone:
+  // only its snapshot-backed review tools, never the clone's other access.
+  const candidateReview = await githubCandidateReviewAssignmentForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const assignedConnections = candidateReview ? [candidateReview.connection] : resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
       connection.status === "active" &&
@@ -4800,9 +4803,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
   );
-  const assignedTools = effective.allowedTools.filter((tool) =>
-    assignedConnectionIds.has(tool.connectionId),
-  );
+  const assignedTools: Array<{ id: string; connectionId: string; applicationId: string | null }> = candidateReview
+    ? candidateReview.tools
+    : effective.allowedTools.filter((tool) =>
+        assignedConnectionIds.has(tool.connectionId),
+      );
   const service = createToolGatewayService(input.db);
   if (assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -4844,7 +4849,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
 
   if (!profile) {
     const fullConnectionIds = new Set(
-      effective.entries
+      (candidateReview ? [] : effective.entries)
         .filter(
           (entry) =>
             entry.effect === "include" &&
