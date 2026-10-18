@@ -4453,6 +4453,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.assignedAgentId, primarySession.runId)).toBeNull();
       expect((await buildPaperclipRuntimeMcpServers({ db, agent: primaryAgent!, runId: primarySession.runId, apiBaseUrl: "http://127.0.0.1:3100" })).map(s => s.url))
         .not.toContain(servers[0]!.url);
+      // Catalog and endpoint state still govern the grant.
+      const grantFor = () => githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      const [quarantined] = await db.update(toolCatalogEntries).set({ quarantinedAt: new Date() })
+        .where(and(eq(toolCatalogEntries.connectionId, f.endpoint.connectionId), eq(toolCatalogEntries.toolName, "read_file"))).returning();
+      expect(await toolNames((await grantFor())!.tools.map(t => t.id))).toEqual(reviewTools.filter(t => t !== "read_file"));
+      await db.update(toolCatalogEntries).set({ quarantinedAt: null }).where(eq(toolCatalogEntries.id, quarantined!.id));
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      expect(await grantFor()).toBeNull();
+      await db.update(toolConnections).set({ enabled: true }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": false}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).toBeNull();
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": true}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).not.toBeNull();
       // A voided candidate loses the grant.
       await db.update(chatGitHubReviewCandidates).set({ state: "voided" }).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
       expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId)).toBeNull();

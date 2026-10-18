@@ -4803,7 +4803,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
   );
-  const assignedTools: Array<{ id: string; connectionId: string; applicationId: string }> = candidateReview
+  const assignedTools: Array<{ id: string; connectionId: string; applicationId: string | null }> = candidateReview
     ? candidateReview.tools
     : effective.allowedTools.filter((tool) =>
         assignedConnectionIds.has(tool.connectionId),
