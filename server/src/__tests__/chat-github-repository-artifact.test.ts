@@ -308,6 +308,28 @@ describe("repository store disk bound", () => {
     expect(existsSync(b)).toBe(false);
   });
 
+  it("never deletes a pinned artifact for age or terminal admission either", async () => {
+    const dir = root();
+    const old = artifactFile(dir, "f", 10, 24 * 8);
+    const release = pinGitHubRepositoryArtifact("f".repeat(64));
+    try {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, liveKeys: new Set() });
+      expect(existsSync(old)).toBe(true);
+    } finally { release(); }
+    await pruneGitHubRepositoryArtifactStore({ root: dir, liveKeys: new Set() });
+    expect(existsSync(old)).toBe(false);
+  });
+
+  it("serialises sweeps: a call during an in-flight sweep still applies its own cap", async () => {
+    const dir = root();
+    const file = artifactFile(dir, "9", 100, 1);
+    const first = pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 10_000 });
+    const second = pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+    expect(await first).toMatchObject({ artifacts: 0 });
+    expect(await second).toMatchObject({ artifacts: 1, artifactBytes: 100 });
+    expect(existsSync(file)).toBe(false);
+  });
+
   it("reads the cap from PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES", async () => {
     const dir = root();
     const [a, b] = [artifactFile(dir, "a", 100, 2), artifactFile(dir, "b", 100, 1)];
