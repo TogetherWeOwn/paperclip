@@ -492,6 +492,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
     let admittedAt = NaN;
     let outcome = "pair_admission_failed";
     const claimedAt = Date.now();
+    let lockedMs: number | null = null;
     try {
       const claim = await db.transaction(async tx => {
         const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, row.id)).for("update", { skipLocked: true });
@@ -551,7 +552,11 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         ? unavailable(failure ?? "admission_snapshot_interrupted")
         : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
           threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
+      // Primary wake authorization takes this endpoint lock NOWAIT; record how
+      // long admission holds it (until commit) so contention is observable.
+      let lockStartedAt: number | undefined;
       await withGitHubPrimaryBlindingAdmission(db, delivery.companyId, () => db.transaction(async tx => {
+        lockStartedAt = Date.now();
         const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, delivery.endpointId)).for("update");
         const [current] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id)).for("update");
         if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) {
@@ -563,7 +568,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...sealed,
           request: source.comment.body, policy, revision: pending.revision, authority });
         outcome = "snapshot" in sealed && sealed.snapshot ? "sealed" : sealed.snapshotFailure ?? "admission_snapshot_unavailable";
-      }));
+      }).finally(() => { if (lockStartedAt !== undefined) lockedMs = Date.now() - lockStartedAt; }));
     } catch {
       outcome = "pair_admission_failed";
       if (capture) await failGitHubPairCapture(db, row.id, capture, outcome).catch(() => undefined);
@@ -571,7 +576,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
       // One line per claimed attempt so admission->seal latency is observable.
       if (capture) logger.info({ deliveryId: row.id, trigger, outcome, attempt: capture.attempts,
         msSinceAdmission: Number.isFinite(admittedAt) ? claimedAt - admittedAt : null,
-        msSpent: Date.now() - claimedAt }, "GitHub paired snapshot capture attempt");
+        msSpent: Date.now() - claimedAt, lockedMs }, "GitHub paired snapshot capture attempt");
     }
   }
 }

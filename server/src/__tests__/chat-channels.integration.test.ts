@@ -3977,7 +3977,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const [wake] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, delivery.id), eq(chatActions.kind, "inbound_wakeup")));
       expect(wake).toMatchObject({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
       expect(attempts()).toEqual([expect.objectContaining({ deliveryId: delivery.id, trigger: "admission", outcome: "sealed", attempt: 1,
-        msSinceAdmission: expect.any(Number), msSpent: expect.any(Number) })]);
+        msSinceAdmission: expect.any(Number), msSpent: expect.any(Number), lockedMs: expect.any(Number) })]);
       expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
     });
     it.each(["hanging", "throwing", "rejecting"] as const)("K2 a %s admission kick never blocks or fails the primary path; the sweep recovers", async mode => {
