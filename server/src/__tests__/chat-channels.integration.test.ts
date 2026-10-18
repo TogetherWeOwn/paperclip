@@ -6218,6 +6218,145 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(secondAcquired).toBe(true);
       await second();
     });
+    it("paired runtime slots admit N concurrent holders on distinct keys, queue the next, and report only other live slots", async () => {
+      const isolation = await import("../services/chat-github-runtime-isolation.js");
+      const key = `fixture:${randomUUID()}`;
+      const holders = async (slot: number) => {
+        const [row] = await db.execute(sql`select count(*)::int as count from pg_locks where locktype = 'advisory' and granted
+          and classid = ((hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, slot)}, 0) >> 32) & 4294967295)::oid
+          and objid = (hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, slot)}, 0) & 4294967295)::oid`);
+        return (row as { count: number }).count;
+      };
+      const first = await isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      const second = await isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      let third: Awaited<ReturnType<typeof isolation.acquireGitHubCandidateRuntimeLease>> | undefined;
+      const thirdPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 }).then(lease => { third = lease; return lease; });
+      try {
+        expect([first.slot, second.slot].sort()).toEqual([0, 1]);
+        // Slot 0 is the original exclusive key: an N=1 controller still excludes it.
+        expect(isolation.githubCandidateRuntimeSlotKey(key, 0)).toBe(`github-shadow-runtime:${key}`);
+        expect([await holders(0), await holders(1), await holders(2)]).toEqual([1, 1, 0]);
+        expect(await first.liveSlots()).toEqual([second.slot]);
+        expect(await second.liveSlots()).toEqual([first.slot]);
+        // Holding a slot never leaves an idle transaction behind.
+        const owners = [...await db.execute(sql`select a.state, a.xact_start from pg_locks l join pg_stat_activity a on a.pid = l.pid
+          where l.locktype = 'advisory' and l.granted
+            and l.classid = ((hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, 1)}, 0) >> 32) & 4294967295)::oid
+            and l.objid = (hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, 1)}, 0) & 4294967295)::oid`)];
+        expect(owners).toMatchObject([{ state: "idle", xact_start: null }]);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        expect(third).toBeUndefined();
+      } finally { await first(); }
+      const queued = await thirdPromise;
+      expect(queued.slot).toBe(first.slot);
+      expect(await queued.liveSlots()).toEqual([second.slot]);
+      // FIFO: a later waiter blocks on the queue key while the head polls the slots.
+      let fourth: Awaited<ReturnType<typeof isolation.acquireGitHubCandidateRuntimeLease>> | undefined;
+      const headPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const fourthPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 }).then(lease => { fourth = lease; return lease; });
+      const queue = `github-shadow-runtime-queue:${key}`;
+      await vi.waitFor(async () => {
+        const rows = [...await db.execute(sql`select granted from pg_locks where locktype = 'advisory'
+          and classid = ((hashtextextended(${queue}, 0) >> 32) & 4294967295)::oid
+          and objid = (hashtextextended(${queue}, 0) & 4294967295)::oid order by granted`)];
+        expect(rows).toMatchObject([{ granted: false }, { granted: true }]);
+      }, { timeout: 3000 });
+      await second();
+      const head = await headPromise;
+      expect(head.slot).toBe(second.slot);
+      expect(fourth).toBeUndefined();
+      await queued();
+      const last = await fourthPromise;
+      expect(last.slot).toBe(queued.slot);
+      expect(await last.liveSlots()).toEqual([head.slot]);
+      await head();
+      expect(await last.liveSlots()).toEqual([]);
+      await last();
+      expect([await holders(0), await holders(1)]).toEqual([0, 0]);
+    });
+    it("two concurrent candidate preparations with N=2 hold distinct slots and homes and a third waits for a cleanup", async () => {
+      const { environments } = await import("@paperclipai/db");
+      const ssh = await import("@paperclipai/adapter-utils/ssh");
+      const isolation = await import("../services/chat-github-runtime-isolation.js");
+      const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-runtime-slots-"));
+      const canaryPath = path.join(scratch, "primary-answer");
+      writeFileSync(canaryPath, "PRIMARY_CANARY", { mode: 0o600 });
+      const certificates: unknown[] = [];
+      const candidates = [];
+      for (const label of ["a", "b", "c"]) {
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `runtime-slots-${label}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const [environment] = await db.insert(environments).values({ name: `Certified shadow SSH ${randomUUID()}`, driver: "ssh",
+          config: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/work",
+            privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true } }).returning();
+        await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { model: "configured-arm-model" }, defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+        certificates.push({ environmentId: environment!.id, companyId: f.companyId,
+          configurationDigest: isolation.githubIsolationConfigurationDigest(environment!), modelProxyPolicy: "client-tools-only-v1",
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath,
+            remotePath: `/primary/${kind}/canary`, sha256: createHash("sha256").update("PRIMARY_CANARY").digest("hex") })) });
+        candidates.push({ run: run!, agent: agent! });
+      }
+      const oldCertificates = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+      const oldConcurrency = process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT;
+      process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(certificates);
+      process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT = "2";
+      const { default: dns } = await import("node:dns/promises");
+      const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+      const probes: Array<{ home: string; slot: number; liveSlots: number[]; concurrent: boolean }> = [];
+      let bothProbing!: () => void;
+      const overlap = new Promise<void>(resolve => { bothProbing = resolve; });
+      const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+        if (command.includes(CLEANUP_PROGRAM_MARKER)) return { stdout: "", stderr: "" };
+        const input = JSON.parse(options!.stdin!);
+        probes.push({ home: input.home, slot: input.slot, liveSlots: input.liveSlots, concurrent: input.concurrent });
+        // The first two probes must overlap: neither answers until both started.
+        if (probes.length === 2) bothProbing();
+        if (probes.length <= 2) await overlap;
+        return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
+          namespaceBusy: false, orphansReclaimed: 0, checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true,
+            providerToolsDenied: true, allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
+      });
+      const prepared: Array<NonNullable<Awaited<ReturnType<typeof isolation.prepareGitHubCandidateRuntime>>>> = [];
+      try {
+        const [a, b] = await Promise.all(candidates.slice(0, 2).map(c => isolation.prepareGitHubCandidateRuntime(db, c)));
+        prepared.push(a!, b!);
+        expect(a!.home).not.toBe(b!.home);
+        expect(probes.map(p => p.home).sort()).toEqual([a!.home, b!.home].sort());
+        expect(probes.map(p => p.slot).sort()).toEqual([0, 1]);
+        expect(probes.every(p => p.concurrent === true)).toBe(true);
+        let thirdPrepared = false;
+        const third = isolation.prepareGitHubCandidateRuntime(db, candidates[2]!).then(value => { thirdPrepared = true; prepared.push(value!); return value!; });
+        await new Promise(resolve => setTimeout(resolve, 800));
+        // Both slots stay held from probe through the run: no third probe yet.
+        expect(thirdPrepared).toBe(false);
+        expect(probes).toHaveLength(2);
+        const freed = probes.find(p => p.home === a!.home)!.slot;
+        await isolation.cleanupGitHubCandidateRuntime(prepared.shift()!);
+        const c = await third;
+        expect(probes).toHaveLength(3);
+        // The waiter takes the freed slot and is told the other one is live.
+        expect(probes[2]).toMatchObject({ home: c.home, slot: freed, liveSlots: [1 - freed], concurrent: true });
+        expect(new Set([a!.home, b!.home, c.home]).size).toBe(3);
+        const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.id, c.enrollmentId));
+        expect(enrollment!.isolationTests[c.runId]).toMatchObject({ status: "passed", runtimeSlot: freed, runtimeMaxConcurrent: 2 });
+      } finally {
+        for (const p of prepared) await isolation.cleanupGitHubCandidateRuntime(p).catch(() => undefined);
+        probe.mockRestore();
+        dnsProbe.mockRestore();
+        if (oldCertificates === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = oldCertificates;
+        if (oldConcurrency === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT = oldConcurrency;
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    });
     it.each(["certified", "uncertified", "wrong-environment", "contaminated", "transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "namespace-busy", "disabled", "disabled-after-probe",
       "allowed-model-rejected", "other-model-accepted", "raw-proxy-open"] as const)(
       "paired certified runtime %s gates dispatch independently of the primary",
@@ -6298,6 +6437,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               expect(probe).not.toHaveBeenCalled();
             } finally { await releaseBlocker(); prepared = await preparation; }
             expect(prepared).not.toBeNull();
+            // Default N=1: slot 0 on the original key and the exclusive probe semantics.
+            expect(JSON.parse(probe.mock.calls.find(([, command]) => !command.includes(CLEANUP_PROGRAM_MARKER))![2]!.stdin!))
+              .toMatchObject({ slot: 0, liveSlots: [], concurrent: false });
             await isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target);
             await expect(isolation.assertGitHubCandidateDispatch(db, { ...prepared!, runId: randomUUID() }, prepared!.target)).rejects.toThrow("github_candidate_isolation_unavailable");
             dispatch();
@@ -6338,7 +6480,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             const [unavailable] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
             expect(unavailable).toMatchObject({ state: "unavailable", lastError: "github_candidate_isolation_error" });
           } else expect(receipt).toBeUndefined();
-          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true, orphansReclaimed: 2 });
+          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true, orphansReclaimed: 2, runtimeSlot: 0, runtimeMaxConcurrent: 1 });
           if (receipt) {
             await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: {} })
               .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();

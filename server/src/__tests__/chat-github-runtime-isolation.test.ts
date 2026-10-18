@@ -12,6 +12,8 @@ import {
   githubIsolationConfigurationDigest,
   githubCandidateAdapterConfig,
   githubCandidateProbeModel,
+  githubCandidateRuntimeSlotKey,
+  githubShadowMaxConcurrent,
   type PreparedGitHubCandidateRuntime,
 } from "../services/chat-github-runtime-isolation.js";
 
@@ -304,12 +306,13 @@ urllib.request.urlopen = proxy
       input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: join(parent, "fresh"), canaries: [], githubAddresses: ["192.0.2.1"] }),
       encoding: "utf8", timeout: 5000,
     }));
-    function crashedHome(name: string, { dirAge = old, ownerAge = old }: { dirAge?: number; ownerAge?: number } = {}) {
+    function crashedHome(name: string, { dirAge = old, ownerAge = old, slot }: { dirAge?: number; ownerAge?: number; slot?: number } = {}) {
       const home = join(parent, name);
       mkdirSync(join(home, "workspace"), { recursive: true });
       writeFileSync(join(home, "workspace", "answer.txt"), "stale checkout");
       symlinkSync(outside, join(home, "workspace", "escape"));
       writeFileSync(join(home, ".probe-owner"), "crashed-nonce");
+      if (slot !== undefined) writeFileSync(join(home, ".probe-slot"), String(slot));
       utimesSync(join(home, ".probe-owner"), ownerAge, ownerAge);
       utimesSync(home, dirAge, dirAge);
       return home;
@@ -359,6 +362,91 @@ urllib.request.urlopen = proxy
       expect(lstatSync(join(parent, "linked-young")).isSymbolicLink()).toBe(true);
       outsideIntact();
     });
+    describe("concurrent runtime slots (temp parent, rmtree/unlink only record)", () => {
+      // listdir/lstat/open run on the temp parent only; rmtree and unlink are
+      // recorders and remove/rmdir raise, so even a broken live-slot guard can
+      // delete nothing, and ISOLATED_PARENT is rebound to the temp parent as above.
+      const recordingProbe = (input: Record<string, unknown>) => {
+        const recorders = `import shutil
+removed = []
+def forbidden(*args, **kwargs): raise AssertionError("unexpected destructive call: " + repr(args))
+shutil.rmtree = lambda path, *args, **kwargs: removed.append(["rmtree", path])
+os.unlink = lambda path, *args, **kwargs: removed.append(["unlink", path])
+os.remove = os.rmdir = forbidden
+`;
+        expect(parent.startsWith(tmpdir())).toBe(true);
+        const [proofLine, removedLine] = execFileSync("python3", ["-c", `${fixture}${recorders}${probeUnder(parent)}\nprint(json.dumps(removed))`], {
+          input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: join(parent, "fresh"), canaries: [], githubAddresses: ["192.0.2.1"], ...input }),
+          encoding: "utf8", timeout: 5000,
+        }).trim().split("\n");
+        return { proof: JSON.parse(proofLine!), removed: (JSON.parse(removedLine!) as string[][]).sort() };
+      };
+      const now = () => Date.now() / 1000;
+      it("a live sibling is not namespaceBusy, not stale config and not reclaimed; this home records its slot", () => {
+        setup();
+        const sibling = crashedHome("live-young", { dirAge: now(), ownerAge: now(), slot: 1 });
+        const { proof, removed } = recordingProbe({ concurrent: true, slot: 0, liveSlots: [1] });
+        expect(proof).toMatchObject({ namespaceBusy: false, orphansReclaimed: 0, checks: { configFresh: true } });
+        expect(removed).toEqual([]);
+        expect(readFileSync(join(parent, "fresh", ".probe-slot"), "utf8")).toBe("0");
+        expect(readFileSync(join(sibling, "workspace", "answer.txt"), "utf8")).toBe("stale checkout");
+        outsideIntact();
+      });
+      it("never reclaims a live slot's home however idle; reclaims idle orphans whose slot is not live", () => {
+        setup();
+        crashedHome("live-old", { slot: 1 });
+        crashedHome("orphan-other-slot", { slot: 2 });
+        // A crashed home of this run's own slot cannot be live: the slot is ours.
+        crashedHome("orphan-own-slot", { slot: 0 });
+        crashedHome("orphan-pre-slot");
+        const { proof, removed } = recordingProbe({ concurrent: true, slot: 0, liveSlots: [1] });
+        expect(proof).toMatchObject({ namespaceBusy: false, orphansReclaimed: 3, checks: { configFresh: true } });
+        expect(removed).toEqual(["orphan-other-slot", "orphan-own-slot", "orphan-pre-slot"].map(name => ["rmtree", join(parent, name)]));
+        outsideIntact();
+      });
+      it("exclusive (N=1) still keeps any remaining sibling namespaceBusy and also spares a live slot's home", () => {
+        setup();
+        crashedHome("live-old", { slot: 1 });
+        crashedHome("orphan-old", { slot: 2 });
+        const { proof, removed } = recordingProbe({ slot: 0, liveSlots: [1] });
+        expect(proof).toMatchObject({ namespaceBusy: true, checks: { configFresh: false } });
+        expect(removed).toEqual([["rmtree", join(parent, "orphan-old")]]);
+        expect(existsSync(join(parent, "fresh"))).toBe(false);
+      });
+      it.each(["directory", "symlink"])("namespaceBusy when THIS run's home already exists as a %s", kind => {
+        setup();
+        if (kind === "directory") mkdirSync(join(parent, "fresh"));
+        else symlinkSync(outside, join(parent, "fresh"));
+        const { proof, removed } = recordingProbe({ concurrent: true, slot: 0, liveSlots: [] });
+        expect(proof).toMatchObject({ namespaceBusy: true, orphansReclaimed: 0, checks: { configFresh: false } });
+        expect(removed).toEqual([]);
+        outsideIntact();
+      });
+      it.each(["symlink", "fifo"])("a %s .probe-slot is no slot: the idle home is an orphan and reclaim never blocks", kind => {
+        setup();
+        const home = crashedHome("forged-marker");
+        writeFileSync(join(outside, "slot"), "1");
+        if (kind === "symlink") symlinkSync(join(outside, "slot"), join(home, ".probe-slot"));
+        else execFileSync("mkfifo", [join(home, ".probe-slot")]);
+        utimesSync(home, old, old);
+        const { proof, removed } = recordingProbe({ concurrent: true, slot: 0, liveSlots: [1] });
+        expect(proof).toMatchObject({ namespaceBusy: false, orphansReclaimed: 1 });
+        expect(removed).toEqual([["rmtree", home]]);
+        outsideIntact();
+      });
+    });
+  });
+  it.each([["", 1], ["0", 1], ["1", 1], [" 4 ", 4], ["8", 8], ["9", 8], ["1000", 8], ["-2", 1], ["2.5", 1], ["4x", 1], ["0x4", 1]] as const)(
+    "PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT %j clamps to %i", (raw, expected) => {
+      expect(githubShadowMaxConcurrent(raw)).toBe(expected);
+    });
+  it("defaults to one serial slot whose lease key is the original exclusive key", () => {
+    vi.stubEnv("PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT", undefined);
+    expect(githubShadowMaxConcurrent()).toBe(1);
+    vi.stubEnv("PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT", "3");
+    expect(githubShadowMaxConcurrent()).toBe(3);
+    expect(githubCandidateRuntimeSlotKey("host:22:paperclip-shadow", 0)).toBe("github-shadow-runtime:host:22:paperclip-shadow");
+    expect(githubCandidateRuntimeSlotKey("host:22:paperclip-shadow", 3)).toBe("github-shadow-runtime:host:22:paperclip-shadow:3");
   });
   it.each(["mine", "another-attempt", "missing", "symlink"])("cleanup only removes the nonce-owned home: %s", owner => {
     const fixture = `import builtins, io, json, os, shutil, sys

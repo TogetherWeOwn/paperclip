@@ -291,6 +291,28 @@ Deferred capture failures and denominator accounting
   candidates do not exhaust the primary pool. Use one canonical host name for all
   environments on the same host. Orphan/sibling HOME is availability failure, not
   evidence that a review read primary answers; preserve its error denominator.
+  Concurrency: PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT (integer, clamped to 1..8,
+  absent/malformed = 1) sets N runtime slots per principal. Slot 0 keeps the
+  original key github-shadow-runtime:<host>:<port>:<user>; slot k>0 appends :k.
+  N=1 is the original exclusive lease (one blocking lock, any sibling HOME left
+  after reclaim is namespaceBusy). N>1: waiters queue FIFO on
+  github-shadow-runtime-queue:<principal> and only the head polls the slots
+  with pg_try_advisory_lock and backoff; namespaceBusy means only that this
+  run's own HOME exists. Each HOME records its slot in .probe-slot; the probe
+  is sent the slots other sessions hold right now and reclaims a HOME only if it
+  is idle for the orphan age AND its slot is not live. Receipts record
+  runtimeSlot and runtimeMaxConcurrent.
+  Why concurrency stays fair: every run gets a fresh HOME of its own
+  arm/head/run namespace holding only sealed inputs plus that candidate's own
+  work. With one candidate arm per principal, siblings are that arm's other
+  in-flight runs (arm-local history, which I4 allows), never primary output.
+  Primary blinding, the per-UID egress firewall,
+  the model filter proxy and the canary checks are unchanged, and every run
+  still passes its own probe. A candidate CAN read or write a concurrent
+  sibling's HOME (same UID), so before raising N for several arms or companies
+  on one principal, confirm no arm may see another's in-flight work.
+  To enable: set PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT in server.env, restart,
+  then raise the candidate agent's maxConcurrentRuns to match.
   The kill switch and certificate are rechecked after setup at adapter dispatch.
   Each receipt also binds the complete certificate digest, including canary path
   mappings and hashes; replacing a grant invalidates an in-flight preparation.
