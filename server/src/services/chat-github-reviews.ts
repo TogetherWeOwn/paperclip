@@ -383,6 +383,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     source: Awaited<ReturnType<typeof scope>>,
     pull: Pull,
   ) {
+    const inputSource = source.enrollment?.envelope.snapshot ? "snapshot" as const : "live" as const;
     const [prior] = await db
       .select()
       .from(chatGitHubReviews)
@@ -401,7 +402,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     if (prior && !prior.runId && prior.deliveryId === source.delivery.id) {
       const [claimed] = await db
         .update(chatGitHubReviews)
-        .set({ runId: source.run.id, state: "running", updatedAt: new Date() })
+        .set({ runId: source.run.id, state: "running", event: { ...prior.event, inputSource }, updatedAt: new Date() })
         .where(
           and(
             eq(chatGitHubReviews.id, prior.id),
@@ -472,7 +473,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         configurationRevision:
           source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
         policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,
-        event: context,
+        event: { ...context, inputSource },
         state: "running",
         shadowLabel: source.shadowLabel,
       })

@@ -4939,13 +4939,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
           expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed",
             hooksDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
-            comparisonEligibility: { certifiedClean: scenario !== "contaminated", reasons: scenario === "contaminated" ? ["candidate_isolation_self_test_failed"] : [] },
+            // This primary ran before capture and has no sealed-input receipt.
+            comparisonEligibility: { certifiedClean: false, reasons: scenario === "contaminated"
+              ? ["candidate_isolation_self_test_failed", "primary_inputs_not_sealed"] : ["primary_inputs_not_sealed"] },
           });
           if (scenario === "certified") {
             const { githubRunCapability } = await import("../services/chat-github-shadow.js");
             const capability = await githubRunCapability(db, { companyId: f.companyId, agentId: f.replacementAgentId,
               issueId: runs[0]!.contextSnapshot!.issueId as string, runId: runs[0]!.id });
-            expect(capability?.enrollment?.envelope.comparisonEligibility).toEqual({ certifiedClean: true, reasons: [] });
+            expect(capability?.enrollment?.envelope.comparisonEligibility)
+              .toEqual({ certifiedClean: false, reasons: ["primary_inputs_not_sealed"] });
           }
           expect(existsSync(provisionMarker)).toBe(false);
           expect(probe.mock.calls.filter(([, command]) => command.includes("shutil.rmtree"))).toHaveLength(1);
@@ -5091,6 +5094,47 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const primary = (await pairedTasks(f.endpoint.id))[0]!;
       const session = await shadowTestSession(f, { issueId: primary.issue.id });
       expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
+    });
+    it("keeps a primary started before seed admission live for its whole run and excludes the pair", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "primary-source-stability", "@maya review this", 81);
+      const session = await shadowTestSession(f, { issueId: primary.issueId });
+      // A genuine earlier primary review makes a live-to-frozen history switch
+      // observable: first-round snapshots deliberately have no previous history.
+      const config = await f.management.configuration(f.endpoint.id, "owner-user");
+      await db.insert(chatGitHubReviews).values({ companyId: f.companyId, endpointId: f.endpoint.id,
+        issueId: primary.issueId, repositoryId: "97531", repository: "paperclipai/paperclip", pullNumber: 81,
+        headSha: "a".repeat(40), deliveryId: randomUUID(), configurationRevision: config.revision,
+        policySnapshot: config.configuration.defaults, event: {} as never, state: "completed",
+        assessment: shadowTestAssessment("a".repeat(40)) });
+      const service = githubChatReviewService(db, f.providerFetch);
+      const beforeRecorder = installShadowRecorder(f, head);
+      const before = await service.execute(session, "read_pull_request", { section: "metadata" });
+      expect(before).toMatchObject({ previousAssessment: { reviewedCommit: "a".repeat(40) } });
+      expect(beforeRecorder.fetches.filter(r => r.url.endsWith("/pulls/81"))).toHaveLength(1);
+      await f.service.processPendingDeliveries(); // The seed lands between calls.
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.previousAssessments?.primary).toBeNull();
+      const afterRecorder = installShadowRecorder(f, head);
+      expect(await service.execute(session, "read_pull_request", { section: "metadata" })).toEqual(before);
+      expect(afterRecorder.fetches.filter(r => r.url.endsWith("/pulls/81"))).toHaveLength(1);
+      expect(await githubRunCapability(db, session)).toMatchObject({ enrollment: null });
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      const [review] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, session.runId));
+      expect(review!.event).toMatchObject({ inputSource: "live" });
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect((await githubRunCapability(db, candidateSession))?.enrollment?.envelope.comparisonEligibility)
+        .toMatchObject({ certifiedClean: false, reasons: expect.arrayContaining(["primary_inputs_not_sealed"]) });
+      // Later primary runs may use the sealed source from their very first call.
+      const laterSession = await shadowTestSession(f, { issueId: primary.issueId });
+      expect((await githubRunCapability(db, laterSession))?.enrollment?.id).toBe(enrollment!.id);
+      await service.execute(laterSession, "begin_review", { reviewedCommit: head });
+      const [laterReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, laterSession.runId));
+      expect(laterReview!.event).toMatchObject({ inputSource: "snapshot" });
     });
     it("sampled primary task comment and wake commit before a never-resolving candidate snapshot fetch", async () => {
       const f = await pairedReviewFixture();
