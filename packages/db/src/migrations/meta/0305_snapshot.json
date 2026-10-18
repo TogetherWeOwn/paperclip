@@ -1,6 +1,6 @@
 {
-  "id": "0fcc72e5-57e6-48f2-b8dd-f89c8b7b9765",
-  "prevId": "721c373b-9400-4c75-a94a-d5a443822620",
+  "id": "721c373b-9400-4c75-a94a-d5a443822620",
+  "prevId": "3837a61d-b338-4aad-942a-b14acc5ca775",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -7145,56 +7145,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_deliveries_pair_seed_idx": {
-          "name": "chat_deliveries_pair_seed_idx",
-          "columns": [
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_deliveries\".\"normalized_event\" ? 'githubPairingSeed'",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_deliveries_pair_round_idx": {
-          "name": "chat_deliveries_pair_round_idx",
-          "columns": [
-            {
-              "expression": "endpoint_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(coalesce(\"normalized_event\"->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', \"normalized_event\"->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId'))",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(coalesce(\"normalized_event\"->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', \"normalized_event\"->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber'))",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "((\"normalized_event\"->'githubPairingSeed'->>'roundOrdinal')::integer)",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_deliveries\".\"normalized_event\" ? 'githubPairingSeed'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -25868,6 +25818,27 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
               "nulls": "last"
             }
           ],

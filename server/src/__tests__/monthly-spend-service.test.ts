@@ -53,28 +53,8 @@ describe("monthly spend hydration", () => {
   });
 
   it("recomputes agent spentMonthlyCents from the current utc month instead of returning stale stored values", async () => {
+    // getById selects the agent, walks reportsTo ancestors (none here), then hydrates spend.
     const dbStub = createSelectSequenceDb([
-      [{
-        id: "agent-1",
-        companyId: "company-1",
-        name: "Budget Agent",
-        role: "general",
-        title: null,
-        reportsTo: null,
-        capabilities: null,
-        adapterType: "claude-local",
-        adapterConfig: {},
-        runtimeConfig: {},
-        budgetMonthlyCents: 5000,
-        spentMonthlyCents: 999999,
-        metadata: null,
-        permissions: null,
-        status: "idle",
-        pauseReason: null,
-        pausedAt: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      }],
       [{
         id: "agent-1",
         companyId: "company-1",

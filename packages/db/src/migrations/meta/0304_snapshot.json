@@ -1,6 +1,6 @@
 {
-  "id": "721c373b-9400-4c75-a94a-d5a443822620",
-  "prevId": "3837a61d-b338-4aad-942a-b14acc5ca775",
+  "id": "3837a61d-b338-4aad-942a-b14acc5ca775",
+  "prevId": "4f98ddbb-88d4-46da-9ba7-e225556741fb",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10712,72 +10712,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_github_reviews_capture_issue_idx": {
-          "name": "chat_github_reviews_capture_issue_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "issue_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_github_reviews\".\"shadow_label\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_github_reviews_capture_run_idx": {
-          "name": "chat_github_reviews_capture_run_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "run_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_github_reviews\".\"shadow_label\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_github_reviews_capture_delivery_idx": {
-          "name": "chat_github_reviews_capture_delivery_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "delivery_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_github_reviews\".\"shadow_label\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -25818,6 +25752,27 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
               "nulls": "last"
             }
           ],

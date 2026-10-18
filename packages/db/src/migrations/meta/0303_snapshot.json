@@ -1,6 +1,6 @@
 {
-  "id": "3837a61d-b338-4aad-942a-b14acc5ca775",
-  "prevId": "4f98ddbb-88d4-46da-9ba7-e225556741fb",
+  "id": "4f98ddbb-88d4-46da-9ba7-e225556741fb",
+  "prevId": "b6477d67-9629-4152-900e-f24a4cc11d54",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -9843,7 +9843,7 @@
         },
         "chat_github_candidates_state_check": {
           "name": "chat_github_candidates_state_check",
-          "value": "\"chat_github_review_candidates\".\"state\" in ('pending', 'materialized', 'dispatched', 'unavailable', 'voided')"
+          "value": "\"chat_github_review_candidates\".\"state\" in ('pending', 'materialized', 'dispatched', 'unavailable')"
         }
       },
       "isRLSEnabled": false
@@ -9942,13 +9942,6 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true
-        },
-        "isolation_tests": {
-          "name": "isolation_tests",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'::jsonb"
         },
         "admitted_at": {
           "name": "admitted_at",
@@ -25752,6 +25745,27 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
               "nulls": "last"
             }
           ],

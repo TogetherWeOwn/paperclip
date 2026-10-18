@@ -1,6 +1,6 @@
 {
-  "id": "f034fa04-213e-4a2d-b449-3717ded7d891",
-  "prevId": "0fcc72e5-57e6-48f2-b8dd-f89c8b7b9765",
+  "id": "0fcc72e5-57e6-48f2-b8dd-f89c8b7b9765",
+  "prevId": "721c373b-9400-4c75-a94a-d5a443822620",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -3515,34 +3515,6 @@
             }
           ],
           "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "assets_company_agent_visibility_idx": {
-          "name": "assets_company_agent_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "created_by_agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"assets\".\"created_by_agent_id\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -20590,34 +20562,6 @@
           "concurrently": false,
           "method": "gin",
           "with": {}
-        },
-        "documents_company_agent_visibility_idx": {
-          "name": "documents_company_agent_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "created_by_agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"documents\".\"created_by_agent_id\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
         }
       },
       "foreignKeys": {
@@ -22419,7 +22363,7 @@
           "name": "opened_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "default": "now()"
         },
         "closed_at": {
@@ -25932,6 +25876,27 @@
           "method": "btree",
           "with": {}
         },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "heartbeat_runs_company_ctx_issue_created_idx": {
           "name": "heartbeat_runs_company_ctx_issue_created_idx",
           "columns": [
@@ -26009,89 +25974,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "heartbeat_runs_company_agent_visibility_idx": {
-          "name": "heartbeat_runs_company_agent_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "heartbeat_runs_company_legacy_issue_visibility_idx": {
-          "name": "heartbeat_runs_company_legacy_issue_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(\"context_snapshot\" ->> 'issueId')",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"heartbeat_runs\".\"native_issue_id\" is null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "heartbeat_runs_company_legacy_task_visibility_idx": {
-          "name": "heartbeat_runs_company_legacy_task_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(\"context_snapshot\" ->> 'taskId')",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"heartbeat_runs\".\"native_issue_id\" is null and \"heartbeat_runs\".\"context_snapshot\"->>'issueId' is null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -28228,34 +28110,6 @@
           "isUnique": false,
           "concurrently": false,
           "method": "gin",
-          "with": {}
-        },
-        "issue_comments_company_agent_visibility_idx": {
-          "name": "issue_comments_company_agent_visibility_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "author_agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"issue_comments\".\"author_agent_id\" is not null",
-          "concurrently": false,
-          "method": "btree",
           "with": {}
         }
       },

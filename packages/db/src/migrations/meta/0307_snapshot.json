@@ -1,6 +1,6 @@
 {
-  "id": "c54ef050-126c-4048-be4f-a90a1dc484c8",
-  "prevId": "f034fa04-213e-4a2d-b449-3717ded7d891",
+  "id": "f034fa04-213e-4a2d-b449-3717ded7d891",
+  "prevId": "0fcc72e5-57e6-48f2-b8dd-f89c8b7b9765",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -7177,28 +7177,6 @@
           "method": "btree",
           "with": {}
         },
-        "chat_deliveries_pair_pending_idx": {
-          "name": "chat_deliveries_pair_pending_idx",
-          "columns": [
-            {
-              "expression": "received_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_deliveries\".\"normalized_event\" ? 'githubPairingPending' and not (\"chat_deliveries\".\"normalized_event\" ? 'githubPairingSeed')",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
         "chat_deliveries_pair_seed_idx": {
           "name": "chat_deliveries_pair_seed_idx",
           "columns": [
@@ -10645,12 +10623,6 @@
           "primaryKey": false,
           "notNull": true
         },
-        "admission_delivery_id": {
-          "name": "admission_delivery_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
         "configuration_revision": {
           "name": "configuration_revision",
           "type": "integer",
@@ -10758,28 +10730,6 @@
             }
           ],
           "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_github_reviews_admission_idx": {
-          "name": "chat_github_reviews_admission_idx",
-          "columns": [
-            {
-              "expression": "endpoint_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "admission_delivery_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"chat_github_reviews\".\"shadow_label\" is null and \"chat_github_reviews\".\"admission_delivery_id\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -25974,6 +25924,27 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
               "nulls": "last"
             }
           ],

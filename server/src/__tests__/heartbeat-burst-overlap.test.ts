@@ -281,7 +281,10 @@ describeEmbeddedPostgres("heartbeat burst overlap (TOG-28460)", () => {
       }
 
       // Exactly CAP running and the rest queued: no burst overrun even with
-      // overlapping schedulers.
+      // overlapping schedulers. 30 s ceiling: six overlapping wakes each run
+      // DB transactions plus adapter setup, and a loaded CI shard can need
+      // more than 10 s to settle into the exact capped state. Polls every
+      // 50 ms, so healthy runs settle just as fast.
       const burstCapped = await waitForCondition(async () => {
         const rows = await db
           .select({ status: heartbeatRuns.status })
@@ -290,7 +293,7 @@ describeEmbeddedPostgres("heartbeat burst overlap (TOG-28460)", () => {
         const running = rows.filter((run) => run.status === "running").length;
         const queued = rows.filter((run) => run.status === "queued").length;
         return rows.length === BURST && running === CAP && queued === BURST - CAP;
-      }, 10_000);
+      }, 30_000);
       expect(burstCapped).toBe(true);
 
       // Release the blocked executions: every burst run drains and the cap

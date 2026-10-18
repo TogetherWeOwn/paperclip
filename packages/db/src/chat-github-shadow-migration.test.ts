@@ -32,7 +32,7 @@ suite("GitHub shadow arm forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const migrationTag = "0296_new_sunspot";
+      const migrationTag = "0297_new_sunspot";
       const index = journal.entries.findIndex((entry) => entry.tag === migrationTag);
       expect(index).toBeGreaterThan(0);
       const apply = async (tag: string) => {
@@ -64,7 +64,7 @@ suite("GitHub shadow arm forward migration", () => {
       const [issue] = await db.insert(issues).values({ companyId, title: "Pre-upgrade review" }).returning();
       for (const shadowLabel of [null, "old-shadow"]) {
         // Seed the historical schema explicitly: today's Drizzle INSERT also
-        // names admission_delivery_id, which is only introduced by 0307.
+        // names admission_delivery_id, which is only introduced by 0308.
         await legacy`insert into chat_github_reviews (company_id, endpoint_id, issue_id, repository_id,
           repository, pull_number, head_sha, delivery_id, configuration_revision, policy_snapshot, event, shadow_label)
           values (${companyId}::uuid, ${endpointId}::uuid, ${issue.id}::uuid, '1', 'example/repo', 1,

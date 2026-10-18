@@ -50,7 +50,7 @@ suite("paired review admission history plans", () => {
           and r.assessment is not null and r.updated_at <= now()
         order by e.round_ordinal desc, r.created_at desc limit 1`))[0]!["QUERY PLAN"];
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8"));
-      const entry = journal.entries.find((e: { tag: string }) => e.tag === "0307_overrated_lightspeed");
+      const entry = journal.entries.find((e: { tag: string }) => e.tag === "0308_overrated_lightspeed");
       expect(entry).toBeDefined();
       await client.unsafe(await readFile(new URL(`./migrations/${entry.tag}.sql`, import.meta.url), "utf8"));
       expect((await client`select count(*)::int as n from chat_github_reviews where admission_delivery_id is not null`)[0]!.n).toBe(100000);

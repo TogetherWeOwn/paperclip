@@ -1,6 +1,6 @@
 {
-  "id": "db56c57a-403e-4823-b853-d1fb24fd1006",
-  "prevId": "c54ef050-126c-4048-be4f-a90a1dc484c8",
+  "id": "c54ef050-126c-4048-be4f-a90a1dc484c8",
+  "prevId": "f034fa04-213e-4a2d-b449-3717ded7d891",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -6494,27 +6494,6 @@
             }
           ],
           "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_actions_delivery_kind_idx": {
-          "name": "chat_actions_delivery_kind_idx",
-          "columns": [
-            {
-              "expression": "delivery_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "kind",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -25995,6 +25974,27 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_updated_at_id_idx": {
+          "name": "heartbeat_runs_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
               "nulls": "last"
             }
           ],

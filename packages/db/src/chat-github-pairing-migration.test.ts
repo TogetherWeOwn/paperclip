@@ -23,7 +23,7 @@ suite("GitHub pairing forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const tag = "0299_green_kingpin";
+      const tag = "0300_green_kingpin";
       const index = journal.entries.findIndex(entry => entry.tag === tag);
       expect(index).toBeGreaterThan(0);
       const apply = async (name: string) => {

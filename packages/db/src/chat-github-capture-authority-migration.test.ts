@@ -23,7 +23,7 @@ suite("GitHub capture authority forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const tag = "0297_steep_patriot";
+      const tag = "0298_steep_patriot";
       const index = journal.entries.findIndex((entry) => entry.tag === tag);
       expect(index).toBeGreaterThan(0);
       const apply = async (name: string) => {
