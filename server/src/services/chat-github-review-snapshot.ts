@@ -5,6 +5,8 @@ import type { GitHubReviewInputSnapshot } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
 import { githubShadowSnapshotBudgetMs } from "./chat-github-shadow-timing.js";
 
+export const GITHUB_SNAPSHOT_MAX_SWEEPS = 6;
+
 export type GitHubReviewReader = {
   request<T>(path: string, options?: { method?: string; body?: unknown; accept?: string }): Promise<T>;
 };
@@ -18,8 +20,8 @@ export function githubSnapshotDigest(value: unknown): string {
 
 /** Capture is bounded, before the candidate wake, and never retried after its admission.
  * Primary admission and waking do not wait for candidate snapshot capture.
- * GitHub has no atomic multi-resource revision. Two identical sweeps detect
- * observed concurrent changes, not a claim of provider serializability. */
+ * GitHub has no atomic multi-resource revision. Two consecutive identical sweeps
+ * detect observed concurrent changes, not a claim of provider serializability. */
 export async function captureGitHubReviewSnapshot(
   api: GitHubReviewReader, event: GitHubReviewEventContext,
   bot?: { login: string; appId: string },
@@ -98,9 +100,18 @@ export async function captureGitHubReviewSnapshot(
       total: Object.values(byRoute).reduce((sum, n) => sum + n, 0), byRoute, botLogin: bot.login, appId: bot.appId,
     } } : {}) };
   };
-  const first = await sweep();
-  const second = await sweep();
-  if (githubSnapshotDigest(first) !== githubSnapshotDigest(second)) throw conflict("snapshot_capture_mutated");
+  // Third-party PR bots comment within seconds of a PR opening. The seal is the
+  // first two consecutive identical sweeps, bounded by the read budget and
+  // GITHUB_SNAPSHOT_MAX_SWEEPS. Primary-bot artifacts are redacted on every
+  // sweep, and a seal that lands after the primary's first live read cannot
+  // upgrade its live-input receipt, so a late seal never certifies a pair.
+  let first = await sweep();
+  for (let sweeps = 2; ; sweeps++) {
+    const next = await sweep();
+    if (githubSnapshotDigest(first) === githubSnapshotDigest(next)) break;
+    if (sweeps >= GITHUB_SNAPSHOT_MAX_SWEEPS) throw conflict("snapshot_capture_mutated");
+    first = next;
+  }
   const checkout = repositoryFailure ? { repositoryFailure } : {};
   const sealed = { version: 2 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first, ...checkout };
   // PostgreSQL jsonb rejects NUL and lone surrogates in decoded strings. Keep

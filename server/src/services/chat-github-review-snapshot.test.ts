@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { captureGitHubReviewSnapshot, githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
+import { captureGitHubReviewSnapshot, GITHUB_SNAPSHOT_MAX_SWEEPS, githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
 
 const head = "b".repeat(40), base = "a".repeat(40), mergeBase = "e".repeat(40);
@@ -20,10 +20,31 @@ function provider(overrides: (path: string) => unknown = () => undefined): GitHu
 }
 
 describe("sealed GitHub review snapshot", () => {
-  it("rejects edits during capture rather than pretending an old created_at pins bytes", async () => {
+  it("rejects inputs that never settle rather than pretending an old created_at pins bytes", async () => {
     let calls = 0;
     await expect(captureGitHubReviewSnapshot(provider(path => path.includes("/issues/7/comments?")
-      ? [{ created_at: "2000-01-01", body: ++calls === 1 ? "old" : "PRIMARY_CANARY" }] : undefined), event)).rejects.toThrow("mutated");
+      ? [{ created_at: "2000-01-01", body: `edit-${++calls}` }] : undefined), event)).rejects.toThrow("mutated");
+    expect(calls).toBe(GITHUB_SNAPSHOT_MAX_SWEEPS);
+  });
+  it("re-sweeps a concurrent third-party comment and seals two consecutive identical sweeps", async () => {
+    let calls = 0;
+    const snapshot = await captureGitHubReviewSnapshot(provider(path => path.includes("/issues/7/comments?")
+      ? ++calls === 1 ? [] : [{ user: { login: "sourcery-ai[bot]" }, body: "summary" }] : undefined), event);
+    expect(calls).toBe(3);
+    const reader = githubSnapshotReader(snapshot, expected, vi.fn());
+    expect(await reader.request("/issues/7/comments?per_page=100&page=1")).toEqual([{ user: { login: "sourcery-ai[bot]" }, body: "summary" }]);
+  });
+  it("keeps primary-bot output redacted when it appears between sweeps", async () => {
+    let calls = 0;
+    const snapshot = await captureGitHubReviewSnapshot(provider(path => path.includes("/issues/7/comments?")
+      ? ++calls === 1 ? [{ user: { login: "human" }, body: "keep" }]
+        : [{ user: { login: "human" }, body: "keep" }, { user: { login: "maya[bot]" }, body: "PRIMARY_CANARY" }]
+      : undefined), event, { login: "maya[bot]", appId: "123" });
+    expect(calls).toBe(3);
+    expect(snapshot.redactions?.total).toBe(1);
+    expect(Object.values(snapshot.responses).map(value => Buffer.from(String(value), "base64").toString("utf8")).join("")).not.toContain("PRIMARY_CANARY");
+    const reader = githubSnapshotReader(snapshot, expected, vi.fn());
+    expect(await reader.request("/issues/7/comments?per_page=100&page=1")).toEqual([{ user: { login: "human" }, body: "keep" }]);
   });
   it("rejects head changes and truncated inventories", async () => {
     await expect(captureGitHubReviewSnapshot(provider(path => path === "/pulls/7"

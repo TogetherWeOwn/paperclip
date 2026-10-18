@@ -167,9 +167,12 @@ export async function prepareGitHubPairEvent(db: Db, input: {
       { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, producer ? undefined : "repository_artifact_disabled");
     return { event, snapshot };
     })()]);
-  } catch {
+  } catch (error) {
     // No admission will reference a checkout for a failed seal.
     artifactAbort.abort();
+    // The stored failure is a coarse class; keep the cause observable.
+    logger.warn({ repository: input.repository, pullNumber: Number(match[2]), eventId: input.eventId,
+      error: error instanceof Error ? error.message : String(error) }, "GitHub paired snapshot capture failed");
     // Selection/denominator survive token and metadata failure too. Automatic
     // events keep their authenticated head; manual unknowns stay explicitly null.
     // Recovery only projects these bytes, never reconstructs a later live view.
