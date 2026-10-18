@@ -173,17 +173,37 @@ suite("GitHub shadow route persistence (A11, real PostgreSQL)", () => {
   it("serializes GitHub endpoint creation against concurrent shadow arm assignment", async () => {
     const f = await fixture();
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.candidateId));
-    const results = await Promise.allSettled([
-      f.save([f.route]),
-      endpointService().create(f.companyId, { provider: "github", assignedAgentId: f.candidateId }, f.userId),
-    ]);
-    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
-    expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
-    const assignments = [...await db.execute(sql`select id from chat_github_review_arms
-      where company_id = ${f.companyId} and agent_id = ${f.candidateId} and retired_at is null
-      union all select id from chat_endpoints where company_id = ${f.companyId}
-        and assigned_agent_id = ${f.candidateId} and provider = 'github'`)];
-    expect(assignments).toHaveLength(1);
+    let creation!: Promise<{ error?: unknown; endpoint?: unknown }>;
+    try {
+      await db.transaction(async tx => {
+        const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+        await tx.select().from(agents).where(eq(agents.id, f.candidateId)).for("update");
+        // Hold an uncommitted arm so the endpoint creator must wait for the agent
+        // lock, then re-read arms after commit rather than miss this assignment.
+        await tx.execute(sql`insert into chat_github_review_arms
+          (company_id, endpoint_id, agent_id, label, configuration_revision)
+          values (${f.companyId}, ${f.endpointId}, ${f.candidateId}, ${f.route.label}, 2)`);
+        creation = endpointService().create(f.companyId,
+          { provider: "github", assignedAgentId: f.candidateId }, f.userId)
+          .then(endpoint => ({ endpoint }), error => ({ error }));
+        await expect.poll(async () => [...await db.execute(sql`
+          select pid from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+            and ${Number(backend!.pid)} = any(pg_blocking_pids(pid))
+            and query ilike '%select%from "agents"%for update%'
+        `)].length, { timeout: 10_000 }).toBe(1);
+      }); // Only now expose the arm to the blocked endpoint transaction.
+      const result = await creation;
+      expect(result.error).toBeInstanceOf(Error);
+      expect((result.error as Error).message).toMatch(/shadow arm/i);
+      expect(result.endpoint).toBeUndefined();
+      expect(await db.select().from(chatEndpoints).where(eq(chatEndpoints.companyId, f.companyId))).toHaveLength(1);
+      expect(await f.arms()).toHaveLength(1);
+    } finally {
+      // A failed lock assertion rolls back the manual transaction; always drain
+      // the competing creator before fixture/database teardown, including mutants.
+      await creation;
+    }
   });
 
   it("revision-fences concurrent saves and does not create arms for a stale revision", async () => {
