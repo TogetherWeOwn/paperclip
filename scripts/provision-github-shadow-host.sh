@@ -13,7 +13,7 @@ shift
 [[ $(id -u) = 0 ]] || { printf '%s\n' 'Run only as the host operator with root authority.' >&2; exit 1; }
 key_file=$1; shift
 [[ -f $key_file ]] || exit 1
-for command in useradd getent install iptables ip6tables setfacl getfacl sshd python3 findmnt; do command -v "$command" >/dev/null; done
+for command in useradd getent install iptables ip6tables setfacl getfacl sshd python3 git findmnt; do command -v "$command" >/dev/null; done
 if getent passwd paperclip-shadow >/dev/null; then
   printf '%s\n' 'Refusing to repurpose an existing account. Audit it manually; no changes made.' >&2
   exit 1
