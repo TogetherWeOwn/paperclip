@@ -426,8 +426,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           revision: number;
         }
       | undefined;
-    const context: GitHubReviewEventContext & { admissionDeliveryId: string } = {
-      admissionDeliveryId: source.delivery.id,
+    const context: GitHubReviewEventContext = {
       event: manual?.event ?? "mention",
       repositoryId: source.repositoryId,
       repository: source.repository,
@@ -469,6 +468,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         pullNumber: source.number,
         headSha: pull.head.sha,
         deliveryId: source.candidate ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
+        admissionDeliveryId: source.delivery.id,
         configurationRevision:
           source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
         policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,

@@ -129,6 +129,29 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   }
 }
 
+export function githubPairPreviousAssessmentQuery(db: Store, input: {
+  companyId: string; endpointId: string; repositoryId: string; pullNumber: number;
+  roundOrdinal: number; snapshotStartedAt: Date; armId: string;
+}) {
+  return db.select({ review: chatGitHubReviews }).from(chatGitHubReviews)
+    .innerJoin(chatGitHubReviewEnrollments, and(
+      eq(chatGitHubReviewEnrollments.companyId, input.companyId),
+      eq(chatGitHubReviewEnrollments.endpointId, input.endpointId),
+      eq(chatGitHubReviewEnrollments.repositoryId, input.repositoryId),
+      eq(chatGitHubReviewEnrollments.pullNumber, input.pullNumber),
+      lt(chatGitHubReviewEnrollments.roundOrdinal, input.roundOrdinal),
+      input.armId === "primary"
+        ? sql`(${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text
+            or ${chatGitHubReviews.admissionDeliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId})`
+        : sql`exists (select 1 from chat_github_review_candidates c where c.company_id = ${input.companyId}
+            and c.enrollment_id = ${chatGitHubReviewEnrollments.id} and c.arm_id = ${input.armId}
+            and c.native_delivery_id::text = ${chatGitHubReviews.deliveryId})`,
+    )).where(and(eq(chatGitHubReviews.companyId, input.companyId), eq(chatGitHubReviews.endpointId, input.endpointId),
+      isNotNull(chatGitHubReviews.assessment), lte(chatGitHubReviews.updatedAt, input.snapshotStartedAt),
+      input.armId === "primary" ? isNull(chatGitHubReviews.shadowLabel) : isNotNull(chatGitHubReviews.shadowLabel)))
+    .orderBy(desc(chatGitHubReviewEnrollments.roundOrdinal), desc(chatGitHubReviews.createdAt)).limit(1);
+}
+
 interface Seed {
   version: 1;
   id: string;
@@ -189,23 +212,9 @@ export async function admitGitHubPair(tx: Tx, input: {
   for (const armId of ["primary", ...selected.map(a => a.id)]) {
     previousAssessments[armId] = null;
     if (roundOrdinal === 1 || !input.snapshot) continue;
-    const [priorReview] = await tx.select({ review: chatGitHubReviews }).from(chatGitHubReviews)
-      .innerJoin(chatGitHubReviewEnrollments, and(
-        eq(chatGitHubReviewEnrollments.companyId, input.endpoint.companyId),
-        eq(chatGitHubReviewEnrollments.endpointId, input.endpoint.id),
-        eq(chatGitHubReviewEnrollments.repositoryId, e.repositoryId),
-        eq(chatGitHubReviewEnrollments.pullNumber, e.pullNumber),
-        lt(chatGitHubReviewEnrollments.roundOrdinal, roundOrdinal),
-        armId === "primary"
-          ? sql`(${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text
-              or ${chatGitHubReviews.event}->>'admissionDeliveryId' = ${chatGitHubReviewEnrollments.originDeliveryId}::text)`
-          : sql`exists (select 1 from chat_github_review_candidates c where c.company_id = ${input.endpoint.companyId}
-              and c.enrollment_id = ${chatGitHubReviewEnrollments.id} and c.arm_id = ${armId}
-              and c.native_delivery_id::text = ${chatGitHubReviews.deliveryId})`,
-      )).where(and(eq(chatGitHubReviews.companyId, input.endpoint.companyId), eq(chatGitHubReviews.endpointId, input.endpoint.id),
-        isNotNull(chatGitHubReviews.assessment), lte(chatGitHubReviews.updatedAt, new Date(input.snapshot.startedAt)),
-        armId === "primary" ? isNull(chatGitHubReviews.shadowLabel) : isNotNull(chatGitHubReviews.shadowLabel)))
-      .orderBy(desc(chatGitHubReviewEnrollments.roundOrdinal), desc(chatGitHubReviews.createdAt)).limit(1);
+    const [priorReview] = await githubPairPreviousAssessmentQuery(tx, { companyId: input.endpoint.companyId,
+      endpointId: input.endpoint.id, repositoryId: e.repositoryId, pullNumber: e.pullNumber,
+      roundOrdinal, snapshotStartedAt: new Date(input.snapshot.startedAt), armId });
     if (priorReview?.review.assessment) previousAssessments[armId] = {
       headSha: priorReview.review.headSha, assessment: priorReview.review.assessment,
       issueId: priorReview.review.issueId, runId: priorReview.review.runId,

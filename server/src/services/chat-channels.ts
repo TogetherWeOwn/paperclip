@@ -16548,7 +16548,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             companyId: endpoint.companyId, endpointId: endpoint.id, issueId: issue.id,
             repositoryId: githubAutomatic.context.repositoryId, repository: githubAutomatic.context.repository,
             pullNumber: githubAutomatic.context.pullNumber, headSha: githubAutomatic.context.headSha,
-            deliveryId: activeDelivery.id, configurationRevision: githubAutomatic.revision,
+            deliveryId: activeDelivery.id, admissionDeliveryId: activeDelivery.id, configurationRevision: githubAutomatic.revision,
             policySnapshot: githubAutomatic.policy, event: githubAutomatic.context, state: "queued",
             shadowLabel: taskShadowLabel,
           }).onConflictDoNothing();

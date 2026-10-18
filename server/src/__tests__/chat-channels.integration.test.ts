@@ -5198,6 +5198,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await service.execute(retry, "begin_review", { reviewedCommit: head });
       const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, admitted.issueId));
       expect(reviews.find(r => r.runId === retry.runId)?.event).toMatchObject({ deliveryId: providerDeliveryId });
+      expect(reviews.find(r => r.runId === retry.runId)).toMatchObject({ admissionDeliveryId: admitted.deliveryId });
+      expect(admitted).toMatchObject({ admissionDeliveryId: admitted.deliveryId });
       expect(await shadowTestActions(f.endpoint.id, "github_review_check")).toHaveLength(1);
     });
     it.each(["failed", "cancelled"])("paired primary retry publishes after its previous run %s", async (status) => {

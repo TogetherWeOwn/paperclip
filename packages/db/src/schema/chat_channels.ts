@@ -484,6 +484,8 @@ export const chatDeliveries = pgTable(
     index("chat_deliveries_work_idx").on(table.state, table.nextAttemptAt),
     // Sparse immutable seeds are the pairing fallback outbox. Neither recovery
     // nor ordinal allocation should detoast every historical delivery.
+    index("chat_deliveries_pair_pending_idx").on(table.receivedAt, table.id)
+      .where(sql`${table.normalizedEvent} ? 'githubPairingPending' and not (${table.normalizedEvent} ? 'githubPairingSeed')`),
     index("chat_deliveries_pair_seed_idx").on(table.id)
       .where(sql`${table.normalizedEvent} ? 'githubPairingSeed'`),
     index("chat_deliveries_pair_round_idx").on(

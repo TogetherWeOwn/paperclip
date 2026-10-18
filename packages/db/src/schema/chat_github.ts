@@ -135,6 +135,9 @@ export const chatGitHubReviews = pgTable(
     pullNumber: integer("pull_number").notNull(),
     headSha: text("head_sha").notNull(),
     deliveryId: text("delivery_id").notNull(),
+    // Native admission identity survives per-run retry rows without changing
+    // the provider delivery id used to deduplicate GitHub check intents.
+    admissionDeliveryId: uuid("admission_delivery_id"),
     configurationRevision: integer("configuration_revision").notNull(),
     policySnapshot: jsonb("policy_snapshot")
       .$type<GitHubReviewPolicy>()
@@ -182,6 +185,8 @@ export const chatGitHubReviews = pgTable(
       t.endpointId,
       t.deliveryId,
     ),
+    index("chat_github_reviews_admission_idx").on(t.endpointId, t.admissionDeliveryId)
+      .where(sql`${t.shadowLabel} is null and ${t.admissionDeliveryId} is not null`),
     index("chat_github_reviews_pull_idx").on(
       t.endpointId,
       t.repositoryId,

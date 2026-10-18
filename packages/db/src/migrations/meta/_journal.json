@@ -2136,6 +2136,13 @@
       "when": 1792285413990,
       "tag": "0306_romantic_power_man",
       "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1792287555148,
+      "tag": "0307_overrated_lightspeed",
+      "breakpoints": true
     }
   ]
 }
