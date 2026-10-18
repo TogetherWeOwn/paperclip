@@ -139,7 +139,10 @@ export const chatGitHubReviews = pgTable(
     policySnapshot: jsonb("policy_snapshot")
       .$type<GitHubReviewPolicy>()
       .notNull(),
-    event: jsonb("event").$type<GitHubReviewEventContext>().notNull(),
+    event: jsonb("event").$type<GitHubReviewEventContext & {
+      /** Native admission identity, distinct from the provider's delivery ID. */
+      admissionDeliveryId?: string;
+    }>().notNull(),
     state: text("state")
       .$type<GitHubTaskReview["state"]>()
       .notNull()
