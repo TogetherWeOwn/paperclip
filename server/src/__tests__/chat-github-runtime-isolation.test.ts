@@ -90,6 +90,45 @@ urllib.request.urlopen = fake_urlopen
       if (scenario === "reused-home") expect(proof.checks.configFresh).toBe(false);
     },
   );
+  it.each([["timeout", false], ["url-timeout", false], ["429", false], ["503", false], ["403-no-policy", true]] as const)(
+    "an allowed-model upstream %s is missing evidence, never a negative confinement proof", (failure, proofEmitted) => {
+      const fixture = `import builtins, errno, pwd, socket, types, io, json, os, urllib.request, urllib.error
+os.geteuid = lambda: 12345
+pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
+real_open = builtins.open
+def controlled_open(path, *args, **kwargs):
+    if str(path).startswith("/primary/"): raise OSError(errno.EACCES, "denied")
+    return real_open(path, *args, **kwargs)
+builtins.open = controlled_open
+class FakeSocket:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def settimeout(self, value): pass
+    def connect(self, address): raise OSError(errno.EACCES, "denied")
+socket.socket = lambda *args: FakeSocket()
+failure = ${JSON.stringify(failure)}
+def fake_urlopen(request, timeout=None):
+    body = json.loads(request.data)
+    if body["model"] == "configured-arm-model" and "tools" not in body and "mcp_servers" not in body:
+        assert timeout >= 25
+        if failure == "timeout": raise TimeoutError("timed out")
+        if failure == "url-timeout": raise urllib.error.URLError(TimeoutError("timed out"))
+        if failure == "403-no-policy": raise urllib.error.HTTPError(request.full_url, 403, "denied", {}, None)
+        raise urllib.error.HTTPError(request.full_url, int(failure), "upstream", {}, None)
+    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
+urllib.request.urlopen = fake_urlopen
+`;
+      const run = () => execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
+        input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: "/nonexistent-fresh", canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"] }),
+        encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "ignore"],
+      });
+      if (!proofEmitted) {
+        expect(run).toThrow();
+        return;
+      }
+      expect(JSON.parse(run()).checks.allowedModelAccepted).toBe(false);
+    },
+  );
   it("materializes the exact hook bundle into a fresh config using the shipped Python probe", () => {
     const scratch = mkdtempSync(join(tmpdir(), "shadow-hooks-"));
     const home = join(scratch, "fresh");

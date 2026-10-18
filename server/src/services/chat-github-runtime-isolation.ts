@@ -126,17 +126,22 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
             checks["rawProxyDenied"] = e.errno in (errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ETIMEDOUT) or isinstance(e, TimeoutError)
     base = {"model": p["model"], "max_tokens": 1, "messages": [{"role": "user", "content": "Reply OK"}],
             "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}}
-    def proxy_request(extra, expect_denied):
+    def proxy_request(extra, expect_denied, timeout=5):
         request = urllib.request.Request("http://127.0.0.1:8318/v1/messages", data=json.dumps({**base, **extra}).encode(),
             headers={"Authorization": "Bearer " + p.get("proxyToken", ""), "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return not expect_denied and 200 <= response.status < 300
         except urllib.error.HTTPError as e:
+            # A slow, rate-limited or failing upstream for the allowed model is
+            # missing evidence (no proof), not a demonstrated confinement failure.
+            if not expect_denied and (e.code == 429 or e.code >= 500): raise
             return expect_denied and e.code == 403 and e.headers.get("x-paperclip-shadow-policy") == "client-tools-only-v1"
-        except OSError:
+        except OSError as e:
+            if not expect_denied and (isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)): raise
             return False
-    checks["allowedModelAccepted"] = proxy_request({}, False)
+    # The allowed model is served by a shared upstream that can queue for minutes.
+    checks["allowedModelAccepted"] = proxy_request({}, False, 25)
     checks["otherModelDenied"] = proxy_request({"model": "isolation-probe-" + p["nonce"]}, True)
     checks["providerToolsDenied"] = all([proxy_request(extra, True) for extra in [
         {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
@@ -458,7 +463,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     ]);
     const result = await runSshCommand(target.spec, `python3 -c ${shellQuote(GITHUB_ISOLATION_PROBE)}`, {
       stdin: JSON.stringify({ nonce, home, hooks, proxyToken, model, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
-      timeoutMs: 40_000, maxBuffer: 8192,
+      timeoutMs: 60_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
     if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
