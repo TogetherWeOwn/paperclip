@@ -214,8 +214,9 @@ export async function materializeGitHubCandidateWorkspace(input: {
   let file: string;
   try { file = await githubRepositoryArtifactFile(artifact, input.artifactRoot); }
   catch (error) { return { ...base, status: "unavailable", reason: error instanceof GitHubRepositoryArtifactError ? error.reason : "repository_artifact_missing" }; }
-  const staging = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-artifact-"));
+  let staging: string | undefined;
   try {
+    staging = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-artifact-"));
     await fs.symlink(file, path.join(staging, "repository.bundle"));
     await syncDirectoryToSsh({ spec: input.target.spec, localDir: staging, remoteDir: `${input.home}/.paperclip-review/artifact`, followSymlinks: true });
     const result = await runSshCommand(input.target.spec, `python3 -c ${shellQuote(GITHUB_WORKSPACE_MATERIALIZE)}`, {
@@ -241,7 +242,7 @@ export async function materializeGitHubCandidateWorkspace(input: {
   } catch {
     return { ...base, status: "error", reason: "workspace_transfer_failed" };
   } finally {
-    await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    if (staging) await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 

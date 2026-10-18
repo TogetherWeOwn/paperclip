@@ -285,7 +285,8 @@ export async function produceGitHubRepositoryArtifact(request: GitHubRepositoryA
     await fs.rename(produced!.file, path.join(options.root, "artifacts", name));
     // Refresh retention on content-addressed reuse.
     await fs.utimes(path.join(options.root, "artifacts", name), new Date(), new Date()).catch(() => undefined);
-    if (request.signal.aborted) fail("repository_artifact_late");
+    // A finished artifact is commit-addressed; the snapshot capture alone
+    // decides whether the admission itself was late.
     return { version: 1, kind, path: name, sha256, bytes: produced!.size, headSha: request.headSha, baseSha: request.baseSha,
       headTree: produced!.headTree, baseTree: produced!.baseTree, refs: produced!.refs, commits: produced!.commits };
   } finally {
