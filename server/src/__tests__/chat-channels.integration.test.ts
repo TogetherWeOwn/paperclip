@@ -3769,15 +3769,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         }),
         trigger: "mention",
       });
-      const [conversation] = await db
+      const conversations = await db
         .select()
         .from(chatConversations)
         .where(and(
           eq(chatConversations.endpointId, f.endpoint.id),
           eq(chatConversations.companyId, f.companyId),
           eq(chatConversations.externalThreadId, thread.id),
+          // Candidate conversations intentionally share the provider thread.
+          // Never let unspecified row ordering select another review arm.
+          eq(chatConversations.executionScope, "primary"),
         ));
-      return conversation;
+      // Deferred-admission tests intentionally have no conversation yet.
+      expect(conversations.length).toBeLessThanOrEqual(1);
+      return conversations[0];
     }
     async function pairedReviewFixture(overrides: Parameters<typeof reviewBotFixture>[0] = {}) {
       const f = await reviewBotFixture(overrides);
