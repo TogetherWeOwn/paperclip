@@ -8,7 +8,7 @@ import { rememberVerifiedSlackSearchEvent, slackSearchActionToken } from "./conn
 import { slackAuthorizationRevision } from "./connectors/slack-revision.js";
 import { slackPublicationAllowed } from "./connectors/slack-access.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { stageGitHubPair, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake } from "./chat-github-shadow.js";
+import { stageGitHubPair, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake, kickGitHubPairCapture } from "./chat-github-shadow.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
@@ -14522,8 +14522,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
     const receiptDeclined = (row: typeof agentWakeupRequests.$inferSelect) =>
       ["skipped", "cancelled", "failed"].includes(row.status);
-    const settle = (status: string, result: Record<string, unknown>) =>
-      db.transaction(async (tx) => {
+    const settle = async (status: string, result: Record<string, unknown>) => {
+      const settled = await db.transaction(async (tx) => {
         const changed = await tx
           .update(chatActions)
           .set({ status, result, updatedAt: new Date() })
@@ -14553,7 +14553,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ),
             );
         }
+        return changed.length > 0;
       });
+      // The primary wake is now durably recorded: the exact condition the
+      // deferred sweep waits for. Start paired capture for this delivery now
+      // (fire-and-forget, never awaited); the sweep stays the fallback.
+      if (
+        settled &&
+        status === "processed" &&
+        (result.code === "inbound_wakeup_durable" ||
+          result.code === "inbound_wakeup_already_durable")
+      )
+        kickGitHubPairCapture(db, deliveryId, fetchImpl);
+    };
     let request: ReturnType<typeof createDurableChatWakeupRequest> | null =
       null;
     const receipt = async () => {

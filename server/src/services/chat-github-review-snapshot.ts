@@ -3,6 +3,7 @@ import type { GitHubReviewEventContext } from "@paperclipai/shared";
 import { githubCommitSchema } from "@paperclipai/shared";
 import type { GitHubReviewInputSnapshot } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
+import { githubShadowSnapshotBudgetMs } from "./chat-github-shadow-timing.js";
 
 export type GitHubReviewReader = {
   request<T>(path: string, options?: { method?: string; body?: unknown; accept?: string }): Promise<T>;
@@ -27,6 +28,8 @@ export async function captureGitHubReviewSnapshot(
   repositoryFailure?: string,
 ): Promise<GitHubReviewInputSnapshot> {
   const startedAt = new Date().toISOString();
+  // Default 15 s; PAPERCLIP_GITHUB_SHADOW_SNAPSHOT_BUDGET_MS, clamped [5 s, 300 s].
+  const budgetMs = githubShadowSnapshotBudgetMs();
   const headSha = githubCommitSchema.parse(event.headSha);
   const baseSha = githubCommitSchema.parse(event.baseSha);
   const comparePath = `/compare/${baseSha}...${headSha}?per_page=1&page=1`;
@@ -44,7 +47,7 @@ export async function captureGitHubReviewSnapshot(
     };
     let size = 0;
     const read = async <T>(route: string): Promise<T> => {
-      if (Date.now() - Date.parse(startedAt) > 15_000) throw conflict("snapshot_capture_budget_exceeded");
+      if (Date.now() - Date.parse(startedAt) > budgetMs) throw conflict("snapshot_capture_budget_exceeded");
       const result = await api.request<T>(route);
       size += Buffer.byteLength(JSON.stringify(result));
       if (size > 16 * 1024 * 1024) throw conflict("snapshot_capture_size_exceeded");
