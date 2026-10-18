@@ -150,7 +150,9 @@ import {
   announcementSchema,
   dismissAnnouncementSchema,
   // Execution workspaces
+  allocateSourceBoundWorkspaceSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -1470,6 +1472,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/source-bound-workspace-allocation",
+  "POST /api/issues/{id}/source-bound-workspace-allocation/rollback",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -4251,6 +4255,76 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/transport-validation",
+  tags: ["issues"],
+  summary: "Validate source-bound transport only",
+  description:
+    "Validates the authenticated agent principal against server-resolved source issue assignee, unresolved blockers, low-trust preflight and selected workspace transport, plus deployed-image digest pinning for the running build from the trusted deployment record. Terminates under a transport-only boundary: no wake, checkout, workspace realization or runtime start. Returns a validation receipt, which grants no execution authority.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        workspaceId: z.string().uuid(),
+        transport: z.string().min(1),
+        requestedToolClass: z.string().nullable().optional(),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation",
+  tags: ["issues"],
+  summary: "Allocate a source-bound unrealized execution workspace",
+  description:
+    "Board principal with runtime:manage only (agent keys are denied). Allocates — or idempotently returns — an unrealized execution-workspace record bound to the issue, with every field derived server-side from the issue's stored isolated_workspace + git_worktree selection. No wake, run, checkout, branch/worktree creation, or runtime start; no issue status, assignee, blocker, or monitor change. Allocation alone never passes transport validation (workspace_not_realized) until a later heartbeat run realizes into the same record.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(allocateSourceBoundWorkspaceSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: { description: "Allocation created" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation/rollback",
+  tags: ["issues"],
+  summary: "Roll back a source-bound workspace allocation",
+  description:
+    "Board principal with runtime:manage only. Archives the allocated unrealized record and restores the issue's exact prior executionWorkspaceId recorded at allocation, refusing if the binding changed in between. Realized workspaces cannot be rolled back through this path. Audited as a separate attributed activity entry.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(rollbackSourceBoundWorkspaceAllocationSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
