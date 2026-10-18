@@ -167,9 +167,12 @@ export async function prepareGitHubPairEvent(db: Db, input: {
       { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, producer ? undefined : "repository_artifact_disabled");
     return { event, snapshot };
     })()]);
-  } catch {
+  } catch (error) {
     // No admission will reference a checkout for a failed seal.
     artifactAbort.abort();
+    // The stored failure is a coarse class; keep the cause observable.
+    logger.warn({ repository: input.repository, pullNumber: Number(match[2]), eventId: input.eventId,
+      error: error instanceof Error ? error.message : String(error) }, "GitHub paired snapshot capture failed");
     // Selection/denominator survive token and metadata failure too. Automatic
     // events keep their authenticated head; manual unknowns stay explicitly null.
     // Recovery only projects these bytes, never reconstructs a later live view.
@@ -461,7 +464,9 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
       and a.kind = 'github_review_publication' and a.status not in ('cancelled', 'failed')
       and a.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
     or exists (select 1 from chat_publications p where p.company_id = ${delivery.companyId}
-      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
+      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz
+      -- The bot-authored "queued" run milestone precedes any primary input read.
+      and coalesce(p.payload->>'progressState', '') <> 'queued')
   ) as started`);
   return evidence?.started ? "admission_snapshot_late" : undefined;
 }
