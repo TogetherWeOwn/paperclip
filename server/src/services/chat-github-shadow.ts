@@ -78,7 +78,9 @@ export async function prepareGitHubPairEvent(db: Db, input: {
       labels: (pr.labels ?? []).map(l => l.name),
     };
     prepared = true;
-    const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event);
+    if (!input.endpoint.botUsername || !input.endpoint.botExternalId) throw new Error("snapshot_bot_identity_missing");
+    const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
+      { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId });
     return { event, snapshot };
   } catch {
     // Selection/denominator survive token and metadata failure too. Automatic
@@ -170,6 +172,7 @@ export async function admitGitHubPair(tx: Tx, input: {
       issueId: priorReview.review.issueId, runId: priorReview.review.runId,
     };
   }
+  const [primaryAgent] = await tx.select().from(agents).where(and(eq(agents.id, input.endpoint.assignedAgentId!), eq(agents.companyId, input.endpoint.companyId)));
   const seed: Seed = {
     version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
     pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, input.event?.headSha ?? null, input.event?.baseSha ?? null, roundOrdinal, input.revision, digest(input.policy)]),
@@ -177,6 +180,9 @@ export async function admitGitHubPair(tx: Tx, input: {
       protocol: GITHUB_SHADOW_PROTOCOL,
       comparisonEligibility: githubComparisonEligibility({ environmentCertified: false, selfTestRecorded: false,
         selfTestPassed: false, primaryBlindingActive: true, snapshotAvailable: !!input.snapshot, roundOrdinal }),
+      primaryToolPolicy: primaryAgent ? { adapterType: primaryAgent.adapterType,
+        engine: typeof primaryAgent.adapterConfig.engine === "string" ? primaryAgent.adapterConfig.engine : null,
+        configDigest: digest(primaryAgent.adapterConfig), effectiveToolsVerified: false } : undefined,
       request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
       snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
       normalizedEvent: delivery.normalizedEvent,

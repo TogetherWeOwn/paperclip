@@ -58,6 +58,27 @@ describe("sealed GitHub review snapshot", () => {
     expect(await reader.request("/issues/7/comments?per_page=100&page=2")).toEqual([{ body: "last" }]);
     expect(await reader.request("/issues/7/comments?per_page=100&page=3")).toEqual([]);
   });
+  it("repaginates blinded comments without losing later human context or exposing raw pages", async () => {
+    const snapshot = await captureGitHubReviewSnapshot(provider(path => path.includes("/issues/7/comments?")
+      ? path.endsWith("page=1") ? Array(100).fill({ user: { login: "MAYA[bot]" }, body: "CANARY" })
+        : [{ performed_via_github_app: { id: 123 }, body: "APP_CANARY" }, { user: { login: "human" }, body: "keep" }]
+      : undefined), event, { login: "maya[bot]", appId: "123" });
+    const live = vi.fn();
+    const reader = githubSnapshotReader(snapshot, expected, live);
+    expect(await reader.request("/issues/7/comments?per_page=100&page=1")).toEqual([{ user: { login: "human" }, body: "keep" }]);
+    expect(await reader.request("/issues/7/comments?per_page=100&page=2")).toEqual([]);
+    expect(snapshot.redactions?.total).toBe(101);
+    expect(live).not.toHaveBeenCalled();
+  });
+  it("round-trips JSON strings PostgreSQL cannot represent and rejects malformed encoding", async () => {
+    const body = "nul\u0000lone\ud800";
+    const snapshot = await captureGitHubReviewSnapshot(provider(path => path.includes("/issues/7/comments?") ? [{ body }] : undefined), event);
+    expect(snapshot.version).toBe(2);
+    expect(JSON.stringify(snapshot)).not.toContain("\\u0000");
+    const reader = githubSnapshotReader(snapshot, expected, vi.fn());
+    expect(await reader.request("/issues/7/comments?per_page=100&page=1")).toEqual([{ body }]);
+    expect(() => githubSnapshotReader({ ...snapshot, responses: { "/pulls/7": "not-json" } }, expected, vi.fn())).toThrow("Invalid sealed");
+  });
   it("verifies pinned blobs and refuses symlinks unavailable bytes and traversal", async () => {
     const snapshot = await captureGitHubReviewSnapshot(provider(), event);
     const valid = { type: "file", content: Buffer.from("source").toString("base64"), encoding: "base64", size: 6,

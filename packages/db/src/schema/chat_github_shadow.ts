@@ -10,7 +10,9 @@ import { issueComments } from "./issue_comments.js";
 /** Exact pre-wake provider responses. Stored inside the immutable enrollment
  * and its durable source seed; no late recapture can rewrite an admitted view. */
 export interface GitHubReviewInputSnapshot {
-  version: 1;
+  /** v2 stores each response as base64 JSON; the digest covers decoded bytes. */
+  version: 1 | 2;
+  redactions?: { total: number; byRoute: Record<string, number>; botLogin: string; appId: string };
   startedAt: string;
   finishedAt: string;
   headSha: string;
@@ -34,6 +36,8 @@ export interface GitHubReviewEnrollmentEnvelope {
       evidence: { successfulRuns: number; lookbackDays: number; webSearchRequests: number; webFetchRequests: number;
         source: string; observedOn: string; verification: string } } };
   };
+  /** Admission-time policy evidence, not a claim about ambient CLI/MCP tools. */
+  primaryToolPolicy?: { adapterType: string; engine: string | null; configDigest: string; effectiveToolsVerified: false };
   request: string;
   lowTrust: boolean;
   snapshot?: GitHubReviewInputSnapshot;
@@ -78,6 +82,8 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
     comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
     primaryBlindingVersion?: number;
     hooksDigest?: string;
+    candidateRuntimeCertified?: boolean; disallowedTools?: string[];
+    primaryToolPolicy?: GitHubReviewEnrollmentEnvelope["primaryToolPolicy"] | null;
   }>>().notNull().default({}),
   admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => [

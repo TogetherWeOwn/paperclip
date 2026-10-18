@@ -16566,14 +16566,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           }).onConflictDoNothing();
         }
         if (pairedEvent && !taskShadowLabel && (githubManual || githubAutomatic)) {
-          await admitGitHubPair(taskTx as DbTransaction, {
-            endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent.event,
-            snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure, unavailableEvent: pairedEvent.unavailableEvent,
-            request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
-            revision: (githubManual ?? githubAutomatic)!.revision,
-            authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,
-              sponsorUserId: !principalResolution.userId ? taskEndpoint.sponsorUserId : null },
-          });
+          try {
+            // PostgreSQL errors poison their transaction. Isolate the ENTIRE
+            // optional pairing write, not just its enrollment projection.
+            await (taskTx as DbTransaction).transaction(pairTx => admitGitHubPair(pairTx, {
+              endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent.event,
+              snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure, unavailableEvent: pairedEvent.unavailableEvent,
+              request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
+              revision: (githubManual ?? githubAutomatic)!.revision,
+              authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,
+                sponsorUserId: !principalResolution.userId ? taskEndpoint.sponsorUserId : null },
+            }));
+          } catch {
+            await taskTx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"pair_admission_failed"}'::jsonb` })
+              .where(eq(chatDeliveries.id, activeDelivery.id));
+          }
         }
         await stageInboundWakeup(taskTx, {
           endpoint: taskEndpoint,

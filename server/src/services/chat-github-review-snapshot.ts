@@ -20,6 +20,7 @@ export function githubSnapshotDigest(value: unknown): string {
  * observed concurrent changes, not a claim of provider serializability. */
 export async function captureGitHubReviewSnapshot(
   api: GitHubReviewReader, event: GitHubReviewEventContext,
+  bot?: { login: string; appId: string },
 ): Promise<GitHubReviewInputSnapshot> {
   const startedAt = new Date().toISOString();
   const headSha = githubCommitSchema.parse(event.headSha);
@@ -27,6 +28,16 @@ export async function captureGitHubReviewSnapshot(
   const comparePath = `/compare/${baseSha}...${headSha}?per_page=1&page=1`;
   const sweep = async () => {
     const responses: Record<string, unknown> = Object.create(null);
+    const byRoute: Record<string, number> = {};
+    const isBotArtifact = (value: unknown): boolean => {
+      if (!bot || !value || typeof value !== "object") return false;
+      const row = value as {
+        user?: { login?: unknown }; creator?: { login?: unknown };
+        app?: { id?: unknown }; performed_via_github_app?: { id?: unknown };
+      };
+      return [row.user, row.creator].some(user => typeof user?.login === "string" && user.login.toLowerCase() === bot.login.toLowerCase())
+        || [row.app, row.performed_via_github_app].some(app => app?.id != null && String(app.id) === bot.appId);
+    };
     let size = 0;
     const read = async <T>(route: string): Promise<T> => {
       if (Date.now() - Date.parse(startedAt) > 15_000) throw conflict("snapshot_capture_budget_exceeded");
@@ -43,24 +54,45 @@ export async function captureGitHubReviewSnapshot(
       `/pulls/${event.pullNumber}/reviews`, `/pulls/${event.pullNumber}/comments`,
       `/commits/${headSha}/check-runs`, `/commits/${headSha}/statuses`,
     ]) {
+      const retained: unknown[] = [];
+      const checks = route.endsWith("/check-runs");
+      let redacted = 0;
       for (let page = 1; page <= 30; page++) {
-        const result = await read<unknown>(`${route}?per_page=100&page=${page}`);
-        const items = route.endsWith("/check-runs")
-          ? (result as { check_runs?: unknown[] }).check_runs : result;
+        const key = `${route}?per_page=100&page=${page}`;
+        const result = await read<unknown>(key);
+        const items = checks ? (result as { check_runs?: unknown[] }).check_runs : result;
         if (!Array.isArray(items)) throw conflict("snapshot_capture_invalid_collection");
+        for (const item of items) {
+          if (!route.endsWith("/files") && isBotArtifact(item)) redacted++;
+          else retained.push(item);
+        }
+        delete responses[key];
         if (items.length < 100) break;
         if (page === 30) throw conflict("snapshot_capture_truncated");
+      }
+      byRoute[route] = redacted;
+      // Repage after redaction. A shortened page must not hide later human
+      // comments or leave an original page accessible through a direct read.
+      for (let offset = 0; offset <= retained.length; offset += 100) {
+        const items = retained.slice(offset, offset + 100);
+        responses[`${route}?per_page=100&page=${offset / 100 + 1}`] = checks ? { check_runs: items } : items;
       }
     }
     const comparison = await read<{ merge_base_commit: { sha: string } }>(comparePath);
     const diffBaseSha = githubCommitSchema.parse(comparison.merge_base_commit.sha);
-    return { responses, diffBaseSha };
+    return { responses, diffBaseSha, ...(bot ? { redactions: {
+      total: Object.values(byRoute).reduce((sum, n) => sum + n, 0), byRoute, botLogin: bot.login, appId: bot.appId,
+    } } : {}) };
   };
   const first = await sweep();
   const second = await sweep();
   if (githubSnapshotDigest(first) !== githubSnapshotDigest(second)) throw conflict("snapshot_capture_mutated");
-  const sealed = { version: 1 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first };
-  return { ...sealed, digest: githubSnapshotDigest(sealed) };
+  const sealed = { version: 2 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first };
+  // PostgreSQL jsonb rejects NUL and lone surrogates in decoded strings. Keep
+  // exact JSON bytes, not a lossy sanitizer, and verify their decoded digest.
+  return { ...sealed, digest: githubSnapshotDigest(sealed), responses: Object.fromEntries(
+    Object.entries(first.responses).map(([route, value]) => [route, Buffer.from(JSON.stringify(value)).toString("base64")]),
+  ) };
 }
 
 /** This is selected BEFORE creating any live client. The only network capability
@@ -74,20 +106,27 @@ export function githubSnapshotReader(
 ): GitHubReviewReader {
   if (!snapshot) throw conflict("This paired review has no sealed admission snapshot; live reads are forbidden");
   const { digest, ...sealed } = snapshot;
-  if (snapshot.version !== 1 || snapshot.headSha !== expected.headSha || snapshot.baseSha !== expected.baseSha
-      || githubSnapshotDigest(sealed) !== digest) throw conflict("Invalid sealed review snapshot");
+  let responses = snapshot.responses;
+  try {
+    if (snapshot.version === 2) responses = Object.fromEntries(Object.entries(responses).map(([route, value]) => {
+      if (typeof value !== "string") throw new Error("Invalid encoded response");
+      return [route, JSON.parse(Buffer.from(value, "base64").toString("utf8"))];
+    }));
+  } catch { throw conflict("Invalid sealed review snapshot"); }
+  if (![1, 2].includes(snapshot.version) || snapshot.headSha !== expected.headSha || snapshot.baseSha !== expected.baseSha
+      || githubSnapshotDigest({ ...sealed, responses }) !== digest) throw conflict("Invalid sealed review snapshot");
   const commits = new Set([snapshot.headSha, snapshot.diffBaseSha]);
   return {
     async request<T>(route: string, options?: { method?: string; body?: unknown; accept?: string }) {
       if (options?.method && options.method !== "GET" || options?.body !== undefined)
         throw forbidden("Snapshot readers cannot publish");
-      if (Object.hasOwn(snapshot.responses, route)) return structuredClone(snapshot.responses[route]) as T;
+      if (Object.hasOwn(responses, route)) return structuredClone(responses[route]) as T;
       // A completed collection has an implicit empty tail. Only known captured
       // collections qualify; malformed/missing objects never become empty success.
       const page = /^(.*\?per_page=100&page=)([1-9][0-9]*)$/.exec(route);
       if (page && Number(page[2]) <= 100) {
         for (let n = 1; n < Number(page[2]); n++) {
-          const result = snapshot.responses[`${page[1]}${n}`];
+          const result = responses[`${page[1]}${n}`];
           const items = Array.isArray(result) ? result : (result as { check_runs?: unknown[] } | undefined)?.check_runs;
           if (items && items.length < 100) return (Array.isArray(result) ? [] : { check_runs: [] }) as T;
         }

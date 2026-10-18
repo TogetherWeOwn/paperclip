@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GITHUB_ISOLATION_PROBE,
+  GITHUB_ISOLATION_CLEANUP,
   githubIsolationCertificates,
   githubIsolationConfigurationDigest,
   githubCandidateAdapterConfig,
@@ -19,7 +20,7 @@ const prepared = {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("certified GitHub candidate configuration", () => {
-  it.each(["isolated", "readable", "missing", "network-open", "reused-home", "wrong-user"])(
+  it.each(["isolated", "readable", "missing", "network-open", "reused-home", "wrong-user", "sibling-home"])(
     "runs the actual Python probe against %s boundary fixtures", scenario => {
       // No real users, firewall, files, or sockets are changed. The exact shipped
       // Python program runs with deterministic syscall fakes, not a fake receipt.
@@ -28,13 +29,14 @@ scenario = ${JSON.stringify(scenario)}
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="other" if scenario == "wrong-user" else "paperclip-shadow")
 def fake_open(*args, **kwargs):
+    if args[0].endswith("/.probe-owner"): return io.StringIO()
     if scenario == "readable": return io.BytesIO(b"PRIMARY_ANSWER")
     raise OSError(errno.ENOENT if scenario == "missing" else errno.EACCES, "fixture")
 builtins.open = fake_open
 def fake_mkdir(*args, **kwargs):
     if scenario == "reused-home": raise FileExistsError()
 os.mkdir = fake_mkdir
-os.listdir = lambda path: []
+os.listdir = lambda path: ["previous-arm-home"] if scenario == "sibling-home" and path == "/" else []
 class FakeSocket:
     def __enter__(self): return self
     def __exit__(self, *args): pass
@@ -81,6 +83,29 @@ socket.socket = lambda *args: FakeSocket()
       expect(proof).toMatchObject({ hooksDigest: "fixture-digest", checks: { configFresh: true } });
       for (const [file, contents] of Object.entries(files)) expect(readFileSync(join(home, file), "utf8")).toBe(contents);
     } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+  it.each(["mine", "another-attempt", "missing", "symlink"])("cleanup only removes the nonce-owned home: %s", owner => {
+    const fixture = `import builtins, io, json, os, shutil, sys
+owner = ${JSON.stringify(owner)}
+sys.argv = ["cleanup", "/fresh", "mine"]
+os.path.isdir = lambda p: True
+os.path.islink = lambda p: owner == "symlink"
+def fake_open(*args, **kwargs):
+    if owner == "missing": raise FileNotFoundError()
+    return io.StringIO(owner)
+builtins.open = fake_open
+removed = []
+shutil.rmtree = lambda p: removed.append(p)
+`;
+    expect(typeof GITHUB_ISOLATION_CLEANUP).toBe("string");
+    const removed = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_CLEANUP + String.fromCharCode(10) + "print(json.dumps(removed))"], { encoding: "utf8", timeout: 5000 }));
+    expect(removed).toEqual(owner === "mine" ? ["/fresh"] : []);
+  });
+  it("blocks provider web tools without changing the primary config", () => {
+    const primary = { engine: "cli", model: "muse-wonder-full-1.0-contributor" };
+    const candidate = githubCandidateAdapterConfig(prepared, primary, "/fresh");
+    expect(candidate.extraArgs).toEqual(["--disallowedTools", "WebSearch", "WebFetch"]);
+    expect(primary).not.toHaveProperty("extraArgs");
   });
   it("is empty by default and rejects malformed certification", () => {
     for (const value of [undefined, "", "{}", "not json", '[{"environmentId":"fake"}]']) {

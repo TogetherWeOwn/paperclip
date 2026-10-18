@@ -618,6 +618,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       && !source.enrollment?.envelope.snapshot) {
       throw conflict("Capture-only review reads require a sealed admission snapshot", { code: "github_review_snapshot_required" });
     }
+    if (source.candidate && (source.enrollment?.envelope.snapshot?.version !== 2
+      || !source.enrollment.envelope.snapshot.redactions)) {
+      throw conflict("Candidate snapshot predates bot-answer blinding; live reads are forbidden");
+    }
     const useSnapshot = !!source.candidate || !!source.enrollment?.envelope.snapshot;
     const api: GitHubReviewReader = useSnapshot
       ? githubSnapshotReader(source.enrollment?.envelope.snapshot, {

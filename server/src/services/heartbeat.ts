@@ -1,6 +1,6 @@
 import { externalObjectService } from "./external-objects.js";
 import { tmpdir } from "node:os";
-import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig } from "./chat-github-runtime-isolation.js";
+import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
@@ -21093,6 +21093,7 @@ export function heartbeatService(
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    let candidateRuntime: Awaited<ReturnType<typeof prepareGitHubCandidateRuntime>> = null;
     let candidateWorkspaceDir: string | null = null;
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
@@ -21142,7 +21143,7 @@ export function heartbeatService(
 
       // Before session restoration, workspace setup, plugins or model work.
       // Only a server-certified SSH environment with fresh per-run proof enters.
-      const candidateRuntime = await prepareGitHubCandidateRuntime(db, { run, agent });
+      candidateRuntime = await prepareGitHubCandidateRuntime(db, { run, agent });
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -27438,6 +27439,8 @@ export function heartbeatService(
         }
       }
     } finally {
+      if (candidateRuntime) await cleanupGitHubCandidateRuntime(candidateRuntime).catch(error =>
+        logger.warn({ runId: run.id, err: error }, "Candidate isolated home cleanup failed; later sibling probes will fail closed"));
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);

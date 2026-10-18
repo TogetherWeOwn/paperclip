@@ -4010,6 +4010,65 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await expect(service.execute(session, "read_file", { path: "src/math.ts", revision: "head" })).rejects.toThrow("sealed admission snapshot");
       expect(recorder.fetches.slice(start)).toEqual([]);
     });
+    it("paired regression preserves NUL snapshot bytes without blocking the primary", async () => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.includes("/issues/81/comments?")
+        ? Response.json([{ id: 7, user: { login: "octocat" }, body: "before\u0000after" }]) : undefined);
+      await deliverShadowTestMention(f, "paired-nul", "@maya review this", 81);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate).toBeDefined();
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "comments" });
+      expect(JSON.stringify(result)).toContain("before\\u0000after");
+    });
+    it("paired regression rolls back seed failure without rolling back the primary", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_fail_pair_seed() returns trigger language plpgsql as $$ begin
+        if NEW.normalized_event ? 'githubPairingSeed' then raise exception 'injected seed failure'; end if; return NEW; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_seed before update on chat_deliveries for each row execute function test_fail_pair_seed()`);
+      try {
+        await deliverShadowTestMention(f, "paired-seed-error", "@maya review this", 81);
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+        const rows = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+        expect(rows.some(r => r.normalizedEvent.githubPairingFailure === "pair_admission_failed")).toBe(true);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_seed on chat_deliveries`);
+        await db.execute(sql`drop function test_fail_pair_seed()`);
+      }
+    });
+    it("paired regression blinds same-head published bot answers across all review surfaces", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "paired-before-rerequest", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      installShadowRecorder(f, head, async url => {
+        if (/\/(comments|reviews)\?/.test(url)) return Response.json([
+          { id: 1, body: "PRIMARY_PUBLISHED_ANSWER_CANARY", user: { login: f.endpoint.botUsername } },
+          { id: 2, body: "AUTHOR_CONTEXT", user: { login: "octocat" } },
+        ]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [
+          { id: 1, app: { id: Number(f.endpoint.botExternalId) }, output: { summary: "PRIMARY_CHECK_CANARY" } },
+          { id: 2, app: { id: 987654321 }, output: { summary: "CI_CONTEXT" } },
+        ] });
+        if (url.includes("/statuses?")) return Response.json([{ id: 1, creator: { login: f.endpoint.botUsername }, description: "PRIMARY_STATUS_CANARY" }]);
+        return undefined;
+      });
+      await deliverShadowTestMention(f, "paired-rerequest", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = (await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.replacementAgentId);
+      for (const candidate of tasks) {
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        for (const section of ["comments", "reviews", "inline_comments", "checks"]) {
+          const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section });
+          expect(JSON.stringify(result)).not.toContain("CANARY");
+        }
+      }
+      const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
+      expect(rows[1]!.envelope.snapshot.redactions.total).toBe(5);
+    });
     it("paired admission creates one primary and one candidate with exact request and native capabilities", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "paired-first", "@maya review this", 81);
@@ -4478,7 +4537,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id } }).where(eq(heartbeatRuns.id, session.runId));
       await expect(gateway.listToolsForSession(access.token)).rejects.toThrow("capability is invalid");
     });
-    it.each(["certified", "uncertified", "contaminated", "disabled", "disabled-after-probe"] as const)(
+    it.each(["certified", "uncertified", "wrong-environment", "contaminated", "transport-error", "invalid-proof", "canary-error", "disabled", "disabled-after-probe"] as const)(
       "paired certified runtime %s gates dispatch independently of the primary",
       async (scenario) => {
         const { environments, chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
@@ -4508,12 +4567,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath,
             remotePath: `/primary/${kind}/canary`, sha256: createHash("sha256").update("PRIMARY_CANARY").digest("hex") })),
         }]);
+        if (scenario === "wrong-environment") {
+          const [other] = await db.insert(environments).values({ name: "Other uncertified SSH", driver: "ssh", config: environment!.config }).returning();
+          agent!.defaultEnvironmentId = other!.id;
+        }
+        if (scenario === "canary-error") rmSync(canaryPath);
         const { default: dns } = await import("node:dns/promises");
         const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
-        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, _command, options) => {
+        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+          if (command.includes("shutil.rmtree")) return { stdout: "", stderr: "" };
+          if (scenario === "transport-error") throw new Error("SSH unavailable");
+          if (scenario === "invalid-proof") return { stdout: "{}", stderr: "" };
           const input = JSON.parse(options!.stdin!);
           if (scenario === "disabled-after-probe") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
-          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
         });
         try {
@@ -4523,10 +4590,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             const prepared = await isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! });
             expect(prepared).not.toBeNull();
             await isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target);
+            await expect(isolation.assertGitHubCandidateDispatch(db, { ...prepared!, runId: randomUUID() }, prepared!.target)).rejects.toThrow("github_candidate_isolation_unavailable");
             dispatch();
             expect(dispatch).toHaveBeenCalledOnce();
             expect(prepared!.env.HOME).toBe(prepared!.home);
             expect(prepared!.env.CLAUDE_CONFIG_DIR).toBe(`${prepared!.home}/.claude`);
+            const beforeReplay = probe.mock.calls.length;
+            await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow("github_candidate_isolation_replayed");
+            expect(probe).toHaveBeenCalledTimes(beforeReplay);
             await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, remoteCwd: "/primary" })).rejects.toThrow();
             await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, githubCandidateIsolation: undefined })).rejects.toThrow();
             const originalCertificate = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS!;
@@ -4541,13 +4612,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow(/github_candidate_/);
             expect(dispatch).not.toHaveBeenCalled();
           }
-          expect(probe).toHaveBeenCalledTimes(["uncertified", "disabled"].includes(scenario) ? 0 : 1);
+          expect(probe.mock.calls.filter(([, command]) => !command.includes("shutil.rmtree"))).toHaveLength(["uncertified", "wrong-environment", "canary-error", "disabled"].includes(scenario) ? 0 : 1);
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
           const receipt = enrollment!.isolationTests[run!.id];
           if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe") {
             expect(receipt).toMatchObject({ runId: run!.id, environmentId: environment!.id,
               status: scenario === "contaminated" ? "failed" : "passed" });
+          } else if (["transport-error", "invalid-proof", "canary-error"].includes(scenario)) {
+            expect(receipt).toMatchObject({ status: "error" });
+            const [unavailable] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+            expect(unavailable).toMatchObject({ state: "unavailable", lastError: "github_candidate_isolation_error" });
           } else expect(receipt).toBeUndefined();
+          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true });
           if (receipt) {
             await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: {} })
               .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
@@ -4578,7 +4654,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         }
       },
     );
-    it.each(["certified", "disabled-at-dispatch", "contaminated"] as const)(
+    it("paired admission cannot replace an existing seed on direct retry", async () => {
+      const { admitGitHubPair } = await import("../services/chat-github-shadow.js");
+      const { isNull } = await import("drizzle-orm");
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "duplicate-seed-guard", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), isNull(chatDeliveries.githubShadowLabel)));
+      const seed = delivery!.normalizedEvent.githubPairingSeed as { envelope: import("@paperclipai/db").GitHubReviewEnrollmentEnvelope; revision: number };
+      expect(seed).toBeDefined();
+      const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.id, delivery!.conversationId!));
+      await expect(db.transaction(tx => admitGitHubPair(tx, { endpoint: f.endpoint, deliveryId: delivery!.id, conversation: conversation!,
+        event: seed.envelope.event, request: "MUST_NOT_REPLACE", policy: seed.envelope.policy, revision: seed.revision,
+        authority: seed.envelope.authority, snapshot: seed.envelope.snapshot }))).resolves.toBeUndefined();
+      const [after] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+      expect(after!.normalizedEvent.githubPairingSeed).toEqual(seed);
+    });
+    it.each(["certified", "disabled-at-dispatch", "contaminated", "changed-realization"] as const)(
       "paired certified heartbeat %s reaches only the permitted adapter",
       async scenario => {
         const { environments, chatGitHubReviewEnrollments } = await import("@paperclipai/db");
@@ -4587,6 +4678,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const runtimeModule = await import("../services/environment-runtime.js");
         const { getServerAdapter } = await import("../adapters/registry.js");
         const { githubIsolationConfigurationDigest } = await import("../services/chat-github-runtime-isolation.js");
+        const targetModule = await import("../services/environment-execution-target.js");
+        const originalResolve = targetModule.resolveEnvironmentExecutionTarget;
+        let realized = false;
+        const targetSpy = vi.spyOn(targetModule, "resolveEnvironmentExecutionTarget").mockImplementation(async input => {
+          const target = await originalResolve(input);
+          return scenario === "changed-realization" && realized && target?.kind === "remote" && target.transport === "ssh"
+            ? { ...target, spec: { ...target.spec, host: "changed.invalid" } } : target;
+        });
         const originalRuntime = runtimeModule.environmentRuntimeService;
         const runtimeSpy = vi.spyOn(runtimeModule, "environmentRuntimeService").mockImplementation((...args) => {
           const runtime = originalRuntime(...args);
@@ -4598,11 +4697,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           }, realizeWorkspace: async input => {
             if (input.environment.driver !== "ssh") return runtime.realizeWorkspace(input);
             if (scenario === "disabled-at-dispatch") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+            realized = true;
             return { cwd: "/home/paperclip-shadow/work", metadata: {} };
           } };
         });
         const heartbeat = heartbeatService(db);
-        const f = await pairedReviewFixture({ wakeup: heartbeat.wakeup });
+        const { agentTaskSessions } = await import("@paperclipai/db");
+        const f = await pairedReviewFixture({ wakeup: async (...args: Parameters<typeof heartbeat.wakeup>) => {
+          if (args[0] === f.replacementAgentId) {
+            const context = args[1]?.contextSnapshot as Record<string, unknown>;
+            expect(typeof context.taskKey).toBe("string");
+            await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+              adapterType: "claude_local", taskKey: String(context.taskKey), sessionDisplayId: "11111111-1111-4111-8111-111111111111",
+              sessionParamsJson: { sessionId: "11111111-1111-4111-8111-111111111111", canary: "PRIMARY_SESSION_CANARY", cwd: "/home/paperclip-shadow/work" } }).onConflictDoNothing();
+          }
+          return heartbeat.wakeup(...args);
+        } });
         const scratch = mkdtempSync(path.join(os.tmpdir(), "certified-heartbeat-"));
         const canaryPath = path.join(scratch, "primary-answer");
         const provisionMarker = path.join(scratch, "UNSAFE_PROVISION_RAN");
@@ -4624,7 +4734,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
           if (!options?.stdin || !command.includes("python3")) return { stdout: "", stderr: "" };
           const input = JSON.parse(options.stdin);
-          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true } }), stderr: "" };
         });
         const originalAdapter = getServerAdapter("claude_local");
@@ -4636,6 +4746,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(env.CLAUDE_CONFIG_DIR).toBe(`${env.HOME}/.claude`);
             expect(input.runtime.sessionId).toBeNull();
             expect(input.runtime.sessionParams).toBeNull();
+            expect(input.runtime.sessionDisplayId).toBeNull();
+            expect(input.config.extraArgs).toEqual(["--disallowedTools", "WebSearch", "WebFetch"]);
             expect(input.authToken).toBeTruthy();
             // The connection broker is NOT the review gateway: it can request
             // new external access and is mounted before the normal API boundary.
@@ -4666,9 +4778,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(input.config.cwd).not.toBe(scratch);
             expect(existsSync(provisionMarker)).toBe(false);
           }
-          return { exitCode: 0, signal: null, timedOut: false, summary: "isolated test result", provider: "test", model: "test" };
+          return { exitCode: 0, signal: null, timedOut: false, summary: "isolated test result", provider: "test", model: "test",
+            sessionId: "CANDIDATE_TRANSCRIPT_CANARY", sessionParams: { sessionId: "CANDIDATE_TRANSCRIPT_CANARY" } };
         });
-        registerServerAdapter({ ...originalAdapter, execute });
+        registerServerAdapter({ ...originalAdapter, execute,
+          // Fault-inject a legacy display-ID fallback after the earlier reset.
+          // The final candidate dispatch seam must erase it too (M23).
+          sessionCodec: { ...originalAdapter.sessionCodec!, getDisplayId: params =>
+            originalAdapter.sessionCodec!.getDisplayId?.(params) ?? "11111111-1111-4111-8111-111111111111" },
+        });
         try {
           await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
           await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { engine: "cli" },
@@ -4685,6 +4803,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.replacementAgentId));
           expect(runs).toHaveLength(1);
           expect(runs[0]).toMatchObject(scenario === "certified" ? { status: "succeeded" } : { status: "failed", errorCode: "configuration_incomplete" });
+          if (scenario === "changed-realization") expect(runs[0]!.error).toContain("SSH realization changed");
+          if (scenario === "certified") {
+            const sessions = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.replacementAgentId));
+            expect(sessions).toHaveLength(1);
+            // Persisting this arm's own result is allowed; the old session must
+            // never reach the adapter or survive as a resumable next-turn value.
+            expect(sessions[0]!.sessionDisplayId).toBe("CANDIDATE_TRANSCRIPT_CANARY");
+            expect(JSON.stringify(sessions[0]!.sessionParamsJson)).not.toContain("PRIMARY_SESSION_CANARY");
+          }
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
           expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed",
             hooksDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -4697,10 +4824,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(capability?.enrollment?.envelope.comparisonEligibility).toEqual({ certifiedClean: true, reasons: [] });
           }
           expect(existsSync(provisionMarker)).toBe(false);
+          expect(probe.mock.calls.filter(([, command]) => command.includes("shutil.rmtree"))).toHaveLength(1);
         } finally {
           await heartbeat.drainActiveRunExecutions();
           registerServerAdapter(originalAdapter);
-          probe.mockRestore(); lookup.mockRestore(); runtimeSpy.mockRestore();
+          probe.mockRestore(); lookup.mockRestore(); runtimeSpy.mockRestore(); targetSpy.mockRestore();
           if (oldCertificate === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
           else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = oldCertificate;
           if (oldApi === undefined) delete process.env.PAPERCLIP_API_URL;

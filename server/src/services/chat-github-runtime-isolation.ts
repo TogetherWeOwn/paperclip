@@ -86,9 +86,11 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
     checks["githubDenied"] = bool(blocked) and all(blocked)
     try:
         os.mkdir(p["home"], 0o700)
+        with open(os.path.join(p["home"], ".probe-owner"), "x") as owner: owner.write(p["nonce"])
         for child in (".claude", ".config", ".cache", ".local", "tmp", "workspace"):
             os.mkdir(os.path.join(p["home"], child), 0o700)
-        checks["configFresh"] = not os.listdir(os.path.join(p["home"], ".claude"))
+        siblings = [name for name in os.listdir(os.path.dirname(p["home"])) if name != os.path.basename(p["home"])]
+        checks["configFresh"] = not siblings and not os.listdir(os.path.join(p["home"], ".claude"))
     except OSError:
         pass
 hooks_digest = None
@@ -107,8 +109,19 @@ if all(checks.values()) and p.get("hooks"):
 print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "hooksDigest": hooks_digest}))
 `;
 
+export const GITHUB_ISOLATION_CLEANUP = `import os, shutil, sys
+home, nonce = sys.argv[1:3]
+if os.path.isdir(home) and not os.path.islink(home):
+    try:
+        with open(os.path.join(home, ".probe-owner")) as owner: owned = owner.read() == nonce
+    except OSError:
+        owned = False
+    if owned: shutil.rmtree(home)
+`;
+
 export interface PreparedGitHubCandidateRuntime {
   companyId: string;
+  cleanupNonce: string;
   runId: string;
   candidateId: string;
   enrollmentId: string;
@@ -155,6 +168,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   const { run, agent } = input;
   const boundary = await githubCandidateRunBoundary(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id });
   if (!boundary) return null; // Primary never consults certification, SSH, or the switch.
+  // A replay must not probe or remove the live namespace of the original run.
+  if (Object.hasOwn(boundary.enrollment.isolationTests, run.id)) refuse("github_candidate_isolation_replayed");
   if (!(await githubCandidateMayWake(db, boundary.candidate))) refuse("github_candidate_disabled");
   const certificate = githubIsolationCertificates().find(c => c.companyId === run.companyId && c.environmentId === agent.defaultEnvironmentId);
   // Only the existing Claude SSH adapter is certified by this contract. Other
@@ -172,6 +187,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
   let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false };
+  let proofReceived = false;
   try {
     for (const canary of certificate.primaryCanaries) {
       const bytes = await fs.readFile(canary.serverPath);
@@ -187,45 +203,72 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       timeoutMs: 15_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
-    if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home || proof.hooksDigest !== hooks.digest) throw new Error("probe_binding_mismatch");
-    checks = { primaryCanariesDenied: proof.checks?.primaryCanariesDenied === true,
-      githubDenied: proof.checks?.githubDenied === true, configFresh: proof.checks?.configFresh === true };
-  } catch { /* A missing canary, transport failure, malformed proof or timeout voids this sample. */ }
-  const passed = Object.values(checks).every(Boolean);
+    if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
+    if (!proof.checks || Object.keys(checks).some(key => typeof proof.checks[key] !== "boolean")) throw new Error("probe_checks_malformed");
+    checks = { primaryCanariesDenied: proof.checks.primaryCanariesDenied,
+      githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh };
+    // The probe intentionally does not install hooks after failed confinement.
+    // A bound negative proof remains contamination, not a missing-hook outage.
+    if (Object.values(checks).every(Boolean) && proof.hooksDigest !== hooks.digest) throw new Error("probe_hooks_mismatch");
+    proofReceived = true;
+  } catch { /* Infrastructure errors are missing evidence, not demonstrated contamination. */ }
+  const passed = proofReceived && Object.values(checks).every(Boolean);
+  const failure = proofReceived ? "github_candidate_contaminated" : "github_candidate_isolation_error";
   const receipt = { version: 1, runId: run.id, candidateId: boundary.candidate.id, armId: boundary.candidate.armId,
     environmentId: environment.id, namespace: boundary.namespace, configurationDigest: certificate.configurationDigest,
     certificateDigest: certificateDigest(certificate),
-    home, checkedAt: new Date().toISOString(), status: passed ? "passed" : "failed", checks,
+    home, checkedAt: new Date().toISOString(), status: passed ? "passed" : proofReceived ? "failed" : "error", checks,
+    // This certifies only this candidate's runtime. It never promotes the
+    // primary's non-isolated namespace or claims tool equivalence.
+    candidateRuntimeCertified: passed, disallowedTools: ["WebSearch", "WebFetch"],
+    primaryToolPolicy: boundary.enrollment.envelope.primaryToolPolicy ?? null,
     hooksDigest: hooks.digest,
     primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
-    // Stored atomically WITH the evidence below. No receipt means no certification;
-    // a different run/arm can never borrow this verdict.
     comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
       selfTestPassed: passed, primaryBlindingActive: boundary.enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
       snapshotAvailable: !!boundary.enrollment.envelope.snapshot, roundOrdinal: boundary.enrollment.roundOrdinal }) };
-  await db.transaction(async tx => {
-    // Append-once evidence. A retry cannot replace failed proof or reuse success.
-    const rows = await tx.update(chatGitHubReviewEnrollments).set({
-      isolationTests: sql`${chatGitHubReviewEnrollments.isolationTests} || ${JSON.stringify({ [run.id]: receipt })}::jsonb`,
-    }).where(and(eq(chatGitHubReviewEnrollments.companyId, run.companyId), eq(chatGitHubReviewEnrollments.id, boundary.enrollment.id),
-      sql`not (${chatGitHubReviewEnrollments.isolationTests} ? ${run.id})`)).returning({ id: chatGitHubReviewEnrollments.id });
-    if (!rows.length) refuse("github_candidate_isolation_replayed");
-    if (!passed) await tx.update(chatGitHubReviewCandidates).set({ state: "voided", lastError: "github_candidate_contaminated", nextAttemptAt: null, updatedAt: new Date() })
-      .where(and(eq(chatGitHubReviewCandidates.id, boundary.candidate.id), eq(chatGitHubReviewCandidates.companyId, run.companyId),
-        sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
-  });
-  if (!passed) refuse("github_candidate_contaminated");
-  const prepared: PreparedGitHubCandidateRuntime = {
-    companyId: run.companyId, runId: run.id, candidateId: boundary.candidate.id, enrollmentId: boundary.enrollment.id,
-    namespace: boundary.namespace, home, configurationDigest: certificate.configurationDigest,
-    certificateDigest: receipt.certificateDigest,
-    env: { HOME: home, CLAUDE_CONFIG_DIR: `${home}/.claude`, XDG_CONFIG_HOME: `${home}/.config`,
-      XDG_CACHE_HOME: `${home}/.cache`, XDG_DATA_HOME: `${home}/.local`, TMPDIR: `${home}/tmp` },
-    target: { ...target, githubCandidateIsolation: { namespace: boundary.namespace, home },
-      remoteCwd: `${home}/workspace`, spec: { ...target.spec, remoteCwd: `${home}/workspace` } },
-  };
-  await assertGitHubCandidateDispatch(db, prepared, prepared.target);
-  return prepared;
+  try {
+    await db.transaction(async tx => {
+      // Append-once evidence. A retry cannot replace failed proof or reuse success.
+      const rows = await tx.update(chatGitHubReviewEnrollments).set({
+        isolationTests: sql`${chatGitHubReviewEnrollments.isolationTests} || ${JSON.stringify({ [run.id]: receipt })}::jsonb`,
+      }).where(and(eq(chatGitHubReviewEnrollments.companyId, run.companyId), eq(chatGitHubReviewEnrollments.id, boundary.enrollment.id),
+        sql`not (${chatGitHubReviewEnrollments.isolationTests} ? ${run.id})`)).returning({ id: chatGitHubReviewEnrollments.id });
+      if (!rows.length) refuse("github_candidate_isolation_replayed");
+      if (!passed) await tx.update(chatGitHubReviewCandidates).set({ state: proofReceived ? "voided" : "unavailable", lastError: failure, nextAttemptAt: null, updatedAt: new Date() })
+        .where(and(eq(chatGitHubReviewCandidates.id, boundary.candidate.id), eq(chatGitHubReviewCandidates.companyId, run.companyId),
+          sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
+    });
+    if (!passed) refuse(failure);
+    const prepared: PreparedGitHubCandidateRuntime = {
+      companyId: run.companyId, runId: run.id, candidateId: boundary.candidate.id, enrollmentId: boundary.enrollment.id,
+      namespace: boundary.namespace, home, cleanupNonce: nonce, configurationDigest: certificate.configurationDigest,
+      certificateDigest: receipt.certificateDigest,
+      env: { HOME: home, CLAUDE_CONFIG_DIR: `${home}/.claude`, XDG_CONFIG_HOME: `${home}/.config`,
+        XDG_CACHE_HOME: `${home}/.cache`, XDG_DATA_HOME: `${home}/.local`, TMPDIR: `${home}/tmp` },
+      target: { ...target, githubCandidateIsolation: { namespace: boundary.namespace, home },
+        remoteCwd: `${home}/workspace`, spec: { ...target.spec, remoteCwd: `${home}/workspace` } },
+    };
+    await assertGitHubCandidateDispatch(db, prepared, prepared.target);
+    return prepared;
+  } catch (error) {
+    // Preparation can create a home and then fail before returning a handle to
+    // heartbeat. Clean that path too; leftover homes fail the next sibling probe.
+    await cleanupGitHubCandidateRuntime({ home, namespace: boundary.namespace, target, cleanupNonce: nonce }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function cleanupGitHubCandidateRuntime(prepared: Pick<PreparedGitHubCandidateRuntime, "home" | "namespace" | "target" | "cleanupNonce">) {
+  if (!/^[a-f0-9]{64}$/.test(prepared.namespace)
+    || prepared.home !== `/home/paperclip-shadow/.paperclip-runtime/isolated/${prepared.namespace}`) {
+    throw new Error("Invalid candidate cleanup namespace");
+  }
+  // rmtree does not follow nested symlinks. Never interpolate arbitrary config
+  // paths, remove siblings, or remove the shared isolated parent.
+  await runSshCommand(prepared.target.spec,
+    `python3 -c ${shellQuote(GITHUB_ISOLATION_CLEANUP)} ${shellQuote(prepared.home)} ${shellQuote(prepared.cleanupNonce)}`,
+    { timeoutMs: 15_000, maxBuffer: 8192 });
 }
 
 /** Recheck the switch, certification and durable receipt at the actual dispatch
