@@ -15,7 +15,8 @@ export function githubSnapshotDigest(value: unknown): string {
   )).digest("hex");
 }
 
-/** Capture is bounded, before the normal wake, and never retried after admission.
+/** Capture is bounded, before the candidate wake, and never retried after its admission.
+ * Primary admission and waking do not wait for candidate snapshot capture.
  * GitHub has no atomic multi-resource revision. Two identical sweeps detect
  * observed concurrent changes, not a claim of provider serializability. */
 export async function captureGitHubReviewSnapshot(

@@ -8,7 +8,7 @@ import { rememberVerifiedSlackSearchEvent, slackSearchActionToken } from "./conn
 import { slackAuthorizationRevision } from "./connectors/slack-revision.js";
 import { slackPublicationAllowed } from "./connectors/slack-access.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { admitGitHubPair, prepareGitHubPairEvent, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake } from "./chat-github-shadow.js";
+import { stageGitHubPair, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake } from "./chat-github-shadow.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
@@ -16256,20 +16256,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return;
       }
 
-      // Optional source preparation is outside SQL locks and before either arm
-      // wakes. A provider failure cannot discard the primary's accepted input.
-      let pairedEvent: Awaited<ReturnType<typeof prepareGitHubPairEvent>> = null;
-      if (endpoint.provider === "github" && !activeDelivery.githubShadowLabel) {
-        try {
-          pairedEvent = await prepareGitHubPairEvent(db, {
-            endpoint, repositoryId: String(resource.metadata?.providerRepositoryId ?? ""), repository: resource.providerResourceId,
-            threadId: thread.id, eventId: activeDelivery.providerEventId, principal: principalResolution.principal,
-            automatic: githubAutomatic?.context, manualEvent: githubManual?.event,
-          }, options.fetch ?? fetch);
-        } catch {
-          await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"source_preparation_failed"}'::jsonb` }).where(eq(chatDeliveries.id, activeDelivery.id));
-        }
-      }
+      // Candidate selection is staged with the primary below. Snapshot capture
+      // belongs exclusively to recovery, after the primary can already wake.
       const inboundActivityPublications: ActivityPublication[] = [];
       const persistTaskMutation = async (
         taskTx: DbOrTransaction,
@@ -16565,17 +16553,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             shadowLabel: taskShadowLabel,
           }).onConflictDoNothing();
         }
-        if (pairedEvent && !taskShadowLabel && (githubManual || githubAutomatic)) {
+        if (!taskShadowLabel && (githubManual || githubAutomatic)) {
           try {
-            // PostgreSQL errors poison their transaction. Isolate the ENTIRE
-            // optional pairing write, not just its enrollment projection.
-            await (taskTx as DbTransaction).transaction(pairTx => admitGitHubPair(pairTx, {
-              endpoint: taskEndpoint, deliveryId: activeDelivery.id, conversation, event: pairedEvent.event,
-              snapshot: pairedEvent.snapshot, snapshotFailure: pairedEvent.snapshotFailure, unavailableEvent: pairedEvent.unavailableEvent,
-              request: comment.body, policy: (githubManual ?? githubAutomatic)!.policy,
+            // This savepoint stores only the immutable sampling decision. No
+            // candidate provider read or materialization can delay the primary.
+            await (taskTx as DbTransaction).transaction(pairTx => stageGitHubPair(pairTx, {
+              endpoint: taskEndpoint, deliveryId: activeDelivery.id, repository: resource.providerResourceId,
               revision: (githubManual ?? githubAutomatic)!.revision,
-              authority: { guest: !principalResolution.userId, responsibleUserId: taskUserId,
-                sponsorUserId: !principalResolution.userId ? taskEndpoint.sponsorUserId : null },
             }));
           } catch {
             await taskTx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"pair_admission_failed"}'::jsonb` })
@@ -28053,7 +28037,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       : Promise.allSettled([
           processPendingSlackBoardMessages(limit),
           processPendingGitHubWebhookIngress(limit),
-          recoverGitHubReviewCandidates(db, { limit: Math.min(limit, 5), stage: stageInboundWakeup, wake: processInboundWakeup }),
           processPendingProviderEffects(limit),
           processPendingReceiptReactions(limit),
           processPendingSlackSessionStops(limit),
@@ -28184,6 +28167,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // explicitly replay one delivery skip these global sweeps entirely.
     if (actionRecovery) await actionRecovery;
     const reactionCount = await reactionRecovery;
+    // Drain primary admission/wakes before even starting candidate capture. The
+    // candidate's endpoint lock must not race its primary wake authorization.
+    if (!onlyDeliveryId) {
+      await recoverGitHubReviewCandidates(db, { limit: Math.min(limit, 5), fetch: fetchImpl, stage: stageInboundWakeup, wake: processInboundWakeup })
+        .catch(error => logger.warn({ error: redactError(error) }, "GitHub candidate recovery deferred"));
+    }
     if (ordinaryFailed) throw ordinaryError;
     return reactionCount + rows.length;
   }

@@ -4,7 +4,7 @@ import { captureGitHubReviewSnapshot } from "./chat-github-review-snapshot.js";
 import {
   agents, chatActions, chatConversations, chatDeliveries, chatEndpoints, chatGitHubConfigurations,
   chatGitHubReviewArms, chatGitHubReviewCandidates, chatGitHubReviewEnrollments,
-  chatGitHubReviews, chatMessageLinks, heartbeatRuns, issues,
+  chatGitHubReviews, chatMessageLinks, chatEndpointResources, issueComments, heartbeatRuns, issues,
   type Db, type GitHubReviewEnrollmentEnvelope,
 } from "@paperclipai/db";
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
@@ -41,19 +41,57 @@ async function selectedGitHubPairArms(db: Store, endpoint: Endpoint,
   });
 }
 
+interface PendingPair {
+  version: 1;
+  revision: number;
+  providerEventId: string;
+  arms: Array<{ id: string; agentId: string; label: string }>;
+}
+
+/** Primary admission records selection only. No provider I/O or snapshot work is
+ * allowed on the primary task/comment/wake transaction's critical path. */
+export async function stageGitHubPair(tx: Tx, input: {
+  endpoint: Endpoint; deliveryId: string; repository: string; revision: number;
+}) {
+  if (!(await githubShadowEnabled(tx))) return;
+  const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, input.deliveryId));
+  if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed || delivery.normalizedEvent.githubPairingPending) return;
+  const [config] = await tx.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
+  if (!config || config.configuration.shadow?.enabled) return;
+  const arms = await selectedGitHubPairArms(tx, input.endpoint, config, delivery.providerEventId, input.repository);
+  if (!arms.length) return;
+  const pending: PendingPair = { version: 1, revision: input.revision, providerEventId: delivery.providerEventId,
+    arms: arms.map(({ id, agentId, label }) => ({ id, agentId, label })) };
+  await tx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubPairingPending: pending })}::jsonb` })
+    .where(eq(chatDeliveries.id, delivery.id));
+}
+
 export async function prepareGitHubPairEvent(db: Db, input: {
   endpoint: Endpoint; repositoryId: string; repository: string; threadId: string;
   eventId: string; principal: { externalId: string; handle: string | null };
   automatic?: GitHubReviewEventContext; manualEvent?: "mention" | "comment";
+  pending?: PendingPair;
 }, fetchImpl: typeof fetch): Promise<Pick<GitHubReviewEnrollmentEnvelope, "event" | "unavailableEvent" | "snapshot" | "snapshotFailure"> | null> {
   if (!(await githubShadowEnabled(db))) return null;
-  const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
-  if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
-  // Use the exact admission draw before minting a token or reading GitHub. An
-  // unsampled primary must not pay for the candidate's two snapshot sweeps.
-  if (!(await selectedGitHubPairArms(db, input.endpoint, config, input.eventId, input.repository)).length) return null;
+  if (!input.pending) {
+    const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
+    if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
+    if (!(await selectedGitHubPairArms(db, input.endpoint, config, input.eventId, input.repository)).length) return null;
+  }
   const captureDeadline = AbortSignal.timeout(15_000);
-  const boundedFetch: typeof fetch = (url, init) => fetchImpl(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline });
+  // Also bound transports that ignore AbortSignal. Never let one candidate's
+  // stalled read hold the recovery sweep forever; late responses are discarded.
+  const boundedFetch: typeof fetch = async (url, init) => {
+    const signal = init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline;
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try { return await Promise.race([fetchImpl(url, { ...init, signal }), cancelled]); }
+    finally { signal.removeEventListener("abort", abort); }
+  };
   const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(input.threadId);
   if (!match || match[1]!.toLowerCase() !== input.repository.toLowerCase()) return null;
   const unavailableEvent: NonNullable<GitHubReviewEnrollmentEnvelope["unavailableEvent"]> = {
@@ -118,8 +156,8 @@ async function projectSeed(tx: Tx, delivery: typeof chatDeliveries.$inferSelect,
   }).onConflictDoNothing();
 }
 
-/** Called under the existing authenticated endpoint/task mutation lock. The seed
- * is the durable fallback outbox if optional projection fails in its savepoint. */
+/** Candidate recovery holds the endpoint lock only after capture. The seed is
+ * the durable fallback outbox if optional projection fails in its savepoint. */
 export async function admitGitHubPair(tx: Tx, input: {
   endpoint: Endpoint; deliveryId: string; conversation: typeof chatConversations.$inferSelect;
   event: GitHubReviewEventContext | null; unavailableEvent?: GitHubReviewEnrollmentEnvelope["unavailableEvent"];
@@ -131,10 +169,11 @@ export async function admitGitHubPair(tx: Tx, input: {
   if (!(await githubShadowEnabled(tx))) return;
   const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, input.deliveryId));
   if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed) return;
-  const [config] = await tx.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
-  if (!config || config.configuration.shadow?.enabled) return;
-  const selected = await selectedGitHubPairArms(tx, input.endpoint, config, delivery.providerEventId,
-    (input.event ?? input.unavailableEvent)?.repository ?? "");
+  const pending = delivery.normalizedEvent.githubPairingPending as PendingPair | undefined;
+  if (!pending || pending.providerEventId !== delivery.providerEventId) return;
+  // Selection is frozen with primary admission, never redrawn after a config
+  // change. Retired/disabled arms remain in the denominator but cannot wake.
+  const selected = pending.arms;
   if (!selected.length) return;
   const e = input.event ?? input.unavailableEvent;
   if (!e) throw new Error("paired_review_event_identity_missing");
@@ -173,6 +212,7 @@ export async function admitGitHubPair(tx: Tx, input: {
     };
   }
   const [primaryAgent] = await tx.select().from(agents).where(and(eq(agents.id, input.endpoint.assignedAgentId!), eq(agents.companyId, input.endpoint.companyId)));
+  const { githubPairingPending: _pending, githubPairingCapture: _capture, ...normalizedEvent } = delivery.normalizedEvent;
   const seed: Seed = {
     version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
     pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, input.event?.headSha ?? null, input.event?.baseSha ?? null, roundOrdinal, input.revision, digest(input.policy)]),
@@ -185,15 +225,15 @@ export async function admitGitHubPair(tx: Tx, input: {
         configDigest: digest(primaryAgent.adapterConfig), effectiveToolsVerified: false } : undefined,
       request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
       snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
-      normalizedEvent: delivery.normalizedEvent,
+      normalizedEvent,
       conversation: { resourceId: input.conversation.resourceId, externalConversationId: input.conversation.externalConversationId,
         externalThreadId: input.conversation.externalThreadId, externalLabel: input.conversation.externalLabel,
         providerUrl: input.conversation.providerUrl, communicationGuidance: input.conversation.communicationGuidance } },
     arms: selected.map(a => ({ id: a.id, agentId: a.agentId, label: a.label, nativeDeliveryId: randomUUID() })),
   };
-  await tx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubPairingSeed: seed })}::jsonb` }).where(eq(chatDeliveries.id, delivery.id));
+  await tx.update(chatDeliveries).set({ normalizedEvent: sql`(${chatDeliveries.normalizedEvent} - 'githubPairingPending' - 'githubPairingCapture') || ${JSON.stringify({ githubPairingSeed: seed })}::jsonb` }).where(eq(chatDeliveries.id, delivery.id));
   try { await tx.transaction(inner => projectSeed(inner, delivery, seed)); }
-  catch { /* Seed committed with the primary; recovery never needs a result. */ }
+  catch { /* Seed committed independently; projection recovery needs no live reads. */ }
 }
 
 /** The one exact native capability resolver. Configuration alone grants nothing. */
@@ -252,12 +292,86 @@ export async function githubCandidateMayWake(db: Store, candidate: Candidate): P
     && config?.configuration.shadowRoutes?.some(r => r.enabled && r.agentId === candidate.agentId && r.label === candidate.shadowLabel) === true;
 }
 
+async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch) {
+  const pendingRows = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'
+    and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')
+    and ${chatDeliveries.githubShadowLabel} is null
+    and exists (select 1 from chat_actions a where a.delivery_id = ${chatDeliveries.id}
+      and a.kind = 'inbound_wakeup' and a.status = 'processed'
+      and a.result->>'code' in ('inbound_wakeup_durable', 'inbound_wakeup_already_durable'))
+    and (not (${chatDeliveries.normalizedEvent} ? 'githubPairingCapture')
+      or (${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'startedAt')::timestamptz <= ${new Date(Date.now() - 30_000).toISOString()}::timestamptz)`)
+    .orderBy(asc(chatDeliveries.receivedAt), asc(chatDeliveries.id)).limit(limit);
+  for (const row of pendingRows) {
+    try {
+      const claim = await db.transaction(async tx => {
+        const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, row.id)).for("update", { skipLocked: true });
+        if (!delivery || delivery.normalizedEvent.githubPairingSeed || !delivery.normalizedEvent.githubPairingPending) return null;
+        const previous = delivery.normalizedEvent.githubPairingCapture as { id: string; startedAt: string } | undefined;
+        if (previous && Date.now() - Date.parse(previous.startedAt) < 30_000) return null;
+        const capture = { id: randomUUID(), startedAt: new Date().toISOString() };
+        await tx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubPairingCapture: capture })}::jsonb` })
+          .where(eq(chatDeliveries.id, delivery.id));
+        return { delivery, capture, interrupted: !!previous };
+      });
+      if (!claim) continue;
+      const { delivery } = claim;
+      const pending = delivery.normalizedEvent.githubPairingPending as PendingPair;
+      const [source] = await db.select({ endpoint: chatEndpoints, conversation: chatConversations, resource: chatEndpointResources, comment: issueComments })
+        .from(chatMessageLinks).innerJoin(chatEndpoints, eq(chatEndpoints.id, chatMessageLinks.endpointId))
+        .innerJoin(chatConversations, eq(chatConversations.id, chatMessageLinks.conversationId))
+        .innerJoin(chatEndpointResources, eq(chatEndpointResources.id, chatConversations.resourceId))
+        .innerJoin(issueComments, eq(issueComments.id, chatMessageLinks.commentId))
+        .where(and(eq(chatMessageLinks.deliveryId, delivery.id), eq(chatMessageLinks.direction, "inbound"), eq(chatMessageLinks.companyId, delivery.companyId))).limit(1);
+      if (!source) continue;
+      const automatic = delivery.normalizedEvent.githubAutomatic as { context: GitHubReviewEventContext; policy: GitHubReviewPolicy } | undefined;
+      const manual = delivery.normalizedEvent.githubManual as { event: "mention" | "comment"; policy: GitHubReviewPolicy } | undefined;
+      const policy = (manual ?? automatic)?.policy;
+      const principal = delivery.normalizedEvent.principal as { externalId: string; handle: string | null };
+      const authority = delivery.normalizedEvent.githubAuthority as GitHubReviewEnrollmentEnvelope["authority"];
+      const threadId = source.conversation.externalThreadId;
+      const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(threadId);
+      if (!policy || !authority || !match) continue;
+      const repositoryId = String(source.resource.metadata?.providerRepositoryId ?? "");
+      // A crashed capture is an unavailable observation, never a fresh live
+      // recapture. A pending selection that has not started may capture once.
+      const prepared = claim.interrupted ? {
+        event: automatic?.context ?? null,
+        unavailableEvent: { event: manual?.event ?? "mention" as const, deliveryId: pending.providerEventId,
+          repositoryId, repository: source.resource.providerResourceId.toLowerCase(), pullNumber: Number(match[2]),
+          sender: { id: principal.externalId, login: principal.handle ?? principal.externalId } },
+        snapshotFailure: "admission_snapshot_interrupted",
+      } : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
+        threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
+      if (!prepared) {
+        // A kill switch may land between the claim and capture. No bytes were
+        // read, so it is safe to release this claim for later recovery.
+        await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} - 'githubPairingCapture'` })
+          .where(and(eq(chatDeliveries.id, delivery.id), sql`${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'id' = ${claim.capture.id}`));
+        continue;
+      }
+      await db.transaction(async tx => {
+        const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, delivery.endpointId)).for("update");
+        const [current] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id)).for("update");
+        if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) return;
+        await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...prepared,
+          request: source.comment.body, policy, revision: pending.revision, authority });
+      });
+    } catch {
+      await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"pair_admission_failed"}'::jsonb` })
+        .where(eq(chatDeliveries.id, row.id));
+    }
+  }
+}
+
 export async function recoverGitHubReviewCandidates(db: Db, input: {
   limit: number;
+  fetch?: typeof fetch;
   stage: (tx: Tx, source: { endpoint: Endpoint; deliveryId: string; conversation: typeof chatConversations.$inferSelect; commentId: string; principalId: string; actorUserId: string | null; agentId: string }) => Promise<void>;
   wake: (deliveryId: string) => Promise<boolean>;
 }) {
   if (!(await githubShadowEnabled(db))) return 0;
+  await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
   const seeds = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed' and not exists (select 1 from chat_github_review_enrollments e where e.origin_delivery_id = ${chatDeliveries.id})`).limit(input.limit);
   for (const delivery of seeds) {
     try { await db.transaction(tx => projectSeed(tx, delivery, delivery.normalizedEvent.githubPairingSeed as Seed)); }
