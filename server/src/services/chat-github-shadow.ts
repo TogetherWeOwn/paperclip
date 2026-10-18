@@ -18,6 +18,8 @@ import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
 import { githubComparisonEligibility, githubPrimaryInputSource, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 import { githubPairRunEvidence } from "./chat-github-run-evidence.js";
+import { githubShadowCaptureClaimStaleMs, githubShadowCaptureWindowMs } from "./chat-github-shadow-timing.js";
+import { logger } from "../middleware/logger.js";
 
 // Re-export the exact application builders; their implementation lives in the
 // DB package so its EXPLAIN tests remain within that package's TypeScript root.
@@ -93,8 +95,9 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     if (!(await selectedGitHubPairArms(db, input.endpoint, config, input.eventId, input.repository)).length) return null;
   }
   // The deadline belongs to admission, not the time a delayed worker starts.
-  const remaining = input.pending ? Date.parse(input.pending.admittedAt) + PAIR_CAPTURE_WINDOW_MS - Date.now() : PAIR_CAPTURE_WINDOW_MS;
-  const captureWindowMs = Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0;
+  const windowMs = githubShadowCaptureWindowMs();
+  const remaining = input.pending ? Date.parse(input.pending.admittedAt) + windowMs - Date.now() : windowMs;
+  const captureWindowMs = Number.isFinite(remaining) ? Math.max(0, Math.min(windowMs, remaining)) : 0;
   const captureDeadline = AbortSignal.timeout(captureWindowMs);
   // Also bound transports that ignore AbortSignal. Never let one candidate's
   // stalled read hold the recovery sweep forever; late responses are discarded.
@@ -348,9 +351,9 @@ export async function sealGitHubPrimaryReviewInputs(db: Db, run: typeof heartbea
     else if (!seed && delivery.normalizedEvent.githubPairingPending) {
       let stopped = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
-      // The worker owns its 15s admission deadline; timing out this waiter must
-      // not cancel an otherwise valid candidate snapshot.
-      void capturePendingGitHubPairs(db, 1, fetchImpl, delivery.id).catch(() => {});
+      // The worker owns its admission deadline (capture window); timing out this
+      // waiter must not cancel an otherwise valid candidate snapshot.
+      void capturePendingGitHubPairs(db, 1, fetchImpl, { deliveryId: delivery.id, trigger: "first_read" }).catch(() => {});
       const observe = async () => {
         while (!stopped) {
           const [current] = await db.select({ event: chatDeliveries.normalizedEvent }).from(chatDeliveries)
@@ -438,8 +441,6 @@ async function failGitHubPairCapture(db: Store, deliveryId: string, capture: Pai
     sql`${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'id' = ${capture.id}`));
 }
 
-const PAIR_CAPTURE_WINDOW_MS = 15_000;
-
 async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$inferSelect, pending: PendingPair) {
   if (pending.disabled || !(await githubShadowEnabled(db))) return "admission_snapshot_disabled";
   // xmin changes on every committed settings rewrite, including an off/on pair
@@ -448,7 +449,7 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
   const [settings] = await db.execute(sql`select xmin::text as epoch from instance_settings where singleton_key = 'default'`);
   if (!pending.settingsEpoch || pending.settingsEpoch !== settings?.epoch) return "admission_snapshot_disabled";
   const admittedAt = Date.parse(pending.admittedAt);
-  if (!Number.isFinite(admittedAt) || admittedAt > Date.now() || Date.now() - admittedAt > PAIR_CAPTURE_WINDOW_MS)
+  if (!Number.isFinite(admittedAt) || admittedAt > Date.now() || Date.now() - admittedAt > githubShadowCaptureWindowMs())
     return "admission_snapshot_late";
   const [evidence] = await db.execute<{ started: boolean }>(sql`select (
     exists (select 1 from chat_github_reviews r where r.company_id = ${delivery.companyId}
@@ -465,25 +466,39 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
   return evidence?.started ? "admission_snapshot_late" : undefined;
 }
 
-async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch, firstReadDeliveryId?: string) {
+/** Who started a capture attempt. "first_read" is the primary's own first
+ * review-tool read (it is past its wake by definition); "admission" and "sweep"
+ * both require the primary inbound wake to be durably recorded first. */
+type PairCaptureTrigger = "sweep" | "admission" | "first_read";
+
+async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch,
+  only?: { deliveryId: string; trigger: Exclude<PairCaptureTrigger, "sweep"> },
+) {
+  const trigger: PairCaptureTrigger = only?.trigger ?? "sweep";
+  const deliveryId = only?.deliveryId ?? null;
+  const staleMs = githubShadowCaptureClaimStaleMs();
   const pendingRows = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'
     and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')
     and ${chatDeliveries.githubShadowLabel} is null
-    and (${firstReadDeliveryId ?? null}::uuid is null or ${chatDeliveries.id} = ${firstReadDeliveryId ?? null}::uuid)
-    and (${firstReadDeliveryId ?? null}::uuid is not null or exists (select 1 from chat_actions a where a.delivery_id = ${chatDeliveries.id}
+    and (${deliveryId}::uuid is null or ${chatDeliveries.id} = ${deliveryId}::uuid)
+    and (${trigger === "first_read"}::boolean or exists (select 1 from chat_actions a where a.delivery_id = ${chatDeliveries.id}
       and a.kind = 'inbound_wakeup' and a.status = 'processed'
       and a.result->>'code' in ('inbound_wakeup_durable', 'inbound_wakeup_already_durable')))
     and (not (${chatDeliveries.normalizedEvent} ? 'githubPairingCapture')
-      or (${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'startedAt')::timestamptz <= ${new Date(Date.now() - 30_000).toISOString()}::timestamptz)`)
+      or (${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'startedAt')::timestamptz <= ${new Date(Date.now() - staleMs).toISOString()}::timestamptz)`)
     .orderBy(asc(chatDeliveries.receivedAt), asc(chatDeliveries.id)).limit(limit);
   for (const row of pendingRows) {
     let capture: PairCapture | undefined;
+    let admittedAt = NaN;
+    let outcome = "pair_admission_failed";
+    const claimedAt = Date.now();
+    let lockedMs: number | null = null;
     try {
       const claim = await db.transaction(async tx => {
         const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, row.id)).for("update", { skipLocked: true });
         if (!delivery || delivery.normalizedEvent.githubPairingSeed || !delivery.normalizedEvent.githubPairingPending) return null;
         const previous = delivery.normalizedEvent.githubPairingCapture as PairCapture | undefined;
-        if (previous && Date.now() - Date.parse(previous.startedAt) < 30_000) return null;
+        if (previous && Date.now() - Date.parse(previous.startedAt) < staleMs) return null;
         if (previous && previous.attempts >= MAX_PAIR_CAPTURE_ATTEMPTS) {
           await failGitHubPairCapture(tx, delivery.id, previous, previous.lastError ?? "pair_capture_interrupted");
           return null;
@@ -498,6 +513,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
       capture = claim.capture;
       const { delivery } = claim;
       const pending = delivery.normalizedEvent.githubPairingPending as PendingPair;
+      admittedAt = Date.parse(pending.admittedAt);
       const [source] = await db.select({ endpoint: chatEndpoints, conversation: chatConversations, resource: chatEndpointResources, comment: issueComments })
         .from(chatMessageLinks).innerJoin(chatEndpoints, eq(chatEndpoints.id, chatMessageLinks.endpointId))
         .innerJoin(chatConversations, eq(chatConversations.id, chatMessageLinks.conversationId))
@@ -505,7 +521,8 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         .innerJoin(issueComments, eq(issueComments.id, chatMessageLinks.commentId))
         .where(and(eq(chatMessageLinks.deliveryId, delivery.id), eq(chatMessageLinks.direction, "inbound"), eq(chatMessageLinks.companyId, delivery.companyId))).limit(1);
       if (!source) {
-        await failGitHubPairCapture(db, delivery.id, capture, "pair_source_missing");
+        outcome = "pair_source_missing";
+        await failGitHubPairCapture(db, delivery.id, capture, outcome);
         continue;
       }
       const automatic = delivery.normalizedEvent.githubAutomatic as { context: GitHubReviewEventContext; policy: GitHubReviewPolicy } | undefined;
@@ -516,7 +533,8 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
       const threadId = source.conversation.externalThreadId;
       const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(threadId);
       if (!policy || !authority || !match) {
-        await failGitHubPairCapture(db, delivery.id, capture, "pair_context_invalid");
+        outcome = "pair_context_invalid";
+        await failGitHubPairCapture(db, delivery.id, capture, outcome);
         continue;
       }
       const repositoryId = String(source.resource.metadata?.providerRepositoryId ?? "");
@@ -534,19 +552,80 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         ? unavailable(failure ?? "admission_snapshot_interrupted")
         : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
           threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
+      // Primary wake authorization takes this endpoint lock NOWAIT; record how
+      // long admission holds it (until commit) so contention is observable.
+      let lockStartedAt: number | undefined;
       await withGitHubPrimaryBlindingAdmission(db, delivery.companyId, () => db.transaction(async tx => {
+        lockStartedAt = Date.now();
         const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, delivery.endpointId)).for("update");
         const [current] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id)).for("update");
-        if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) return;
+        if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) {
+          outcome = "superseded";
+          return;
+        }
         const finalFailure = await pairCaptureFailure(tx, current, current.normalizedEvent.githubPairingPending as PendingPair);
         const sealed = finalFailure ? unavailable(finalFailure) : prepared ?? unavailable("admission_snapshot_disabled");
         await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...sealed,
           request: source.comment.body, policy, revision: pending.revision, authority });
-      }));
+        outcome = "snapshot" in sealed && sealed.snapshot ? "sealed" : sealed.snapshotFailure ?? "admission_snapshot_unavailable";
+      }).finally(() => { if (lockStartedAt !== undefined) lockedMs = Date.now() - lockStartedAt; }));
     } catch {
-      if (capture) await failGitHubPairCapture(db, row.id, capture, "pair_admission_failed");
+      outcome = "pair_admission_failed";
+      if (capture) await failGitHubPairCapture(db, row.id, capture, outcome).catch(() => undefined);
+    } finally {
+      // One line per claimed attempt so admission->seal latency is observable.
+      if (capture) logger.info({ deliveryId: row.id, trigger, outcome, attempt: capture.attempts,
+        msSinceAdmission: Number.isFinite(admittedAt) ? claimedAt - admittedAt : null,
+        msSpent: Date.now() - claimedAt, lockedMs }, "GitHub paired snapshot capture attempt");
     }
   }
+}
+
+type PairCaptureKick = (db: Db, deliveryId: string, fetchImpl: typeof fetch) => Promise<unknown>;
+const defaultPairCaptureKick: PairCaptureKick = (db, deliveryId, fetchImpl) =>
+  capturePendingGitHubPairs(db, 1, fetchImpl, { deliveryId, trigger: "admission" });
+let pairCaptureKick = defaultPairCaptureKick;
+const inflightPairCaptureKicks = new Map<string, { startedAt: number; run: Promise<void> }>();
+
+/** Test seam: replace (or restore with undefined) the kicked capture. */
+export function setGitHubPairCaptureKickForTests(kick: PairCaptureKick | undefined) {
+  pairCaptureKick = kick ?? defaultPairCaptureKick;
+}
+
+/** Start capture for exactly this delivery as soon as its primary inbound wake
+ * is durably recorded, instead of waiting for the next (possibly late) sweep.
+ * Fire-and-forget: never awaited by, and never throws into, the primary/webhook
+ * path. The capture itself re-checks the durable-wake receipt and takes the
+ * same exclusive claim as the sweep; failures are logged and left to it. */
+export function kickGitHubPairCapture(db: Db, deliveryId: string, fetchImpl: typeof fetch): void {
+  try {
+    if (inflightPairCaptureKicks.has(deliveryId)) return;
+    const kick = pairCaptureKick;
+    const run = Promise.resolve()
+      .then(() => kick(db, deliveryId, fetchImpl))
+      .then(() => undefined, error => {
+        logger.warn({ deliveryId, error: error instanceof Error ? error.message : String(error) },
+          "GitHub paired snapshot capture kick failed; recovery sweep will retry");
+      })
+      .finally(() => { inflightPairCaptureKicks.delete(deliveryId); });
+    inflightPairCaptureKicks.set(deliveryId, { startedAt: Date.now(), run });
+  } catch { /* Never fail the primary path; the sweep is the fallback. */ }
+}
+
+/** Let the sweep project/wake candidates for captures kicked in this process.
+ * Each kick is awaited at most one capture window (+5 s) from its start, so a
+ * stalled kick can never hold this or any later sweep beyond that bound. */
+export async function settleGitHubPairCaptureKicks() {
+  const boundMs = githubShadowCaptureWindowMs() + 5_000;
+  const now = Date.now();
+  const live = [...inflightPairCaptureKicks.values()].filter(kick => now - kick.startedAt < boundMs);
+  if (!live.length) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([Promise.allSettled(live.map(kick => kick.run)), new Promise<void>(resolve => {
+      timer = setTimeout(resolve, Math.max(...live.map(kick => kick.startedAt + boundMs - now)));
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 const ARTIFACT_SWEEP_INTERVAL_MS = 5 * 60_000;
@@ -592,6 +671,7 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
       .where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending' and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`);
   }
   await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
+  await settleGitHubPairCaptureKicks();
   void sweepGitHubRepositoryArtifacts(db).catch(() => undefined);
   const seeds = await githubPairSeedRecoveryQuery(db, input.limit);
   for (const delivery of seeds) {

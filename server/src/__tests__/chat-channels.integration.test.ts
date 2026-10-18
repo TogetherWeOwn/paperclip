@@ -3810,6 +3810,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(conversations.length).toBeLessThanOrEqual(1);
       return conversations[0];
     }
+    /** Model a lost or late admission kick: capture is left to the recovery
+     * sweep, so these tests exercise its fallback guards deterministically. */
+    async function deferPairCaptureToSweep() {
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      setGitHubPairCaptureKickForTests(async () => undefined);
+      onTestFinished(() => setGitHubPairCaptureKickForTests(undefined));
+    }
     async function pairedReviewFixture(overrides: Parameters<typeof reviewBotFixture>[0] = {}) {
       const oldProxyToken = process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN;
       process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN = "fixture-restricted-shadow-token";
@@ -3942,6 +3949,162 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true, selfTestPassed: true,
         primaryBlindingActive: true, snapshotAvailable: true, roundOrdinal: 1, primaryInputSource }).reasons)
         .not.toContain("primary_inputs_not_sealed");
+    });
+    const CAPTURE_ATTEMPT_LOG = "GitHub paired snapshot capture attempt";
+    async function captureAttempts() {
+      const { logger } = await import("../middleware/logger.js");
+      const info = vi.spyOn(logger, "info");
+      onTestFinished(() => info.mockRestore());
+      return () => info.mock.calls.filter(call => call[1] === CAPTURE_ATTEMPT_LOG).map(call => call[0] as Record<string, unknown>);
+    }
+    async function pairedDelivery(f: Awaited<ReturnType<typeof pairedReviewFixture>>) {
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      return delivery!;
+    }
+    it("K1 admission kick seals the pair as soon as the primary wake is durable, without a recovery sweep", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const attempts = await captureAttempts();
+      const f = await pairedReviewFixture();
+      // Single-delivery processing (the webhook path) never runs the global
+      // recovery sweep, so only the admission kick can seal this pair.
+      await deliverShadowTestMention(f, "k1-admission-kick", "@maya review this", 81);
+      await vi.waitFor(async () => {
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        expect(enrollment?.envelope.snapshot).toBeDefined();
+        expect(enrollment?.envelope.snapshotFailure).toBeUndefined();
+      }, { timeout: 10_000, interval: 50 });
+      const delivery = await pairedDelivery(f);
+      const [wake] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, delivery.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(wake).toMatchObject({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(attempts()).toEqual([expect.objectContaining({ deliveryId: delivery.id, trigger: "admission", outcome: "sealed", attempt: 1,
+        msSinceAdmission: expect.any(Number), msSpent: expect.any(Number), lockedMs: expect.any(Number) })]);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it.each(["hanging", "throwing", "rejecting"] as const)("K2 a %s admission kick never blocks or fails the primary path; the sweep recovers", async mode => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      let release: (() => void) | undefined;
+      const kick = vi.fn(mode === "hanging" ? () => new Promise<void>(resolve => { release = resolve; })
+        : mode === "throwing" ? () => { throw new Error("injected synchronous kick failure"); }
+          : async () => { throw new Error("injected kick rejection"); });
+      setGitHubPairCaptureKickForTests(kick);
+      onTestFinished(() => { release?.(); setGitHubPairCaptureKickForTests(undefined); });
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `k2-${mode}`, "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // The primary admission and wake completed while the kick hung or failed.
+      const [wake] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, delivery.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(wake).toMatchObject({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await vi.waitFor(() => expect(kick).toHaveBeenCalledWith(expect.anything(), delivery.id, expect.any(Function)));
+      expect(delivery.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(delivery.normalizedEvent.githubPairingSeed).toBeUndefined();
+      release?.();
+      setGitHubPairCaptureKickForTests(async () => undefined);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment?.envelope.snapshot).toBeDefined();
+    });
+    it("K3 a racing kick and sweep share one exclusive claim (no double capture)", async () => {
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const { kickGitHubPairCapture } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      // Queue only the primary wake: no kick has fired for this delivery yet.
+      await deliverShadowTestMention(f, "k3-race", "@maya review this", 81);
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      setGitHubPairCaptureKickForTests(undefined);
+      const delivery = await pairedDelivery(f);
+      const attempts = await captureAttempts();
+      let release!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      let reading = false;
+      installShadowRecorder(f, "b".repeat(40), async url => {
+        if (url.includes("/files?")) { reading = true; await blocked; }
+        return undefined;
+      });
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      // The kick holds the claim mid-I/O while a sweep and a duplicate kick race it.
+      await vi.waitFor(() => expect(reading).toBe(true), { timeout: 5000 });
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      const sweep = f.service.processPendingDeliveries();
+      const timer = setTimeout(release, 300);
+      try { await sweep; } finally { clearTimeout(timer); release(); }
+      expect(attempts()).toEqual([expect.objectContaining({ deliveryId: delivery.id, trigger: "admission", outcome: "sealed", attempt: 1 })]);
+      const enrollments = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollments).toHaveLength(1);
+      expect(enrollments[0]!.envelope.snapshot).toBeDefined();
+      // The sweep awaited the in-process kick, so it dispatched in the same pass.
+      expect(await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollments[0]!.id)))
+        .toMatchObject([{ state: "dispatched" }]);
+    });
+    it.each([
+      ["default 15 s", undefined, "admission_snapshot_late"],
+      ["configured 60 s", "60000", undefined],
+    ] as const)("K4 the capture window is honoured (%s) for a capture 30 s after admission", async (_label, windowMs, failure) => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const previous = process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      if (windowMs === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = windowMs;
+      onTestFinished(() => {
+        if (previous === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = previous;
+      });
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `k4-window-${windowMs ?? "default"}`, "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event,
+        '{githubPairingPending,admittedAt}', to_jsonb(${new Date(Date.now() - 30_000).toISOString()}::text)) where id = ${delivery.id}`);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment).toBeDefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe(failure);
+      if (failure) expect(enrollment!.envelope.snapshot).toBeUndefined();
+      else expect(enrollment!.envelope.snapshot).toBeDefined();
+    });
+    it("K5 a live claim younger than the configured window is never re-claimed as interrupted", async () => {
+      const previous = process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = "60000";
+      onTestFinished(() => {
+        if (previous === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = previous;
+      });
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "k5-live-claim", "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // A worker claimed 40 s ago and is still inside its 60 s window.
+      const claim = { id: randomUUID(), startedAt: new Date(Date.now() - 40_000).toISOString(), attempts: 1 };
+      await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({ githubPairingCapture: claim })}::jsonb
+        where id = ${delivery.id}`);
+      await f.service.processPendingDeliveries();
+      const current = await pairedDelivery(f);
+      expect(current.normalizedEvent.githubPairingCapture).toEqual(claim);
+      expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
+    });
+    it("K6 a kick before the primary wake is durably recorded captures nothing", async () => {
+      const { kickGitHubPairCapture, settleGitHubPairCaptureKicks, setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "k6-not-durable", "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // Model a wake that is still retrying: no durable receipt exists yet.
+      await db.execute(sql`update chat_actions set status = 'issued', result = ${JSON.stringify({ code: "inbound_wakeup_retry",
+        retryAt: new Date(Date.now() + 60_000).toISOString(), attemptCount: 1 })}::jsonb
+        where delivery_id = ${delivery.id} and kind = 'inbound_wakeup'`);
+      setGitHubPairCaptureKickForTests(undefined);
+      const attempts = await captureAttempts();
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await settleGitHubPairCaptureKicks();
+      const current = await pairedDelivery(f);
+      expect(current.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(current.normalizedEvent.githubPairingCapture).toBeUndefined();
+      expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
+      expect(attempts()).toEqual([]);
+      expect(recorder.fetches).toEqual([]);
     });
     it("P12 switch off at mention admission creates no enrollment or candidate", async () => {
       const f = await pairedReviewFixture();
@@ -4205,6 +4368,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it.each(["lagged", "disabled", "disabled-between-sweeps", "primary-published", "published-during-capture"] as const)(
       "paired capture refuses post-admission signals: %s", async scenario => {
         const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+        await deferPairCaptureToSweep();
         const f = await pairedReviewFixture();
         const primary = await deliverShadowTestMention(f, `late-snapshot-${scenario}`, "@maya review this", 81);
         const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
@@ -5544,6 +5708,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it.each(["ready", "timeout"] as const)("first primary read awaits an already-claimed capture (%s)", async outcome => {
       const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
       const { githubRunCapability, GITHUB_PRIMARY_SEAL_WAIT_MS } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       const primary = await deliverShadowTestMention(f, `seal-wait-${outcome}`, "@maya review this", 81);
       const session = await shadowTestSession(f, primary);
@@ -5596,6 +5761,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       } finally { release(); await sweep; }
     });
     it("concurrent first reads cannot overwrite the winning live receipt with a late snapshot", async () => {
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       const primary = await deliverShadowTestMention(f, "seal-concurrent-readers", "@maya review this", 81);
       const session = await shadowTestSession(f, primary);
@@ -5689,6 +5855,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     });
     it.each(["source", "authority", "exception"] as const)("terminates deferred capture after three %s failures and accounts for the missing pair", async (failure) => {
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, `capture-terminal-${failure}`, "@maya review this", 81);
       const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
@@ -5745,6 +5912,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "0", capture_failed_pairs: "0" }]);
     });
     it("terminates an interrupted third capture without starting a fourth attempt", async () => {
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "interrupted-final-capture", "@maya review this", 81);
       const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
@@ -5761,6 +5929,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(recorder.fetches).toEqual([]);
     });
     it("interrupted deferred capture stays unavailable instead of recapturing later provider bytes", async () => {
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "interrupted-capture", "@maya review this", 81);
       await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({
@@ -5776,6 +5945,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     it("deferred candidate snapshot refuses capture after primary publication", async () => {
       const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       const head = "b".repeat(40);
       const primary = await deliverShadowTestMention(f, "primary-published-before-capture", "@maya review this", 81);
