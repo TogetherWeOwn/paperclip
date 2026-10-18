@@ -7,7 +7,59 @@ import { notFound } from "../errors.js";
  * admitted candidate data stays private after cancellation, retirement or disable. */
 export const GITHUB_PRIMARY_BLINDING_VERSION = 1;
 
-export async function githubPrimaryBlinding(db: Db, companyId: string) {
+type Visibility = ReturnType<typeof createGitHubPrimaryVisibility>;
+type CachedVisibility = { version: string; value: Promise<Visibility | null> };
+const visibilityCaches = new WeakMap<Db, Map<string, CachedVisibility>>();
+const MAX_CACHED_COMPANIES = 64;
+
+async function visibilityVersion(db: Db, companyId: string) {
+  // The covering candidate index and the single-row epoch lookup never touch run
+  // history. The epoch also covers aliases created AFTER candidate materialization.
+  const [row] = await db.execute<{ count: string; updated: string | null; epoch: string }>(sql`
+    select count(*)::text as count, max(updated_at)::text as updated,
+      coalesce((select version::text from chat_github_blinding_versions where company_id = ${companyId}), '0') as epoch
+    from chat_github_review_candidates where company_id = ${companyId}`);
+  if (!row) throw new Error("Review visibility version unavailable");
+  return { key: `${row.count}/${row.updated}/${row.epoch}`, empty: row.count === "0" };
+}
+
+/** No TTL: a stale privacy cache can leak a newly admitted candidate. Every
+ * boundary checks the indexed version, sharing only construction of that exact
+ * version. Failed constructions are evicted; all errors fail closed rather than
+ * serving a stale snapshot. */
+export async function githubPrimaryBlinding(db: Db, companyId: string): Promise<Visibility> {
+  let cache = visibilityCaches.get(db);
+  if (!cache) { cache = new Map(); visibilityCaches.set(db, cache); }
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const version = await visibilityVersion(db, companyId);
+    let entry = cache.get(companyId);
+    if (entry?.version !== version.key) {
+      entry = { version: version.key, value: version.empty
+        ? Promise.resolve(createGitHubPrimaryVisibility(new Set(), []))
+        : loadGitHubPrimaryVisibility(db, companyId) };
+      cache.delete(companyId);
+      cache.set(companyId, entry);
+      if (cache.size > MAX_CACHED_COMPANIES) cache.delete(cache.keys().next().value!);
+      // Multiple SELECTs build the token set. A write during construction must
+      // not publish a partial snapshot under the new epoch.
+      entry.value = entry.value.then(async value => {
+        if (!version.empty && (await visibilityVersion(db, companyId)).key !== version.key) return null;
+        return value;
+      });
+    }
+    try {
+      const value = await entry.value;
+      if (value) return value;
+      if (cache.get(companyId) === entry) cache.delete(companyId);
+    } catch (error) {
+      if (cache.get(companyId) === entry) cache.delete(companyId);
+      throw error;
+    }
+  }
+  throw new Error("Review visibility changed during snapshot construction");
+}
+
+async function loadGitHubPrimaryVisibility(db: Db, companyId: string) {
   const candidates = await db.select({ id: chatGitHubReviewCandidates.id, issueId: chatGitHubReviewCandidates.issueId,
     commentId: chatGitHubReviewCandidates.commentId, conversationId: chatGitHubReviewCandidates.conversationId,
     deliveryId: chatGitHubReviewCandidates.nativeDeliveryId, agentId: chatGitHubReviewCandidates.agentId,
@@ -16,13 +68,21 @@ export async function githubPrimaryBlinding(db: Db, companyId: string) {
     .where(eq(chatGitHubReviewCandidates.companyId, companyId));
   const tokens = new Set(candidates.flatMap(c => Object.values(c).filter((v): v is string => !!v)));
   if (candidates.length) {
+    const agentIds = [...new Set(candidates.map(c => c.agentId))];
+    const issueIds = [...new Set(candidates.flatMap(c => c.issueId ? [c.issueId] : []))];
     const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), sql`exists (select 1 from chat_github_review_candidates c
-        where c.company_id = ${companyId} and (c.agent_id = ${heartbeatRuns.agentId}
-        or c.issue_id::text = coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')))`));
+      eq(heartbeatRuns.companyId, companyId), or(
+        inArray(heartbeatRuns.agentId, agentIds),
+        inArray(heartbeatRuns.nativeIssueId, issueIds),
+        // Preserve legacy COALESCE precedence without wrapping indexed columns.
+        // Both JSON expressions already have company-prefixed indexes.
+        and(sql`${heartbeatRuns.nativeIssueId} is null`, or(
+          inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'`, issueIds),
+          and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'taskId'`, issueIds)),
+        )),
+      )));
     for (const run of runs) tokens.add(run.id);
-    const agentIds = candidates.map(c => c.agentId);
-    const issueIds = candidates.flatMap(c => c.issueId ? [c.issueId] : []);
     const identifiers = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
     for (const row of identifiers) if (row.identifier) tokens.add(row.identifier);
     // Deny aliases as well as issue/run paths, including raw attachment downloads
@@ -42,11 +102,37 @@ export async function githubPrimaryBlinding(db: Db, companyId: string) {
     for (const row of [...comments, ...attachments, ...candidateAssets, ...reviews, ...candidateDocuments, ...revisions])
       for (const id of Object.values(row)) tokens.add(id);
   }
-  // Match whole IDs: hiding TOG-2 must not also hide the primary's TOG-20.
-  const references = tokens.size ? new RegExp(`(^|[^a-z0-9_-])(?:${[...tokens].map(token => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![a-z0-9_-])`, "i") : null;
+  return createGitHubPrimaryVisibility(tokens, [...new Set(candidates.map(c => c.agentId))]);
+}
+
+export function createGitHubPrimaryVisibility(tokens: ReadonlySet<string>, candidateAgentIds: string[]) {
+  // Preserve the former non-Unicode /i regex's canonicalization, including its
+  // ASCII word boundaries. Whole-string lowercasing turns a Kelvin sign into k
+  // and can wrongly unhide a UUID beside it; expanding ß also shifts offsets.
+  const fold = (text: string) => /[^\x00-\x7f]/.test(text)
+    ? text.replace(/[\s\S]/g, char => {
+      const upper = char.toUpperCase();
+      return upper.length === 1 && !(char.charCodeAt(0) >= 128 && upper.charCodeAt(0) < 128) ? upper : char;
+    })
+    : text.toUpperCase();
+  const references = new Set([...tokens].map(fold));
+  const lengths = [...new Set([...references].map(token => token.length))];
+  const word = (char: string | undefined) => char !== undefined && /[a-z0-9_-]/i.test(char);
   const containsReference = (text: string) => {
+    if (!references.size) return false;
     try { text = decodeURIComponent(text); } catch { /* Not a URL-encoded value. */ }
-    return references?.test(text) ?? false;
+    text = fold(text);
+    // Match whole IDs via set membership, not a history-sized alternation regex.
+    // Length buckets also preserve identifiers containing punctuation. TOG-2
+    // must never hide TOG-20, nor a UUID embedded in a larger token.
+    for (let start = 0; start < text.length; start++) {
+      if (start > 0 && word(text[start - 1])) continue;
+      for (const length of lengths) {
+        const end = start + length;
+        if (end <= text.length && !word(text[end]) && references.has(text.slice(start, end))) return true;
+      }
+    }
+    return false;
   };
   const hiddenKeys = new Set(["githubPairingSeed", "githubPairedCandidate", "previousAssessments", "isolationTests"]);
   const structuredText = (value: string) => {
@@ -77,8 +163,8 @@ export async function githubPrimaryBlinding(db: Db, companyId: string) {
     }));
   }
   return {
-    active: candidates.length > 0,
-    candidateAgentIds: candidates.map(c => c.agentId),
+    active: candidateAgentIds.length > 0,
+    candidateAgentIds,
     filter,
     assertVisible(value: unknown) {
       if (containsReference(typeof value === "string" ? value : JSON.stringify(value) ?? "")) throw notFound();
@@ -97,8 +183,8 @@ export async function installGitHubPrimaryApiBlinding(db: Db, companyId: string,
   visibility.assertVisible(req.body);
   const json = res.json.bind(res);
   res.json = ((body: unknown) => {
-    // Read again at response time so a concurrent materialization cannot leak
-    // through a collection query executed after the ingress snapshot.
+    // Probe the cheap version at response time: reuse the ingress snapshot unless
+    // candidate materialization or an alias write changed it during the request.
     void githubPrimaryBlinding(db, companyId).then(current => {
       const visible = current.filter(body);
       if (visible === undefined) res.status(404);
