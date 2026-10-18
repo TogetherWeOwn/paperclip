@@ -1074,9 +1074,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   // after its assertions so another case (or shard order) cannot claim them.
   const fixtureCompanies = new Set<string>();
   const fixtureServices = new Set<ChatChannelService>();
+  /** Bounded per service, leaving the hook budget for the database settle below. */
+  const FIXTURE_SHUTDOWN_WAIT_MS = 10_000;
   afterEach(async () => {
+    // Detach first: one hung shutdown() must not leave its service registered,
+    // or every later afterEach waits on it again and the whole file fails.
+    const services = [...fixtureServices];
+    fixtureServices.clear();
     try {
-      await Promise.all([...fixtureServices].map((service) => service.shutdown()));
+      await Promise.all(services.map((service) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        return Promise.race([service.shutdown(), new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, FIXTURE_SHUTDOWN_WAIT_MS);
+          timer.unref?.();
+        })]).finally(() => clearTimeout(timer));
+      }));
     } finally {
       const companyIds = [...fixtureCompanies];
       await retireFixtureState(companyIds);
