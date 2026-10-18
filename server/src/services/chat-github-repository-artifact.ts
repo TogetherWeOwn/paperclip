@@ -5,26 +5,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import type { GitHubReviewRepositoryArtifact } from "@paperclipai/db";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 /** Commit-addressed repository bytes sealed with the admission snapshot. The
  * artifact holds exactly two refs: the PR base and the admitted head. Nothing
  * newer than either commit (later fixes, other branches, tags) can enter. */
-export interface GitHubRepositoryArtifact {
-  version: 1;
-  kind: "bundle" | "synthetic";
-  /** Server-local, content-addressed file name under the artifact root. */
-  path: string;
-  sha256: string;
-  bytes: number;
-  headSha: string;
-  baseSha: string;
-  headTree: string;
-  baseTree: string;
-  /** Exact refs inside the artifact; synthetic commits stand in for the admitted SHAs. */
-  refs: { base: string; head: string };
-  commits: { base: string; head: string };
-}
+export type GitHubRepositoryArtifact = GitHubReviewRepositoryArtifact;
 
 export interface GitHubRepositoryArtifactRequest {
   repository: string;

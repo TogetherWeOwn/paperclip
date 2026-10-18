@@ -22,6 +22,8 @@ export function githubSnapshotDigest(value: unknown): string {
 export async function captureGitHubReviewSnapshot(
   api: GitHubReviewReader, event: GitHubReviewEventContext,
   bot?: { login: string; appId: string },
+  /** Produced concurrently inside the same capture window; sealed under the digest. */
+  repository?: Promise<Pick<GitHubReviewInputSnapshot, "repository" | "repositoryFailure">>,
 ): Promise<GitHubReviewInputSnapshot> {
   const startedAt = new Date().toISOString();
   const headSha = githubCommitSchema.parse(event.headSha);
@@ -88,7 +90,12 @@ export async function captureGitHubReviewSnapshot(
   const first = await sweep();
   const second = await sweep();
   if (githubSnapshotDigest(first) !== githubSnapshotDigest(second)) throw conflict("snapshot_capture_mutated");
-  const sealed = { version: 2 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first };
+  const artifact = repository ? await repository : {};
+  // Bind the artifact to this exact admission; a mismatched artifact is dropped.
+  const checkout = !artifact.repository ? (artifact.repositoryFailure ? { repositoryFailure: artifact.repositoryFailure } : {})
+    : artifact.repository.headSha === headSha && artifact.repository.baseSha === baseSha ? { repository: artifact.repository }
+      : { repositoryFailure: "repository_artifact_binding_mismatch" };
+  const sealed = { version: 2 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first, ...checkout };
   // PostgreSQL jsonb rejects NUL and lone surrogates in decoded strings. Keep
   // exact JSON bytes, not a lossy sanitizer, and verify their decoded digest.
   return { ...sealed, digest: githubSnapshotDigest(sealed), responses: Object.fromEntries(

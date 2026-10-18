@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { captureGitHubReviewSnapshot } from "./chat-github-review-snapshot.js";
+import { GitHubRepositoryArtifactError, githubRepositoryArtifactProducer } from "./chat-github-repository-artifact.js";
 import {
   agents, chatActions, chatConversations, chatDeliveries, chatEndpoints, chatGitHubConfigurations,
   chatGitHubReviewArms, chatGitHubReviewCandidates, chatGitHubReviewEnrollments,
   chatGitHubReviews, chatMessageLinks, chatEndpointResources, issueComments, heartbeatRuns, issues,
   githubPairPreviousAssessmentQuery, githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery,
-  type Db, type GitHubReviewEnrollmentEnvelope,
+  type Db, type GitHubReviewEnrollmentEnvelope, type GitHubReviewInputSnapshot,
 } from "@paperclipai/db";
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -93,7 +94,8 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   }
   // The deadline belongs to admission, not the time a delayed worker starts.
   const remaining = input.pending ? Date.parse(input.pending.admittedAt) + PAIR_CAPTURE_WINDOW_MS - Date.now() : PAIR_CAPTURE_WINDOW_MS;
-  const captureDeadline = AbortSignal.timeout(Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0);
+  const captureWindowMs = Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0;
+  const captureDeadline = AbortSignal.timeout(captureWindowMs);
   // Also bound transports that ignore AbortSignal. Never let one candidate's
   // stalled read hold the recovery sweep forever; late responses are discarded.
   const boundedFetch: typeof fetch = async (url, init) => {
@@ -148,8 +150,23 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     };
     prepared = true;
     if (!input.endpoint.botUsername || !input.endpoint.botExternalId) throw new Error("snapshot_bot_identity_missing");
+    // The checkout artifact shares the admission window and abort; it is
+    // commit-addressed, so it cannot see anything the primary publishes later.
+    const producer = githubRepositoryArtifactProducer();
+    const admitted = event;
+    const repository = (async (): Promise<Pick<GitHubReviewInputSnapshot, "repository" | "repositoryFailure">> => {
+      if (!producer) return { repositoryFailure: "repository_artifact_disabled" };
+      try {
+        return { repository: await producer({ repository: input.repository, pullNumber: admitted.pullNumber,
+          headSha: admitted.headSha, baseSha: admitted.baseSha, baseBranch: admitted.baseBranch, token,
+          fetchImpl: boundedFetch, signal: captureDeadline, deadlineAt: Date.now() + captureWindowMs }) };
+      } catch (error) {
+        return { repositoryFailure: captureDeadline.aborted ? "repository_artifact_late"
+          : error instanceof GitHubRepositoryArtifactError ? error.reason : "repository_artifact_unavailable" };
+      }
+    })();
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
-      { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId });
+      { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, repository);
     return { event, snapshot };
     })()]);
   } catch {

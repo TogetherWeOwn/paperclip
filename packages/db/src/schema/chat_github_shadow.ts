@@ -20,7 +20,39 @@ export interface GitHubReviewInputSnapshot {
   baseSha: string;
   diffBaseSha: string;
   responses: Record<string, unknown>;
+  /** Sealed checkout of exactly the admitted head+base ancestry (covered by digest). */
+  repository?: GitHubReviewRepositoryArtifact;
+  /** Precise reason no repository artifact was sealed; candidate still runs unverified. */
+  repositoryFailure?: string;
   digest: string;
+}
+
+/** Commit-addressed git bundle stored server-side next to the sealed snapshot. */
+export interface GitHubReviewRepositoryArtifact {
+  version: 1;
+  kind: "bundle" | "synthetic";
+  path: string;
+  sha256: string;
+  bytes: number;
+  headSha: string;
+  baseSha: string;
+  headTree: string;
+  baseTree: string;
+  refs: { base: string; head: string };
+  commits: { base: string; head: string };
+}
+
+/** Candidate checkout observed on the isolated host right after materialisation. */
+export interface GitHubCandidateWorkspaceReceipt {
+  version: 1;
+  status: "materialized" | "unavailable" | "error";
+  kind: "bundle" | "synthetic" | null;
+  reason?: string;
+  artifactSha256?: string;
+  head?: string | null;
+  tree?: string | null;
+  baseCommit?: string | null;
+  baseTree?: string | null;
 }
 
 export interface GitHubReviewEnrollmentEnvelope {
@@ -86,6 +118,7 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
     hooksDigest?: string;
     candidateRuntimeCertified?: boolean; disallowedTools?: string[];
     primaryToolPolicy?: GitHubReviewEnrollmentEnvelope["primaryToolPolicy"] | null;
+    workspace?: GitHubCandidateWorkspaceReceipt;
   }>>().notNull().default({}),
   admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => [
