@@ -29,7 +29,8 @@ describe("evidence-derived paired review eligibility", () => {
     const enrollment = { roundOrdinal: 1, envelope: { snapshot: {}, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
       run: { version: 1, runId: "run", candidateId: "candidate", armId: "arm", environmentId: "env", configurationDigest: "config",
         certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed",
-        checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true, providerToolsDenied: true } },
+        checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true, providerToolsDenied: true,
+          allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } },
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
     expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot")).toEqual({ certifiedClean: false, reasons: unverified });
     for (const [candidateId, armId, runId] of [["other", "arm", "run"], ["candidate", "other", "run"], ["candidate", "arm", "retry"]]) {
@@ -42,7 +43,8 @@ describe("evidence-derived paired review eligibility", () => {
     const enrollment = { roundOrdinal: 1, envelope: { snapshot: {}, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
       run: { version: 1, runId: "run", candidateId: "candidate", armId: "arm", environmentId: "env", configurationDigest: "config",
         certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed",
-        checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true, providerToolsDenied: true } },
+        checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true, providerToolsDenied: true,
+          allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } },
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
     if (missing === "receipt") delete enrollment.isolationTests.run!.primaryBlindingVersion;
     else delete enrollment.envelope.protocol;

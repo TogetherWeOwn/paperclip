@@ -9,6 +9,7 @@ import {
   githubIsolationCertificates,
   githubIsolationConfigurationDigest,
   githubCandidateAdapterConfig,
+  githubCandidateProbeModel,
   type PreparedGitHubCandidateRuntime,
 } from "../services/chat-github-runtime-isolation.js";
 
@@ -20,11 +21,17 @@ const prepared = {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("certified GitHub candidate configuration", () => {
-  it.each(["isolated", "readable", "missing", "network-open", "reused-home", "wrong-user", "sibling-home", "proxy-open", "proxy-error"])(
+  it("probes the explicit CLI model with config-before-env precedence and no invented default", () => {
+    expect(githubCandidateProbeModel({ model: " configured ", env: { ANTHROPIC_MODEL: "environment" } })).toBe("configured");
+    expect(githubCandidateProbeModel({ model: " ", env: { ANTHROPIC_MODEL: " environment " } })).toBe("environment");
+    expect(githubCandidateProbeModel({ model: 1, env: { ANTHROPIC_MODEL: false } })).toBeNull();
+    expect(githubCandidateProbeModel({})).toBeNull();
+  });
+  it.each(["isolated", "readable", "missing", "network-open", "raw-proxy-open", "raw-proxy-error", "reused-home", "wrong-user", "sibling-home", "proxy-open", "proxy-error", "proxy-deny-all", "proxy-context-denied", "proxy-other-model", "proxy-wrong-header", "proxy-non-2xx"])(
     "runs the actual Python probe against %s boundary fixtures", scenario => {
       // No real users, firewall, files, or sockets are changed. The exact shipped
       // Python program runs with deterministic syscall fakes, not a fake receipt.
-      const fixture = `import builtins, errno, io, os, pwd, socket, types, urllib.request, urllib.error
+      const fixture = `import builtins, errno, io, json, os, pwd, socket, types, urllib.request, urllib.error
 scenario = ${JSON.stringify(scenario)}
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="other" if scenario == "wrong-user" else "paperclip-shadow")
@@ -42,24 +49,43 @@ class FakeSocket:
     def __exit__(self, *args): pass
     def settimeout(self, value): pass
     def connect(self, address):
-        if scenario != "network-open": raise OSError(errno.EACCES, "fixture")
+        if address == ("127.0.0.1", 8317):
+            if scenario == "raw-proxy-open": return
+            if scenario == "raw-proxy-error": raise OSError(errno.EBADF, "not confinement")
+        elif scenario == "network-open": return
+        raise OSError(errno.EACCES, "fixture")
 socket.socket = lambda *args: FakeSocket()
 import urllib.request, urllib.error
 def fake_urlopen(request, **kwargs):
     if scenario == "proxy-error": raise OSError("proxy unavailable")
-    if scenario == "proxy-open": return io.StringIO("accepted")
-    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
+    body = json.loads(request.data)
+    assert body["max_tokens"] == 1 and body["messages"]
+    tool_request = "tools" in body or "mcp_servers" in body
+    other_model = body["model"] != "configured-arm-model"
+    if tool_request: assert not other_model, "tool denial must not pass solely on a disallowed model"
+    accepted = not tool_request and not other_model
+    if scenario == "proxy-open" or scenario == "proxy-other-model" and other_model: accepted = True
+    if scenario == "proxy-deny-all" or scenario == "proxy-context-denied" and "context_management" in body: accepted = False
+    if accepted:
+        response = io.StringIO("accepted")
+        response.status = 302 if scenario == "proxy-non-2xx" else 200
+        return response
+    policy = "wrong" if scenario == "proxy-wrong-header" else "client-tools-only-v1"
+    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": policy}, None)
 urllib.request.urlopen = fake_urlopen
 `;
       const proof = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
-        input: JSON.stringify({ nonce: "nonce", home: "/fresh", canaries: ["/primary/run", "/primary/worktree"], githubAddresses: ["192.0.2.1", "2001:db8::1"] }),
+        input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: "/fresh", canaries: ["/primary/run", "/primary/worktree"], githubAddresses: ["192.0.2.1", "2001:db8::1"] }),
         encoding: "utf8", timeout: 5000,
       }));
       expect(proof.nonce).toBe("nonce");
       expect(Object.values(proof.checks).every(Boolean)).toBe(scenario === "isolated");
       if (["readable", "missing"].includes(scenario)) expect(proof.checks.primaryCanariesDenied).toBe(false);
       if (scenario === "network-open") expect(proof.checks.githubDenied).toBe(false);
-      expect(proof.checks.providerToolsDenied).toBe(!["wrong-user", "proxy-open", "proxy-error"].includes(scenario));
+      expect(proof.checks.providerToolsDenied).toBe(!["wrong-user", "proxy-open", "proxy-error", "proxy-wrong-header"].includes(scenario));
+      expect(proof.checks.allowedModelAccepted).toBe(!["wrong-user", "proxy-error", "proxy-deny-all", "proxy-context-denied", "proxy-non-2xx"].includes(scenario));
+      expect(proof.checks.otherModelDenied).toBe(!["wrong-user", "proxy-open", "proxy-error", "proxy-other-model", "proxy-wrong-header"].includes(scenario));
+      expect(proof.checks.rawProxyDenied).toBe(!["wrong-user", "raw-proxy-open", "raw-proxy-error"].includes(scenario));
       if (scenario === "reused-home") expect(proof.checks.configFresh).toBe(false);
     },
   );
@@ -67,7 +93,7 @@ urllib.request.urlopen = fake_urlopen
     const scratch = mkdtempSync(join(tmpdir(), "shadow-hooks-"));
     const home = join(scratch, "fresh");
     const files = { ".claude/settings.json": '{"hooks":{}}', "hooks/guard.mjs": "// immutable guard" };
-    const fixture = `import builtins, errno, pwd, socket, types, os, urllib.request, urllib.error
+    const fixture = `import builtins, errno, pwd, socket, types, os, io, json, urllib.request, urllib.error
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
 real_open = builtins.open
@@ -83,12 +109,17 @@ class FakeSocket:
 socket.socket = lambda *args: FakeSocket()
 import urllib.request, urllib.error
 def deny_provider_tool(request, **kwargs):
+    body = json.loads(request.data)
+    if body["model"] == "configured-arm-model" and "tools" not in body and "mcp_servers" not in body:
+        response = io.StringIO("accepted")
+        response.status = 200
+        return response
     raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
 urllib.request.urlopen = deny_provider_tool
 `;
     try {
       const proof = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
-        input: JSON.stringify({ nonce: "nonce", home, canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"], hooks: { files, digest: "fixture-digest" } }),
+        input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home, canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"], hooks: { files, digest: "fixture-digest" } }),
         encoding: "utf8", timeout: 5000,
       }));
       expect(proof).toMatchObject({ hooksDigest: "fixture-digest", checks: { configFresh: true } });

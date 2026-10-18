@@ -16,6 +16,7 @@ import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
 import { githubComparisonEligibility, githubPrimaryInputSource, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
+import { githubPairRunEvidence } from "./chat-github-run-evidence.js";
 
 // Re-export the exact application builders; their implementation lives in the
 // DB package so its EXPLAIN tests remain within that package's TypeScript root.
@@ -303,7 +304,7 @@ export async function githubRunCapability(db: Store, session: {
   return enrollment?.envelope.event && enrollment.headSha && enrollment.baseSha
     ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha,
         envelope: { ...enrollment.envelope, comparisonEligibility: githubRunComparisonEligibility(enrollment, candidate, session.runId,
-          await githubPrimaryInputSource(db, enrollment)) } } } : null;
+          await githubPrimaryInputSource(db, enrollment), await githubPairRunEvidence(db, enrollment, candidate, session.runId)) } } } : null;
 }
 
 interface PrimaryReviewInput {

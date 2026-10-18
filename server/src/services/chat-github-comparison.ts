@@ -1,6 +1,7 @@
 import { and, eq, isNotNull, isNull, or } from "drizzle-orm";
 import { chatGitHubReviews, type chatGitHubReviewEnrollments, type Db } from "@paperclipai/db";
 import { GITHUB_PRIMARY_BLINDING_VERSION } from "./chat-github-primary-blinding.js";
+import { githubPairEquivalence, type GitHubPairRunEvidence } from "./chat-github-run-evidence.js";
 
 type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Enrollment = typeof chatGitHubReviewEnrollments.$inferSelect;
@@ -25,6 +26,7 @@ export function githubRunComparisonEligibility(
   candidate: { id: string; armId: string },
   runId: string,
   primaryInputSource?: "snapshot" | "live",
+  runEvidence?: GitHubPairRunEvidence,
 ) {
   const receipt = enrollment.isolationTests[runId];
   const bound = receipt?.version === 1 && receipt.runId === runId
@@ -33,12 +35,14 @@ export function githubRunComparisonEligibility(
     environmentCertified: !!(bound && receipt.environmentId && receipt.configurationDigest && receipt.certificateDigest),
     selfTestRecorded: !!bound,
     selfTestPassed: !!(bound && receipt.status === "passed" && receipt.checks.primaryCanariesDenied
-      && receipt.checks.githubDenied && receipt.checks.configFresh && receipt.checks.providerToolsDenied === true && receipt.hooksDigest),
+      && receipt.checks.githubDenied && receipt.checks.configFresh && receipt.checks.providerToolsDenied === true
+      && receipt.checks.allowedModelAccepted === true && receipt.checks.otherModelDenied === true && receipt.checks.rawProxyDenied === true && receipt.hooksDigest),
     primaryBlindingActive: enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_PRIMARY_BLINDING_VERSION
       && receipt?.primaryBlindingVersion === GITHUB_PRIMARY_BLINDING_VERSION,
     snapshotAvailable: !!enrollment.envelope.snapshot,
     roundOrdinal: enrollment.roundOrdinal,
     primaryInputSource,
+    runEvidence: bound && runEvidence ? { ...runEvidence, admittedHead: enrollment.headSha } : undefined,
   });
   if (receipt && !bound) {
     result.certifiedClean = false;
@@ -47,14 +51,15 @@ export function githubRunComparisonEligibility(
   return result;
 }
 
-/** Admission is immutable and necessarily precedes per-run evidence. The
- * authoritative, run-scoped verdict is stored with isolationTests[runId], not
- * promoted on the admission envelope (which could certify a different retry/arm).
- * Consumers must join the assessment's exact runId to its isolation receipt. */
+/** Admission and pre-dispatch isolation receipts necessarily precede CLI init.
+ * Their cached verdict stays conservative. The authoritative read-time verdict
+ * joins the exact assessment run's isolation receipt with both arms' run events;
+ * it never promotes immutable admission bytes or borrows another retry/arm. */
 export function githubComparisonEligibility(evidence: {
   environmentCertified: boolean; selfTestRecorded: boolean; selfTestPassed: boolean;
   primaryBlindingActive: boolean; snapshotAvailable: boolean; roundOrdinal: number;
   primaryInputSource?: "snapshot" | "live";
+  runEvidence?: GitHubPairRunEvidence & { admittedHead: string | null };
 }): { certifiedClean: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!evidence.primaryBlindingActive) reasons.push("primary_namespace_not_isolated");
@@ -64,17 +69,16 @@ export function githubComparisonEligibility(evidence: {
   if (!evidence.snapshotAvailable) reasons.push("admission_snapshot_unavailable");
   if (evidence.roundOrdinal > 1) reasons.push("longitudinal_arm_history");
   if (evidence.primaryInputSource !== "snapshot") reasons.push("primary_inputs_not_sealed");
-  // The current protocol records policy configuration, not effective CLI/MCP
-  // tool inventories or a matched workspace. Isolation must never certify an
-  // apples-to-apples comparison until those independent proofs are implemented.
-  reasons.push("effective_tool_equivalence_unverified", "workspace_equivalence_unverified");
+  const equivalence = githubPairEquivalence(evidence.runEvidence);
+  if (!equivalence.tools) reasons.push("effective_tool_equivalence_unverified");
+  if (!equivalence.workspace) reasons.push("workspace_equivalence_unverified");
   return { certifiedClean: reasons.length === 0, reasons };
 }
 
 export const GITHUB_SHADOW_PROTOCOL = {
-  version: 2,
+  version: 3,
   primaryBlindingVersion: GITHUB_PRIMARY_BLINDING_VERSION,
-  eligibilitySource: "isolationTests[assessment.runId].comparisonEligibility",
+  eligibilitySource: "runCapability.envelope.comparisonEligibility",
   deviations: {
     webTools: {
       deniedTools: ["WebSearch", "WebFetch"],
