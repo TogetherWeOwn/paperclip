@@ -469,7 +469,17 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
       and a.kind = 'github_review_publication' and a.status not in ('cancelled', 'failed')
       and a.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
     or exists (select 1 from chat_publications p where p.company_id = ${delivery.companyId}
-      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
+      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz
+      -- The bot-authored "queued" run milestone precedes any primary input read.
+      and coalesce(p.payload->>'progressState', '') <> 'queued'
+      -- So does the run's base "working" milestone: enqueueChatRunMilestones
+      -- writes it (key run:<run>:working:<endpoint>, no comment) from run
+      -- status alone. Run start is not an input read; the first review-tool
+      -- read seals the receipt. Native-activity samples in that lane
+      -- (...:native:...), agent comments and every other publication still
+      -- mark capture late; a missing field never exempts (fail closed).
+      and not coalesce(p.payload->>'progressState' = 'working' and p.comment_id is null
+        and p.idempotency_key ~ ('^run:[0-9a-f-]{36}:working:' || p.endpoint_id::text || '$'), false))
   ) as started`);
   return evidence?.started ? "admission_snapshot_late" : undefined;
 }
