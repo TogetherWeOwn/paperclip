@@ -7069,6 +7069,74 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
       expect(enrollment!.envelope.snapshot).toBeDefined();
     });
+    it("primary run start (working milestone) before capture still seals, and the primary's first read uses the snapshot", async () => {
+      // Production order on tog.17 (e.g. nntunev2#408): mention -> durable wake ->
+      // run running -> "The assistant is working…" milestone -> capture commits.
+      // The milestone follows run status only; the first review-tool read came
+      // 3.3-133 s after capture in all 16 production pairs voided this way.
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const { enqueueChatRunMilestones } = await import("../services/chat-run-publications.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "working-milestone-before-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(delivery!.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(delivery!.normalizedEvent.githubPairingSeed).toBeUndefined();
+      // The primary run is already running (no review tool called yet), and the
+      // production milestone producer publishes its lifecycle milestone.
+      const session = await shadowTestSession(f, primary);
+      // Inbound chat wakes carry contextSource `chat:<provider>` (queueIssueAssignmentWakeup).
+      await db.update(heartbeatRuns).set({ startedAt: new Date(), contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || '{"source":"chat:github"}'::jsonb` })
+        .where(eq(heartbeatRuns.id, session.runId));
+      await enqueueChatRunMilestones(db, { since: new Date(Date.now() - 60_000) });
+      const milestones = await db.select().from(chatPublications).where(eq(chatPublications.conversationId, delivery!.conversationId!));
+      expect(milestones.map(p => [p.idempotencyKey, p.payload.progressState])).toContainEqual(
+        [`run:${session.runId}:working:${f.endpoint.id}`, "working"]);
+      installShadowRecorder(f, head);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+      expect(enrollment!.headSha).toBe(head);
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id));
+      expect(candidate!.state).not.toBe("unavailable");
+      expect(candidate!.lastError).not.toBe("candidate_snapshot_unavailable");
+      // The primary's first review read follows the seal: it reads the sealed
+      // snapshot (append-once receipt), with no live provider read.
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" }))
+        .toMatchObject({ pull: { head: { sha: head } } });
+      expect(recorder.fetches).toEqual([]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+      expect(run!.contextSnapshot).toMatchObject({ githubPrimaryReviewInput: { source: "snapshot", enrollmentId: enrollment!.id } });
+    });
+    it.each([
+      ["native-activity sample in the working lane", "native", "working", false],
+      ["completed milestone", "completed", "completed", false],
+      ["agent comment on the working key", "working", "working", true],
+      ["working-key publication without a progress state", "working", null, false],
+    ] as const)("paired capture still refuses a pre-capture %s", async (name, lane, progressState, withComment) => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, `post-start-signal-${name.replaceAll(" ", "-")}`, "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      const session = await shadowTestSession(f, primary);
+      const key = lane === "native" ? `run:${session.runId}:working:${f.endpoint.id}:native:using_tools:1`
+        : `run:${session.runId}:${lane}:${f.endpoint.id}`;
+      const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, primary.issueId)).limit(1);
+      // Stored payloads keep only text/progressState (projectSafeChatPublication).
+      await db.execute(sql`insert into chat_publications (company_id, endpoint_id, conversation_id, issue_id, comment_id, idempotency_key, payload, state)
+        values (${delivery!.companyId}, ${f.endpoint.id}, ${delivery!.conversationId}, ${primary.issueId}, ${withComment ? comment!.id : null}, ${key},
+          ${JSON.stringify({ text: "PRIMARY_PROGRESS_CANARY", ...(progressState ? { progressState } : {}) })}::jsonb, 'published')`);
+      installShadowRecorder(f, "b".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeUndefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe("admission_snapshot_late");
+      expect(JSON.stringify(enrollment)).not.toContain("CANARY");
+    });
     it("unsampled primary admission makes no candidate snapshot requests", async () => {
       const f = await pairedReviewFixture();
       const current = await f.management.configuration(f.endpoint.id, "owner-user");
