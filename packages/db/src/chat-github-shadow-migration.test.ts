@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { defaultGitHubReviewPolicy } from "@paperclipai/shared";
 import { createDb } from "./client.js";
 import {
-  agents, chatEndpoints, chatGitHubConfigurations, chatGitHubReviews,
+  agents, chatEndpoints, chatGitHubConfigurations,
   companies, issues, toolApplications, toolConnections,
 } from "./schema/index.js";
 import {
@@ -63,7 +63,12 @@ suite("GitHub shadow arm forward migration", () => {
       });
       const [issue] = await db.insert(issues).values({ companyId, title: "Pre-upgrade review" }).returning();
       for (const shadowLabel of [null, "old-shadow"]) {
-        await db.insert(chatGitHubReviews).values({ companyId, endpointId, issueId: issue.id, repositoryId: "1", repository: "example/repo", pullNumber: 1, headSha: "a".repeat(40), deliveryId: randomUUID(), configurationRevision: 7, policySnapshot: policy, event: {} as never, shadowLabel });
+        // Seed the historical schema explicitly: today's Drizzle INSERT also
+        // names admission_delivery_id, which is only introduced by 0307.
+        await legacy`insert into chat_github_reviews (company_id, endpoint_id, issue_id, repository_id,
+          repository, pull_number, head_sha, delivery_id, configuration_revision, policy_snapshot, event, shadow_label)
+          values (${companyId}::uuid, ${endpointId}::uuid, ${issue.id}::uuid, '1', 'example/repo', 1,
+            ${"a".repeat(40)}, ${randomUUID()}, 7, ${JSON.stringify(policy)}::jsonb, '{}'::jsonb, ${shadowLabel})`;
       }
       const beforeConfig = await db.select().from(chatGitHubConfigurations);
       const beforeReviews = await legacy`select * from chat_github_reviews order by id`;
