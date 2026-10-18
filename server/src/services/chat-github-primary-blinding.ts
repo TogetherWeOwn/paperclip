@@ -14,8 +14,18 @@ type Visibility = ReturnType<typeof createGitHubPrimaryVisibility>;
 const passthrough: Visibility = { active: false, candidateAgentIds: [], filter: value => value, assertVisible() {} };
 type Waiter = { resolve: (value: Visibility) => void; reject: (error: unknown) => void };
 type CachedVisibility = { snapshot?: { key: string; value: Visibility; databaseSnapshot?: string }; waiters: Waiter[]; running: boolean };
-const visibilityCaches = new WeakMap<Db, Map<string, CachedVisibility>>();
+let visibilityCaches = new WeakMap<Db, Map<string, CachedVisibility>>();
 const MAX_CACHED_COMPANIES = 64;
+
+export const gitHubPrimaryBlindingInternals = {
+  /** Test-only: drop all cached visibility snapshots so suites that share a
+   * Db handle cannot observe filter state from an earlier test. Production
+   * code never calls this; it changes no request-time behaviour. In-flight
+   * drains keep their local cache reference and are unaffected. */
+  resetForTests(): void {
+    visibilityCaches = new WeakMap();
+  },
+};
 
 /** A single READ COMMITTED statement computes both the watermark and any reload.
  * Only candidate identities/aliases participate, not company-wide write epochs or

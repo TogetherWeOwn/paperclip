@@ -4,10 +4,20 @@ import type { Db } from "@paperclipai/db";
 // Admission is a control-plane operation, not an agent request. Keep the negative
 // fast path out of the database entirely. Bootstrap before accepting requests;
 // arm BEFORE projecting candidates, not after their transaction commits.
-const admissions = new WeakMap<Db, Map<string, { pending: number; enrolled: boolean }>>();
+let admissions = new WeakMap<Db, Map<string, { pending: number; enrolled: boolean }>>();
 // If startup cannot establish the negative set, no company may use the bypass.
 // startServer also awaits bootstrap before accepting requests.
-const uncertainBootstraps = new WeakSet<Db>();
+let uncertainBootstraps = new WeakSet<Db>();
+
+export const gitHubPrimaryBlindingStateInternals = {
+  /** Test-only: drop all admission state so suites that share a Db handle
+   * cannot observe enrollments from an earlier test. Production code never
+   * calls this; it changes no request-time behaviour. */
+  resetForTests(): void {
+    admissions = new WeakMap();
+    uncertainBootstraps = new WeakSet();
+  },
+};
 function companies(db: Db) {
   let state = admissions.get(db);
   if (!state) { state = new Map(); admissions.set(db, state); }

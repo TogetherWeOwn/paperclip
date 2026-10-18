@@ -265,7 +265,6 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
   }, 30_000);
 
   afterEach(async () => {
-    track.mockClear();
     failLogActivityForAction.current = null;
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
@@ -288,6 +287,32 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
+    // emitConnectionInvoked runs as detached background work (one DB read,
+    // then a track call). An in-flight emit from this test can otherwise land
+    // after track.mockClear() and be counted by the next test, making event
+    // counts order-dependent (TOG-30065). Drain after the deletes: any emit
+    // whose read resolves now finds its rows gone and returns without
+    // emitting, while an already-resolved emit lands here before the clear.
+    // Quiescence = no new `connection.invoked` call for 250ms straight (5s
+    // cap); nothing in this hook issues new gateway work.
+    const quiesceStart = Date.now();
+    let lastCount = -1;
+    let stableSince = quiesceStart;
+    for (;;) {
+      const count = track.mock.calls.filter(
+        ([name]) => name === "connection.invoked",
+      ).length;
+      const now = Date.now();
+      if (count === lastCount) {
+        if (now - stableSince >= 250) break;
+      } else {
+        lastCount = count;
+        stableSince = now;
+      }
+      if (now - quiesceStart > 5000) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    track.mockClear();
   });
 
   afterAll(async () => {

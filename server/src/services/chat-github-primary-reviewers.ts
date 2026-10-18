@@ -6,7 +6,7 @@ import type { Db } from "@paperclipai/db";
 // the former all-agent blinding. There is no request-time membership query.
 type CompanyScope = { agents: Set<string>; pending: number; generation: number; uncertain: boolean };
 type Scope = { loaded: boolean; companies: Map<string, CompanyScope> };
-const scopes = new WeakMap<Db, Scope>();
+let scopes = new WeakMap<Db, Scope>();
 function scope(db: Db) {
   let state = scopes.get(db);
   if (!state) { state = { loaded: false, companies: new Map() }; scopes.set(db, state); }
@@ -20,6 +20,15 @@ function companyScope(state: Scope, companyId: string) {
   }
   return company;
 }
+
+export const gitHubPrimaryReviewersInternals = {
+  /** Test-only: drop all cached reviewer state so suites that share a Db
+   * handle cannot observe bootstrap results from an earlier test. Production
+   * code never calls this; it changes no request-time behaviour. */
+  resetForTests(): void {
+    scopes = new WeakMap();
+  },
+};
 
 export function isGitHubPrimaryReviewer(db: Db, companyId: string, agentId: string) {
   const state = scopes.get(db);
