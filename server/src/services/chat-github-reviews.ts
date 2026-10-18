@@ -453,9 +453,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         ),
       },
       labels: pull.labels.map((l) => l.name),
-      ...(automatic ? automatic.context : {}),
-      // Keep the source admission identity even when retries get per-run rows.
       deliveryId: source.delivery.id,
+      ...(automatic ? automatic.context : {}),
     };
     const [review] = await db
       .insert(chatGitHubReviews)
@@ -472,7 +471,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         configurationRevision:
           source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
         policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,
-        event: context,
+        event: { ...context, admissionDeliveryId: source.delivery.id },
         state: "running",
         shadowLabel: source.shadowLabel,
       })

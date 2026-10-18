@@ -4998,6 +4998,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(previous?.shadowLabel ?? null).toBeNull();
       expect(previous?.issueId ?? null).toBe(hasPrimaryHistory ? primary.issueId : null);
     });
+    it("automatic primary retry keeps one GitHub check and the provider delivery identity with pairing off", async () => {
+      const f = await reviewBotFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const head = "b".repeat(40);
+      installShadowRecorder(f, head);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const providerDeliveryId = (admitted.event as { deliveryId: string }).deliveryId;
+      expect(providerDeliveryId).not.toBe(admitted.deliveryId);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const first = await shadowTestSession(f, admitted);
+      await service.execute(first, "begin_review", { reviewedCommit: head });
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, first.runId));
+      const retry = await shadowTestSession(f, admitted);
+      await service.execute(retry, "begin_review", { reviewedCommit: head });
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, admitted.issueId));
+      expect(reviews.find(r => r.runId === retry.runId)?.event).toMatchObject({ deliveryId: providerDeliveryId });
+      expect(await shadowTestActions(f.endpoint.id, "github_review_check")).toHaveLength(1);
+    });
     it.each(["failed", "cancelled"])("paired primary retry publishes after its previous run %s", async (status) => {
       const f = await pairedReviewFixture();
       const head = "b".repeat(40);
