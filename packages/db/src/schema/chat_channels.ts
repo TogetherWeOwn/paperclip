@@ -693,6 +693,7 @@ export const chatActions = pgTable(
       table.endpointId,
       table.providerActionId,
     ),
+    index("chat_actions_delivery_kind_idx").on(table.deliveryId, table.kind),
     foreignKey({
       columns: [table.companyId, table.deliveryId],
       foreignColumns: [chatDeliveries.companyId, chatDeliveries.id],
