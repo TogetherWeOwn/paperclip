@@ -70,11 +70,21 @@ function refuse(reason: string): never {
  * GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS are reclaimed (lstat only, rmtree never
  * follows symlinks, only direct children of the isolated parent); a younger
  * one still means namespaceBusy, the backstop should the lease ever be lost.
+ * Reclaim refuses (deletes nothing) unless the parent is exactly
+ * GITHUB_ISOLATED_PARENT, so a malformed home can never widen it to "/".
+ * An allowed-model outage (timeout, 429, 5xx) is missing evidence only when
+ * every other check passed: the probe then exits without a proof. Any other
+ * failed check keeps the bound negative proof, so a breach is never hidden.
  */
 export const GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS = 30 * 60;
+/** The only namespace parent the server derives candidate homes under. */
+export const GITHUB_ISOLATED_PARENT = "/home/paperclip-shadow/.paperclip-runtime/isolated";
 export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, shutil, socket, stat, sys, time, urllib.request, urllib.error
+ISOLATED_PARENT = ${JSON.stringify(GITHUB_ISOLATED_PARENT)}
 p = json.load(sys.stdin)
 def reclaim_orphans(parent, min_age):
+    # Exact match only: never "/", an ancestor, a sibling or an unnormalised alias.
+    if parent != ISOLATED_PARENT: return 0
     reclaimed = 0
     now = time.time()
     for name in os.listdir(parent):
@@ -134,11 +144,12 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
                 return not expect_denied and 200 <= response.status < 300
         except urllib.error.HTTPError as e:
             # A slow, rate-limited or failing upstream for the allowed model is
-            # missing evidence (no proof), not a demonstrated confinement failure.
-            if not expect_denied and (e.code == 429 or e.code >= 500): raise
+            # unavailable (None), not a demonstrated confinement failure. The
+            # remaining checks still run so an observed breach is not discarded.
+            if not expect_denied and (e.code == 429 or e.code >= 500): return None
             return expect_denied and e.code == 403 and e.headers.get("x-paperclip-shadow-policy") == "client-tools-only-v1"
         except OSError as e:
-            if not expect_denied and (isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)): raise
+            if not expect_denied and (isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)): return None
             return False
     # The allowed model is served by a shared upstream that can queue for minutes.
     checks["allowedModelAccepted"] = proxy_request({}, False, 25)
@@ -159,6 +170,11 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
         checks["configFresh"] = not siblings and not os.listdir(os.path.join(p["home"], ".claude"))
     except OSError:
         pass
+if checks["allowedModelAccepted"] is None:
+    # Unavailable with nothing else wrong: no proof (isolation_error). Any other
+    # failed check is a recorded breach and stays a bound negative proof.
+    if all(value for key, value in checks.items() if key != "allowedModelAccepted"): sys.exit("allowed_model_unavailable")
+    checks["allowedModelAccepted"] = False
 hooks_digest = None
 if all(checks.values()) and p.get("hooks"):
     try:
@@ -432,7 +448,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   // No synthetic model: both positive and tool-denial probes must exercise the
   // arm's actual model, so a deny-all or model-only filter cannot certify.
   if (!proxyToken || !model) refuse("github_candidate_isolation_unavailable");
-  const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
+  const home = `${GITHUB_ISOLATED_PARENT}/${boundary.namespace}`;
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
   // Wait for the admission's checkout BEFORE taking the host-wide lease. The
@@ -535,7 +551,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
 
 export async function cleanupGitHubCandidateRuntime(prepared: Pick<PreparedGitHubCandidateRuntime, "home" | "namespace" | "target" | "cleanupNonce">) {
   if (!/^[a-f0-9]{64}$/.test(prepared.namespace)
-    || prepared.home !== `/home/paperclip-shadow/.paperclip-runtime/isolated/${prepared.namespace}`) {
+    || prepared.home !== `${GITHUB_ISOLATED_PARENT}/${prepared.namespace}`) {
     throw new Error("Invalid candidate cleanup namespace");
   }
   // rmtree does not follow nested symlinks. Never interpolate arbitrary config

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import {
   GITHUB_ISOLATION_PROBE,
   GITHUB_ISOLATION_CLEANUP,
   GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS,
+  GITHUB_ISOLATED_PARENT,
   githubIsolationCertificates,
   githubIsolationConfigurationDigest,
   githubCandidateAdapterConfig,
@@ -32,8 +33,10 @@ describe("certified GitHub candidate configuration", () => {
     "runs the actual Python probe against %s boundary fixtures", scenario => {
       // No real users, firewall, files, or sockets are changed. The exact shipped
       // Python program runs with deterministic syscall fakes, not a fake receipt.
-      const fixture = `import builtins, errno, io, json, os, pwd, socket, types, urllib.request, urllib.error
+      const fixture = `import builtins, errno, io, json, os, pwd, shutil, socket, types, urllib.request, urllib.error
 scenario = ${JSON.stringify(scenario)}
+def forbidden(*args, **kwargs): raise AssertionError("destructive call in fixture: " + repr(args))
+shutil.rmtree = os.unlink = os.remove = os.rmdir = forbidden
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="other" if scenario == "wrong-user" else "paperclip-shadow")
 def fake_open(*args, **kwargs):
@@ -90,23 +93,35 @@ urllib.request.urlopen = fake_urlopen
       if (scenario === "reused-home") expect(proof.checks.configFresh).toBe(false);
     },
   );
-  it.each([["timeout", false], ["url-timeout", false], ["429", false], ["503", false], ["403-no-policy", true]] as const)(
-    "an allowed-model upstream %s is missing evidence, never a negative confinement proof", (failure, proofEmitted) => {
-      const fixture = `import builtins, errno, pwd, socket, types, io, json, os, urllib.request, urllib.error
+  describe("allowed-model upstream availability", () => {
+    // Identity, canaries, sockets, the proxy and every namespace syscall are
+    // faked and destructive calls raise. The home sits under a fresh temp
+    // parent, so even a broken reclaim guard has nothing real to list or remove.
+    const fixture = (breach: string, failure: string) => `import builtins, errno, io, json, os, pwd, shutil, socket, types, urllib.request, urllib.error
+breach, failure = ${JSON.stringify(breach)}, ${JSON.stringify(failure)}
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
-real_open = builtins.open
 def controlled_open(path, *args, **kwargs):
-    if str(path).startswith("/primary/"): raise OSError(errno.EACCES, "denied")
-    return real_open(path, *args, **kwargs)
+    if str(path).startswith("/primary/"):
+        if breach == "readable": return io.BytesIO(b"PRIMARY_ANSWER")
+        raise OSError(errno.EACCES, "denied")
+    if str(path).endswith("/.probe-owner"): return io.StringIO()
+    raise AssertionError("unexpected open: " + str(path))
 builtins.open = controlled_open
+os.listdir = lambda path: []
+os.mkdir = lambda *args, **kwargs: None
+def forbidden(*args, **kwargs): raise AssertionError("destructive call in fixture: " + repr(args))
+shutil.rmtree = os.unlink = os.remove = os.rmdir = forbidden
 class FakeSocket:
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def settimeout(self, value): pass
-    def connect(self, address): raise OSError(errno.EACCES, "denied")
+    def connect(self, address):
+        if address == ("127.0.0.1", 8317):
+            if breach == "raw-proxy-open": return
+        elif breach == "network-open": return
+        raise OSError(errno.EACCES, "denied")
 socket.socket = lambda *args: FakeSocket()
-failure = ${JSON.stringify(failure)}
 def fake_urlopen(request, timeout=None):
     body = json.loads(request.data)
     if body["model"] == "configured-arm-model" and "tools" not in body and "mcp_servers" not in body:
@@ -118,17 +133,103 @@ def fake_urlopen(request, timeout=None):
     raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
 urllib.request.urlopen = fake_urlopen
 `;
-      const run = () => execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
-        input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: "/nonexistent-fresh", canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"] }),
-        encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "ignore"],
+    const breachCheck = { readable: "primaryCanariesDenied", "network-open": "githubDenied", "raw-proxy-open": "rawProxyDenied" } as const;
+    const breaches = ["none", ...Object.keys(breachCheck)] as Array<"none" | keyof typeof breachCheck>;
+    const failures = ["timeout", "url-timeout", "429", "503", "403-no-policy"] as const;
+    it.each(breaches.flatMap(breach => failures.map(failure => [breach, failure] as const)))(
+      "breach %s with an allowed-model upstream %s: an outage alone is missing evidence, an observed breach is still a negative proof",
+      (breach, failure) => {
+        const scratch = mkdtempSync(join(tmpdir(), "probe-"));
+        try {
+          const result = spawnSync("python3", ["-c", fixture(breach, failure) + GITHUB_ISOLATION_PROBE], {
+            input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: join(scratch, "fresh"), canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"] }),
+            encoding: "utf8", timeout: 5000,
+          });
+          if (breach === "none" && failure !== "403-no-policy") {
+            // Precisely the availability exit, not a crash that also emits no proof.
+            expect({ status: result.status, stdout: result.stdout, stderr: result.stderr.trim() })
+              .toEqual({ status: 1, stdout: "", stderr: "allowed_model_unavailable" });
+            return;
+          }
+          expect(result.stderr).toBe("");
+          const proof = JSON.parse(result.stdout);
+          const failed = breach === "none" ? ["allowedModelAccepted"] : ["allowedModelAccepted", breachCheck[breach]];
+          // Every later check still ran: the outage did not abort the probe.
+          expect(Object.entries(proof.checks).filter(([, passed]) => passed !== true).map(([key]) => key).sort()).toEqual(failed.sort());
+          expect(proof.checks.allowedModelAccepted).toBe(false);
+          expect(proof).toMatchObject({ nonce: "nonce", namespaceBusy: false, orphansReclaimed: 0 });
+        } finally { rmSync(scratch, { recursive: true, force: true }); }
+      },
+    );
+  });
+  describe("orphan reclaim parent guard (destructive calls replaced by recorders)", () => {
+    // listdir/lstat are fakes and rmtree/unlink/remove/rmdir only record, so a
+    // broken guard shows up as recorded calls and can never delete anything.
+    const recorders = `import json, os, pwd, shutil, stat, types
+listed, removed = [], []
+def fake_listdir(path):
+    listed.append(path)
+    return ["victim-dir", "victim-file"]
+def fake_lstat(path):
+    if str(path).endswith("/.probe-owner"): raise FileNotFoundError(path)
+    return types.SimpleNamespace(st_mtime=0, st_mode=(stat.S_IFDIR if str(path).endswith("/victim-dir") else stat.S_IFREG) | 0o700)
+os.listdir, os.lstat = fake_listdir, fake_lstat
+def record(kind): return lambda path, *args, **kwargs: removed.append([kind, path])
+shutil.rmtree, os.unlink, os.remove, os.rmdir = record("rmtree"), record("unlink"), record("remove"), record("rmdir")
+os.geteuid = lambda: 12345
+`;
+    const runReclaim = (parent: string) => {
+      // Not the shadow user: the probe body is skipped and only reclaim_orphans runs.
+      const program = `${recorders}pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="not-the-shadow-user")
+${GITHUB_ISOLATION_PROBE}
+result = {"reclaimed": reclaim_orphans(${JSON.stringify(parent)}, ${GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS}), "listed": list(listed), "removed": list(removed)}
+del listed[:], removed[:]
+result["control"] = {"reclaimed": reclaim_orphans(${JSON.stringify(GITHUB_ISOLATED_PARENT)}, ${GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS}), "listed": listed, "removed": removed}
+print(json.dumps(result))
+`;
+      const lines = execFileSync("python3", ["-c", program], { input: JSON.stringify({ nonce: "nonce", home: "/unused" }), encoding: "utf8", timeout: 5000 }).trim().split("\n");
+      return JSON.parse(lines[lines.length - 1]);
+    };
+    it.each(["/", "/home", "/home/paperclip-shadow", "/home/paperclip-shadow/.paperclip-runtime", `${GITHUB_ISOLATED_PARENT}/`,
+      `${GITHUB_ISOLATED_PARENT}/..`, `${GITHUB_ISOLATED_PARENT}/run`, `${GITHUB_ISOLATED_PARENT}-other`, `/${GITHUB_ISOLATED_PARENT}`,
+      GITHUB_ISOLATED_PARENT.slice(1), "/tmp/isolated", "", "."])(
+      "reclaim_orphans refuses unexpected parent %j without listing or removing anything", parent => {
+        const result = runReclaim(parent);
+        expect(result).toMatchObject({ reclaimed: 0, listed: [], removed: [] });
+        // Positive control: the same recorders do see the exact parent's reclaim.
+        expect(result.control).toEqual({ reclaimed: 2, listed: [GITHUB_ISOLATED_PARENT],
+          removed: [["rmtree", `${GITHUB_ISOLATED_PARENT}/victim-dir`], ["unlink", `${GITHUB_ISOLATED_PARENT}/victim-file`]] });
       });
-      if (!proofEmitted) {
-        expect(run).toThrow();
-        return;
-      }
-      expect(JSON.parse(run()).checks.allowedModelAccepted).toBe(false);
-    },
-  );
+    it("reclaim_orphans refuses / through the probe's own call site for a home outside the namespace", () => {
+      // The original unsafe input (home directly under "/"), now with recorders only.
+      const program = `${recorders}import builtins, errno, io, socket, urllib.request, urllib.error
+pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
+os.mkdir = lambda *args, **kwargs: None
+def controlled_open(path, *args, **kwargs):
+    if str(path).startswith("/primary/"): raise OSError(errno.EACCES, "denied")
+    if str(path).endswith("/.probe-owner"): return io.StringIO()
+    raise AssertionError("unexpected open: " + str(path))
+builtins.open = controlled_open
+class FakeSocket:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def settimeout(self, value): pass
+    def connect(self, address): raise OSError(errno.EACCES, "denied")
+socket.socket = lambda *args: FakeSocket()
+def no_policy(request, **kwargs): raise urllib.error.HTTPError(request.full_url, 403, "denied", {}, None)
+urllib.request.urlopen = no_policy
+${GITHUB_ISOLATION_PROBE}
+print(json.dumps({"listed": listed, "removed": removed}))
+`;
+      const [proofLine, recordedLine] = execFileSync("python3", ["-c", program], {
+        input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: "/nonexistent-fresh", canaries: ["/primary/run"], githubAddresses: ["192.0.2.1"] }),
+        encoding: "utf8", timeout: 5000,
+      }).trim().split("\n");
+      expect(JSON.parse(proofLine)).toMatchObject({ orphansReclaimed: 0, namespaceBusy: true });
+      // Only the namespaceBusy check listed "/"; nothing was reclaimed.
+      expect(JSON.parse(recordedLine)).toEqual({ listed: ["/"], removed: [] });
+    });
+  });
   it("materializes the exact hook bundle into a fresh config using the shipped Python probe", () => {
     const scratch = mkdtempSync(join(tmpdir(), "shadow-hooks-"));
     const home = join(scratch, "fresh");
@@ -168,7 +269,15 @@ urllib.request.urlopen = deny_provider_tool
   });
   describe("orphaned isolated homes (probe namespace section on a real directory)", () => {
     // Only identity, sockets and the proxy are faked; listdir/lstat/rmtree/unlink
-    // run for real against a temp isolated/ parent.
+    // run for real against a temp isolated/ parent. The shipped probe runs with
+    // only its ISOLATED_PARENT constant rebound to that temp parent, so these
+    // real-delete tests never point at the production path, and production has
+    // no override (env, argv or stdin) that could widen the reclaim guard.
+    const parentLine = `ISOLATED_PARENT = ${JSON.stringify(GITHUB_ISOLATED_PARENT)}`;
+    const probeUnder = (isolatedParent: string) => {
+      expect(GITHUB_ISOLATION_PROBE.split(parentLine)).toHaveLength(2);
+      return GITHUB_ISOLATION_PROBE.replace(parentLine, `ISOLATED_PARENT = ${JSON.stringify(isolatedParent)}`);
+    };
     const fixture = `import errno, io, json, os, pwd, socket, types, urllib.request, urllib.error
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
@@ -191,7 +300,7 @@ urllib.request.urlopen = proxy
     let scratch: string;
     let parent: string;
     let outside: string;
-    const probe = () => JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
+    const probe = () => JSON.parse(execFileSync("python3", ["-c", fixture + probeUnder(parent)], {
       input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: join(parent, "fresh"), canaries: [], githubAddresses: ["192.0.2.1"] }),
       encoding: "utf8", timeout: 5000,
     }));
