@@ -274,16 +274,30 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await expect(stop).toHaveCount(0);
       await page.getByRole("button", { name: "Send", exact: true }).click();
       await expect(stop).toBeVisible();
-      const comments = await json(
-        await request.get(`/api/issues/${parent.id}/comments`),
-      );
-      expect(JSON.stringify(comments)).toContain("Please check mobile too.");
-      const queue = await json(
-        await request.get(`/api/issues/${parent.id}/queued-comments`),
-      );
-      expect(JSON.stringify(queue.entries)).toContain(
-        "Please check mobile too.",
-      );
+      // The comment row is committed synchronously with the Send POST, but the
+      // wake that populates the queue is enqueued fire-and-forget and left
+      // unawaited, so it can land after the response and a single GET can
+      // observe the comment without its queue entry. Poll until both are
+      // visible. The queue stays deferred while the parent run is live, so
+      // nothing drains it in this window.
+      await expect
+        .poll(
+          async () => {
+            const comments = await json(
+              await request.get(`/api/issues/${parent.id}/comments`),
+            );
+            if (
+              !JSON.stringify(comments).includes("Please check mobile too.")
+            )
+              return "comment-missing";
+            const queue = await json(
+              await request.get(`/api/issues/${parent.id}/queued-comments`),
+            );
+            return JSON.stringify(queue.entries ?? queue);
+          },
+          { timeout: 30_000 },
+        )
+        .toContain("Please check mobile too.");
 
       let dispatchedAt = 0;
       page.on("request", (req) => {
