@@ -451,7 +451,9 @@ export function startGitHubRepositoryArtifact(
     } finally { signal.removeEventListener("abort", onAbort); }
     try { await writeManifest(root, key, checkout); }
     catch { checkout = { repositoryFailure: "repository_artifact_manifest_unwritable" }; }
-    void pruneGitHubRepositoryArtifactStore({ root }).catch(() => undefined);
+    // After any in-flight sweep, so this write is always counted against the cap.
+    void (pruning ?? Promise.resolve()).catch(() => undefined)
+      .then(() => pruneGitHubRepositoryArtifactStore({ root })).catch(() => undefined);
     return checkout;
   })().finally(() => { inflight.delete(key); });
   inflight.set(key, work);

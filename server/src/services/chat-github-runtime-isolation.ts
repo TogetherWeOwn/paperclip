@@ -425,7 +425,12 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   // wait is bounded relative to admission; late or lost production becomes a
   // precise reason and the candidate runs with equivalence unverified.
   const checkout = await resolveGitHubCandidateCheckout(boundary.enrollment);
-  const releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`);
+  // Pinned from resolution, not from materialisation: the cap sweep must not
+  // evict it while this candidate queues for the host lease. Idempotent.
+  const releasePin = checkout?.repository ? pinGitHubRepositoryArtifact(checkout.repository.sha256) : () => undefined;
+  let releaseLease: () => Promise<void>;
+  try { releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`); }
+  catch (error) { releasePin(); throw error; }
   runtimeLeases.set(nonce, releaseLease);
   try {
   // A queued candidate may have been disabled while waiting for the prior arm.
@@ -469,6 +474,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   // gets a checkout; materialisation failure leaves equivalence unverified.
   const workspace = passed ? await materializeGitHubCandidateWorkspace({ snapshot: boundary.enrollment.envelope.snapshot,
     checkout, target, home, nonce }) : undefined;
+  releasePin();
   const receipt = { version: 1, runId: run.id, candidateId: boundary.candidate.id, armId: boundary.candidate.armId,
     environmentId: environment.id, namespace: boundary.namespace, configurationDigest: certificate.configurationDigest,
     certificateDigest: certificateDigest(certificate),
@@ -509,6 +515,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     await assertGitHubCandidateDispatch(db, prepared, prepared.target);
     return prepared;
   } catch (error) {
+    releasePin();
     await cleanupGitHubCandidateRuntime({ home, namespace: boundary.namespace, target, cleanupNonce: nonce }).catch(() => undefined);
     throw error;
   }
