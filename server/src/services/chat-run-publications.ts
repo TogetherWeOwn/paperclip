@@ -1,3 +1,4 @@
+import { insertChatPublications } from "./chat-publication-authority.js";
 import {
   and,
   asc,
@@ -537,9 +538,7 @@ async function enqueueSafeNativeChatProgress(
           .limit(1);
         if (explicitlyAuthoredFinal.length > 0) return 0;
 
-        const insertedRows = await tx
-          .insert(chatPublications)
-          .values({
+        const insertedRows = await insertChatPublications(tx, {
             companyId: row.companyId,
             endpointId: row.endpointId,
             conversationId: row.conversationId,
@@ -552,9 +551,7 @@ async function enqueueSafeNativeChatProgress(
               progressState: "working",
             }),
             state: "pending",
-          })
-          .onConflictDoNothing()
-          .returning({ id: chatPublications.id });
+          }, { onConflictDoNothing: true });
         return insertedRows.length;
       });
       inserted += result;
@@ -913,9 +910,7 @@ export async function enqueueChatRunMilestones(
           .limit(1);
         if (explicitlyAuthoredPublication.length > 0) continue;
       }
-      const result = await db
-        .insert(chatPublications)
-        .values({
+      const result = await insertChatPublications(db, {
           companyId: row.companyId,
           endpointId: row.endpointId,
           conversationId: row.conversationId,
@@ -935,9 +930,7 @@ export async function enqueueChatRunMilestones(
             progressState: milestone,
           }),
           state: "pending",
-        })
-        .onConflictDoNothing()
-        .returning({ id: chatPublications.id });
+        }, { onConflictDoNothing: true });
       inserted += result.length;
     }
     if (rows.length < pageSize) break;

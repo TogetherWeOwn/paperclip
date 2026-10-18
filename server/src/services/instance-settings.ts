@@ -38,7 +38,13 @@ import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
 const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();
-const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema.strip();
+const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema
+  .extend({
+    // A malformed stored experiment switch must fail closed without resetting
+    // unrelated primary runtime settings. API writes remain strictly validated.
+    githubReviewShadowEnabled: instanceExperimentalSettingsSchema.shape.githubReviewShadowEnabled.catch(false),
+  })
+  .strip();
 const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
 interface InstanceSettingsServiceOptions {
@@ -233,6 +239,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableApps: true,
       enableMcpAggregators: true,
       enableChatConnectors: parsed.data.enableChatConnectors ?? false,
+      githubReviewShadowEnabled: parsed.data.githubReviewShadowEnabled ?? false,
       enableMemoryConnectors: parsed.data.enableMemoryConnectors ?? false,
       enablePipelines: parsed.data.enablePipelines ?? false,
       enableCases: parsed.data.enableCases ?? false,
@@ -277,6 +284,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableApps: true,
     enableMcpAggregators: true,
     enableChatConnectors: false,
+    githubReviewShadowEnabled: false,
     enableMemoryConnectors: false,
     enablePipelines: false,
     enableCases: false,

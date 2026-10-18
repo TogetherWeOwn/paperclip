@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, bigint, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -19,6 +20,8 @@ export const assets = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    companyAgentVisibilityIdx: index("assets_company_agent_visibility_idx")
+      .on(table.companyId, table.createdByAgentId, table.id).where(sql`${table.createdByAgentId} is not null`),
     companyCreatedIdx: index("assets_company_created_idx").on(table.companyId, table.createdAt),
     companyProviderIdx: index("assets_company_provider_idx").on(table.companyId, table.provider),
     companyObjectKeyUq: uniqueIndex("assets_company_object_key_uq").on(table.companyId, table.objectKey),

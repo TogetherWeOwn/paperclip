@@ -135,6 +135,10 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 }
 
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+  /** Host-only per-run isolation attestation. Never parsed from agent config.
+   * The certified principal reaches the loopback API directly; an SSH reverse
+   * tunnel would bypass its owner-match egress rules. */
+  githubCandidateIsolation?: { namespace: string; home: string };
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;
@@ -548,7 +552,7 @@ export function resolveAdapterExecutionTargetCwd(
 export function adapterExecutionTargetUsesPaperclipBridge(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
-  return target?.kind === "remote";
+  return target?.kind === "remote" && !(target.transport === "ssh" && target.githubCandidateIsolation);
 }
 
 export function describeAdapterExecutionTarget(

@@ -1,4 +1,5 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
+import { primaryGitHubDelivery, primaryGitHubReview } from "./chat-github-primary.js";
 import { chatDeliveries, chatGitHubReviews, type Db } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
@@ -218,6 +219,7 @@ export async function githubGreenReviewAttempt(
     .from(chatGitHubReviews)
     .where(
       and(
+        primaryGitHubReview(),
         eq(chatGitHubReviews.companyId, input.companyId),
         eq(chatGitHubReviews.endpointId, input.endpointId),
         eq(chatGitHubReviews.repositoryId, input.repositoryId),
@@ -237,6 +239,7 @@ export async function githubGreenReviewAttempt(
     .from(chatDeliveries)
     .where(
       and(
+        primaryGitHubDelivery(),
         eq(chatDeliveries.companyId, input.companyId),
         eq(chatDeliveries.endpointId, input.endpointId),
         sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' like ${`${base}%`}`,
@@ -280,6 +283,7 @@ export async function supersedeQueuedGitHubReviews(
     .set({ state: "superseded", updatedAt: new Date() })
     .where(
       and(
+        primaryGitHubReview(),
         eq(chatGitHubReviews.companyId, input.companyId),
         eq(chatGitHubReviews.endpointId, input.endpointId),
         eq(chatGitHubReviews.repositoryId, input.repositoryId),

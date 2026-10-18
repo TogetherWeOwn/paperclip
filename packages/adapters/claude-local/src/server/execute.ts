@@ -307,8 +307,14 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  const certifiedCandidate = executionTarget?.kind === "remote" && executionTarget.transport === "ssh"
+    && executionTarget.githubCandidateIsolation;
+  if (certifiedCandidate) env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+  // Ordinary SSH inherits host compatibility variables. A certified candidate
+  // must never send controller credentials to the isolated account, even in
+  // command-resolution/bootstrap probes before the actual CLI launch.
   const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv(certifiedCandidate ? { ...env } : { ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -636,6 +642,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterKey: "claude",
           timeoutSec,
           workspaceLocalDir: cwd,
+          // A certified GitHub candidate's checkout is materialised from the
+          // sealed artifact on the isolated host. Never replace or sync it back.
+          ...(executionTarget?.kind === "remote" && executionTarget.transport === "ssh" && executionTarget.githubCandidateIsolation
+            ? { syncWorkspace: false } : {}),
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,
           onProgress: (line) => onLog("stdout", line),

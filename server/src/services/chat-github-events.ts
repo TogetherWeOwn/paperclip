@@ -17,6 +17,7 @@ import {
   githubIdSchema,
   type GitHubReviewEventContext,
 } from "@paperclipai/shared";
+import { primaryGitHubReview } from "./chat-github-primary.js";
 import {
   effectiveGitHubReviewPolicy,
   githubReviewSchedulingDecision,
@@ -199,6 +200,7 @@ export async function githubPreviousAssessment(
         eq(chatGitHubReviews.repositoryId, repositoryId),
         eq(chatGitHubReviews.pullNumber, pullNumber),
         isNotNull(chatGitHubReviews.assessment),
+        primaryGitHubReview(),
       ),
     )
     .orderBy(desc(chatGitHubReviews.createdAt))
@@ -267,6 +269,7 @@ export async function reuseOpenGitHubPullConversation(
         eq(chatConversations.companyId, input.companyId),
         eq(chatConversations.endpointId, input.endpointId),
         sql`lower(${chatConversations.externalThreadId}) = ${key}`,
+        eq(chatConversations.executionScope, "primary"),
         inArray(chatConversations.state, ["active", "waiting"]),
         inArray(issues.status, [...GITHUB_PULL_REUSABLE_ISSUE_STATUSES]),
       ),

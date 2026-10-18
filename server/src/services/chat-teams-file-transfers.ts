@@ -1,3 +1,4 @@
+import { insertChatActions } from "./chat-publication-authority.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -612,7 +613,7 @@ export function teamsFileTransferService(
         await quarantine(tx, row, "conflicting_consent_receipt");
         return "denied";
       }
-      await tx.insert(chatActions).values({
+      await insertChatActions(tx, {
         companyId: row.companyId,
         endpointId: row.endpointId,
         conversationId: row.conversationId,

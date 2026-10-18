@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use paperclip_runner_core::durable::{
     AcpxLaunchProfile, Command, CommandExecutor, DurableRunnerConfig, OpenCodeLaunchProfile,
-    QualifiedLaunchArtifact,
+    PolledEvent, QualifiedLaunchArtifact,
 };
 use paperclip_runner_core::native_provider_backend::NativeProviderCommandExecutor;
 use paperclip_runner_core::provider_bridge::{authorized_tool_catalog_digest, AuthorizedTool};
@@ -60,7 +60,12 @@ fn config(state_dir: &Path) -> DurableRunnerConfig {
 
 fn acpx_config(state_dir: &Path, mode: &str) -> DurableRunnerConfig {
     let mut config = config(state_dir);
-    let command = PathBuf::from(env!("CARGO_BIN_EXE_fake-acpx-sidecar"));
+    // Cargo artifacts can inherit a group-writable umask. Qualify a private
+    // fixture copy instead of mutating the shared target or weakening checks.
+    let command = state_dir.join("qualified-acpx-sidecar");
+    fs::copy(env!("CARGO_BIN_EXE_fake-acpx-sidecar"), &command).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o500)).unwrap();
     config.acpx_launch_profile = Some(AcpxLaunchProfile {
         authority_digest: format!("sha256:{}", "d".repeat(64)),
         command: command.clone(),
@@ -162,6 +167,26 @@ fn assert_valid_terminal(payload: &Value) {
     validator.validate(payload).unwrap();
 }
 
+fn poll_until_event(
+    executor: &mut NativeProviderCommandExecutor,
+    event_type: &str,
+) -> Vec<PolledEvent> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // Unacknowledged events are retained, so return the complete prefix
+        // without accumulating duplicate deliveries across polls.
+        let events = executor.poll_events().unwrap();
+        if events.iter().any(|event| event.event_type == event_type) {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {event_type}; retained events: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn command(sequence: u64, command_type: &str, payload: Value) -> Command {
     Command {
         schema: "paperclip.prp.command.v1".to_owned(),
@@ -206,7 +231,7 @@ fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value
             "agentRuntimePackage": runtime_package,
             "agentRuntimeVersion": runtime_version,
             "commandDigest": CODEX_ACPX_DIGEST,
-            "sidecarCommand": env!("CARGO_BIN_EXE_fake-acpx-sidecar"),
+            "sidecarCommand": directory.join("qualified-acpx-sidecar"),
             "sidecarArgs": [
                 "--mode",
                 mode,
@@ -976,7 +1001,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
             json!({"text":"Finish", "turnId":"provider-turn-review"}),
         ))
         .unwrap();
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "semantic_tool.input");
     let first = events
         .iter()
         .find(|event| event.event_type == "semantic_tool.input")
@@ -991,7 +1016,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
         "result":{"success":false,"contentItems":[{"type":"inputText","text":"Name the reviewer and decision."}]},
     }))).unwrap();
     // The sidecar emits this correction only after receiving the exact reason.
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "semantic_tool.input");
     let corrected = events
         .iter()
         .find(|event| event.event_type == "semantic_tool.input")
@@ -1012,7 +1037,7 @@ fn routes_reserved_completion_feedback_with_the_full_controller_catalog() {
         "callId":"call-finish-2", "operationId":"paperclip_finish", "isError":false,
         "result":{"success":true,"contentItems":[{"type":"inputText","text":"Completion report accepted."}]},
     }))).unwrap();
-    let events = executor.poll_events().unwrap();
+    let events = poll_until_event(&mut executor, "turn.completed");
     assert_eq!(
         events
             .iter()

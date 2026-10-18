@@ -51,6 +51,16 @@ describe("codex auth cache store", () => {
     };
   }
 
+  async function waitForEnter(events: string[], marker: string): Promise<void> {
+    // Poll instead of sleeping a fixed window: on a loaded CI runner the
+    // first caller can need longer than 20 ms to acquire the lock and run.
+    const deadline = Date.now() + 5000;
+    while (!events.includes(marker)) {
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${marker}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
   function subscriptionAuth(input: { accountId: string; lastRefresh?: string; marker?: string }): string {
     const suffix = input.marker ?? input.accountId;
     return JSON.stringify({
@@ -395,9 +405,9 @@ describe("codex auth cache store", () => {
         events.push("first-exit");
         return "first";
       });
-      // Give the first caller a chance to acquire the lock and enter its
+      // Wait until the first caller has acquired the lock and entered its
       // callback before the second caller starts racing for the same lock.
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForEnter(events, "first-enter");
       const secondCall = withCodexAccountHomePromotionLock(env, "company-shared", async () => {
         events.push("second-enter");
         events.push("second-exit");
@@ -432,7 +442,7 @@ describe("codex auth cache store", () => {
         await companyAGate;
         events.push("a-exit");
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForEnter(events, "a-enter");
       const companyBCall = withCodexAccountHomePromotionLock(env, "company-b", async () => {
         events.push("b-enter");
         events.push("b-exit");
@@ -469,7 +479,7 @@ describe("codex auth cache store", () => {
         events.push("first-exit");
         return "first";
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForEnter(events, "first-enter");
       const secondCall = withAccountHomeSecretMutationLock(env, "company-shared", async () => {
         events.push("second-enter");
         events.push("second-exit");
@@ -502,7 +512,7 @@ describe("codex auth cache store", () => {
         await companyAGate;
         events.push("a-exit");
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitForEnter(events, "a-enter");
       const companyBCall = withAccountHomeSecretMutationLock(env, "company-b", async () => {
         events.push("b-enter");
         events.push("b-exit");

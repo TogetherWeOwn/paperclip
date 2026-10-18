@@ -51,6 +51,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   // configs continue to load during upgrades.
   enableApps: z.boolean().default(true),
   enableChatConnectors: z.boolean().default(false),
+  // Global admission/wake kill switch for paired reviews, independent of the
+  // primary endpoint and permanent capture-only fences. Preparation is inert.
+  githubReviewShadowEnabled: z.boolean().default(false),
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),
   enableMemoryConnectors: z.boolean().default(false),
