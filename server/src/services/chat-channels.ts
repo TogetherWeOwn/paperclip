@@ -95,7 +95,10 @@ function readLowTrustAllowedBindingIds(value: unknown): string[] {
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
-import { githubReviewPrompt } from "./chat-github-review-policy.js";
+import {
+  githubReviewPrompt,
+  githubWorkflowReviewTriggerHeadSha,
+} from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
 import { githubChatReviewService } from "./chat-github-reviews.js";
@@ -14566,6 +14569,61 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
+  /**
+   * Workflow review-trigger admission.
+   *
+   * Bot-authored `issue_comment.created` callbacks never reach delivery
+   * admission through the ordinary path below. The single exception is a
+   * `@togetherweown-reviewer review <40-hex head>` comment whose author is an
+   * allow-listed workflow identity: a sponsored guest with
+   * `automaticReviews:true` and a currently active non-viewer sponsor. The
+   * mention identity comes only from the endpoint configuration, never from
+   * comment text. Own-bot (`isMe`) and system messages are never admitted,
+   * and label/draft/head policy stays at review time so comment-then-label
+   * ordering keeps working.
+   */
+  async function githubWorkflowReviewTriggerAdmitted(
+    endpoint: EndpointRow,
+    message: Message,
+  ): Promise<boolean> {
+    if (endpoint.provider !== "github") return false;
+    if (message.author.isMe || message.author.isSystem) return false;
+    if (message.author.isBot !== true) return false;
+    if (githubWorkflowReviewTriggerHeadSha(message.text) === null)
+      return false;
+    if (!endpoint.allowUnlinkedPeople) return false;
+    const [saved] = await db
+      .select()
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
+    if (!saved) return false;
+    const person = saved.configuration.people.find(
+      (candidate) => candidate.githubUserId === message.author.userId,
+    );
+    if (
+      !person ||
+      person.kind !== "guest" ||
+      person.automaticReviews !== true
+    )
+      return false;
+    const [sponsor] = await db
+      .select({
+        status: companyMemberships.status,
+        membershipRole: companyMemberships.membershipRole,
+      })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, endpoint.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, person.sponsorUserId),
+        ),
+      );
+    return (
+      sponsor?.status === "active" && sponsor.membershipRole !== "viewer"
+    );
+  }
+
   async function processMessage(
     endpoint: EndpointRow,
     thread: Thread,
@@ -14608,8 +14666,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       message.author.isMe ||
       message.author.isBot === true ||
       message.author.isSystem
-    )
-      return;
+    ) {
+      if (
+        !(await githubWorkflowReviewTriggerAdmitted(endpoint, message))
+      )
+        return;
+    }
     // One provider message can match both a mention handler and the catch-all
     // new-message handler. The trigger is policy metadata, not provider event
     // identity, so it must not defeat durable deduplication.

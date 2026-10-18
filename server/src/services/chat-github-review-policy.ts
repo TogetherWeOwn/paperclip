@@ -256,6 +256,28 @@ export function validatePersistedGitHubReviewAssessment(
   );
 }
 
+/**
+ * Workflow review-trigger admission.
+ *
+ * The review-trigger workflow posts `@togetherweown-reviewer review <head_sha>`
+ * issue comments as `github-actions[bot]`. Those bot-authored `created`
+ * callbacks must reach `chat_deliveries` so the assigned reviewer can assess
+ * the exact head; every other bot/system/self message stays suppressed.
+ *
+ * Matching is deliberately narrow: the literal reviewer mention, the literal
+ * `review` keyword, and exactly one 40-hex head SHA. The sender allow-list
+ * (sponsored guest with `automaticReviews:true`) is checked by the caller
+ * against the live endpoint configuration, never from comment text.
+ */
+const GITHUB_WORKFLOW_REVIEW_TRIGGER_PATTERN =
+  /(?<![\w-])@togetherweown-reviewer\s+review\s+([0-9a-f]{40})(?![0-9a-f])/i;
+
+/** Lowercase head SHA from a workflow review-trigger comment, or null. */
+export function githubWorkflowReviewTriggerHeadSha(text: string): string | null {
+  const match = GITHUB_WORKFLOW_REVIEW_TRIGGER_PATTERN.exec(text);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
 export function githubReviewConclusion(
   assessment: GitHubReviewAssessment,
   threshold: GitHubReviewPolicy["ratingThreshold"],

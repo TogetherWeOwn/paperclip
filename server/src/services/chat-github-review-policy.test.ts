@@ -9,6 +9,7 @@ import {
   githubReviewConclusion,
   githubReviewLineIsInPatch,
   githubReviewSchedulingDecision,
+  githubWorkflowReviewTriggerHeadSha,
   matchesGitHubReviewPattern,
   validateGitHubReviewAssessment,
   validatePersistedGitHubReviewAssessment,
@@ -272,5 +273,52 @@ describe("GitHub score validation", () => {
     expect(matchesGitHubReviewPattern("src/a.ts", "**/*.ts")).toBe(true);
     expect(matchesGitHubReviewPattern("src/deep/a.ts", "src/*.ts")).toBe(false);
     expect(matchesGitHubReviewPattern("aXts", "a.ts")).toBe(false);
+  });
+});
+
+describe("workflow review-trigger admission", () => {
+  const sha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+  it("extracts the head SHA from the exact workflow trigger", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}`,
+      ),
+    ).toBe(sha);
+  });
+  it("tolerates surrounding text and normalizes uppercase hex", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `please\n@togetherweown-reviewer review ${sha.toUpperCase()}\nthanks`,
+      ),
+    ).toBe(sha);
+  });
+  it("rejects lookalikes that must stay suppressed", () => {
+    expect(githubWorkflowReviewTriggerHeadSha("hello world")).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha("@togetherweown-reviewer review"),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${"a".repeat(39)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${"g".repeat(40)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer please review ${sha}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-reviewer review ${sha}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(`@togetherweown-reviewerX review ${sha}`),
+    ).toBe(null);
   });
 });
