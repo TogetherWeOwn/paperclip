@@ -26,7 +26,7 @@ import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
 import { githubReviewPrompt, githubShadowLabel } from "./chat-github-review-policy.js";
-import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
+import { chatGitHubConfigurations, chatGitHubReviews, chatGitHubReviewArms } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
 import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
@@ -6128,6 +6128,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       input.name?.trim() || `${PROVIDER_LABELS[input.provider]} — ${agent.name}`
     ).slice(0, 145);
     await db.transaction(async (tx) => {
+      if (input.provider === "github") {
+        // Match saveConfiguration's agent lock so even an absent arm cannot be
+        // assigned concurrently with creation of a primary endpoint.
+        const [lockedAgent] = await tx.select().from(agents)
+          .where(and(eq(agents.companyId, companyId), eq(agents.id, agent.id))).for("update");
+        if (!lockedAgent || !isAgentStatusInvokable(lockedAgent.status)) {
+          throw unprocessable("The selected agent must be active before it can be connected to chat", {
+            code: "chat_agent_not_invokable",
+          });
+        }
+        const [activeArm] = await tx.select({ id: chatGitHubReviewArms.id }).from(chatGitHubReviewArms)
+          .where(and(eq(chatGitHubReviewArms.companyId, companyId), eq(chatGitHubReviewArms.agentId, agent.id),
+            isNull(chatGitHubReviewArms.retiredAt))).limit(1).for("update");
+        if (activeArm) throw badRequest("GitHub endpoints require an agent that is not reserved by an active shadow arm");
+      }
       if (input.applicationId) {
         const application = await tx
           .select({

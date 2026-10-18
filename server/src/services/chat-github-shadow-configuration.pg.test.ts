@@ -8,6 +8,7 @@ import {
   toolConnectionInstalls,
 } from "@paperclipai/db";
 import { githubChatManagementService } from "./chat-github-management.js";
+import { chatChannelService } from "./chat-channels.js";
 import { normalizeExperimentalSettings, applyExperimentalSettingsPatch, instanceSettingsService } from "./instance-settings.js";
 
 // Always disposable, never a shared application DB. Do not turn unsupported
@@ -133,6 +134,56 @@ suite("GitHub shadow route persistence (A11, real PostgreSQL)", () => {
     expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
     expect([...await db.execute(sql`select id from chat_github_review_arms where company_id = ${f.companyId} and agent_id = ${f.candidateId} and retired_at is null`)]).toHaveLength(1);
+  });
+
+  function endpointService() {
+    return chatChannelService(db, {
+      heartbeat: { wakeup: async () => { throw new Error("Endpoint creation must not wake an agent"); } },
+      fetch: async () => { throw new Error("Endpoint creation must not call a provider"); },
+      publicBaseUrl: "https://paperclip.example",
+    });
+  }
+
+  it("rejects GitHub endpoint creation for an active shadow arm without leaving connector rows", async () => {
+    const f = await fixture();
+    // Only this disposable fixture is made invokable; no real agent is resumed.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.candidateId));
+    await f.save([f.route]); // Disabled routes still reserve their dedicated identity.
+    const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId));
+    const beforeConnections = await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId));
+    await expect(endpointService().create(f.companyId, { provider: "github", assignedAgentId: f.candidateId }, f.userId))
+      .rejects.toThrow(/shadow arm|dedicated/i);
+    expect(await db.select().from(chatEndpoints).where(eq(chatEndpoints.companyId, f.companyId))).toHaveLength(1);
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toEqual(beforeApplications);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toEqual(beforeConnections);
+    expect((await f.arms())[0].retired_at).toBeNull();
+  });
+
+  it("allows non-GitHub endpoints and a GitHub endpoint after the shadow arm is retired", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.candidateId));
+    await f.save([f.route]);
+    const service = endpointService();
+    expect(await service.create(f.companyId, { provider: "slack", assignedAgentId: f.candidateId }, f.userId)).toBeDefined();
+    await f.save([]);
+    expect(await service.create(f.companyId, { provider: "github", assignedAgentId: f.candidateId }, f.userId)).toBeDefined();
+    expect((await f.arms())[0].retired_at).not.toBeNull();
+  });
+
+  it("serializes GitHub endpoint creation against concurrent shadow arm assignment", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.candidateId));
+    const results = await Promise.allSettled([
+      f.save([f.route]),
+      endpointService().create(f.companyId, { provider: "github", assignedAgentId: f.candidateId }, f.userId),
+    ]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+    const assignments = [...await db.execute(sql`select id from chat_github_review_arms
+      where company_id = ${f.companyId} and agent_id = ${f.candidateId} and retired_at is null
+      union all select id from chat_endpoints where company_id = ${f.companyId}
+        and assigned_agent_id = ${f.candidateId} and provider = 'github'`)];
+    expect(assignments).toHaveLength(1);
   });
 
   it("revision-fences concurrent saves and does not create arms for a stale revision", async () => {
