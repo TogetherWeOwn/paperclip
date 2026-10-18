@@ -33,7 +33,10 @@ export const executionWorkspaces = pgTable(
     derivedFromExecutionWorkspaceId: uuid("derived_from_execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }).notNull().defaultNow(),
-    openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
+    // Nullable: an allocated-but-unrealized source-bound record has never
+    // been opened. Realization sets it; the default still covers inserts
+    // that omit it.
+    openedAt: timestamp("opened_at", { withTimezone: true }).defaultNow(),
     closedAt: timestamp("closed_at", { withTimezone: true }),
     cleanupEligibleAt: timestamp("cleanup_eligible_at", { withTimezone: true }),
     cleanupReason: text("cleanup_reason"),

@@ -460,6 +460,10 @@ import {
   mergeExecutionWorkspaceConfig,
 } from "./execution-workspaces.js";
 import {
+  createDbSourceBoundWorkspaceAllocationDeps,
+  markAllocatedWorkspaceRealized,
+} from "./source-bound-workspace-allocation.js";
+import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
@@ -6109,7 +6113,11 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      input.existingExecutionWorkspaceStatus !== "archived" &&
+      // An unrealized source-bound allocation has no worktree to restore:
+      // presence of the binding is not proof of realization. Dispatch
+      // realizes fresh and adopts the record at persistence instead.
+      input.existingExecutionWorkspaceStatus !== "unrealized",
   };
 }
 
@@ -17720,6 +17728,14 @@ export function heartbeatService(
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        // TOG-28460: agents row first (FOR NO KEY UPDATE, NOWAIT) so this
+        // gate matches the claim transactions' agents-then-issue order.
+        // Reverse order deadlocks (40P01) with concurrent claims that hold
+        // the agents row and wait on the issue row. NOWAIT preserves the
+        // gate's non-blocking contract: contention defers to the queue.
+        await tx.execute(
+          sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update nowait`,
+        );
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -17940,6 +17956,36 @@ export function heartbeatService(
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
       );
       return null;
+    }
+    const maxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
+
+    // TOG-28460: per-agent start gate. Every queued->running transition
+    // funnels through the claim transactions below, so the cap is enforced
+    // there — on the SAME connection that performs the claim — instead of in
+    // the scheduler loop or at the executeRun entry. Lock order is uniform in
+    // every claim tx: agents row first, then the issue/wake/run rows the
+    // existing claim code already locks. The agents lock is FOR NO KEY UPDATE
+    // (not FOR UPDATE) so FK KEY SHARE checks from comment/run inserts still
+    // commit — FOR UPDATE deadlocks with those (40P01) while NO KEY UPDATE
+    // still serializes concurrent claimants. Each claim tx stays short (a
+    // lock, a count, the claim) and never awaits another scheduler, so an
+    // overlapping scheduler that outlives the in-process start lock only waits
+    // briefly instead of wedging. At cap the run stays queued for a later
+    // drain pass.
+    async function isAtStartConcurrencyCap(tx: Db): Promise<boolean> {
+      await tx.execute(
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update`,
+      );
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        );
+      return Number(count ?? 0) >= maxConcurrentRuns;
     }
 
     const context = parseObject(run.contextSnapshot);
@@ -18165,6 +18211,12 @@ export function heartbeatService(
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              // TOG-28460: agents row first (see isAtStartConcurrencyCap),
+              // then the issue/wake/run order below. At cap the run stays
+              // queued for a later drain pass.
+              if (await isAtStartConcurrencyCap(tx as unknown as Db)) {
+                return { kind: "stale" as const, run: null };
+              }
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -18484,9 +18536,15 @@ export function heartbeatService(
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              maxConcurrentRuns,
             });
           }
           return tx.transaction(async (claimTx) => {
+            // TOG-28460: agents row first (see isAtStartConcurrencyCap);
+            // at cap the run stays queued for a later drain pass.
+            if (await isAtStartConcurrencyCap(claimTx as unknown as Db)) {
+              return null;
+            }
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
@@ -20589,6 +20647,24 @@ export function heartbeatService(
     return err instanceof HttpError && err.status >= 400 && err.status < 500;
   }
 
+  // TOG-28460: a 40P01 deadlock aborts only the losing claim transaction.
+  // The run stays queued and a later pass retries it. Crucially the drain
+  // loop must NOT rethrow: already-claimed runs in this batch still need
+  // their execute loop below, otherwise they sit running with no executor
+  // until the orphan reaper. Walk the cause chain like
+  // isExternalChatWaitAuthorizationContention (55P03) does.
+  function isPostgresDeadlock(err: unknown): boolean {
+    let current: unknown = err;
+    for (let depth = 0; depth < 4 && current; depth += 1) {
+      if (typeof current !== "object" || current === null) return false;
+      const record = current as Record<string, unknown>;
+      const code = record.code;
+      if (typeof code === "string" && code.toUpperCase() === "40P01") return true;
+      current = (record as { cause?: unknown }).cause;
+    }
+    return false;
+  }
+
   // Settle runs that can never be claimed. Letting the error escape stalls the
   // agent's queue and, during startup recovery, stops the server from booting.
   async function cancelRejectedQueuedRuns(
@@ -20635,12 +20711,14 @@ export function heartbeatService(
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
-      );
-      if (availableSlots <= 0) return [];
+      // Fast path: already at cap. The claim loop below recounts before
+      // every claim, so a stale read here can only under-claim (a later wake
+      // or drain pass retries).
+      if (
+        (await countRunningRunsForAgent(agentId)) >= policy.maxConcurrentRuns
+      ) {
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -20728,15 +20806,40 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // TOG-28460: withAgentStartLock only chains callers in this process
+      // and lapses 30 s after registration, so overlapping schedulers (other
+      // processes, or a lapsed lock) can both pass the recount below. The
+      // recount is only a fast-path break to avoid wasted claims; the real
+      // gate is the agents-row lock inside claimQueuedRun's claim
+      // transactions, which serializes the recount with the queued->running
+      // flip on one connection. Deliberately no agents-row lock around the
+      // loop: claimQueuedRun performs its own pooled writes, and holding one
+      // transaction across them risks pool starvation. A later wake or drain
+      // pass retries anything left queued.
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        let claimed: typeof heartbeatRuns.$inferSelect | null;
+        // A successful claim flips its row to running synchronously, so the
+        // live count already includes this batch's claims. Claims that cancel,
+        // defer, or hit the atomic cap return null and must not consume the
+        // budget: later queued runs still need their claim attempt (e.g.
+        // blocked-dependency cancellation).
+        const liveRunningCount = await countRunningRunsForAgent(agentId);
+        if (liveRunningCount >= policy.maxConcurrentRuns) {
+          break;
+        }
+        let claimedRun: typeof heartbeatRuns.$inferSelect | null;
         try {
-          claimed = await claimQueuedRun(queuedRun, companyAgents);
+          claimedRun = await claimQueuedRun(queuedRun, companyAgents);
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
+            continue;
+          }
+          if (isPostgresDeadlock(err)) {
+            logger.warn(
+              { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
+              "queued heartbeat run claim deadlocked; leaving it queued for the next recovery pass",
+            );
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
@@ -20746,7 +20849,7 @@ export function heartbeatService(
           );
           continue;
         }
-        if (claimed) claimedRuns.push(claimed);
+        if (claimedRun) claimedRuns.push(claimedRun);
       }
       if (claimedRuns.length === 0) return [];
 
@@ -20888,6 +20991,10 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // TOG-28460: the cap is enforced atomically inside claimQueuedRun's
+      // claim transactions (agents-row lock + recount on the claim
+      // connection), so direct executeRun callers are gated there too. At cap
+      // the claim leaves the run queued for a later drain pass.
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
@@ -21921,6 +22028,16 @@ export function heartbeatService(
         !candidateRuntime && workspaceReuseRequest.existingExecutionWorkspaceAvailable
           ? existingExecutionWorkspace
           : null;
+      // A Board-allocated unrealized record bound to this issue is adopted
+      // at persistence: realization flips that exact record instead of
+      // inserting a second source-bound workspace.
+      const allocatedUnrealizedExecutionWorkspace =
+        existingExecutionWorkspace?.status === "unrealized" &&
+        existingExecutionWorkspace.companyId === agent.companyId &&
+        issueRef?.id &&
+        existingExecutionWorkspace.sourceIssueId === issueRef.id
+          ? existingExecutionWorkspace
+          : null;
       const requestedReusableExecutionWorkspaceConfig =
         reusableExistingExecutionWorkspace?.config ?? null;
       const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
@@ -22906,7 +23023,9 @@ export function heartbeatService(
           existingMetadata:
             resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
               ? (reusableExistingExecutionWorkspace?.metadata ?? null)
-              : null,
+              : // Adoption keeps the allocation provenance recorded on the
+                // unrealized record (actor, selection, prior binding).
+                (allocatedUnrealizedExecutionWorkspace?.metadata ?? null),
           source: executionWorkspace.source,
           // Attaching a new worktree to a pre-existing branch reports a fresh
           // workspace, but must not make cleanup own the operator's branch.
@@ -22972,7 +23091,71 @@ export function heartbeatService(
       const branchNameForInitialPersistence =
         pendingForwardBranchReconcile?.recordedBranchName ??
         executionWorkspace.branchName;
+      // Guarded adoption: the allocated record was captured before
+      // realization, and a Board rollback in between (archived + binding
+      // restored) must not be resurrected by this run. The flip runs inside
+      // the allocation transaction (issue FOR UPDATE lock with status and
+      // binding re-checked), so a rollback that commits first makes the
+      // adoption deny and this run falls through to a fresh insert. This
+      // replaces a getById-then-update sequence whose window between the
+      // two awaits let a rollback be overwritten back to active.
+      const tryAdoptAllocatedExecutionWorkspace = async () => {
+        if (
+          !allocatedUnrealizedExecutionWorkspace ||
+          resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace ||
+          !issueRef?.id
+        ) {
+          return null;
+        }
+        const adoption = await markAllocatedWorkspaceRealized(
+          createDbSourceBoundWorkspaceAllocationDeps(db),
+          {
+            companyId: agent.companyId,
+            sourceIssueId: issueRef.id,
+            workspaceId: allocatedUnrealizedExecutionWorkspace.id,
+            cwd: executionWorkspace.cwd,
+            // A null worktree path fails the helper's completeness check
+            // with `realization_incomplete` (handled below).
+            providerRef: executionWorkspace.worktreePath ?? "",
+            branchName:
+              branchNameForInitialPersistence ??
+              executionWorkspace.branchName ??
+              "",
+            repoUrl: executionWorkspace.repoUrl,
+            providerType:
+              executionWorkspace.strategy === "git_worktree"
+                ? "git_worktree"
+                : "local_fs",
+            baseRef: executionWorkspace.repoRef,
+            metadata: nextExecutionWorkspaceMetadata,
+          },
+        );
+        if (!adoption.ok) {
+          // Fail closed when the allocation is still open and bound but
+          // this run cannot realize into it (e.g. it resolved to
+          // project_primary with no worktree path). Falling through to a
+          // fresh insert here would rebind the issue and orphan the
+          // allocation with a second open source-bound row. Other denies
+          // (binding_conflict / workspace_not_unrealized) mean the
+          // allocation is already gone, so falling through is correct.
+          if (adoption.errorCode === "realization_incomplete") {
+            throw new Error(
+              "Source-bound allocation exists but this run cannot realize into it; failing instead of orphaning the allocation with a second record",
+            );
+          }
+          return null;
+        }
+        return executionWorkspacesSvc.getById(
+          allocatedUnrealizedExecutionWorkspace.id,
+        );
+      };
       try {
+        // Attempted inside persistence so a thrown error still runs the
+        // worktree cleanup below; a denial (rollback won the race) returns
+        // null and falls through to insert, while incomplete facts throw
+        // above instead of orphaning the allocation.
+        const adoptedAllocatedExecutionWorkspace =
+          await tryAdoptAllocatedExecutionWorkspace();
         persistedExecutionWorkspace =
           resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
           reusableExistingExecutionWorkspace
@@ -22998,8 +23181,9 @@ export function heartbeatService(
                     ),
                 },
               )
-            : resolvedProjectId
-              ? await executionWorkspacesSvc.create({
+            : (adoptedAllocatedExecutionWorkspace ??
+              (resolvedProjectId
+                ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,
                   projectWorkspaceId: resolvedProjectWorkspaceId,
@@ -23034,7 +23218,7 @@ export function heartbeatService(
                   openedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
                 })
-              : null;
+              : null));
       } catch (error) {
         if (executionWorkspace.created) {
           try {

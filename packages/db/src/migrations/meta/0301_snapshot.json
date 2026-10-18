@@ -1,6 +1,6 @@
 {
-  "id": "4f98ddbb-88d4-46da-9ba7-e225556741fb",
-  "prevId": "b6477d67-9629-4152-900e-f24a4cc11d54",
+  "id": "b6477d67-9629-4152-900e-f24a4cc11d54",
+  "prevId": "4380f671-6959-41e1-a5b7-f1b6c285ca53",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -9696,27 +9696,6 @@
             },
             {
               "expression": "next_attempt_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_github_candidates_agent_idx": {
-          "name": "chat_github_candidates_agent_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "agent_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
