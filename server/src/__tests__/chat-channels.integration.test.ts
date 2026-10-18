@@ -4496,6 +4496,45 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const candidates = await db.execute(sql`select state from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
       expect([...candidates]).toEqual([{ state: "materialized" }]);
     });
+    it("paired recovery defers a pending candidate without materializing it while the kill switch is off", async () => {
+      const f = await pairedReviewFixture();
+      // The kill switch flips after admission committed the candidate row but
+      // before the recovery sweep claims it for materialization.
+      await db.execute(sql`create function test_stop_paired_recovery() returns trigger language plpgsql as $$ begin
+        update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb;
+        return NEW; end $$`);
+      await db.execute(sql`create trigger test_stop_paired_recovery after insert on chat_github_review_candidates for each row execute function test_stop_paired_recovery()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger if exists test_stop_paired_recovery on chat_github_review_candidates`);
+        await db.execute(sql`drop function if exists test_stop_paired_recovery()`);
+      });
+      await deliverShadowTestMention(f, "paired-recovery-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const candidates = await db.execute(sql`select state, last_error from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "pending", last_error: "candidate_unavailable" }]);
+    });
+    it("paired inbound wake rechecks the kill switch inside the claimed wake transaction", async () => {
+      const f = await pairedReviewFixture();
+      // Flip the switch after the sweep's pre-wake check, when the candidate's
+      // queued chat action is claimed: only the inbound wake gate can stop it.
+      await db.execute(sql.raw(`create function test_stop_paired_inbound_wake() returns trigger language plpgsql as $$ begin
+        if NEW.status = 'processing' and NEW.payload->>'agentId' = '${f.replacementAgentId}' then
+          update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb; end if;
+        return NEW; end $$`));
+      await db.execute(sql`create trigger test_stop_paired_inbound_wake after update on chat_actions for each row execute function test_stop_paired_inbound_wake()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger if exists test_stop_paired_inbound_wake on chat_actions`);
+        await db.execute(sql`drop function if exists test_stop_paired_inbound_wake()`);
+      });
+      await deliverShadowTestMention(f, "paired-inbound-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      // The denied wake never dispatches the candidate.
+      const candidates = await db.execute(sql`select state from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "unavailable" }]);
+    });
     it("paired admission recovers an enrollment projection failure from immutable source seed", async () => {
       const f = await pairedReviewFixture();
       await db.execute(sql`create function test_fail_pair_projection() returns trigger language plpgsql as $$ begin raise exception 'injected projection failure'; end $$`);
@@ -4954,7 +4993,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(secondAcquired).toBe(true);
       await second();
     });
-    it.each(["certified", "uncertified", "wrong-environment", "contaminated", "transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "namespace-busy", "disabled", "disabled-after-probe"] as const)(
+    it.each(["certified", "uncertified", "wrong-environment", "contaminated", "transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "namespace-busy", "disabled", "disabled-after-probe",
+      "allowed-model-rejected", "other-model-accepted", "raw-proxy-open"] as const)(
       "paired certified runtime %s gates dispatch independently of the primary",
       async (scenario) => {
         const { environments, chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
@@ -5004,8 +5044,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             home: scenario === "wrong-home" ? "/primary-home" : input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
             namespaceBusy: scenario === "namespace-busy",
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: scenario !== "namespace-busy", providerToolsDenied: true,
-              allowedModelAccepted: input.model === "configured-arm-model", otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
+              // Each model-proxy check must flow from the bound proof into the receipt.
+              allowedModelAccepted: input.model === "configured-arm-model" && scenario !== "allowed-model-rejected",
+              otherModelDenied: scenario !== "other-model-accepted", rawProxyDenied: scenario !== "raw-proxy-open" } }), stderr: "" };
         });
+        const proxyContaminated = ({ "allowed-model-rejected": "allowedModelAccepted", "other-model-accepted": "otherModelDenied",
+          "raw-proxy-open": "rawProxyDenied" } as Record<string, string>)[scenario];
         let prepared: Awaited<ReturnType<typeof isolation.prepareGitHubCandidateRuntime>> = null;
         try {
           if (scenario === "disabled") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
@@ -5057,9 +5101,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(probe.mock.calls.filter(([, command]) => !command.includes("shutil.rmtree"))).toHaveLength(["uncertified", "wrong-environment", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "disabled"].includes(scenario) ? 0 : 1);
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
           const receipt = enrollment!.isolationTests[run!.id];
-          if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe") {
+          if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe" || proxyContaminated) {
             expect(receipt).toMatchObject({ runId: run!.id, environmentId: environment!.id,
-              status: scenario === "contaminated" ? "failed" : "passed" });
+              status: scenario === "contaminated" || proxyContaminated ? "failed" : "passed", candidateRuntimeCertified: !(scenario === "contaminated" || proxyContaminated) });
+            for (const key of ["allowedModelAccepted", "otherModelDenied", "rawProxyDenied"])
+              expect(receipt.checks[key]).toBe(key !== proxyContaminated);
           } else if (["transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "canary-hash", "canary-error", "namespace-busy"].includes(scenario)) {
             expect(receipt).toMatchObject({ status: "error" });
             const [unavailable] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
@@ -5074,7 +5120,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(enrollment!.envelope.comparisonEligibility.certifiedClean).toBe(false);
           }
           const [stored] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
-          if (scenario === "contaminated") {
+          if (scenario === "contaminated" || proxyContaminated) {
             expect(stored!.state).toBe("voided");
             expect(stored!.lastError).toBe("github_candidate_contaminated");
             await expect(db.update(chatGitHubReviewCandidates).set({ state: "dispatched" })

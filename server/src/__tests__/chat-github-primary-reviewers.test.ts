@@ -173,6 +173,30 @@ describe("visibility watermark reuse", () => {
     expect(execute).toHaveBeenCalledTimes(4);
   });
 
+  it("recomputes API visibility at response time so a late alias committed during the request is filtered", async () => {
+    const { db, execute } = await fixture();
+    const lateBody = [{ id: "public" }, { id: "late-alias", body: "LATE PRIVATE" }];
+    execute.mockResolvedValueOnce([{ ...candidate, database_snapshot: "10:20:12" }]);
+    const app = express();
+    app.get("/late", async (req, res, next) => {
+      req.actor = { type: "agent", companyId, agentId: "primary", source: "agent_key" };
+      try {
+        await installGitHubPrimaryApiBlinding(db, companyId, req, res);
+        expect(execute).toHaveBeenCalledTimes(1);
+        // An already-running transaction commits a candidate alias while the
+        // route runs; the ingress visibility still admits it.
+        execute.mockResolvedValueOnce([{ database_snapshot: "10:20:" }])
+          .mockResolvedValueOnce([{ ...candidate, key: "late", tokens: [...candidate.tokens, "late-alias"], database_snapshot: "10:20:" }]);
+        res.json(lateBody);
+      } catch (error) { next(error); }
+    });
+    const actual = await request(app).get("/late");
+    expect(actual.status).toBe(200);
+    expect(actual.body).toEqual([{ id: "public" }]);
+    expect(actual.text).not.toContain("LATE PRIVATE");
+    expect(execute).toHaveBeenCalledTimes(3);
+  });
+
   it("does not return cached visibility if the cheap watermark cannot be read", async () => {
     const { db, execute } = await fixture();
     execute.mockResolvedValueOnce([candidate]).mockResolvedValueOnce([]);
