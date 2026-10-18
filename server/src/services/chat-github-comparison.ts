@@ -1,7 +1,8 @@
 import { and, eq, isNotNull, isNull, or } from "drizzle-orm";
 import { chatGitHubReviews, type chatGitHubReviewEnrollments, type Db } from "@paperclipai/db";
 import { GITHUB_PRIMARY_BLINDING_VERSION } from "./chat-github-primary-blinding.js";
-import { githubPairEquivalence, type GitHubPairRunEvidence, type GitHubPairWorkspaceBinding } from "./chat-github-run-evidence.js";
+import { githubPairEquivalence, GITHUB_SHADOW_CANDIDATE_DENIALS, type GitHubPairRunEvidence,
+  type GitHubPairWorkspaceBinding } from "./chat-github-run-evidence.js";
 
 type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Enrollment = typeof chatGitHubReviewEnrollments.$inferSelect;
@@ -80,13 +81,42 @@ export const GITHUB_SHADOW_PROTOCOL = {
   version: 3,
   primaryBlindingVersion: GITHUB_PRIMARY_BLINDING_VERSION,
   eligibilitySource: "runCapability.envelope.comparisonEligibility",
+  /** Candidate-only removals enforced by githubPairEquivalence through
+   * GITHUB_SHADOW_CANDIDATE_DENIALS. Each removes a capability from the
+   * candidate alone, so each biases the comparison toward the primary. */
   deviations: {
     webTools: {
-      deniedTools: ["WebSearch", "WebFetch"],
+      deniedTools: GITHUB_SHADOW_CANDIDATE_DENIALS.webTools.tools,
       reason: "Provider-side public PR reads can reveal the primary review despite candidate host egress isolation.",
       primaryChanged: false,
+      bias: "favours_primary",
       evidence: { successfulRuns: 3138, lookbackDays: 7, webSearchRequests: 0, webFetchRequests: 0,
         source: "heartbeat_runs.result_json.server_tool_use", observedOn: "2026-10-17", verification: "operator_supplied" },
+    },
+    paperclipBoardMcp: {
+      deniedMcpServers: GITHUB_SHADOW_CANDIDATE_DENIALS.paperclipBoardMcp.mcpServers,
+      deniedToolPrefixes: GITHUB_SHADOW_CANDIDATE_DENIALS.paperclipBoardMcp.toolPrefixes,
+      reason: "Project/task creation and connection requests mutate the board; a capture-only candidate must not, and reviewing needs neither.",
+      primaryChanged: false,
+      bias: "favours_primary",
+    },
+    githubPublication: {
+      deniedToolPattern: GITHUB_SHADOW_CANDIDATE_DENIALS.githubPublication.toolPattern,
+      reason: "Invariant I1: the candidate is capture-only; it reads and records its assessment (read_pull_request, read_file, begin_review, submit_review) but never publishes a comment or formal review.",
+      primaryChanged: false,
+      bias: "favours_primary",
+    },
+    webCapableMcpApps: {
+      deniedToolPrefixes: GITHUB_SHADOW_CANDIDATE_DENIALS.webCapableMcpApps.toolPrefixes,
+      reason: "App-gallery MCP tools (SearXNG web search and web-url-read, DeepWiki, Cloudflare docs, Hugging Face, package-version-check) are web-capable and could read the primary's public PR review, as WebSearch/WebFetch could.",
+      primaryChanged: false,
+      bias: "favours_primary",
+    },
+    sharedMemory: {
+      deniedToolPrefixes: GITHUB_SHADOW_CANDIDATE_DENIALS.sharedMemory.toolPrefixes,
+      reason: "Shared Hindsight memory could carry the primary's verdicts into the candidate.",
+      primaryChanged: false,
+      bias: "favours_primary",
     },
   },
 } as const;
