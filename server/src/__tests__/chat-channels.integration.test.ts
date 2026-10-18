@@ -4973,8 +4973,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(chatGitHubReviews).set({ createdAt: new Date(Date.now() + 1000) }).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
       await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
       const next = await deliverShadowTestMention(f, `history-unpaired-${hasPrimaryHistory}`, "@maya second unpaired review", 81);
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, next.issueId!));
-      const comment = comments.find(c => c.body.includes("second unpaired review"))!;
+      // Admission can defer behind a concurrent durable wakeup; wait for its
+      // persisted comment rather than assuming the callback drained the queue.
+      const comment = await vi.waitFor(async () => {
+        await f.service.processPendingDeliveries();
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, next.issueId!));
+        const admitted = comments.find(c => c.body.includes("second unpaired review"));
+        expect(admitted).toBeDefined();
+        return admitted!;
+      }, { timeout: 5000, interval: 50 });
       const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
         invocationSource: "assignment", status: "running", contextSnapshot: { issueId: next.issueId, wakeCommentId: comment.id } }).returning();
       const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: next.issueId!, runId: run!.id };
@@ -5006,8 +5013,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("paired admission never retargets candidate review to an advanced provider head", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "paired-advanced", "@maya review this", 81);
-      await f.service.processPendingDeliveries();
-      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidate = await vi.waitFor(async () => {
+        await f.service.processPendingDeliveries();
+        const admitted = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId);
+        expect(admitted).toBeDefined();
+        return admitted!;
+      }, { timeout: 5000, interval: 50 });
       const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
       installShadowRecorder(f, "c".repeat(40));
       await expect(githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "c".repeat(40) })).rejects.toThrow();
