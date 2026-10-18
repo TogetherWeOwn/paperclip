@@ -31,6 +31,11 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Environment (driver `sandbox`) that runs the trust preset `low_trust_review`
+  // whenever its environment selection would otherwise land on local. Trusted
+  // runs never read it. Absent/null = no designation: a low-trust run that
+  // lands on local fails closed (`low_trust_requires_sandbox_environment`).
+  lowTrustSandboxEnvironmentId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z
@@ -51,6 +56,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   // configs continue to load during upgrades.
   enableApps: z.boolean().default(true),
   enableChatConnectors: z.boolean().default(false),
+  // Global admission/wake kill switch for paired reviews, independent of the
+  // primary endpoint and permanent capture-only fences. Preparation is inert.
+  githubReviewShadowEnabled: z.boolean().default(false),
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),
   enableMemoryConnectors: z.boolean().default(false),

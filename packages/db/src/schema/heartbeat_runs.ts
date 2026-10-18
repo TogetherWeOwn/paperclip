@@ -118,6 +118,13 @@ export const heartbeatRuns = pgTable(
       table.id,
       table.completionContractId,
     ),
+    companyAgentVisibilityIdx: index("heartbeat_runs_company_agent_visibility_idx").on(table.companyId, table.agentId, table.id),
+    companyLegacyIssueVisibilityIdx: index("heartbeat_runs_company_legacy_issue_visibility_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} ->> 'issueId')`, table.id)
+      .where(sql`${table.nativeIssueId} is null`),
+    companyLegacyTaskVisibilityIdx: index("heartbeat_runs_company_legacy_task_visibility_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} ->> 'taskId')`, table.id)
+      .where(sql`${table.nativeIssueId} is null and ${table.contextSnapshot}->>'issueId' is null`),
     companyAgentStartedIdx: index("heartbeat_runs_company_agent_started_idx").on(
       table.companyId,
       table.agentId,

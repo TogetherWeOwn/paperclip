@@ -1,0 +1,338 @@
+Certified GitHub candidate execution — operator contract (default OFF)
+
+This code does not provision a host, change production config, enable the shadow
+switch, or certify the primary. PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS is
+an operator-owned server environment variable, default []. Invalid JSON or an
+invalid entry rejects the entire list. Agent/issue environment variables cannot
+set this server-side grant. Do not enable PR #167 merely because unit tests pass.
+
+Scope
+  Only claude_local with explicit adapterConfig.engine="cli", command="claude"
+  (or unset), no args/extraArgs, Chrome, managed-AI config seed, or isolateRuntime.
+  ACP/default-engine and other adapters remain unsupported, not silently changed.
+  The candidate keeps its configured model/effort/instruction text and sealed
+  review request/tools. Use muse-wonder-full-1.0-contributor, effort low as planned.
+  Primary adapter/session/environment behavior is unchanged.
+  Ordinary worktree reuse, provisioning hooks, GitHub launchers and persistent
+  agent-directory restores are bypassed for candidates. Only instruction text
+  and selected skills may stage, not primary memory or the previous worktree.
+  comparisonEligibility.certifiedClean is derived at read time from the exact
+  run receipts. Passing isolation alone is NOT a fair-comparison certificate or
+  permission to replace the production Claude gate.
+
+Blinding scope
+  Primary-side API, tool-gateway and live-event blinding applies only to agents
+  assigned to a GitHub chat endpoint in the same company (provider='github',
+  assigned_agent_id), not the whole fleet. Startup loads this set in memory;
+  GitHub endpoint create/update refreshes it, failing closed during changes or
+  on load failure. Assignments are currently immutable in the public update API;
+  maintenance reassignment must use withGitHubPrimaryReviewerChange (or restart
+  before serving requests), never an unfenced direct database write. Candidate
+  confinement and board/operator visibility are unchanged. Accepted deviation:
+  non-primary agents may read candidate artifacts and could indirectly relay
+  them to the primary. That unlikely contamination would favor the primary
+  (Claude), the conservative direction for a replace-Claude decision. This is
+  not strict organization-wide noninterference or complete comparison certification.
+  Equal PostgreSQL MVCC snapshots permit reusing visibility between ingress and
+  response; any transaction-visibility change rechecks candidate identities,
+  including aliases committed late by transactions already open at ingress.
+
+Primary input provenance
+  Pair capture must not delay the production wake. A primary that started before
+  seed.admittedAt therefore stays live for its whole run; it must not switch to
+  snapshot/history bytes when capture finishes. Legacy seeds without admittedAt
+  cannot bind a primary. begin_review (or submit_review without begin) records
+  event.inputSource on the exact primary run's review row, including claimed
+  automatic rows. Only "snapshot" is sealed-input evidence.
+  Run-scoped comparison re-derives eligibility using that admission/head's primary
+  receipt as well as the candidate's isolation receipt. Live, missing, and legacy
+  primary provenance yield primary_inputs_not_sealed; runtime isolation alone
+  never certifies equal inputs. Pre-primary candidate receipts stay conservative.
+  Decision: retain early live primaries in ALL_ASSIGNED but exclude CLEAN_PAIRED.
+  Matching the head alone cannot prove equivalent mutable comments/checks/reviews
+  or previousAssessment, nor absence of counterpart output at every live read.
+  This implementation does not record a complete, timed live-read transcript, so
+  opportunistic certification of same-head live primaries is deliberately NOT
+  implemented. A future opt-in needs that evidence, not an inferred clean label.
+  Pending selections now record their actual admission time and instance-settings
+  transaction epoch. Capture is allowed only within 15 seconds, before any linked
+  primary execution/review/publication, with checks before and after provider I/O.
+  Any committed settings rewrite invalidates pending selection conservatively,
+  including off/on transitions entirely between sweeps. Interrupted, disabled or
+  late selections retain an unavailable denominator; they never recapture fresh
+  comments/reviews/head. Actual primary reviewed-head disagreement voids the
+  candidate at wake, tool binding and dispatch checks.
+  NUL in PR title/body is accounted as admission_event_not_jsonb_safe, without
+  altering its bytes or silently dropping the selected pair.
+
+Evidence-based tool/workspace equivalence
+  Heartbeat records github_review.runtime_evidence for both Claude CLI arms when
+  the shadow switch is on. Only init-event version, tool names, MCP server names
+  and permission mode are retained, plus the actual execution target's git HEAD.
+  Prompts, model output, session IDs, MCP URLs and cwd are NOT in these receipts.
+  A CLI cwd differing from the execution target, an unsupported inner sandbox,
+  or an empty/non-git workspace has no verified head (never the admitted head by
+  assumption). The controller observes HEAD at CLI initialization, not a full
+  dirty-tree/content digest; this does not prove all filesystem bytes identical.
+  Effective_tool_equivalence_unverified clears only for equal CLI versions,
+  permission modes, MCP name sets and tool sets across every init and every
+  primary retry bound to this admission/head. Only candidate WebSearch/WebFetch
+  removals are allowed; model identity intentionally differs. Missing/malformed
+  evidence stays unverified. workspace_equivalence_unverified: see "Sealed
+  candidate checkout" below.
+  Primary run IDs are joined through exact admission/head review rows; candidate
+  evidence is bound to the exact run and agent. Never reuse a previous good run.
+  Admission/pre-dispatch cached eligibility stays conservative; consumers use
+  the read-time comparisonEligibility returned by the run capability.
+
+Sealed candidate checkout (repository artifact)
+  Why: production measurement 2026-10-18 (agent 68cba6b5, last 80 succeeded
+  runs): 79 used Bash, 75 used git/gh; 1,592 Bash calls (938 starting with cd)
+  vs 664 github-bot tool calls. The primary reviews mainly from local clones.
+  A candidate limited to an empty non-git workspace was handicapped.
+  Capture: in the same 15 s admission window/abort as the snapshot (before the
+  primary has published anything; pairCaptureFailure rechecks after I/O), the
+  server produces one artifact with the endpoint's installation token:
+    bundle (preferred): git fetch BY SHA of the admitted head and PR base into a
+      server cache clone (<instance>/data/github-shadow-repositories/cache, or
+      PAPERCLIP_GITHUB_SHADOW_REPOSITORY_DIR), then `git bundle create` from a
+      temporary repo that borrows the cache objects and names exactly two refs:
+      refs/heads/<base branch> = base, refs/pull/<n>/head = admitted head. The
+      bundle therefore holds only their ancestry: no later fix commits, other
+      branches, tags or cache refs. The token travels in the git child env
+      (http.extraHeader), never argv/config. A slow first fetch keeps warming the
+      cache (10 min cap) after the window; this admission falls back.
+    synthetic (fallback, repo too large / fetch failed / bundle share of the
+      window spent): base and head tarballs (codeload; token never forwarded)
+      rebuilt with all attributes/filters disabled into commit 1 = base tree,
+      commit 2 = head tree. Accepted only if each rebuilt tree hash equals the
+      tree GitHub reports for the admitted commit; export-ignore/export-subst/
+      submodules make that impossible and fail closed.
+  The artifact (content-addressed <sha256>.bundle under .../artifacts, 512 MiB
+  cap, 7-day retention) is recorded in the sealed snapshot as
+  snapshot.repository {kind, path, sha256, headSha, baseSha, headTree, baseTree,
+  refs, commits} UNDER the snapshot digest. No artifact => snapshot.
+  repositoryFailure carries a precise reason (repository_artifact_late,
+  bundle:<reason>;synthetic:<reason>, repository_artifact_disabled, ...); the
+  candidate still runs and workspace equivalence stays unverified.
+  PAPERCLIP_GITHUB_SHADOW_REPOSITORY_ARTIFACTS=off disables production.
+  Dispatch: only after a PASSED isolation probe, the controller re-hashes the
+  local artifact, transfers it over the certified SSH channel (tar stream) into
+  <home>/.paperclip-review/artifact, and the isolated principal materialises it:
+  local bare origin <home>/.paperclip-review/origin.git, `git clone` into
+  <home>/workspace, detached HEAD at the admitted head (synthetic: commit 2),
+  origin/pull/<n>/head and origin/<base> present, .paperclip-runtime/ excluded.
+  `git fetch origin` and `git diff origin/<base>...HEAD` work offline; the only
+  remote is the local path. The claude adapter does not sync/restore the
+  workspace for certified candidates, so the CLI cwd IS that checkout. The
+  receipt (isolationTests[run].workspace) records status/kind/head/tree/base
+  commit/base tree or a precise reason. Namespace cleanup removes it all.
+  Equivalence: workspace_equivalence_unverified clears only when
+    candidate: receipt materialized for this exact artifact; bundle => HEAD =
+      admitted head and origin/<base> = admitted base; synthetic => HEAD tree =
+      admitted head tree and base tree present; and every candidate CLI init
+      observed exactly that HEAD and tree (workspaceKind isolated_checkout);
+    primary: every run either observed HEAD = admitted head (checkout) or ran
+      from its agent home with no checkout HEAD, recorded as workspaceKind
+      "agent_home_with_network_git" (it clones/fetches GitHub itself).
+  The arms are equivalent in CAPABILITY: both have a full local checkout of the
+  admitted head. The primary may additionally fetch other refs (including later
+  commits); the candidate cannot, by design (that would leak what the primary
+  found or published).
+  Remaining asymmetries (recorded, not hidden):
+    - synthetic fallback lacks real history/blame/log (two commits only);
+    - the primary has network gh/curl/GitHub API; the candidate only the sealed
+      snapshot tools and the local checkout;
+    - the candidate lacks WebSearch/WebFetch (protocol deviation webTools);
+    - primary "agent_home_with_network_git" is a recorded kind, not a proof
+      that the primary actually cloned the admitted head in that run.
+
+Known deviations
+  The operator-provisioned host's /proc does not use hidepid. Other users'
+  command lines are visible; the audited command lines contain CLI flags and
+  denied file paths, not review output. This is an accepted, documented deviation,
+  not a claim that process metadata is isolated. The runtime self-test does NOT
+  check hidepid. Re-audit if launchers start putting prompts/output in arguments.
+  The new-account provisioning template still recommends/refuses absent hidepid=2;
+  it must not be rerun against the existing operator-provisioned account.
+  The operator pinned the candidate CLI to primary 2.1.284 (byte-identical binary)
+  before this code change. Per-run init receipts now detect version disagreement;
+  version equality is not a cryptographic binary-integrity attestation.
+
+Deferred capture failures and denominator accounting
+  githubPairingCapture.attempts bounds recovery to three claims. Missing source,
+  invalid context, and admission exceptions record the failure reason; the third
+  failure (or recovery after an interrupted third claim) atomically removes both
+  pending/capture markers and retains the frozen selected arms in
+  githubPairingFailure { reason, attempts, arms, revision, providerEventId }.
+  Do not count only enrollment rows: terminal capture failures have none.
+  scripts/github-shadow-pair-accounting.sql is the executable ALL_ASSIGNED
+  accounting query (bind company UUID, endpoint UUID). It includes pending and
+  terminal selections as missing pairs, and counts each frozen selected arm once
+  even before enrollment projection. A missing assessment is not an exclusion
+  from the operational denominator or evidence of a passing review.
+
+1. Provision ONLY after host-operator review, on staging first
+  scripts/provision-github-shadow-host.sh is a new-account template, not an
+  automatically executed installer. With no --apply it prints usage and exits.
+  It refuses to repurpose an existing paperclip-shadow account. It creates no
+  private keys, rotates no credentials and does not edit server config.
+  Review every PRIMARY_ROOT: include primary run/session/config/worktree storage,
+  controller home/credentials and any alternate mounts exposing those bytes.
+  The script adds a deny ACL at each root, saving the prior ACL for rollback.
+  Ensure there are no accessible bind-mount aliases, hard links or shared groups.
+  Use a dedicated staging host with /proc hidepid=2 already configured. The
+  script refuses to change global /proc behavior, which could affect primary.
+  Root owns the login HOME, profiles and SSH authorized_keys; only work and the
+  isolated runtime parent are writable. Do not give this user sudo, Docker,
+  containerd, primary groups, writable login profiles or readable service keys.
+  Audit Unix sockets and setuid helpers too; an IP firewall does not confine them.
+  Preinstall the same root-owned Claude CLI version as primary at
+  /usr/local/bin/claude, plus /usr/bin/python3, sh, tar and git. Candidate bootstrap
+  cannot download packages. No primary config/credential seeding is permitted.
+
+2. Review and persist the network boundary
+  The template installs IPv4/IPv6 owner-match OUTPUT rules for this UID only.
+  Only IPv4 loopback TCP 3100 (Paperclip) and 8318 (restricted proxy) are allowed.
+  Raw upstream 8317 MUST be denied to the candidate UID. As a DIFFERENT trusted
+  non-candidate service UID, run scripts/github-shadow-model-proxy.mjs using Node
+  22+ under the host-managed service supervisor. It binds only 127.0.0.1:8318.
+  Set PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN to a dedicated candidate token and
+  PAPERCLIP_GITHUB_SHADOW_UPSTREAM_TOKEN to a DIFFERENT private upstream token.
+  Set PAPERCLIP_GITHUB_SHADOW_ALLOWED_MODELS to a JSON array containing only the
+  arm's configured model IDs, e.g. ["muse-wonder-full-1.0-contributor"]. No default
+  or wildcard is accepted. Other models are refused before upstream I/O.
+  The controller needs the candidate token; candidates never receive upstream
+  credentials. Do not run the proxy as paperclip-shadow or share its env/file.
+  Provision credentials through the existing secret-management mechanism; this
+  change neither creates nor rotates credentials. The proxy accepts only exact
+  POST /v1/messages (plus the exact SDK ?beta=true alias), custom client tools
+  and inline inputs, rejecting provider
+  web/MCP tools, URL sources and management routes before upstream I/O. It strips
+  request headers except the fixed protocol headers and private upstream auth.
+  The proxy permits context_management only for edits with types matching
+  ^clear_(thinking|tool_uses)_\d{8}$; compaction and unknown extensions stay denied.
+  A sanitized recorded CLI request is replayed against a fake upstream in tests.
+  It drops anthropic-beta (existing upstream compatibility contract); the positive
+  runtime request also uses context_management, so upstream incompatibility fails
+  certification instead of being mistaken for isolation.
+  The runtime probes authenticated web-search, web-fetch and MCP denial USING THE
+  CONFIGURED MODEL, and another model's denial; each requires HTTP 403 plus
+  x-paperclip-shadow-policy: client-tools-only-v1. It also requires a normal request
+  for the configured model (max_tokens=1) to return 2xx, and TCP connect to raw
+  127.0.0.1:8317 to be refused for the candidate UID. Outage is NOT a pass.
+  CLI --disallowedTools alone is not a network boundary.
+  All other TCP/UDP, Internet, DNS, IPv6 and other loopback destinations reject.
+  Persist these rules using the existing host-managed firewall mechanism before
+  certification. Do not certify an ephemeral rule which disappears on reboot.
+  SSH keys use 'restrict': no forwarding, PTY, agent forwarding or user rc.
+  Audit effective sshd settings and all keys; no password login/user env bypass.
+  Certified runs DO NOT create the normal SSH reverse API tunnel (that could
+  bypass owner-match egress via sshd). The two approved services must actually be
+  bound to these loopback endpoints on the SSH host.
+  Paperclip MUST require authentication even from loopback; local_trusted or an
+  unauthenticated admin/UI route is disqualifying. The model proxy MUST expose
+  inference only to candidate credentials, not management, logs or other users'
+  transcripts. Probe both anonymously and with the candidate's scoped token.
+  Runtime API/tool-gateway confinement from I4 remains required. Candidates are
+  not given the connection-intent broker token, project-tools endpoint, or generic
+  managed-MCP configuration. Their signed run JWT can mint a snapshot-only session
+  via POST /api/tool-gateway/sessions; assigned MCP gateways use the same run-bound
+  confinement and the fixed loopback API URL. No connection-request capability is
+  necessary for reviewing the sealed head.
+
+3. Plant and map real primary canaries; do not accept 'file missing'
+  Place random nonempty canary files inside actual primary run and worktree
+  storage protected by the same access controls as primary answers.
+  Keep an operator/controller-readable path to the SAME files (e.g. a mounted
+  path inside the controller). Record each file's SHA256, remote host path and
+  controller path. EACCES/EPERM is required remotely; ENOENT is not a pass.
+  Independently prove the primary can read them. Never put primary answers into
+  canaries. The runtime probe verifies their hashes locally before SSH.
+  A certificate's serverPath/remotePath mapping is an operator attestation:
+  two different files at those paths are not a valid test.
+
+4. Configure an existing SSH environment, then build a certificate
+  Environment: driver ssh, status active, username paperclip-shadow, explicit
+  pinned knownHosts, strictHostKeyChecking=true, remoteWorkspacePath normally
+  /home/paperclip-shadow/work. Store a scoped SSH key via the existing
+  privateKeySecretRef mechanism; do not inline a private key into the certificate.
+  Pin the secret version rather than 'latest'; changing resolved key material
+  requires re-certification even if a secret reference did not change.
+  Set candidate.defaultEnvironmentId to this environment. Leave primary alone.
+  Each certificate binds companyId, environmentId and the digest returned by
+  githubIsolationConfigurationDigest({driver, config, envVars}) in
+  server/src/services/chat-github-runtime-isolation.ts. Pass the STORED environment
+  representation, not a redacted API representation or resolved secret bytes.
+  The digest is SHA256 of recursively key-sorted JSON for those three fields.
+  Server environment value schema (replace placeholders, never paste as-is):
+  [{"companyId":"UUID","environmentId":"UUID","configurationDigest":"64-lowercase-hex",
+    "modelProxyPolicy":"client-tools-only-v1",
+    "primaryCanaries":[
+      {"kind":"run","serverPath":"/controller/path/run-canary","remotePath":"/host/primary/run/canary","sha256":"64-lowercase-hex"},
+      {"kind":"worktree","serverPath":"/controller/path/worktree-canary","remotePath":"/host/primary/worktree/canary","sha256":"64-lowercase-hex"}
+    ]}]
+  No public keys, tokens, private keys, answers or canary contents enter receipts.
+  Only explicit model/context/time settings are forwarded from agent config.
+  ANTHROPIC_AUTH_TOKEN is replaced with the dedicated shadow proxy token, with
+  fixed ANTHROPIC_BASE_URL=http://127.0.0.1:8318 and fresh HOME/config/XDG/TMP.
+  The dedicated candidate token is sent over SSH stdin for the authenticated
+  denial probe, never argv or receipts. No ambient/upstream credentials are sent.
+  Use the normal signed run JWT for Paperclip, not a long-lived agent API key.
+
+5. Stage, verify, and retain evidence before any enablement
+  Each run uses the persisted arm/head/run namespace, creates HOME atomically,
+  tests canary denial and GitHub TCP/443 denial, and appends an immutable receipt
+  to chat_github_review_enrollments.isolation_tests[runId]. A failed probe marks
+  the candidate voided; neither recovery nor tools can revive it. A missing grant
+  starts no probe/provider. Replay cannot overwrite a previous receipt.
+  Probe, provider execution and nonce-owned cleanup hold a PostgreSQL advisory
+  lease keyed by SSH host/port/principal, using a separate connection so waiting
+  candidates do not exhaust the primary pool. Use one canonical host name for all
+  environments on the same host. Orphan/sibling HOME is availability failure, not
+  evidence that a review read primary answers; preserve its error denominator.
+  Concurrency: PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT (integer, clamped to 1..8,
+  absent/malformed = 1) sets N runtime slots per principal. Slot 0 keeps the
+  original key github-shadow-runtime:<host>:<port>:<user>; slot k>0 appends :k.
+  N=1 is the original exclusive lease (one blocking lock, any sibling HOME left
+  after reclaim is namespaceBusy). N>1: waiters queue FIFO on
+  github-shadow-runtime-queue:<principal> and only the head polls the slots
+  with pg_try_advisory_lock and backoff; namespaceBusy means only that this
+  run's own HOME exists. Each HOME records its slot in .probe-slot; the probe
+  is sent the slots other sessions hold right now and reclaims a HOME only if it
+  is idle for the orphan age AND its slot is not live. Receipts record
+  runtimeSlot and runtimeMaxConcurrent.
+  Why concurrency stays fair: every run gets a fresh HOME of its own
+  arm/head/run namespace holding only sealed inputs plus that candidate's own
+  work. With one candidate arm per principal, siblings are that arm's other
+  in-flight runs (arm-local history, which I4 allows), never primary output.
+  Primary blinding, the per-UID egress firewall,
+  the model filter proxy and the canary checks are unchanged, and every run
+  still passes its own probe. A candidate CAN read or write a concurrent
+  sibling's HOME (same UID), so before raising N for several arms or companies
+  on one principal, confirm no arm may see another's in-flight work.
+  To enable: set PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT in server.env, restart,
+  then raise the candidate agent's maxConcurrentRuns to match.
+  The kill switch and certificate are rechecked after setup at adapter dispatch.
+  Each receipt also binds the complete certificate digest, including canary path
+  mappings and hashes; replacing a grant invalidates an in-flight preparation.
+  The probes are checks of an independently certified boundary, not a substitute
+  for it: an ordinary network outage also makes a TCP connect fail.
+  Tests use disposable PostgreSQL, fake SSH/provider I/O and deterministic Python
+  syscall fixtures. They are NOT evidence of a live firewall, SSH identity, CLI
+  install, authenticated API, real tool delivery or successful model inference.
+  Run a staging end-to-end canary review and prove primary unaffected before
+  certifying any live environment. Review canary receipts and verify no primary
+  answer appears in candidate inputs/output. Keep the production review gate.
+
+Rollback and failure handling
+  First clear the certification list and/or disable githubReviewShadowEnabled;
+  that prevents subsequent dispatch but is not a cancellation of already-running
+  provider processes. Drain/cancel candidate runs through normal host lifecycle.
+  Preserve append-only receipts and voided rows; do not downgrade the migration.
+  Revoke the dedicated SSH key, then (only after candidate processes have exited)
+  remove the UID-specific OUTPUT jump for each of iptables/ip6tables, flush and
+  delete PC_SHADOW_EGRESS. Restore only the recorded ACL entries via the saved
+  primary-roots.acl after checking intervening operator changes. Do not remove
+  another user's rules, reset the host firewall, delete the account's evidence
+  or remove primary storage. Partial provisioning must leave certification EMPTY.

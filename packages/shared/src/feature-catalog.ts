@@ -116,6 +116,13 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  githubReviewShadowEnabled: {
+    title: "Paired GitHub shadow reviews",
+    description: "Global switch for experimental paired review admission. Route configuration alone does not start work or grant tools. Does not disable primary reviews or permanent capture-only fences.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableMemoryConnectors: {
     title: "Memory connectors",
     description: "Show experimental Mem0, Zep, Supermemory, Cognee, and Honcho setup. Existing connections keep running when hidden.",

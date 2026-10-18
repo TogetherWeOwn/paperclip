@@ -1,3 +1,4 @@
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -38,7 +39,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { environmentService } from "./environments.js";
-import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
+import { selectLowTrustReviewEnvironment } from "./low-trust-sandbox-environment.js";
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
@@ -640,23 +641,13 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         throw badRequest(
           "Low-trust email agents require isolated workspaces and a sandbox environment. Complete runtime setup before connecting this inbox.",
         );
-      const envs = environmentService(db);
-      const local = await envs.ensureLocalEnvironment(companyId);
-      const managed = experimental.enableManagedSandboxOnly
-        ? await envs.findManagedSandboxEnvironment(companyId)
-        : null;
-      const selected = resolveExecutionWorkspaceEnvironmentId({
+      const { environment, owners } = await selectLowTrustReviewEnvironment({
+        companyId,
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
-        instanceDefaultEnvironmentId:
-          (await settings.get()).defaultEnvironmentId ?? null,
-        localDefaultEnvironmentId: local.id,
         managedSandboxOnly: experimental.enableManagedSandboxOnly,
-        managedSandboxEnvironmentId: managed?.id,
+        instanceSettings: await settings.get(),
+        environments: environmentService(db),
       });
-      const environment = await envs.getById(selected.environmentId);
-      const owners = environment
-        ? await envs.listBoundCompanyIds(environment.id)
-        : [];
       if (
         environment?.driver !== "sandbox" ||
         environment.status !== "active" ||
@@ -1557,7 +1548,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         if (!reply)
           throw badRequest("Reply target is not in this inbox conversation");
       }
-      await tx.insert(chatPublications).values({
+      await insertChatPublications(tx, {
         id: input.idempotencyKey,
         companyId,
         endpointId: endpoint.id,

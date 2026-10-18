@@ -1,3 +1,4 @@
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -12713,9 +12714,7 @@ export function issueService(db: Db) {
               );
         const publicationCreatedAt = new Date();
         for (const binding of bindings) {
-          await dbOrTx
-            .insert(chatPublications)
-            .values({
+          await insertChatPublications(dbOrTx, {
               companyId: binding.companyId,
               endpointId: binding.endpointId,
               conversationId: binding.conversationId,
@@ -12730,15 +12729,12 @@ export function issueService(db: Db) {
               state: "pending",
               createdAt: publicationCreatedAt,
               updatedAt: publicationCreatedAt,
-            })
-            .onConflictDoNothing();
+            }, { onConflictDoNothing: true });
           for (const [index, attachment] of boundAttachments.entries()) {
             const attachmentCreatedAt = new Date(
               publicationCreatedAt.getTime() + index + 1,
             );
-            await dbOrTx
-              .insert(chatPublications)
-              .values({
+            await insertChatPublications(dbOrTx, {
                 companyId: binding.companyId,
                 endpointId: binding.endpointId,
                 conversationId: binding.conversationId,
@@ -12754,8 +12750,7 @@ export function issueService(db: Db) {
                 state: "pending",
                 createdAt: attachmentCreatedAt,
                 updatedAt: attachmentCreatedAt,
-              })
-              .onConflictDoNothing();
+              }, { onConflictDoNothing: true });
           }
         }
       }
@@ -12999,9 +12994,7 @@ export function issueService(db: Db) {
             registeredRunId,
           );
           for (const binding of bindings) {
-            await tx
-              .insert(chatPublications)
-              .values({
+            await insertChatPublications(tx, {
                 companyId: issue.companyId,
                 endpointId: binding.endpointId,
                 conversationId: binding.conversationId,
@@ -13015,8 +13008,7 @@ export function issueService(db: Db) {
                   attachmentIds: [attachment.id],
                 }),
                 state: "pending",
-              })
-              .onConflictDoNothing();
+              }, { onConflictDoNothing: true });
           }
         }
 

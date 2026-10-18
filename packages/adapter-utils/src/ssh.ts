@@ -479,6 +479,21 @@ export function resolveSshSyncBackMaxBytes(env: NodeJS.ProcessEnv = process.env)
  * The message carries only the remote directory path and byte counts, never
  * credentials or connection details.
  */
+/** A bounded `syncDirectoryToSsh` transfer that hit its deadline. The tar and
+ * ssh children are SIGKILLed before this rejects. Recognise it with
+ * `isSshSyncTimeoutError` (stable `code`), not `instanceof`, across bundles. */
+export class SshSyncTimeoutError extends Error {
+  readonly code = "SSH_SYNC_TIMEOUT";
+  constructor(readonly timeoutMs: number) {
+    super(`SSH directory sync timed out after ${timeoutMs}ms`);
+    this.name = "SshSyncTimeoutError";
+  }
+}
+
+export function isSshSyncTimeoutError(error: unknown): error is SshSyncTimeoutError {
+  return error instanceof Error && (error as { code?: unknown }).code === "SSH_SYNC_TIMEOUT";
+}
+
 export class SshSyncBackSizeLimitExceededError extends Error {
   constructor(message: string) {
     super(message);
@@ -1542,6 +1557,9 @@ export async function syncDirectoryToSsh(input: {
   followSymlinks?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
+  /** Optional hard deadline. On expiry both children are SIGKILLed and the
+   * promise rejects with `SshSyncTimeoutError`. Unset = unbounded (legacy). */
+  timeoutMs?: number;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -1600,12 +1618,14 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let deadline: NodeJS.Timeout | undefined;
 
     const maybeFinish = () => {
       if (settled || !tarExited || !sshExited) {
         return;
       }
       settled = true;
+      clearTimeout(deadline);
       if ((tarExitCode ?? 0) !== 0) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
@@ -1617,15 +1637,27 @@ export async function syncDirectoryToSsh(input: {
       resolve();
     };
 
-    const fail = (error: Error) => {
+    const fail = (error: Error, signal: NodeJS.Signals = "SIGTERM") => {
       if (settled) {
         return;
       }
       settled = true;
-      tar.kill("SIGTERM");
-      ssh.kill("SIGTERM");
+      clearTimeout(deadline);
+      tar.kill(signal);
+      ssh.kill(signal);
       reject(error);
     };
+    // A killed (timeout/error) or early-exiting ssh closes its stdin under the
+    // tar pipe; without a listener that EPIPE is an unhandled stream error that
+    // crashes the process. The ssh exit code/stderr carries the real outcome;
+    // stop tar so it cannot block forever on the now-unread pipe.
+    ssh.stdin?.on("error", () => {
+      if (!tarExited) tar.kill("SIGTERM");
+    });
+    if (input.timeoutMs !== undefined) {
+      const timeoutMs = input.timeoutMs;
+      deadline = setTimeout(() => fail(new SshSyncTimeoutError(timeoutMs), "SIGKILL"), timeoutMs);
+    }
 
     if (progress) {
       progress.counter.on("error", fail);

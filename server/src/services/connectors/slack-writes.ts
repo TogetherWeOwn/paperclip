@@ -1,3 +1,4 @@
+import { insertChatActions } from "../chat-publication-authority.js";
 import { authorizeSlackDocument } from "./slack-document.js";
 import { slackMessage } from "./slack-message.js";
 import { createHash } from "node:crypto";
@@ -100,9 +101,7 @@ export async function executeSlackWrite(
     .update(JSON.stringify({ name, args }))
     .digest("hex");
   const key = `slack-tool:${binding.issueId}:${args.idempotencyKey}`;
-  const [created] = await db
-    .insert(chatActions)
-    .values({
+  const [created] = await insertChatActions(db, {
       companyId: binding.companyId,
       endpointId: authority.endpoint.id,
       conversationId: authority.conversation?.id ?? null,
@@ -119,9 +118,7 @@ export async function executeSlackWrite(
         revision: authority.revision,
         invocationId,
       },
-    })
-    .onConflictDoNothing()
-    .returning();
+    }, { onConflictDoNothing: true });
   const action =
     created ??
     (

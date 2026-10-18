@@ -7,6 +7,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  chatDeliveries,
+  chatEndpoints,
+  chatExternalPrincipals,
+  chatGitHubReviewArms,
+  chatGitHubReviewCandidates,
+  chatGitHubReviewEnrollments,
   companySecretBindings,
   companySecrets,
   companySecretVersions,
@@ -43,6 +49,7 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
+import { defaultGitHubReviewPolicy } from "@paperclipai/shared";
 import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
 import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
@@ -898,18 +905,117 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     expect(denied.body.error.data.reasonCode).toBe("deny_default");
   });
 
-  it("proxies namespaced resources and prompts only for fully assigned MCP connections", async () => {
-    const company = await createCompany(db);
+  it.each([false, true])("proxies namespaced resources and prompts only for fully assigned MCP connections (agent blinding=%s)", async agentScoped => {
+    // Agent blinding only filters for enrolled review companies: admission-aware
+    // blinding keeps a zero-query transparent path for never-enrolled companies,
+    // and only primary GitHub reviewers are blinded. The enrolled case admits a
+    // candidate, whose arm row is delete-protected (immutable trigger) and would
+    // RESTRICT-block this file's afterEach toolConnections cleanup, so it runs in
+    // its own embedded database, dropped wholesale in finally.
+    const enrolledDb = agentScoped ? await startEmbeddedPostgresTestDatabase("paperclip-tool-gateway-blinding-") : null;
+    const gdb = enrolledDb ? createDb(enrolledDb.connectionString) : db;
+    const company = await createCompany(gdb);
+    const agent = agentScoped ? await createAgent(gdb, company.id) : null;
+    if (agent) {
+      // Mirror production startup: admit a candidate for a different agent, assign
+      // this agent to the GitHub endpoint, and run both bootstraps, so the
+      // paired-meta resource exercises the real filter instead of the transparent
+      // path.
+      const candidateAgent = await createAgent(gdb, company.id);
+      const [application] = await gdb.insert(toolApplications).values({
+        companyId: company.id,
+        name: `Endpoint app ${randomUUID()}`,
+        type: "chat",
+      }).returning();
+      const [chatConnection] = await gdb.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: application.id,
+        name: `Endpoint connection ${randomUUID()}`,
+        uid: `endpoint-${randomUUID()}`,
+        connectionPurpose: "channel",
+        transport: "chat_sdk",
+      }).returning();
+      const [endpoint] = await gdb.insert(chatEndpoints).values({
+        companyId: company.id,
+        connectionId: chatConnection.id,
+        provider: "github",
+        publicId: `github-${randomUUID()}`,
+        assignedAgentId: agent.id,
+      }).returning();
+      const [principal] = await gdb.insert(chatExternalPrincipals).values({
+        companyId: company.id,
+        provider: "github",
+        providerAccountId: "test-org",
+        externalId: "owner-user",
+      }).returning();
+      const [delivery] = await gdb.insert(chatDeliveries).values({
+        companyId: company.id,
+        endpointId: endpoint.id,
+        providerEventId: `evt-${randomUUID()}`,
+        deduplicationKey: `dedupe-${randomUUID()}`,
+        eventKind: "unknown",
+        normalizedEvent: {},
+      }).returning();
+      const [enrollment] = await gdb.insert(chatGitHubReviewEnrollments).values({
+        companyId: company.id,
+        endpointId: endpoint.id,
+        originDeliveryId: delivery.id,
+        originEventId: `origin-${randomUUID()}`,
+        principalId: principal.id,
+        repositoryId: "test-repo",
+        repository: "owner/repo",
+        pullNumber: 81,
+        roundOrdinal: 1,
+        configurationRevision: 1,
+        pairKey: `pair-${randomUUID()}`,
+        envelope: {
+          version: 1,
+          event: null,
+          request: "tool-gateway blinding fixture",
+          lowTrust: false,
+          policy: defaultGitHubReviewPolicy(),
+          authority: { guest: false, responsibleUserId: null, sponsorUserId: null },
+          normalizedEvent: {},
+          conversation: {
+            resourceId: null,
+            externalConversationId: "conv-1",
+            externalThreadId: "thread-1",
+            externalLabel: "label-1",
+            providerUrl: null,
+            communicationGuidance: null,
+          },
+        },
+      }).returning();
+      const [arm] = await gdb.insert(chatGitHubReviewArms).values({
+        companyId: company.id,
+        endpointId: endpoint.id,
+        label: "paired-meta",
+        agentId: candidateAgent.id,
+        configurationRevision: 1,
+      }).returning();
+      await gdb.insert(chatGitHubReviewCandidates).values({
+        companyId: company.id,
+        endpointId: endpoint.id,
+        enrollmentId: enrollment.id,
+        armId: arm.id,
+        agentId: candidateAgent.id,
+        shadowLabel: "paired-meta",
+      });
+      const { initializeGitHubPrimaryBlinding } = await import("../services/chat-github-primary-blinding-state.js");
+      const { initializeGitHubPrimaryReviewers } = await import("../services/chat-github-primary-reviewers.js");
+      await initializeGitHubPrimaryBlinding(gdb);
+      await initializeGitHubPrimaryReviewers(gdb);
+    }
     const remote = await startFakeRemoteMcpServer(async ({ body }) => {
       const method = body?.method;
       if (method === "resources/list") {
-        return { body: { jsonrpc: "2.0", id: body?.id, result: { resources: [{ uri: "notes://one", name: "Note one", mimeType: "text/plain" }] } } };
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { resources: [{ uri: "notes://one", name: "Note one", mimeType: "text/plain" }, { uri: "notes://candidate", name: "Candidate answer", shadowLabel: "paired-meta" }] } } };
       }
       if (method === "resources/read") {
         return { body: { jsonrpc: "2.0", id: body?.id, result: { contents: [{ uri: String((body?.params as Record<string, unknown>)?.uri), mimeType: "text/plain", text: "resource body" }] } } };
       }
       if (method === "prompts/list") {
-        return { body: { jsonrpc: "2.0", id: body?.id, result: { prompts: [{ name: "summarize", title: "Summarize note" }] } } };
+        return { body: { jsonrpc: "2.0", id: body?.id, result: { prompts: [{ name: "summarize", title: "Summarize note" }, { name: "candidate", title: "Candidate answer", shadowLabel: "paired-meta" }] } } };
       }
       if (method === "prompts/get") {
         return { body: { jsonrpc: "2.0", id: body?.id, result: { description: "Summary prompt", messages: [{ role: "user", content: { type: "text", text: "Summarize it" } }] } } };
@@ -917,51 +1023,51 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       return { body: { jsonrpc: "2.0", id: body?.id, result: {} } };
     });
     try {
-      const assigned = await createRemoteMcpTool(db, company.id, {
+      const assigned = await createRemoteMcpTool(gdb, company.id, {
         url: remote.url,
         applicationKey: "context-app",
         connectionName: "Assigned context",
         toolName: "search_notes",
         riskLevel: "read",
       });
-      await createRemoteMcpTool(db, company.id, {
+      await createRemoteMcpTool(gdb, company.id, {
         url: remote.url,
         applicationKey: "unassigned-context-app",
         connectionName: "Unassigned context",
         toolName: "private_search",
         riskLevel: "read",
       });
-      const [profile] = await db.insert(toolProfiles).values({
+      const [profile] = await gdb.insert(toolProfiles).values({
         companyId: company.id,
         profileKey: `context-${randomUUID()}`,
         name: `Context ${randomUUID()}`,
         defaultAction: "deny",
       }).returning();
-      await db.insert(toolProfileEntries).values({
+      await gdb.insert(toolProfileEntries).values({
         companyId: company.id,
         profileId: profile.id,
         selectorType: "connection",
         effect: "include",
         connectionId: assigned.connection.id,
       });
-      const gateway = createTestToolGatewayService(db);
+      const gateway = createTestToolGatewayService(gdb);
       const created = await gateway.createNamedGateway({
         companyId: company.id,
-        body: { name: "Context gateway", profileId: profile.id },
+        body: { name: "Context gateway", profileId: profile.id, agentId: agent?.id ?? null },
       });
       const token = await gateway.createNamedGatewayToken({
         companyId: company.id,
         gatewayId: created.id,
         body: { name: "Native runner" },
       });
-      const app = createGatewayRouteApp(db, gateway);
+      const app = createGatewayRouteApp(gdb, gateway);
 
       const resources = await request(app)
         .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
         .set("authorization", `Bearer ${token.token}`)
         .send({ jsonrpc: "2.0", id: 1, method: "resources/list" })
         .expect(200);
-      expect(resources.body.result.resources).toHaveLength(1);
+      expect(resources.body.result.resources).toHaveLength(agentScoped ? 1 : 2);
       expect(resources.body.result.resources[0]).toMatchObject({
         uri: expect.stringMatching(new RegExp(`^paperclip-resource://${assigned.connection.id}/`)),
         name: "Assigned context: Note one",
@@ -980,7 +1086,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         .set("authorization", `Bearer ${token.token}`)
         .send({ jsonrpc: "2.0", id: 3, method: "prompts/list" })
         .expect(200);
-      expect(prompts.body.result.prompts).toHaveLength(1);
+      expect(prompts.body.result.prompts).toHaveLength(agentScoped ? 1 : 2);
       expect(prompts.body.result.prompts[0].title).toBe("Assigned context: Summarize note");
       const promptName = prompts.body.result.prompts[0].name as string;
 
@@ -994,6 +1100,9 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       expect(remote.requests.filter((entry) => entry.body?.method === "prompts/get")[0]?.body?.params).toEqual({ name: "summarize", arguments: {} });
     } finally {
       await remote.close();
+      // The enrolled case owns its database (immutable arm rows cannot be deleted),
+      // so drop it wholesale instead of row cleanup.
+      await enrolledDb?.cleanup();
     }
   });
 

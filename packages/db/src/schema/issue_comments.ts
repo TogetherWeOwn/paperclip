@@ -6,6 +6,7 @@ import type {
   SourceTrustMetadata,
 } from "@paperclipai/shared";
 import { pgTable, uuid, text, timestamp, index, jsonb, unique, integer } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
@@ -47,6 +48,8 @@ export const issueComments = pgTable(
   (table) => ({
     clientRequestUq: unique("issue_comments_client_request_uq").on(table.issueId, table.authorUserId, table.clientRequestId),
     companyIdUq: unique("issue_comments_company_id_uq").on(table.companyId, table.id),
+    companyAgentVisibilityIdx: index("issue_comments_company_agent_visibility_idx")
+      .on(table.companyId, table.authorAgentId, table.id).where(sql`${table.authorAgentId} is not null`),
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
     companyIssueCreatedAtIdx: index("issue_comments_company_issue_created_at_idx").on(

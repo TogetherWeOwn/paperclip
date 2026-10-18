@@ -37,6 +37,14 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Environment (driver `sandbox`) that runs the trust preset
+   * `low_trust_review` whenever its environment selection would otherwise land
+   * on local. Trusted runs never read it. Absent/`null` = no designation: a
+   * low-trust run that lands on local fails closed
+   * (`low_trust_requires_sandbox_environment`).
+   */
+  lowTrustSandboxEnvironmentId?: string | null;
 }
 
 export interface InstanceExperimentalSettings {
@@ -70,6 +78,8 @@ export interface InstanceExperimentalSettings {
   enableApps: boolean;
   /** Exposes chat connector setup and Board surfaces; existing delivery continues when hidden. */
   enableChatConnectors: boolean;
+  /** Global paired-review admission switch. Default OFF; never changes primary review or capture-only fences. */
+  githubReviewShadowEnabled: boolean;
   /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
   enableMcpAggregators: boolean;
   /** Show experimental memory connection setup. Existing connections remain usable. */

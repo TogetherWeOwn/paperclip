@@ -2066,6 +2066,97 @@
       "when": 1792296920434,
       "tag": "0296_volatile_star_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1792296920435,
+      "tag": "0297_new_sunspot",
+      "breakpoints": true
+    },
+    {
+      "idx": 298,
+      "version": "7",
+      "when": 1792296920436,
+      "tag": "0298_steep_patriot",
+      "breakpoints": true
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1792296920437,
+      "tag": "0299_chat_capture_outbound_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 300,
+      "version": "7",
+      "when": 1792296920438,
+      "tag": "0300_green_kingpin",
+      "breakpoints": true
+    },
+    {
+      "idx": 301,
+      "version": "7",
+      "when": 1792296920439,
+      "tag": "0301_chat_capture_native_run_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1792296920440,
+      "tag": "0302_parallel_bloodstrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1792296920441,
+      "tag": "0303_luxuriant_annihilus",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792296920442,
+      "tag": "0304_dashing_joshua_kane",
+      "breakpoints": true
+    },
+    {
+      "idx": 305,
+      "version": "7",
+      "when": 1792296920443,
+      "tag": "0305_capture_review_lookup_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1792296920444,
+      "tag": "0306_pairing_seed_lookup_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1792296920445,
+      "tag": "0307_romantic_power_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 308,
+      "version": "7",
+      "when": 1792296920446,
+      "tag": "0308_overrated_lightspeed",
+      "breakpoints": true
+    },
+    {
+      "idx": 309,
+      "version": "7",
+      "when": 1792296920447,
+      "tag": "0309_chat_actions_delivery_kind",
+      "breakpoints": true
     }
   ]
 }

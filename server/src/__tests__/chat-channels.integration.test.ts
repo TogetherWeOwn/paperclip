@@ -7,7 +7,7 @@ import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession } from "../services/chat-github-tools.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
-import { chatGitHubRegistrations, chatGitHubReviews, toolCatalogEntries } from "@paperclipai/db";
+import { chatGitHubRegistrations, chatGitHubReviewCandidates, chatGitHubReviews, toolCatalogEntries, toolMcpGateways, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as cloudRuntimeIdentity from "../services/cloud-runtime-identity.js";
 import {
@@ -38,6 +38,7 @@ import {
   desc,
   eq,
   inArray,
+  innerJoin,
   isNotNull,
   like,
   notInArray,
@@ -86,6 +87,7 @@ import {
   environmentLeases,
   principalPermissionGrants,
   toolConnections,
+  environments,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
@@ -133,6 +135,7 @@ import {
 } from "../services/chat-teams-personal-recipient.js";
 import * as discordQuestionForms from "../services/chat-discord-question-forms.js";
 import { issueService } from "../services/issues.js";
+import { environmentService } from "../services/environments.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -193,6 +196,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+// The isolation probe itself may rmtree reclaimed orphan homes; SSH mocks must
+// recognise the per-run cleanup program specifically.
+const CLEANUP_PROGRAM_MARKER = "home, nonce = sys.argv[1:3]";
 
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const embeddedPostgresSupport = externalTestDatabaseUrl
@@ -1052,9 +1058,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   // after its assertions so another case (or shard order) cannot claim them.
   const fixtureCompanies = new Set<string>();
   const fixtureServices = new Set<ChatChannelService>();
+  /** Bounded per service, leaving the hook budget for the database settle below. */
+  const FIXTURE_SHUTDOWN_WAIT_MS = 10_000;
   afterEach(async () => {
+    // Detach first: one hung shutdown() must not leave its service registered,
+    // or every later afterEach waits on it again and the whole file fails.
+    const services = [...fixtureServices];
+    fixtureServices.clear();
     try {
-      await Promise.all([...fixtureServices].map((service) => service.shutdown()));
+      await Promise.all(services.map((service) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        return Promise.race([service.shutdown(), new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, FIXTURE_SHUTDOWN_WAIT_MS);
+          timer.unref?.();
+        })]).finally(() => clearTimeout(timer));
+      }));
     } finally {
       const companyIds = [...fixtureCompanies];
       await retireFixtureState(companyIds);
@@ -2113,9 +2131,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   }
 
   describe("GitHub agent review workflow", () => {
-    async function reviewBotFixture() {
+    async function reviewBotFixture(overrides: Parameters<typeof configuredGitHubEndpoint>[1] = {}) {
       const fixture = await seedCompany();
-      const context = await configuredGitHubEndpoint(fixture, {}, true);
+      const context = await configuredGitHubEndpoint(fixture, overrides, true);
       const endpoint = await context.service.get(context.endpoint.id);
       const [principal] = await db
         .insert(chatExternalPrincipals)
@@ -2313,6 +2331,57 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           (check) => check.key === "permissions",
         ),
       ).toMatchObject({ ok: false });
+    });
+    it("counts the instance low-trust sandbox designation when verifying a low-trust bot agent", async () => {
+      const f = await reviewBotFixture();
+      await db
+        .update(agents)
+        .set({ permissions: { trustPreset: "low_trust_review" } })
+        .where(eq(agents.id, f.assignedAgentId));
+      const permissions = {
+        contents: "read",
+        issues: "write",
+        metadata: "read",
+        pull_requests: "write",
+        checks: "write",
+      };
+      f.setAppAccess({
+        permissions,
+        events: ["issue_comment", "pull_request_review_comment", "pull_request"],
+      });
+      f.setSupplementalProviderFetch(async (input) =>
+        String(input).endsWith("/app/installations/2468")
+          ? Response.json({ permissions, suspended_at: null })
+          : undefined,
+      );
+      const settings = instanceSettingsService(db);
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+      const isolation = async () =>
+        (await f.management.verification(f.endpoint.id)).checks.find(
+          (check) => check.key === "isolation",
+        );
+      try {
+        // No binding and no designation: the agent resolves to local.
+        expect(await isolation()).toMatchObject({ ok: false });
+        const sandbox = await environmentService(db).create({
+          name: `low-trust-sandbox-${randomUUID()}`,
+          driver: "sandbox",
+          config: { provider: "exe-dev", reuseLease: false },
+        });
+        await settings.updateGeneral({
+          lowTrustSandboxEnvironmentId: sandbox.id,
+        });
+        expect(await isolation()).toMatchObject({ ok: true });
+        // A designation that retains its VM is unusable at run time, so setup
+        // must not report ready either.
+        await db
+          .update(environments)
+          .set({ config: { provider: "exe-dev", reuseLease: true } })
+          .where(eq(environments.id, sandbox.id));
+        expect(await isolation()).toMatchObject({ ok: false });
+      } finally {
+        await settings.updateGeneral({ lowTrustSandboxEnvironmentId: null });
+      }
     });
     it("keeps GitHub publication I/O outside transactions and fences an expired owner's receipt", async () => {
       const f = await reviewBotFixture();
@@ -2674,6 +2743,898 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         issueId: task.id,
         runId: run.id,
       }, "read_pull_request", { section: "metadata" })).rejects.toThrow("older pull request head");
+    });
+    it("admits an allow-listed workflow review-trigger bot comment and persists the marker", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:85",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "6235777120",
+        text: `@${reviewerHandle} review ${headSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:85:6235777120";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [delivery] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, f.endpoint.id),
+            eq(chatDeliveries.providerEventId, providerEventId),
+          ),
+        );
+      expect(delivery.normalizedEvent.githubWorkflowTrigger).toEqual({
+        headSha,
+        senderGithubUserId: "41898282",
+      });
+      expect(delivery.normalizedEvent.principal).toMatchObject({
+        externalId: "41898282",
+      });
+      const conversations = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, f.endpoint.id));
+      expect(conversations).toHaveLength(1);
+      expect(conversations[0]!.externalThreadId).toBe(
+        "github:paperclipai/paperclip:85",
+      );
+    });
+    it("suppresses workflow trigger lookalikes and non-allow-listed bot senders", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      async function sendBotComment(input: {
+        pr: number;
+        messageId: string;
+        text: string;
+        userId?: string;
+        userName?: string;
+        isMe?: boolean;
+        isSystem?: boolean;
+      }) {
+        const thread = makeThread({
+          channelId: "paperclipai/paperclip",
+          id: `github:paperclipai/paperclip:${input.pr}`,
+          name: "paperclipai/paperclip",
+        });
+        const message = makeMessage({
+          id: input.messageId,
+          text: input.text,
+          userId: input.userId ?? "41898282",
+          userName: input.userName ?? "github-actions[bot]",
+          mentioned: true,
+        });
+        (message.author as { isBot: boolean }).isBot = true;
+        if (input.isMe === true)
+          (message.author as { isMe: boolean }).isMe = true;
+        if (input.isSystem === true)
+          (message.author as { isSystem: boolean }).isSystem = true;
+        await deliverMessage({
+          callbacks: f.callbacks,
+          endpointId: f.endpoint.id,
+          provider: "github",
+          thread: thread.thread,
+          message,
+          trigger: "mention",
+        });
+        return `github:paperclipai/paperclip:${input.pr}:${input.messageId}`;
+      }
+      async function expectNoDelivery(providerEventId: string) {
+        const rows = await db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, f.endpoint.id),
+              eq(chatDeliveries.providerEventId, providerEventId),
+            ),
+          );
+        expect(rows).toHaveLength(0);
+      }
+      // Unknown bot identity is not on the allow-list.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 86,
+          messageId: "86001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          userId: "99999999",
+          userName: "other-bot[bot]",
+        }),
+      );
+      // Own-bot messages stay suppressed even with exact trigger text.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 87,
+          messageId: "87001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          isMe: true,
+        }),
+      );
+      // System messages stay suppressed even with exact trigger text.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 88,
+          messageId: "88001",
+          text: `@${reviewerHandle} review ${headSha}`,
+          isSystem: true,
+        }),
+      );
+      // A mention without a head SHA is not a trigger.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 89,
+          messageId: "89001",
+          text: `@${reviewerHandle} please re-review`,
+        }),
+      );
+      // A trigger aimed at a different reviewer handle is not admitted here.
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 90,
+          messageId: "90001",
+          text: `@other-reviewer review ${headSha}`,
+        }),
+      );
+      // Revoking the allow-list flag suppresses the same sender.
+      const configured = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 91,
+          messageId: "91001",
+          text: `@${reviewerHandle} review ${headSha}`,
+        }),
+      );
+      // An inactive sponsor suppresses the same sender.
+      const restored = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: restored.revision,
+          configuration: {
+            ...restored.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await db
+        .update(companyMemberships)
+        .set({ status: "inactive" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, f.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, "owner-user"),
+          ),
+        );
+      await expectNoDelivery(
+        await sendBotComment({
+          pr: 92,
+          messageId: "92001",
+          text: `@${reviewerHandle} review ${headSha}`,
+        }),
+      );
+      await db
+        .update(companyMemberships)
+        .set({ status: "active" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, f.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, "owner-user"),
+          ),
+        );
+      const deliveries = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries).toHaveLength(0);
+    });
+    it("fails closed when the workflow trigger allow-list is revoked before drain", async () => {
+      const fixture = await seedCompany();
+      const deferred: Array<() => void> = [];
+      const context = await configuredGitHubEndpoint(
+        fixture,
+        {
+          deferWebhookProcessing: true,
+          scheduleDeferredWork: (task) => deferred.push(task),
+        },
+        true,
+      );
+      const management = githubChatManagementService(
+        db,
+        context.providerFetch,
+      );
+      const initial = await management.configuration(
+        context.endpoint.id,
+        "owner-user",
+      );
+      await management.saveConfiguration(
+        context.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            toolsEnabled: true,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await context.service.update(
+        context.endpoint.id,
+        { allowGroupChats: true },
+        "owner-user",
+      );
+      const current = await context.service.get(context.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const headSha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:93",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "93001",
+        text: `@${reviewerHandle} review ${headSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: context.callbacks,
+        endpointId: context.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      expect(deferred).toHaveLength(1);
+      const providerEventId = "github:paperclipai/paperclip:93:93001";
+      const [admitted] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, context.endpoint.id),
+            eq(chatDeliveries.providerEventId, providerEventId),
+          ),
+        );
+      expect(admitted.state).toBe("received");
+      expect(admitted.normalizedEvent.githubWorkflowTrigger).toEqual({
+        headSha,
+        senderGithubUserId: "41898282",
+      });
+      const configured = await management.configuration(
+        context.endpoint.id,
+        "owner-user",
+      );
+      await management.saveConfiguration(
+        context.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      await db
+        .update(chatDeliveries)
+        .set({ nextAttemptAt: new Date() })
+        .where(eq(chatDeliveries.id, admitted.id));
+      // Restart simulation: a fresh service has no live-message shortcut, so
+      // the drain must restore the marker from the persisted delivery and
+      // recheck the now-revoked allow-list instead of re-entering ingress.
+      const restarted = createService(
+        new FakeChatSdkRuntime(),
+        context.providerFetch,
+      );
+      await restarted.service.processPendingDeliveries(25, admitted.id);
+      const [settled] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.id, admitted.id));
+      expect(settled.state).toBe("filtered");
+      const conversations = await db
+        .select({ id: chatConversations.id })
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, context.endpoint.id));
+      expect(conversations).toHaveLength(0);
+    });
+    it("rejects a workflow trigger review when the live pull request head moved on", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "a".repeat(40);
+      const liveHeadSha = "b".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:94",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "94001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:94:94001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:94",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      f.setSupplementalProviderFetch(async (input) =>
+        String(input).endsWith("/pulls/94")
+          ? Response.json({
+              number: 94,
+              title: "Trigger head moved on",
+              body: "",
+              draft: false,
+              base: { sha: "a".repeat(40), ref: "master" },
+              head: { sha: liveHeadSha },
+              user: { id: 42, login: "octocat", type: "User" },
+              labels: [],
+            })
+          : undefined,
+      );
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          {
+            companyId: f.companyId,
+            agentId: f.assignedAgentId,
+            issueId: conversation.issueId,
+            runId: run.id,
+          },
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow("older pull request head");
+    });
+    it("rejects workflow trigger tool calls after the allow-list is revoked mid-run", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "c".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:95",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "95001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:95:95001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:95",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      // Revoke mid-run: the run and task already exist, so the only guard
+      // left for every bot tool call is the scope() recheck below.
+      const configured = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: configured.revision,
+          configuration: {
+            ...configured.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: false,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      // Live PR head matches the trigger SHA so the review-decision gates
+      // would allow; only the revoked allow-list must stop the call. The
+      // compare mock keeps the success path honest: with the scope() block
+      // removed this call would succeed instead of throwing.
+      const baseSha = "a".repeat(40);
+      f.setSupplementalProviderFetch(async (input) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/95"))
+          return Response.json({
+            number: 95,
+            title: "Mid-run revocation",
+            body: "",
+            draft: false,
+            base: { sha: baseSha, ref: "master" },
+            head: { sha: triggerHeadSha },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: baseSha },
+            status: "identical",
+            total_commits: 0,
+            files: [],
+          });
+        return undefined;
+      });
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          {
+            companyId: f.companyId,
+            agentId: f.assignedAgentId,
+            issueId: conversation.issueId,
+            runId: run.id,
+          },
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow(
+        "Workflow review-trigger authority is no longer available",
+      );
+    });
+    it("rejects workflow trigger tool calls when the live pull request is not reviewable", async () => {
+      const f = await reviewBotFixture();
+      const initial = await f.management.configuration(
+        f.endpoint.id,
+        "owner-user",
+      );
+      await f.management.saveConfiguration(
+        f.endpoint.id,
+        {
+          expectedRevision: initial.revision,
+          configuration: {
+            ...initial.configuration,
+            people: [
+              {
+                kind: "guest",
+                githubUserId: "41898282",
+                login: "github-actions[bot]",
+                sponsorUserId: "owner-user",
+                permissionProfile: "restricted",
+                automaticReviews: true,
+              },
+            ],
+          },
+        },
+        "owner-user",
+      );
+      const current = await f.service.get(f.endpoint.id);
+      const reviewerHandle =
+        current.botUsername!.replace(/\[bot\]$/i, "");
+      const triggerHeadSha = "d".repeat(40);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:96",
+        name: "paperclipai/paperclip",
+      });
+      const trigger = makeMessage({
+        id: "96001",
+        text: `@${reviewerHandle} review ${triggerHeadSha}`,
+        userId: "41898282",
+        userName: "github-actions[bot]",
+        mentioned: true,
+      });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: trigger,
+        trigger: "mention",
+      });
+      const providerEventId = "github:paperclipai/paperclip:96:96001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, providerEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, f.endpoint.id),
+            eq(
+              chatConversations.externalThreadId,
+              "github:paperclipai/paperclip:96",
+            ),
+          ),
+        );
+      const [link] = await db
+        .select()
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, f.endpoint.id),
+            eq(chatMessageLinks.direction, "inbound"),
+            eq(chatMessageLinks.conversationId, conversation.id),
+          ),
+        );
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: f.companyId,
+          agentId: f.assignedAgentId,
+          invocationSource: "assignment",
+          status: "running",
+          contextSnapshot: {
+            issueId: conversation.issueId,
+            wakeCommentId: link.commentId,
+          },
+        })
+        .returning();
+      // Live head matches the trigger SHA but the PR is a draft, which the
+      // default policy does not review. Both the execute() gate (read tools)
+      // and the reviewForHead() gate (begin/submit) must reject.
+      const baseSha = "a".repeat(40);
+      f.setSupplementalProviderFetch(async (input) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/96"))
+          return Response.json({
+            number: 96,
+            title: "Draft trigger PR",
+            body: "",
+            draft: true,
+            base: { sha: baseSha, ref: "master" },
+            head: { sha: triggerHeadSha },
+            user: { id: 42, login: "octocat", type: "User" },
+            labels: [],
+          });
+        if (url.includes("/compare/"))
+          return Response.json({
+            merge_base_commit: { sha: baseSha },
+            status: "identical",
+            total_commits: 0,
+            files: [],
+          });
+        return undefined;
+      });
+      const session = {
+        companyId: f.companyId,
+        agentId: f.assignedAgentId,
+        issueId: conversation.issueId,
+        runId: run.id,
+      };
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(
+          session,
+          "read_pull_request",
+          { section: "metadata" },
+        ),
+      ).rejects.toThrow("Workflow review trigger is not reviewable");
+      await expect(
+        githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", {
+          reviewedCommit: triggerHeadSha,
+        }),
+      ).rejects.toThrow("Workflow review trigger is not reviewable");
     });
     it("supersedes a late review projection after its check already rejected the old head", async () => {
       const f = await reviewBotFixture();
@@ -3375,10 +4336,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         eq(chatActions.endpointId, f.endpoint.id),
         eq(chatActions.kind, "github_review_check"),
       ))).toHaveLength(0);
+      // The mention is the earliest comment on a fresh review issue. Never let
+      // unspecified row ordering select a later comment for these assertions.
       const comments = await db
         .select()
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .where(eq(issueComments.issueId, admitted.issueId))
+        .orderBy(asc(issueComments.createdAt));
       // Prompt parity: the shadow reviewer is never told it is shadow.
       expect(comments[0].body).not.toContain("meta-shadow");
       expect(comments[0].body.toLowerCase()).not.toContain("shadow");
@@ -3436,7 +4400,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", { section: "metadata" });
+      // Legacy capture-only storage still works, but unsealed reads no longer
+      // qualify as blinded comparison input (even for the metadata surface).
+      await expect(service.execute(session, "read_pull_request", { section: "metadata" })).rejects.toThrow("sealed admission snapshot");
       const begun = await service.execute(session, "begin_review", { reviewedCommit: head });
       expect(begun).toMatchObject({ reviewId: admitted.id });
       await githubReviewCheckService(db, f.providerFetch).processPending();
@@ -3638,16 +4604,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       f: Awaited<ReturnType<typeof reviewBotFixture>>,
       admitted: { issueId: string },
     ) {
-      const comments = await db
-        .select()
+      // The wake comment must be the admission mention: it is the only comment
+      // carrying the inbound message link the capability resolver requires.
+      // Never let unspecified row ordering select a later unlinked comment.
+      const [wakeComment] = await db
+        .select({ id: issueComments.id })
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, admitted.issueId), eq(chatMessageLinks.direction, "inbound")))
+        .orderBy(asc(issueComments.createdAt))
+        .limit(1);
+      if (!wakeComment) throw new Error(`shadow fixture has no linked wake comment for issue ${admitted.issueId}`);
       const [run] = await db.insert(heartbeatRuns).values({
         companyId: f.companyId,
         agentId: f.assignedAgentId,
         invocationSource: "assignment",
         status: "running",
-        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: comments[0].id },
+        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: wakeComment.id },
       }).returning();
       return {
         companyId: f.companyId,
@@ -3746,10 +4719,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       f: Awaited<ReturnType<typeof reviewBotFixture>>,
       messageId: string,
       text: string,
+      pullNumber = 97,
     ) {
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
-        id: "github:paperclipai/paperclip:97",
+        id: `github:paperclipai/paperclip:${pullNumber}`,
         name: "Shadow gate mention",
       }).thread;
       await deliverMessage({
@@ -3766,12 +4740,2880 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         }),
         trigger: "mention",
       });
-      const [conversation] = await db
+      const conversations = await db
         .select()
         .from(chatConversations)
-        .where(eq(chatConversations.externalThreadId, thread.id));
-      return conversation;
+        .where(and(
+          eq(chatConversations.endpointId, f.endpoint.id),
+          eq(chatConversations.companyId, f.companyId),
+          eq(chatConversations.externalThreadId, thread.id),
+          // Candidate conversations intentionally share the provider thread.
+          // Never let unspecified row ordering select another review arm.
+          eq(chatConversations.executionScope, "primary"),
+        ));
+      // Deferred-admission tests intentionally have no conversation yet.
+      expect(conversations.length).toBeLessThanOrEqual(1);
+      return conversations[0];
     }
+    /** Model a lost or late admission kick: capture is left to the recovery
+     * sweep, so these tests exercise its fallback guards deterministically. */
+    async function deferPairCaptureToSweep() {
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      setGitHubPairCaptureKickForTests(async () => undefined);
+      onTestFinished(() => setGitHubPairCaptureKickForTests(undefined));
+    }
+    async function pairedReviewFixture(overrides: Parameters<typeof reviewBotFixture>[0] = {}) {
+      const oldProxyToken = process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN;
+      process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN = "fixture-restricted-shadow-token";
+      onTestFinished(() => {
+        if (oldProxyToken === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN = oldProxyToken;
+      });
+      const f = await reviewBotFixture(overrides);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: true });
+      onTestFinished(async () => { await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false }); });
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate: 1 }] },
+      }, "owner-user");
+      installShadowRecorder(f, "b".repeat(40));
+      const { initializeGitHubPrimaryReviewers } = await import("../services/chat-github-primary-reviewers.js");
+      await initializeGitHubPrimaryReviewers(db);
+      return f;
+    }
+    async function pairedTasks(endpointId: string) {
+      return db.select({ conversation: chatConversations, issue: issues }).from(chatConversations)
+        .innerJoin(issues, eq(issues.id, chatConversations.issueId))
+        .where(eq(chatConversations.endpointId, endpointId));
+    }
+    it.each(["sealed", "late", "disabled"] as const)("P11 produces the candidate checkout beside, not inside, the sealed snapshot (%s)", async mode => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const artifacts = await import("../services/chat-github-repository-artifact.js");
+      const { resolveGitHubCandidateCheckout } = await import("../services/chat-github-runtime-isolation.js");
+      const requests: Array<Parameters<artifacts.GitHubRepositoryArtifactProducer>[0]> = [];
+      const previousWindow = process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS;
+      // Long enough that a seal waiting on the checkout would visibly outlast it.
+      const artifactWindowMs = mode === "late" ? 3_000 : 500;
+      process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS = String(artifactWindowMs);
+      let producerStartedAt = 0;
+      artifacts.setGitHubRepositoryArtifactProducer(mode === "disabled" ? null : async request => {
+        producerStartedAt ||= Date.now();
+        requests.push(request);
+        if (mode === "late") {
+          // Ignores its signal entirely: only the store's own race ends it.
+          await new Promise(() => undefined);
+        }
+        return { version: 1, kind: "bundle", path: `${"c".repeat(64)}.bundle`, sha256: "c".repeat(64), bytes: 1,
+          headSha: request.headSha, baseSha: request.baseSha, headTree: "d".repeat(40), baseTree: "e".repeat(40),
+          refs: { base: `refs/heads/${request.baseBranch}`, head: `refs/pull/${request.pullNumber}/head` },
+          commits: { base: request.baseSha, head: request.headSha } };
+      });
+      try {
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `p11-artifact-${mode}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        // A slow or missing checkout never costs the sealed snapshot itself.
+        expect(enrollment!.envelope.snapshot).toBeDefined();
+        expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+        const snapshot = enrollment!.envelope.snapshot!;
+        expect(snapshot.repository).toBeUndefined();
+        const checkout = await resolveGitHubCandidateCheckout(enrollment!, { waitMs: 10_000, pollMs: 25 });
+        if (mode === "disabled") {
+          expect(requests).toHaveLength(0);
+          expect(snapshot.repositoryFailure).toBe("repository_artifact_disabled");
+          expect(checkout).toBeUndefined();
+        } else {
+          expect(snapshot.repositoryFailure).toBeUndefined();
+          expect(requests).toHaveLength(1);
+          expect(requests[0]).toMatchObject({ pullNumber: 81, headSha: snapshot.headSha, baseSha: snapshot.baseSha, token: expect.any(String) });
+          if (mode === "sealed") {
+            expect(checkout).toEqual({ repository: expect.objectContaining({ kind: "bundle", headSha: snapshot.headSha, baseSha: snapshot.baseSha, sha256: "c".repeat(64) }) });
+            // The checkout stays live only while a candidate may still materialise it.
+            const { githubLiveRepositoryArtifactKeys } = await import("../services/chat-github-shadow.js");
+            const { chatGitHubReviewCandidates } = await import("@paperclipai/db");
+            const key = artifacts.githubRepositoryArtifactKey(enrollment!.envelope.event!);
+            expect((await githubLiveRepositoryArtifactKeys(db)).has(key)).toBe(true);
+            await db.update(chatGitHubReviewCandidates).set({ state: "voided" }).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id));
+            expect((await githubLiveRepositoryArtifactKeys(db)).has(key)).toBe(false);
+          } else {
+            expect(checkout).toEqual({ repositoryFailure: "repository_artifact_late" });
+            // The seal never waited for the (hung) checkout window.
+            expect(Date.parse(snapshot.finishedAt)).toBeLessThan(producerStartedAt + artifactWindowMs);
+            expect(Date.parse(snapshot.finishedAt) - Date.parse(snapshot.startedAt)).toBeLessThan(15_000);
+          }
+        }
+        // The admission-time checkout reason is covered by the sealed digest.
+        const { githubSnapshotReader } = await import("../services/chat-github-review-snapshot.js");
+        const expected = { headSha: snapshot.headSha, baseSha: snapshot.baseSha, pullNumber: 81 };
+        expect(() => githubSnapshotReader(snapshot, expected, async () => { throw new Error("live"); })).not.toThrow();
+        expect(() => githubSnapshotReader({ ...snapshot, repositoryFailure: "forged" }, expected, async () => { throw new Error("live"); }))
+          .toThrow("Invalid sealed review snapshot");
+      } finally {
+        artifacts.setGitHubRepositoryArtifactProducer(undefined);
+        if (previousWindow === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS = previousWindow;
+      }
+    }, 60_000);
+    it.each(["idle-primary", "busy-primary"] as const)("P11 captures a pair when the primary wake starts immediately (%s)", async mode => {
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      let candidateAgentId: string | undefined;
+      let primaryRunId: string | undefined;
+      const f = await pairedReviewFixture({ wakeup: async (agentId, opts) => {
+        const contextSnapshot = (opts as { contextSnapshot?: Record<string, unknown> })?.contextSnapshot ?? {};
+        if (agentId !== candidateAgentId) {
+          const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+          const [run] = await db.insert(heartbeatRuns).values({ companyId: agent!.companyId, agentId, invocationSource: "assignment",
+            status: mode === "idle-primary" ? "running" : "queued", startedAt: mode === "idle-primary" ? new Date() : null,
+            contextSnapshot }).returning();
+          primaryRunId = run!.id;
+        }
+        return { accepted: true } as never;
+      } });
+      candidateAgentId = f.replacementAgentId;
+      const primary = await deliverShadowTestMention(f, `p11-${mode}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+      expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+      expect(await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id)))
+        .toMatchObject([{ state: "dispatched" }]);
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, primaryRunId!));
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, runId: primaryRunId!, issueId: primary.issueId };
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "read_pull_request", { section: "metadata" })).toMatchObject({ pull: { head: { sha: "b".repeat(40) } } });
+      await service.execute(session, "begin_review", { reviewedCommit: "b".repeat(40) });
+      const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+      expect((await githubRunCapability(db, session))?.enrollment?.id).toBe(enrollment!.id);
+      expect(recorder.fetches.filter(r => r.url.includes("/repos/") && r.method === "GET")).toEqual([]);
+      const { githubPrimaryInputSource, githubComparisonEligibility } = await import("../services/chat-github-comparison.js");
+      const primaryInputSource = await githubPrimaryInputSource(db, enrollment!);
+      expect(primaryInputSource).toBe("snapshot");
+      expect(githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true, selfTestPassed: true,
+        primaryBlindingActive: true, snapshotAvailable: true, roundOrdinal: 1, primaryInputSource }).reasons)
+        .not.toContain("primary_inputs_not_sealed");
+    });
+    const CAPTURE_ATTEMPT_LOG = "GitHub paired snapshot capture attempt";
+    async function captureAttempts() {
+      const { logger } = await import("../middleware/logger.js");
+      const info = vi.spyOn(logger, "info");
+      onTestFinished(() => info.mockRestore());
+      return () => info.mock.calls.filter(call => call[1] === CAPTURE_ATTEMPT_LOG).map(call => call[0] as Record<string, unknown>);
+    }
+    async function pairedDelivery(f: Awaited<ReturnType<typeof pairedReviewFixture>>) {
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      return delivery!;
+    }
+    it("K1 admission kick seals the pair as soon as the primary wake is durable, without a recovery sweep", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const attempts = await captureAttempts();
+      const f = await pairedReviewFixture();
+      // Single-delivery processing (the webhook path) never runs the global
+      // recovery sweep, so only the admission kick can seal this pair.
+      await deliverShadowTestMention(f, "k1-admission-kick", "@maya review this", 81);
+      await vi.waitFor(async () => {
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        expect(enrollment?.envelope.snapshot).toBeDefined();
+        expect(enrollment?.envelope.snapshotFailure).toBeUndefined();
+      }, { timeout: 10_000, interval: 50 });
+      const delivery = await pairedDelivery(f);
+      const [wake] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, delivery.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(wake).toMatchObject({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(attempts()).toEqual([expect.objectContaining({ deliveryId: delivery.id, trigger: "admission", outcome: "sealed", attempt: 1,
+        msSinceAdmission: expect.any(Number), msSpent: expect.any(Number), lockedMs: expect.any(Number) })]);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it.each(["hanging", "throwing", "rejecting"] as const)("K2 a %s admission kick never blocks or fails the primary path; the sweep recovers", async mode => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      let release: (() => void) | undefined;
+      const kick = vi.fn(mode === "hanging" ? () => new Promise<void>(resolve => { release = resolve; })
+        : mode === "throwing" ? () => { throw new Error("injected synchronous kick failure"); }
+          : async () => { throw new Error("injected kick rejection"); });
+      setGitHubPairCaptureKickForTests(kick);
+      onTestFinished(() => { release?.(); setGitHubPairCaptureKickForTests(undefined); });
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `k2-${mode}`, "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // The primary admission and wake completed while the kick hung or failed.
+      const [wake] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, delivery.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(wake).toMatchObject({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await vi.waitFor(() => expect(kick).toHaveBeenCalledWith(expect.anything(), delivery.id, expect.any(Function)));
+      expect(delivery.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(delivery.normalizedEvent.githubPairingSeed).toBeUndefined();
+      release?.();
+      setGitHubPairCaptureKickForTests(async () => undefined);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment?.envelope.snapshot).toBeDefined();
+    });
+    it("K3 a racing kick and sweep share one exclusive claim (no double capture)", async () => {
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const { kickGitHubPairCapture } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      // Queue only the primary wake: no kick has fired for this delivery yet.
+      await deliverShadowTestMention(f, "k3-race", "@maya review this", 81);
+      const { setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      setGitHubPairCaptureKickForTests(undefined);
+      const delivery = await pairedDelivery(f);
+      const attempts = await captureAttempts();
+      let release!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      let reading = false;
+      installShadowRecorder(f, "b".repeat(40), async url => {
+        if (url.includes("/files?")) { reading = true; await blocked; }
+        return undefined;
+      });
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      // The kick holds the claim mid-I/O while a sweep and a duplicate kick race it.
+      await vi.waitFor(() => expect(reading).toBe(true), { timeout: 5000 });
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      const sweep = f.service.processPendingDeliveries();
+      const timer = setTimeout(release, 300);
+      try { await sweep; } finally { clearTimeout(timer); release(); }
+      expect(attempts()).toEqual([expect.objectContaining({ deliveryId: delivery.id, trigger: "admission", outcome: "sealed", attempt: 1 })]);
+      const enrollments = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollments).toHaveLength(1);
+      expect(enrollments[0]!.envelope.snapshot).toBeDefined();
+      // The sweep awaited the in-process kick, so it dispatched in the same pass.
+      expect(await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollments[0]!.id)))
+        .toMatchObject([{ state: "dispatched" }]);
+    });
+    it.each([
+      ["default 15 s", undefined, "admission_snapshot_late"],
+      ["configured 60 s", "60000", undefined],
+    ] as const)("K4 the capture window is honoured (%s) for a capture 30 s after admission", async (_label, windowMs, failure) => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const previous = process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      if (windowMs === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = windowMs;
+      onTestFinished(() => {
+        if (previous === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = previous;
+      });
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `k4-window-${windowMs ?? "default"}`, "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event,
+        '{githubPairingPending,admittedAt}', to_jsonb(${new Date(Date.now() - 30_000).toISOString()}::text)) where id = ${delivery.id}`);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment).toBeDefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe(failure);
+      if (failure) expect(enrollment!.envelope.snapshot).toBeUndefined();
+      else expect(enrollment!.envelope.snapshot).toBeDefined();
+    });
+    it("K5 a live claim younger than the configured window is never re-claimed as interrupted", async () => {
+      const previous = process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+      process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = "60000";
+      onTestFinished(() => {
+        if (previous === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS = previous;
+      });
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "k5-live-claim", "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // A worker claimed 40 s ago and is still inside its 60 s window.
+      const claim = { id: randomUUID(), startedAt: new Date(Date.now() - 40_000).toISOString(), attempts: 1 };
+      await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({ githubPairingCapture: claim })}::jsonb
+        where id = ${delivery.id}`);
+      await f.service.processPendingDeliveries();
+      const current = await pairedDelivery(f);
+      expect(current.normalizedEvent.githubPairingCapture).toEqual(claim);
+      expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
+    });
+    it("K6 a kick before the primary wake is durably recorded captures nothing", async () => {
+      const { kickGitHubPairCapture, settleGitHubPairCaptureKicks, setGitHubPairCaptureKickForTests } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "k6-not-durable", "@maya review this", 81);
+      const delivery = await pairedDelivery(f);
+      // Model a wake that is still retrying: no durable receipt exists yet.
+      await db.execute(sql`update chat_actions set status = 'issued', result = ${JSON.stringify({ code: "inbound_wakeup_retry",
+        retryAt: new Date(Date.now() + 60_000).toISOString(), attemptCount: 1 })}::jsonb
+        where delivery_id = ${delivery.id} and kind = 'inbound_wakeup'`);
+      setGitHubPairCaptureKickForTests(undefined);
+      const attempts = await captureAttempts();
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      kickGitHubPairCapture(db, delivery.id, f.providerFetch);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await settleGitHubPairCaptureKicks();
+      const current = await pairedDelivery(f);
+      expect(current.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(current.normalizedEvent.githubPairingCapture).toBeUndefined();
+      expect(current.normalizedEvent.githubPairingSeed).toBeUndefined();
+      expect(attempts()).toEqual([]);
+      expect(recorder.fetches).toEqual([]);
+    });
+    it("P12 switch off at mention admission creates no enrollment or candidate", async () => {
+      const f = await pairedReviewFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      await deliverShadowTestMention(f, "p12-off-at-admission", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      await f.service.processPendingDeliveries();
+      const [counts] = await db.execute(sql`select
+        (select count(*)::int from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}) as enrollments,
+        (select count(*)::int from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}) as candidates,
+        (select count(*)::int from chat_deliveries where endpoint_id = ${f.endpoint.id} and normalized_event ? 'githubPairingPending') as pending`);
+      expect(counts).toMatchObject({ enrollments: 0, candidates: 0, pending: 0 });
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("primary tool discovery preserves task-bound continuations with pairing off", async () => {
+      const f = await reviewBotFixture();
+      const conversation = await deliverShadowTestMention(f, "primary-continuation", "@maya review this", 81);
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId, agentId: f.assignedAgentId, invocationSource: "assignment", status: "queued",
+        nativeIssueId: conversation.issueId, contextSnapshot: { issueId: conversation.issueId },
+      }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run!.id };
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      const { githubBotConnectionIdsForRun } = await import("../services/chat-github-tools.js");
+      expect([...(await githubBotConnectionIdsForRun(db, f.companyId, f.assignedAgentId, run!.id))]).toContain(f.endpoint.connectionId);
+    });
+    it.each(["nativeIssueId", "taskId"] as const)("paired regression fences failed run-only output bound by %s before begin_review", async (binding) => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `run-only-${binding}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        invocationSource: "assignment", status: "failed",
+        nativeIssueId: binding === "nativeIssueId" ? candidate.issue.id : null,
+        contextSnapshot: binding === "taskId" ? { taskId: candidate.issue.id } : {} }).returning();
+      const { insertChatActions } = await import("../services/chat-publication-authority.js");
+      const intent = { companyId: f.companyId, endpointId: f.endpoint.id, kind: "github_review_publication",
+        providerActionId: randomUUID(), payload: { runId: run!.id }, status: "received" };
+      expect(await insertChatActions(db, intent)).toHaveLength(0);
+      await expect(db.insert(chatActions).values(intent)).rejects.toMatchObject({ cause: { code: "23514", constraint_name: "chat_outbound_capture_only" } });
+      expect(await db.select().from(chatActions).where(eq(chatActions.providerActionId, intent.providerActionId))).toHaveLength(0);
+    });
+    it("paired regression rejects long-lived candidate keys with missing forged and valid run headers", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "candidate-key-history", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_KEY_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const token = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        name: "candidate fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(token).digest("hex") });
+      const app = express();
+      app.use(express.json());
+      app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+      app.use("/api", issueRoutes(db, createStorageService().storage));
+      app.post("/api/tool-gateway/sessions", (_req, res) => res.json({ reached: true }));
+      app.use(errorHandler);
+      for (const runId of [undefined, session.runId, primarySession.runId, randomUUID()]) {
+        const query = request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${token}`);
+        if (runId) query.set("X-Paperclip-Run-Id", runId);
+        const response = await query;
+        expect(response.status).toBe(403);
+        expect(JSON.stringify(response.body)).not.toContain("PRIMARY_KEY_HISTORY_CANARY");
+      }
+      expect((await request(app).post("/api/tool-gateway/sessions").set("Authorization", `Bearer ${token}`)
+        .set("X-Paperclip-Run-Id", session.runId).send({ issueId: candidate.issue.id })).status).toBe(403);
+      // A primary agent's existing long-lived key retains its ordinary behavior.
+      const primaryKey = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        name: "primary fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(primaryKey).digest("hex") });
+      const control = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${primaryKey}`);
+      expect(control.status).toBe(200);
+      expect(JSON.stringify(control.body)).toContain("PRIMARY_KEY_HISTORY_CANARY");
+    });
+    it("paired regression preserves unadmitted agent keys when the global flag is off", async () => {
+      const f = await pairedReviewFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const primary = await deliverShadowTestMention(f, "configured-but-off", "@maya review this", 81);
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const token = `pc_test_${randomUUID()}`;
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        name: "unadmitted fixture", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(token).digest("hex") });
+      const app = express();
+      app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+      app.use("/api", issueRoutes(db, createStorageService().storage));
+      app.use(errorHandler);
+      expect((await request(app).get(`/api/issues/${primary.issueId}/comments`).set("Authorization", `Bearer ${token}`)).status).toBe(200);
+      expect([...await db.execute(sql`select id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`)]).toHaveLength(0);
+    });
+    it("paired confinement leaves an admitted agent's signed non-candidate run usable", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "candidate-and-normal-runs", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const [ordinary] = await db.insert(issues).values({ companyId: f.companyId, title: "Ordinary production work", assigneeAgentId: f.replacementAgentId }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        invocationSource: "assignment", status: "running", nativeIssueId: ordinary!.id, contextSnapshot: { issueId: ordinary!.id } }).returning();
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-normal-run-fixture";
+      try {
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/ordinary-probe", (_req, res) => res.json({ reached: true }));
+        app.use(errorHandler);
+        const token = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", run!.id, "owner-user")!;
+        const candidateToken = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", candidateSession.runId, "owner-user")!;
+        for (const enabled of [true, false]) {
+          await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: enabled });
+          expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${token}`)).status).toBe(200);
+          expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${candidateToken}`)).status).toBe(403);
+        }
+        // A native normal task cannot mask a persisted candidate context alias.
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: ordinary!.id, taskId: candidate.issue.id } }).where(eq(heartbeatRuns.id, run!.id));
+        expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${token}`)).status).toBe(403);
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired regression rejects signed but unbound candidate credentials after enrollment is disabled", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "unbound-signed-candidate", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_UNBOUND_JWT_CANARY", { agentId: f.assignedAgentId });
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-unbound-jwt-fixture";
+      try {
+        const token = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", randomUUID(), "owner-user")!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.use("/api", issueRoutes(db, createStorageService().storage));
+        app.use(errorHandler);
+        const response = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${token}`);
+        expect(response.status).toBe(403);
+        expect(JSON.stringify(response.body)).not.toContain("PRIMARY_UNBOUND_JWT_CANARY");
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired regression records automatic metadata failure against the authenticated event head", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      installShadowRecorder(f, head, async url => url.endsWith("/pulls/81") ? new Response("temporary failure", { status: 503 }) : undefined);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      // Wake acceptance and candidate projection commit independently. A webhook
+      // recovery can already own the capture when our explicit sweep returns, so
+      // neither a resolved mock nor a processed wake proves the candidate exists.
+      // Wait for the durable condition we assert, driving recovery if needed.
+      const candidateRows = () => db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`);
+      await expect.poll(async () => {
+        await f.service.processPendingDeliveries();
+        return [...await candidateRows()];
+      }, { timeout: 10000 }).toMatchObject([{ state: "unavailable" }]);
+      const rows = [...await candidateRows()];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ head_sha: admitted.headSha, state: "unavailable",
+        envelope: { event: { deliveryId: admitted.event.deliveryId, headSha: head }, snapshotFailure: "source_preparation_failed" } });
+      expect(f.wakeup.mock.calls.every(c => c[0] === f.assignedAgentId)).toBe(true);
+    });
+    it.each(["metadata", "token"])("paired regression records unavailable manual %s without inventing or recapturing admission bytes", async (failure) => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url =>
+        (failure === "metadata" ? url.endsWith("/pulls/81") : url.includes("/access_tokens"))
+          ? new Response("temporary failure", { status: 503 }) : undefined);
+      await deliverShadowTestMention(f, `source-failure-${failure}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const rows = [...await db.execute(sql`select e.head_sha, e.base_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ head_sha: null, base_sha: null, state: "unavailable", envelope: {
+        event: null, unavailableEvent: { repository: "paperclipai/paperclip", repositoryId: "97531", pullNumber: 81 },
+        snapshotFailure: "source_preparation_failed", request: expect.stringContaining("review this"),
+      } });
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, `source-failure-${failure}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect([...await db.execute(sql`select e.head_sha, e.base_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)]).toEqual(rows);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("paired regression excludes primary history carryover from the certified clean cohort", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "primary-head-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_PRIOR_HEAD_ANSWER_CANARY", { agentId: f.assignedAgentId });
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, "primary-head-two", "@maya review new head", 81);
+      await f.service.processPendingDeliveries();
+      // Preserve normal primary behavior; do not silently make the live gate a new experiment.
+      const primaries = (await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.assignedAgentId);
+      expect(primaries.map(t => t.issue.id)).toEqual([primary.issue.id]);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      expect(JSON.stringify(comments)).toContain("PRIMARY_PRIOR_HEAD_ANSWER_CANARY");
+      const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
+      expect(rows).toHaveLength(2);
+      for (const row of rows) expect(row.envelope).toMatchObject({ comparisonEligibility: {
+        certifiedClean: false, reasons: expect.arrayContaining(["candidate_isolation_self_test_not_recorded", "candidate_runtime_not_certified"]),
+      } });
+    });
+    it("paired candidate rejects a version-one unblinded snapshot with 409 before provider reads", async () => {
+      const snapshots = await import("../services/chat-github-review-snapshot.js");
+      const capture = snapshots.captureGitHubReviewSnapshot;
+      const oldSnapshot = vi.spyOn(snapshots, "captureGitHubReviewSnapshot").mockImplementation(async (...args) => {
+        const { digest: _digest, redactions: _redactions, ...value } = await capture(...args);
+        const responses = Object.fromEntries(Object.entries(value.responses).map(([route, encoded]) =>
+          [route, JSON.parse(Buffer.from(String(encoded), "base64").toString("utf8"))]));
+        responses["/pulls/81"].body = "PRIMARY_LEGACY_ANSWER_CANARY";
+        const legacy = { ...value, version: 1 as const, responses };
+        // Correct v1 encoding and digest: rejection must come from the blinding
+        // guard, not incidental malformed-snapshot validation farther downstream.
+        return { ...legacy, digest: snapshots.githubSnapshotDigest(legacy) };
+      });
+      try {
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, "legacy-snapshot-version", "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const recorder = installShadowRecorder(f, "c".repeat(40));
+        await expect(githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" }))
+          .rejects.toMatchObject({ status: 409, message: expect.stringContaining("predates bot-answer blinding") });
+        expect(recorder.fetches).toEqual([]);
+      } finally { oldSnapshot.mockRestore(); }
+    });
+    it("paired regression fails closed on legacy mutable reads even after shadow mode is disabled", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      let answer = "admission text";
+      const recorder = installShadowRecorder(f, "b".repeat(40), async url => url.includes("/comments?")
+        ? Response.json([{ id: 7, created_at: "2020-01-01T00:00:00Z", body: answer }]) : undefined);
+      const conversation = await deliverShadowTestMention(f, "legacy-blind", "@maya review this", 81);
+      const session = await shadowTestSession(f, conversation);
+      answer = "PRIMARY_LEGACY_EDITED_ANSWER_CANARY";
+      await saveShadowMode(f, false);
+      const start = recorder.fetches.length;
+      const service = githubChatReviewService(db, f.providerFetch);
+      for (const section of ["comments", "reviews", "checks", "metadata", "changes_since_review", "diff"]) {
+        await expect(service.execute(session, "read_pull_request", { section })).rejects.toThrow("sealed admission snapshot");
+      }
+      await expect(service.execute(session, "read_file", { path: "src/math.ts", revision: "head" })).rejects.toThrow("sealed admission snapshot");
+      expect(recorder.fetches.slice(start)).toEqual([]);
+    });
+    it.each(["lagged", "disabled", "disabled-between-sweeps", "primary-published", "published-during-capture"] as const)(
+      "paired capture refuses post-admission signals: %s", async scenario => {
+        const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+        await deferPairCaptureToSweep();
+        const f = await pairedReviewFixture();
+        const primary = await deliverShadowTestMention(f, `late-snapshot-${scenario}`, "@maya review this", 81);
+        const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+        if (scenario === "lagged") await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event,
+          '{githubPairingPending,admittedAt}', to_jsonb(${new Date(0).toISOString()}::text)) where id = ${delivery!.id}`);
+        if (scenario === "disabled" || scenario === "disabled-between-sweeps") {
+          await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+          if (scenario === "disabled") await f.service.processPendingDeliveries();
+          await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: true });
+        }
+        const publish = async () => {
+          const session = await shadowTestSession(f, primary);
+          await githubChatReviewService(db, f.providerFetch).execute(session, "comment", {
+            body: "PRIMARY_ANSWER_CANARY", idempotencyKey: `published-${scenario}`,
+          });
+        };
+        if (scenario === "primary-published") await publish();
+        let published = false;
+        const recorder = installShadowRecorder(f, "c".repeat(40), async url => {
+          if (scenario === "published-during-capture" && !published) { published = true; await publish(); }
+          if (url.includes("/comments?")) return Response.json([{ id: 7, user: { login: "octocat" }, body: "AUTHOR_QUOTES_PRIMARY_CANARY" }]);
+          if (url.includes("/reviews?")) return Response.json([{ id: 8, user: { login: "steward-owner" }, state: "APPROVED", body: "STEWARD_APPROVAL_CANARY" }]);
+          return undefined;
+        });
+        await f.service.processPendingDeliveries();
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        expect(enrollment).toBeDefined();
+        expect(enrollment!.envelope.snapshot).toBeUndefined();
+        expect(enrollment!.envelope.snapshotFailure).toBe(scenario.startsWith("disabled") ? "admission_snapshot_disabled" : "admission_snapshot_late");
+        expect(JSON.stringify(enrollment)).not.toContain("CANARY");
+        expect(enrollment!.headSha).not.toBe("c".repeat(40));
+        expect((await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id)))[0]!.state).toBe("unavailable");
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        if (scenario !== "published-during-capture") expect(recorder.fetches).toEqual([]);
+      },
+    );
+    it.each(["wake", "binding"] as const)("paired head binding voids a candidate when the actual primary begins a different head (%s)", async guard => {
+      const { chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const { githubCandidateMayWake, githubCandidateBinding } = await import("../services/chat-github-shadow.js");
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, "head-mismatch-after-capture", "@maya review this", 81);
+      const session = await shadowTestSession(f, primary);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      // A primary whose first read already fell back to live must stay live.
+      await db.update(heartbeatRuns).set({ contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify({
+        githubPrimaryReviewInput: { deliveryId: delivery!.id, source: "live" },
+      })}::jsonb` }).where(eq(heartbeatRuns.id, session.runId));
+      await f.service.processPendingDeliveries();
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, session.runId));
+      installShadowRecorder(f, "c".repeat(40));
+      await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "c".repeat(40) });
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.endpointId, f.endpoint.id));
+      await db.update(chatGitHubReviewCandidates).set({ state: "materialized", nextAttemptAt: null })
+        .where(eq(chatGitHubReviewCandidates.id, candidate!.id));
+      if (guard === "binding") {
+        expect(await githubCandidateBinding(db, { companyId: f.companyId, endpointId: f.endpoint.id,
+          agentId: f.replacementAgentId, issueId: candidate!.issueId!, deliveryId: candidate!.nativeDeliveryId,
+          conversationId: candidate!.conversationId!, commentId: candidate!.commentId! })).toBeNull();
+      } else await f.service.processPendingDeliveries();
+      expect((await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.id, candidate!.id)))[0])
+        .toMatchObject({ state: "voided", lastError: "head_mismatch" });
+      expect(await githubCandidateMayWake(db, candidate!)).toBe(false);
+    });
+    it.each(["title", "body"] as const)("paired admission accounts for NUL in PR %s", async field => {
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.endsWith("/pulls/81") ? Response.json({
+        number: 81, title: "Title", body: "Body", [field]: "before\u0000after", draft: false,
+        head: { sha: "b".repeat(40) }, base: { sha: "a".repeat(40), ref: "main" }, user: { id: 42, login: "octocat" }, labels: [],
+      }) : undefined);
+      await deliverShadowTestMention(f, `nul-event-${field}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment).toBeDefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe("admission_event_not_jsonb_safe");
+      expect((await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id)))[0]!.state).toBe("unavailable");
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("paired admission preserves literal backslash-u0000 text as JSONB-safe input", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.endsWith("/pulls/81") ? Response.json({
+        number: 81, title: "Text \\u0000", body: "Text \\u0000", draft: false,
+        head: { sha: "b".repeat(40) }, base: { sha: "a".repeat(40), ref: "main" }, user: { id: 42, login: "octocat" }, labels: [],
+      }) : undefined);
+      await deliverShadowTestMention(f, "literal-nul-text", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+      expect(enrollment!.envelope.event!.title).toBe("Text \\u0000");
+    });
+    it("paired regression preserves NUL snapshot bytes without blocking the primary", async () => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.includes("/issues/81/comments?")
+        ? Response.json([{ id: 7, user: { login: "octocat" }, body: "before\u0000after" }]) : undefined);
+      await deliverShadowTestMention(f, "paired-nul", "@maya review this", 81);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate).toBeDefined();
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "comments" });
+      expect(JSON.stringify(result)).toContain("before\\u0000after");
+    });
+    it("paired regression rolls back pending-stage failure without rolling back the primary", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_fail_pair_seed() returns trigger language plpgsql as $$ begin
+        if NEW.normalized_event ? 'githubPairingPending' then raise exception 'injected pending-stage failure'; end if; return NEW; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_seed before update on chat_deliveries for each row execute function test_fail_pair_seed()`);
+      try {
+        await deliverShadowTestMention(f, "paired-seed-error", "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+        const rows = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+        expect(rows.some(r => r.normalizedEvent.githubPairingFailure === "pair_admission_failed")).toBe(true);
+        expect(rows.every(r => !r.normalizedEvent.githubPairingPending)).toBe(true);
+        expect(rows.every(r => !r.normalizedEvent.githubPairingSeed)).toBe(true);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_seed on chat_deliveries`);
+        await db.execute(sql`drop function test_fail_pair_seed()`);
+      }
+    });
+    it("paired regression blinds same-head published bot answers across all review surfaces", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "paired-before-rerequest", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      installShadowRecorder(f, head, async url => {
+        if (/\/(comments|reviews)\?/.test(url)) return Response.json([
+          { id: 1, body: "PRIMARY_PUBLISHED_ANSWER_CANARY", user: { login: f.endpoint.botUsername } },
+          { id: 2, body: "AUTHOR_CONTEXT", user: { login: "octocat" } },
+        ]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [
+          { id: 1, app: { id: Number(f.endpoint.botExternalId) }, output: { summary: "PRIMARY_CHECK_CANARY" } },
+          { id: 2, app: { id: 987654321 }, output: { summary: "CI_CONTEXT" } },
+        ] });
+        if (url.includes("/statuses?")) return Response.json([{ id: 1, creator: { login: f.endpoint.botUsername }, description: "PRIMARY_STATUS_CANARY" }]);
+        return undefined;
+      });
+      await deliverShadowTestMention(f, "paired-rerequest", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = (await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.replacementAgentId);
+      for (const candidate of tasks) {
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        for (const section of ["comments", "reviews", "inline_comments", "checks"]) {
+          const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section });
+          expect(JSON.stringify(result)).not.toContain("CANARY");
+        }
+      }
+      const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
+      expect(rows[1]!.envelope.snapshot.redactions.total).toBe(5);
+    });
+    it("paired admission creates one primary and one candidate with exact request and native capabilities", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-first", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.conversation.githubShadowLabel).toBe("paired-meta");
+      const primaryComments = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      const candidateComments = await db.select().from(issueComments).where(eq(issueComments.issueId, candidate.issue.id));
+      expect(candidateComments.map(c => c.body)).toEqual(primaryComments.map(c => c.body));
+      const candidateWake = (await shadowTestActions(f.endpoint.id, "inbound_wakeup")).find(a => a.conversationId === candidate.conversation.id);
+      expect({ status: candidateWake?.status, result: candidateWake?.result }).toEqual({ status: "processed", result: expect.objectContaining({ code: "inbound_wakeup_durable" }) });
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+      // Crash after the durable scheduler acknowledgement but before updating
+      // the local outbox: native receipt reconciliation must not wake twice.
+      await db.execute(sql`update chat_github_review_candidates set state = 'materialized', next_attempt_at = null where issue_id = ${candidate.issue.id}`);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+      expect([...(await db.execute(sql`select state from chat_github_review_candidates where issue_id = ${candidate.issue.id}`))]).toEqual([{ state: "dispatched" }]);
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" })).toBeDefined();
+      expect(await githubBotToolsForSession(db, { ...session, issueId: primary.issue.id })).toEqual([]);
+      await expect(githubChatReviewService(db, f.providerFetch).execute({ ...session, issueId: primary.issue.id }, "read_pull_request", { section: "metadata" })).rejects.toThrow();
+      const intents = await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate.issue.id));
+      expect(intents).toEqual([]);
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      for (const unauthorized of [
+        { ...session, agentId: f.assignedAgentId },
+        { ...session, runId: primarySession.runId },
+        { ...session, companyId: randomUUID() },
+      ]) expect(await githubBotToolsForSession(db, unauthorized)).toEqual([]);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id, wakeCommentId: primaryComments[0]!.id } }).where(eq(heartbeatRuns.id, session.runId));
+      expect(await githubBotToolsForSession(db, session)).toEqual([]);
+    });
+    it("paired candidate runtime MCP assignment is granted only by the exact candidate capability", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-runtime-mcp", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const { githubCandidateReviewAssignmentForRun } = await import("../services/chat-github-tools.js");
+      const { buildPaperclipRuntimeMcpServers } = await import("../services/heartbeat.js");
+      const { resolveNativeRuntimeMcpSnapshot } = await import("../services/native-runtime/runtime-context.js");
+      const [clone] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+      const [primaryAgent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+      const toolNames = async (ids: string[]) => ids.length ? (await db.select({ toolName: toolCatalogEntries.toolName })
+        .from(toolCatalogEntries).where(inArray(toolCatalogEntries.id, ids))).map(r => r.toolName).sort() : [];
+      const reviewTools = ["begin_review", "read_file", "read_pull_request", "submit_review"];
+      // Even a clone misconfigured with connection-wide access to the bot
+      // connection gets only the four catalog entries, never comment/formal_review.
+      const [wide] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `clone-wide:${randomUUID()}`, name: "Clone wide", defaultAction: "deny" }).returning();
+      const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: wide!.id, selectorType: "connection", effect: "include",
+        applicationId: connection!.applicationId, connectionId: connection!.id });
+      await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: wide!.id, targetType: "agent", targetId: f.replacementAgentId });
+
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const grant = await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      expect(grant?.connection.id).toBe(f.endpoint.connectionId);
+      expect(await toolNames(grant!.tools.map(t => t.id))).toEqual(reviewTools);
+      expect((await githubBotToolsForSession(db, session)).map(t => t.upstreamToolName).sort()).toEqual(reviewTools);
+      const servers = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId: session.runId, apiBaseUrl: "http://127.0.0.1:3100" });
+      expect(servers).toHaveLength(1);
+      const [gatewayRow] = (await db.select().from(toolMcpGateways).where(eq(toolMcpGateways.companyId, f.companyId)))
+        .filter(g => servers[0]!.url.endsWith(`/${g.gatewayPublicId}`));
+      const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, gatewayRow!.profileId!));
+      expect(entries.every(e => e.selectorType === "catalog_entry" && e.connectionId === f.endpoint.connectionId)).toBe(true);
+      expect(await toolNames(entries.map(e => e.catalogEntryId!))).toEqual(reviewTools);
+      // The native runtime snapshot pins the same assignment the gateway realizes.
+      expect((await resolveNativeRuntimeMcpSnapshot({ db, agent: clone!, runId: session.runId })).digest)
+        .toBe(gatewayRow!.metadata?.nativeRuntimeAssignmentDigest);
+
+      const primaryComment = (await db.select({ id: issueComments.id }).from(issueComments)
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, primary.issue.id), eq(chatMessageLinks.direction, "inbound"))))[0]!;
+      const cloneRun = async (contextSnapshot: Record<string, unknown>) => (await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+        agentId: f.replacementAgentId, invocationSource: "assignment", status: "running", contextSnapshot }).returning())[0]!.id;
+      for (const runId of [
+        await cloneRun({ issueId: candidate.issue.id }), // another run of the clone, no admitted wake
+        await cloneRun({ issueId: candidate.issue.id, wakeCommentId: primaryComment.id }), // wrong conversation
+        await cloneRun({ issueId: primary.issue.id, wakeCommentId: primaryComment.id }), // primary task
+      ]) {
+        expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, runId)).toBeNull();
+        const other = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId, apiBaseUrl: "http://127.0.0.1:3100" });
+        expect(other.map(s => s.url)).not.toContain(servers[0]!.url);
+      }
+      // The primary keeps its configured (non-candidate) assignment.
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.assignedAgentId, primarySession.runId)).toBeNull();
+      expect((await buildPaperclipRuntimeMcpServers({ db, agent: primaryAgent!, runId: primarySession.runId, apiBaseUrl: "http://127.0.0.1:3100" })).map(s => s.url))
+        .not.toContain(servers[0]!.url);
+      // Catalog and endpoint state still govern the grant.
+      const grantFor = () => githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      const [quarantined] = await db.update(toolCatalogEntries).set({ quarantinedAt: new Date() })
+        .where(and(eq(toolCatalogEntries.connectionId, f.endpoint.connectionId), eq(toolCatalogEntries.toolName, "read_file"))).returning();
+      expect(await toolNames((await grantFor())!.tools.map(t => t.id))).toEqual(reviewTools.filter(t => t !== "read_file"));
+      await db.update(toolCatalogEntries).set({ quarantinedAt: null }).where(eq(toolCatalogEntries.id, quarantined!.id));
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      expect(await grantFor()).toBeNull();
+      await db.update(toolConnections).set({ enabled: true }).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": false}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).toBeNull();
+      await db.execute(sql`update chat_github_configurations set configuration = configuration || '{"toolsEnabled": true}'::jsonb where endpoint_id = ${f.endpoint.id}`);
+      expect(await grantFor()).not.toBeNull();
+      // A voided candidate loses the grant.
+      await db.update(chatGitHubReviewCandidates).set({ state: "voided" }).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId)).toBeNull();
+    });
+    it("paired admission enrolls authenticated automatic PR events with the same guest authority", async () => {
+      const f = await pairedReviewFixture();
+      await db.delete(chatIdentityLinks).where(eq(chatIdentityLinks.principalId, f.principal.id));
+      const config = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: config.revision,
+        configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, invocation: "allowed_authors" }, people: [{ kind: "guest", githubUserId: "42", login: "octocat", sponsorUserId: "owner-user", permissionProfile: "restricted", automaticReviews: true }] },
+      }, "owner-user");
+      await admitShadowTestPullRequest(f, "b".repeat(40));
+      // The webhook helper observes admission, not dispatch completion. Wait for
+      // the committed primary wake before racing the endpoint's NOWAIT lock.
+      await expect.poll(async () => (await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup"), eq(chatActions.status, "processed"),
+      ))).length, { timeout: 10000 }).toBeGreaterThan(0);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.issue.sourceTrust?.preset).toBe("low_trust_review");
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { githubBotConnectionIdsForRun, githubGuestBotConnectionForSession } = await import("../services/chat-github-tools.js");
+      expect([...(await githubBotConnectionIdsForRun(db, f.companyId, f.replacementAgentId, session.runId))]).toContain(f.endpoint.connectionId);
+      expect(await githubGuestBotConnectionForSession(db, session)).toBe(f.endpoint.connectionId);
+      expect(await githubBotToolsForSession(db, session)).not.toHaveLength(0);
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" })).toBeDefined();
+      expect(f.wakeup.mock.calls.some(c => c[0] === f.replacementAgentId)).toBe(true);
+    });
+    it("paired admission deduplicates delivery and freezes head across independent rounds", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-duplicate", "@maya review this", 81);
+      await f.service.processPendingDeliveries(); // Candidate admission freezes this head.
+      installShadowRecorder(f, "c".repeat(40));
+      await deliverShadowTestMention(f, "paired-duplicate", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      await deliverShadowTestMention(f, "paired-next-head", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks.filter(t => t.issue.assigneeAgentId === f.assignedAgentId)).toHaveLength(1);
+      expect(tasks.filter(t => t.issue.assigneeAgentId === f.replacementAgentId)).toHaveLength(2);
+      const rows = await db.execute(sql`select head_sha, round_ordinal from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`);
+      expect([...rows]).toMatchObject([{ head_sha: "b".repeat(40), round_ordinal: 1 }, { head_sha: "c".repeat(40), round_ordinal: 2 }]);
+      await deliverShadowTestMention(f, "paired-same-head", "@maya another request at the same head", 81);
+      await f.service.processPendingDeliveries();
+      const rounds = await db.execute(sql`select head_sha, round_ordinal from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`);
+      expect([...rounds]).toMatchObject([{ round_ordinal: 1 }, { round_ordinal: 2 }, { head_sha: "c".repeat(40), round_ordinal: 3 }]);
+      expect((await pairedTasks(f.endpoint.id)).filter(t => t.issue.assigneeAgentId === f.replacementAgentId)).toHaveLength(3);
+    });
+    it("paired admission kill switch blocks new admission and pending recovery without touching primary", async () => {
+      const f = await pairedReviewFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      await deliverShadowTestMention(f, "paired-off", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: true });
+      await deliverShadowTestMention(f, "paired-before-stop", "@maya review again", 81);
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+      expect(f.wakeup.mock.calls.every(c => c[0] === f.assignedAgentId)).toBe(true);
+    });
+    it("paired admission recovers interrupted enqueue and candidate failure leaves primary unaffected", async () => {
+      let cloneId = "";
+      const f = await pairedReviewFixture({ wakeup: async (agentId) => { if (agentId === cloneId) throw new Error("candidate unavailable"); return { accepted: true }; } });
+      cloneId = f.replacementAgentId;
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      await deliverShadowTestMention(f, "paired-crash", "@maya review this", 81);
+      // No in-memory scheduling is needed: a new service drains the durable outbox.
+      const restarted = createService(new FakeChatSdkRuntime(), f.providerFetch, { wakeup: async (agentId) => { if (agentId === cloneId) throw new Error("candidate unavailable"); return { accepted: true }; } });
+      await restarted.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      await restarted.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      const review = githubChatReviewService(db, f.providerFetch);
+      await review.execute(session, "begin_review", { reviewedCommit: "b".repeat(40) });
+      expect(await review.execute(session, "submit_review", shadowTestAssessment("b".repeat(40)))).toMatchObject({ score: 2, conclusion: "failure" });
+      const publications = await shadowTestActions(f.endpoint.id, "github_review_publication");
+      expect(publications).toHaveLength(1);
+      expect(publications[0]!.status).toBe("processed");
+      expect(recorder.mutations.some(m => m.url.includes("/check-runs"))).toBe(true);
+      expect(recorder.mutations.some(m => m.url.includes("/comments"))).toBe(true);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect([...(await db.execute(sql`select state from chat_github_review_candidates where issue_id = ${candidate.issue.id}`))]).toEqual([{ state: "materialized" }]);
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate.issue.id))).toHaveLength(0);
+    });
+    it("paired admission defers unavailable clones without starving the recovery queue", async () => {
+      const blocked = await pairedReviewFixture();
+      await deliverShadowTestMention(blocked, "paired-paused", "@maya review this", 81);
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, blocked.replacementAgentId));
+      const runnable = await pairedReviewFixture();
+      await deliverShadowTestMention(runnable, "paired-runnable", "@maya review this", 81);
+      await runnable.service.processPendingDeliveries(1);
+      await runnable.service.processPendingDeliveries(1);
+      expect(await pairedTasks(blocked.endpoint.id)).toHaveLength(1);
+      expect(await pairedTasks(runnable.endpoint.id)).toHaveLength(2);
+      expect(runnable.wakeup.mock.calls.some(c => c[0] === blocked.replacementAgentId)).toBe(false);
+      expect(runnable.wakeup.mock.calls.some(c => c[0] === runnable.replacementAgentId)).toBe(true);
+    });
+    it("paired admission rolls back partial materialization and retries the reserved delivery", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-materialize-crash", "@maya review this", 81);
+      let before: Array<Record<string, unknown>> = [];
+      await db.execute(sql`create function test_fail_pair_materialization() returns trigger language plpgsql as $$ begin
+        if NEW.execution_scope <> 'primary' then raise exception 'injected materialization crash'; end if; return NEW; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_materialization before insert on chat_conversations for each row execute function test_fail_pair_materialization()`);
+      try {
+        await f.service.processPendingDeliveries();
+        before = [...(await db.execute(sql`select native_delivery_id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`))];
+        expect(before).toHaveLength(1);
+        expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+        expect(await db.select().from(issues).where(and(eq(issues.companyId, f.companyId), eq(issues.assigneeAgentId, f.replacementAgentId)))).toHaveLength(0);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_materialization on chat_conversations`);
+        await db.execute(sql`drop function test_fail_pair_materialization()`);
+      }
+      await db.execute(sql`update chat_github_review_candidates set next_attempt_at = null where endpoint_id = ${f.endpoint.id}`);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect([...(await db.execute(sql`select native_delivery_id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`))]).toEqual(before);
+      expect(f.wakeup.mock.calls.map(c => c[0]).sort()).toEqual([f.assignedAgentId, f.replacementAgentId].sort());
+    });
+    it("paired admission rechecks kill switch immediately before wake after materialization", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_stop_paired_wake() returns trigger language plpgsql as $$ begin
+        if NEW.state = 'materialized' then update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb; end if;
+        return NEW; end $$`);
+      await db.execute(sql`create trigger test_stop_paired_wake after update on chat_github_review_candidates for each row execute function test_stop_paired_wake()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger test_stop_paired_wake on chat_github_review_candidates`);
+        await db.execute(sql`drop function test_stop_paired_wake()`);
+      });
+      await deliverShadowTestMention(f, "paired-midflight-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const candidates = await db.execute(sql`select state from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "materialized" }]);
+    });
+    it("paired recovery defers a pending candidate without materializing it while the kill switch is off", async () => {
+      const f = await pairedReviewFixture();
+      // The kill switch flips after admission committed the candidate row but
+      // before the recovery sweep claims it for materialization.
+      await db.execute(sql`create function test_stop_paired_recovery() returns trigger language plpgsql as $$ begin
+        update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb;
+        return NEW; end $$`);
+      await db.execute(sql`create trigger test_stop_paired_recovery after insert on chat_github_review_candidates for each row execute function test_stop_paired_recovery()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger if exists test_stop_paired_recovery on chat_github_review_candidates`);
+        await db.execute(sql`drop function if exists test_stop_paired_recovery()`);
+      });
+      await deliverShadowTestMention(f, "paired-recovery-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const candidates = await db.execute(sql`select state, last_error from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "pending", last_error: "candidate_unavailable" }]);
+    });
+    it("paired inbound wake rechecks the kill switch inside the claimed wake transaction", async () => {
+      const f = await pairedReviewFixture();
+      // Flip the switch after the sweep's pre-wake check, when the candidate's
+      // queued chat action is claimed: only the inbound wake gate can stop it.
+      await db.execute(sql.raw(`create function test_stop_paired_inbound_wake() returns trigger language plpgsql as $$ begin
+        if NEW.status = 'processing' and NEW.payload->>'agentId' = '${f.replacementAgentId}' then
+          update instance_settings set experimental = experimental || '{"githubReviewShadowEnabled":false}'::jsonb; end if;
+        return NEW; end $$`));
+      await db.execute(sql`create trigger test_stop_paired_inbound_wake after update on chat_actions for each row execute function test_stop_paired_inbound_wake()`);
+      onTestFinished(async () => {
+        await db.execute(sql`drop trigger if exists test_stop_paired_inbound_wake on chat_actions`);
+        await db.execute(sql`drop function if exists test_stop_paired_inbound_wake()`);
+      });
+      await deliverShadowTestMention(f, "paired-inbound-stop", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      // The denied wake never dispatches the candidate.
+      const candidates = await db.execute(sql`select state from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`);
+      expect([...candidates]).toEqual([{ state: "unavailable" }]);
+    });
+    it("paired admission recovers an enrollment projection failure from immutable source seed", async () => {
+      const f = await pairedReviewFixture();
+      await db.execute(sql`create function test_fail_pair_projection() returns trigger language plpgsql as $$ begin raise exception 'injected projection failure'; end $$`);
+      await db.execute(sql`create trigger test_fail_pair_projection before insert on chat_github_review_enrollments for each row execute function test_fail_pair_projection()`);
+      try {
+        await deliverShadowTestMention(f, "paired-projection-crash", "@maya frozen request", 81);
+        await f.service.processPendingDeliveries();
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        expect([...(await db.execute(sql`select id from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`))]).toEqual([]);
+      } finally {
+        await db.execute(sql`drop trigger test_fail_pair_projection on chat_github_review_enrollments`);
+        await db.execute(sql`drop function test_fail_pair_projection()`);
+      }
+      installShadowRecorder(f, "c".repeat(40));
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(2);
+      expect([...(await db.execute(sql`select head_sha from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`))]).toEqual([{ head_sha: "b".repeat(40) }]);
+    });
+    it("paired snapshot seals edited comments reviews checks and body before the candidate runs", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      let answer = "admission bytes";
+      const recorder = installShadowRecorder(f, head, async (url) => {
+        if (url.endsWith("/pulls/81")) return Response.json({ number: 81, title: "Frozen title", body: answer, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (/\/(comments|reviews)\?/.test(url)) return Response.json([{ id: 7, created_at: "2020-01-01T00:00:00Z", body: answer }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [{ id: 8, output: { summary: answer } }] });
+        return undefined;
+      });
+      await deliverShadowTestMention(f, "snapshot-blinding", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      answer = "PRIMARY_ANSWER_EDITED_AFTER_ADMISSION_CANARY";
+      const tasks = await pairedTasks(f.endpoint.id);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      // Negative control: a live read sees an edited old comment despite its old created_at.
+      expect(await (await f.providerFetch("https://api.github.com/repos/paperclipai/paperclip/issues/81/comments?per_page=100&page=1")).json()).toEqual([expect.objectContaining({ body: answer })]);
+      const start = recorder.fetches.length;
+      const service = githubChatReviewService(db, f.providerFetch);
+      for (const section of ["metadata", "comments", "reviews", "inline_comments", "checks"]) {
+        const candidateResult = await service.execute(candidateSession, "read_pull_request", { section });
+        const primaryResult = await service.execute(primarySession, "read_pull_request", { section });
+        expect(JSON.stringify(candidateResult)).toContain("admission bytes");
+        expect(JSON.stringify(candidateResult)).not.toContain(answer);
+        expect(primaryResult).toEqual(candidateResult);
+      }
+      expect(recorder.fetches.slice(start)).toEqual([]);
+      const [enrollment] = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id}`)];
+      expect(JSON.stringify(enrollment)).toContain("admission bytes");
+      await expect(db.execute(sql`update chat_github_review_enrollments set envelope = jsonb_set(envelope, '{snapshot}', '{}') where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+    });
+    it("paired snapshot first round excludes a newer unlabelled assessment and issue history canary", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-history", "@maya review this", 81);
+      const primary = (await pairedTasks(f.endpoint.id))[0]!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_ISSUE_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      await db.insert(chatGitHubReviews).values({ companyId: f.companyId, endpointId: f.endpoint.id, issueId: primary.issue.id,
+        repositoryId: "97531", repository: "paperclipai/paperclip", pullNumber: 81, headSha: head,
+        deliveryId: randomUUID(), configurationRevision: 1, policySnapshot: (await f.management.configuration(f.endpoint.id, "owner-user")).configuration.defaults,
+        event: { event: "mention", deliveryId: "unlabelled", repositoryId: "97531", repository: "paperclipai/paperclip", pullNumber: 81,
+          headSha: head, baseSha: "a".repeat(40), baseBranch: "master", title: "Late result", body: "", draft: false,
+          author: { id: "42", login: "octocat", isBot: false }, sender: { id: "42", login: "octocat" }, labels: [] },
+        state: "completed", assessment: { ...shadowTestAssessment(head), summary: "PRIMARY_UNLABELLED_ASSESSMENT_CANARY" } });
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const result = await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" });
+      expect(result).toMatchObject({ previousAssessment: null });
+      expect(JSON.stringify(result)).not.toContain("CANARY");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, candidate.issue.id));
+      expect(JSON.stringify(comments)).not.toContain("PRIMARY_ISSUE_HISTORY_CANARY");
+    });
+    it("paired isolation denies primary issue history through a candidate signed run", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "isolation-history", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      await issueService(db).addComment(primary.issue.id, "PRIMARY_API_HISTORY_CANARY", { agentId: f.assignedAgentId });
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-isolation-test-secret";
+      try {
+        const token = createLocalAgentJwt(session.agentId, session.companyId, "claude_local", session.runId, null)!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/issues/:id/comments", async (req, res) => {
+          res.json(await db.select().from(issueComments).where(eq(issueComments.issueId, req.params.id)));
+        });
+        app.use(errorHandler);
+        for (const route of [`/api/issues/${primary.issue.id}/comments`, `/api/issues/${candidate.issue.id}/comments`,
+          `/api/heartbeat-runs/${session.runId}/log`, `/api/agents/${f.assignedAgentId}`, `/api/companies/${f.companyId}/issues?q=CANARY`]) {
+          const response = await request(app).get(route).set("Authorization", `Bearer ${token}`);
+          expect(response.status).toBe(403);
+          expect(JSON.stringify(response.body)).not.toContain("PRIMARY_API_HISTORY_CANARY");
+        }
+        const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+        const primaryToken = createLocalAgentJwt(primarySession.agentId, f.companyId, "claude_local", primarySession.runId, null)!;
+        const positive = await request(app).get(`/api/issues/${primary.issue.id}/comments`).set("Authorization", `Bearer ${primaryToken}`);
+        expect(positive.status).toBe(200);
+        expect(JSON.stringify(positive.body)).toContain("PRIMARY_API_HISTORY_CANARY");
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("paired primary blinding hides candidate issues comments assessments and run output over API and gateway", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "primary-blinding", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const secretComment = await issueService(db).addComment(candidate.issue.id, "CANDIDATE_COMMENT_SECRET", { agentId: f.replacementAgentId });
+      const { assets, issueAttachments, documents, issueDocuments } = await import("@paperclipai/db");
+      const [attachment] = await db.insert(assets).values({ companyId: f.companyId, provider: "local_disk", objectKey: randomUUID(),
+        contentType: "text/plain", byteSize: 20, sha256: "0".repeat(64) }).returning();
+      await db.insert(issueAttachments).values({ companyId: f.companyId, issueId: candidate.issue.id, assetId: attachment!.id });
+      const [document] = await db.insert(documents).values({ companyId: f.companyId, latestBody: "CANDIDATE_DOCUMENT_SECRET" }).returning();
+      await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: candidate.issue.id, documentId: document!.id, key: "plan" });
+      const { githubPrimaryBlinding } = await import("../services/chat-github-primary-blinding.js");
+      const visibility = await githubPrimaryBlinding(db, f.companyId);
+      expect(() => visibility.assertVisible({ documentId: document!.id })).toThrow(/not found/i);
+      expect(() => visibility.assertVisible({ assetId: attachment!.id })).toThrow(/not found/i);
+      expect(() => visibility.assertVisible(`${candidate.issue.identifier}0`)).not.toThrow();
+      expect(() => visibility.assertVisible({ commentId: secretComment.id })).toThrow(/not found/i);
+      expect(visibility.filter({ data: [{ id: primary.issue.id, title: "primary" }, { id: candidate.issue.id, title: "secret" }],
+        content: JSON.stringify([{ id: primary.issue.id }, { id: candidate.issue.id, body: "secret" }]) })).toEqual({
+          data: [{ id: primary.issue.id, title: "primary" }], content: JSON.stringify([{ id: primary.issue.id }]),
+        });
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      await db.update(heartbeatRuns).set({ resultJson: { text: "CANDIDATE_RUN_SECRET" } }).where(eq(heartbeatRuns.id, candidateSession.runId));
+      expect(await githubChatReviewService(db, f.providerFetch).execute(candidateSession, "submit_review", {
+        ...shadowTestAssessment("b".repeat(40)), summary: "CANDIDATE_ASSESSMENT_SECRET",
+      })).toMatchObject({ status: "shadow_stored" });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "primary-blinding-test-secret";
+      try {
+        const token = createLocalAgentJwt(primarySession.agentId, f.companyId, "claude_local", primarySession.runId, null)!;
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/companies/:companyId/issues", async (_req, res) => res.json(await db.select().from(issues).where(eq(issues.companyId, f.companyId))));
+        app.get("/api/issues/:id/comments", async (req, res) => res.json(await db.select().from(issueComments).where(eq(issueComments.issueId, req.params.id))));
+        app.get("/api/heartbeat-runs/:id/log", (_req, res) => res.send("CANDIDATE_RUN_SECRET"));
+        app.get("/api/companies/:companyId/reviews", async (_req, res) => res.json(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.companyId, f.companyId))));
+        app.use(errorHandler);
+        const listing = await request(app).get(`/api/companies/${f.companyId}/issues`).set("Authorization", `Bearer ${token}`);
+        expect(listing.status).toBe(200);
+        expect(listing.body.map((row: { id: string }) => row.id)).toEqual([primary.issue.id]);
+        for (const url of [`/api/issues/${candidate.issue.id}/comments`, `/api/heartbeat-runs/${candidateSession.runId}/log`]) {
+          const response = await request(app).get(url).set("Authorization", `Bearer ${token}`);
+          expect(response.status).toBe(404);
+          expect(JSON.stringify(response.body)).not.toContain("CANDIDATE_");
+        }
+        const { agentApiKeys } = await import("@paperclipai/db");
+        const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Unrelated reader", role: "engineer", status: "idle" }).returning();
+        for (const readerId of [primarySession.agentId, otherAgent!.id]) {
+          const key = `pc_test_${randomUUID()}`;
+          await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: readerId,
+            name: "blinding reader", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(key).digest("hex") });
+          const visible = await request(app).get(`/api/companies/${f.companyId}/issues`).set("Authorization", `Bearer ${key}`);
+          expect(visible.status).toBe(200);
+          const isPrimary = readerId === primarySession.agentId;
+          expect(visible.body.map((row: { id: string }) => row.id).sort()).toEqual(
+            (isPrimary ? [primary.issue.id] : [primary.issue.id, candidate.issue.id]).sort());
+          expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${key}`)).status).toBe(isPrimary ? 404 : 200);
+        }
+        const reviews = await request(app).get(`/api/companies/${f.companyId}/reviews`).set("Authorization", `Bearer ${token}`);
+        expect(reviews.body.every((r: { shadowLabel: string | null }) => !r.shadowLabel)).toBe(true);
+        const { createToolGatewayService } = await import("../services/tool-gateway.js");
+        const { toolPolicies } = await import("@paperclipai/db");
+        await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+        const gateway = createToolGatewayService(db);
+        const access = await gateway.createSession(primarySession);
+        const tools = await gateway.listToolsForSession(access.token);
+        const getIssue = tools.find(t => t.name === "paperclip-self:get_issue_context")!;
+        expect(getIssue).toBeDefined();
+        await expect(gateway.executeTool({ sessionToken: access.token, tool: getIssue.name, parameters: { issueId: candidate.issue.id } })).rejects.toThrow(/not found/i);
+        // Blinding survives the admission kill switch: results cannot be unsealed by disabling future work.
+        await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+        expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${token}`)).status).toBe(404);
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
+    it("primary reviewer scope follows GitHub endpoint creation and update refreshes", async () => {
+      const f = await pairedReviewFixture();
+      const { isGitHubPrimaryReviewer } = await import("../services/chat-github-primary-reviewers.js");
+      const [first, replacement, slack] = await db.insert(agents).values(["New primary", "Replacement primary", "Slack reader"].map(name =>
+        ({ companyId: f.companyId, name, role: "engineer" as const, status: "idle" as const }))).returning();
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(false);
+      const endpoint = await f.service.create(f.companyId, { provider: "github", assignedAgentId: first!.id }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(true);
+      await f.service.create(f.companyId, { provider: "slack", assignedAgentId: slack!.id }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, slack!.id)).toBe(false);
+      // The public update schema has no reassignment field; simulate maintenance
+      // and verify the existing endpoint update seam refreshes the assignment.
+      await db.update(chatEndpoints).set({ assignedAgentId: replacement!.id }).where(eq(chatEndpoints.id, endpoint!.id));
+      await f.service.update(endpoint!.id, { allowDirectMessages: true }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(false);
+      expect(isGitHubPrimaryReviewer(db, f.companyId, replacement!.id)).toBe(true);
+      expect(isGitHubPrimaryReviewer(db, f.companyId, f.assignedAgentId)).toBe(true);
+    });
+    it("primary blinding reuses versioned snapshots and refreshes newly written aliases", async () => {
+      const f = await pairedReviewFixture();
+      const { githubPrimaryBlinding } = await import("../services/chat-github-primary-blinding.js");
+      const empty = await githubPrimaryBlinding(db, f.companyId);
+      expect(empty.active).toBe(false);
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(empty);
+      await deliverShadowTestMention(f, "blinding-cache", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const snapshot = await githubPrimaryBlinding(db, f.companyId);
+      expect(snapshot.active).toBe(true);
+      const reads = vi.spyOn(db, "select");
+      try {
+        const cached = await Promise.all(Array.from({ length: 50 }, () => githubPrimaryBlinding(db, f.companyId)));
+        expect(cached.every(v => v === snapshot)).toBe(true);
+        expect(reads).not.toHaveBeenCalled();
+      } finally { reads.mockRestore(); }
+      const comment = await issueService(db).addComment(candidate.issue.id, "late alias", { agentId: f.replacementAgentId });
+      // Legacy issue-bound runs need the context indexes, including a non-candidate agent.
+      const runs = await db.insert(heartbeatRuns).values([
+        { companyId: f.companyId, agentId: f.assignedAgentId, nativeIssueId: candidate.issue.id },
+        { companyId: f.companyId, agentId: f.assignedAgentId, contextSnapshot: { issueId: candidate.issue.id } },
+        { companyId: f.companyId, agentId: f.assignedAgentId, contextSnapshot: { taskId: candidate.issue.id } },
+        { companyId: f.companyId, agentId: f.assignedAgentId, nativeIssueId: primary.issue.id, contextSnapshot: { issueId: candidate.issue.id } },
+      ]).returning();
+      const refreshed = await githubPrimaryBlinding(db, f.companyId);
+      expect(refreshed).not.toBe(snapshot);
+      for (const id of [comment.id, ...runs.slice(0, 3).map(r => r.id)]) {
+        expect(() => refreshed.assertVisible(`/api/resources/${id.toUpperCase()}`)).toThrow(/not found/i);
+        expect(() => refreshed.assertVisible(`prefix_${id}`)).not.toThrow();
+      }
+      expect(() => refreshed.assertVisible(runs[3]!.id)).not.toThrow();
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runs[0]!.id));
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      const failure = vi.spyOn(db, "execute").mockRejectedValueOnce(new Error("version unavailable"));
+      try { await expect(githubPrimaryBlinding(db, f.companyId)).rejects.toThrow("version unavailable"); }
+      finally { failure.mockRestore(); }
+      expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
+      const retryAlias = await issueService(db).addComment(candidate.issue.id, "retry alias", { agentId: f.replacementAgentId });
+      // Watermark and alias reload are now the same MVCC statement.
+      const loadFailure = vi.spyOn(db, "execute").mockRejectedValueOnce(new Error("aliases unavailable"));
+      try { await expect(githubPrimaryBlinding(db, f.companyId)).rejects.toThrow("aliases unavailable"); }
+      finally { loadFailure.mockRestore(); }
+      const recovered = await githubPrimaryBlinding(db, f.companyId);
+      expect(recovered).not.toBe(refreshed);
+      expect(() => recovered.assertVisible(retryAlias.id)).toThrow(/not found/i);
+    });
+    it("primary tools/call strips candidate rows from results with entirely visible parameters", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "blinding-tool-result", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      const { toolApplications, connectionGrants, toolPolicies } = await import("@paperclipai/db");
+      const [application] = await db.insert(toolApplications).values({ companyId: f.companyId,
+        applicationKey: `blind-${randomUUID()}`, name: "Result blinding", type: "mcp_http", status: "active" }).returning();
+      const [connection] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: application!.id,
+        name: "Result blinding", uid: `test/${randomUUID()}`, transport: "mcp_remote", status: "active", enabled: true,
+        healthStatus: "ok", credentialPolicy: "shared", config: { url: "https://8.8.8.8/mcp" } }).returning();
+      await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: connection!.id,
+        kind: "organization", credentialSecretRefs: [], status: "active", isDefault: true });
+      await db.insert(toolCatalogEntries).values({ companyId: f.companyId, applicationId: application!.id, connectionId: connection!.id,
+        entryKind: "tool", name: "list_rows", toolName: "list_rows", title: "List rows", riskLevel: "read", isReadOnly: true,
+        status: "active", versionHash: randomUUID(), schemaHash: randomUUID() });
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      let calls = 0;
+      const gateway = createToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+        const payload = JSON.parse(String(init.body));
+        if (payload.method === "initialize") return Response.json({ jsonrpc: "2.0", id: payload.id,
+          result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "test", version: "1" } } });
+        if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+        expect(payload.method).toBe("tools/call");
+        expect(payload.params.arguments).toEqual({});
+        calls++;
+        // Created after gateway ingress: response must revalidate, not reuse a stale snapshot.
+        const late = await issueService(db).addComment(candidate.issue.id, "late tool alias", { agentId: f.replacementAgentId });
+        const rows = [{ id: primary.issue.id, title: "VISIBLE_PRIMARY" },
+          { id: candidate.issue.id, title: "CANDIDATE_RESULT_CANARY" }, { id: late.id, title: "LATE_ALIAS_CANARY" }];
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: {
+          content: [{ type: "text", text: JSON.stringify(rows) }], structuredContent: { rows },
+        } });
+      } });
+      const access = await gateway.createSession(session);
+      const tool = (await gateway.listToolsForSession(access.token)).find(t => t.providerType === "mcp_remote_http")!;
+      expect(tool).toBeDefined();
+      const result = await gateway.executeTool({ sessionToken: access.token, tool: tool.name, parameters: {} });
+      expect(result.status).toBe("completed");
+      expect(calls).toBe(1);
+      expect(JSON.stringify(result)).toContain("VISIBLE_PRIMARY");
+      expect(JSON.stringify(result)).not.toContain(candidate.issue.id);
+      expect(JSON.stringify(result)).not.toContain("CANDIDATE_RESULT_CANARY");
+      expect(JSON.stringify(result)).not.toContain("LATE_ALIAS_CANARY");
+      const [builder] = await db.insert(agents).values({ companyId: f.companyId, name: "Non-primary tool reader", role: "engineer", status: "idle" }).returning();
+      const builderSession = await shadowTestSession({ ...f, assignedAgentId: builder!.id }, { issueId: primary.issue.id });
+      const builderAccess = await gateway.createSession(builderSession);
+      const unblinded = await gateway.executeTool({ sessionToken: builderAccess.token, tool: tool.name, parameters: {} });
+      expect(unblinded.status).toBe("completed");
+      expect(JSON.stringify(unblinded)).toContain("CANDIDATE_RESULT_CANARY");
+      expect(JSON.stringify(unblinded)).toContain("LATE_ALIAS_CANARY");
+    });
+    it("paired primary blinding also seals the live API event stream", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "blinding-live-events", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const { agentApiKeys } = await import("@paperclipai/db");
+      const { createServer } = await import("node:http");
+      const { WebSocket } = await import("ws");
+      const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
+      const { publishLiveEvent } = await import("../services/live-events.js");
+      const [builder] = await db.insert(agents).values({ companyId: f.companyId, name: "Non-primary live reader", role: "engineer", status: "idle" }).returning();
+      const keys: string[] = [];
+      for (const agentId of [f.assignedAgentId, f.replacementAgentId, builder!.id]) {
+        const key = `pc_test_${randomUUID()}`; keys.push(key);
+        await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId, name: "live reader", keyHash: createHash("sha256").update(key).digest("hex") });
+      }
+      const server = createServer();
+      const wss = setupLiveEventsWebSocketServer(server, db, { deploymentMode: "authenticated" });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address() as { port: number };
+      const clients: InstanceType<typeof WebSocket>[] = [];
+      const connect = (key: string) => new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/companies/${f.companyId}/events/ws`, { headers: { Authorization: `Bearer ${key}` } });
+        clients.push(socket); socket.once("open", () => resolve(socket)); socket.on("error", reject);
+      });
+      try {
+        const socket = await connect(keys[0]!);
+        const builderSocket = await connect(keys[2]!);
+        const builderEvent = new Promise<string>(resolve => builderSocket.once("message", data => resolve(String(data))));
+        const seen: string[] = [];
+        const primaryEvent = new Promise<void>(resolve => socket.on("message", data => {
+          const text = String(data); seen.push(text); if (text.includes("PRIMARY_VISIBLE")) resolve();
+        }));
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "CANDIDATE_LIVE_SECRET" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "PRIMARY_VISIBLE" } });
+        await primaryEvent;
+        expect(seen.join("\n")).not.toContain("CANDIDATE_LIVE_SECRET");
+        expect(await builderEvent).toContain("CANDIDATE_LIVE_SECRET");
+        // Scope is checked on each event, not frozen when the socket opens.
+        const { withGitHubPrimaryReviewerChange } = await import("../services/chat-github-primary-reviewers.js");
+        await withGitHubPrimaryReviewerChange(db, f.companyId, () => db.update(chatEndpoints)
+          .set({ assignedAgentId: builder!.id }).where(eq(chatEndpoints.id, f.endpoint.id)));
+        const afterPromotion: string[] = [];
+        const promotedEvent = new Promise<void>(resolve => builderSocket.on("message", data => {
+          const text = String(data); afterPromotion.push(text); if (text.includes("AFTER_PROMOTION")) resolve();
+        }));
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "PROMOTED_CANDIDATE_SECRET" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "AFTER_PROMOTION" } });
+        await promotedEvent;
+        expect(afterPromotion.join("\n")).not.toContain("PROMOTED_CANDIDATE_SECRET");
+        await expect(connect(keys[1]!)).rejects.toThrow("403");
+      } finally {
+        for (const client of clients) client.terminate();
+        await new Promise<void>(resolve => wss.close(() => resolve()));
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+    it.each([
+      { repos: ["TogetherWeOwn/nntunev2"], selected: false },
+      { repos: [], selected: false },
+      { repos: ["PAPERCLIPAI/PAPERCLIP"], selected: true },
+    ])("paired repository allowlist $repos selects only matching candidates without affecting primary admission", async ({ repos, selected }) => {
+      const f = await pairedReviewFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: current.configuration.shadowRoutes!.map(r => ({ ...r, repos })) } }, "owner-user");
+      await deliverShadowTestMention(f, "repo-filter", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(selected ? 2 : 1);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual(selected ? [f.assignedAgentId, f.replacementAgentId] : [f.assignedAgentId]);
+    });
+    it("paired isolation exposes only snapshot tools and rejects context retargeting", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "isolation-gateway", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const { toolPolicies } = await import("@paperclipai/db");
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+      const gateway = createToolGatewayService(db);
+      const access = await gateway.createSession(session);
+      const tools = await gateway.listToolsForSession(access.token);
+      expect(tools.length).toBeGreaterThan(0);
+      expect(tools.every(t => t.providerType === "paperclip_github_chat")).toBe(true);
+      const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
+      expect(readTool).toBeDefined();
+      expect(await gateway.executeTool({ sessionToken: access.token, tool: readTool.name, parameters: { section: "metadata" } }))
+        .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+      const primaryRun = await shadowTestSession(f, { issueId: primary.issue.id });
+      const primaryAccess = await gateway.createSession(primaryRun);
+      const generic = (await gateway.listToolsForSession(primaryAccess.token)).find(t => t.providerType !== "paperclip_github_chat")!;
+      expect(generic).toBeDefined(); // Positive control: the generic catalog exists.
+      await expect(gateway.executeTool({ sessionToken: access.token, tool: generic.name, parameters: { issueId: primary.issue.id } })).rejects.toThrow("snapshot-backed");
+      await expect(gateway.createSession({ ...session, issueId: primary.issue.id })).rejects.toThrow();
+      const { toolProfiles } = await import("@paperclipai/db");
+      const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: randomUUID(), name: "Candidate MCP", defaultAction: "deny" }).returning();
+      const named = await gateway.createNamedGateway({ companyId: f.companyId, body: { name: "Candidate MCP", profileId: profile!.id, agentId: session.agentId, issueId: session.issueId } });
+      const namedToken = await gateway.createNamedGatewayToken({ companyId: f.companyId, gatewayId: named.id,
+        body: { name: "Candidate run", subjectType: "heartbeat_run", subjectId: session.runId } });
+      for (const method of ["resources/list", "resources/read", "prompts/list", "prompts/get"] as const) {
+        await expect(gateway.executeContextForNamedGateway({ gatewayId: named.id, bearerToken: namedToken.token, method })).rejects.toThrow("cannot read MCP");
+      }
+      const { githubCandidateRunBoundary } = await import("../services/chat-github-isolation.js");
+      await expect(githubCandidateRunBoundary(db, { ...session, issueId: primary.issue.id })).rejects.toThrow("retargeted");
+      const scope = await githubCandidateRunBoundary(db, session);
+      const retry = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect((await githubCandidateRunBoundary(db, retry))!.namespace).not.toBe(scope!.namespace);
+      // Tampering with the wake binding must not downgrade a candidate to a normal run.
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id } }).where(eq(heartbeatRuns.id, session.runId));
+      await expect(gateway.listToolsForSession(access.token)).rejects.toThrow("capability is invalid");
+    });
+    it("paired runtime lease serializes the entire probe-run-cleanup interval without borrowing the primary pool", async () => {
+      const isolation = await import("../services/chat-github-runtime-isolation.js");
+      const key = `fixture:${randomUUID()}`;
+      const first = await isolation.acquireGitHubCandidateRuntimeLease(db, key);
+      let secondAcquired = false;
+      const secondPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key).then(lease => { secondAcquired = true; return lease; });
+      try {
+        // A normal control-plane query remains available while both lock clients exist.
+        expect([...await db.execute(sql`select 1 as ok`)]).toMatchObject([{ ok: 1 }]);
+        // The held lock must not leave an idle transaction for PostgreSQL's
+        // idle_in_transaction_session_timeout to kill during a long review.
+        const [owner] = await db.execute(sql`select a.state, a.xact_start from pg_locks l join pg_stat_activity a on a.pid = l.pid
+          where l.locktype = 'advisory' and l.granted
+            and l.classid = ((hashtextextended(${`github-shadow-runtime:${key}`}, 0) >> 32) & 4294967295)::oid
+            and l.objid = (hashtextextended(${`github-shadow-runtime:${key}`}, 0) & 4294967295)::oid`);
+        expect(owner).toMatchObject({ state: "idle", xact_start: null });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(secondAcquired).toBe(false);
+      } finally { await first(); }
+      const second = await secondPromise;
+      expect(secondAcquired).toBe(true);
+      await second();
+    });
+    it("paired runtime slots admit N concurrent holders on distinct keys, queue the next, and report only other live slots", async () => {
+      const isolation = await import("../services/chat-github-runtime-isolation.js");
+      const key = `fixture:${randomUUID()}`;
+      const holders = async (slot: number) => {
+        const [row] = await db.execute(sql`select count(*)::int as count from pg_locks where locktype = 'advisory' and granted
+          and classid = ((hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, slot)}, 0) >> 32) & 4294967295)::oid
+          and objid = (hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, slot)}, 0) & 4294967295)::oid`);
+        return (row as { count: number }).count;
+      };
+      const first = await isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      const second = await isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      let third: Awaited<ReturnType<typeof isolation.acquireGitHubCandidateRuntimeLease>> | undefined;
+      const thirdPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 }).then(lease => { third = lease; return lease; });
+      try {
+        expect([first.slot, second.slot].sort()).toEqual([0, 1]);
+        // Slot 0 is the original exclusive key: an N=1 controller still excludes it.
+        expect(isolation.githubCandidateRuntimeSlotKey(key, 0)).toBe(`github-shadow-runtime:${key}`);
+        expect([await holders(0), await holders(1), await holders(2)]).toEqual([1, 1, 0]);
+        expect(await first.liveSlots()).toEqual([second.slot]);
+        expect(await second.liveSlots()).toEqual([first.slot]);
+        // Holding a slot never leaves an idle transaction behind.
+        const owners = [...await db.execute(sql`select a.state, a.xact_start from pg_locks l join pg_stat_activity a on a.pid = l.pid
+          where l.locktype = 'advisory' and l.granted
+            and l.classid = ((hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, 1)}, 0) >> 32) & 4294967295)::oid
+            and l.objid = (hashtextextended(${isolation.githubCandidateRuntimeSlotKey(key, 1)}, 0) & 4294967295)::oid`)];
+        expect(owners).toMatchObject([{ state: "idle", xact_start: null }]);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        expect(third).toBeUndefined();
+      } finally { await first(); }
+      const queued = await thirdPromise;
+      expect(queued.slot).toBe(first.slot);
+      expect(await queued.liveSlots()).toEqual([second.slot]);
+      // FIFO: a later waiter blocks on the queue key while the head polls the slots.
+      let fourth: Awaited<ReturnType<typeof isolation.acquireGitHubCandidateRuntimeLease>> | undefined;
+      const headPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const fourthPromise = isolation.acquireGitHubCandidateRuntimeLease(db, key, { maxConcurrent: 2 }).then(lease => { fourth = lease; return lease; });
+      const queue = `github-shadow-runtime-queue:${key}`;
+      await vi.waitFor(async () => {
+        const rows = [...await db.execute(sql`select granted from pg_locks where locktype = 'advisory'
+          and classid = ((hashtextextended(${queue}, 0) >> 32) & 4294967295)::oid
+          and objid = (hashtextextended(${queue}, 0) & 4294967295)::oid order by granted`)];
+        expect(rows).toMatchObject([{ granted: false }, { granted: true }]);
+      }, { timeout: 3000 });
+      await second();
+      const head = await headPromise;
+      expect(head.slot).toBe(second.slot);
+      expect(fourth).toBeUndefined();
+      await queued();
+      const last = await fourthPromise;
+      expect(last.slot).toBe(queued.slot);
+      expect(await last.liveSlots()).toEqual([head.slot]);
+      await head();
+      expect(await last.liveSlots()).toEqual([]);
+      await last();
+      expect([await holders(0), await holders(1)]).toEqual([0, 0]);
+    });
+    it("two concurrent candidate preparations with N=2 hold distinct slots and homes and a third waits for a cleanup", async () => {
+      const { environments } = await import("@paperclipai/db");
+      const ssh = await import("@paperclipai/adapter-utils/ssh");
+      const isolation = await import("../services/chat-github-runtime-isolation.js");
+      const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-runtime-slots-"));
+      const canaryPath = path.join(scratch, "primary-answer");
+      writeFileSync(canaryPath, "PRIMARY_CANARY", { mode: 0o600 });
+      const certificates: unknown[] = [];
+      const candidates = [];
+      for (const label of ["a", "b", "c"]) {
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `runtime-slots-${label}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const [environment] = await db.insert(environments).values({ name: `Certified shadow SSH ${randomUUID()}`, driver: "ssh",
+          config: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/work",
+            privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true } }).returning();
+        await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { model: "configured-arm-model" }, defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+        certificates.push({ environmentId: environment!.id, companyId: f.companyId,
+          configurationDigest: isolation.githubIsolationConfigurationDigest(environment!), modelProxyPolicy: "client-tools-only-v1",
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath,
+            remotePath: `/primary/${kind}/canary`, sha256: createHash("sha256").update("PRIMARY_CANARY").digest("hex") })) });
+        candidates.push({ run: run!, agent: agent! });
+      }
+      const oldCertificates = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+      const oldConcurrency = process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT;
+      process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(certificates);
+      process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT = "2";
+      const { default: dns } = await import("node:dns/promises");
+      const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+      const probes: Array<{ home: string; slot: number; liveSlots: number[]; concurrent: boolean }> = [];
+      let bothProbing!: () => void;
+      const overlap = new Promise<void>(resolve => { bothProbing = resolve; });
+      const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+        if (command.includes(CLEANUP_PROGRAM_MARKER)) return { stdout: "", stderr: "" };
+        const input = JSON.parse(options!.stdin!);
+        probes.push({ home: input.home, slot: input.slot, liveSlots: input.liveSlots, concurrent: input.concurrent });
+        // The first two probes must overlap: neither answers until both started.
+        if (probes.length === 2) bothProbing();
+        if (probes.length <= 2) await overlap;
+        return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: input.hooks.digest,
+          namespaceBusy: false, orphansReclaimed: 0, checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true,
+            providerToolsDenied: true, allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
+      });
+      const prepared: Array<NonNullable<Awaited<ReturnType<typeof isolation.prepareGitHubCandidateRuntime>>>> = [];
+      try {
+        const [a, b] = await Promise.all(candidates.slice(0, 2).map(c => isolation.prepareGitHubCandidateRuntime(db, c)));
+        prepared.push(a!, b!);
+        expect(a!.home).not.toBe(b!.home);
+        expect(probes.map(p => p.home).sort()).toEqual([a!.home, b!.home].sort());
+        expect(probes.map(p => p.slot).sort()).toEqual([0, 1]);
+        expect(probes.every(p => p.concurrent === true)).toBe(true);
+        let thirdPrepared = false;
+        const third = isolation.prepareGitHubCandidateRuntime(db, candidates[2]!).then(value => { thirdPrepared = true; prepared.push(value!); return value!; });
+        await new Promise(resolve => setTimeout(resolve, 800));
+        // Both slots stay held from probe through the run: no third probe yet.
+        expect(thirdPrepared).toBe(false);
+        expect(probes).toHaveLength(2);
+        const freed = probes.find(p => p.home === a!.home)!.slot;
+        await isolation.cleanupGitHubCandidateRuntime(prepared.shift()!);
+        const c = await third;
+        expect(probes).toHaveLength(3);
+        // The waiter takes the freed slot and is told the other one is live.
+        expect(probes[2]).toMatchObject({ home: c.home, slot: freed, liveSlots: [1 - freed], concurrent: true });
+        expect(new Set([a!.home, b!.home, c.home]).size).toBe(3);
+        const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.id, c.enrollmentId));
+        expect(enrollment!.isolationTests[c.runId]).toMatchObject({ status: "passed", runtimeSlot: freed, runtimeMaxConcurrent: 2 });
+      } finally {
+        for (const p of prepared) await isolation.cleanupGitHubCandidateRuntime(p).catch(() => undefined);
+        probe.mockRestore();
+        dnsProbe.mockRestore();
+        if (oldCertificates === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = oldCertificates;
+        if (oldConcurrency === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT;
+        else process.env.PAPERCLIP_GITHUB_SHADOW_MAX_CONCURRENT = oldConcurrency;
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+    it.each(["certified", "uncertified", "wrong-environment", "contaminated", "transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "namespace-busy", "disabled", "disabled-after-probe",
+      "allowed-model-rejected", "other-model-accepted", "raw-proxy-open"] as const)(
+      "paired certified runtime %s gates dispatch independently of the primary",
+      async (scenario) => {
+        const { environments, chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+        const ssh = await import("@paperclipai/adapter-utils/ssh");
+        const isolation = await import("../services/chat-github-runtime-isolation.js");
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `certified-runtime-${scenario}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const tasks = await pairedTasks(f.endpoint.id);
+        const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+        const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+        const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-runtime-canary-"));
+        const canaryPath = path.join(scratch, "primary-answer");
+        writeFileSync(canaryPath, "PRIMARY_CANARY", { mode: 0o600 });
+        const [environment] = await db.insert(environments).values({ name: `Certified shadow SSH ${randomUUID()}`,
+          driver: "ssh", config: { host: "127.0.0.1", port: 22, username: scenario === "wrong-ssh-user" ? "primary-user" : "paperclip-shadow",
+            remoteWorkspacePath: "/home/paperclip-shadow/work", privateKey: null, knownHosts: scenario === "no-host-key" ? null : "fixture", strictHostKeyChecking: scenario !== "host-key-check-off" } }).returning();
+        // The probe must exercise the arm's actual configured model (no synthetic default).
+        await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { model: "configured-arm-model" }, defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+        const old = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(scenario === "uncertified" ? [] : [{
+          environmentId: environment!.id, companyId: f.companyId,
+          configurationDigest: isolation.githubIsolationConfigurationDigest(environment!), modelProxyPolicy: "client-tools-only-v1",
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath,
+            remotePath: `/primary/${kind}/canary`, sha256: createHash("sha256").update("PRIMARY_CANARY").digest("hex") })),
+        }]);
+        if (scenario === "wrong-environment") {
+          const [other] = await db.insert(environments).values({ name: "Other uncertified SSH", driver: "ssh", config: environment!.config }).returning();
+          agent!.defaultEnvironmentId = other!.id;
+        }
+        if (scenario === "canary-error") rmSync(canaryPath);
+        if (scenario === "canary-hash") writeFileSync(canaryPath, "WRONG_CANARY_BYTES");
+        const { default: dns } = await import("node:dns/promises");
+        const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+        expect(isolation.GITHUB_ISOLATION_CLEANUP).toContain(CLEANUP_PROGRAM_MARKER);
+        expect(isolation.GITHUB_ISOLATION_PROBE).not.toContain(CLEANUP_PROGRAM_MARKER);
+        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+          if (command.includes(CLEANUP_PROGRAM_MARKER)) return { stdout: "", stderr: "" };
+          if (scenario === "transport-error") throw new Error("SSH unavailable");
+          if (scenario === "invalid-proof") return { stdout: "{}", stderr: "" };
+          const input = JSON.parse(options!.stdin!);
+          if (scenario === "disabled-after-probe") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+          return { stdout: JSON.stringify({ nonce: scenario === "wrong-nonce" ? "forged" : input.nonce,
+            username: scenario === "wrong-user-proof" ? "primary-user" : "paperclip-shadow",
+            home: scenario === "wrong-home" ? "/primary-home" : input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
+            namespaceBusy: scenario === "namespace-busy", orphansReclaimed: scenario === "certified" ? 2 : 0,
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: scenario !== "namespace-busy", providerToolsDenied: true,
+              // Each model-proxy check must flow from the bound proof into the receipt.
+              allowedModelAccepted: input.model === "configured-arm-model" && scenario !== "allowed-model-rejected",
+              otherModelDenied: scenario !== "other-model-accepted", rawProxyDenied: scenario !== "raw-proxy-open" } }), stderr: "" };
+        });
+        const proxyContaminated = ({ "allowed-model-rejected": "allowedModelAccepted", "other-model-accepted": "otherModelDenied",
+          "raw-proxy-open": "rawProxyDenied" } as Record<string, string>)[scenario];
+        let prepared: Awaited<ReturnType<typeof isolation.prepareGitHubCandidateRuntime>> = null;
+        try {
+          if (scenario === "disabled") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+          const dispatch = vi.fn();
+          if (scenario === "certified") {
+            const key = "127.0.0.1:22:paperclip-shadow";
+            const releaseBlocker = await isolation.acquireGitHubCandidateRuntimeLease(db, key);
+            const preparation = isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! });
+            try {
+              // Exercise the actual runtime caller, not merely the lock helper.
+              // Removing its lease call (N19) must fail before any SSH probe.
+              await vi.waitFor(async () => {
+                const [waiting] = await db.execute(sql`select count(*)::int as count from pg_locks
+                  where locktype = 'advisory' and not granted
+                    and classid = ((hashtextextended(${`github-shadow-runtime:${key}`}, 0) >> 32) & 4294967295)::oid
+                    and objid = (hashtextextended(${`github-shadow-runtime:${key}`}, 0) & 4294967295)::oid`);
+                expect(waiting).toMatchObject({ count: 1 });
+              }, { timeout: 3000 });
+              expect(probe).not.toHaveBeenCalled();
+            } finally { await releaseBlocker(); prepared = await preparation; }
+            expect(prepared).not.toBeNull();
+            // Default N=1: slot 0 on the original key and the exclusive probe semantics.
+            expect(JSON.parse(probe.mock.calls.find(([, command]) => !command.includes(CLEANUP_PROGRAM_MARKER))![2]!.stdin!))
+              .toMatchObject({ slot: 0, liveSlots: [], concurrent: false });
+            await isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target);
+            await expect(isolation.assertGitHubCandidateDispatch(db, { ...prepared!, runId: randomUUID() }, prepared!.target)).rejects.toThrow("github_candidate_isolation_unavailable");
+            dispatch();
+            expect(dispatch).toHaveBeenCalledOnce();
+            expect(prepared!.env.HOME).toBe(prepared!.home);
+            expect(prepared!.env.CLAUDE_CONFIG_DIR).toBe(`${prepared!.home}/.claude`);
+            const beforeReplay = probe.mock.calls.length;
+            await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow("github_candidate_isolation_replayed");
+            expect(probe).toHaveBeenCalledTimes(beforeReplay);
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, remoteCwd: "/primary" })).rejects.toThrow();
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, { ...prepared!.target, githubCandidateIsolation: undefined })).rejects.toThrow();
+            const originalCertificate = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS!;
+            const replacement = JSON.parse(originalCertificate);
+            replacement[0].primaryCanaries[0].remotePath = "/changed-primary/run/canary";
+            process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify(replacement);
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target)).rejects.toThrow();
+            process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = originalCertificate;
+            await db.update(environments).set({ status: "disabled" }).where(eq(environments.id, environment!.id));
+            await expect(isolation.assertGitHubCandidateDispatch(db, prepared!, prepared!.target)).rejects.toThrow();
+          } else {
+            const preparation = isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! }).then(value => {
+              prepared = value; // Release even when a guard mutant unexpectedly succeeds.
+              return value;
+            });
+            await expect(preparation).rejects.toThrow(/github_candidate_/);
+            expect(dispatch).not.toHaveBeenCalled();
+          }
+          expect(probe.mock.calls.filter(([, command]) => !command.includes(CLEANUP_PROGRAM_MARKER))).toHaveLength(["uncertified", "wrong-environment", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "disabled"].includes(scenario) ? 0 : 1);
+          const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+          const receipt = enrollment!.isolationTests[run!.id];
+          if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe" || proxyContaminated) {
+            expect(receipt).toMatchObject({ runId: run!.id, environmentId: environment!.id,
+              status: scenario === "contaminated" || proxyContaminated ? "failed" : "passed", candidateRuntimeCertified: !(scenario === "contaminated" || proxyContaminated) });
+            for (const key of ["allowedModelAccepted", "otherModelDenied", "rawProxyDenied"])
+              expect(receipt.checks[key]).toBe(key !== proxyContaminated);
+          } else if (["transport-error", "invalid-proof", "wrong-nonce", "wrong-user-proof", "wrong-home", "canary-hash", "canary-error", "namespace-busy"].includes(scenario)) {
+            expect(receipt).toMatchObject({ status: "error" });
+            const [unavailable] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+            expect(unavailable).toMatchObject({ state: "unavailable", lastError: "github_candidate_isolation_error" });
+          } else expect(receipt).toBeUndefined();
+          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true, orphansReclaimed: 2, runtimeSlot: 0, runtimeMaxConcurrent: 1 });
+          if (receipt) {
+            await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: {} })
+              .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
+            await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: { [run!.id]: { ...receipt, status: "forged" } } })
+              .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
+            expect(enrollment!.envelope.comparisonEligibility.certifiedClean).toBe(false);
+          }
+          const [stored] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+          if (scenario === "contaminated" || proxyContaminated) {
+            expect(stored!.state).toBe("voided");
+            expect(stored!.lastError).toBe("github_candidate_contaminated");
+            await expect(db.update(chatGitHubReviewCandidates).set({ state: "dispatched" })
+              .where(eq(chatGitHubReviewCandidates.id, stored!.id))).rejects.toThrow();
+            await expect(githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).rejects.toThrow();
+            await expect(isolation.prepareGitHubCandidateRuntime(db, { run: run!, agent: agent! })).rejects.toThrow();
+          }
+          const [primaryAgent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+          const [primaryRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, primarySession.runId));
+          expect(await isolation.prepareGitHubCandidateRuntime(db, { run: primaryRun!, agent: primaryAgent! })).toBeNull();
+          expect(await githubChatReviewService(db, f.providerFetch).execute(primarySession, "begin_review", { reviewedCommit: "b".repeat(40) })).toMatchObject({ reviewedCommit: "b".repeat(40) });
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, primarySession.runId)))[0]!.status).toBe("running");
+        } finally {
+          if (prepared) await isolation.cleanupGitHubCandidateRuntime(prepared);
+          probe.mockRestore();
+          dnsProbe.mockRestore();
+          if (old === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+          else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = old;
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      },
+    );
+    it("paired admission cannot replace an existing seed on direct retry", async () => {
+      const { admitGitHubPair } = await import("../services/chat-github-shadow.js");
+      const { isNull } = await import("drizzle-orm");
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "duplicate-seed-guard", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const [delivery] = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), isNull(chatDeliveries.githubShadowLabel)));
+      const seed = delivery!.normalizedEvent.githubPairingSeed as { envelope: import("@paperclipai/db").GitHubReviewEnrollmentEnvelope; revision: number };
+      expect(seed).toBeDefined();
+      const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.id, delivery!.conversationId!));
+      await expect(db.transaction(tx => admitGitHubPair(tx, { endpoint: f.endpoint, deliveryId: delivery!.id, conversation: conversation!,
+        event: seed.envelope.event, request: "MUST_NOT_REPLACE", policy: seed.envelope.policy, revision: seed.revision,
+        authority: seed.envelope.authority, snapshot: seed.envelope.snapshot }))).resolves.toBeUndefined();
+      const [after] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+      expect(after!.normalizedEvent.githubPairingSeed).toEqual(seed);
+    });
+    /**
+     * The CLI sees only the MCP config written from runtimeMcp, so drive the
+     * exact per-run gateway bearer through the real MCP protocol route (named
+     * gateway session resolution, native profile policy and candidate
+     * boundary), never a hand-built session or an agent API session.
+     */
+    async function expectCandidateRuntimeMcpReviewTools(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      gateway: Parameters<typeof import("../routes/tool-gateway.js").mcpGatewayProtocolRoutes>[0],
+      servers: Array<{ url: string; token: string }>,
+    ) {
+      expect(servers).toHaveLength(1);
+      const { mcpGatewayProtocolRoutes } = await import("../routes/tool-gateway.js");
+      const app = express();
+      app.use(express.json());
+      app.use(mcpGatewayProtocolRoutes(gateway));
+      app.use(errorHandler);
+      const server = servers[0]!;
+      const rpc = (id: number, method: string, params?: Record<string, unknown>) => request(app)
+        .post(new URL(server.url).pathname).set("Authorization", `Bearer ${server.token}`)
+        .set("Accept", "application/json, text/event-stream").send({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+      const listed = await rpc(1, "tools/list");
+      expect(listed.status).toBe(200);
+      const names: string[] = listed.body.result.tools.map((t: { name: string }) => t.name);
+      const reviewTools = names.filter(n => n.startsWith(`github-bot.${f.endpoint.id}:`));
+      // Exactly the snapshot-backed review surface: no comment/formal_review,
+      // no live GitHub, Paperclip or other connected tools.
+      expect(reviewTools.map(n => n.split(":").pop()).sort()).toEqual(["begin_review", "read_file", "read_pull_request", "submit_review"]);
+      expect(names.filter(n => !reviewTools.includes(n) && !/^paperclip_(list|read|get)_(resources|resource|prompts|prompt)$/.test(n))).toEqual([]);
+      const tool = (name: string) => reviewTools.find(n => n.endsWith(`:${name}`))!;
+      const call = async (id: number, name: string, args: Record<string, unknown>) => {
+        const res = await rpc(id, "tools/call", { name, arguments: args });
+        expect({ status: res.status, error: res.body.error ?? null }).toEqual({ status: 200, error: null });
+        return res.body.result;
+      };
+      await call(2, tool("read_pull_request"), { section: "metadata" });
+      const head = "b".repeat(40);
+      await call(3, tool("begin_review"), { reviewedCommit: head });
+      expect(JSON.stringify(await call(4, tool("submit_review"), shadowTestAssessment(head)))).toContain("shadow_stored");
+      for (const denied of [`github-bot.${f.endpoint.id}:comment`, `github-bot.${f.endpoint.id}:formal_review`, "read_pull_request"]) {
+        const res = await rpc(5, "tools/call", { name: denied, arguments: { body: "x" } });
+        expect(res.body.error?.data?.reasonCode).toBe("github_candidate_tool_denied");
+      }
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.agentId, f.replacementAgentId));
+      const [stored] = await db.select().from(chatGitHubReviews).where(and(eq(chatGitHubReviews.issueId, candidate!.issueId), eq(chatGitHubReviews.state, "completed")));
+      expect(stored).toMatchObject({ shadowLabel: "paired-meta", headSha: head, assessment: expect.objectContaining({ reviewedCommit: head, score: 2, complete: true }) });
+      // I1: capture-only. The candidate stages no outbound publication intent.
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate!.issueId))).toEqual([]);
+    }
+    it.each(["certified", "disabled-at-dispatch", "contaminated", "changed-realization"] as const)(
+      "paired certified heartbeat %s reaches only the permitted adapter",
+      async scenario => {
+        const { environments, chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+        const ssh = await import("@paperclipai/adapter-utils/ssh");
+        const { default: dns } = await import("node:dns/promises");
+        const runtimeModule = await import("../services/environment-runtime.js");
+        const { getServerAdapter } = await import("../adapters/registry.js");
+        const { githubIsolationConfigurationDigest } = await import("../services/chat-github-runtime-isolation.js");
+        const targetModule = await import("../services/environment-execution-target.js");
+        const originalResolve = targetModule.resolveEnvironmentExecutionTarget;
+        let realized = false;
+        const targetSpy = vi.spyOn(targetModule, "resolveEnvironmentExecutionTarget").mockImplementation(async input => {
+          const target = await originalResolve(input);
+          return scenario === "changed-realization" && realized && target?.kind === "remote" && target.transport === "ssh"
+            ? { ...target, spec: { ...target.spec, host: "changed.invalid" } } : target;
+        });
+        const originalRuntime = runtimeModule.environmentRuntimeService;
+        const runtimeSpy = vi.spyOn(runtimeModule, "environmentRuntimeService").mockImplementation((...args) => {
+          const runtime = originalRuntime(...args);
+          // Keep real disposable-DB leases, replacing only host SSH I/O.
+          runtime.getDriver("ssh")!.acquireRunLease = runtime.getDriver("local")!.acquireRunLease;
+          return { ...runtime, execute: async input => {
+            if (input.environment.driver === "ssh") throw new Error("Unexpected SSH command outside the isolated adapter");
+            return runtime.execute(input);
+          }, realizeWorkspace: async input => {
+            if (input.environment.driver !== "ssh") return runtime.realizeWorkspace(input);
+            if (scenario === "disabled-at-dispatch") await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+            realized = true;
+            return { cwd: "/home/paperclip-shadow/work", metadata: {} };
+          } };
+        });
+        const heartbeat = heartbeatService(db);
+        const { agentTaskSessions } = await import("@paperclipai/db");
+        let queuedPrimary: Parameters<typeof heartbeat.wakeup> | undefined;
+        const f = await pairedReviewFixture({ wakeup: async (...args: Parameters<typeof heartbeat.wakeup>) => {
+          // Model a durable queued primary; capture must precede execution, not
+          // rely on the scheduler losing a race to this test's recovery sweep.
+          if (args[0] === f.assignedAgentId) { queuedPrimary = args; return { id: randomUUID() } as never; }
+          if (args[0] === f.replacementAgentId) {
+            const context = args[1]?.contextSnapshot as Record<string, unknown>;
+            expect(typeof context.taskKey).toBe("string");
+            await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+              adapterType: "claude_local", taskKey: String(context.taskKey), sessionDisplayId: "11111111-1111-4111-8111-111111111111",
+              sessionParamsJson: { sessionId: "11111111-1111-4111-8111-111111111111", canary: "PRIMARY_SESSION_CANARY", cwd: "/home/paperclip-shadow/work" } }).onConflictDoNothing();
+          }
+          return heartbeat.wakeup(...args);
+        } });
+        const scratch = mkdtempSync(path.join(os.tmpdir(), "certified-heartbeat-"));
+        const canaryPath = path.join(scratch, "primary-answer");
+        const provisionMarker = path.join(scratch, "UNSAFE_PROVISION_RAN");
+        writeFileSync(canaryPath, "PRIMARY_HEARTBEAT_CANARY", { mode: 0o600 });
+        const [environment] = await db.insert(environments).values({ name: `Shadow heartbeat ${randomUUID()}`, driver: "ssh",
+          config: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/work", privateKey: null,
+            knownHosts: "fixture", strictHostKeyChecking: true } }).returning();
+        const oldCertificate = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+        const oldApi = process.env.PAPERCLIP_API_URL;
+        const oldJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        process.env.PAPERCLIP_AGENT_JWT_SECRET = "certified-heartbeat-test-secret";
+        process.env.PAPERCLIP_API_URL = "https://controller.example.test";
+        process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = JSON.stringify([{
+          companyId: f.companyId, environmentId: environment!.id, configurationDigest: githubIsolationConfigurationDigest(environment!), modelProxyPolicy: "client-tools-only-v1",
+          primaryCanaries: ["run", "worktree"].map(kind => ({ kind, serverPath: canaryPath, remotePath: `/primary/${kind}/canary`,
+            sha256: createHash("sha256").update("PRIMARY_HEARTBEAT_CANARY").digest("hex") })),
+        }]);
+        const lookup = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+        const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
+          if (!options?.stdin || !command.includes("python3")) return { stdout: "", stderr: "" };
+          const input = JSON.parse(options.stdin);
+          return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true, providerToolsDenied: true,
+              allowedModelAccepted: input.model === "configured-arm-model", otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
+        });
+        const originalAdapter = getServerAdapter("claude_local");
+        const execute = vi.fn(async (input: Parameters<typeof originalAdapter.execute>[0]) => {
+          if (input.agent.id === f.replacementAgentId) {
+            expect(input.executionTarget).toMatchObject({ kind: "remote", transport: "ssh", spec: { username: "paperclip-shadow" },
+              githubCandidateIsolation: { home: expect.stringContaining("/.paperclip-runtime/isolated/") } });
+            const env = input.config.env as Record<string, string>;
+            expect(env.CLAUDE_CONFIG_DIR).toBe(`${env.HOME}/.claude`);
+            expect(input.runtime.sessionId).toBeNull();
+            expect(input.runtime.sessionParams).toBeNull();
+            expect(input.runtime.sessionDisplayId).toBeNull();
+            expect(input.config.extraArgs).toEqual(["--disallowedTools", "WebSearch", "WebFetch"]);
+            expect(input.authToken).toBeTruthy();
+            // The connection broker is NOT the review gateway: it can request
+            // new external access and is mounted before the normal API boundary.
+            expect(input.runtimeTools).toBeUndefined();
+            expect(input.context.paperclipManagedMcp).toBeUndefined();
+            expect((input.runtimeMcp?.getServers() ?? []).every(s => s.url.startsWith("http://127.0.0.1:3100/mcp/gateways/"))).toBe(true);
+            expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+            const { actorMiddleware } = await import("../middleware/auth.js");
+            const { toolGatewayRoutes } = await import("../routes/tool-gateway.js");
+            const { createToolGatewayService } = await import("../services/tool-gateway.js");
+            const { toolPolicies } = await import("@paperclipai/db");
+            await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Certified review reads", policyType: "allow", selectors: { riskLevel: "read" } });
+            const gateway = createToolGatewayService(db);
+            const app = express();
+            app.use(express.json());
+            app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+            app.use("/api", toolGatewayRoutes(db, gateway));
+            app.use(errorHandler);
+            const sessionResponse = await request(app).post("/api/tool-gateway/sessions")
+              .set("Authorization", `Bearer ${input.authToken}`).send({});
+            expect(sessionResponse.status).toBe(201);
+            const tools = await gateway.listToolsForSession(sessionResponse.body.token);
+            expect(tools.length).toBeGreaterThan(0);
+            expect(tools.every(t => t.providerType === "paperclip_github_chat")).toBe(true);
+            const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
+            expect(await gateway.executeTool({ sessionToken: sessionResponse.body.token, tool: readTool.name, parameters: { section: "metadata" } }))
+              .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+            await expectCandidateRuntimeMcpReviewTools(f, gateway, input.runtimeMcp?.getServers() ?? []);
+            expect(input.config.cwd).not.toBe(scratch);
+            expect(existsSync(provisionMarker)).toBe(false);
+          }
+          return { exitCode: 0, signal: null, timedOut: false, summary: "isolated test result", provider: "test", model: "test",
+            sessionId: "CANDIDATE_TRANSCRIPT_CANARY", sessionParams: { sessionId: "CANDIDATE_TRANSCRIPT_CANARY" } };
+        });
+        registerServerAdapter({ ...originalAdapter, execute,
+          // Fault-inject a legacy display-ID fallback after the earlier reset.
+          // The final candidate dispatch seam must erase it too (M23).
+          sessionCodec: { ...originalAdapter.sessionCodec!, getDisplayId: params =>
+            originalAdapter.sessionCodec!.getDisplayId?.(params) ?? "11111111-1111-4111-8111-111111111111" },
+        });
+        try {
+          await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+          await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { engine: "cli" },
+            runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+            .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+          await db.update(agents).set({ defaultEnvironmentId: environment!.id, adapterConfig: { engine: "cli", model: "configured-arm-model", cwd: scratch,
+            workspaceStrategy: { type: "project_primary", provisionCommand: `touch '${provisionMarker}'` } } }).where(eq(agents.id, f.replacementAgentId));
+          await deliverShadowTestMention(f, `certified-heartbeat-${scenario}`, "@maya review this", 81);
+          await f.service.processPendingDeliveries();
+          expect(queuedPrimary).toBeDefined();
+          await heartbeat.wakeup(queuedPrimary![0], { ...queuedPrimary![1], durableChatRequest: undefined });
+          await heartbeat.drainActiveRunExecutions();
+          expect(execute.mock.calls.filter(([input]) => input.agent.id === f.assignedAgentId)).toHaveLength(1);
+          expect(execute.mock.calls.filter(([input]) => input.agent.id === f.replacementAgentId)).toHaveLength(scenario === "certified" ? 1 : 0);
+          const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.replacementAgentId));
+          expect(runs).toHaveLength(1);
+          expect(runs[0]).toMatchObject(scenario === "certified" ? { status: "succeeded" } : { status: "failed", errorCode: "configuration_incomplete" });
+          if (scenario === "changed-realization") expect(runs[0]!.error).toContain("SSH realization changed");
+          if (scenario === "certified") {
+            const sessions = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.replacementAgentId));
+            expect(sessions).toHaveLength(1);
+            // Persisting this arm's own result is allowed; the old session must
+            // never reach the adapter or survive as a resumable next-turn value.
+            expect(sessions[0]!.sessionDisplayId).toBe("CANDIDATE_TRANSCRIPT_CANARY");
+            expect(JSON.stringify(sessions[0]!.sessionParamsJson)).not.toContain("PRIMARY_SESSION_CANARY");
+          }
+          const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+          expect(enrollment!.isolationTests[runs[0]!.id]).toMatchObject({ status: scenario === "contaminated" ? "failed" : "passed",
+            hooksDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+            // The primary has not submitted a sealed-input receipt; successful
+            // isolation also cannot prove effective tool/workspace equivalence.
+            comparisonEligibility: { certifiedClean: false, reasons: [
+              ...(scenario === "contaminated" ? ["candidate_isolation_self_test_failed"] : []),
+              "primary_inputs_not_sealed", "effective_tool_equivalence_unverified", "workspace_equivalence_unverified",
+            ] },
+          });
+          if (scenario === "certified") {
+            const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+            const capability = await githubRunCapability(db, { companyId: f.companyId, agentId: f.replacementAgentId,
+              issueId: runs[0]!.contextSnapshot!.issueId as string, runId: runs[0]!.id });
+            expect(capability?.enrollment?.envelope.comparisonEligibility)
+              .toEqual({ certifiedClean: false, reasons: ["primary_inputs_not_sealed", "effective_tool_equivalence_unverified", "workspace_equivalence_unverified"] });
+          }
+          expect(existsSync(provisionMarker)).toBe(false);
+          expect(probe.mock.calls.filter(([, command]) => command.includes(CLEANUP_PROGRAM_MARKER))).toHaveLength(1);
+        } finally {
+          await heartbeat.drainActiveRunExecutions();
+          registerServerAdapter(originalAdapter);
+          probe.mockRestore(); lookup.mockRestore(); runtimeSpy.mockRestore(); targetSpy.mockRestore();
+          if (oldCertificate === undefined) delete process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
+          else process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS = oldCertificate;
+          if (oldApi === undefined) delete process.env.PAPERCLIP_API_URL;
+          else process.env.PAPERCLIP_API_URL = oldApi;
+          if (oldJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+          else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldJwtSecret;
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      },
+    );
+    it("paired isolation fails closed before an unsupported adapter can read primary session scratch", async () => {
+      const heartbeat = heartbeatService(db);
+      let queuedPrimary: Parameters<typeof heartbeat.wakeup> | undefined;
+      const f = await pairedReviewFixture({ wakeup: async (...args: Parameters<typeof heartbeat.wakeup>) => {
+        if (args[0] === f.assignedAgentId) { queuedPrimary = args; return { id: randomUUID() } as never; }
+        return heartbeat.wakeup(...args);
+      } });
+      const oldApiUrl = process.env.PAPERCLIP_API_URL;
+      process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+      const adapterType = `paired-isolation-test-${randomUUID()}`;
+      const scratch = mkdtempSync(path.join(os.tmpdir(), "paired-primary-scratch-"));
+      const canaryPath = path.join(scratch, "primary-session.txt");
+      writeFileSync(canaryPath, "PRIMARY_SESSION_SCRATCH_CANARY");
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(canaryPath, "utf8")).toBe("PRIMARY_SESSION_SCRATCH_CANARY");
+      const candidateReads: string[] = [];
+      const execute = vi.fn(async (input: { agent: { id: string } }) => {
+        if (input.agent.id === f.replacementAgentId) candidateReads.push(readFileSync(canaryPath, "utf8"));
+        return { exitCode: 0, signal: null, timedOut: false, summary: "test result", provider: "test", model: "test" };
+      });
+      registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false, execute,
+        testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+      try {
+        await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+        await db.update(agents).set({ adapterType, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+          .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+        await deliverShadowTestMention(f, "isolation-runtime", "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        expect(queuedPrimary).toBeDefined();
+        await heartbeat.wakeup(queuedPrimary![0], { ...queuedPrimary![1], durableChatRequest: undefined });
+        await heartbeat.drainActiveRunExecutions();
+        expect(candidateReads).toEqual([]);
+        expect(execute.mock.calls.some(([input]) => input.agent.id === f.assignedAgentId)).toBe(true);
+        const candidateRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.replacementAgentId));
+        expect(candidateRuns).toHaveLength(1);
+        expect(candidateRuns[0]).toMatchObject({ status: "failed", errorCode: "configuration_incomplete" });
+        expect(candidateRuns[0]!.error).toContain("github_candidate_isolation_unavailable");
+      } finally {
+        await heartbeat.drainActiveRunExecutions();
+        unregisterServerAdapter(adapterType);
+        if (oldApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+        else process.env.PAPERCLIP_API_URL = oldApiUrl;
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+    it("paired snapshot validates and reads original commits after the live head advances", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-pinned-head", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const recorder = installShadowRecorder(f, "c".repeat(40), async (url) => {
+        if (url.includes("/contents/")) return Response.json({ encoding: "base64", content: Buffer.from("pinned source").toString("base64"),
+          size: 13, sha: createHash("sha1").update("blob 13\0pinned source").digest("hex") });
+        return undefined;
+      });
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "begin_review", { reviewedCommit: head })).toMatchObject({ reviewedCommit: head });
+      expect(await service.execute(session, "read_file", { path: "src/math.ts", revision: "head" })).toMatchObject({ content: Buffer.from("pinned source").toString("base64") });
+      expect(await service.execute(session, "read_file", { path: "src/math.ts", revision: "base" })).toMatchObject({ content: Buffer.from("pinned source").toString("base64") });
+      expect(await service.execute(session, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "shadow_stored" });
+      expect(recorder.fetches.filter(r => r.url.includes("/repos/")).map(r => r.url)).toEqual([
+        expect.stringContaining(`/contents/src/math.ts?ref=${head}`), expect.stringContaining(`/contents/src/math.ts?ref=${"e".repeat(40)}`),
+      ]);
+      expect(recorder.mutations).toEqual([]);
+    });
+    it("paired snapshot freezes only earlier own-arm assessments across rounds", async () => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      await deliverShadowTestMention(f, "snapshot-own-round-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const service = githubChatReviewService(db, f.providerFetch);
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      await service.execute(candidateSession, "submit_review", { ...shadowTestAssessment(head), summary: "Own prior reasoning" });
+      await service.execute(primarySession, "submit_review", { ...shadowTestAssessment(head), summary: "PRIMARY_PREVIOUS_ANSWER_CANARY" });
+      await deliverShadowTestMention(f, "snapshot-own-round-two", "@maya re-review", 81);
+      await f.service.processPendingDeliveries();
+      // A later DB mutation cannot change the candidate's already-frozen bytes.
+      await db.update(chatGitHubReviews).set({ assessment: { ...shadowTestAssessment(head), summary: "LATE_MUTATION_CANARY" } }).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      const second = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId && t.issue.id !== candidate.issue.id)!;
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: second.issue.id });
+      const result = await service.execute(session, "read_pull_request", { section: "metadata" });
+      expect(result).toMatchObject({ previousAssessment: { reviewedCommit: head, assessment: { summary: "Own prior reasoning" } } });
+      expect(JSON.stringify(result)).not.toContain("CANARY");
+      expect(second.conversation.executionScope).not.toBe(candidate.conversation.executionScope);
+    });
+    it("round two freezes the primary assessment from round one's per-run review row", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const first = await deliverShadowTestMention(f, "primary-history-round-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const session = await shadowTestSession(f, { issueId: first.issueId });
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "submit_review", {
+        ...shadowTestAssessment(head), summary: "PRIMARY_ROUND_ONE_REASONING",
+      })).toMatchObject({ status: "processed" });
+      const [review] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, session.runId));
+      const [firstEnrollment] = await db.select().from(chatGitHubReviewEnrollments)
+        .where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(review!.deliveryId).toBe(`run:${session.runId}:${head}`);
+      expect(review!.admissionDeliveryId).toBe(firstEnrollment!.originDeliveryId);
+      expect(review!.assessment).toMatchObject({ summary: "PRIMARY_ROUND_ONE_REASONING" });
+      await deliverShadowTestMention(f, "primary-history-round-two", "@maya re-review", 81);
+      await f.service.processPendingDeliveries();
+      const enrollments = await db.select().from(chatGitHubReviewEnrollments)
+        .where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollments).toHaveLength(2);
+      const second = enrollments.find(e => e.roundOrdinal === 2)!;
+      const expected = { headSha: head, assessment: review!.assessment, issueId: first.issueId, runId: session.runId };
+      expect(second.envelope.previousAssessments?.primary).toEqual(expected);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, second.originDeliveryId));
+      expect(delivery!.normalizedEvent.githubPairingSeed).toMatchObject({
+        roundOrdinal: 2, envelope: { previousAssessments: { primary: expected } },
+      });
+    });
+    it("paired snapshot capture failure preserves primary progress without waking a live-reading candidate", async () => {
+      const f = await pairedReviewFixture();
+      installShadowRecorder(f, "b".repeat(40), async url => url.includes("/reviews?") ? new Response("unavailable", { status: 503 }) : undefined);
+      await deliverShadowTestMention(f, "snapshot-failure", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const rows = [...await db.execute(sql`select e.envelope, c.state, c.last_error from chat_github_review_enrollments e join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ last_error: "candidate_snapshot_unavailable", envelope: { snapshotFailure: "admission_snapshot_unavailable" } });
+      const primary = (await pairedTasks(f.endpoint.id))[0]!;
+      const session = await shadowTestSession(f, { issueId: primary.issue.id });
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
+    });
+    it.each(["read_pull_request", "begin_review", "read_file"] as const)("first %s claims pending capture before choosing primary inputs", async tool => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, `seal-first-${tool}`, "@maya review this", 81);
+      const session = await shadowTestSession(f, primary);
+      installShadowRecorder(f, "b".repeat(40), async url => url.includes("/contents/")
+        ? Response.json({ encoding: "base64", content: Buffer.from("pinned source").toString("base64"),
+          sha: createHash("sha1").update("blob 13\0pinned source").digest("hex"), size: 13 }) : undefined);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const input = tool === "begin_review" ? { reviewedCommit: "b".repeat(40) }
+        : tool === "read_file" ? { path: "src/math.ts", revision: "head" } : { section: "metadata" };
+      await service.execute(session, tool, input);
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+      expect(run!.contextSnapshot).toMatchObject({ githubPrimaryReviewInput: { source: "snapshot", enrollmentId: enrollment!.id } });
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      expect(await service.execute(session, "read_pull_request", { section: "metadata" }))
+        .toMatchObject({ pull: { head: { sha: "b".repeat(40) } } });
+      expect(recorder.fetches).toEqual([]);
+      await f.service.processPendingDeliveries();
+      expect((await pairedTasks(f.endpoint.id)).some(t => t.issue.assigneeAgentId === f.replacementAgentId)).toBe(true);
+    });
+    it.each(["ready", "timeout"] as const)("first primary read awaits an already-claimed capture (%s)", async outcome => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const { githubRunCapability, GITHUB_PRIMARY_SEAL_WAIT_MS } = await import("../services/chat-github-shadow.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, `seal-wait-${outcome}`, "@maya review this", 81);
+      const session = await shadowTestSession(f, primary);
+      let release!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      let capturing = false;
+      const recorder = installShadowRecorder(f, "b".repeat(40), async url => {
+        if (url.includes("/files?")) { capturing = true; await blocked; }
+        return undefined;
+      });
+      const sweep = f.service.processPendingDeliveries();
+      try {
+        await vi.waitFor(() => expect(capturing).toBe(true), { timeout: 3000 });
+        const service = githubChatReviewService(db, f.providerFetch);
+        let returned = false;
+        const start = performance.now();
+        const read = service.execute(session, "read_pull_request", { section: "metadata" }).then(result => { returned = true; return result; });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(returned).toBe(false);
+        if (outcome === "ready") release();
+        expect(await read).toMatchObject({ pull: { head: { sha: "b".repeat(40) } } });
+        expect(performance.now() - start).toBeLessThan(GITHUB_PRIMARY_SEAL_WAIT_MS + 3000);
+        if (outcome === "timeout") {
+          expect(performance.now() - start).toBeGreaterThanOrEqual(GITHUB_PRIMARY_SEAL_WAIT_MS);
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+          expect(run!.contextSnapshot).toMatchObject({ githubPrimaryReviewInput: { source: "live" } });
+        }
+        release();
+        await sweep;
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        expect(enrollment!.envelope.snapshot).toBeDefined();
+        if (outcome === "timeout") expect(await githubRunCapability(db, session)).toMatchObject({ enrollment: null });
+        expect(recorder.fetches.filter(r => r.url.includes("/files?"))).toHaveLength(2); // one two-sweep capture
+        const after = installShadowRecorder(f, "c".repeat(40));
+        const expectedHead = (outcome === "ready" ? "b" : "c").repeat(40);
+        expect(await service.execute(session, "read_pull_request", { section: "metadata" }))
+          .toMatchObject({ pull: { head: { sha: expectedHead } } });
+        expect(after.fetches.filter(r => r.url.endsWith("/pulls/81"))).toHaveLength(outcome === "ready" ? 0 : 1);
+        // Record the original head so the timeout receipt, not head mismatch,
+        // is what excludes the comparison. Both arms still dispatch.
+        installShadowRecorder(f, "b".repeat(40));
+        await service.execute(session, "begin_review", { reviewedCommit: "b".repeat(40) });
+        const [review] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, session.runId));
+        expect(review!.event.inputSource).toBe(outcome === "ready" ? "snapshot" : "live");
+        const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+        expect(candidate).toBeDefined();
+        const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+        const reasons = (await githubRunCapability(db, candidateSession))!.enrollment!.envelope.comparisonEligibility!.reasons;
+        expect(reasons.includes("primary_inputs_not_sealed")).toBe(outcome === "timeout");
+      } finally { release(); await sweep; }
+    });
+    it("concurrent first reads cannot overwrite the winning live receipt with a late snapshot", async () => {
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, "seal-concurrent-readers", "@maya review this", 81);
+      const session = await shadowTestSession(f, primary);
+      let release!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      let capturing = false;
+      installShadowRecorder(f, "b".repeat(40), async url => {
+        if (url.includes("/files?")) { capturing = true; await blocked; }
+        return undefined;
+      });
+      const sweep = f.service.processPendingDeliveries();
+      const service = githubChatReviewService(db, f.providerFetch);
+      let first: Promise<unknown> | undefined;
+      let second: Promise<unknown> | undefined;
+      try {
+        await vi.waitFor(() => expect(capturing).toBe(true), { timeout: 3000 });
+        first = service.execute(session, "read_pull_request", { section: "metadata" });
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        second = service.execute(session, "read_pull_request", { section: "metadata" });
+        await first; // Times out while the second request still has time left.
+        release();
+        await sweep;
+        await second;
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+        expect(run!.contextSnapshot).toMatchObject({ githubPrimaryReviewInput: { source: "live" } });
+        const recorder = installShadowRecorder(f, "c".repeat(40));
+        expect(await service.execute(session, "read_pull_request", { section: "metadata" }))
+          .toMatchObject({ pull: { head: { sha: "c".repeat(40) } } });
+        expect(recorder.fetches.filter(r => r.url.endsWith("/pulls/81"))).toHaveLength(1);
+      } finally { release(); await Promise.all([sweep, first, second]); }
+    });
+    it("keeps a live primary assessment ineligible after a later snapshot retry begins", async () => {
+      const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "primary-source-retry", "@maya review this", 81);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const firstSession = await shadowTestSession(f, { issueId: primary.issueId });
+      // Model an earlier run whose first input read timed out. A later sealed
+      // retry must not hide that earlier live receipt in pair eligibility.
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      await db.update(heartbeatRuns).set({ contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify({
+        githubPrimaryReviewInput: { deliveryId: delivery!.id, source: "live" },
+      })}::jsonb` }).where(eq(heartbeatRuns.id, firstSession.runId));
+      await f.service.processPendingDeliveries();
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, firstSession.runId));
+      await service.execute(firstSession, "begin_review", { reviewedCommit: head });
+      const [firstReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, firstSession.runId));
+      expect(firstReview!.event).toMatchObject({ inputSource: "live" });
+      expect(await service.execute(firstSession, "submit_review", shadowTestAssessment(head)))
+        .toMatchObject({ status: "processed" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, firstSession.runId));
+
+      const laterSession = await shadowTestSession(f, { issueId: primary.issueId });
+      await service.execute(laterSession, "begin_review", { reviewedCommit: head });
+      const [laterReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, laterSession.runId));
+      expect(laterReview!.event).toMatchObject({ inputSource: "snapshot" });
+
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect((await githubRunCapability(db, candidateSession))?.enrollment?.envelope.comparisonEligibility)
+        .toMatchObject({ certifiedClean: false, reasons: expect.arrayContaining(["primary_inputs_not_sealed"]) });
+    });
+    it("sampled primary task comment and wake commit before a never-resolving candidate snapshot fetch", async () => {
+      const f = await pairedReviewFixture();
+      let release!: () => void;
+      let captureStarted = false;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      installShadowRecorder(f, "b".repeat(40), async url => {
+        if (url.includes("/files?")) { captureStarted = true; await blocked; }
+        return undefined;
+      });
+      const admission = deliverShadowTestMention(f, "primary-before-snapshot", "@maya do not wait", 81);
+      let recovery: Promise<unknown> | undefined;
+      try {
+        await vi.waitFor(async () => {
+          const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId);
+          expect(primary).toBeDefined();
+          expect(await db.select().from(issueComments).where(eq(issueComments.issueId, primary!.issue.id))).toHaveLength(1);
+          expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+        }, { timeout: 3000, interval: 25 });
+        await admission;
+        recovery = f.service.processPendingDeliveries();
+        await vi.waitFor(() => expect(captureStarted).toBe(true), { timeout: 3000 });
+        expect((await pairedTasks(f.endpoint.id)).map(t => t.issue.assigneeAgentId)).toEqual([f.assignedAgentId]);
+        expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      } finally {
+        release();
+        await admission;
+        await recovery;
+      }
+    });
+    it.each(["source", "authority", "exception"] as const)("terminates deferred capture after three %s failures and accounts for the missing pair", async (failure) => {
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `capture-terminal-${failure}`, "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      if (failure === "source") await db.delete(chatMessageLinks).where(eq(chatMessageLinks.deliveryId, delivery!.id));
+      if (failure === "authority") await db.execute(sql`update chat_deliveries
+        set normalized_event = normalized_event - 'githubAuthority' where id = ${delivery!.id}`);
+      // The interrupted-capture branch needs sender identity; corrupting it
+      // exercises the outer exception path on every subsequent attempt.
+      if (failure === "exception") await db.execute(sql`update chat_deliveries set normalized_event =
+        (normalized_event - 'principal') || ${JSON.stringify({ githubPairingCapture: { id: randomUUID(),
+          startedAt: new Date(0).toISOString(), attempts: 0 } })}::jsonb where id = ${delivery!.id}`);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await f.service.processPendingDeliveries();
+        const [current] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+        if (attempt < 3) {
+          expect(current!.normalizedEvent.githubPairingCapture).toMatchObject({ attempts: attempt });
+          expect(current!.normalizedEvent.githubPairingPending).toBeDefined();
+          await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event,
+            '{githubPairingCapture,startedAt}', to_jsonb(${new Date(0).toISOString()}::text)) where id = ${delivery!.id}`);
+        } else {
+          expect(current!.normalizedEvent.githubPairingPending).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingCapture).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingSeed).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingFailure).toMatchObject({ attempts: 3,
+            reason: failure === "source" ? "pair_source_missing" : failure === "authority" ? "pair_context_invalid" : "pair_admission_failed",
+            arms: [{ agentId: f.replacementAgentId, label: "paired-meta" }] });
+          await f.service.processPendingDeliveries();
+          expect((await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id)))[0]!.normalizedEvent)
+            .toEqual(current!.normalizedEvent);
+        }
+      }
+      const { readFileSync } = await import("node:fs");
+      const accountingSql = readFileSync(new URL("../../../scripts/github-shadow-pair-accounting.sql", import.meta.url), "utf8");
+      expect([...(await db.$client.unsafe(accountingSql, [f.companyId, f.endpoint.id]))])
+        .toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "1" }]);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("counts a pending assignment once through projection and candidate assessment", async () => {
+      const f = await pairedReviewFixture();
+      const { readFileSync } = await import("node:fs");
+      const accountingSql = readFileSync(new URL("../../../scripts/github-shadow-pair-accounting.sql", import.meta.url), "utf8");
+      const counts = async () => [...await db.$client.unsafe(accountingSql, [f.companyId, f.endpoint.id])];
+      await deliverShadowTestMention(f, "capture-accounting", "@maya review this", 81);
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "0" }]);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate).toBeDefined();
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "0" }]);
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "submit_review", shadowTestAssessment("b".repeat(40))))
+        .toMatchObject({ status: "shadow_stored" });
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "0", capture_failed_pairs: "0" }]);
+      await f.service.processPendingDeliveries();
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "0", capture_failed_pairs: "0" }]);
+    });
+    it("terminates an interrupted third capture without starting a fourth attempt", async () => {
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "interrupted-final-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({
+        githubPairingCapture: { id: randomUUID(), startedAt: new Date(0).toISOString(), attempts: 3 },
+      })}::jsonb where id = ${delivery!.id}`);
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [current] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+      expect(current!.normalizedEvent.githubPairingFailure).toMatchObject({ reason: "pair_capture_interrupted", attempts: 3 });
+      expect(current!.normalizedEvent.githubPairingPending).toBeUndefined();
+      expect(current!.normalizedEvent.githubPairingCapture).toBeUndefined();
+      expect(current!.normalizedEvent.githubPairingSeed).toBeUndefined();
+      expect(recorder.fetches).toEqual([]);
+    });
+    it("interrupted deferred capture stays unavailable instead of recapturing later provider bytes", async () => {
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "interrupted-capture", "@maya review this", 81);
+      await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({
+        githubPairingCapture: { id: randomUUID(), startedAt: new Date(0).toISOString() },
+      })}::jsonb where endpoint_id = ${f.endpoint.id}`);
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      await f.service.processPendingDeliveries();
+      const rows = [...await db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      expect(rows).toMatchObject([{ head_sha: null, state: "unavailable", envelope: { snapshotFailure: "admission_snapshot_interrupted" } }]);
+      expect(recorder.fetches).toEqual([]);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("deferred candidate snapshot refuses capture after primary publication", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "primary-published-before-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(delivery!.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(delivery!.normalizedEvent.githubPairingSeed).toBeUndefined();
+      const session = await shadowTestSession(f, { issueId: primary.issueId });
+      // This run already timed out its first-read wait (covered above). It can
+      // publish live without claiming another capture or delaying production.
+      await db.update(heartbeatRuns).set({ contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify({
+        githubPrimaryReviewInput: { deliveryId: delivery!.id, source: "live" },
+      })}::jsonb` }).where(eq(heartbeatRuns.id, session.runId));
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "submit_review", { ...shadowTestAssessment(head), summary: "PRIMARY_BETWEEN_ADMISSIONS_CANARY" })).toMatchObject({ status: "processed" });
+      installShadowRecorder(f, head, async url => {
+        if (/\/(comments|reviews)\?/.test(url)) return Response.json([
+          { id: 1, body: "PRIMARY_BETWEEN_ADMISSIONS_CANARY", user: { login: f.endpoint.botUsername } },
+          { id: 2, body: "HUMAN_CONTEXT", user: { login: "octocat" } },
+        ]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [
+          { id: 1, app: { id: Number(f.endpoint.botExternalId) }, output: { summary: "PRIMARY_BETWEEN_ADMISSIONS_CANARY" } },
+        ] });
+        return undefined;
+      });
+      await f.service.processPendingDeliveries();
+      expect((await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)).toBeUndefined();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeUndefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe("admission_snapshot_late");
+      expect(JSON.stringify(enrollment)).not.toContain("CANARY");
+      const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries).toHaveLength(1);
+      for (const row of deliveries) {
+        expect(row.normalizedEvent.githubPairingPending).toBeUndefined();
+        expect(row.normalizedEvent.githubPairingCapture).toBeUndefined();
+      }
+    });
+    it("deferred candidate snapshot still seals after only the primary's queued milestone", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, "queued-milestone-before-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      await db.execute(sql`insert into chat_publications (company_id, endpoint_id, conversation_id, issue_id, idempotency_key, payload, state)
+        values (${delivery!.companyId}, ${f.endpoint.id}, ${delivery!.conversationId}, ${primary.issueId},
+          ${`run:queued-milestone:queued:${f.endpoint.id}`}, ${JSON.stringify({ classification: "external", source: "safe_milestone",
+            text: "The assistant is queued.", progressState: "queued" })}::jsonb, 'published')`);
+      installShadowRecorder(f, "b".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+    });
+    it("primary run start (working milestone) before capture still seals, and the primary's first read uses the snapshot", async () => {
+      // Production order on tog.17 (e.g. nntunev2#408): mention -> durable wake ->
+      // run running -> "The assistant is working…" milestone -> capture commits.
+      // The milestone follows run status only; the first review-tool read came
+      // 3.3-133 s after capture in all 16 production pairs voided this way.
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      const { enqueueChatRunMilestones } = await import("../services/chat-run-publications.js");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "working-milestone-before-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(delivery!.normalizedEvent.githubPairingPending).toBeDefined();
+      expect(delivery!.normalizedEvent.githubPairingSeed).toBeUndefined();
+      // The primary run is already running (no review tool called yet), and the
+      // production milestone producer publishes its lifecycle milestone.
+      const session = await shadowTestSession(f, primary);
+      // Inbound chat wakes carry contextSource `chat:<provider>` (queueIssueAssignmentWakeup).
+      await db.update(heartbeatRuns).set({ startedAt: new Date(), contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || '{"source":"chat:github"}'::jsonb` })
+        .where(eq(heartbeatRuns.id, session.runId));
+      await enqueueChatRunMilestones(db, { since: new Date(Date.now() - 60_000) });
+      const milestones = await db.select().from(chatPublications).where(eq(chatPublications.conversationId, delivery!.conversationId!));
+      expect(milestones.map(p => [p.idempotencyKey, p.payload.progressState])).toContainEqual(
+        [`run:${session.runId}:working:${f.endpoint.id}`, "working"]);
+      installShadowRecorder(f, head);
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+      expect(enrollment!.headSha).toBe(head);
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.enrollmentId, enrollment!.id));
+      expect(candidate!.state).not.toBe("unavailable");
+      expect(candidate!.lastError).not.toBe("candidate_snapshot_unavailable");
+      // The primary's first review read follows the seal: it reads the sealed
+      // snapshot (append-once receipt), with no live provider read.
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "read_pull_request", { section: "metadata" }))
+        .toMatchObject({ pull: { head: { sha: head } } });
+      expect(recorder.fetches).toEqual([]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
+      expect(run!.contextSnapshot).toMatchObject({ githubPrimaryReviewInput: { source: "snapshot", enrollmentId: enrollment!.id } });
+    });
+    it.each([
+      ["native-activity sample in the working lane", "native", "working", false],
+      ["completed milestone", "completed", "completed", false],
+      ["agent comment on the working key", "working", "working", true],
+      ["working-key publication without a progress state", "working", null, false],
+    ] as const)("paired capture still refuses a pre-capture %s", async (name, lane, progressState, withComment) => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, `post-start-signal-${name.replaceAll(" ", "-")}`, "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      const session = await shadowTestSession(f, primary);
+      const key = lane === "native" ? `run:${session.runId}:working:${f.endpoint.id}:native:using_tools:1`
+        : `run:${session.runId}:${lane}:${f.endpoint.id}`;
+      const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, primary.issueId)).limit(1);
+      // Stored payloads keep only text/progressState (projectSafeChatPublication).
+      await db.execute(sql`insert into chat_publications (company_id, endpoint_id, conversation_id, issue_id, comment_id, idempotency_key, payload, state)
+        values (${delivery!.companyId}, ${f.endpoint.id}, ${delivery!.conversationId}, ${primary.issueId}, ${withComment ? comment!.id : null}, ${key},
+          ${JSON.stringify({ text: "PRIMARY_PROGRESS_CANARY", ...(progressState ? { progressState } : {}) })}::jsonb, 'published')`);
+      installShadowRecorder(f, "b".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshot).toBeUndefined();
+      expect(enrollment!.envelope.snapshotFailure).toBe("admission_snapshot_late");
+      expect(JSON.stringify(enrollment)).not.toContain("CANARY");
+    });
+    it("unsampled primary admission makes no candidate snapshot requests", async () => {
+      const f = await pairedReviewFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      const sampleRate = 0.000001;
+      const saved = await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate }] },
+      }, "owner-user");
+      const [arm] = await db.execute(sql`select id from chat_github_review_arms where endpoint_id = ${f.endpoint.id} and retired_at is null`);
+      const eventId = "unsampled-no-capture";
+      const draw = parseInt(createHash("sha256").update(JSON.stringify([eventId, arm!.id, saved.revision])).digest("hex").slice(0, 13), 16) / 0x10000000000000;
+      expect(draw).toBeGreaterThan(sampleRate);
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      const { prepareGitHubPairEvent } = await import("../services/chat-github-shadow.js");
+      expect(await prepareGitHubPairEvent(db, { endpoint: f.endpoint, repositoryId: "97531", repository: "paperclipai/paperclip",
+        threadId: "github:paperclipai/paperclip:81", eventId, principal: { externalId: "42", handle: "octocat" } }, f.providerFetch)).toBeNull();
+      expect(recorder.fetches).toEqual([]);
+    });
+    it.each([false, true])("unpaired primary never inherits a candidate assessment (primary history %s)", async (hasPrimaryHistory) => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, `history-paired-${hasPrimaryHistory}`, "@maya first review", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const service = githubChatReviewService(db, f.providerFetch);
+      if (hasPrimaryHistory) {
+        const session = await shadowTestSession(f, { issueId: primary.issueId! });
+        expect(await service.execute(session, "submit_review", { ...shadowTestAssessment(head), summary: "PRIMARY_OWN_HISTORY" })).toMatchObject({ status: "processed" });
+      }
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await service.execute(candidateSession, "submit_review", { ...shadowTestAssessment(head), summary: "CANDIDATE_ONLY_FINDING_CANARY" })).toMatchObject({ status: "shadow_stored" });
+      // Force the candidate to be newest regardless of manual/automatic row timing.
+      await db.update(chatGitHubReviews).set({ createdAt: new Date(Date.now() + 1000) }).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const next = await deliverShadowTestMention(f, `history-unpaired-${hasPrimaryHistory}`, "@maya second unpaired review", 81);
+      // Admission can defer behind a concurrent durable wakeup; wait for its
+      // persisted comment rather than assuming the callback drained the queue.
+      const comment = await vi.waitFor(async () => {
+        await f.service.processPendingDeliveries();
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, next.issueId!));
+        const admitted = comments.find(c => c.body.includes("second unpaired review"));
+        expect(admitted).toBeDefined();
+        return admitted!;
+      }, { timeout: 5000, interval: 50 });
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        invocationSource: "assignment", status: "running", contextSnapshot: { issueId: next.issueId, wakeCommentId: comment.id } }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: next.issueId!, runId: run!.id };
+      const metadata = await service.execute(session, "read_pull_request", { section: "metadata" }) as { previousAssessment: unknown };
+      expect(metadata.previousAssessment).toEqual(hasPrimaryHistory ? expect.objectContaining({ assessment: expect.objectContaining({ summary: "PRIMARY_OWN_HISTORY" }) }) : null);
+      expect(JSON.stringify(metadata)).not.toContain("CANDIDATE_ONLY_FINDING_CANARY");
+      const { githubPreviousAssessment } = await import("../services/chat-github-events.js");
+      const previous = await githubPreviousAssessment(db, f.endpoint, "97531", 81);
+      expect(previous?.shadowLabel ?? null).toBeNull();
+      expect(previous?.issueId ?? null).toBe(hasPrimaryHistory ? primary.issueId : null);
+    });
+    it("automatic primary retry keeps one GitHub check and the provider delivery identity with pairing off", async () => {
+      const f = await reviewBotFixture();
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const head = "b".repeat(40);
+      installShadowRecorder(f, head);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      const providerDeliveryId = (admitted.event as { deliveryId: string }).deliveryId;
+      expect(providerDeliveryId).not.toBe(admitted.deliveryId);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const first = await shadowTestSession(f, admitted);
+      await service.execute(first, "begin_review", { reviewedCommit: head });
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, first.runId));
+      const retry = await shadowTestSession(f, admitted);
+      await service.execute(retry, "begin_review", { reviewedCommit: head });
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, admitted.issueId));
+      expect(reviews.find(r => r.runId === retry.runId)?.event).toMatchObject({ deliveryId: providerDeliveryId });
+      expect(reviews.find(r => r.runId === retry.runId)).toMatchObject({ admissionDeliveryId: admitted.deliveryId });
+      expect(admitted).toMatchObject({ admissionDeliveryId: admitted.deliveryId });
+      expect(await shadowTestActions(f.endpoint.id, "github_review_check")).toHaveLength(1);
+    });
+    it.each(["failed", "cancelled"])("paired primary retry publishes after its previous run %s", async (status) => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, `paired-primary-retry-${status}`, "@maya review this", 81);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const first = await shadowTestSession(f, { issueId: primary.issueId! });
+      await service.execute(first, "begin_review", { reviewedCommit: head });
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, first.runId));
+      const retry = await shadowTestSession(f, { issueId: primary.issueId! });
+      await service.execute(retry, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(retry, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "processed" });
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, primary.issueId!));
+      expect(reviews.find(r => r.runId === retry.runId)).toMatchObject({ state: "completed", assessment: { score: 2 } });
+      expect(reviews.find(r => r.runId === first.runId)?.assessment).toBeNull();
+      // Idempotent begin/submit belongs to the retry, not its predecessor.
+      expect(await service.execute(retry, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "processed" });
+    });
+    it("paired admission never retargets candidate review to an advanced provider head", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-advanced", "@maya review this", 81);
+      const candidate = await vi.waitFor(async () => {
+        await f.service.processPendingDeliveries();
+        const admitted = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId);
+        expect(admitted).toBeDefined();
+        return admitted!;
+      }, { timeout: 5000, interval: 50 });
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      installShadowRecorder(f, "c".repeat(40));
+      await expect(githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "c".repeat(40) })).rejects.toThrow();
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      expect(reviews.map(r => r.headSha)).toEqual(["b".repeat(40)]);
+    });
+    it("paired admission preserves low-trust boundaries without lending primary task authority", async () => {
+      const f = await pairedReviewFixture();
+      await db.update(agents).set({ permissions: { trustPreset: "low_trust_review" } }).where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+      await deliverShadowTestMention(f, "paired-trust", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate.issue.sourceTrust?.preset).toBe("low_trust_review");
+      expect(candidate.issue.executionPolicy?.authorizationPolicy).toMatchObject({ trustBoundary: {
+        companyId: f.companyId, rootIssueId: candidate.issue.id, issueIds: [candidate.issue.id], allowedAgentIds: [f.replacementAgentId],
+      } });
+    });
+    it("paired admission identities and capture authority cannot be rewritten", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-immutable", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, primary.issue.id));
+      await expect(db.execute(sql`update chat_github_review_candidates set issue_id = ${primary.issue.id}, conversation_id = ${primary.conversation.id}, comment_id = ${comment!.id} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await f.service.processPendingDeliveries();
+      await expect(db.execute(sql`update chat_github_review_enrollments set head_sha = ${"c".repeat(40)} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await expect(db.execute(sql`update chat_github_review_candidates set agent_id = ${f.assignedAgentId} where endpoint_id = ${f.endpoint.id}`)).rejects.toThrow();
+      await expect(db.execute(sql`update chat_deliveries set normalized_event = normalized_event - 'githubPairingSeed' where endpoint_id = ${f.endpoint.id} and normalized_event ? 'githubPairingSeed'`)).rejects.toThrow();
+    });
+    it("shadow final replies stay internal before begin_review and after config changes", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-final-intent", "@maya review this");
+      const session = await shadowTestSession(f, conversation);
+      await db.update(heartbeatRuns).set({ contextSnapshot: await chatWakeContext({
+        endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: "shadow-final-intent",
+      }) }).where(eq(heartbeatRuns.id, session.runId));
+      await saveShadowMode(f, false);
+      const { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } = await import("../services/chat-run-publications.js");
+      const comment = await issueService(db).addComment(
+        conversation.issueId, "Private candidate answer",
+        { agentId: session.agentId, runId: session.runId },
+        { authorType: "agent", authorizationReason: CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON },
+      );
+      expect(comment.body).toBe("Private candidate answer");
+      const storage = createStorageService();
+      const stored = await storage.storage.putFile({
+        companyId: f.companyId, namespace: `issues/${conversation.issueId}`,
+        originalFilename: "candidate.txt", contentType: "text/plain", body: Buffer.from("Private attachment"),
+      });
+      await issueService(db).createAttachment({
+        issueId: conversation.issueId, issueCommentId: comment.id,
+        provider: stored.provider, objectKey: stored.objectKey, contentType: stored.contentType,
+        byteSize: stored.byteSize, sha256: stored.sha256, originalFilename: stored.originalFilename,
+        createdByAgentId: session.agentId, createdByRunId: session.runId,
+      });
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      await f.service.processPendingPublications();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it("shadow explicit sends return a capture outcome without a publication row", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-explicit-intent", "@maya review this");
+      await saveShadowMode(f, false);
+      const comment = await issueService(db).addComment(conversation.issueId, "Private board reply", { userId: "owner-user" });
+      expect(await f.service.publishComment(f.endpoint.id, conversation.id, comment.id)).toMatchObject({ status: "shadow_stored" });
+      expect(await f.service.publishBoardMessage(f.endpoint.id, conversation.id, "Private explicit reply", "capture-send", "owner-user")).toMatchObject({ status: "shadow_stored" });
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it.each(["running", "failed", "timed_out", "cancelled", "succeeded"] as const)(
+      "shadow %s milestones create zero intents after disabling shadow",
+      async (status) => {
+        const f = await reviewBotFixture();
+        await saveShadowMode(f, true);
+        const conversation = await deliverShadowTestMention(f, `shadow-milestone-${status}`, "@maya review this");
+        const session = await shadowTestSession(f, conversation);
+        await db.update(heartbeatRuns).set({ status, contextSnapshot: {
+          ...await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: `shadow-milestone-${status}` }),
+        } }).where(eq(heartbeatRuns.id, session.runId));
+        await saveShadowMode(f, false);
+        await enqueueChatRunMilestones(db);
+        expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      },
+    );
+    it("shadow database tripwires reject direct outbound inserts but permit local wake bookkeeping", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-db-tripwire", "@maya review this");
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id));
+      await saveShadowMode(f, false);
+      await expect(db.insert(chatPublications).values({
+        companyId: f.companyId, endpointId: f.endpoint.id, conversationId: conversation.id,
+        issueId: conversation.issueId, idempotencyKey: randomUUID(), payload: { text: "Bypass" },
+      })).rejects.toThrow();
+      for (const kind of ["github_review_publication", "github_review_check", "receipt_reaction", "provider_effect", "future_outbound_kind"]) {
+        await expect(db.insert(chatActions).values({
+          companyId: f.companyId, endpointId: f.endpoint.id, deliveryId: delivery.id,
+          kind, providerActionId: randomUUID(), payload: {}, status: "received",
+        })).rejects.toThrow();
+      }
+      await expect(db.insert(chatActions).values({
+        companyId: f.companyId, endpointId: f.endpoint.id, deliveryId: delivery.id,
+        kind: "inbound_wakeup", providerActionId: randomUUID(), payload: {}, status: "processed",
+      })).resolves.toBeDefined();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+    });
+    it("cancels a legacy check bound only to a captured admission without a review row", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const admitted = await admitShadowTestPullRequest(f, head);
+      // Model an intent from before the insertion tripwire. Its exact delivery
+      // has capture authority, even if no review record survived the old run.
+      await db.update(chatDeliveries).set({ githubShadowLabel: "meta-shadow" }).where(eq(chatDeliveries.id, admitted.deliveryId));
+      await db.delete(chatGitHubReviews).where(eq(chatGitHubReviews.id, admitted.id));
+      const recorder = installShadowRecorder(f, head);
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      const [action] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(action).toMatchObject({ status: "cancelled", result: { code: "shadow_mode" } });
+      expect(recorder.mutations).toHaveLength(0);
+    });
+    it("shadow interaction prompts and exact event/run-only actions create no intents", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "shadow-interaction-intent", "@maya review this");
+      const session = await shadowTestSession(f, conversation);
+      const context = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: "shadow-interaction-intent" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, session.runId));
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id));
+      await saveShadowMode(f, false);
+      await issueThreadInteractionService(db).create(
+        { id: conversation.issueId, companyId: f.companyId },
+        { kind: "request_confirmation", continuationPolicy: "wake_assignee", sourceRunId: session.runId,
+          title: "Candidate question", payload: { version: 1, prompt: "Private question?", acceptLabel: "Yes", rejectLabel: "No" } },
+        { agentId: session.agentId, runId: session.runId },
+      );
+      const { insertChatActions } = await import("../services/chat-publication-authority.js");
+      for (const payload of [
+        { event: { deliveryId: delivery.providerEventId } },
+        { runId: session.runId },
+        { session: { issueId: conversation.issueId, runId: session.runId } },
+      ]) {
+        const value = { companyId: f.companyId, endpointId: f.endpoint.id, kind: "future_outbound_kind", providerActionId: randomUUID(), payload };
+        expect(await insertChatActions(db, value)).toEqual([]);
+        await expect(db.insert(chatActions).values(value)).rejects.toThrow();
+      }
+      await f.service.processPendingPublications();
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, conversation.issueId))).toHaveLength(0);
+      expect(await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), inArray(chatActions.kind, ["future_outbound_kind", "confirmation_response", "receipt_reaction"])))).toHaveLength(0);
+    });
+    it("keeps manual shadow admission capture-only before begin_review after disabling shadow", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "manual-shadow-toggle", "@maya review this");
+      expect(await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.endpointId, f.endpoint.id))).toHaveLength(0);
+      const session = await shadowTestSession(f, conversation);
+      await saveShadowMode(f, false);
+      const head = "b".repeat(40);
+      const recorder = installShadowRecorder(f, head, async (url, method) => {
+        if (method === "GET" && url.endsWith("/pulls/97")) return Response.json({
+          number: 97, title: "Manual review", body: "", state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        });
+      });
+      // A new service instance cannot rely on in-memory admission state.
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "comment", {
+        body: "Must remain private", idempotencyKey: "before-begin",
+      })).toMatchObject({ status: "shadow_stored", actionId: null, shadowLabel: "meta-shadow" });
+      expect(await shadowTestActions(f.endpoint.id, "github_review_publication")).toHaveLength(0);
+      await service.execute(session, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(session, "submit_review", shadowTestAssessment(head))).toMatchObject({
+        status: "shadow_stored", shadowLabel: "meta-shadow",
+      });
+      const [review] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, conversation.issueId));
+      expect(review).toMatchObject({ shadowLabel: "meta-shadow", state: "completed", checkId: null });
+      await service.processPending();
+      await githubReviewCheckService(db, f.providerFetch).processPending();
+      expect(await shadowTestActions(f.endpoint.id, "github_review_check")).toHaveLength(0);
+      expect(await shadowTestActions(f.endpoint.id, "github_review_publication")).toHaveLength(0);
+      expect(recorder.mutations).toHaveLength(0);
+      await f.service.shutdown();
+    });
+    it("recovers deferred manual shadow admission after config changes without in-memory state", async () => {
+      const deferred: Array<() => void | Promise<void>> = [];
+      const f = await reviewBotFixture({ deferWebhookProcessing: true, scheduleDeferredWork: task => deferred.push(task) });
+      await saveShadowMode(f, true);
+      await deliverShadowTestMention(f, "deferred-shadow", "@maya recover this review");
+      expect(await db.select().from(chatConversations).where(eq(chatConversations.endpointId, f.endpoint.id))).toHaveLength(0);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(delivery).toMatchObject({ githubShadowLabel: "meta-shadow", conversationId: null });
+      await saveShadowMode(f, false);
+      await f.service.shutdown();
+      // Do not run the old closure: recovery must reconstruct the authenticated
+      // event from durable state, including its original capture restriction.
+      const recovery = createService(new FakeChatSdkRuntime(), f.providerFetch);
+      // Make the persisted reorder delay due; do not depend on wall-clock sleeps.
+      await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, delivery.id));
+      await recovery.service.processPendingDeliveries(1, delivery.id);
+      const [conversation] = await db.select().from(chatConversations).where(eq(chatConversations.endpointId, f.endpoint.id));
+      expect(conversation).toMatchObject({ githubShadowLabel: "meta-shadow" });
+      const session = await shadowTestSession(f, conversation);
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "comment", {
+        body: "Still private after recovery", idempotencyKey: "recovered-shadow",
+      })).toMatchObject({ status: "shadow_stored", actionId: null });
+      expect(await shadowTestActions(f.endpoint.id, "github_review_publication")).toHaveLength(0);
+      expect(await shadowTestActions(f.endpoint.id, "receipt_reaction")).toHaveLength(0);
+      expect(recorder.mutations).toHaveLength(0);
+      await recovery.service.shutdown();
+    });
+    it("persists immutable manual capture authority through duplicate delivery and later task messages", async () => {
+      const f = await reviewBotFixture();
+      await saveShadowMode(f, true);
+      const conversation = await deliverShadowTestMention(f, "immutable-shadow", "@maya first review");
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id));
+      expect(delivery.githubShadowLabel).toBe("meta-shadow");
+      expect(conversation.githubShadowLabel).toBe("meta-shadow");
+      await saveShadowMode(f, false);
+      await deliverShadowTestMention(f, "immutable-shadow", "@maya first review");
+      expect(await db.select().from(chatDeliveries).where(eq(chatDeliveries.conversationId, conversation.id))).toHaveLength(1);
+      await deliverShadowTestMention(f, "later-primary-message", "@maya retry the review");
+      expect(await shadowTestActions(f.endpoint.id, "receipt_reaction")).toHaveLength(0);
+      const [stored] = await db.select().from(chatConversations).where(eq(chatConversations.id, conversation.id));
+      expect(stored.githubShadowLabel).toBe("meta-shadow");
+      for (const label of [null, "different", ""]) {
+        await expect(db.update(chatDeliveries).set({ githubShadowLabel: label }).where(eq(chatDeliveries.id, delivery.id))).rejects.toThrow();
+        await expect(db.update(chatConversations).set({ githubShadowLabel: label }).where(eq(chatConversations.id, conversation.id))).rejects.toThrow();
+      }
+      const [otherTask] = await db.insert(issues).values({ companyId: f.companyId, title: "Cannot rebind capture authority" }).returning();
+      await expect(db.update(chatConversations).set({ issueId: otherTask.id }).where(eq(chatConversations.id, conversation.id))).rejects.toThrow();
+      await f.service.shutdown();
+    });
     it("shadow mode cancels generic chat publications for live and pinned shadow reviews", async () => {
       const f = await reviewBotFixture();
       await saveShadowMode(f, true);
@@ -3782,8 +7624,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .select()
         .from(chatConversations)
         .where(eq(chatConversations.issueId, admitted.issueId));
-      // A plain mention conversation on the same endpoint has no review
-      // row, so only the live shadow config can suppress its publications.
+      // A plain mention has no review row. Its admission authority must still
+      // suppress output permanently, including after live shadow is disabled.
       const mentionConversation = await deliverShadowTestMention(
         f,
         "910001",
@@ -3792,8 +7634,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       if (!mentionConversation) throw new Error("Expected mention conversation");
       expect(mentionConversation.issueId).not.toBe(admitted.issueId);
       const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
-      const stageProbe = async (conversation: typeof mentionConversation) => {
-        const [row] = await db.insert(chatPublications).values({
+      // Seed pre-migration rows in the disposable database only. Transactional
+      // DDL holds the table lock and restores the tripwire even on rollback.
+      const stageProbe = async (conversation: typeof mentionConversation, legacy = true) => db.transaction(async (tx) => {
+        if (legacy) await tx.execute(sql`ALTER TABLE chat_publications DISABLE TRIGGER chat_publication_capture_only`);
+        const [row] = await tx.insert(chatPublications).values({
           companyId: f.companyId,
           endpointId: f.endpoint.id,
           conversationId: conversation.id,
@@ -3802,8 +7647,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           payload: { text: "Shadow gate probe" },
           state: "pending",
         }).returning();
+        if (legacy) await tx.execute(sql`ALTER TABLE chat_publications ENABLE TRIGGER chat_publication_capture_only`);
         return row;
-      };
+      });
       const liveProbe = await stageProbe(mentionConversation);
       await f.service.processPendingPublications();
       const [liveResult] = await db
@@ -3814,8 +7660,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "cancelled",
         redactedError: "Shadow review endpoint does not publish to GitHub",
       });
-      // Disabling shadow must not resurrect output from the pinned shadow
-      // review task, while ordinary conversations publish again.
+      // Disabling shadow must not resurrect either shadow-origin task.
       await saveShadowMode(f, false);
       const pinnedProbe = await stageProbe(reviewConversation);
       await f.service.processPendingPublications();
@@ -3833,10 +7678,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .select()
         .from(chatPublications)
         .where(eq(chatPublications.id, resumedProbe.id));
-      expect(resumedResult.state).toBe("published");
-      expect(
-        endpointRuntime?.posts.filter((post) => post.text === "Shadow gate probe"),
-      ).toHaveLength(1);
+      expect(resumedResult.state).toBe("cancelled");
+      expect(endpointRuntime?.posts.filter((post) => post.text === "Shadow gate probe")).toHaveLength(0);
+      // Positive control: a new task admitted after disabling shadow can publish.
+      const primaryConversation = await deliverShadowTestMention(f, "primary-after-toggle", "@maya new review", 98);
+      const primaryProbe = await stageProbe(primaryConversation, false);
+      await f.service.processPendingPublications();
+      const [primaryResult] = await db.select().from(chatPublications).where(eq(chatPublications.id, primaryProbe.id));
+      expect(primaryResult.state).toBe("published");
+      expect(endpointRuntime?.posts.filter((post) => post.text === "Shadow gate probe")).toHaveLength(1);
       await f.service.shutdown();
     });
     it("shadow mode stages no receipt reaction for GitHub mentions", async () => {
@@ -3947,6 +7797,64 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(endpointRuntime.reactions).toEqual([]);
       await f.service.shutdown();
     });
+    it.each([
+      { outcome: "blocking", state: "completed", score: 2, primaryScore: 5 },
+      { outcome: "passing", state: "completed", score: 5, primaryScore: 2 },
+      { outcome: "error", state: "error", score: 2, primaryScore: 5 },
+      { outcome: "incomplete", state: "incomplete", score: 2, primaryScore: 5 },
+      { outcome: "timeout", state: "running", score: 2, primaryScore: 5 },
+    ] as const)(
+      "primary gate ignores a newer same-head shadow $outcome outcome",
+      async ({ state: candidateState, score: candidateScore, primaryScore }) => {
+        const f = await reviewBotFixture();
+        const head = "b".repeat(40);
+        const recorder = installShadowRecorder(f, head);
+        const admitted = await admitShadowTestPullRequest(f, head);
+        const session = await shadowTestSession(f, admitted);
+        const [candidateTask] = await db.insert(issues).values({
+          companyId: f.companyId, title: "Isolated candidate", assigneeAgentId: f.assignedAgentId,
+        }).returning();
+        const [candidateRun] = await db.insert(heartbeatRuns).values({
+          companyId: f.companyId, agentId: f.assignedAgentId,
+          status: candidateState === "running" ? "timed_out" : "failed",
+          contextSnapshot: { issueId: candidateTask.id },
+        }).returning();
+        const [primaryDelivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, admitted.deliveryId));
+        const [candidateDelivery] = await db.insert(chatDeliveries).values({
+          ...primaryDelivery, id: randomUUID(), conversationId: null,
+          providerEventId: `candidate:${randomUUID()}`, deduplicationKey: randomUUID(),
+          githubShadowLabel: "meta-shadow",
+          // Paired arms can carry the same canonical provider event, but never
+          // borrow authority through that copied event's deliveryId string.
+        }).returning();
+        const [candidate] = await db.insert(chatGitHubReviews).values({
+          ...admitted, id: randomUUID(), issueId: candidateTask.id,
+          deliveryId: candidateDelivery.id, runId: candidateRun.id,
+          shadowLabel: "meta-shadow", state: candidateState,
+          assessment: candidateState === "completed" ? { ...shadowTestAssessment(head), score: candidateScore } : null,
+          createdAt: new Date(Date.now() + 1000),
+        }).returning();
+        const checks = githubReviewCheckService(db, f.providerFetch);
+        await checks.processPending();
+        const [check] = await shadowTestActions(f.endpoint.id, "github_review_check");
+        expect(check.status).toBe("received");
+        expect(check.result).toMatchObject({ state: "running" });
+        expect(recorder.mutations.some((call) => call.url.endsWith("/check-runs"))).toBe(true);
+        const reviewService = githubChatReviewService(db, f.providerFetch);
+        expect(await reviewService.execute(session, "submit_review", {
+          ...shadowTestAssessment(head), score: primaryScore,
+          ...(primaryScore === 5 ? { findings: [] } : {}),
+          summary: "Primary result", rationale: "Primary result is independent",
+        })).toMatchObject({ status: "processed", conclusion: primaryScore === 5 ? "success" : "failure" });
+        await db.update(chatActions).set({ result: { retryAt: new Date(0).toISOString() } })
+          .where(eq(chatActions.id, check.id));
+        await checks.processPending();
+        const [settled] = await shadowTestActions(f.endpoint.id, "github_review_check");
+        expect(settled).toMatchObject({ status: "processed", result: { code: "assessment_owns_check", reviewId: admitted.id } });
+        const [storedCandidate] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, candidate.id));
+        expect(storedCandidate).toEqual(candidate);
+      },
+    );
     it("cancels a check intent staged before shadow mode was enabled without any provider call", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
@@ -4072,7 +7980,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = await shadowTestSession(f, admitted);
       await saveShadowMode(f, false);
       const service = githubChatReviewService(db, f.providerFetch);
-      await service.execute(session, "read_pull_request", { section: "metadata" });
+      await expect(service.execute(session, "read_pull_request", { section: "metadata" })).rejects.toThrow("sealed admission snapshot");
       await service.execute(session, "begin_review", { reviewedCommit: head });
       expect(await service.execute(
         session,
@@ -17555,13 +21463,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId));
-      expect(rows).toHaveLength(8);
-    });
+    await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId));
+        expect(rows).toHaveLength(8);
+      },
+      // Eight comments plus eight durable wakes drain here. The default 1s
+      // waitFor budget flakes under full-shard CI load; the drain itself is
+      // asserted below, so wait generously for it to land.
+      { timeout: 15_000 },
+    );
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
@@ -17580,15 +21494,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Comment admission commits before the durable wake. Wait for this
     // company's last wake too, not merely its already-visible last comment.
     // The competing sweep may legitimately reconcile another fixture company.
-    await vi.waitFor(() => {
-      const calls = wakeup.mock.calls.filter(
-        (call) => call[0] === fixture.assignedAgentId,
-      );
-      expect(calls).toHaveLength(8);
-      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
-        comments.map((comment) => comment.id),
-      );
-    });
+    await vi.waitFor(
+      () => {
+        const calls = wakeup.mock.calls.filter(
+          (call) => call[0] === fixture.assignedAgentId,
+        );
+        expect(calls).toHaveLength(8);
+        expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+          comments.map((comment) => comment.id),
+        );
+      },
+      // Same eight-wake drain as above: generous budget under shard load.
+      { timeout: 15_000 },
+    );
     // The last comment and wakeup commit inside the lease. Under full-suite
     // load the assertions above can observe those effects one microtask before
     // the deferred owner's `finally` deletes its lease. Require prompt eventual
