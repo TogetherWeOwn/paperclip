@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { hasGitHubPrimaryBlinding } from "./chat-github-primary-blinding-state.js";
+import { isGitHubPrimaryReviewer } from "./chat-github-primary-reviewers.js";
 import type { Request, Response } from "express";
 import { notFound } from "../errors.js";
 
@@ -12,7 +13,7 @@ export const GITHUB_PRIMARY_BLINDING_VERSION = 1;
 type Visibility = ReturnType<typeof createGitHubPrimaryVisibility>;
 const passthrough: Visibility = { active: false, candidateAgentIds: [], filter: value => value, assertVisible() {} };
 type Waiter = { resolve: (value: Visibility) => void; reject: (error: unknown) => void };
-type CachedVisibility = { snapshot?: { key: string; value: Visibility }; waiters: Waiter[]; running: boolean };
+type CachedVisibility = { snapshot?: { key: string; value: Visibility; databaseSnapshot?: string }; waiters: Waiter[]; running: boolean };
 const visibilityCaches = new WeakMap<Db, Map<string, CachedVisibility>>();
 const MAX_CACHED_COMPANIES = 64;
 
@@ -71,7 +72,8 @@ export function githubPrimaryVisibilityQuery(companyId: string, previousKey: str
       select tokens, array(select agent_id::text from candidate_agents order by agent_id) as agents from identities
     ), versioned as materialized (
       select *, encode(sha256(convert_to(array_to_string(agents, ',') || '/' || array_to_string(tokens, ','), 'UTF8')), 'hex') as key from snapshot
-    ) select key, agents, case when key is distinct from ${previousKey} then tokens end as tokens from versioned`;
+    ) select key, agents, case when key is distinct from ${previousKey} then tokens end as tokens,
+      pg_current_snapshot()::text as database_snapshot from versioned`;
 }
 
 /** Every caller gets a snapshot started AFTER it asked. Coalesce only waiting
@@ -89,13 +91,30 @@ export async function githubPrimaryBlinding(db: Db, companyId: string): Promise<
   const drain = async () => {
     const waiters = current.waiters.splice(0);
     try {
-      const [row] = await db.execute<{ key: string; agents: string[]; tokens: string[] | null }>(
-        githubPrimaryVisibilityQuery(companyId, current.snapshot?.key ?? null));
-      if (!row) throw new Error("Review visibility unavailable");
-      if (row.key !== current.snapshot?.key) {
-        if (!row.tokens) throw new Error("Review visibility aliases unavailable");
-        current.snapshot = { key: row.key, value: row.agents.length
-          ? createGitHubPrimaryVisibility(new Set(row.tokens), row.agents) : passthrough };
+      // Equal MVCC snapshots prove that no transaction's writes became visible,
+      // hence no candidate identity/alias can have changed. This history-independent statement
+      // avoids computing the full fingerprint twice on an unchanged request.
+      // Compare the entire snapshot (including in-progress XIDs), not just xmax:
+      // an older transaction may commit a LATE_ALIAS_CANARY during the request.
+      // Unrelated commits conservatively fall back to the candidate fingerprint;
+      // no write-path triggers, locks, timestamps or statistics are involved.
+      let unchanged = false;
+      if (current.snapshot?.databaseSnapshot) {
+        const [probe] = await db.execute<{ database_snapshot: string }>(sql`
+          select pg_current_snapshot()::text as database_snapshot`);
+        if (!probe?.database_snapshot) throw new Error("Review visibility watermark unavailable");
+        unchanged = probe.database_snapshot === current.snapshot.databaseSnapshot;
+      }
+      if (!unchanged) {
+        const [row] = await db.execute<{ key: string; agents: string[]; tokens: string[] | null; database_snapshot?: string }>(
+          githubPrimaryVisibilityQuery(companyId, current.snapshot?.key ?? null));
+        if (!row) throw new Error("Review visibility unavailable");
+        if (row.key !== current.snapshot?.key) {
+          if (!row.tokens) throw new Error("Review visibility aliases unavailable");
+          current.snapshot = { key: row.key, value: row.agents.length
+            ? createGitHubPrimaryVisibility(new Set(row.tokens), row.agents) : passthrough };
+        }
+        current.snapshot!.databaseSnapshot = row.database_snapshot;
       }
       for (const waiter of waiters) waiter.resolve(current.snapshot!.value);
     } catch (error) {
@@ -213,12 +232,17 @@ export function createGitHubPrimaryVisibility(tokens: ReadonlySet<string>, candi
  * Deny direct resource paths before any stream/attachment handler can run, then
  * filter collection/enriched JSON at the final response seam, not just /issues. */
 export async function installGitHubPrimaryApiBlinding(db: Db, companyId: string, req: Request, res: Response) {
-  const visibility = await githubPrimaryBlinding(db, companyId);
-  if (req.actor.type === "agent" && req.actor.agentId && visibility.candidateAgentIds.includes(req.actor.agentId)) return;
-  visibility.assertVisible(req.originalUrl);
-  visibility.assertVisible(req.body);
+  if (req.actor.type !== "agent" || !req.actor.agentId) return;
+  const agentId = req.actor.agentId;
+  const visibility = isGitHubPrimaryReviewer(db, companyId, agentId) ? await githubPrimaryBlinding(db, companyId) : null;
+  if (visibility?.candidateAgentIds.includes(agentId)) return;
+  visibility?.assertVisible(req.originalUrl);
+  visibility?.assertVisible(req.body);
   const json = res.json.bind(res);
   res.json = ((body: unknown) => {
+    // Non-primary responses are byte-identical, without any DB work or JSON walk.
+    // Recheck the in-memory set in case this agent was promoted during the route.
+    if (!visibility && !isGitHubPrimaryReviewer(db, companyId, agentId)) return json(body);
     // Revalidate candidate-scoped identities at response time. Never reuse an
     // ingress snapshot without checking for aliases committed during the request.
     void githubPrimaryBlinding(db, companyId).then(current => {

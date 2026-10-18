@@ -8,7 +8,9 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { describe, expect, it } from "vitest";
-import { githubPrimaryBlinding } from "../services/chat-github-primary-blinding.js";
+import type { Request, Response } from "express";
+import { githubPrimaryBlinding, installGitHubPrimaryApiBlinding } from "../services/chat-github-primary-blinding.js";
+import { initializeGitHubPrimaryReviewers } from "../services/chat-github-primary-reviewers.js";
 import { initializeGitHubPrimaryBlinding } from "../services/chat-github-primary-blinding-state.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 
@@ -17,6 +19,8 @@ const postgres = createRequire(import.meta.resolve("@paperclipai/db"))("postgres
 const suite = process.env.BLINDING_PERF_EVIDENCE ? describe : describe.skip;
 const company = "00000000-0000-4000-8000-000000000001";
 const offCompany = "00000000-0000-4000-8000-000000000002";
+const primaryAgent = "00000000-0000-4000-8000-000000000003";
+const nonPrimaryAgent = "00000000-0000-4000-8000-000000000004";
 const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
 function gate() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
 
@@ -42,7 +46,7 @@ suite("primary blinding lock-free production write and request budgets", () => {
     };
     try {
       await client.unsafe("create schema blinding_fixture; create schema baseline_fixture");
-      for (const table of ["chat_github_review_candidates", "heartbeat_runs", "issues", "issue_comments", "issue_attachments", "assets", "chat_github_reviews", "documents", "issue_documents", "document_revisions"]) {
+      for (const table of ["chat_endpoints", "chat_github_review_candidates", "heartbeat_runs", "issues", "issue_comments", "issue_attachments", "assets", "chat_github_reviews", "documents", "issue_documents", "document_revisions"]) {
         await client.unsafe(`create table blinding_fixture.${table} (like public.${table} including defaults including indexes)`);
       }
       expect(await client`select 1 from pg_trigger where tgname ~ '^github_.*_visibility$'`).toHaveLength(0);
@@ -92,11 +96,23 @@ suite("primary blinding lock-free production write and request budgets", () => {
       metrics.fixture = actualCounts;
       await setShadow(true);
       await initializeGitHubPrimaryBlinding(db);
+      await client`insert into chat_endpoints (company_id, connection_id, provider, public_id, assigned_agent_id)
+        values (${company}, gen_random_uuid(), 'github', 'perf-primary', ${primaryAgent}),
+          (${offCompany}, gen_random_uuid(), 'github', 'perf-off-primary', ${primaryAgent})`;
+      await initializeGitHubPrimaryReviewers(db);
       const body = [{ id: "public-row", title: "Visible" }];
-      const request = async (id = company) => {
-        (await githubPrimaryBlinding(db, id)).assertVisible("/api/issues?limit=20");
-        return (await githubPrimaryBlinding(db, id)).filter(body);
-      };
+      // Measure the actual ingress + response seam, not two synthetic full reads.
+      // Authentication, route work and HTTP transport are outside this blinding budget.
+      const request = (id = company, agentId = primaryAgent) => new Promise<unknown>((resolve, reject) => {
+        const req = { actor: { type: "agent", agentId, companyId: id }, originalUrl: "/api/issues?limit=20" } as Request;
+        let status = 200;
+        const res = { json: (value: unknown) => {
+          if (status >= 400) reject(new Error(`Blinding returned ${status}: ${JSON.stringify(value)}`));
+          else resolve(value);
+          return res;
+        }, status: (code: number) => { status = code; return res; } } as unknown as Response;
+        void installGitHubPrimaryApiBlinding(db, id, req, res).then(() => res.json(body)).catch(reject);
+      });
       queries.length = 0;
       const coldStart = performance.now();
       expect(await request()).toEqual(body);
@@ -109,7 +125,7 @@ suite("primary blinding lock-free production write and request budgets", () => {
       const visit = (node: Record<string, any>) => { nodes.push(node); for (const child of node.Plans ?? []) visit(child); };
       for (const plan of plans) visit((plan as any[])[0].Plan);
       expect(nodes.filter(n => n["Relation Name"] === "heartbeat_runs" && /Seq Scan/.test(n["Node Type"]))).toEqual([]);
-      const measure = async (minimumCount: number, id: string, minimumDurationMs = 0) => {
+      const measure = async (minimumCount: number, id: string, minimumDurationMs = 0, agentId = primaryAgent) => {
         let next = 0;
         const timings: number[] = [];
         const errors: string[] = [];
@@ -119,7 +135,7 @@ suite("primary blinding lock-free production write and request budgets", () => {
           while (next < minimumCount || performance.now() - start < minimumDurationMs) {
             next++;
             const t = performance.now();
-            try { await request(id); } catch (error) { errors.push(String(error)); }
+            try { await request(id, agentId); } catch (error) { errors.push(String(error)); }
             timings.push(performance.now() - t);
             await yieldTurn();
           }
@@ -130,6 +146,12 @@ suite("primary blinding lock-free production write and request budgets", () => {
           p95Ms: timings[Math.ceil(timings.length * .95) - 1]!, samplesMs: timings };
       };
       metrics.quiet = await measure(400, company);
+      const nonPrimary = await measure(2000, company, 0, nonPrimaryAgent);
+      metrics.nonPrimary = nonPrimary;
+      expect(nonPrimary.queries).toBe(0);
+      expect(nonPrimary.errors).toEqual([]);
+      expect(await request(company, nonPrimaryAgent)).toBe(body);
+      expect(JSON.stringify(await request(company, nonPrimaryAgent))).toBe(JSON.stringify(body));
       const stable = await githubPrimaryBlinding(db, company);
       let stop = false;
       const completedWritesAtMs: number[] = [];
@@ -268,7 +290,8 @@ suite("primary blinding lock-free production write and request budgets", () => {
       metrics.commentWriteOverheadPercent = { on: 100 * (writesMetric.on!.medianMs / writesMetric.baseline!.medianMs - 1),
         off: 100 * (writesMetric.off!.medianMs / writesMetric.baseline!.medianMs - 1) };
       console.log(JSON.stringify({ coldMs: metrics.coldMs, churnP95Ms: churn.p95Ms, achievedWritesPerSecond,
-        offP95Ms: off.p95Ms, offQueries: off.queries, locks, writesMetric }));
+        offP95Ms: off.p95Ms, offQueries: off.queries,
+        nonPrimaryP95Ms: nonPrimary.p95Ms, nonPrimaryQueries: nonPrimary.queries, locks, writesMetric }));
       // Soft budgets report every unmet requirement in one expensive fixture run;
       // nothing is retried or relaxed to turn a loaded-host failure into a pass.
       expect.soft(churn.errors, "A3: no snapshot retry exhaustion or other request errors").toEqual([]);

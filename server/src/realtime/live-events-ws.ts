@@ -4,12 +4,23 @@ import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, chatGitHubReviewCandidates, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { githubPrimaryBlinding } from "../services/chat-github-primary-blinding.js";
+import { hasGitHubPrimaryBlinding } from "../services/chat-github-primary-blinding-state.js";
+import { isGitHubPrimaryReviewer } from "../services/chat-github-primary-reviewers.js";
+
+async function isCandidateAgent(db: Db, companyId: string, agentId: string) {
+  if (!hasGitHubPrimaryBlinding(db, companyId)) return false;
+  // Candidate confinement is independent of primary-side blinding. Probe only
+  // admission, not the full alias snapshot, for non-primary sockets too.
+  const [candidate] = await db.select({ id: chatGitHubReviewCandidates.id }).from(chatGitHubReviewCandidates)
+    .where(and(eq(chatGitHubReviewCandidates.companyId, companyId), eq(chatGitHubReviewCandidates.agentId, agentId))).limit(1);
+  return !!candidate;
+}
 
 interface WsSocket {
   readyState: number;
@@ -215,8 +226,7 @@ async function authorizeUpgrade(
   }
 
   // Upgrades bypass Express actorMiddleware, so enforce candidate confinement here too.
-  const visibility = await githubPrimaryBlinding(db, companyId);
-  if (visibility.candidateAgentIds.includes(key.agentId)) return null;
+  if (await isCandidateAgent(db, companyId, key.agentId)) return null;
 
   await db
     .update(agentApiKeys)
@@ -277,12 +287,13 @@ export function setupLiveEventsWebSocketServer(
       }
       delivery = delivery.then(async () => {
         if (socket.readyState !== WebSocket.OPEN) return;
-        const visibility = await githubPrimaryBlinding(db, context.companyId);
-        if (visibility.candidateAgentIds.includes(context.actorId)) {
+        if (await isCandidateAgent(db, context.companyId, context.actorId)) {
           socket.close(1008, "forbidden");
           return;
         }
-        const payload = visibility.filter(event.payload);
+        const payload = isGitHubPrimaryReviewer(db, context.companyId, context.actorId)
+          ? (await githubPrimaryBlinding(db, context.companyId)).filter(event.payload)
+          : event.payload;
         if (payload !== undefined && socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ ...event, payload }));
         }

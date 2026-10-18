@@ -19,6 +19,23 @@ Scope
   comparisonEligibility.certifiedClean remains false: this is NOT a certified
   fair comparison or permission to replace the production Claude gate.
 
+Blinding scope
+  Primary-side API, tool-gateway and live-event blinding applies only to agents
+  assigned to a GitHub chat endpoint in the same company (provider='github',
+  assigned_agent_id), not the whole fleet. Startup loads this set in memory;
+  GitHub endpoint create/update refreshes it, failing closed during changes or
+  on load failure. Assignments are currently immutable in the public update API;
+  maintenance reassignment must use withGitHubPrimaryReviewerChange (or restart
+  before serving requests), never an unfenced direct database write. Candidate
+  confinement and board/operator visibility are unchanged. Accepted deviation:
+  non-primary agents may read candidate artifacts and could indirectly relay
+  them to the primary. That unlikely contamination would favor the primary
+  (Claude), the conservative direction for a replace-Claude decision. This is
+  not strict organization-wide noninterference or complete comparison certification.
+  Equal PostgreSQL MVCC snapshots permit reusing visibility between ingress and
+  response; any transaction-visibility change rechecks candidate identities,
+  including aliases committed late by transactions already open at ingress.
+
 Primary input provenance
   Pair capture must not delay the production wake. A primary that started before
   seed.admittedAt therefore stays live for its whole run; it must not switch to

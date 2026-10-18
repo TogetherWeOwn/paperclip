@@ -12,6 +12,7 @@ import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
 import { githubPrimaryBlinding } from "./chat-github-primary-blinding.js";
+import { isGitHubPrimaryReviewer } from "./chat-github-primary-reviewers.js";
 import { runIdentityContexts } from "@paperclipai/db";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
@@ -5328,9 +5329,10 @@ export function createToolGatewayService(
     await assertGatewayTokenAction(session, input.method);
     if (await githubCandidateRunBoundary(db, session))
       throw new ToolGatewayHttpError(403, "Paired candidates cannot read MCP resources or prompts", "github_candidate_context_denied");
-    const visibility = session.agentId ? await githubPrimaryBlinding(db, session.companyId) : null;
+    const primaryBlinding = () => session.agentId && isGitHubPrimaryReviewer(db, session.companyId, session.agentId);
+    const visibility = primaryBlinding() ? await githubPrimaryBlinding(db, session.companyId) : null;
     visibility?.assertVisible(input.params);
-    const visibleContext = async (value: unknown) => session.agentId
+    const visibleContext = async (value: unknown) => primaryBlinding()
       ? (await githubPrimaryBlinding(db, session.companyId)).filter(value) : value;
     const connections = await fullyAssignedMcpConnections(session);
     if (input.method === "resources/list") {
@@ -9712,7 +9714,8 @@ export function createToolGatewayService(
         callerHeaders: input.callerHeaders,
       });
       await assertGatewayTokenAction(session, "tools/call");
-      const primaryBlinding = session.agentId && !(await githubCandidateRunBoundary(db, session));
+      const nonCandidateAgent = session.agentId && !(await githubCandidateRunBoundary(db, session));
+      let primaryBlinding = nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
       if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(input.parameters);
       let invocationId = String(randomUUID());
       const startedAt = Date.now();
@@ -10428,6 +10431,7 @@ export function createToolGatewayService(
       });
 
       try {
+        primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
         if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(effectiveParameters);
         const executionTimeoutMs = timeoutMs(input.timeoutMs);
         if (
@@ -10521,6 +10525,7 @@ export function createToolGatewayService(
                 executeBuiltinTool(session, tool, effectiveParameters, invocationId),
                 executionTimeoutMs,
               );
+        primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
         const result = primaryBlinding
           ? (await githubPrimaryBlinding(db, session.companyId)).filter(unfilteredResult) ?? { content: "Not found", data: null }
           : unfilteredResult;

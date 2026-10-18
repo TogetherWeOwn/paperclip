@@ -227,6 +227,7 @@ import {
   unprocessable,
 } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { withGitHubPrimaryReviewerChange } from "./chat-github-primary-reviewers.js";
 import { redactSensitiveText } from "../redaction.js";
 import type { StorageService } from "../storage/types.js";
 import {
@@ -6127,7 +6128,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const name = (
       input.name?.trim() || `${PROVIDER_LABELS[input.provider]} — ${agent.name}`
     ).slice(0, 145);
-    await db.transaction(async (tx) => {
+    const persist = () => db.transaction(async (tx) => {
       if (input.provider === "github") {
         // Match saveConfiguration's agent lock so even an absent arm cannot be
         // assigned concurrently with creation of a primary endpoint.
@@ -6227,6 +6228,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         },
       });
     });
+    if (input.provider === "github") await withGitHubPrimaryReviewerChange(db, companyId, persist);
+    else await persist();
     await logActivity(db, {
       companyId,
       actorType: "user",
@@ -6251,7 +6254,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
     if (initial.endpoint.provider === "agentmail") throw badRequest("Use the email inbox API for AgentMail");
-    await withCredentialMutationLease(
+    const persist = () => withCredentialMutationLease(
       initial.endpoint,
       async (credentialLease) => {
         // Reach changes share the provider-transport lane with publications.
@@ -6308,6 +6311,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         });
       },
     );
+    // Assignments are currently immutable through UpdateChatEndpointInput. Keep
+    // this mutation seam refreshed as well, including operator maintenance changes.
+    if (initial.endpoint.provider === "github") await withGitHubPrimaryReviewerChange(db, initial.endpoint.companyId, persist);
+    else await persist();
     return get(endpointId);
   }
 

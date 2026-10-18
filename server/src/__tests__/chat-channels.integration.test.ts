@@ -3811,6 +3811,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate: 1 }] },
       }, "owner-user");
       installShadowRecorder(f, "b".repeat(40));
+      const { initializeGitHubPrimaryReviewers } = await import("../services/chat-github-primary-reviewers.js");
+      await initializeGitHubPrimaryReviewers(db);
       return f;
     }
     async function pairedTasks(endpointId: string) {
@@ -4559,8 +4561,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             name: "blinding reader", responsibleUserId: "owner-user", keyHash: createHash("sha256").update(key).digest("hex") });
           const visible = await request(app).get(`/api/companies/${f.companyId}/issues`).set("Authorization", `Bearer ${key}`);
           expect(visible.status).toBe(200);
-          expect(visible.body.map((row: { id: string }) => row.id)).toEqual([primary.issue.id]);
-          expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${key}`)).status).toBe(404);
+          const isPrimary = readerId === primarySession.agentId;
+          expect(visible.body.map((row: { id: string }) => row.id).sort()).toEqual(
+            (isPrimary ? [primary.issue.id] : [primary.issue.id, candidate.issue.id]).sort());
+          expect((await request(app).get(`/api/issues/${candidate.issue.id}/comments`).set("Authorization", `Bearer ${key}`)).status).toBe(isPrimary ? 404 : 200);
         }
         const reviews = await request(app).get(`/api/companies/${f.companyId}/reviews`).set("Authorization", `Bearer ${token}`);
         expect(reviews.body.every((r: { shadowLabel: string | null }) => !r.shadowLabel)).toBe(true);
@@ -4580,6 +4584,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
         else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
       }
+    });
+    it("primary reviewer scope follows GitHub endpoint creation and update refreshes", async () => {
+      const f = await pairedReviewFixture();
+      const { isGitHubPrimaryReviewer } = await import("../services/chat-github-primary-reviewers.js");
+      const [first, replacement, slack] = await db.insert(agents).values(["New primary", "Replacement primary", "Slack reader"].map(name =>
+        ({ companyId: f.companyId, name, role: "engineer" as const, status: "idle" as const }))).returning();
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(false);
+      const endpoint = await f.service.create(f.companyId, { provider: "github", assignedAgentId: first!.id }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(true);
+      await f.service.create(f.companyId, { provider: "slack", assignedAgentId: slack!.id }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, slack!.id)).toBe(false);
+      // The public update schema has no reassignment field; simulate maintenance
+      // and verify the existing endpoint update seam refreshes the assignment.
+      await db.update(chatEndpoints).set({ assignedAgentId: replacement!.id }).where(eq(chatEndpoints.id, endpoint!.id));
+      await f.service.update(endpoint!.id, { allowDirectMessages: true }, "owner-user");
+      expect(isGitHubPrimaryReviewer(db, f.companyId, first!.id)).toBe(false);
+      expect(isGitHubPrimaryReviewer(db, f.companyId, replacement!.id)).toBe(true);
+      expect(isGitHubPrimaryReviewer(db, f.companyId, f.assignedAgentId)).toBe(true);
     });
     it("primary blinding reuses versioned snapshots and refreshes newly written aliases", async () => {
       const f = await pairedReviewFixture();
@@ -4679,6 +4701,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(result)).not.toContain(candidate.issue.id);
       expect(JSON.stringify(result)).not.toContain("CANDIDATE_RESULT_CANARY");
       expect(JSON.stringify(result)).not.toContain("LATE_ALIAS_CANARY");
+      const [builder] = await db.insert(agents).values({ companyId: f.companyId, name: "Non-primary tool reader", role: "engineer", status: "idle" }).returning();
+      const builderSession = await shadowTestSession({ ...f, assignedAgentId: builder!.id }, { issueId: primary.issue.id });
+      const builderAccess = await gateway.createSession(builderSession);
+      const unblinded = await gateway.executeTool({ sessionToken: builderAccess.token, tool: tool.name, parameters: {} });
+      expect(unblinded.status).toBe("completed");
+      expect(JSON.stringify(unblinded)).toContain("CANDIDATE_RESULT_CANARY");
+      expect(JSON.stringify(unblinded)).toContain("LATE_ALIAS_CANARY");
     });
     it("paired primary blinding also seals the live API event stream", async () => {
       const f = await pairedReviewFixture();
@@ -4692,8 +4721,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const { WebSocket } = await import("ws");
       const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
       const { publishLiveEvent } = await import("../services/live-events.js");
+      const [builder] = await db.insert(agents).values({ companyId: f.companyId, name: "Non-primary live reader", role: "engineer", status: "idle" }).returning();
       const keys: string[] = [];
-      for (const agentId of [f.assignedAgentId, f.replacementAgentId]) {
+      for (const agentId of [f.assignedAgentId, f.replacementAgentId, builder!.id]) {
         const key = `pc_test_${randomUUID()}`; keys.push(key);
         await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId, name: "live reader", keyHash: createHash("sha256").update(key).digest("hex") });
       }
@@ -4708,6 +4738,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
       try {
         const socket = await connect(keys[0]!);
+        const builderSocket = await connect(keys[2]!);
+        const builderEvent = new Promise<string>(resolve => builderSocket.once("message", data => resolve(String(data))));
         const seen: string[] = [];
         const primaryEvent = new Promise<void>(resolve => socket.on("message", data => {
           const text = String(data); seen.push(text); if (text.includes("PRIMARY_VISIBLE")) resolve();
@@ -4716,6 +4748,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "PRIMARY_VISIBLE" } });
         await primaryEvent;
         expect(seen.join("\n")).not.toContain("CANDIDATE_LIVE_SECRET");
+        expect(await builderEvent).toContain("CANDIDATE_LIVE_SECRET");
+        // Scope is checked on each event, not frozen when the socket opens.
+        const { withGitHubPrimaryReviewerChange } = await import("../services/chat-github-primary-reviewers.js");
+        await withGitHubPrimaryReviewerChange(db, f.companyId, () => db.update(chatEndpoints)
+          .set({ assignedAgentId: builder!.id }).where(eq(chatEndpoints.id, f.endpoint.id)));
+        const afterPromotion: string[] = [];
+        const promotedEvent = new Promise<void>(resolve => builderSocket.on("message", data => {
+          const text = String(data); afterPromotion.push(text); if (text.includes("AFTER_PROMOTION")) resolve();
+        }));
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "PROMOTED_CANDIDATE_SECRET" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "AFTER_PROMOTION" } });
+        await promotedEvent;
+        expect(afterPromotion.join("\n")).not.toContain("PROMOTED_CANDIDATE_SECRET");
         await expect(connect(keys[1]!)).rejects.toThrow("403");
       } finally {
         for (const client of clients) client.terminate();
