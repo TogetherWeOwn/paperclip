@@ -116,6 +116,8 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
     comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
     primaryBlindingVersion?: number;
     hooksDigest?: string;
+    /** Crashed-run homes the probe reclaimed (idle >= orphan age) before this run. */
+    orphansReclaimed?: number;
     candidateRuntimeCertified?: boolean; disallowedTools?: string[];
     primaryToolPolicy?: GitHubReviewEnrollmentEnvelope["primaryToolPolicy"] | null;
     workspace?: GitHubCandidateWorkspaceReceipt;

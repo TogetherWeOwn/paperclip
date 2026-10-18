@@ -191,13 +191,15 @@ describe("candidate workspace materialisation over SSH", () => {
       cpSync(input.localDir, input.remoteDir, { recursive: true, dereference: true });
     });
     const commands: string[] = [];
+    const timeouts: Array<number | undefined> = [];
     vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
       commands.push(command);
+      timeouts.push(options?.timeoutMs);
       const script = /^python3 -c '([\s\S]*)'$/.exec(command)![1]!.replaceAll(`'"'"'`, "'");
       const stdout = execFileSync("python3", ["-c", script], { input: options!.stdin, encoding: "utf8", env: { PATH: process.env.PATH! } });
       return { stdout, stderr: "" };
     });
-    return { home, commands };
+    return { home, commands, timeouts };
   }
   const target = { kind: "remote", transport: "ssh", spec: { host: "127.0.0.1", port: 22, username: "paperclip-shadow" } } as unknown as AdapterSshExecutionTarget;
 
@@ -206,8 +208,11 @@ describe("candidate workspace materialisation over SSH", () => {
     const artifact = await produceGitHubRepositoryArtifact(request(), { root: dir,
       remoteUrl: () => kind === "bundle" ? origin : join(scratch, "missing-origin") });
     expect(artifact.kind).toBe(kind);
-    const { home } = fakeHost();
+    const { home, timeouts } = fakeHost();
     const receipt = await materializeGitHubCandidateWorkspace({ snapshot: { repository: artifact } as never, target, home, nonce: "n", artifactRoot: dir });
+    // Both legs run under the host-wide candidate lease, so both are bounded.
+    expect(vi.mocked(ssh.syncDirectoryToSsh).mock.calls[0]![0].timeoutMs).toBe(120_000);
+    expect(timeouts).toEqual([180_000]);
     expect(receipt).toMatchObject({ version: 1, status: "materialized", kind, artifactSha256: artifact.sha256,
       head: kind === "bundle" ? head : artifact.commits.head, tree: artifact.headTree,
       baseCommit: kind === "bundle" ? base : artifact.commits.base, baseTree: artifact.baseTree });
@@ -253,5 +258,10 @@ describe("candidate workspace materialisation over SSH", () => {
     vi.mocked(ssh.syncDirectoryToSsh).mockRejectedValueOnce(new Error("ssh down"));
     expect(await materializeGitHubCandidateWorkspace({ snapshot: { repository: artifact } as never, target, home, nonce: "n", artifactRoot: dir }))
       .toMatchObject({ status: "error", reason: "workspace_transfer_failed" });
+    vi.mocked(ssh.syncDirectoryToSsh).mockRejectedValueOnce(new ssh.SshSyncTimeoutError(120_000));
+    const runs = vi.mocked(ssh.runSshCommand).mock.calls.length;
+    expect(await materializeGitHubCandidateWorkspace({ snapshot: { repository: artifact } as never, target, home, nonce: "n", artifactRoot: dir }))
+      .toEqual({ version: 1, kind: artifact.kind, artifactSha256: artifact.sha256, status: "error", reason: "workspace_transfer_timeout" });
+    expect(vi.mocked(ssh.runSshCommand).mock.calls.length).toBe(runs);
   });
 });

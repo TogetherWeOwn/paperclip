@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GITHUB_ISOLATION_PROBE,
   GITHUB_ISOLATION_CLEANUP,
+  GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS,
   githubIsolationCertificates,
   githubIsolationConfigurationDigest,
   githubCandidateAdapterConfig,
@@ -125,6 +126,91 @@ urllib.request.urlopen = deny_provider_tool
       expect(proof).toMatchObject({ hooksDigest: "fixture-digest", checks: { configFresh: true } });
       for (const [file, contents] of Object.entries(files)) expect(readFileSync(join(home, file), "utf8")).toBe(contents);
     } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+  describe("orphaned isolated homes (probe namespace section on a real directory)", () => {
+    // Only identity, sockets and the proxy are faked; listdir/lstat/rmtree/unlink
+    // run for real against a temp isolated/ parent.
+    const fixture = `import errno, io, json, os, pwd, socket, types, urllib.request, urllib.error
+os.geteuid = lambda: 12345
+pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
+class FakeSocket:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def settimeout(self, value): pass
+    def connect(self, address): raise OSError(errno.EACCES, "denied")
+socket.socket = lambda *args: FakeSocket()
+def proxy(request, **kwargs):
+    body = json.loads(request.data)
+    if body["model"] == "configured-arm-model" and "tools" not in body and "mcp_servers" not in body:
+        response = io.StringIO("accepted")
+        response.status = 200
+        return response
+    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
+urllib.request.urlopen = proxy
+`;
+    const old = (Date.now() / 1000) - GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS - 60;
+    let scratch: string;
+    let parent: string;
+    let outside: string;
+    const probe = () => JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
+      input: JSON.stringify({ nonce: "nonce", model: "configured-arm-model", home: join(parent, "fresh"), canaries: [], githubAddresses: ["192.0.2.1"] }),
+      encoding: "utf8", timeout: 5000,
+    }));
+    function crashedHome(name: string, { dirAge = old, ownerAge = old }: { dirAge?: number; ownerAge?: number } = {}) {
+      const home = join(parent, name);
+      mkdirSync(join(home, "workspace"), { recursive: true });
+      writeFileSync(join(home, "workspace", "answer.txt"), "stale checkout");
+      symlinkSync(outside, join(home, "workspace", "escape"));
+      writeFileSync(join(home, ".probe-owner"), "crashed-nonce");
+      utimesSync(join(home, ".probe-owner"), ownerAge, ownerAge);
+      utimesSync(home, dirAge, dirAge);
+      return home;
+    }
+    afterEach(() => rmSync(scratch, { recursive: true, force: true }));
+    function setup() {
+      scratch = mkdtempSync(join(tmpdir(), "shadow-orphans-"));
+      parent = join(scratch, "isolated");
+      outside = join(scratch, "outside");
+      mkdirSync(parent);
+      mkdirSync(outside);
+      writeFileSync(join(outside, "keep.txt"), "must survive");
+    }
+    const outsideIntact = () => expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("must survive");
+
+    it("reclaims an orphan idle past the orphan age, records the count, and continues", () => {
+      setup();
+      crashedHome("crashed-run");
+      const proof = probe();
+      expect(proof).toMatchObject({ namespaceBusy: false, orphansReclaimed: 1, checks: { configFresh: true } });
+      expect(readdirSync(parent)).toEqual(["fresh"]);
+      outsideIntact();
+    });
+    it.each([["young home", true, false], ["old home with a young owner file", false, true]] as const)(
+      "keeps candidate_namespace_busy for a %s", (_label, youngDir, youngOwner) => {
+        setup();
+        const now = Date.now() / 1000;
+        const home = crashedHome("live-run", { dirAge: youngDir ? now : old, ownerAge: youngOwner ? now : old });
+        const proof = probe();
+        expect(proof).toMatchObject({ namespaceBusy: true, orphansReclaimed: 0, checks: { configFresh: false } });
+        expect(existsSync(join(home, "workspace", "answer.txt"))).toBe(true);
+        expect(existsSync(join(parent, "fresh"))).toBe(false);
+        outsideIntact();
+      });
+    it("never follows a symlinked sibling: an old link is unlinked, its target untouched; a young one stays busy", () => {
+      setup();
+      symlinkSync(outside, join(parent, "linked-old"));
+      lutimesSync(join(parent, "linked-old"), old, old);
+      let proof = probe();
+      expect(proof).toMatchObject({ namespaceBusy: false, orphansReclaimed: 1, checks: { configFresh: true } });
+      expect(() => lstatSync(join(parent, "linked-old"))).toThrow();
+      outsideIntact();
+      rmSync(join(parent, "fresh"), { recursive: true });
+      symlinkSync(outside, join(parent, "linked-young"));
+      proof = probe();
+      expect(proof).toMatchObject({ namespaceBusy: true, orphansReclaimed: 0 });
+      expect(lstatSync(join(parent, "linked-young")).isSymbolicLink()).toBe(true);
+      outsideIntact();
+    });
   });
   it.each(["mine", "another-attempt", "missing", "symlink"])("cleanup only removes the nonce-owned home: %s", owner => {
     const fixture = `import builtins, io, json, os, shutil, sys

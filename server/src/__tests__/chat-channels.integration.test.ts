@@ -194,6 +194,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+// The isolation probe itself may rmtree reclaimed orphan homes; SSH mocks must
+// recognise the per-run cleanup program specifically.
+const CLEANUP_PROGRAM_MARKER = "home, nonce = sys.argv[1:3]";
 
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const embeddedPostgresSupport = externalTestDatabaseUrl
@@ -5033,8 +5036,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (scenario === "canary-hash") writeFileSync(canaryPath, "WRONG_CANARY_BYTES");
         const { default: dns } = await import("node:dns/promises");
         const dnsProbe = vi.spyOn(dns, "lookup").mockResolvedValue([{ address: "192.0.2.1", family: 4 }] as never);
+        expect(isolation.GITHUB_ISOLATION_CLEANUP).toContain(CLEANUP_PROGRAM_MARKER);
+        expect(isolation.GITHUB_ISOLATION_PROBE).not.toContain(CLEANUP_PROGRAM_MARKER);
         const probe = vi.spyOn(ssh, "runSshCommand").mockImplementation(async (_spec, command, options) => {
-          if (command.includes("shutil.rmtree")) return { stdout: "", stderr: "" };
+          if (command.includes(CLEANUP_PROGRAM_MARKER)) return { stdout: "", stderr: "" };
           if (scenario === "transport-error") throw new Error("SSH unavailable");
           if (scenario === "invalid-proof") return { stdout: "{}", stderr: "" };
           const input = JSON.parse(options!.stdin!);
@@ -5042,7 +5047,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           return { stdout: JSON.stringify({ nonce: scenario === "wrong-nonce" ? "forged" : input.nonce,
             username: scenario === "wrong-user-proof" ? "primary-user" : "paperclip-shadow",
             home: scenario === "wrong-home" ? "/primary-home" : input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
-            namespaceBusy: scenario === "namespace-busy",
+            namespaceBusy: scenario === "namespace-busy", orphansReclaimed: scenario === "certified" ? 2 : 0,
             checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: scenario !== "namespace-busy", providerToolsDenied: true,
               // Each model-proxy check must flow from the bound proof into the receipt.
               allowedModelAccepted: input.model === "configured-arm-model" && scenario !== "allowed-model-rejected",
@@ -5098,7 +5103,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             await expect(preparation).rejects.toThrow(/github_candidate_/);
             expect(dispatch).not.toHaveBeenCalled();
           }
-          expect(probe.mock.calls.filter(([, command]) => !command.includes("shutil.rmtree"))).toHaveLength(["uncertified", "wrong-environment", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "disabled"].includes(scenario) ? 0 : 1);
+          expect(probe.mock.calls.filter(([, command]) => !command.includes(CLEANUP_PROGRAM_MARKER))).toHaveLength(["uncertified", "wrong-environment", "wrong-ssh-user", "no-host-key", "host-key-check-off", "canary-hash", "canary-error", "disabled"].includes(scenario) ? 0 : 1);
           const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
           const receipt = enrollment!.isolationTests[run!.id];
           if (scenario === "certified" || scenario === "contaminated" || scenario === "disabled-after-probe" || proxyContaminated) {
@@ -5111,7 +5116,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             const [unavailable] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
             expect(unavailable).toMatchObject({ state: "unavailable", lastError: "github_candidate_isolation_error" });
           } else expect(receipt).toBeUndefined();
-          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true });
+          if (scenario === "certified") expect(receipt).toMatchObject({ candidateRuntimeCertified: true, orphansReclaimed: 2 });
           if (receipt) {
             await expect(db.update(chatGitHubReviewEnrollments).set({ isolationTests: {} })
               .where(eq(chatGitHubReviewEnrollments.id, enrollment!.id))).rejects.toThrow();
@@ -5326,7 +5331,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               .toEqual({ certifiedClean: false, reasons: ["primary_inputs_not_sealed", "effective_tool_equivalence_unverified", "workspace_equivalence_unverified"] });
           }
           expect(existsSync(provisionMarker)).toBe(false);
-          expect(probe.mock.calls.filter(([, command]) => command.includes("shutil.rmtree"))).toHaveLength(1);
+          expect(probe.mock.calls.filter(([, command]) => command.includes(CLEANUP_PROGRAM_MARKER))).toHaveLength(1);
         } finally {
           await heartbeat.drainActiveRunExecutions();
           registerServerAdapter(originalAdapter);

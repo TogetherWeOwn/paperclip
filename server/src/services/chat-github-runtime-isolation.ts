@@ -9,7 +9,7 @@ import {
   agents, environments, heartbeatRuns, chatGitHubReviewCandidates, chatGitHubReviewEnrollments, withDedicatedDbConnection, type Db,
   type GitHubCandidateWorkspaceReceipt, type GitHubReviewInputSnapshot,
 } from "@paperclipai/db";
-import { runSshCommand, shellQuote, syncDirectoryToSsh } from "@paperclipai/adapter-utils/ssh";
+import { isSshSyncTimeoutError, runSshCommand, shellQuote, syncDirectoryToSsh } from "@paperclipai/adapter-utils/ssh";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
@@ -64,13 +64,39 @@ function refuse(reason: string): never {
  * independently verifies each planted canary's bytes through its mounted path.
  * Numeric GitHub addresses bypass DNS (which the egress policy also denies).
  * TLS is deliberately unnecessary: any TCP connection can fetch public answers.
+ * Probe, run and cleanup all hold the exclusive host-wide advisory lease, so a
+ * home already under isolated/ belongs to a crashed run. Homes idle for
+ * GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS are reclaimed (lstat only, rmtree never
+ * follows symlinks, only direct children of the isolated parent); a younger
+ * one still means namespaceBusy, the backstop should the lease ever be lost.
  */
-export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, socket, sys, urllib.request, urllib.error
+export const GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS = 30 * 60;
+export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, shutil, socket, stat, sys, time, urllib.request, urllib.error
 p = json.load(sys.stdin)
+def reclaim_orphans(parent, min_age):
+    reclaimed = 0
+    now = time.time()
+    for name in os.listdir(parent):
+        if not name or "/" in name or name in (".", ".."): continue
+        entry = os.path.join(parent, name)
+        try:
+            st = os.lstat(entry)
+            newest = st.st_mtime
+            if stat.S_ISDIR(st.st_mode):
+                try: newest = max(newest, os.lstat(os.path.join(entry, ".probe-owner")).st_mtime)
+                except OSError: pass
+            if now - newest < min_age: continue
+            if stat.S_ISDIR(st.st_mode): shutil.rmtree(entry)
+            else: os.unlink(entry)
+            reclaimed += 1
+        except OSError:
+            pass
+    return reclaimed
 checks = {"primaryCanariesDenied": False, "githubDenied": False, "configFresh": False, "providerToolsDenied": False,
           "allowedModelAccepted": False, "otherModelDenied": False, "rawProxyDenied": False}
 username = pwd.getpwuid(os.geteuid()).pw_name
 namespace_busy = False
+orphans_reclaimed = 0
 if username == "paperclip-shadow" and os.geteuid() != 0:
     denied = []
     for canary in p["canaries"]:
@@ -116,6 +142,7 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
         {"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]},
         {"mcp_servers": [{"type": "url", "url": "https://github.com"}]}]])
     try:
+        orphans_reclaimed = reclaim_orphans(os.path.dirname(p["home"]), ${GITHUB_ORPHAN_HOME_MIN_AGE_SECONDS})
         namespace_busy = bool(os.listdir(os.path.dirname(p["home"])))
         if namespace_busy: raise FileExistsError("candidate_namespace_busy")
         os.mkdir(p["home"], 0o700)
@@ -139,7 +166,7 @@ if all(checks.values()) and p.get("hooks"):
         hooks_digest = p["hooks"]["digest"]
     except (OSError, ValueError):
         checks["configFresh"] = False
-print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "namespaceBusy": namespace_busy, "hooksDigest": hooks_digest}))
+print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "namespaceBusy": namespace_busy, "orphansReclaimed": orphans_reclaimed, "hooksDigest": hooks_digest}))
 `;
 
 export const GITHUB_ISOLATION_CLEANUP = `import os, shutil, sys
@@ -197,6 +224,9 @@ except (OSError, ValueError, subprocess.SubprocessError) as e:
 print(json.dumps(result))
 `;
 
+export const GITHUB_WORKSPACE_TRANSFER_TIMEOUT_MS = 120_000;
+export const GITHUB_WORKSPACE_MATERIALIZE_TIMEOUT_MS = 180_000;
+
 /** Transfer + materialise the sealed checkout over the certified SSH channel.
  * Never throws: a missing artifact is a precise, recorded reason and the
  * candidate still runs with workspace equivalence unverified. */
@@ -218,10 +248,17 @@ export async function materializeGitHubCandidateWorkspace(input: {
   try {
     staging = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-artifact-"));
     await fs.symlink(file, path.join(staging, "repository.bundle"));
-    await syncDirectoryToSsh({ spec: input.target.spec, localDir: staging, remoteDir: `${input.home}/.paperclip-review/artifact`, followSymlinks: true });
+    // Bounded: this runs while holding the host-wide candidate lease.
+    try {
+      await syncDirectoryToSsh({ spec: input.target.spec, localDir: staging, remoteDir: `${input.home}/.paperclip-review/artifact`,
+        followSymlinks: true, timeoutMs: GITHUB_WORKSPACE_TRANSFER_TIMEOUT_MS });
+    } catch (error) {
+      if (isSshSyncTimeoutError(error)) return { ...base, status: "error", reason: "workspace_transfer_timeout" };
+      throw error;
+    }
     const result = await runSshCommand(input.target.spec, `python3 -c ${shellQuote(GITHUB_WORKSPACE_MATERIALIZE)}`, {
       stdin: JSON.stringify({ nonce: input.nonce, home: input.home, sha256: artifact.sha256, refs: artifact.refs, commits: artifact.commits }),
-      timeoutMs: 600_000, maxBuffer: 64 * 1024,
+      timeoutMs: GITHUB_WORKSPACE_MATERIALIZE_TIMEOUT_MS, maxBuffer: 64 * 1024,
     });
     const proof = JSON.parse(result.stdout) as Record<string, unknown>;
     if (proof.nonce !== input.nonce || proof.home !== input.home) return { ...base, status: "error", reason: "workspace_proof_binding_mismatch" };
@@ -250,7 +287,8 @@ export async function materializeGitHubCandidateWorkspace(input: {
  * transaction. idle_in_transaction_session_timeout must not drop confinement
  * while the candidate runs. The normal primary pool is never borrowed. The key
  * is the SSH host/principal (same UID shares files across companies and arms).
- * Stale remote homes still fail the independent namespaceBusy probe. */
+ * The probe reclaims homes of crashed runs once idle for the orphan age; a
+ * younger one still fails the independent namespaceBusy check. */
 export async function acquireGitHubCandidateRuntimeLease(db: Db, hostPrincipal: string): Promise<() => Promise<void>> {
   let acquired!: () => void;
   let failed!: (error: unknown) => void;
@@ -364,6 +402,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false, providerToolsDenied: false,
     allowedModelAccepted: false, otherModelDenied: false, rawProxyDenied: false };
   let proofReceived = false;
+  let probeOrphansReclaimed = 0;
   try {
     for (const canary of certificate.primaryCanaries) {
       const bytes = await fs.readFile(canary.serverPath);
@@ -380,6 +419,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     });
     const proof = JSON.parse(result.stdout);
     if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
+    if (Number.isSafeInteger(proof.orphansReclaimed) && proof.orphansReclaimed > 0) probeOrphansReclaimed = proof.orphansReclaimed;
     if (!proof.checks || Object.keys(checks).some(key => typeof proof.checks[key] !== "boolean")) throw new Error("probe_checks_malformed");
     // A stale/concurrent namespace is missing availability, not proof that this
     // sample read a primary answer. The advisory lease handles healthy overlap.
@@ -407,6 +447,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     candidateRuntimeCertified: passed, disallowedTools: ["WebSearch", "WebFetch"],
     primaryToolPolicy: boundary.enrollment.envelope.primaryToolPolicy ?? null,
     hooksDigest: hooks.digest,
+    orphansReclaimed: probeOrphansReclaimed,
     ...(workspace ? { workspace } : {}),
     primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
     comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
