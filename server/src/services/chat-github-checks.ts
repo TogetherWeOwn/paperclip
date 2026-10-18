@@ -1,3 +1,4 @@
+import { insertChatActions, isCaptureOnlyChatOutput } from "./chat-publication-authority.js";
 import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
@@ -21,6 +22,15 @@ import {
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
+import { githubShadowLabel } from "./chat-github-review-policy.js";
+import { primaryGitHubDelivery, primaryGitHubReview } from "./chat-github-primary.js";
+import { githubPullPermalink } from "./chat-github-review-template.js";
+import {
+  findGitHubReviewChecks,
+  hasReconciledGitHubCheckUrl,
+  rememberGitHubCheckUrl,
+  type GitHubReviewCheckResponse,
+} from "./chat-github-check-reconciliation.js";
 
 /** Check status follows the ordinary chat delivery/task/run. This outbox never
  * schedules an agent. Assessments are published by the governed review tool. */
@@ -30,6 +40,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
     event: GitHubReviewEventContext,
     admitted: boolean,
     reason: string,
+    deliveryId?: string,
   ) {
     const [config] = await db
       .select()
@@ -41,11 +52,10 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
       ...config.configuration.repositories[event.repositoryId],
     };
     if (policy.ratingThreshold === null && !admitted) return;
-    await db
-      .insert(chatActions)
-      .values({
+    await insertChatActions(db, {
         companyId: endpoint.companyId,
         endpointId: endpoint.id,
+        deliveryId,
         kind: "github_review_check",
         providerActionId: `github-check:${event.deliveryId}`,
         payload: {
@@ -58,8 +68,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               .runtimeGeneration ?? 0,
         },
         status: "received",
-      })
-      .onConflictDoNothing();
+      }, { onConflictDoNothing: true });
   }
   async function dispatch(id: string) {
     const [action] = await db
@@ -74,6 +83,11 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
       .limit(1);
     if (!action || ["processed", "cancelled"].includes(action.status)) return;
     const event = action.payload.event as GitHubReviewEventContext;
+    // Match the actual admission identity, never a copied canonical event in a
+    // candidate's normalized payload. Manual checks pin their delivery UUID.
+    const deliveryIdentity = action.deliveryId
+      ? eq(chatDeliveries.id, action.deliveryId)
+      : eq(chatDeliveries.providerEventId, `github:${event.repository}:${event.pullNumber}:pr-event:${event.deliveryId}`);
     await withGitHubPublicationLease(
       db,
       {
@@ -138,12 +152,53 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
+          // Defense in depth: an intent staged before shadow mode was
+          // enabled must still never become a GitHub check run.
+          if (githubShadowLabel(source.configuration)) {
+            await lease.commit(async (tx) => {
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: { code: "shadow_mode" },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
+          // A legacy intent may belong to capture-only work. Resolve its OWN
+          // delivery, not the newest review of this endpoint/head (which may be
+          // another arm). Candidate rows must never cancel a primary action.
+          const [captureReview] = await db
+            .select({ id: chatGitHubReviews.id })
+            .from(chatGitHubReviews)
+            .innerJoin(chatDeliveries, and(
+              eq(chatDeliveries.companyId, chatGitHubReviews.companyId),
+              sql`${chatDeliveries.id}::text = ${chatGitHubReviews.deliveryId}`,
+            ))
+            .where(and(
+              eq(chatGitHubReviews.companyId, action.companyId),
+              eq(chatGitHubReviews.endpointId, action.endpointId),
+              deliveryIdentity,
+              sql`not (${primaryGitHubReview()})`,
+            )).limit(1);
+          if (captureReview || await isCaptureOnlyChatOutput(db, action)) {
+            await lease.commit(async (tx) => {
+              await tx.update(chatActions).set({
+                status: "cancelled", result: { code: "shadow_mode", ...(captureReview ? { reviewId: captureReview.id } : {}) }, updatedAt: new Date(),
+              }).where(eq(chatActions.id, id));
+            });
+            return;
+          }
           const [review] = await db
             .select()
             .from(chatGitHubReviews)
             .where(
               and(
+                eq(chatGitHubReviews.companyId, action.companyId),
                 eq(chatGitHubReviews.endpointId, action.endpointId),
+                primaryGitHubReview(),
                 eq(chatGitHubReviews.repositoryId, event.repositoryId),
                 eq(chatGitHubReviews.pullNumber, event.pullNumber),
                 eq(chatGitHubReviews.headSha, event.headSha),
@@ -202,7 +257,9 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               .where(
                 and(
                   eq(chatDeliveries.endpointId, action.endpointId),
-                  sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' = ${event.deliveryId}`,
+                  eq(chatDeliveries.companyId, action.companyId),
+                  primaryGitHubDelivery(),
+                  deliveryIdentity,
                 ),
               )
               .orderBy(desc(heartbeatRuns.createdAt))
@@ -215,7 +272,9 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             .where(
               and(
                 eq(chatDeliveries.endpointId, action.endpointId),
-                sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' = ${event.deliveryId}`,
+                  eq(chatDeliveries.companyId, action.companyId),
+                  primaryGitHubDelivery(),
+                deliveryIdentity,
               ),
             )
             .limit(1);
@@ -303,30 +362,52 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          if (fresh.result?.state !== state) {
-            const origin = runtimePublicOrigin();
-            const detailsPath = review
-              ? `issues/${review.issueId}`
-              : `apps/chat/${source.endpoint.id}/reviews`;
-            const detailsUrl = origin
-              ? `${origin}/${encodeURIComponent(source.companyPrefix)}/${detailsPath}`
-              : null;
-            const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
-            const checks = await request<{
-              check_runs: Array<{
-                id: number;
-                status?: string;
-                external_id?: string;
-                app?: { id?: number };
-              }>;
-            }>(
-              `/commits/${event.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
-            );
-            const check = checks.check_runs.find(
-              (check) =>
-                check.external_id === externalId &&
-                String(check.app?.id) === source.endpoint.botExternalId,
-            );
+          const detailsUrl = githubPullPermalink(event.repository, event.pullNumber);
+          const externalId = `${action.endpointId}:${event.pullNumber}:${event.headSha}`;
+          const appId = source.endpoint.botExternalId;
+          if (!appId) throw new Error("GitHub bot app identity is unavailable.");
+          const stateChanged = fresh.result?.state !== state;
+          const checks =
+            stateChanged ||
+            !hasReconciledGitHubCheckUrl(externalId, appId, detailsUrl)
+              ? await findGitHubReviewChecks(
+                  (path) => request<GitHubReviewCheckResponse>(path),
+                  event.headSha,
+                  externalId,
+                  appId,
+                )
+              : [];
+          const check = checks[0];
+          const staleChecks = checks.filter(
+            (candidate) => candidate.details_url !== detailsUrl,
+          );
+          // Final shadow re-check after the check-run reads, immediately
+          // before the first write: enabling shadow mid-dispatch cancels.
+          const [freshConfig] = await db
+            .select({ configuration: chatGitHubConfigurations.configuration })
+            .from(chatGitHubConfigurations)
+            .where(eq(chatGitHubConfigurations.endpointId, action.endpointId));
+          if (!freshConfig || githubShadowLabel(freshConfig.configuration) || await isCaptureOnlyChatOutput(db, action)) {
+            await lease.commit(async (tx) => {
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "cancelled",
+                  result: { code: "shadow_mode" },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
+          for (const staleCheck of staleChecks)
+            await request(`/check-runs/${staleCheck.id}`, {
+              method: "PATCH",
+              body: { details_url: detailsUrl },
+            });
+          if (checks.length > 0 && staleChecks.length === 0)
+            rememberGitHubCheckUrl(externalId, appId, detailsUrl);
+          if (stateChanged) {
             // GitHub retains a completed check's conclusion when PATCHed back to
             // queued/in_progress. A fresh attempt needs a new check run with the
             // same stable name; otherwise a prior success still looks passing.
@@ -427,6 +508,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
       })
       .where(
         and(
+          primaryGitHubReview(),
           inArray(chatGitHubReviews.state, ["queued", "running"]),
           isNull(chatGitHubReviews.assessment),
           // Resolve the review's own delivery by primary key first, then probe

@@ -13,6 +13,9 @@ import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
+import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
+import { githubPrimaryBlinding } from "./chat-github-primary-blinding.js";
+import { isGitHubPrimaryReviewer } from "./chat-github-primary-reviewers.js";
 import { runIdentityContexts } from "@paperclipai/db";
 import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { captureRunIdentity } from "./run-identity.js";
@@ -2791,6 +2794,13 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
+    if (await githubCandidateRunBoundary(db, session)) {
+      // Dispatch (including approval replay) must enforce the same boundary as
+      // discovery, before building generic clients or resolving credentials.
+      const tool = (await githubBotToolsForSession(db, session)).find(t => t.name === toolName);
+      if (!tool) throw new ToolGatewayHttpError(403, "Paired candidates can only use snapshot-backed review tools", "github_candidate_tool_denied");
+      return tool;
+    }
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
@@ -3031,10 +3041,12 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
-    const connectionTools = await connectionToolsForContext(session);
+    const isolated = await githubCandidateRunBoundary(db, session);
+    const connectionTools = isolated ? [] : await connectionToolsForContext(session);
     const onDemandTargets = connectionTools.filter(isOnDemandRemoteTool);
     const tools = [
-      ...allTools(),
+      ...(isolated ? [] : allTools()),
+      ...(isolated ? await githubBotToolsForSession(db, session) : []),
       ...connectionTools.filter((tool) => !isOnDemandRemoteTool(tool)),
     ].filter(
       (tool) =>
@@ -5475,18 +5487,25 @@ export function createToolGatewayService(
       callerHeaders: input.callerHeaders,
     });
     await assertGatewayTokenAction(session, input.method);
+    if (await githubCandidateRunBoundary(db, session))
+      throw new ToolGatewayHttpError(403, "Paired candidates cannot read MCP resources or prompts", "github_candidate_context_denied");
+    const primaryBlinding = () => session.agentId && isGitHubPrimaryReviewer(db, session.companyId, session.agentId);
+    const visibility = primaryBlinding() ? await githubPrimaryBlinding(db, session.companyId) : null;
+    visibility?.assertVisible(input.params);
+    const visibleContext = async (value: unknown) => primaryBlinding()
+      ? (await githubPrimaryBlinding(db, session.companyId)).filter(value) : value;
     const connections = await fullyAssignedMcpConnections(session);
     if (input.method === "resources/list") {
       const resources = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
-        const result = asRecord(
+        const result = asRecord(await visibleContext(
           await callAssignedConnectionProtocol({
             ...input,
             session,
             connection,
             method: input.method,
           }),
-        );
+        ));
         for (const resource of Array.isArray(result?.resources)
           ? result.resources
           : []) {
@@ -5504,14 +5523,14 @@ export function createToolGatewayService(
     if (input.method === "prompts/list") {
       const prompts = [] as Array<Record<string, unknown>>;
       for (const connection of connections) {
-        const result = asRecord(
+        const result = asRecord(await visibleContext(
           await callAssignedConnectionProtocol({
             ...input,
             session,
             connection,
             method: input.method,
           }),
-        );
+        ));
         for (const prompt of Array.isArray(result?.prompts)
           ? result.prompts
           : []) {
@@ -5545,7 +5564,8 @@ export function createToolGatewayService(
       kind === "resource"
         ? { uri: handle.value }
         : { name: handle.value, arguments: input.params?.arguments ?? {} };
-    const result = asRecord(
+    visibility?.assertVisible(params); // Check the decoded handle, not only its base64 wrapper.
+    const result = asRecord(await visibleContext(
       await callAssignedConnectionProtocol({
         ...input,
         session,
@@ -5553,7 +5573,7 @@ export function createToolGatewayService(
         method: input.method,
         params,
       }),
-    );
+    ));
     if (kind === "resource" && Array.isArray(result?.contents)) {
       return {
         ...result,
@@ -9938,6 +9958,9 @@ export function createToolGatewayService(
         callerHeaders: input.callerHeaders,
       });
       await assertGatewayTokenAction(session, "tools/call");
+      const nonCandidateAgent = session.agentId && !(await githubCandidateRunBoundary(db, session));
+      let primaryBlinding = nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
+      if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(input.parameters);
       let invocationId = String(randomUUID());
       const startedAt = Date.now();
 
@@ -10652,6 +10675,8 @@ export function createToolGatewayService(
       });
 
       try {
+        primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
+        if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(effectiveParameters);
         const executionTimeoutMs = timeoutMs(input.timeoutMs);
         if (
           tool.providerType === "paperclip_plugin" &&
@@ -10722,7 +10747,7 @@ export function createToolGatewayService(
             );
           }
         }
-        const result = connectedMcpExecution
+        const unfilteredResult = connectedMcpExecution
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
@@ -10744,6 +10769,10 @@ export function createToolGatewayService(
                 executeBuiltinTool(session, tool, effectiveParameters, invocationId),
                 executionTimeoutMs,
               );
+        primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
+        const result = primaryBlinding
+          ? (await githubPrimaryBlinding(db, session.companyId)).filter(unfilteredResult) ?? { content: "Not found", data: null }
+          : unfilteredResult;
 
         const resultValidation = validateToolContent({
           value: result,

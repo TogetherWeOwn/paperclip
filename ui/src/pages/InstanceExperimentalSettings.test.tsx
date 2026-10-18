@@ -89,6 +89,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableOpenAiDot: false,
     enableChatConnectors: false,
     enableGitHubReviewBots: false,
+    githubReviewShadowEnabled: false,
     enableMemoryConnectors: false,
     enablePipelines: false,
     enableCases: false,

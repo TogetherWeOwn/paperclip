@@ -485,6 +485,24 @@ describe("agent auth middleware", () => {
     expect(writeRes.status).toBe(401);
   });
 
+  it("preserves default-off response bytes through real agent authentication", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_default_off_bytes";
+    const { db } = createDbState({ agent: { id: agentId, companyId }, agentKey: {
+      id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-key",
+    } });
+    const payload = { description: '{\n "id": 12345678901234567890\n}', array: "[1, 2,   3]",
+      previousAssessments: ["ordinary data"], isolationTests: { arbitrary: true } };
+    const app = createApp(db);
+    app.get("/bytes", (_req, res) => res.json(payload));
+    const response = await request(app).get("/bytes").set("Authorization", `Bearer ${token}`);
+    expect(response.status).toBe(200);
+    expect(response.text).toBe(JSON.stringify(payload));
+    // Keep the response-time epoch check: a candidate can materialize while an
+    // initially empty request is in flight. The wrapper must be byte-transparent.
+  });
+
   it("populates agent-key actors from the key responsible user binding", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

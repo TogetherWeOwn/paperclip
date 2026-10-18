@@ -60,6 +60,10 @@ function removeTestDirectory(directory: string) {
   fs.rmSync(directory, { recursive: true, force: true });
 }
 
+// Paired-review admission would otherwise `git fetch` real GitHub origins for
+// fixture repositories. Suites that exercise checkouts inject a local producer.
+process.env.PAPERCLIP_GITHUB_SHADOW_REPOSITORY_ARTIFACTS ??= "off";
+
 const testPaperclipHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-home-"));
 process.env.PAPERCLIP_HOME = testPaperclipHome;
 afterAll(() => {

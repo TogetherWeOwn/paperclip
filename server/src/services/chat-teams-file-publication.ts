@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
+import { insertChatActions } from "./chat-publication-authority.js";
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { CHAT_FILE_TRANSFER_PHASES } from "@paperclipai/shared";
@@ -270,9 +271,7 @@ export async function projectTeamsFilePublication(
       attemptId: transfer.attemptId,
       stage,
     };
-    const inserted = await tx
-      .insert(chatActions)
-      .values({
+    const inserted = await insertChatActions(tx, {
         companyId: s.companyId,
         endpointId: s.endpointId,
         conversationId: s.conversationId,
@@ -280,9 +279,7 @@ export async function projectTeamsFilePublication(
         providerActionId,
         payload,
         status: "processed",
-      })
-      .onConflictDoNothing()
-      .returning({ id: chatActions.id });
+      }, { onConflictDoNothing: true });
     newAttempt = inserted.length === 1;
     if (!newAttempt) {
       const prior = await tx

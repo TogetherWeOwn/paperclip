@@ -2,6 +2,7 @@ import { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { fastResponseService, enqueueFastResponse, fastResponseSourceCurrent, fastResponseTurnQueued } from "./fast-responses.js";
 import { fastResponseRequests } from "@paperclipai/db";
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -1593,8 +1594,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         if (!reply)
           throw badRequest("Reply target is not in this inbox conversation");
       }
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.email);
-      await tx.insert(chatPublications).values({
+      await insertChatPublications(tx, {
         id: input.idempotencyKey,
         companyId,
         endpointId: endpoint.id,

@@ -22,6 +22,38 @@ import type {
 import { chatEndpoints } from "./chat_channels.js";
 import { issues } from "./issues.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
+import { agents } from "./agents.js";
+
+/** Stable candidate identity. Removing configuration retires, never rebinds, an arm. */
+export const chatGitHubReviewArms = pgTable(
+  "chat_github_review_arms",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull(),
+    endpointId: uuid("endpoint_id").notNull(),
+    label: text("label").notNull(),
+    agentId: uuid("agent_id").notNull(),
+    configurationRevision: integer("configuration_revision").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
+  },
+  (t) => [
+    unique("chat_github_review_arms_company_id_uq").on(t.companyId, t.id),
+    uniqueIndex("chat_github_review_arms_label_uq").on(t.endpointId, t.label),
+    uniqueIndex("chat_github_review_arms_active_agent_uq")
+      .on(t.endpointId, t.agentId).where(sql`${t.retiredAt} is null`),
+    foreignKey({
+      columns: [t.companyId, t.endpointId],
+      foreignColumns: [chatEndpoints.companyId, chatEndpoints.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [t.companyId, t.agentId],
+      foreignColumns: [agents.companyId, agents.id],
+    }).onDelete("restrict"),
+    check("chat_github_review_arm_revision_check", sql`${t.configurationRevision} > 0`),
+    check("chat_github_review_arm_label_check", sql`${t.label} ~ '^[a-z0-9][a-z0-9._-]{0,63}$'`),
+  ],
+);
 
 /** The endpoint owns the immutable agent/connection binding. Config is opt-in. */
 export const chatGitHubConfigurations = pgTable(
@@ -128,11 +160,19 @@ export const chatGitHubReviews = pgTable(
     pullNumber: integer("pull_number").notNull(),
     headSha: text("head_sha").notNull(),
     deliveryId: text("delivery_id").notNull(),
+    // Native admission identity survives per-run retry rows without changing
+    // the provider delivery id used to deduplicate GitHub check intents.
+    admissionDeliveryId: uuid("admission_delivery_id"),
     configurationRevision: integer("configuration_revision").notNull(),
     policySnapshot: jsonb("policy_snapshot")
       .$type<GitHubReviewPolicy>()
       .notNull(),
-    event: jsonb("event").$type<GitHubReviewEventContext>().notNull(),
+    event: jsonb("event").$type<GitHubReviewEventContext & {
+      /** Native admission identity, distinct from the provider's delivery ID. */
+      admissionDeliveryId?: string;
+      /** Reader actually selected for this run at begin/submit, not admission. */
+      inputSource?: "snapshot" | "live";
+    }>().notNull(),
     state: text("state")
       .$type<GitHubTaskReview["state"]>()
       .notNull()
@@ -169,6 +209,8 @@ export const chatGitHubReviews = pgTable(
       t.endpointId,
       t.deliveryId,
     ),
+    index("chat_github_reviews_admission_idx").on(t.endpointId, t.admissionDeliveryId)
+      .where(sql`${t.shadowLabel} is null and ${t.admissionDeliveryId} is not null`),
     index("chat_github_reviews_pull_idx").on(
       t.endpointId,
       t.repositoryId,
@@ -176,6 +218,14 @@ export const chatGitHubReviews = pgTable(
       t.createdAt,
     ),
     index("chat_github_reviews_task_idx").on(t.companyId, t.issueId, t.runId),
+    // Every OR branch in chat_outbound_is_capture_only must be a bounded lookup.
+    // Keep cross-provider fencing: a candidate may emit through any provider.
+    index("chat_github_reviews_capture_issue_idx").on(t.companyId, t.issueId)
+      .where(sql`${t.shadowLabel} is not null`),
+    index("chat_github_reviews_capture_run_idx").on(t.companyId, t.runId)
+      .where(sql`${t.shadowLabel} is not null`),
+    index("chat_github_reviews_capture_delivery_idx").on(t.companyId, t.deliveryId)
+      .where(sql`${t.shadowLabel} is not null`),
     check("chat_github_review_pull_number_check", sql`${t.pullNumber} > 0`),
     check(
       "chat_github_review_state_check",

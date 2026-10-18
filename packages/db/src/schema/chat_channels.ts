@@ -373,6 +373,7 @@ export const chatConversations = pgTable(
       .references(() => issues.id, { onDelete: "restrict" }),
     externalConversationId: text("external_conversation_id").notNull(),
     externalThreadId: text("external_thread_id").notNull().default(""),
+    executionScope: text("execution_scope").notNull().default("primary"),
     // Providers with linear conversations (DMs, Telegram groups, Teams group
     // chats) reuse one native thread id. A generation preserves the native id
     // used for replies while allowing completed Paperclip tasks to roll over.
@@ -382,6 +383,8 @@ export const chatConversations = pgTable(
     isDirectMessage: boolean("is_direct_message").notNull().default(false),
     // Immutable initial task context, never refreshed from endpoint settings.
     communicationGuidance: text("communication_guidance"),
+    // Capture-only authority survives config changes and later messages on this task.
+    githubShadowLabel: text("github_shadow_label"),
     state: text("state").notNull().default("active"),
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -396,12 +399,14 @@ export const chatConversations = pgTable(
       "chat_conversations_state_check",
       sql`${table.state} in ('active', 'waiting', 'completed', 'unavailable', 'endpoint_removed')`,
     ),
+    check("chat_conversations_shadow_label_check", sql`${table.githubShadowLabel} is null or ${table.githubShadowLabel} <> ''`),
     index("chat_conversations_issue_idx").on(table.companyId, table.issueId),
     uniqueIndex("chat_conversations_thread_uq").on(
       table.endpointId,
       table.externalConversationId,
       table.externalThreadId,
       table.sessionGeneration,
+      table.executionScope,
     ),
     unique("chat_conversations_company_id_uq").on(table.companyId, table.id),
     foreignKey({
@@ -448,6 +453,8 @@ export const chatDeliveries = pgTable(
     providerEventId: text("provider_event_id").notNull(),
     deduplicationKey: text("deduplication_key").notNull(),
     eventKind: text("event_kind").$type<ChatEventKind>().notNull(),
+    // Server-pinned on initial ingress, never refreshed during retry or recovery.
+    githubShadowLabel: text("github_shadow_label"),
     normalizedEvent: jsonb("normalized_event")
       .$type<Record<string, unknown>>()
       .notNull(),
@@ -474,7 +481,20 @@ export const chatDeliveries = pgTable(
       "chat_deliveries_state_check",
       sql`${table.state} in ('received', 'filtered', 'processing', 'processed', 'retry', 'failed')`,
     ),
+    check("chat_deliveries_shadow_label_check", sql`${table.githubShadowLabel} is null or ${table.githubShadowLabel} <> ''`),
     index("chat_deliveries_work_idx").on(table.state, table.nextAttemptAt),
+    // Sparse immutable seeds are the pairing fallback outbox. Neither recovery
+    // nor ordinal allocation should detoast every historical delivery.
+    index("chat_deliveries_pair_pending_idx").on(table.receivedAt, table.id)
+      .where(sql`${table.normalizedEvent} ? 'githubPairingPending' and not (${table.normalizedEvent} ? 'githubPairingSeed')`),
+    index("chat_deliveries_pair_seed_idx").on(table.id)
+      .where(sql`${table.normalizedEvent} ? 'githubPairingSeed'`),
+    index("chat_deliveries_pair_round_idx").on(
+      table.endpointId,
+      sql`(coalesce(${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId'))`,
+      sql`(coalesce(${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber'))`,
+      sql`((${table.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer)`,
+    ).where(sql`${table.normalizedEvent} ? 'githubPairingSeed'`),
     unique("chat_deliveries_company_id_uq").on(table.companyId, table.id),
     uniqueIndex("chat_deliveries_event_uq").on(
       table.endpointId,
@@ -674,6 +694,7 @@ export const chatActions = pgTable(
       table.endpointId,
       table.providerActionId,
     ),
+    index("chat_actions_delivery_kind_idx").on(table.deliveryId, table.kind),
     foreignKey({
       columns: [table.companyId, table.deliveryId],
       foreignColumns: [chatDeliveries.companyId, chatDeliveries.id],

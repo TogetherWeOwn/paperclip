@@ -1,4 +1,5 @@
 import { notifyChatActionWork } from "./chat-work-notifications.js";
+import { insertChatActions } from "./chat-publication-authority.js";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import {
   chatActions,
@@ -239,7 +240,7 @@ export async function stageReceiptReactionRemovals(
         ),
       );
   }
-  await tx.insert(chatActions).values(removals).onConflictDoNothing();
+  await insertChatActions(tx, removals, { onConflictDoNothing: true });
   return tx
     .select({ id: chatActions.id })
     .from(chatActions)

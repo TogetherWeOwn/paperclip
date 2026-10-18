@@ -52,6 +52,8 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import { initializeGitHubPrimaryBlinding } from "./services/chat-github-primary-blinding-state.js";
+import { initializeGitHubPrimaryReviewers } from "./services/chat-github-primary-reviewers.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -903,6 +905,18 @@ async function startServerWithDatabaseTeardown(
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  // Both states start fail-closed (blind every agent, query the candidate boundary)
+  // until bootstrap succeeds, so a bootstrap error must not stop startup.
+  const bootstrapGitHubReviewVisibility = async (): Promise<void> => {
+    try {
+      await initializeGitHubPrimaryBlinding(db);
+      await initializeGitHubPrimaryReviewers(db);
+    } catch (err) {
+      logger.warn({ err }, "GitHub review visibility bootstrap failed; blinding stays fail-closed, retrying in 30s");
+      setTimeout(() => void bootstrapGitHubReviewVisibility(), 30_000).unref?.();
+    }
+  };
+  await bootstrapGitHubReviewVisibility();
   const app = await createApp(db as any, {
     prepareIdleDatabaseBackup: idleDatabaseBackupEnabled
       ? async () => (await runServerDatabaseBackup("idle")) !== null

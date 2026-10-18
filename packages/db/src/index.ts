@@ -44,3 +44,4 @@ export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";
 
 export { signalDatabaseWork, subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "./work-signals.js";
+export { githubPairPreviousAssessmentQuery, githubPairRoundOrdinalQuery, githubPairSeedRecoveryQuery } from "./chat-github-pairing-queries.js";

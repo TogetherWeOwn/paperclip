@@ -729,4 +729,23 @@ describe("review history and thread labels", () => {
       conversationDestination({ ...row, externalUrl: "invalid" }, "github"),
     ).toBe("acme/web");
   });
+  // Regression coverage of the existing UI: an unrelated complete-save must not
+  // silently erase API-configured routes. No shadow route editor is introduced.
+  it("preserves API-configured shadow routes when a user edits review policy and saves", async () => {
+    const routes = [{ label: "candidate-low", agentId: "f0000000-0000-4000-8000-000000000001", enabled: false, sampleRate: 0.5 }];
+    mocks.config.mockResolvedValue({
+      revision: 7,
+      configuration: { ...structuredClone(base), shadowRoutes: routes },
+    });
+    await render();
+    await input(container.querySelector("textarea")!, "Edited instructions");
+    await click("Save changes");
+    await vi.waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
+    const [id, revision, saved] = mocks.save.mock.calls[0];
+    expect(id).toBe("bot");
+    expect(revision).toBe(7);
+    expect(saved.shadowRoutes).toEqual(routes);
+    expect(saved.shadow).toBeUndefined();
+    expect(saved.defaults.instructions).toBe("Edited instructions");
+  });
 });

@@ -77,6 +77,8 @@ export interface InstanceExperimentalSettings {
   enablePublicMcp: boolean;
   /** Enable the standalone Dot choice and dedicated agent MCP connection independently of the general Runner rollout. */
   enableOpenAiDot: boolean;
+  /** Global paired-review admission switch. Default OFF; never changes primary review or capture-only fences. */
+  githubReviewShadowEnabled: boolean;
   /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
   enableMcpAggregators: boolean;
   /** Show experimental memory connection setup. Existing connections remain usable. */

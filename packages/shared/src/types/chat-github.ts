@@ -45,6 +45,16 @@ export type GitHubAllowedPerson = {
   | { kind: "guest"; sponsorUserId: string; permissionProfile: "restricted" }
 );
 
+/** Configuration only: the server owns each stable arm ID and agent binding. */
+export interface GitHubReviewShadowRoute {
+  label: string;
+  agentId: string;
+  enabled: boolean;
+  sampleRate: number;
+  /** Omitted selects all repositories; an empty list selects none. */
+  repos?: string[];
+}
+
 export interface GitHubChatConfiguration {
   version: 1;
   /** Enabling the feature and bot tools is explicit for existing endpoints. */
@@ -55,6 +65,24 @@ export interface GitHubChatConfiguration {
   defaults: GitHubReviewPolicy;
   /** Keys are stable GitHub repository IDs; labels never grant access. */
   repositories: Record<string, Partial<GitHubReviewPolicy>>;
+  /**
+   * Shadow review mode: the endpoint runs the reviewer exactly as normal —
+   * same prompts, task-scoped tools, and assessment validation — but never
+   * publishes anything to GitHub (no check run, summary, inline findings,
+   * formal review, comments, reactions, or chat replies) and creates no
+   * publication intents. Assessments are stored tagged with `label` so a
+   * shadow reviewer seat (e.g. a cloned agent on another model) can be
+   * compared against the publishing reviewer on identical PR heads.
+   * Absent means disabled, so configurations saved before this field existed
+   * keep publishing as before.
+   */
+  shadow?: { enabled: boolean; label: string };
+  /**
+   * Same-endpoint experimental routes, independent of endpoint-wide shadow.
+   * Absent means no routes. Each route defaults OFF when parsed. Configuration
+   * alone grants no tools, connection access, task authority, or execution.
+   */
+  shadowRoutes?: GitHubReviewShadowRoute[];
 }
 
 export interface GitHubReviewEventContext {

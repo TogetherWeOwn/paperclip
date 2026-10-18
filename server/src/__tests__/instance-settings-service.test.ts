@@ -63,6 +63,7 @@ describe("instance settings service", () => {
       enableCombinedInboxTasks: false,
       enableChatConnectors: false,
       enableGitHubReviewBots: false,
+      githubReviewShadowEnabled: false,
       enableMemoryConnectors: false,
       enableConferenceRoomChat: false,
       enableClassicTaskInterface: false,
