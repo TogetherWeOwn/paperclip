@@ -5034,6 +5034,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(result)).not.toContain("CANARY");
       expect(second.conversation.executionScope).not.toBe(candidate.conversation.executionScope);
     });
+    it("round two freezes the primary assessment from round one's per-run review row", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const first = await deliverShadowTestMention(f, "primary-history-round-one", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const session = await shadowTestSession(f, { issueId: first.issueId });
+      const service = githubChatReviewService(db, f.providerFetch);
+      expect(await service.execute(session, "submit_review", {
+        ...shadowTestAssessment(head), summary: "PRIMARY_ROUND_ONE_REASONING",
+      })).toMatchObject({ status: "processed" });
+      const [review] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, session.runId));
+      const [firstEnrollment] = await db.select().from(chatGitHubReviewEnrollments)
+        .where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(review!.deliveryId).toBe(`run:${session.runId}:${head}`);
+      expect(review!.admissionDeliveryId).toBe(firstEnrollment!.originDeliveryId);
+      expect(review!.assessment).toMatchObject({ summary: "PRIMARY_ROUND_ONE_REASONING" });
+      await deliverShadowTestMention(f, "primary-history-round-two", "@maya re-review", 81);
+      await f.service.processPendingDeliveries();
+      const enrollments = await db.select().from(chatGitHubReviewEnrollments)
+        .where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollments).toHaveLength(2);
+      const second = enrollments.find(e => e.roundOrdinal === 2)!;
+      const expected = { headSha: head, assessment: review!.assessment, issueId: first.issueId, runId: session.runId };
+      expect(second.envelope.previousAssessments?.primary).toEqual(expected);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, second.originDeliveryId));
+      expect(delivery!.normalizedEvent.githubPairingSeed).toMatchObject({
+        roundOrdinal: 2, envelope: { previousAssessments: { primary: expected } },
+      });
+    });
     it("paired snapshot capture failure preserves primary progress without waking a live-reading candidate", async () => {
       const f = await pairedReviewFixture();
       installShadowRecorder(f, "b".repeat(40), async url => url.includes("/reviews?") ? new Response("unavailable", { status: 503 }) : undefined);
