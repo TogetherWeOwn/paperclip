@@ -12,6 +12,7 @@ import {
   evaluateRunModelDecisionSeam,
   evaluateRunModelDecisionSkip,
   hasAssignedModelLane,
+  hasAssignedModelLaneInSnapshot,
   isRunModelDecisionDeferral,
   isSecretEnvBinding,
   readPreviousRunModelDecision,
@@ -555,5 +556,60 @@ describe("run model decision seam enforcement (wrong-base re-expression)", () =>
     expect(hasAssignedModelLane(skipped)).toBe(false);
     expect(hasAssignedModelLane(exempt)).toBe(false);
     expect(hasAssignedModelLane(null)).toBe(false);
+  });
+
+  it("reads lane presence from the run snapshot, tolerating absent shapes", () => {
+    const decided = {
+      decisionId: "dec-1",
+      pluginKey: "togetherweown.model-capacity",
+      model: "muse-spark-1.3",
+      source: "router",
+      latencyMs: 7,
+      outcome: "decided",
+    };
+    const kept = {
+      decisionId: null,
+      pluginKey: "togetherweown.model-capacity",
+      model: null,
+      source: null,
+      latencyMs: 7,
+      outcome: "kept",
+    };
+    expect(hasAssignedModelLaneInSnapshot({ modelDecision: decided })).toBe(true);
+    expect(hasAssignedModelLaneInSnapshot({ modelDecision: kept })).toBe(true);
+    // Lane absent: skipped, deferred, timed-out and exempt outcomes still
+    // open the card, even with a plugin key present.
+    for (const outcome of ["skipped", "deferred", "timeout", "exempt"]) {
+      expect(
+        hasAssignedModelLaneInSnapshot({
+          modelDecision: { ...decided, model: null, decisionId: null, source: null, outcome },
+        }),
+        outcome,
+      ).toBe(false);
+    }
+    // An advisory suggestion is not an assigned lane: the top-level outcome
+    // stays timeout even when the holder answered decide.
+    expect(
+      hasAssignedModelLaneInSnapshot({
+        modelDecision: {
+          decisionId: null,
+          pluginKey: "togetherweown.model-capacity",
+          model: null,
+          source: null,
+          latencyMs: 7,
+          outcome: "timeout",
+          reason: "requireRunModelDecision disabled",
+          advisory: { outcome: "decided", decisionId: "dec-9", model: "muse-spark-1.3", source: "router" },
+        },
+      }),
+    ).toBe(false);
+    // Missing or malformed shapes never suppress: no snapshot, no decision
+    // key, a non-object decision, or adapter config alone.
+    expect(hasAssignedModelLaneInSnapshot(null)).toBe(false);
+    expect(hasAssignedModelLaneInSnapshot(undefined)).toBe(false);
+    expect(hasAssignedModelLaneInSnapshot({})).toBe(false);
+    expect(hasAssignedModelLaneInSnapshot({ modelDecision: null })).toBe(false);
+    expect(hasAssignedModelLaneInSnapshot({ modelDecision: "dec-1" })).toBe(false);
+    expect(hasAssignedModelLaneInSnapshot({ adapterConfig: { model: "muse-spark-1.3" } })).toBe(false);
   });
 });

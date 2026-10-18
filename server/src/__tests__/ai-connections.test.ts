@@ -114,6 +114,66 @@ describe("managed AI connections", () => {
     await db.insert(heartbeatRuns).values({ companyId, agentId: id, status: "succeeded", responsibleUserId: "alice", contextSnapshot: { issueId }, createdAt: new Date(Date.now() + 1000) });
     expect(await intents.requestForRunAuthFailure(runId)).toBeNull();
   });
+
+  it.each([
+    ["decided", "dec-lane", "muse-spark-1.3"],
+    ["kept", null, null],
+  ] as const)("opens no card when the failed run has an assigned model lane (%s)", async (outcome, decisionId, model) => {
+    const userId = `auth-lane-${outcome}`;
+    const id = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const selectedBinding = { provider: "anthropic", method: "api_key", mode: "responsible_user" } as const;
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Lane agent", adapterType: "claude_local", runtimeConfig: { aiConnection: selectedBinding } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Lane failure", status: "in_progress", assigneeAgentId: id });
+    await service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Lane account", apiKey: "fixture", agentIds: [id], allAgents: false }, "fixture-lane-key");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId,
+      contextSnapshot: {
+        issueId,
+        aiConnection: { ...runtime.attribution, identity: runtime.identity },
+        modelDecision: {
+          decisionId, pluginKey: "togetherweown.model-capacity", model,
+          source: outcome === "decided" ? "router" : null, latencyMs: 7, outcome,
+        },
+      },
+    });
+    await runtime.cleanup();
+    const intents = connectionIntentService(db);
+    expect(await intents.requestForRunAuthFailure(runId)).toBeNull();
+    const rows = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(rows.filter((row) => row.kind === "connection_intent")).toHaveLength(0);
+  });
+
+  it("still opens the card when the failed run has only an advisory suggestion", async () => {
+    const userId = "auth-lane-advisory";
+    const id = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const selectedBinding = { provider: "anthropic", method: "api_key", mode: "responsible_user" } as const;
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Advisory agent", adapterType: "claude_local", runtimeConfig: { aiConnection: selectedBinding } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Advisory failure", status: "in_progress", assigneeAgentId: id });
+    await service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Advisory account", apiKey: "fixture", agentIds: [id], allAgents: false }, "fixture-advisory-key");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId,
+      contextSnapshot: {
+        issueId,
+        aiConnection: { ...runtime.attribution, identity: runtime.identity },
+        modelDecision: {
+          decisionId: null, pluginKey: "togetherweown.model-capacity", model: null, source: null,
+          latencyMs: 7, outcome: "timeout", reason: "requireRunModelDecision disabled",
+          advisory: { outcome: "decided", decisionId: "dec-9", model: "muse-spark-1.3", source: "router" },
+        },
+      },
+    });
+    await runtime.cleanup();
+    const card = await connectionIntentService(db).requestForRunAuthFailure(runId);
+    expect(card).toMatchObject({ state: "needs_user_action", service: "anthropic" });
+  });
   it.each([
     ["anthropic", "claude_local", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
     ["openai", "codex_local", "CODEX_HOME", "OPENAI_API_KEY"],

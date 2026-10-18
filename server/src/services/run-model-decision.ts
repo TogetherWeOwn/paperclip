@@ -498,6 +498,28 @@ export function hasAssignedModelLane(
   return false;
 }
 
+/**
+ * True when a heartbeat run's context snapshot carries an assigned-model lane
+ * for the current run (`contextSnapshot.modelDecision`, TOG-22796). Tolerant
+ * of missing or malformed shapes: anything but an enforced `decide` or an
+ * authoritative `keep` is lane-absent. Advisory suggestions, historical
+ * decisions, mere plugin presence, `adapterConfig.model` and ambient env are
+ * never lanes. `purpose=ai` intent openers use this so lane-assigned runs
+ * never prompt a reconnect; the run still fails with its explicit receipt.
+ */
+export function hasAssignedModelLaneInSnapshot(snapshot: unknown): boolean {
+  const decision = isRecord(snapshot) ? snapshot.modelDecision : undefined;
+  if (!isRecord(decision)) return false;
+  const outcome =
+    typeof decision.outcome === "string" ? decision.outcome : null;
+  return hasAssignedModelLane({
+    model: typeof decision.model === "string" ? decision.model : null,
+    outcome: outcome as RunModelDecisionRecord["outcome"],
+    pluginKey:
+      typeof decision.pluginKey === "string" ? decision.pluginKey : null,
+  });
+}
+
 /** Reads `previous` from the last run on the same issue and agent. */
 export function readPreviousRunModelDecision(
   row: { id: string; contextSnapshot: unknown } | null | undefined,
