@@ -20,9 +20,10 @@ export interface GitHubReviewInputSnapshot {
   baseSha: string;
   diffBaseSha: string;
   responses: Record<string, unknown>;
-  /** Sealed checkout of exactly the admitted head+base ancestry (covered by digest). */
+  /** Legacy: checkout sealed under the digest. Newer admissions produce the
+   * commit-addressed checkout in parallel and record it in the run receipt. */
   repository?: GitHubReviewRepositoryArtifact;
-  /** Precise reason no repository artifact was sealed; candidate still runs unverified. */
+  /** Admission-time reason no checkout will exist; candidate still runs unverified. */
   repositoryFailure?: string;
   digest: string;
 }
@@ -53,6 +54,9 @@ export interface GitHubCandidateWorkspaceReceipt {
   tree?: string | null;
   baseCommit?: string | null;
   baseTree?: string | null;
+  /** Server-authored artifact facts when the checkout was resolved from the
+   * admission manifest rather than sealed inside the snapshot (legacy). */
+  artifact?: GitHubReviewRepositoryArtifact;
 }
 
 export interface GitHubReviewEnrollmentEnvelope {
