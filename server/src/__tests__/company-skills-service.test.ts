@@ -20,7 +20,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { __unstableExpireSkillInventoryCache, companySkillService } from "../services/company-skills.ts";
+import {
+  __unstableExpireSkillInventoryCache,
+  __unstableGetSkillInventoryLastReconciledAt,
+  companySkillService,
+} from "../services/company-skills.ts";
 import { removeRuntimeSkillCache } from "../services/runtime-skill-cache.js";
 import { folderService } from "../services/folders.js";
 
@@ -445,6 +449,38 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     // inventory TTL serve the persisted rows, so expire it to observe the removal.
     __unstableExpireSkillInventoryCache(companyId);
     expect(await prepare()).toBeUndefined();
+  });
+
+  it("serves cached inventory reads within the TTL and reconciles after expiry", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Inventory TTL",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    const skill = await svc.createLocalSkill(companyId, {
+      name: "TTL Skill",
+      slug: "ttl-skill",
+    });
+    const first = await svc.list(companyId);
+    expect(first.map((row) => row.id)).toContain(skill.id);
+    const reconciledAt = __unstableGetSkillInventoryLastReconciledAt(companyId);
+    expect(reconciledAt).toBeDefined();
+
+    // Remove the source file directly: a read inside the TTL still serves the
+    // persisted rows without blocking on a fresh reconcile.
+    await fs.unlink(path.join(skill.sourceLocator!, "SKILL.md"));
+    const cached = await svc.list(companyId);
+    expect(cached.map((row) => row.id)).toContain(skill.id);
+    expect(__unstableGetSkillInventoryLastReconciledAt(companyId)).toBe(
+      reconciledAt,
+    );
+
+    // After expiry the next read reconciles synchronously and observes the removal.
+    __unstableExpireSkillInventoryCache(companyId);
+    const reconciled = await svc.list(companyId);
+    expect(reconciled.map((row) => row.id)).not.toContain(skill.id);
+    expect(__unstableGetSkillInventoryLastReconciledAt(companyId)).toBeDefined();
   });
 
   it("lists skills without exposing markdown content", async () => {

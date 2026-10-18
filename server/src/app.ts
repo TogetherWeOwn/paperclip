@@ -154,7 +154,10 @@ import { createToolGatewayService } from "./services/tool-gateway.js";
 import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
-import { enqueueChatRunMilestones } from "./services/chat-run-publications.js";
+import {
+  CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT,
+  enqueueChatRunMilestones,
+} from "./services/chat-run-publications.js";
 import {
   createCoalescedAsyncTrigger,
   isChatPublicationCommitSignal,
@@ -188,8 +191,12 @@ type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
 const CHAT_PUBLICATION_FLUSH_INTERVAL_MS = 1_000;
 // The run-milestone sweep held a pool slot for ~122 s per idle execution.
-// Recovery polls run here; commit-signal wakes still notify immediately via
-// notifyPublications, so idle recovery can be slow.
+// Recovery polls run here on a slow cadence. Commit-signal wakes
+// (run.presentation.resolved and safe native progress events) notify dispatch
+// immediately via notifyPublications, but earlier lifecycle events for
+// non-native runs (queued/working/failed) still rely on this poll and lag by
+// up to one interval; a run that finishes inside one interval may never
+// project a working milestone.
 export const CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS = 15_000;
 // Overlap between consecutive milestone sweeps. A run that commits while a
 // sweep runs is re-scanned by the next sweep; projection is idempotent, so
@@ -333,7 +340,12 @@ export function createChatReconciliationCoordinator(input: {
             );
       const inserted = await input.projectRunMilestones(since);
       // Advance only on success so a failed sweep retries the same delta.
-      lastMilestoneSweepStartedAt = sweepStartedAt;
+      // A pass that hits the insert cap is truncated: more unprojected runs
+      // may remain in the same window, so hold the watermark and let the next
+      // sweep re-scan it instead of dropping the backlog.
+      if (inserted < CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT) {
+        lastMilestoneSweepStartedAt = sweepStartedAt;
+      }
       // Existing final/question publications never wait on this optional
       // projection. Newly committed milestones get a bounded dispatch wake;
       // an empty/contended pass does not create a self-sustaining loop.

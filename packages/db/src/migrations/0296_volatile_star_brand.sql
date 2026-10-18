@@ -1,1 +1,2 @@
-CREATE INDEX "heartbeat_runs_updated_at_id_idx" ON "heartbeat_runs" USING btree ("updated_at","id");
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. This delta-window index lets each idle milestone sweep scan minutes of heartbeat_runs instead of the full window; the one-time build takes a SHARE lock and blocks run writes while it runs.
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_updated_at_id_idx" ON "heartbeat_runs" USING btree ("updated_at","id");

@@ -22,6 +22,34 @@ describe("milestone sweep + skills cache bounds", () => {
     expect(source).toContain("CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS = 15_000");
     expect(source).toContain("CHAT_MILESTONE_SWEEP_OVERLAP_MS = 5 * 60_000");
     expect(source).toContain("lastMilestoneSweepStartedAt");
+    // A truncated sweep must not advance past its backlog.
+    expect(source).toContain("CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT");
+    expect(source).toContain(
+      "if (inserted < CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT)",
+    );
+  });
+
+  it("keeps the milestone sweep index migration idempotent", () => {
+    const migration = readFileSync(
+      new URL(
+        "../../../packages/db/src/migrations/0296_volatile_star_brand.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    expect(migration).toContain("IF NOT EXISTS");
+    expect(migration).toContain("heartbeat_runs_updated_at_id_idx");
+  });
+
+  it("logs background skills refresh failures instead of swallowing them", () => {
+    const source = readFileSync(
+      new URL("./company-skills.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain("scheduleSkillInventoryBackgroundRefresh(companyId)");
+    expect(source).toContain(
+      '"Background skills inventory refresh failed; next read retries"',
+    );
   });
 
   it("keeps the skills inventory TTL at 60 s", () => {

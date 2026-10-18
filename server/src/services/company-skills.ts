@@ -3249,9 +3249,13 @@ export function companySkillService(db: Db) {
 
   function scheduleSkillInventoryBackgroundRefresh(companyId: string): void {
     if (skillInventoryRefreshPromises.has(companyId)) return;
-    void ensureSkillInventoryCurrent(companyId).catch(() => {
+    void ensureSkillInventoryCurrent(companyId).catch((err) => {
       // Background refresh is best-effort; the next read retries. Never
       // reject into a read path that already served cached rows.
+      logger.warn(
+        { err, companyId },
+        "Background skills inventory refresh failed; next read retries",
+      );
     });
   }
 
