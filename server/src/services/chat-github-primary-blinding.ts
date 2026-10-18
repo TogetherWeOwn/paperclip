@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, eq, inArray, or, sql } from "drizzle-orm";
-import { assets, chatGitHubReviewCandidates, chatGitHubReviews, documentRevisions, documents, heartbeatRuns, issueAttachments, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { hasGitHubPrimaryBlinding } from "./chat-github-primary-blinding-state.js";
 import type { Request, Response } from "express";
 import { notFound } from "../errors.js";
 
@@ -9,101 +10,113 @@ import { notFound } from "../errors.js";
 export const GITHUB_PRIMARY_BLINDING_VERSION = 1;
 
 type Visibility = ReturnType<typeof createGitHubPrimaryVisibility>;
-type CachedVisibility = { version: string; value: Promise<Visibility | null> };
+const passthrough: Visibility = { active: false, candidateAgentIds: [], filter: value => value, assertVisible() {} };
+type Waiter = { resolve: (value: Visibility) => void; reject: (error: unknown) => void };
+type CachedVisibility = { snapshot?: { key: string; value: Visibility }; waiters: Waiter[]; running: boolean };
 const visibilityCaches = new WeakMap<Db, Map<string, CachedVisibility>>();
 const MAX_CACHED_COMPANIES = 64;
 
-async function visibilityVersion(db: Db, companyId: string) {
-  // The covering candidate index and the single-row epoch lookup never touch run
-  // history. The epoch also covers aliases created AFTER candidate materialization.
-  const [row] = await db.execute<{ count: string; updated: string | null; epoch: string }>(sql`
-    select count(*)::text as count, max(updated_at)::text as updated,
-      coalesce((select version::text from chat_github_blinding_versions where company_id = ${companyId}), '0') as epoch
-    from chat_github_review_candidates where company_id = ${companyId}`);
-  if (!row) throw new Error("Review visibility version unavailable");
-  return { key: `${row.count}/${row.updated}/${row.epoch}`, empty: row.count === "0" };
+/** A single READ COMMITTED statement computes both the watermark and any reload.
+ * Only candidate identities/aliases participate, not company-wide write epochs or
+ * status/body timestamps. Fingerprint the identities themselves: count/max alone
+ * misses replacement of a non-maximal alias, and timestamps predate late commits.
+ * UNION ALL keeps each run predicate independently indexable (including legacy
+ * nativeIssueId -> issueId -> taskId precedence). No row locks, triggers or writes.
+ */
+export function githubPrimaryVisibilityQuery(companyId: string, previousKey: string | null) {
+  return sql`
+    with candidates as materialized (
+      select id, issue_id, comment_id, conversation_id, native_delivery_id, agent_id, enrollment_id
+      from chat_github_review_candidates where company_id = ${companyId}
+    ), candidate_agents as materialized (select distinct agent_id from candidates),
+    candidate_issues as materialized (select distinct issue_id from candidates where issue_id is not null),
+    candidate_documents as materialized (
+      select id from documents where company_id = ${companyId}
+        and created_by_agent_id = any(array(select agent_id from candidate_agents))
+      union
+      select id from documents where company_id = ${companyId} and id = any(array(
+        select document_id from issue_documents where company_id = ${companyId}
+          and issue_id = any(array(select issue_id from candidate_issues))))
+    ), tokens as (
+      select unnest(array[id, issue_id, comment_id, conversation_id, native_delivery_id, agent_id, enrollment_id])::text as token from candidates
+      union all select id::text from heartbeat_runs where company_id = ${companyId}
+        and agent_id = any(array(select agent_id from candidate_agents))
+      union all select id::text from heartbeat_runs where company_id = ${companyId}
+        and native_issue_id = any(array(select issue_id from candidate_issues))
+      union all select id::text from heartbeat_runs where company_id = ${companyId} and native_issue_id is null
+        and context_snapshot->>'issueId' = any(array(select issue_id::text from candidate_issues))
+      union all select id::text from heartbeat_runs where company_id = ${companyId} and native_issue_id is null
+        and context_snapshot->>'issueId' is null
+        and context_snapshot->>'taskId' = any(array(select issue_id::text from candidate_issues))
+      union all select identifier from issues where company_id = ${companyId}
+        and id = any(array(select issue_id from candidate_issues))
+      union all select id::text from issue_comments where company_id = ${companyId}
+        and issue_id = any(array(select issue_id from candidate_issues))
+      union all select id::text from issue_comments where company_id = ${companyId}
+        and author_agent_id = any(array(select agent_id from candidate_agents))
+      union all select unnest(array[id, asset_id])::text from issue_attachments where company_id = ${companyId}
+        and issue_id = any(array(select issue_id from candidate_issues))
+      union all select id::text from assets where company_id = ${companyId}
+        and created_by_agent_id = any(array(select agent_id from candidate_agents))
+      union all select id::text from chat_github_reviews where company_id = ${companyId}
+        and issue_id = any(array(select issue_id from candidate_issues))
+      union all select id::text from chat_github_reviews where company_id = ${companyId}
+        and shadow_label is not null and exists (select 1 from candidates)
+      union all select id::text from candidate_documents
+      union all select id::text from document_revisions where company_id = ${companyId}
+        and document_id = any(array(select id from candidate_documents))
+    ), identities as (
+      select coalesce(array_agg(token order by token collate "C"), array[]::text[]) as tokens from tokens where token is not null
+    ), snapshot as (
+      select tokens, array(select agent_id::text from candidate_agents order by agent_id) as agents from identities
+    ), versioned as materialized (
+      select *, encode(sha256(convert_to(array_to_string(agents, ',') || '/' || array_to_string(tokens, ','), 'UTF8')), 'hex') as key from snapshot
+    ) select key, agents, case when key is distinct from ${previousKey} then tokens end as tokens from versioned`;
 }
 
-/** No TTL: a stale privacy cache can leak a newly admitted candidate. Every
- * boundary checks the indexed version, sharing only construction of that exact
- * version. Failed constructions are evicted; all errors fail closed rather than
- * serving a stale snapshot. */
+/** Every caller gets a snapshot started AFTER it asked. Coalesce only waiting
+ * readers, never readers arriving after a query has started: sharing that older
+ * in-flight query would miss a late alias commit at the response boundary.
+ * Serial batches also prevent an older result overwriting a newer cache entry.
+ * The single-statement snapshot needs no retries, even under continuous writes. */
 export async function githubPrimaryBlinding(db: Db, companyId: string): Promise<Visibility> {
+  if (!hasGitHubPrimaryBlinding(db, companyId)) return passthrough;
   let cache = visibilityCaches.get(db);
   if (!cache) { cache = new Map(); visibilityCaches.set(db, cache); }
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const version = await visibilityVersion(db, companyId);
-    let entry = cache.get(companyId);
-    if (entry?.version !== version.key) {
-      entry = { version: version.key, value: version.empty
-        ? Promise.resolve(createGitHubPrimaryVisibility(new Set(), []))
-        : loadGitHubPrimaryVisibility(db, companyId) };
-      cache.delete(companyId);
-      cache.set(companyId, entry);
-      if (cache.size > MAX_CACHED_COMPANIES) cache.delete(cache.keys().next().value!);
-      // Multiple SELECTs build the token set. A write during construction must
-      // not publish a partial snapshot under the new epoch.
-      entry.value = entry.value.then(async value => {
-        if (!version.empty && (await visibilityVersion(db, companyId)).key !== version.key) return null;
-        return value;
-      });
-    }
+  let entry = cache.get(companyId);
+  if (!entry) { entry = { waiters: [], running: false }; cache.set(companyId, entry); }
+  const current = entry;
+  const drain = async () => {
+    const waiters = current.waiters.splice(0);
     try {
-      const value = await entry.value;
-      if (value) return value;
-      if (cache.get(companyId) === entry) cache.delete(companyId);
+      const [row] = await db.execute<{ key: string; agents: string[]; tokens: string[] | null }>(
+        githubPrimaryVisibilityQuery(companyId, current.snapshot?.key ?? null));
+      if (!row) throw new Error("Review visibility unavailable");
+      if (row.key !== current.snapshot?.key) {
+        if (!row.tokens) throw new Error("Review visibility aliases unavailable");
+        current.snapshot = { key: row.key, value: row.agents.length
+          ? createGitHubPrimaryVisibility(new Set(row.tokens), row.agents) : passthrough };
+      }
+      for (const waiter of waiters) waiter.resolve(current.snapshot!.value);
     } catch (error) {
-      if (cache.get(companyId) === entry) cache.delete(companyId);
-      throw error;
+      // Do not return the cached value on an error. A subsequent call probes anew.
+      for (const waiter of waiters) waiter.reject(error);
+    } finally {
+      if (current.waiters.length) queueMicrotask(() => { void drain(); });
+      else {
+        current.running = false;
+        cache!.delete(companyId); cache!.set(companyId, current);
+        for (const [id, value] of cache!) {
+          if (cache!.size <= MAX_CACHED_COMPANIES) break;
+          if (!value.running) cache!.delete(id);
+        }
+      }
     }
-  }
-  throw new Error("Review visibility changed during snapshot construction");
-}
-
-async function loadGitHubPrimaryVisibility(db: Db, companyId: string) {
-  const candidates = await db.select({ id: chatGitHubReviewCandidates.id, issueId: chatGitHubReviewCandidates.issueId,
-    commentId: chatGitHubReviewCandidates.commentId, conversationId: chatGitHubReviewCandidates.conversationId,
-    deliveryId: chatGitHubReviewCandidates.nativeDeliveryId, agentId: chatGitHubReviewCandidates.agentId,
-    enrollmentId: chatGitHubReviewCandidates.enrollmentId })
-    .from(chatGitHubReviewCandidates)
-    .where(eq(chatGitHubReviewCandidates.companyId, companyId));
-  const tokens = new Set(candidates.flatMap(c => Object.values(c).filter((v): v is string => !!v)));
-  if (candidates.length) {
-    const agentIds = [...new Set(candidates.map(c => c.agentId))];
-    const issueIds = [...new Set(candidates.flatMap(c => c.issueId ? [c.issueId] : []))];
-    const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), or(
-        inArray(heartbeatRuns.agentId, agentIds),
-        inArray(heartbeatRuns.nativeIssueId, issueIds),
-        // Preserve legacy COALESCE precedence without wrapping indexed columns.
-        // Both JSON expressions already have company-prefixed indexes.
-        and(sql`${heartbeatRuns.nativeIssueId} is null`, or(
-          inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'`, issueIds),
-          and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
-            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'taskId'`, issueIds)),
-        )),
-      )));
-    for (const run of runs) tokens.add(run.id);
-    const identifiers = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
-    for (const row of identifiers) if (row.identifier) tokens.add(row.identifier);
-    // Deny aliases as well as issue/run paths, including raw attachment downloads
-    // whose URL contains only an asset ID and whose response is not JSON.
-    const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, companyId), or(inArray(issueComments.issueId, issueIds), inArray(issueComments.authorAgentId, agentIds))));
-    const attachments = await db.select({ id: issueAttachments.id, assetId: issueAttachments.assetId }).from(issueAttachments)
-      .where(and(eq(issueAttachments.companyId, companyId), inArray(issueAttachments.issueId, issueIds)));
-    const candidateAssets = await db.select({ id: assets.id }).from(assets).where(and(eq(assets.companyId, companyId), inArray(assets.createdByAgentId, agentIds)));
-    const reviews = await db.select({ id: chatGitHubReviews.id }).from(chatGitHubReviews).where(and(eq(chatGitHubReviews.companyId, companyId),
-      or(inArray(chatGitHubReviews.issueId, issueIds), sql`${chatGitHubReviews.shadowLabel} is not null`)));
-    const candidateDocuments = await db.select({ id: documents.id }).from(documents).where(and(eq(documents.companyId, companyId),
-      or(inArray(documents.createdByAgentId, agentIds), sql`exists (select 1 from ${issueDocuments} d
-        where d.document_id = ${documents.id} and d.issue_id in (select issue_id from chat_github_review_candidates where company_id = ${companyId}))`)));
-    const revisions = await db.select({ id: documentRevisions.id }).from(documentRevisions).where(and(eq(documentRevisions.companyId, companyId),
-      inArray(documentRevisions.documentId, candidateDocuments.map(d => d.id))));
-    for (const row of [...comments, ...attachments, ...candidateAssets, ...reviews, ...candidateDocuments, ...revisions])
-      for (const id of Object.values(row)) tokens.add(id);
-  }
-  return createGitHubPrimaryVisibility(tokens, [...new Set(candidates.map(c => c.agentId))]);
+  };
+  return new Promise<Visibility>((resolve, reject) => {
+    current.waiters.push({ resolve, reject });
+    if (!current.running) { current.running = true; queueMicrotask(() => { void drain(); }); }
+  });
 }
 
 export function createGitHubPrimaryVisibility(tokens: ReadonlySet<string>, candidateAgentIds: string[]) {
@@ -206,9 +219,12 @@ export async function installGitHubPrimaryApiBlinding(db: Db, companyId: string,
   visibility.assertVisible(req.body);
   const json = res.json.bind(res);
   res.json = ((body: unknown) => {
-    // Probe the cheap version at response time: reuse the ingress snapshot unless
-    // candidate materialization or an alias write changed it during the request.
+    // Revalidate candidate-scoped identities at response time. Never reuse an
+    // ingress snapshot without checking for aliases committed during the request.
     void githubPrimaryBlinding(db, companyId).then(current => {
+      // Even null/undefined responses must retain Express's original semantics
+      // for companies without candidates, not become a synthetic error body.
+      if (!current.active) { json(body); return; }
       const visible = current.filter(body);
       if (visible === undefined) res.status(404);
       json(visible ?? { error: "Not found" });

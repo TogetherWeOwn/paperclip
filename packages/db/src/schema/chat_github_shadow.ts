@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { bigint, check, foreignKey, index, integer, jsonb, pgTable, text, timestamp, unique, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { check, foreignKey, index, integer, jsonb, pgTable, text, timestamp, unique, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
 import { chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals } from "./chat_channels.js";
@@ -7,12 +7,6 @@ import { chatGitHubReviewArms } from "./chat_github.js";
 import { agents } from "./agents.js";
 import { issues } from "./issues.js";
 import { issueComments } from "./issue_comments.js";
-
-/** Transactional invalidation for primary visibility aliases. No candidate data. */
-export const chatGitHubBlindingVersions = pgTable("chat_github_blinding_versions", {
-  companyId: uuid("company_id").primaryKey().references(() => companies.id, { onDelete: "cascade" }),
-  version: bigint("version", { mode: "bigint" }).notNull().default(sql`0`),
-});
 
 /** Exact pre-wake provider responses. Stored inside the immutable enrollment
  * and its durable source seed; no late recapture can rewrite an admitted view. */
@@ -130,7 +124,6 @@ export const chatGitHubReviewCandidates = pgTable("chat_github_review_candidates
   uniqueIndex("chat_github_candidates_delivery_uq").on(t.nativeDeliveryId),
   index("chat_github_candidates_work_idx").on(t.state, t.nextAttemptAt),
   index("chat_github_candidates_agent_idx").on(t.companyId, t.agentId),
-  index("chat_github_candidates_visibility_version_idx").on(t.companyId, t.updatedAt),
   foreignKey({ columns: [t.companyId, t.endpointId], foreignColumns: [chatEndpoints.companyId, chatEndpoints.id] }),
   foreignKey({ columns: [t.companyId, t.enrollmentId], foreignColumns: [chatGitHubReviewEnrollments.companyId, chatGitHubReviewEnrollments.id] }),
   foreignKey({ columns: [t.companyId, t.armId], foreignColumns: [chatGitHubReviewArms.companyId, chatGitHubReviewArms.id] }),

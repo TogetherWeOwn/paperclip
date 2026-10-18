@@ -44,6 +44,7 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import { initializeGitHubPrimaryBlinding } from "./services/chat-github-primary-blinding-state.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -884,6 +885,7 @@ async function startServerWithDatabaseTeardown(
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  await initializeGitHubPrimaryBlinding(db);
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,

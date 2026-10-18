@@ -77,9 +77,6 @@ function createDbState(input: {
         if (table === heartbeatRuns) return runRow ? [runRow] : [];
         return [];
       }),
-    // Primary-API blinding probes the review-candidate epoch via db.execute.
-    // This middleware test never enrolls candidates, so report the empty epoch.
-    execute: async () => [{ count: "0", updated: null, epoch: "0" }],
     update: () => ({
       set() {
         return {

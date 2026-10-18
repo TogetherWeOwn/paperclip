@@ -1,4 +1,4 @@
-export { chatGitHubReviewEnrollments, chatGitHubReviewCandidates, chatGitHubBlindingVersions } from "./chat_github_shadow.js";
+export { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } from "./chat_github_shadow.js";
 export type { GitHubReviewEnrollmentEnvelope, GitHubReviewInputSnapshot } from "./chat_github_shadow.js";
 export { companies } from "./companies.js";
 export { companyLogos } from "./company_logos.js";

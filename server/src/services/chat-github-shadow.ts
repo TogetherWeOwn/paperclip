@@ -10,6 +10,7 @@ import {
 } from "@paperclipai/db";
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
+import { withGitHubPrimaryBlindingAdmission } from "./chat-github-primary-blinding-state.js";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
@@ -432,7 +433,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         ? unavailable(failure ?? "admission_snapshot_interrupted")
         : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
           threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
-      await db.transaction(async tx => {
+      await withGitHubPrimaryBlindingAdmission(db, delivery.companyId, () => db.transaction(async tx => {
         const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, delivery.endpointId)).for("update");
         const [current] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id)).for("update");
         if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) return;
@@ -440,7 +441,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         const sealed = finalFailure ? unavailable(finalFailure) : prepared ?? unavailable("admission_snapshot_disabled");
         await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...sealed,
           request: source.comment.body, policy, revision: pending.revision, authority });
-      });
+      }));
     } catch {
       if (capture) await failGitHubPairCapture(db, row.id, capture, "pair_admission_failed");
     }
@@ -463,7 +464,8 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
   await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
   const seeds = await githubPairSeedRecoveryQuery(db, input.limit);
   for (const delivery of seeds) {
-    try { await db.transaction(tx => projectSeed(tx, delivery, delivery.normalizedEvent.githubPairingSeed as Seed)); }
+    try { await withGitHubPrimaryBlindingAdmission(db, delivery.companyId,
+      () => db.transaction(tx => projectSeed(tx, delivery, delivery.normalizedEvent.githubPairingSeed as Seed))); }
     catch { /* Durable seed remains pending; primary recovery is independent. */ }
   }
   const rows = await db.select().from(chatGitHubReviewCandidates).where(and(
