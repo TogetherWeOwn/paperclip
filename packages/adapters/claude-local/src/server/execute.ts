@@ -642,6 +642,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterKey: "claude",
           timeoutSec,
           workspaceLocalDir: cwd,
+          // A certified GitHub candidate's checkout is materialised from the
+          // sealed artifact on the isolated host. Never replace or sync it back.
+          ...(executionTarget?.kind === "remote" && executionTarget.transport === "ssh" && executionTarget.githubCandidateIsolation
+            ? { syncWorkspace: false } : {}),
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,
           onProgress: (line) => onLog("stdout", line),

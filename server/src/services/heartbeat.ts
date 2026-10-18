@@ -2,7 +2,7 @@ import { externalObjectService } from "./external-objects.js";
 import { tmpdir } from "node:os";
 import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
-import { createGitHubRunEvidenceCollector, githubWorkspaceHead, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
+import { createGitHubRunEvidenceCollector, githubWorkspaceState, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -24118,7 +24118,9 @@ export function heartbeatService(
           ? createGitHubRunEvidenceCollector({
             expectedCwd: executionTarget?.kind === "remote" ? executionTarget.remoteCwd : executionWorkspace.cwd,
             workspaceHead: () => runtimeConfig.isolateRuntime === true ? Promise.resolve(null)
-              : githubWorkspaceHead({ runId, target: executionTarget, cwd: executionWorkspace.cwd, env: gitExecutionEnv }),
+              : githubWorkspaceState({ runId, target: executionTarget, cwd: executionWorkspace.cwd, env: gitExecutionEnv }),
+            // Isolated primaries have neither a checkout nor recorded network git.
+            ...(runtimeConfig.isolateRuntime === true ? {} : { role: candidateRuntime ? "candidate" as const : "primary" as const }),
             record: async evidence => { await appendRunEvent(currentRun, { eventType: GITHUB_REVIEW_RUN_EVIDENCE,
               stream: "system", payload: { ...evidence } }); },
           }) : null;

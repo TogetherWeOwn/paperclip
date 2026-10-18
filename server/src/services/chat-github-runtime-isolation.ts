@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import dns from "node:dns/promises";
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agents, environments, heartbeatRuns, chatGitHubReviewCandidates, chatGitHubReviewEnrollments, withDedicatedDbConnection, type Db,
+  type GitHubCandidateWorkspaceReceipt, type GitHubReviewInputSnapshot,
 } from "@paperclipai/db";
-import { runSshCommand, shellQuote } from "@paperclipai/adapter-utils/ssh";
+import { runSshCommand, shellQuote, syncDirectoryToSsh } from "@paperclipai/adapter-utils/ssh";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
@@ -14,6 +17,7 @@ import { githubCandidateMayWake } from "./chat-github-shadow.js";
 import { resolveEnvironmentExecutionTarget } from "./environment-execution-target.js";
 import { githubComparisonEligibility, githubPrimaryInputSource, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 import { githubCandidateHooks } from "./chat-github-hooks.js";
+import { GitHubRepositoryArtifactError, githubRepositoryArtifactFile } from "./chat-github-repository-artifact.js";
 
 const certificateSchema = z.object({
   environmentId: z.string().uuid(),
@@ -147,6 +151,99 @@ if os.path.isdir(home) and not os.path.islink(home):
         owned = False
     if owned: shutil.rmtree(home)
 `;
+
+/** Executed by the isolated SSH principal inside its fresh home. Materialises
+ * the sealed artifact as a normal checkout with a LOCAL bare origin, so offline
+ * `git fetch origin` / `git diff origin/<base>...HEAD` work and no network
+ * remote exists. The controller independently re-verifies every reported hash. */
+export const GITHUB_WORKSPACE_MATERIALIZE = `import hashlib, json, os, subprocess, sys
+p = json.load(sys.stdin)
+home = p["home"]
+review = os.path.join(home, ".paperclip-review")
+bundle = os.path.join(review, "artifact", "repository.bundle")
+origin = os.path.join(review, "origin.git")
+ws = os.path.join(home, "workspace")
+env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home, "LANG": "C", "LC_ALL": "C",
+       "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
+def git(*args):
+    return subprocess.run(["git", *args], env=env, check=True, capture_output=True, text=True, timeout=300).stdout.strip()
+result = {"nonce": p["nonce"], "home": home, "error": None}
+try:
+    digest = hashlib.sha256()
+    with open(bundle, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): digest.update(chunk)
+    if digest.hexdigest() != p["sha256"]: raise ValueError("artifact_digest_mismatch")
+    if os.listdir(ws): raise ValueError("workspace_not_empty")
+    git("init", "-q", "--bare", origin)
+    git("--git-dir", origin, "fetch", "-q", "--no-tags", bundle, "+refs/heads/*:refs/heads/*", "+refs/pull/*:refs/pull/*")
+    refs = sorted(git("--git-dir", origin, "for-each-ref", "--format=%(objectname) %(refname)").splitlines())
+    expected = sorted({p["commits"]["base"] + " " + p["refs"]["base"], p["commits"]["head"] + " " + p["refs"]["head"]})
+    if refs != expected: raise ValueError("artifact_refs_mismatch")
+    git("--git-dir", origin, "symbolic-ref", "HEAD", p["refs"]["base"])
+    os.remove(bundle)
+    git("clone", "-q", "--no-checkout", "--no-hardlinks", origin, ws)
+    git("-C", ws, "fetch", "-q", "--no-tags", "origin", "+refs/pull/*:refs/remotes/origin/pull/*")
+    git("-C", ws, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", p["commits"]["head"])
+    with open(os.path.join(ws, ".git", "info", "exclude"), "a") as f: f.write("\\n.paperclip-runtime/\\n")
+    base = "refs/remotes/origin/" + p["refs"]["base"][len("refs/heads/"):]
+    result.update({"head": git("-C", ws, "rev-parse", "--verify", "HEAD"),
+                   "tree": git("-C", ws, "rev-parse", "--verify", "HEAD^{tree}"),
+                   "baseCommit": git("-C", ws, "rev-parse", "--verify", base + "^{commit}"),
+                   "baseTree": git("-C", ws, "rev-parse", "--verify", base + "^{tree}"),
+                   "remotes": sorted(set(git("-C", ws, "config", "--get-regexp", "^remote[.].*[.]url$").splitlines())),
+                   "origin": origin})
+except (OSError, ValueError, subprocess.SubprocessError) as e:
+    result["error"] = str(e) if isinstance(e, ValueError) else type(e).__name__
+print(json.dumps(result))
+`;
+
+/** Transfer + materialise the sealed checkout over the certified SSH channel.
+ * Never throws: a missing artifact is a precise, recorded reason and the
+ * candidate still runs with workspace equivalence unverified. */
+export async function materializeGitHubCandidateWorkspace(input: {
+  snapshot: GitHubReviewInputSnapshot | undefined;
+  target: AdapterSshExecutionTarget;
+  home: string;
+  nonce: string;
+  artifactRoot?: string;
+}): Promise<GitHubCandidateWorkspaceReceipt> {
+  const artifact = input.snapshot?.repository;
+  if (!artifact) return { version: 1, status: "unavailable", kind: null,
+    reason: input.snapshot ? input.snapshot.repositoryFailure ?? "repository_artifact_missing" : "admission_snapshot_unavailable" };
+  const base = { version: 1 as const, kind: artifact.kind, artifactSha256: artifact.sha256 };
+  let file: string;
+  try { file = await githubRepositoryArtifactFile(artifact, input.artifactRoot); }
+  catch (error) { return { ...base, status: "unavailable", reason: error instanceof GitHubRepositoryArtifactError ? error.reason : "repository_artifact_missing" }; }
+  const staging = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-artifact-"));
+  try {
+    await fs.symlink(file, path.join(staging, "repository.bundle"));
+    await syncDirectoryToSsh({ spec: input.target.spec, localDir: staging, remoteDir: `${input.home}/.paperclip-review/artifact`, followSymlinks: true });
+    const result = await runSshCommand(input.target.spec, `python3 -c ${shellQuote(GITHUB_WORKSPACE_MATERIALIZE)}`, {
+      stdin: JSON.stringify({ nonce: input.nonce, home: input.home, sha256: artifact.sha256, refs: artifact.refs, commits: artifact.commits }),
+      timeoutMs: 600_000, maxBuffer: 64 * 1024,
+    });
+    const proof = JSON.parse(result.stdout) as Record<string, unknown>;
+    if (proof.nonce !== input.nonce || proof.home !== input.home) return { ...base, status: "error", reason: "workspace_proof_binding_mismatch" };
+    if (proof.error) return { ...base, status: "error", reason: `workspace_materialize_failed:${String(proof.error).slice(0, 80)}` };
+    const hash = (value: unknown) => typeof value === "string" && /^[a-f0-9]{40}$/.test(value) ? value : null;
+    const observed = { head: hash(proof.head), tree: hash(proof.tree), baseCommit: hash(proof.baseCommit), baseTree: hash(proof.baseTree) };
+    const origin = `${input.home}/.paperclip-review/origin.git`;
+    const remotes = Array.isArray(proof.remotes) ? proof.remotes : [];
+    // Exactly one remote, the local bare origin: no network remote can exist.
+    if (proof.origin !== origin || remotes.length !== 1 || remotes[0] !== `remote.origin.url ${origin}`)
+      return { ...base, ...observed, status: "error", reason: "workspace_network_remote_present" };
+    const matches = artifact.kind === "bundle"
+      ? observed.head === artifact.headSha && observed.baseCommit === artifact.baseSha
+      : observed.head === artifact.commits.head && observed.baseCommit === artifact.commits.base;
+    if (!matches || observed.tree !== artifact.headTree || observed.baseTree !== artifact.baseTree)
+      return { ...base, ...observed, status: "error", reason: "workspace_head_mismatch" };
+    return { ...base, ...observed, status: "materialized" };
+  } catch {
+    return { ...base, status: "error", reason: "workspace_transfer_failed" };
+  } finally {
+    await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
 
 /** Cross-controller lease on a reserved, dedicated SESSION, never a long idle
  * transaction. idle_in_transaction_session_timeout must not drop confinement
@@ -296,6 +393,10 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   } catch { /* Infrastructure errors are missing evidence, not demonstrated contamination. */ }
   const passed = proofReceived && Object.values(checks).every(Boolean);
   const failure = proofReceived ? "github_candidate_contaminated" : "github_candidate_isolation_error";
+  // Only a confined, fresh home receives repository bytes. A failed proof never
+  // gets a checkout; materialisation failure leaves equivalence unverified.
+  const workspace = passed ? await materializeGitHubCandidateWorkspace({ snapshot: boundary.enrollment.envelope.snapshot,
+    target, home, nonce }) : undefined;
   const receipt = { version: 1, runId: run.id, candidateId: boundary.candidate.id, armId: boundary.candidate.armId,
     environmentId: environment.id, namespace: boundary.namespace, configurationDigest: certificate.configurationDigest,
     certificateDigest: certificateDigest(certificate),
@@ -305,6 +406,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     candidateRuntimeCertified: passed, disallowedTools: ["WebSearch", "WebFetch"],
     primaryToolPolicy: boundary.enrollment.envelope.primaryToolPolicy ?? null,
     hooksDigest: hooks.digest,
+    ...(workspace ? { workspace } : {}),
     primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
     comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
       selfTestPassed: passed, primaryBlindingActive: boundary.enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,

@@ -1,7 +1,7 @@
 import { and, eq, isNotNull, isNull, or } from "drizzle-orm";
 import { chatGitHubReviews, type chatGitHubReviewEnrollments, type Db } from "@paperclipai/db";
 import { GITHUB_PRIMARY_BLINDING_VERSION } from "./chat-github-primary-blinding.js";
-import { githubPairEquivalence, type GitHubPairRunEvidence } from "./chat-github-run-evidence.js";
+import { githubPairEquivalence, type GitHubPairRunEvidence, type GitHubPairWorkspaceBinding } from "./chat-github-run-evidence.js";
 
 type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Enrollment = typeof chatGitHubReviewEnrollments.$inferSelect;
@@ -42,7 +42,8 @@ export function githubRunComparisonEligibility(
     snapshotAvailable: !!enrollment.envelope.snapshot,
     roundOrdinal: enrollment.roundOrdinal,
     primaryInputSource,
-    runEvidence: bound && runEvidence ? { ...runEvidence, admittedHead: enrollment.headSha } : undefined,
+    runEvidence: bound && runEvidence ? { ...runEvidence, admittedHead: enrollment.headSha, admittedBase: enrollment.baseSha,
+      repository: enrollment.envelope.snapshot?.repository, candidateWorkspace: receipt.workspace } : undefined,
   });
   if (receipt && !bound) {
     result.certifiedClean = false;
@@ -59,7 +60,7 @@ export function githubComparisonEligibility(evidence: {
   environmentCertified: boolean; selfTestRecorded: boolean; selfTestPassed: boolean;
   primaryBlindingActive: boolean; snapshotAvailable: boolean; roundOrdinal: number;
   primaryInputSource?: "snapshot" | "live";
-  runEvidence?: GitHubPairRunEvidence & { admittedHead: string | null };
+  runEvidence?: GitHubPairRunEvidence & GitHubPairWorkspaceBinding;
 }): { certifiedClean: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!evidence.primaryBlindingActive) reasons.push("primary_namespace_not_isolated");
