@@ -5290,6 +5290,35 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const [laterReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, laterSession.runId));
       expect(laterReview!.event).toMatchObject({ inputSource: "live" });
     });
+    it("keeps a live primary assessment ineligible after a later snapshot retry begins", async () => {
+      const { githubRunCapability } = await import("../services/chat-github-shadow.js");
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, "primary-source-retry", "@maya review this", 81);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const firstSession = await shadowTestSession(f, { issueId: primary.issueId });
+      // Model a legacy queued run without startedAt. Capture precedes execution,
+      // but missing timing proof keeps this earlier run on live inputs forever.
+      await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, firstSession.runId));
+      await f.service.processPendingDeliveries();
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, firstSession.runId));
+      await service.execute(firstSession, "begin_review", { reviewedCommit: head });
+      const [firstReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, firstSession.runId));
+      expect(firstReview!.event).toMatchObject({ inputSource: "live" });
+      expect(await service.execute(firstSession, "submit_review", shadowTestAssessment(head)))
+        .toMatchObject({ status: "processed" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, firstSession.runId));
+
+      const laterSession = await shadowTestSession(f, { issueId: primary.issueId });
+      await service.execute(laterSession, "begin_review", { reviewedCommit: head });
+      const [laterReview] = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.runId, laterSession.runId));
+      expect(laterReview!.event).toMatchObject({ inputSource: "snapshot" });
+
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect((await githubRunCapability(db, candidateSession))?.enrollment?.envelope.comparisonEligibility)
+        .toMatchObject({ certifiedClean: false, reasons: expect.arrayContaining(["primary_inputs_not_sealed"]) });
+    });
     it("sampled primary task comment and wake commit before a never-resolving candidate snapshot fetch", async () => {
       const f = await pairedReviewFixture();
       let release!: () => void;

@@ -1,19 +1,20 @@
-import { and, desc, eq, isNotNull, isNull, or } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, or } from "drizzle-orm";
 import { chatGitHubReviews, type chatGitHubReviewEnrollments, type Db } from "@paperclipai/db";
 import { GITHUB_PRIMARY_BLINDING_VERSION } from "./chat-github-primary-blinding.js";
 
 type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Enrollment = typeof chatGitHubReviewEnrollments.$inferSelect;
 
-/** Match the primary run receipt to this admission and exact head. Legacy or
- * not-yet-started primary rows are not evidence of sealed inputs. */
+/** Match all primary run receipts to this admission and exact head. A snapshot
+ * retry cannot erase evidence of earlier live or unproven inputs. */
 export async function githubPrimaryInputSource(db: Store, enrollment: Enrollment) {
-  const [review] = await db.select({ event: chatGitHubReviews.event }).from(chatGitHubReviews).where(and(
+  const reviews = await db.select({ event: chatGitHubReviews.event }).from(chatGitHubReviews).where(and(
     eq(chatGitHubReviews.companyId, enrollment.companyId), eq(chatGitHubReviews.endpointId, enrollment.endpointId),
     eq(chatGitHubReviews.headSha, enrollment.headSha ?? ""), isNull(chatGitHubReviews.shadowLabel), isNotNull(chatGitHubReviews.runId),
     or(eq(chatGitHubReviews.deliveryId, enrollment.originDeliveryId), eq(chatGitHubReviews.admissionDeliveryId, enrollment.originDeliveryId)),
-  )).orderBy(desc(chatGitHubReviews.createdAt), desc(chatGitHubReviews.id)).limit(1);
-  return review?.event.inputSource;
+  ));
+  if (reviews.length === 0) return undefined;
+  return reviews.every(review => review.event.inputSource === "snapshot") ? "snapshot" : "live";
 }
 
 /** Read-time assessment eligibility. The immutable admission envelope cannot be
