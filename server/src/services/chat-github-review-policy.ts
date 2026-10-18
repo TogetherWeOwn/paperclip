@@ -269,12 +269,33 @@ export function validatePersistedGitHubReviewAssessment(
  * (sponsored guest with `automaticReviews:true`) is checked by the caller
  * against the live endpoint configuration, never from comment text.
  */
-const GITHUB_WORKFLOW_REVIEW_TRIGGER_PATTERN =
-  /(?<![\w-])@togetherweown-reviewer\s+review\s+([0-9a-f]{40})(?![0-9a-f])/i;
+/**
+ * Default reviewer handle for workflow review-trigger comments. Callers pass
+ * the endpoint's configured handle when one is known so a trigger aimed at a
+ * different GitHub App is never admitted here.
+ */
+export const GITHUB_WORKFLOW_REVIEWER_HANDLE = "togetherweown-reviewer";
 
-/** Lowercase head SHA from a workflow review-trigger comment, or null. */
-export function githubWorkflowReviewTriggerHeadSha(text: string): string | null {
-  const match = GITHUB_WORKFLOW_REVIEW_TRIGGER_PATTERN.exec(text);
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Lowercase head SHA from a workflow review-trigger comment, or null.
+ *
+ * The match is an exact mention of the given reviewer handle, the literal
+ * `review` keyword, and exactly one 40-hex head SHA. A SHA glued to a
+ * trailing word character or hyphen is malformed and rejected.
+ */
+export function githubWorkflowReviewTriggerHeadSha(
+  text: string,
+  reviewerHandle: string = GITHUB_WORKFLOW_REVIEWER_HANDLE,
+): string | null {
+  const pattern = new RegExp(
+    `(?<![\\w-])@${escapeRegExp(reviewerHandle)}\\s+review\\s+([0-9a-f]{40})(?![\\w-])`,
+    "i",
+  );
+  const match = pattern.exec(text);
   return match?.[1]?.toLowerCase() ?? null;
 }
 

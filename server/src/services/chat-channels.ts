@@ -96,6 +96,7 @@ import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
 import {
+  GITHUB_WORKFLOW_REVIEWER_HANDLE,
   githubReviewPrompt,
   githubWorkflowReviewTriggerHeadSha,
 } from "./chat-github-review-policy.js";
@@ -14577,10 +14578,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
    * `@togetherweown-reviewer review <40-hex head>` comment whose author is an
    * allow-listed workflow identity: a sponsored guest with
    * `automaticReviews:true` and a currently active non-viewer sponsor. The
-   * mention identity comes only from the endpoint configuration, never from
-   * comment text. Own-bot (`isMe`) and system messages are never admitted,
-   * and label/draft/head policy stays at review time so comment-then-label
-   * ordering keeps working.
+   * mention is matched against this endpoint's GitHub App identity, never
+   * against a handle taken from comment text; endpoints without a discovered
+   * bot username keep the default reviewer handle. Own-bot (`isMe`) and
+   * system messages are never admitted, and label/draft/head policy stays
+   * at review time so comment-then-label ordering keeps working.
    */
   async function githubWorkflowReviewTriggerAdmitted(
     endpoint: EndpointRow,
@@ -14589,7 +14591,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (endpoint.provider !== "github") return false;
     if (message.author.isMe || message.author.isSystem) return false;
     if (message.author.isBot !== true) return false;
-    if (githubWorkflowReviewTriggerHeadSha(message.text) === null)
+    const reviewerHandle =
+      endpoint.botUsername?.replace(/\[bot\]$/i, "") ||
+      GITHUB_WORKFLOW_REVIEWER_HANDLE;
+    if (
+      githubWorkflowReviewTriggerHeadSha(message.text, reviewerHandle) ===
+      null
+    )
       return false;
     if (!endpoint.allowUnlinkedPeople) return false;
     const [saved] = await db

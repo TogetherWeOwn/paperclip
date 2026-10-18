@@ -320,5 +320,40 @@ describe("workflow review-trigger admission", () => {
     expect(
       githubWorkflowReviewTriggerHeadSha(`@togetherweown-reviewerX review ${sha}`),
     ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}g`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}-${"a".repeat(7)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}_note`,
+      ),
+    ).toBe(null);
+  });
+  it("binds the mention to the endpoint reviewer handle", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-bot review ${sha}`,
+        "other-bot",
+      ),
+    ).toBe(sha);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}`,
+        "other-bot",
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-bot review ${sha}g`,
+        "other-bot",
+      ),
+    ).toBe(null);
   });
 });
