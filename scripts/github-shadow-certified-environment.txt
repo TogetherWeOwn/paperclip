@@ -78,13 +78,74 @@ Evidence-based tool/workspace equivalence
   permission modes, MCP name sets and tool sets across every init and every
   primary retry bound to this admission/head. Only candidate WebSearch/WebFetch
   removals are allowed; model identity intentionally differs. Missing/malformed
-  evidence stays unverified. workspace_equivalence_unverified clears only if
-  both arms' observed heads equal the admitted head. An empty candidate workspace
-  therefore remains unverified; this change does not seed or clone that workspace.
+  evidence stays unverified. workspace_equivalence_unverified: see "Sealed
+  candidate checkout" below.
   Primary run IDs are joined through exact admission/head review rows; candidate
   evidence is bound to the exact run and agent. Never reuse a previous good run.
   Admission/pre-dispatch cached eligibility stays conservative; consumers use
   the read-time comparisonEligibility returned by the run capability.
+
+Sealed candidate checkout (repository artifact)
+  Why: production measurement 2026-10-18 (agent 68cba6b5, last 80 succeeded
+  runs): 79 used Bash, 75 used git/gh; 1,592 Bash calls (938 starting with cd)
+  vs 664 github-bot tool calls. The primary reviews mainly from local clones.
+  A candidate limited to an empty non-git workspace was handicapped.
+  Capture: in the same 15 s admission window/abort as the snapshot (before the
+  primary has published anything; pairCaptureFailure rechecks after I/O), the
+  server produces one artifact with the endpoint's installation token:
+    bundle (preferred): git fetch BY SHA of the admitted head and PR base into a
+      server cache clone (<instance>/data/github-shadow-repositories/cache, or
+      PAPERCLIP_GITHUB_SHADOW_REPOSITORY_DIR), then `git bundle create` from a
+      temporary repo that borrows the cache objects and names exactly two refs:
+      refs/heads/<base branch> = base, refs/pull/<n>/head = admitted head. The
+      bundle therefore holds only their ancestry: no later fix commits, other
+      branches, tags or cache refs. The token travels in the git child env
+      (http.extraHeader), never argv/config. A slow first fetch keeps warming the
+      cache (10 min cap) after the window; this admission falls back.
+    synthetic (fallback, repo too large / fetch failed / bundle share of the
+      window spent): base and head tarballs (codeload; token never forwarded)
+      rebuilt with all attributes/filters disabled into commit 1 = base tree,
+      commit 2 = head tree. Accepted only if each rebuilt tree hash equals the
+      tree GitHub reports for the admitted commit; export-ignore/export-subst/
+      submodules make that impossible and fail closed.
+  The artifact (content-addressed <sha256>.bundle under .../artifacts, 512 MiB
+  cap, 7-day retention) is recorded in the sealed snapshot as
+  snapshot.repository {kind, path, sha256, headSha, baseSha, headTree, baseTree,
+  refs, commits} UNDER the snapshot digest. No artifact => snapshot.
+  repositoryFailure carries a precise reason (repository_artifact_late,
+  bundle:<reason>;synthetic:<reason>, repository_artifact_disabled, ...); the
+  candidate still runs and workspace equivalence stays unverified.
+  PAPERCLIP_GITHUB_SHADOW_REPOSITORY_ARTIFACTS=off disables production.
+  Dispatch: only after a PASSED isolation probe, the controller re-hashes the
+  local artifact, transfers it over the certified SSH channel (tar stream) into
+  <home>/.paperclip-review/artifact, and the isolated principal materialises it:
+  local bare origin <home>/.paperclip-review/origin.git, `git clone` into
+  <home>/workspace, detached HEAD at the admitted head (synthetic: commit 2),
+  origin/pull/<n>/head and origin/<base> present, .paperclip-runtime/ excluded.
+  `git fetch origin` and `git diff origin/<base>...HEAD` work offline; the only
+  remote is the local path. The claude adapter does not sync/restore the
+  workspace for certified candidates, so the CLI cwd IS that checkout. The
+  receipt (isolationTests[run].workspace) records status/kind/head/tree/base
+  commit/base tree or a precise reason. Namespace cleanup removes it all.
+  Equivalence: workspace_equivalence_unverified clears only when
+    candidate: receipt materialized for this exact artifact; bundle => HEAD =
+      admitted head and origin/<base> = admitted base; synthetic => HEAD tree =
+      admitted head tree and base tree present; and every candidate CLI init
+      observed exactly that HEAD and tree (workspaceKind isolated_checkout);
+    primary: every run either observed HEAD = admitted head (checkout) or ran
+      from its agent home with no checkout HEAD, recorded as workspaceKind
+      "agent_home_with_network_git" (it clones/fetches GitHub itself).
+  The arms are equivalent in CAPABILITY: both have a full local checkout of the
+  admitted head. The primary may additionally fetch other refs (including later
+  commits); the candidate cannot, by design (that would leak what the primary
+  found or published).
+  Remaining asymmetries (recorded, not hidden):
+    - synthetic fallback lacks real history/blame/log (two commits only);
+    - the primary has network gh/curl/GitHub API; the candidate only the sealed
+      snapshot tools and the local checkout;
+    - the candidate lacks WebSearch/WebFetch (protocol deviation webTools);
+    - primary "agent_home_with_network_git" is a recorded kind, not a proof
+      that the primary actually cloned the admitted head in that run.
 
 Known deviations
   The operator-provisioned host's /proc does not use hidepid. Other users'
