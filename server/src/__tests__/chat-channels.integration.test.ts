@@ -3957,7 +3957,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const head = "b".repeat(40);
       installShadowRecorder(f, head, async url => url.endsWith("/pulls/81") ? new Response("temporary failure", { status: 503 }) : undefined);
       const admitted = await admitShadowTestPullRequest(f, head);
-      await expect.poll(() => f.wakeup.mock.calls.filter(c => c[0] === f.assignedAgentId).length, { timeout: 10000 }).toBeGreaterThan(0);
+      // The mock can resolve before dispatch commits its durable wake receipt.
+      // Capture intentionally ignores a still-processing inbound_wakeup action.
+      await expect.poll(async () => (await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup"),
+      )))[0]?.status, { timeout: 10000 }).toBe("processed");
       await f.service.processPendingDeliveries();
       const rows = [...await db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
         join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
