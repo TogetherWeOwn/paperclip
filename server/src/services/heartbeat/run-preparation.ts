@@ -3,7 +3,7 @@ import { githubConfiguredInstructionSources } from "../chat-github-review-policy
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "../mcp-tool-names.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
-import { githubBotConnectionIdsForRun } from "../chat-github-tools.js";
+import { githubBotConnectionIdsForRun, githubCandidateReviewAssignmentForRun } from "../chat-github-tools.js";
 import { isBrowserUseConnection } from "../browser-use-client.js";
 import { explicitOperatorRunIdentity } from "../run-identity.js";
 import {
@@ -1000,7 +1000,10 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         identityContextId: runIdentity?.activeIdentityContextId,
       })).map(tool => tool.connectionId))
     : new Set<string>();
-  const assignedConnections = resolvedInstalledConnections.filter(
+  // A dispatched paired candidate is granted by its exact capability alone:
+  // only its snapshot-backed review tools, never the clone's other access.
+  const candidateReview = await githubCandidateReviewAssignmentForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const assignedConnections = candidateReview ? [candidateReview.connection] : resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
       connection.status === "active" &&
