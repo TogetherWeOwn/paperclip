@@ -17,6 +17,9 @@ import {
   githubReviewLineIsInPatch,
   githubReviewSchedulingDecision,
   githubShadowLabel,
+  githubWorkflowReviewTriggerHeadSha,
+  githubWorkflowTriggerPersonAllowed,
+  githubWorkflowTriggerReviewDecision,
   matchesGitHubReviewPattern,
   validateGitHubReviewAssessment,
   validatePersistedGitHubReviewAssessment,
@@ -457,5 +460,217 @@ describe("shadow review configuration", () => {
           shadow: { enabled: true, label },
         }).success,
       ).toBe(false);
+  });
+});
+
+describe("workflow review-trigger admission", () => {
+  const sha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+  it("extracts the head SHA from the exact workflow trigger", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}`,
+      ),
+    ).toBe(sha);
+  });
+  it("tolerates surrounding text and normalizes uppercase hex", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `please\n@togetherweown-reviewer review ${sha.toUpperCase()}\nthanks`,
+      ),
+    ).toBe(sha);
+  });
+  it("rejects lookalikes that must stay suppressed", () => {
+    expect(githubWorkflowReviewTriggerHeadSha("hello world")).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha("@togetherweown-reviewer review"),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${"a".repeat(39)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${"g".repeat(40)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer please review ${sha}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-reviewer review ${sha}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(`@togetherweown-reviewerX review ${sha}`),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}g`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}-${"a".repeat(7)}`,
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}_note`,
+      ),
+    ).toBe(null);
+  });
+  it("binds the mention to the endpoint reviewer handle", () => {
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-bot review ${sha}`,
+        "other-bot",
+      ),
+    ).toBe(sha);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@togetherweown-reviewer review ${sha}`,
+        "other-bot",
+      ),
+    ).toBe(null);
+    expect(
+      githubWorkflowReviewTriggerHeadSha(
+        `@other-bot review ${sha}g`,
+        "other-bot",
+      ),
+    ).toBe(null);
+  });
+});
+
+describe("workflow review-trigger allow-list", () => {
+  const sha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+  const allowed = {
+    provider: "github",
+    isMe: false,
+    isSystem: false,
+    isBot: true,
+    triggerHeadSha: sha,
+    allowUnlinkedPeople: true,
+    person: {
+      kind: "guest",
+      automaticReviews: true,
+      sponsorUserId: "owner",
+    },
+    sponsor: { status: "active", membershipRole: "member" },
+  };
+  it("admits the allow-listed workflow identity", () => {
+    expect(githubWorkflowTriggerPersonAllowed(allowed)).toBe(true);
+  });
+  it("suppresses every non-allow-listed variant", () => {
+    expect(
+      githubWorkflowTriggerPersonAllowed({ ...allowed, provider: "slack" }),
+    ).toBe(false);
+    expect(githubWorkflowTriggerPersonAllowed({ ...allowed, isMe: true })).toBe(
+      false,
+    );
+    expect(
+      githubWorkflowTriggerPersonAllowed({ ...allowed, isSystem: true }),
+    ).toBe(false);
+    expect(githubWorkflowTriggerPersonAllowed({ ...allowed, isBot: false })).toBe(
+      false,
+    );
+    expect(
+      githubWorkflowTriggerPersonAllowed({ ...allowed, triggerHeadSha: null }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({
+        ...allowed,
+        allowUnlinkedPeople: false,
+      }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({ ...allowed, person: undefined }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({
+        ...allowed,
+        person: { kind: "member", automaticReviews: true },
+      }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({
+        ...allowed,
+        person: {
+          kind: "guest",
+          automaticReviews: false,
+          sponsorUserId: "owner",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({ ...allowed, sponsor: undefined }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({
+        ...allowed,
+        sponsor: { status: "suspended", membershipRole: "member" },
+      }),
+    ).toBe(false);
+    expect(
+      githubWorkflowTriggerPersonAllowed({
+        ...allowed,
+        sponsor: { status: "active", membershipRole: "viewer" },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("workflow review-trigger review-time policy", () => {
+  const sha = "67308fef6be412067b16b29a8282c36cfe373c2f";
+  const pull = {
+    headSha: sha,
+    draft: false,
+    labels: ["review-ready"],
+    baseBranch: "master",
+    authorLogin: "author",
+    authorIsBot: false,
+  };
+  function decision(policyOverrides = {}, pullOverrides = {}, triggerHeadSha = sha) {
+    const policy = {
+      ...defaultGitHubReviewPolicy(),
+      requiredLabels: ["review-ready"],
+      ...policyOverrides,
+    };
+    return githubWorkflowTriggerReviewDecision({
+      policy,
+      triggerHeadSha,
+      pull: { ...pull, ...pullOverrides },
+    });
+  }
+  it("admits the exact trigger head on a ready PR", () => {
+    expect(decision().allowed).toBe(true);
+  });
+  it("rejects a stale trigger SHA", () => {
+    const stale = decision({}, {}, "a".repeat(40));
+    expect(stale.allowed).toBe(false);
+    expect(stale.reason).toBe("stale_head");
+  });
+  it("enforces draft, labels, branches and authors at review time", () => {
+    expect(decision({}, { draft: true }).reason).toBe("draft");
+    expect(decision({}, { labels: [] }).reason).toBe("required_label_missing");
+    expect(
+      decision(
+        { excludedLabels: ["do-not-review"] },
+        { labels: ["review-ready", "do-not-review"] },
+      ).reason,
+    ).toBe("label_excluded");
+    expect(
+      decision({ targetBranches: ["release/*"] }, {}).reason,
+    ).toBe("branch_excluded");
+    expect(decision({}, { authorIsBot: true }).reason).toBe("bot_author");
+    expect(
+      decision({ includeAuthors: ["teammate"] }, {}).reason,
+    ).toBe("author_not_included");
+    expect(decision({ excludeAuthors: ["author"] }, {}).reason).toBe(
+      "author_excluded",
+    );
   });
 });
