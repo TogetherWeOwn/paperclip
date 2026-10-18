@@ -3878,6 +3878,39 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await request(app).get(`/api/issues/${primary.issueId}/comments`).set("Authorization", `Bearer ${token}`)).status).toBe(200);
       expect([...await db.execute(sql`select id from chat_github_review_candidates where endpoint_id = ${f.endpoint.id}`)]).toHaveLength(0);
     });
+    it("paired confinement leaves an admitted agent's signed non-candidate run usable", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "candidate-and-normal-runs", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const [ordinary] = await db.insert(issues).values({ companyId: f.companyId, title: "Ordinary production work", assigneeAgentId: f.replacementAgentId }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        invocationSource: "assignment", status: "running", nativeIssueId: ordinary!.id, contextSnapshot: { issueId: ordinary!.id } }).returning();
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { createLocalAgentJwt } = await import("../agent-auth-jwt.js");
+      const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "paired-normal-run-fixture";
+      try {
+        const app = express();
+        app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+        app.get("/api/ordinary-probe", (_req, res) => res.json({ reached: true }));
+        app.use(errorHandler);
+        const token = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", run!.id, "owner-user")!;
+        const candidateToken = createLocalAgentJwt(f.replacementAgentId, f.companyId, "claude_local", candidateSession.runId, "owner-user")!;
+        for (const enabled of [true, false]) {
+          await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: enabled });
+          expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${token}`)).status).toBe(200);
+          expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${candidateToken}`)).status).toBe(403);
+        }
+        // A native normal task cannot mask a persisted candidate context alias.
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: ordinary!.id, taskId: candidate.issue.id } }).where(eq(heartbeatRuns.id, run!.id));
+        expect((await request(app).get("/api/ordinary-probe").set("Authorization", `Bearer ${token}`)).status).toBe(403);
+      } finally {
+        if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+      }
+    });
     it("paired regression rejects signed but unbound candidate credentials after enrollment is disabled", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "unbound-signed-candidate", "@maya review this", 81);

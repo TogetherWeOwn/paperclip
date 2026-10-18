@@ -2,7 +2,7 @@ import { githubBotCredentials } from "./chat-github-client.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { agents, toolCatalogEntries } from "@paperclipai/db";
 import { GITHUB_BOT_TOOLS, syncGitHubBotTools } from "./chat-github-tools.js";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import {
   chatEndpoints,
   chatEndpointResources,
@@ -185,11 +185,24 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
           inArray(agents.id, config.shadowRoutes.map((route) => route.agentId)),
         ))
         .orderBy(asc(agents.id))
-        .for("share");
+        // Serialize arm assignment across endpoints targeting the same agent.
+        .for("update");
+      const targetIds = targets.map(target => target.id);
+      const primaryAssignments = targetIds.length ? await tx.select({ agentId: chatEndpoints.assignedAgentId })
+        .from(chatEndpoints).where(and(eq(chatEndpoints.companyId, bot.companyId),
+          eq(chatEndpoints.provider, "github"), inArray(chatEndpoints.assignedAgentId, targetIds))) : [];
+      const otherArms = targetIds.length ? await tx.select({ agentId: chatGitHubReviewArms.agentId })
+        .from(chatGitHubReviewArms).where(and(eq(chatGitHubReviewArms.companyId, bot.companyId),
+          ne(chatGitHubReviewArms.endpointId, endpointId), isNull(chatGitHubReviewArms.retiredAt),
+          inArray(chatGitHubReviewArms.agentId, targetIds))) : [];
       for (const route of config.shadowRoutes) {
         const target = targets.find((agent) => agent.id === route.agentId);
         if (!target || target.id === lockedBot.assignedAgentId || target.status === "terminated") {
           throw badRequest("Shadow route must target a different, non-terminated agent in this company");
+        }
+        if (primaryAssignments.some(row => row.agentId === route.agentId)
+          || otherArms.some(row => row.agentId === route.agentId)) {
+          throw badRequest("Shadow route requires a dedicated agent, not a primary reviewer or another endpoint's active arm");
         }
         const existing = armRows.find((arm) => arm.label === route.label);
         if (existing && (existing.agentId !== route.agentId || existing.retiredAt !== null)) {

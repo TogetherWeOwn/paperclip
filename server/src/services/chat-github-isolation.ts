@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import { chatGitHubReviewCandidates, heartbeatRuns, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import { githubRunCapability } from "./chat-github-shadow.js";
@@ -19,12 +19,16 @@ export async function githubCandidateRunBoundary(db: Db, session: {
   if (!run) return null;
   const issueId = run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
   const commentId = run.contextSnapshot?.wakeCommentId;
+  // Check every persisted alias for denial, as the outbound fence does. A
+  // conflicting native task must not hide a candidate contextSnapshot.taskId.
+  const issueIds = [...new Set([run.nativeIssueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
+    .filter((id): id is string => typeof id === "string"))];
   // An empty OR is elided by Drizzle, so reject it before querying.
-  if (typeof issueId !== "string" && typeof commentId !== "string") return null;
+  if (!issueIds.length && typeof commentId !== "string") return null;
   const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(and(
     eq(chatGitHubReviewCandidates.companyId, session.companyId),
     or(
-      typeof issueId === "string" ? eq(chatGitHubReviewCandidates.issueId, issueId) : undefined,
+      issueIds.length ? inArray(chatGitHubReviewCandidates.issueId, issueIds) : undefined,
       typeof commentId === "string" ? eq(chatGitHubReviewCandidates.commentId, commentId) : undefined,
     ),
   ));
@@ -58,7 +62,17 @@ export async function assertGitHubCandidateApiBoundary(db: Db, session: {
     throw forbidden("Paired candidates require signed run-bound credentials", { code: "github_candidate_api_denied" });
   const boundary = await githubCandidateRunBoundary(db, session);
   if (!boundary) {
-    if (admission) throw forbidden("Paired candidate credentials have no verified native run capability", { code: "github_candidate_api_denied" });
+    if (admission) {
+      // Admission confines candidate RUNS, not every future task of the agent.
+      // Only a signed, persisted run proves a separate non-candidate execution;
+      // long-lived keys and fabricated run IDs remain fail-closed.
+      const [ordinaryRun] = session.credential === "agent_jwt" && session.runId
+        ? await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
+            eq(heartbeatRuns.agentId, session.agentId),
+          )) : [];
+      if (!ordinaryRun) throw forbidden("Paired candidate credentials have no verified native run capability", { code: "github_candidate_api_denied" });
+    }
     return;
   }
   // An API key's run header is caller-controlled and proves no run authority.

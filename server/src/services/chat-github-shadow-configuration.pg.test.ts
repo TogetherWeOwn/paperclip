@@ -93,6 +93,48 @@ suite("GitHub shadow route persistence (A11, real PostgreSQL)", () => {
     }
   });
 
+  async function otherEndpoint(f: Awaited<ReturnType<typeof fixture>>, assignedAgentId: string) {
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.connectionId));
+    const [otherConnection] = await db.insert(toolConnections).values({ ...connection!, id: randomUUID(), uid: randomUUID() }).returning();
+    const [endpoint] = await db.insert(chatEndpoints).values({ companyId: f.companyId, connectionId: otherConnection!.id,
+      assignedAgentId, provider: "github", publicId: randomUUID(), status: "active" }).returning();
+    return endpoint!;
+  }
+
+  it("rejects a primary reviewer assigned to another endpoint without changing either bot", async () => {
+    const f = await fixture();
+    const other = await otherEndpoint(f, f.candidateId);
+    await expect(f.save([f.route])).rejects.toThrow(/dedicated|primary|endpoint/i);
+    expect((await f.service.configuration(f.endpointId, f.userId)).revision).toBe(1);
+    expect(await f.arms()).toHaveLength(0);
+    expect((await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, other.id)))[0]!.assignedAgentId).toBe(f.candidateId);
+  });
+
+  it("rejects an agent already serving an active shadow arm on another endpoint", async () => {
+    const f = await fixture();
+    await f.save([f.route]);
+    const other = await otherEndpoint(f, f.agentId);
+    const config = await f.service.configuration(other.id, f.userId);
+    await expect(f.service.saveConfiguration(other.id, { expectedRevision: config.revision,
+      configuration: { ...config.configuration, shadowRoutes: [f.route] } }, f.userId)).rejects.toThrow(/dedicated|another|arm/i);
+    expect((await f.service.configuration(other.id, f.userId)).revision).toBe(0);
+    expect(await f.arms()).toHaveLength(1);
+  });
+
+  it("serializes concurrent cross-endpoint assignments of the same shadow agent", async () => {
+    const f = await fixture();
+    const other = await otherEndpoint(f, f.agentId);
+    const config = await f.service.configuration(other.id, f.userId);
+    const results = await Promise.allSettled([
+      f.save([f.route]),
+      f.service.saveConfiguration(other.id, { expectedRevision: config.revision,
+        configuration: { ...config.configuration, shadowRoutes: [f.route] } }, f.userId),
+    ]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+    expect([...await db.execute(sql`select id from chat_github_review_arms where company_id = ${f.companyId} and agent_id = ${f.candidateId} and retired_at is null`)]).toHaveLength(1);
+  });
+
   it("revision-fences concurrent saves and does not create arms for a stale revision", async () => {
     const f = await fixture();
     const results = await Promise.allSettled([f.save([f.route], 1), f.save([f.route], 1)]);
