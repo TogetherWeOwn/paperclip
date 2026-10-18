@@ -14,6 +14,14 @@ describe("primary visibility set matching", () => {
     expect(() => visibility.assertVisible(text)).not.toThrow();
     expect(visibility.filter(text)).toBe(text);
   });
+  it.each(["{\n \"id\": 12345678901234567890\n}", "[1, 2,   3]"])("preserves untouched structured text byte for byte: %s", text => {
+    expect(visibility.filter({ description: text })).toEqual({ description: text });
+    expect(createGitHubPrimaryVisibility(new Set(), []).filter(text)).toBe(text);
+  });
+  it("is the identity for ordinary default-off data including colliding property names", () => {
+    const value = { previousAssessments: ["ordinary"], isolationTests: { ordinary: true }, description: "[1, 2,   3]" };
+    expect(createGitHubPrimaryVisibility(new Set(), []).filter(value)).toBe(value);
+  });
   it("filters both structured rows and JSON text without removing adjacent public rows", () => {
     const rows = [{ id: uuid, title: "private" }, { id: "public", title: "public", previousAssessments: { secret: true } }];
     const expected = [{ id: "public", title: "public" }];

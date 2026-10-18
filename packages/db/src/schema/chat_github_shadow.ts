@@ -85,7 +85,7 @@ export const chatGitHubReviewEnrollments = pgTable("chat_github_review_enrollmen
   isolationTests: jsonb("isolation_tests").$type<Record<string, {
     version: number; runId: string; candidateId: string; armId: string; environmentId: string;
     namespace: string; configurationDigest: string; certificateDigest: string; home: string; checkedAt: string;
-    status: string; checks: { primaryCanariesDenied: boolean; githubDenied: boolean; configFresh: boolean };
+    status: string; checks: { primaryCanariesDenied: boolean; githubDenied: boolean; configFresh: boolean; providerToolsDenied?: boolean };
     comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
     primaryBlindingVersion?: number;
     hooksDigest?: string;

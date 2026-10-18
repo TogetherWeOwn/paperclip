@@ -53,7 +53,7 @@ for root in "$@"; do setfacl -m u:paperclip-shadow:--- -- "$root"; done
 for firewall in iptables ip6tables; do
   "$firewall" -w -N PC_SHADOW_EGRESS
   if [[ $firewall = iptables ]]; then
-    "$firewall" -w -A PC_SHADOW_EGRESS -o lo -d 127.0.0.1/32 -p tcp -m multiport --dports 3100,8317 -j ACCEPT
+    "$firewall" -w -A PC_SHADOW_EGRESS -o lo -d 127.0.0.1/32 -p tcp -m multiport --dports 3100,8318 -j ACCEPT
   fi
   "$firewall" -w -A PC_SHADOW_EGRESS -j REJECT
   "$firewall" -w -I OUTPUT 1 -m owner --uid-owner "$uid" -j PC_SHADOW_EGRESS

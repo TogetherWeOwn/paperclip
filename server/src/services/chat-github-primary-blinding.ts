@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { assets, chatGitHubReviewCandidates, chatGitHubReviews, documentRevisions, documents, heartbeatRuns, issueAttachments, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
 import type { Request, Response } from "express";
@@ -143,13 +144,35 @@ export function createGitHubPrimaryVisibility(tokens: ReadonlySet<string>, candi
     typeof record.shadowLabel === "string" || typeof record.githubShadowLabel === "string"
     || typeof record.shadow_label === "string" || typeof record.github_shadow_label === "string"
     || Object.values(record).some(value => typeof value === "string" && !structuredText(value) && containsReference(value));
+  function hasHiddenData(value: unknown): boolean {
+    if (typeof value === "string") {
+      try { const decoded = JSON.parse(value); return decoded !== value && hasHiddenData(decoded); }
+      catch { return false; }
+    }
+    if (!value || typeof value !== "object" || value instanceof Date) return false;
+    if (Array.isArray(value)) return value.some(hasHiddenData);
+    const record = value as Record<string, unknown>;
+    return isHiddenRecord(record) || Object.hasOwn(record, "githubPairingSeed")
+      || Object.hasOwn(record, "githubPairedCandidate") || Object.values(record).some(hasHiddenData);
+  }
   function filter(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(filter).filter(v => v !== undefined);
+    // With no candidate references or actual shadow records, ordinary user keys
+    // such as previousAssessments are not evidence of private review data.
+    if (!references.size && !hasHiddenData(value)) return value;
+    return filterHidden(value);
+  }
+  function filterHidden(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(filterHidden).filter(v => v !== undefined);
     if (typeof value === "string") {
       // MCP self tools also encode their data as JSON text. Filter both copies.
       try {
         const decoded = JSON.parse(value);
-        if (decoded && typeof decoded === "object") return JSON.stringify(filter(decoded) ?? null);
+        if (decoded && typeof decoded === "object") {
+          const visible = filterHidden(decoded);
+          // Parsing JSON text is lossy (large integers, whitespace). Only encode
+          // it again when redaction actually changed the decoded value.
+          return isDeepStrictEqual(decoded, visible) ? value : JSON.stringify(visible ?? null);
+        }
       } catch { /* Ordinary text. */ }
       return containsReference(value) ? undefined : value;
     }
@@ -158,7 +181,7 @@ export function createGitHubPrimaryVisibility(tokens: ReadonlySet<string>, candi
     if (isHiddenRecord(record)) return undefined;
     return Object.fromEntries(Object.entries(record).flatMap(([key, entry]) => {
       if (hiddenKeys.has(key)) return [];
-      const visible = filter(entry);
+      const visible = filterHidden(entry);
       return visible === undefined ? [] : [[key, visible]];
     }));
   }

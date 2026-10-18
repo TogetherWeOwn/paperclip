@@ -36,6 +36,25 @@ Primary input provenance
   This implementation does not record a complete, timed live-read transcript, so
   opportunistic certification of same-head live primaries is deliberately NOT
   implemented. A future opt-in needs that evidence, not an inferred clean label.
+  Pending selections now record their actual admission time and instance-settings
+  transaction epoch. Capture is allowed only within 15 seconds, before any linked
+  primary execution/review/publication, with checks before and after provider I/O.
+  Any committed settings rewrite invalidates pending selection conservatively,
+  including off/on transitions entirely between sweeps. Interrupted, disabled or
+  late selections retain an unavailable denominator; they never recapture fresh
+  comments/reviews/head. Actual primary reviewed-head disagreement voids the
+  candidate at wake, tool binding and dispatch checks.
+  NUL in PR title/body is accounted as admission_event_not_jsonb_safe, without
+  altering its bytes or silently dropping the selected pair.
+
+Tool/workspace equivalence remains UNVERIFIED
+  Empty isolated candidate workspace is not equivalent to a primary worktree.
+  primaryToolPolicy is configuration evidence, not an effective tool inventory.
+  Eligibility explicitly includes effective_tool_equivalence_unverified and
+  workspace_equivalence_unverified even after successful isolation/sealed reads.
+  Do not report CLEAN_PAIRED until per-run effective tool/workspace inventories
+  are recorded and compared with justified deviations. This implementation does
+  not supply that missing equivalence proof.
 
 Deferred capture failures and denominator accounting
   githubPairingCapture.attempts bounds recovery to three claims. Missing source,
@@ -71,7 +90,23 @@ Deferred capture failures and denominator accounting
 
 2. Review and persist the network boundary
   The template installs IPv4/IPv6 owner-match OUTPUT rules for this UID only.
-  Only IPv4 loopback TCP 3100 (Paperclip) and 8317 (model proxy) are allowed.
+  Only IPv4 loopback TCP 3100 (Paperclip) and 8318 (restricted proxy) are allowed.
+  Raw upstream 8317 MUST be denied to the candidate UID. As a DIFFERENT trusted
+  non-candidate service UID, run scripts/github-shadow-model-proxy.mjs using Node
+  22+ under the host-managed service supervisor. It binds only 127.0.0.1:8318.
+  Set PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN to a dedicated candidate token and
+  PAPERCLIP_GITHUB_SHADOW_UPSTREAM_TOKEN to a DIFFERENT private upstream token.
+  The controller needs the candidate token; candidates never receive upstream
+  credentials. Do not run the proxy as paperclip-shadow or share its env/file.
+  Provision credentials through the existing secret-management mechanism; this
+  change neither creates nor rotates credentials. The proxy accepts only exact
+  POST /v1/messages (plus the exact SDK ?beta=true alias), custom client tools
+  and inline inputs, rejecting provider
+  web/MCP tools, URL sources and management routes before upstream I/O. It strips
+  request headers except the fixed protocol headers and private upstream auth.
+  The runtime probes authenticated web-search, web-fetch and MCP denial and requires
+  HTTP 403 plus x-paperclip-shadow-policy: client-tools-only-v1. Outage is NOT a pass.
+  CLI --disallowedTools alone is not a network boundary.
   All other TCP/UDP, Internet, DNS, IPv6 and other loopback destinations reject.
   Persist these rules using the existing host-managed firewall mechanism before
   certification. Do not certify an ephemeral rule which disappears on reboot.
@@ -117,14 +152,17 @@ Deferred capture failures and denominator accounting
   The digest is SHA256 of recursively key-sorted JSON for those three fields.
   Server environment value schema (replace placeholders, never paste as-is):
   [{"companyId":"UUID","environmentId":"UUID","configurationDigest":"64-lowercase-hex",
+    "modelProxyPolicy":"client-tools-only-v1",
     "primaryCanaries":[
       {"kind":"run","serverPath":"/controller/path/run-canary","remotePath":"/host/primary/run/canary","sha256":"64-lowercase-hex"},
       {"kind":"worktree","serverPath":"/controller/path/worktree-canary","remotePath":"/host/primary/worktree/canary","sha256":"64-lowercase-hex"}
     ]}]
   No public keys, tokens, private keys, answers or canary contents enter receipts.
-  Only explicit ANTHROPIC_AUTH_TOKEN/API_KEY/MODEL config env is forwarded, with
-  fixed ANTHROPIC_BASE_URL=http://127.0.0.1:8317 and fresh HOME/config/XDG/TMP.
-  Ambient controller process credentials are not sent to SSH command probes.
+  Only explicit model/context/time settings are forwarded from agent config.
+  ANTHROPIC_AUTH_TOKEN is replaced with the dedicated shadow proxy token, with
+  fixed ANTHROPIC_BASE_URL=http://127.0.0.1:8318 and fresh HOME/config/XDG/TMP.
+  The dedicated candidate token is sent over SSH stdin for the authenticated
+  denial probe, never argv or receipts. No ambient/upstream credentials are sent.
   Use the normal signed run JWT for Paperclip, not a long-lived agent API key.
 
 5. Stage, verify, and retain evidence before any enablement
@@ -133,6 +171,11 @@ Deferred capture failures and denominator accounting
   to chat_github_review_enrollments.isolation_tests[runId]. A failed probe marks
   the candidate voided; neither recovery nor tools can revive it. A missing grant
   starts no probe/provider. Replay cannot overwrite a previous receipt.
+  Probe, provider execution and nonce-owned cleanup hold a PostgreSQL advisory
+  lease keyed by SSH host/port/principal, using a separate connection so waiting
+  candidates do not exhaust the primary pool. Use one canonical host name for all
+  environments on the same host. Orphan/sibling HOME is availability failure, not
+  evidence that a review read primary answers; preserve its error denominator.
   The kill switch and certificate are rechecked after setup at adapter dispatch.
   Each receipt also binds the complete certificate digest, including canary path
   mappings and hashes; replacing a grant invalidates an in-flight preparation.

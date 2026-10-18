@@ -32,7 +32,7 @@ export function githubRunComparisonEligibility(
     environmentCertified: !!(bound && receipt.environmentId && receipt.configurationDigest && receipt.certificateDigest),
     selfTestRecorded: !!bound,
     selfTestPassed: !!(bound && receipt.status === "passed" && receipt.checks.primaryCanariesDenied
-      && receipt.checks.githubDenied && receipt.checks.configFresh && receipt.hooksDigest),
+      && receipt.checks.githubDenied && receipt.checks.configFresh && receipt.checks.providerToolsDenied === true && receipt.hooksDigest),
     primaryBlindingActive: enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_PRIMARY_BLINDING_VERSION
       && receipt?.primaryBlindingVersion === GITHUB_PRIMARY_BLINDING_VERSION,
     snapshotAvailable: !!enrollment.envelope.snapshot,
@@ -63,6 +63,10 @@ export function githubComparisonEligibility(evidence: {
   if (!evidence.snapshotAvailable) reasons.push("admission_snapshot_unavailable");
   if (evidence.roundOrdinal > 1) reasons.push("longitudinal_arm_history");
   if (evidence.primaryInputSource !== "snapshot") reasons.push("primary_inputs_not_sealed");
+  // The current protocol records policy configuration, not effective CLI/MCP
+  // tool inventories or a matched workspace. Isolation must never certify an
+  // apples-to-apples comparison until those independent proofs are implemented.
+  reasons.push("effective_tool_equivalence_unverified", "workspace_equivalence_unverified");
   return { certifiedClean: reasons.length === 0, reasons };
 }
 

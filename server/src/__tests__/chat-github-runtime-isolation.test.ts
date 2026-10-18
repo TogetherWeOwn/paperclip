@@ -14,17 +14,17 @@ import {
 
 const prepared = {
   home: "/home/paperclip-shadow/.paperclip-runtime/isolated/run",
-  env: { HOME: "/home/paperclip-shadow/.paperclip-runtime/isolated/run", CLAUDE_CONFIG_DIR: "/home/paperclip-shadow/.paperclip-runtime/isolated/run/.claude" },
+  env: { ANTHROPIC_AUTH_TOKEN: "restricted-shadow-token", HOME: "/home/paperclip-shadow/.paperclip-runtime/isolated/run", CLAUDE_CONFIG_DIR: "/home/paperclip-shadow/.paperclip-runtime/isolated/run/.claude" },
 } as PreparedGitHubCandidateRuntime;
 
 afterEach(() => vi.unstubAllEnvs());
 
 describe("certified GitHub candidate configuration", () => {
-  it.each(["isolated", "readable", "missing", "network-open", "reused-home", "wrong-user", "sibling-home"])(
+  it.each(["isolated", "readable", "missing", "network-open", "reused-home", "wrong-user", "sibling-home", "proxy-open", "proxy-error"])(
     "runs the actual Python probe against %s boundary fixtures", scenario => {
       // No real users, firewall, files, or sockets are changed. The exact shipped
       // Python program runs with deterministic syscall fakes, not a fake receipt.
-      const fixture = `import builtins, errno, io, os, pwd, socket, types
+      const fixture = `import builtins, errno, io, os, pwd, socket, types, urllib.request, urllib.error
 scenario = ${JSON.stringify(scenario)}
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="other" if scenario == "wrong-user" else "paperclip-shadow")
@@ -44,6 +44,12 @@ class FakeSocket:
     def connect(self, address):
         if scenario != "network-open": raise OSError(errno.EACCES, "fixture")
 socket.socket = lambda *args: FakeSocket()
+import urllib.request, urllib.error
+def fake_urlopen(request, **kwargs):
+    if scenario == "proxy-error": raise OSError("proxy unavailable")
+    if scenario == "proxy-open": return io.StringIO("accepted")
+    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
+urllib.request.urlopen = fake_urlopen
 `;
       const proof = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
         input: JSON.stringify({ nonce: "nonce", home: "/fresh", canaries: ["/primary/run", "/primary/worktree"], githubAddresses: ["192.0.2.1", "2001:db8::1"] }),
@@ -53,6 +59,7 @@ socket.socket = lambda *args: FakeSocket()
       expect(Object.values(proof.checks).every(Boolean)).toBe(scenario === "isolated");
       if (["readable", "missing"].includes(scenario)) expect(proof.checks.primaryCanariesDenied).toBe(false);
       if (scenario === "network-open") expect(proof.checks.githubDenied).toBe(false);
+      expect(proof.checks.providerToolsDenied).toBe(!["wrong-user", "proxy-open", "proxy-error"].includes(scenario));
       if (scenario === "reused-home") expect(proof.checks.configFresh).toBe(false);
     },
   );
@@ -60,7 +67,7 @@ socket.socket = lambda *args: FakeSocket()
     const scratch = mkdtempSync(join(tmpdir(), "shadow-hooks-"));
     const home = join(scratch, "fresh");
     const files = { ".claude/settings.json": '{"hooks":{}}', "hooks/guard.mjs": "// immutable guard" };
-    const fixture = `import builtins, errno, pwd, socket, types, os
+    const fixture = `import builtins, errno, pwd, socket, types, os, urllib.request, urllib.error
 os.geteuid = lambda: 12345
 pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_name="paperclip-shadow")
 real_open = builtins.open
@@ -74,6 +81,10 @@ class FakeSocket:
     def settimeout(self, value): pass
     def connect(self, address): raise OSError(errno.EACCES, "denied")
 socket.socket = lambda *args: FakeSocket()
+import urllib.request, urllib.error
+def deny_provider_tool(request, **kwargs):
+    raise urllib.error.HTTPError(request.full_url, 403, "denied", {"x-paperclip-shadow-policy": "client-tools-only-v1"}, None)
+urllib.request.urlopen = deny_provider_tool
 `;
     try {
       const proof = JSON.parse(execFileSync("python3", ["-c", fixture + GITHUB_ISOLATION_PROBE], {
@@ -125,7 +136,7 @@ shutil.rmtree = lambda p: removed.append(p)
         ANTHROPIC_AUTH_TOKEN: "explicit-proxy-token", ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", NODE_OPTIONS: "--require /primary/inject.js" },
     }, "/fresh/workspace");
     expect(config).toMatchObject({ engine: "cli", model: "muse-wonder-full-1.0-contributor", effort: "low", cwd: "/fresh/workspace",
-      env: { ...prepared.env, ANTHROPIC_AUTH_TOKEN: "explicit-proxy-token", ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", PAPERCLIP_API_URL: "http://127.0.0.1:3100" } });
+      env: { ...prepared.env, ANTHROPIC_AUTH_TOKEN: "restricted-shadow-token", ANTHROPIC_BASE_URL: "http://127.0.0.1:8318", PAPERCLIP_API_URL: "http://127.0.0.1:3100" } });
     expect(JSON.stringify(config)).not.toContain("primary-secret");
     expect(JSON.stringify(config)).not.toContain("primary-db");
     expect(JSON.stringify(config)).not.toContain("NODE_OPTIONS");

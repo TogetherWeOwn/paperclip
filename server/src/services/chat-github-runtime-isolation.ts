@@ -4,7 +4,7 @@ import dns from "node:dns/promises";
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
-  agents, environments, heartbeatRuns, chatGitHubReviewCandidates, chatGitHubReviewEnrollments, type Db,
+  agents, environments, heartbeatRuns, chatGitHubReviewCandidates, chatGitHubReviewEnrollments, withDedicatedDbConnection, type Db,
 } from "@paperclipai/db";
 import { runSshCommand, shellQuote } from "@paperclipai/adapter-utils/ssh";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -19,6 +19,7 @@ const certificateSchema = z.object({
   environmentId: z.string().uuid(),
   companyId: z.string().uuid(),
   configurationDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  modelProxyPolicy: z.literal("client-tools-only-v1"),
   primaryCanaries: z.array(z.object({
     kind: z.enum(["run", "worktree"]),
     serverPath: z.string().startsWith("/"),
@@ -60,10 +61,11 @@ function refuse(reason: string): never {
  * Numeric GitHub addresses bypass DNS (which the egress policy also denies).
  * TLS is deliberately unnecessary: any TCP connection can fetch public answers.
  */
-export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, socket, sys
+export const GITHUB_ISOLATION_PROBE = `import errno, json, os, pwd, socket, sys, urllib.request, urllib.error
 p = json.load(sys.stdin)
-checks = {"primaryCanariesDenied": False, "githubDenied": False, "configFresh": False}
+checks = {"primaryCanariesDenied": False, "githubDenied": False, "configFresh": False, "providerToolsDenied": False}
 username = pwd.getpwuid(os.geteuid()).pw_name
+namespace_busy = False
 if username == "paperclip-shadow" and os.geteuid() != 0:
     denied = []
     for canary in p["canaries"]:
@@ -84,7 +86,23 @@ if username == "paperclip-shadow" and os.geteuid() != 0:
             except OSError as e:
                 blocked.append(e.errno in (errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ETIMEDOUT) or isinstance(e, TimeoutError))
     checks["githubDenied"] = bool(blocked) and all(blocked)
+    refused = []
+    for extra in [{"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+                  {"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]},
+                  {"mcp_servers": [{"type": "url", "url": "https://github.com"}]}]:
+        body = {"model": "isolation-probe", "max_tokens": 1, "messages": [], **extra}
+        request = urllib.request.Request("http://127.0.0.1:8318/v1/messages", data=json.dumps(body).encode(),
+            headers={"Authorization": "Bearer " + p.get("proxyToken", ""), "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=2): refused.append(False)
+        except urllib.error.HTTPError as e:
+            refused.append(e.code == 403 and e.headers.get("x-paperclip-shadow-policy") == "client-tools-only-v1")
+        except OSError:
+            refused.append(False)
+    checks["providerToolsDenied"] = all(refused)
     try:
+        namespace_busy = bool(os.listdir(os.path.dirname(p["home"])))
+        if namespace_busy: raise FileExistsError("candidate_namespace_busy")
         os.mkdir(p["home"], 0o700)
         with open(os.path.join(p["home"], ".probe-owner"), "x") as owner: owner.write(p["nonce"])
         for child in (".claude", ".config", ".cache", ".local", "tmp", "workspace"):
@@ -106,7 +124,7 @@ if all(checks.values()) and p.get("hooks"):
         hooks_digest = p["hooks"]["digest"]
     except (OSError, ValueError):
         checks["configFresh"] = False
-print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "hooksDigest": hooks_digest}))
+print(json.dumps({"nonce": p["nonce"], "username": username, "home": p["home"], "checks": checks, "namespaceBusy": namespace_busy, "hooksDigest": hooks_digest}))
 `;
 
 export const GITHUB_ISOLATION_CLEANUP = `import os, shutil, sys
@@ -118,6 +136,27 @@ if os.path.isdir(home) and not os.path.islink(home):
         owned = False
     if owned: shutil.rmtree(home)
 `;
+
+/** Cross-controller lease; unlike a pool reservation this cannot starve primary
+ * queries while candidates wait. Keep the transaction open until remote cleanup.
+ * The key is the SSH host/principal, not a company or arm (same Unix UID shares
+ * files across all of those). Stale remote homes still fail the independent probe. */
+export async function acquireGitHubCandidateRuntimeLease(db: Db, hostPrincipal: string): Promise<() => Promise<void>> {
+  let acquired!: () => void;
+  let failed!: (error: unknown) => void;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve, reject) => { acquired = resolve; failed = reject; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const holding = withDedicatedDbConnection(db, dedicated => dedicated.transaction(async tx => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`github-shadow-runtime:${hostPrincipal}`}, 0))`);
+    acquired();
+    await released;
+  }));
+  void holding.catch(failed);
+  await ready;
+  return async () => { release(); await holding; };
+}
+const runtimeLeases = new Map<string, () => Promise<void>>();
 
 export interface PreparedGitHubCandidateRuntime {
   companyId: string;
@@ -145,11 +184,11 @@ export function githubCandidateAdapterConfig(
     || (config.command && config.command !== "claude") || config.chrome === true
     || (config.args != null && (!Array.isArray(config.args) || config.args.length > 0))
     || (config.extraArgs != null && (!Array.isArray(config.extraArgs) || config.extraArgs.length > 0))
-    || (env.ANTHROPIC_BASE_URL != null && env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:8317")) {
+    || (env.ANTHROPIC_BASE_URL != null && !["http://127.0.0.1:8317", "http://127.0.0.1:8318"].includes(String(env.ANTHROPIC_BASE_URL)))) {
     refuse("github_candidate_isolation_unavailable");
   }
   const providerEnv = Object.fromEntries(
-    ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+    ["ANTHROPIC_MODEL",
       "API_TIMEOUT_MS", "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
       "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"].flatMap(key =>
       typeof env[key] === "string" ? [[key, env[key]]] : []),
@@ -158,7 +197,7 @@ export function githubCandidateAdapterConfig(
     PATH: "/usr/local/bin:/usr/bin:/bin", PAPERCLIP_API_URL: "http://127.0.0.1:3100",
     PAPERCLIP_ASSIGNED_MODEL: typeof config.model === "string" ? config.model : providerEnv.ANTHROPIC_MODEL ?? "",
     PAPERCLIP_RUN_SCRATCH_DIR: `${prepared.home}/tmp`,
-    ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } };
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:8318", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } };
 }
 
 export async function prepareGitHubCandidateRuntime(db: Db, input: {
@@ -183,10 +222,17 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   if (target?.kind !== "remote" || target.transport !== "ssh" || target.spec.username !== "paperclip-shadow"
     || target.spec.strictHostKeyChecking !== true || !target.spec.knownHosts)
     refuse("github_candidate_isolation_unavailable");
+  const proxyToken = process.env.PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN;
+  if (!proxyToken) refuse("github_candidate_isolation_unavailable");
   const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
-  let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false };
+  const releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`);
+  runtimeLeases.set(nonce, releaseLease);
+  try {
+  // A queued candidate may have been disabled while waiting for the prior arm.
+  if (!(await githubCandidateMayWake(db, boundary.candidate))) refuse("github_candidate_disabled");
+  let checks = { primaryCanariesDenied: false, githubDenied: false, configFresh: false, providerToolsDenied: false };
   let proofReceived = false;
   try {
     for (const canary of certificate.primaryCanaries) {
@@ -199,14 +245,17 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error("dns_timeout")), 3000); timer.unref(); }),
     ]);
     const result = await runSshCommand(target.spec, `python3 -c ${shellQuote(GITHUB_ISOLATION_PROBE)}`, {
-      stdin: JSON.stringify({ nonce, home, hooks, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
+      stdin: JSON.stringify({ nonce, home, hooks, proxyToken, canaries: certificate.primaryCanaries.map(c => c.remotePath), githubAddresses: addresses.slice(0, 4).map(a => a.address) }),
       timeoutMs: 15_000, maxBuffer: 8192,
     });
     const proof = JSON.parse(result.stdout);
     if (proof.nonce !== nonce || proof.username !== "paperclip-shadow" || proof.home !== home) throw new Error("probe_binding_mismatch");
     if (!proof.checks || Object.keys(checks).some(key => typeof proof.checks[key] !== "boolean")) throw new Error("probe_checks_malformed");
+    // A stale/concurrent namespace is missing availability, not proof that this
+    // sample read a primary answer. The advisory lease handles healthy overlap.
+    if (proof.namespaceBusy === true) throw new Error("candidate_namespace_busy");
     checks = { primaryCanariesDenied: proof.checks.primaryCanariesDenied,
-      githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh };
+      githubDenied: proof.checks.githubDenied, configFresh: proof.checks.configFresh, providerToolsDenied: proof.checks.providerToolsDenied };
     // The probe intentionally does not install hooks after failed confinement.
     // A bound negative proof remains contamination, not a missing-hook outage.
     if (Object.values(checks).every(Boolean) && proof.hooksDigest !== hooks.digest) throw new Error("probe_hooks_mismatch");
@@ -228,7 +277,6 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       selfTestPassed: passed, primaryBlindingActive: boundary.enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
       snapshotAvailable: !!boundary.enrollment.envelope.snapshot, roundOrdinal: boundary.enrollment.roundOrdinal,
       primaryInputSource: await githubPrimaryInputSource(db, boundary.enrollment) }) };
-  try {
     await db.transaction(async tx => {
       // Append-once evidence. A retry cannot replace failed proof or reuse success.
       const rows = await tx.update(chatGitHubReviewEnrollments).set({
@@ -245,7 +293,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
       companyId: run.companyId, runId: run.id, candidateId: boundary.candidate.id, enrollmentId: boundary.enrollment.id,
       namespace: boundary.namespace, home, cleanupNonce: nonce, configurationDigest: certificate.configurationDigest,
       certificateDigest: receipt.certificateDigest,
-      env: { HOME: home, CLAUDE_CONFIG_DIR: `${home}/.claude`, XDG_CONFIG_HOME: `${home}/.config`,
+      env: { ANTHROPIC_AUTH_TOKEN: proxyToken, HOME: home, CLAUDE_CONFIG_DIR: `${home}/.claude`, XDG_CONFIG_HOME: `${home}/.config`,
         XDG_CACHE_HOME: `${home}/.cache`, XDG_DATA_HOME: `${home}/.local`, TMPDIR: `${home}/tmp` },
       target: { ...target, githubCandidateIsolation: { namespace: boundary.namespace, home },
         remoteCwd: `${home}/workspace`, spec: { ...target.spec, remoteCwd: `${home}/workspace` } },
@@ -253,8 +301,6 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     await assertGitHubCandidateDispatch(db, prepared, prepared.target);
     return prepared;
   } catch (error) {
-    // Preparation can create a home and then fail before returning a handle to
-    // heartbeat. Clean that path too; leftover homes fail the next sibling probe.
     await cleanupGitHubCandidateRuntime({ home, namespace: boundary.namespace, target, cleanupNonce: nonce }).catch(() => undefined);
     throw error;
   }
@@ -267,9 +313,15 @@ export async function cleanupGitHubCandidateRuntime(prepared: Pick<PreparedGitHu
   }
   // rmtree does not follow nested symlinks. Never interpolate arbitrary config
   // paths, remove siblings, or remove the shared isolated parent.
-  await runSshCommand(prepared.target.spec,
-    `python3 -c ${shellQuote(GITHUB_ISOLATION_CLEANUP)} ${shellQuote(prepared.home)} ${shellQuote(prepared.cleanupNonce)}`,
-    { timeoutMs: 15_000, maxBuffer: 8192 });
+  try {
+    await runSshCommand(prepared.target.spec,
+      `python3 -c ${shellQuote(GITHUB_ISOLATION_CLEANUP)} ${shellQuote(prepared.home)} ${shellQuote(prepared.cleanupNonce)}`,
+      { timeoutMs: 15_000, maxBuffer: 8192 });
+  } finally {
+    const release = runtimeLeases.get(prepared.cleanupNonce);
+    runtimeLeases.delete(prepared.cleanupNonce);
+    await release?.();
+  }
 }
 
 /** Recheck the switch, certification and durable receipt at the actual dispatch
@@ -288,7 +340,7 @@ export async function assertGitHubCandidateDispatch(db: Db, prepared: PreparedGi
     || JSON.stringify(target.spec) !== JSON.stringify(prepared.target.spec)) refuse("github_candidate_isolation_unavailable");
   const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(and(eq(chatGitHubReviewEnrollments.id, prepared.enrollmentId), eq(chatGitHubReviewEnrollments.companyId, prepared.companyId)));
   const receipt = enrollment?.isolationTests[prepared.runId];
-  if (!receipt || receipt.status !== "passed" || receipt.candidateId !== prepared.candidateId || receipt.namespace !== prepared.namespace
+  if (!receipt || receipt.status !== "passed" || receipt.checks.providerToolsDenied !== true || receipt.candidateId !== prepared.candidateId || receipt.namespace !== prepared.namespace
     || receipt.configurationDigest !== prepared.configurationDigest || receipt.certificateDigest !== prepared.certificateDigest)
     refuse("github_candidate_isolation_unavailable");
 }

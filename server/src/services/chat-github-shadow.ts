@@ -48,6 +48,9 @@ async function selectedGitHubPairArms(db: Store, endpoint: Endpoint,
 
 interface PendingPair {
   version: 1;
+  admittedAt: string;
+  settingsEpoch: string;
+  disabled?: boolean;
   revision: number;
   providerEventId: string;
   arms: Array<{ id: string; agentId: string; label: string }>;
@@ -66,7 +69,9 @@ export async function stageGitHubPair(tx: Tx, input: {
   if (!config || config.configuration.shadow?.enabled) return;
   const arms = await selectedGitHubPairArms(tx, input.endpoint, config, delivery.providerEventId, input.repository);
   if (!arms.length) return;
-  const pending: PendingPair = { version: 1, revision: input.revision, providerEventId: delivery.providerEventId,
+  const [settings] = await tx.execute(sql`select xmin::text as epoch from instance_settings where singleton_key = 'default'`);
+  if (!settings?.epoch) return;
+  const pending: PendingPair = { version: 1, admittedAt: new Date().toISOString(), settingsEpoch: String(settings.epoch), revision: input.revision, providerEventId: delivery.providerEventId,
     arms: arms.map(({ id, agentId, label }) => ({ id, agentId, label })) };
   await tx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubPairingPending: pending })}::jsonb` })
     .where(eq(chatDeliveries.id, delivery.id));
@@ -121,6 +126,13 @@ export async function prepareGitHubPairEvent(db: Db, input: {
       author: { id: String(pr.user.id), login: pr.user.login, isBot: pr.user.type === "Bot" },
       labels: (pr.labels ?? []).map(l => l.name),
     };
+    // jsonb cannot represent NUL. Preserve the sampled denominator rather than
+    // dropping the enrollment or silently changing the review's input bytes.
+    const containsNul = (value: unknown): boolean => typeof value === "string" ? value.includes("\u0000")
+      : !!value && typeof value === "object" && Object.values(value).some(containsNul);
+    if (containsNul(event)) return {
+      event: null, unavailableEvent, snapshotFailure: "admission_event_not_jsonb_safe",
+    };
     prepared = true;
     if (!input.endpoint.botUsername || !input.endpoint.botExternalId) throw new Error("snapshot_bot_identity_missing");
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
@@ -173,7 +185,9 @@ export async function admitGitHubPair(tx: Tx, input: {
   snapshot?: GitHubReviewEnrollmentEnvelope["snapshot"];
   snapshotFailure?: string;
 }) {
-  if (!(await githubShadowEnabled(tx))) return;
+  // A failed observation still belongs in the denominator after disable. It
+  // cannot carry snapshot bytes or materialize/wake a candidate.
+  if (!(await githubShadowEnabled(tx)) && (!input.snapshotFailure || input.snapshot)) return;
   const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, input.deliveryId));
   if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed) return;
   const pending = delivery.normalizedEvent.githubPairingPending as PendingPair | undefined;
@@ -238,7 +252,7 @@ export async function githubCandidateBinding(db: Store, input: {
     eq(chatGitHubReviewCandidates.nativeDeliveryId, input.deliveryId), eq(chatGitHubReviewCandidates.conversationId, input.conversationId),
     eq(chatGitHubReviewCandidates.commentId, input.commentId),
   ));
-  return row?.state === "voided" ? null : row ?? null;
+  return row && row.state !== "voided" && await githubCandidateHeadMatchesPrimary(db, row) ? row : null;
 }
 
 export async function githubRunCapability(db: Store, session: {
@@ -277,8 +291,28 @@ export async function githubRunCapability(db: Store, session: {
           await githubPrimaryInputSource(db, enrollment)) } } } : null;
 }
 
+async function githubCandidateHeadMatchesPrimary(db: Store, candidate: Candidate): Promise<boolean> {
+  const [mismatch] = await db.select({ id: chatGitHubReviews.id }).from(chatGitHubReviewEnrollments)
+    .innerJoin(chatGitHubReviews, and(
+      eq(chatGitHubReviews.companyId, chatGitHubReviewEnrollments.companyId),
+      eq(chatGitHubReviews.endpointId, chatGitHubReviewEnrollments.endpointId),
+      or(sql`${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text`,
+        eq(chatGitHubReviews.admissionDeliveryId, chatGitHubReviewEnrollments.originDeliveryId)),
+      isNull(chatGitHubReviews.shadowLabel), sql`${chatGitHubReviews.runId} is not null`,
+      sql`${chatGitHubReviews.headSha} is distinct from ${chatGitHubReviewEnrollments.headSha}`,
+    )).where(and(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId),
+      eq(chatGitHubReviewEnrollments.companyId, candidate.companyId))).limit(1);
+  if (!mismatch) return true;
+  // The actual primary begin/submit receipt owns the head. Never retarget an
+  // immutable candidate; invalidate it at wake, dispatch and every tool read.
+  await db.update(chatGitHubReviewCandidates).set({ state: "voided", lastError: "head_mismatch", nextAttemptAt: null, updatedAt: new Date() })
+    .where(and(eq(chatGitHubReviewCandidates.id, candidate.id), eq(chatGitHubReviewCandidates.companyId, candidate.companyId),
+      sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
+  return false;
+}
+
 export async function githubCandidateMayWake(db: Store, candidate: Candidate): Promise<boolean> {
-  if (candidate.state === "voided" || !(await githubShadowEnabled(db))) return false;
+  if (candidate.state === "voided" || !(await githubShadowEnabled(db)) || !(await githubCandidateHeadMatchesPrimary(db, candidate))) return false;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, candidate.endpointId));
   const [arm] = await db.select().from(chatGitHubReviewArms).where(and(eq(chatGitHubReviewArms.id, candidate.armId), eq(chatGitHubReviewArms.companyId, candidate.companyId), isNull(chatGitHubReviewArms.retiredAt)));
   const [agent] = await db.select().from(agents).where(and(eq(agents.id, candidate.agentId), eq(agents.companyId, candidate.companyId)));
@@ -301,6 +335,33 @@ async function failGitHubPairCapture(db: Store, deliveryId: string, capture: Pai
     sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'`,
     sql`not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`,
     sql`${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'id' = ${capture.id}`));
+}
+
+const PAIR_CAPTURE_WINDOW_MS = 15_000;
+
+async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$inferSelect, pending: PendingPair) {
+  if (pending.disabled || !(await githubShadowEnabled(db))) return "admission_snapshot_disabled";
+  // xmin changes on every committed settings rewrite, including an off/on pair
+  // between recovery sweeps. Conservatively invalidate on unrelated changes too;
+  // a stale selected event is never recaptured into a newer experimental window.
+  const [settings] = await db.execute(sql`select xmin::text as epoch from instance_settings where singleton_key = 'default'`);
+  if (!pending.settingsEpoch || pending.settingsEpoch !== settings?.epoch) return "admission_snapshot_disabled";
+  const admittedAt = Date.parse(pending.admittedAt);
+  if (!Number.isFinite(admittedAt) || admittedAt > Date.now() || Date.now() - admittedAt > PAIR_CAPTURE_WINDOW_MS)
+    return "admission_snapshot_late";
+  const [evidence] = await db.execute<{ started: boolean }>(sql`select (
+    exists (select 1 from chat_github_reviews r where r.company_id = ${delivery.companyId}
+      and r.endpoint_id = ${delivery.endpointId} and r.shadow_label is null
+      and (r.delivery_id = ${delivery.id} or r.admission_delivery_id = ${delivery.id})
+      and (r.run_id is not null or r.assessment is not null or r.state <> 'queued'))
+    or exists (select 1 from chat_message_links l join heartbeat_runs r
+      on r.company_id = l.company_id and r.context_snapshot->>'wakeCommentId' = l.comment_id::text
+      where l.delivery_id = ${delivery.id} and l.direction = 'inbound'
+        and (r.started_at is not null or r.status not in ('queued', 'pending')))
+    or exists (select 1 from chat_publications p where p.company_id = ${delivery.companyId}
+      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
+  ) as started`);
+  return evidence?.started ? "admission_snapshot_late" : undefined;
 }
 
 async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch) {
@@ -357,28 +418,27 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         continue;
       }
       const repositoryId = String(source.resource.metadata?.providerRepositoryId ?? "");
-      // A crashed capture is an unavailable observation, never a fresh live
-      // recapture. A pending selection that has not started may capture once.
-      const prepared = claim.interrupted ? {
+      // Never capture post-primary signals or revive an observation across a
+      // disable window. Recheck after I/O too: the primary never waits for us.
+      const unavailable = (snapshotFailure: string) => ({
         event: automatic?.context ?? null,
         unavailableEvent: { event: manual?.event ?? "mention" as const, deliveryId: pending.providerEventId,
           repositoryId, repository: source.resource.providerResourceId.toLowerCase(), pullNumber: Number(match[2]),
           sender: { id: principal.externalId, login: principal.handle ?? principal.externalId } },
-        snapshotFailure: "admission_snapshot_interrupted",
-      } : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
-        threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
-      if (!prepared) {
-        // A kill switch may land between the claim and capture. No bytes were
-        // read, so it is safe to release this claim for later recovery.
-        await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} - 'githubPairingCapture'` })
-          .where(and(eq(chatDeliveries.id, delivery.id), sql`${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'id' = ${claim.capture.id}`));
-        continue;
-      }
+        snapshotFailure,
+      });
+      const failure = await pairCaptureFailure(db, delivery, pending);
+      const prepared = failure || claim.interrupted
+        ? unavailable(failure ?? "admission_snapshot_interrupted")
+        : await prepareGitHubPairEvent(db, { endpoint: source.endpoint, repositoryId, repository: source.resource.providerResourceId,
+          threadId, eventId: pending.providerEventId, principal, automatic: automatic?.context, manualEvent: manual?.event, pending }, fetchImpl);
       await db.transaction(async tx => {
         const [endpoint] = await tx.select().from(chatEndpoints).where(eq(chatEndpoints.id, delivery.endpointId)).for("update");
         const [current] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id)).for("update");
         if (!endpoint || !current || (current.normalizedEvent.githubPairingCapture as { id?: string } | undefined)?.id !== claim.capture.id) return;
-        await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...prepared,
+        const finalFailure = await pairCaptureFailure(tx, current, current.normalizedEvent.githubPairingPending as PendingPair);
+        const sealed = finalFailure ? unavailable(finalFailure) : prepared ?? unavailable("admission_snapshot_disabled");
+        await admitGitHubPair(tx, { endpoint, deliveryId: delivery.id, conversation: source.conversation, ...sealed,
           request: source.comment.body, policy, revision: pending.revision, authority });
       });
     } catch {
@@ -393,7 +453,13 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
   stage: (tx: Tx, source: { endpoint: Endpoint; deliveryId: string; conversation: typeof chatConversations.$inferSelect; commentId: string; principalId: string; actorUserId: string | null; agentId: string }) => Promise<void>;
   wake: (deliveryId: string) => Promise<boolean>;
 }) {
-  if (!(await githubShadowEnabled(db))) return 0;
+  const enabled = await githubShadowEnabled(db);
+  if (!enabled) {
+    // Tombstone every pending selection, including in-flight captures and rows
+    // beyond this sweep's limit. Re-enabling never makes those bytes timely.
+    await db.update(chatDeliveries).set({ normalizedEvent: sql`jsonb_set(${chatDeliveries.normalizedEvent}, '{githubPairingPending,disabled}', 'true'::jsonb)` })
+      .where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending' and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`);
+  }
   await capturePendingGitHubPairs(db, input.limit, input.fetch ?? fetch);
   const seeds = await githubPairSeedRecoveryQuery(db, input.limit);
   for (const delivery of seeds) {
@@ -414,18 +480,19 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         const defer = async (reason: string) => {
           await tx.update(chatGitHubReviewCandidates).set({
             lastError: reason, nextAttemptAt: new Date(Date.now() + 30_000), updatedAt: new Date(),
-          }).where(eq(chatGitHubReviewCandidates.id, candidate.id));
+          }).where(and(eq(chatGitHubReviewCandidates.id, candidate.id),
+            sql`${chatGitHubReviewCandidates.state} <> 'voided'`));
           return null;
         };
         // A paused/disabled oldest arm must not monopolize a bounded sweep.
         // Keep the admitted denominator and retry if authority is restored.
-        if (!(await githubCandidateMayWake(tx, candidate))) return defer("candidate_unavailable");
         const [enrollment] = await tx.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId));
         if (!enrollment?.envelope.snapshot || !enrollment.envelope.event || !enrollment.headSha || !enrollment.baseSha) {
           await tx.update(chatGitHubReviewCandidates).set({ state: "unavailable", lastError: "candidate_snapshot_unavailable", nextAttemptAt: null, updatedAt: new Date() })
             .where(eq(chatGitHubReviewCandidates.id, candidate.id));
           return null;
         }
+        if (!(await githubCandidateMayWake(tx, candidate))) return defer("candidate_unavailable");
         if (candidate.state === "materialized") return candidate;
         const [endpoint] = await tx.select().from(chatEndpoints).where(and(eq(chatEndpoints.id, candidate.endpointId), eq(chatEndpoints.companyId, candidate.companyId)));
         if (!enrollment || !endpoint || !["active", "verifying"].includes(endpoint.status)) return defer("candidate_endpoint_unavailable");
