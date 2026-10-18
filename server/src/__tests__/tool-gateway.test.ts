@@ -11,6 +11,7 @@ import {
   companySecrets,
   companySecretVersions,
   companyMemberships,
+  chatEndpoints,
   companies,
   connectionGrantMembers,
   connectionGrantDelegations,
@@ -55,6 +56,8 @@ import {
   summarizeToolValue,
 } from "../services/tool-content-guards.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
+import { initializeGitHubPrimaryReviewers } from "../services/chat-github-primary-reviewers.js";
+import { withGitHubPrimaryBlindingAdmission } from "../services/chat-github-primary-blinding-state.js";
 import { resolveConnectionGrantSecret } from "../services/connection-credentials.js";
 import { secretService } from "../services/secrets.js";
 import * as cogneeBridge from "../services/cognee-connection.js";
@@ -898,9 +901,13 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     expect(denied.body.error.data.reasonCode).toBe("deny_default");
   });
 
-  it.each([false, true])("proxies namespaced resources and prompts only for fully assigned MCP connections (agent blinding=%s)", async agentScoped => {
+  it.each(["none", "primary", "nonPrimary"] as const)("proxies namespaced resources and prompts only for fully assigned MCP connections (gateway agent=%s)", async gatewayAgent => {
     const company = await createCompany(db);
-    const agent = agentScoped ? await createAgent(db, company.id) : null;
+    const agent = gatewayAgent === "none" ? null : await createAgent(db, company.id);
+    // Blinding is scoped to GitHub primary reviewers AND only engages once the company has
+    // candidate agents; without candidate material every scope sees the plain catalog. The
+    // enrolled filter path is covered by the paired shadow integration tests.
+    const blinded = gatewayAgent === "primary";
     const remote = await startFakeRemoteMcpServer(async ({ body }) => {
       const method = body?.method;
       if (method === "resources/list") {
@@ -925,6 +932,19 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         toolName: "search_notes",
         riskLevel: "read",
       });
+      if (agent) {
+        if (blinded) {
+          await db.insert(chatEndpoints).values({
+            companyId: company.id,
+            connectionId: assigned.connection.id,
+            provider: "github",
+            publicId: randomUUID(),
+            assignedAgentId: agent.id,
+            status: "active",
+          });
+        }
+        await initializeGitHubPrimaryReviewers(db);
+      }
       await createRemoteMcpTool(db, company.id, {
         url: remote.url,
         applicationKey: "unassigned-context-app",
@@ -956,43 +976,48 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         body: { name: "Native runner" },
       });
       const app = createGatewayRouteApp(db, gateway);
+      const exercise = async () => {
 
-      const resources = await request(app)
-        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
-        .set("authorization", `Bearer ${token.token}`)
-        .send({ jsonrpc: "2.0", id: 1, method: "resources/list" })
-        .expect(200);
-      expect(resources.body.result.resources).toHaveLength(agentScoped ? 1 : 2);
-      expect(resources.body.result.resources[0]).toMatchObject({
-        uri: expect.stringMatching(new RegExp(`^paperclip-resource://${assigned.connection.id}/`)),
-        name: "Assigned context: Note one",
-      });
-      const resourceUri = resources.body.result.resources[0].uri as string;
+        const resources = await request(app)
+          .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id: 1, method: "resources/list" })
+          .expect(200);
+        expect(resources.body.result.resources).toHaveLength(2);
+        expect(resources.body.result.resources[0]).toMatchObject({
+          uri: expect.stringMatching(new RegExp(`^paperclip-resource://${assigned.connection.id}/`)),
+          name: "Assigned context: Note one",
+        });
+        const resourceUri = resources.body.result.resources[0].uri as string;
 
-      const read = await request(app)
-        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
-        .set("authorization", `Bearer ${token.token}`)
-        .send({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: resourceUri } })
-        .expect(200);
-      expect(read.body.result.contents[0]).toMatchObject({ uri: resourceUri, text: "resource body" });
+        const read = await request(app)
+          .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: resourceUri } })
+          .expect(200);
+        expect(read.body.result.contents[0]).toMatchObject({ uri: resourceUri, text: "resource body" });
 
-      const prompts = await request(app)
-        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
-        .set("authorization", `Bearer ${token.token}`)
-        .send({ jsonrpc: "2.0", id: 3, method: "prompts/list" })
-        .expect(200);
-      expect(prompts.body.result.prompts).toHaveLength(agentScoped ? 1 : 2);
-      expect(prompts.body.result.prompts[0].title).toBe("Assigned context: Summarize note");
-      const promptName = prompts.body.result.prompts[0].name as string;
+        const prompts = await request(app)
+          .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id: 3, method: "prompts/list" })
+          .expect(200);
+        expect(prompts.body.result.prompts).toHaveLength(2);
+        expect(prompts.body.result.prompts[0].title).toBe("Assigned context: Summarize note");
+        const promptName = prompts.body.result.prompts[0].name as string;
 
-      const wrapper = await request(app)
-        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
-        .set("authorization", `Bearer ${token.token}`)
-        .send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "paperclip_get_prompt", arguments: { name: promptName } } })
-        .expect(200);
-      expect(wrapper.body.result.structuredContent).toMatchObject({ description: "Summary prompt" });
-      expect(remote.requests.filter((entry) => entry.body?.method === "resources/read")[0]?.body?.params).toEqual({ uri: "notes://one" });
-      expect(remote.requests.filter((entry) => entry.body?.method === "prompts/get")[0]?.body?.params).toEqual({ name: "summarize", arguments: {} });
+        const wrapper = await request(app)
+          .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "paperclip_get_prompt", arguments: { name: promptName } } })
+          .expect(200);
+        expect(wrapper.body.result.structuredContent).toMatchObject({ description: "Summary prompt" });
+        expect(remote.requests.filter((entry) => entry.body?.method === "resources/read")[0]?.body?.params).toEqual({ uri: "notes://one" });
+        expect(remote.requests.filter((entry) => entry.body?.method === "prompts/get")[0]?.body?.params).toEqual({ name: "summarize", arguments: {} });
+      };
+      // Exercise the enrolled (admission-pending) path for the primary reviewer.
+      if (blinded) await withGitHubPrimaryBlindingAdmission(db, company.id, exercise);
+      else await exercise();
     } finally {
       await remote.close();
     }
