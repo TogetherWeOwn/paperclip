@@ -482,6 +482,16 @@ export const chatDeliveries = pgTable(
     ),
     check("chat_deliveries_shadow_label_check", sql`${table.githubShadowLabel} is null or ${table.githubShadowLabel} <> ''`),
     index("chat_deliveries_work_idx").on(table.state, table.nextAttemptAt),
+    // Sparse immutable seeds are the pairing fallback outbox. Neither recovery
+    // nor ordinal allocation should detoast every historical delivery.
+    index("chat_deliveries_pair_seed_idx").on(table.id)
+      .where(sql`${table.normalizedEvent} ? 'githubPairingSeed'`),
+    index("chat_deliveries_pair_round_idx").on(
+      table.endpointId,
+      sql`(coalesce(${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId'))`,
+      sql`(coalesce(${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${table.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber'))`,
+      sql`((${table.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer)`,
+    ).where(sql`${table.normalizedEvent} ? 'githubPairingSeed'`),
     unique("chat_deliveries_company_id_uq").on(table.companyId, table.id),
     uniqueIndex("chat_deliveries_event_uq").on(
       table.endpointId,

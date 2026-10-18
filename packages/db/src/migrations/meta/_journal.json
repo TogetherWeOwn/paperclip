@@ -2115,6 +2115,13 @@
       "when": 1792283790751,
       "tag": "0303_capture_review_lookup_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792284177583,
+      "tag": "0304_pairing_seed_lookup_indexes",
+      "breakpoints": true
     }
   ]
 }

@@ -139,6 +139,7 @@ export async function admitGitHubPair(tx: Tx, input: {
   // Endpoint lock serializes allocation, including seeds not yet projected.
   const [prior] = await tx.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
     .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpoint.id),
+      sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'`,
       sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${e.repositoryId}`,
       sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(e.pullNumber)}`));
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;
