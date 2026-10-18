@@ -580,7 +580,7 @@ type PairCaptureKick = (db: Db, deliveryId: string, fetchImpl: typeof fetch) => 
 const defaultPairCaptureKick: PairCaptureKick = (db, deliveryId, fetchImpl) =>
   capturePendingGitHubPairs(db, 1, fetchImpl, { deliveryId, trigger: "admission" });
 let pairCaptureKick = defaultPairCaptureKick;
-const inflightPairCaptureKicks = new Map<string, Promise<void>>();
+const inflightPairCaptureKicks = new Map<string, { startedAt: number; run: Promise<void> }>();
 
 /** Test seam: replace (or restore with undefined) the kicked capture. */
 export function setGitHubPairCaptureKickForTests(kick: PairCaptureKick | undefined) {
@@ -603,18 +603,23 @@ export function kickGitHubPairCapture(db: Db, deliveryId: string, fetchImpl: typ
           "GitHub paired snapshot capture kick failed; recovery sweep will retry");
       })
       .finally(() => { inflightPairCaptureKicks.delete(deliveryId); });
-    inflightPairCaptureKicks.set(deliveryId, run);
+    inflightPairCaptureKicks.set(deliveryId, { startedAt: Date.now(), run });
   } catch { /* Never fail the primary path; the sweep is the fallback. */ }
 }
 
-/** Let the sweep project/wake candidates for captures kicked in this process,
- * bounded so a stalled kick can never hold the sweep past one capture window. */
-async function settleGitHubPairCaptureKicks() {
-  if (!inflightPairCaptureKicks.size) return;
+/** Let the sweep project/wake candidates for captures kicked in this process.
+ * Each kick is awaited at most one capture window (+5 s) from its start, so a
+ * stalled kick can never hold this or any later sweep beyond that bound. */
+export async function settleGitHubPairCaptureKicks() {
+  const boundMs = githubShadowCaptureWindowMs() + 5_000;
+  const now = Date.now();
+  const live = [...inflightPairCaptureKicks.values()].filter(kick => now - kick.startedAt < boundMs);
+  if (!live.length) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([Promise.allSettled([...inflightPairCaptureKicks.values()]),
-      new Promise<void>(resolve => { timer = setTimeout(resolve, githubShadowCaptureWindowMs() + 5_000); })]);
+    await Promise.race([Promise.allSettled(live.map(kick => kick.run)), new Promise<void>(resolve => {
+      timer = setTimeout(resolve, Math.max(...live.map(kick => kick.startedAt + boundMs - now)));
+    })]);
   } finally { clearTimeout(timer); }
 }
 
