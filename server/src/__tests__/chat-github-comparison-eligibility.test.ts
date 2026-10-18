@@ -4,7 +4,7 @@ import type { chatGitHubReviewEnrollments } from "@paperclipai/db";
 
 describe("evidence-derived paired review eligibility", () => {
   const proof = { environmentCertified: true, selfTestRecorded: true, selfTestPassed: true, primaryBlindingActive: true,
-    snapshotAvailable: true, roundOrdinal: 1 };
+    snapshotAvailable: true, roundOrdinal: 1, primaryInputSource: "snapshot" as const };
   it("certifies only a recorded successful isolated run with the primary guard active", () => {
     expect(githubComparisonEligibility(proof)).toEqual({ certifiedClean: true, reasons: [] });
   });
@@ -17,6 +17,10 @@ describe("evidence-derived paired review eligibility", () => {
   ])("fails closed for %s and retains its exact reason", (field, reason) => {
     expect(githubComparisonEligibility({ ...proof, [field]: false })).toEqual({ certifiedClean: false, reasons: [reason] });
   });
+  it.each(["live", undefined] as const)("does not certify primary inputs without a sealed-source receipt (%s)", primaryInputSource => {
+    expect(githubComparisonEligibility({ ...proof, primaryInputSource }))
+      .toEqual({ certifiedClean: false, reasons: ["primary_inputs_not_sealed"] });
+  });
   it("does not call longitudinal history a clean first-round sample", () => {
     expect(githubComparisonEligibility({ ...proof, roundOrdinal: 2 })).toEqual({ certifiedClean: false, reasons: ["longitudinal_arm_history"] });
   });
@@ -26,12 +30,12 @@ describe("evidence-derived paired review eligibility", () => {
         certificateDigest: "cert", hooksDigest: "hooks", primaryBlindingVersion: 1, status: "passed",
         checks: { primaryCanariesDenied: true, githubDenied: true, configFresh: true } },
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
-    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run")).toEqual({ certifiedClean: true, reasons: [] });
+    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot")).toEqual({ certifiedClean: true, reasons: [] });
     for (const [candidateId, armId, runId] of [["other", "arm", "run"], ["candidate", "other", "run"], ["candidate", "arm", "retry"]]) {
       expect(githubRunComparisonEligibility(enrollment, { id: candidateId!, armId: armId! }, runId!)).toMatchObject({ certifiedClean: false });
     }
     enrollment.isolationTests.run!.checks.githubDenied = false;
-    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run").reasons).toContain("candidate_isolation_self_test_failed");
+    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot").reasons).toContain("candidate_isolation_self_test_failed");
   });
   it.each(["receipt", "envelope"] as const)("rejects missing %s primary namespace evidence", (missing) => {
     const enrollment = { roundOrdinal: 1, envelope: { snapshot: {}, protocol: GITHUB_SHADOW_PROTOCOL }, isolationTests: {
@@ -41,7 +45,7 @@ describe("evidence-derived paired review eligibility", () => {
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
     if (missing === "receipt") delete enrollment.isolationTests.run!.primaryBlindingVersion;
     else delete enrollment.envelope.protocol;
-    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run"))
+    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot"))
       .toEqual({ certifiedClean: false, reasons: ["primary_namespace_not_isolated"] });
   });
   it("records the deliberate web-tools deviation and the supplied observational provenance", () => {

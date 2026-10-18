@@ -19,6 +19,24 @@ Scope
   comparisonEligibility.certifiedClean remains false: this is NOT a certified
   fair comparison or permission to replace the production Claude gate.
 
+Primary input provenance
+  Pair capture must not delay the production wake. A primary that started before
+  seed.admittedAt therefore stays live for its whole run; it must not switch to
+  snapshot/history bytes when capture finishes. Legacy seeds without admittedAt
+  cannot bind a primary. begin_review (or submit_review without begin) records
+  event.inputSource on the exact primary run's review row, including claimed
+  automatic rows. Only "snapshot" is sealed-input evidence.
+  Run-scoped comparison re-derives eligibility using that admission/head's primary
+  receipt as well as the candidate's isolation receipt. Live, missing, and legacy
+  primary provenance yield primary_inputs_not_sealed; runtime isolation alone
+  never certifies equal inputs. Pre-primary candidate receipts stay conservative.
+  Decision: retain early live primaries in ALL_ASSIGNED but exclude CLEAN_PAIRED.
+  Matching the head alone cannot prove equivalent mutable comments/checks/reviews
+  or previousAssessment, nor absence of counterpart output at every live read.
+  This implementation does not record a complete, timed live-read transcript, so
+  opportunistic certification of same-head live primaries is deliberately NOT
+  implemented. A future opt-in needs that evidence, not an inferred clean label.
+
 1. Provision ONLY after host-operator review, on staging first
   scripts/provision-github-shadow-host.sh is a new-account template, not an
   automatically executed installer. With no --apply it prints usage and exits.

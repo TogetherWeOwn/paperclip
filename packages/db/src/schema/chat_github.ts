@@ -145,6 +145,8 @@ export const chatGitHubReviews = pgTable(
     event: jsonb("event").$type<GitHubReviewEventContext & {
       /** Native admission identity, distinct from the provider's delivery ID. */
       admissionDeliveryId?: string;
+      /** Reader actually selected for this run at begin/submit, not admission. */
+      inputSource?: "snapshot" | "live";
     }>().notNull(),
     state: text("state")
       .$type<GitHubTaskReview["state"]>()

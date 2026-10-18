@@ -14,7 +14,7 @@ import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
-import { githubComparisonEligibility, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
+import { githubComparisonEligibility, githubPrimaryInputSource, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 
 // Re-export the exact application builders; their implementation lives in the
 // DB package so its EXPLAIN tests remain within that package's TypeScript root.
@@ -138,6 +138,7 @@ interface Seed {
   version: 1;
   id: string;
   roundOrdinal: number;
+  admittedAt: string;
   revision: number;
   pairKey: string;
   envelope: GitHubReviewEnrollmentEnvelope;
@@ -203,7 +204,7 @@ export async function admitGitHubPair(tx: Tx, input: {
   const [primaryAgent] = await tx.select().from(agents).where(and(eq(agents.id, input.endpoint.assignedAgentId!), eq(agents.companyId, input.endpoint.companyId)));
   const { githubPairingPending: _pending, githubPairingCapture: _capture, ...normalizedEvent } = delivery.normalizedEvent;
   const seed: Seed = {
-    version: 1, id: randomUUID(), roundOrdinal, revision: input.revision,
+    version: 1, id: randomUUID(), admittedAt: new Date().toISOString(), roundOrdinal, revision: input.revision,
     pairKey: digest([1, delivery.companyId, delivery.endpointId, delivery.providerEventId, e.repositoryId, e.repository, e.pullNumber, input.event?.headSha ?? null, input.event?.baseSha ?? null, roundOrdinal, input.revision, digest(input.policy)]),
     envelope: { version: 1, event: input.event, unavailableEvent: input.unavailableEvent,
       protocol: GITHUB_SHADOW_PROTOCOL,
@@ -256,10 +257,12 @@ export async function githubRunCapability(db: Store, session: {
       eq(chatMessageLinks.direction, "inbound"), eq(chatConversations.issueId, session.issueId), eq(chatEndpoints.provider, "github"), eq(issues.assigneeAgentId, session.agentId)));
   if (!source || source.delivery.companyId !== session.companyId || source.delivery.endpointId !== source.endpoint.id || source.delivery.conversationId !== source.conversation.id) return null;
   if (source.conversation.executionScope === "primary" && source.endpoint.assignedAgentId === session.agentId) {
-    // The immutable source seed is authoritative even if its optional table
-    // projection failed. Both arms must see the same admission-time bytes.
+    // A seed captured after this run began must never change its reader or its
+    // previous-assessment source mid-turn. Missing/legacy timestamps fail closed.
     const seed = source.delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
-    const enrollment = seed?.envelope.event ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
+    const admittedBeforeRun = !!seed?.admittedAt
+      && Date.parse(seed.admittedAt) <= (run.startedAt ?? run.createdAt).getTime();
+    const enrollment = admittedBeforeRun && seed?.envelope.event ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
       baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
     return { ...source, candidate: null, enrollment };
   }
@@ -269,7 +272,8 @@ export async function githubRunCapability(db: Store, session: {
   const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(and(eq(chatGitHubReviewEnrollments.id, candidate.enrollmentId), eq(chatGitHubReviewEnrollments.companyId, session.companyId)));
   return enrollment?.envelope.event && enrollment.headSha && enrollment.baseSha
     ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha,
-        envelope: { ...enrollment.envelope, comparisonEligibility: githubRunComparisonEligibility(enrollment, candidate, session.runId) } } } : null;
+        envelope: { ...enrollment.envelope, comparisonEligibility: githubRunComparisonEligibility(enrollment, candidate, session.runId,
+          await githubPrimaryInputSource(db, enrollment)) } } } : null;
 }
 
 export async function githubCandidateMayWake(db: Store, candidate: Candidate): Promise<boolean> {

@@ -12,7 +12,7 @@ import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failu
 import { githubCandidateRunBoundary } from "./chat-github-isolation.js";
 import { githubCandidateMayWake } from "./chat-github-shadow.js";
 import { resolveEnvironmentExecutionTarget } from "./environment-execution-target.js";
-import { githubComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
+import { githubComparisonEligibility, githubPrimaryInputSource, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 import { githubCandidateHooks } from "./chat-github-hooks.js";
 
 const certificateSchema = z.object({
@@ -226,7 +226,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
     primaryBlindingVersion: GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
     comparisonEligibility: githubComparisonEligibility({ environmentCertified: true, selfTestRecorded: true,
       selfTestPassed: passed, primaryBlindingActive: boundary.enrollment.envelope.protocol?.primaryBlindingVersion === GITHUB_SHADOW_PROTOCOL.primaryBlindingVersion,
-      snapshotAvailable: !!boundary.enrollment.envelope.snapshot, roundOrdinal: boundary.enrollment.roundOrdinal }) };
+      snapshotAvailable: !!boundary.enrollment.envelope.snapshot, roundOrdinal: boundary.enrollment.roundOrdinal,
+      primaryInputSource: await githubPrimaryInputSource(db, boundary.enrollment) }) };
   try {
     await db.transaction(async tx => {
       // Append-once evidence. A retry cannot replace failed proof or reuse success.

@@ -1,5 +1,20 @@
-import type { chatGitHubReviewEnrollments } from "@paperclipai/db";
+import { and, desc, eq, isNotNull, isNull, or } from "drizzle-orm";
+import { chatGitHubReviews, type chatGitHubReviewEnrollments, type Db } from "@paperclipai/db";
 import { GITHUB_PRIMARY_BLINDING_VERSION } from "./chat-github-primary-blinding.js";
+
+type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type Enrollment = typeof chatGitHubReviewEnrollments.$inferSelect;
+
+/** Match the primary run receipt to this admission and exact head. Legacy or
+ * not-yet-started primary rows are not evidence of sealed inputs. */
+export async function githubPrimaryInputSource(db: Store, enrollment: Enrollment) {
+  const [review] = await db.select({ event: chatGitHubReviews.event }).from(chatGitHubReviews).where(and(
+    eq(chatGitHubReviews.companyId, enrollment.companyId), eq(chatGitHubReviews.endpointId, enrollment.endpointId),
+    eq(chatGitHubReviews.headSha, enrollment.headSha ?? ""), isNull(chatGitHubReviews.shadowLabel), isNotNull(chatGitHubReviews.runId),
+    or(eq(chatGitHubReviews.deliveryId, enrollment.originDeliveryId), eq(chatGitHubReviews.admissionDeliveryId, enrollment.originDeliveryId)),
+  )).orderBy(desc(chatGitHubReviews.createdAt), desc(chatGitHubReviews.id)).limit(1);
+  return review?.event.inputSource;
+}
 
 /** Read-time assessment eligibility. The immutable admission envelope cannot be
  * updated after a run; callers must use its exact run and candidate/arm binding.
@@ -8,6 +23,7 @@ export function githubRunComparisonEligibility(
   enrollment: typeof chatGitHubReviewEnrollments.$inferSelect,
   candidate: { id: string; armId: string },
   runId: string,
+  primaryInputSource?: "snapshot" | "live",
 ) {
   const receipt = enrollment.isolationTests[runId];
   const bound = receipt?.version === 1 && receipt.runId === runId
@@ -21,6 +37,7 @@ export function githubRunComparisonEligibility(
       && receipt?.primaryBlindingVersion === GITHUB_PRIMARY_BLINDING_VERSION,
     snapshotAvailable: !!enrollment.envelope.snapshot,
     roundOrdinal: enrollment.roundOrdinal,
+    primaryInputSource,
   });
   if (receipt && !bound) {
     result.certifiedClean = false;
@@ -36,6 +53,7 @@ export function githubRunComparisonEligibility(
 export function githubComparisonEligibility(evidence: {
   environmentCertified: boolean; selfTestRecorded: boolean; selfTestPassed: boolean;
   primaryBlindingActive: boolean; snapshotAvailable: boolean; roundOrdinal: number;
+  primaryInputSource?: "snapshot" | "live";
 }): { certifiedClean: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!evidence.primaryBlindingActive) reasons.push("primary_namespace_not_isolated");
@@ -44,6 +62,7 @@ export function githubComparisonEligibility(evidence: {
   else if (!evidence.selfTestPassed) reasons.push("candidate_isolation_self_test_failed");
   if (!evidence.snapshotAvailable) reasons.push("admission_snapshot_unavailable");
   if (evidence.roundOrdinal > 1) reasons.push("longitudinal_arm_history");
+  if (evidence.primaryInputSource !== "snapshot") reasons.push("primary_inputs_not_sealed");
   return { certifiedClean: reasons.length === 0, reasons };
 }
 
