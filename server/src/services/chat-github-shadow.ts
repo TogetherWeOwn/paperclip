@@ -90,7 +90,9 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
     if (!(await selectedGitHubPairArms(db, input.endpoint, config, input.eventId, input.repository)).length) return null;
   }
-  const captureDeadline = AbortSignal.timeout(15_000);
+  // The deadline belongs to admission, not the time a delayed worker starts.
+  const remaining = input.pending ? Date.parse(input.pending.admittedAt) + PAIR_CAPTURE_WINDOW_MS - Date.now() : PAIR_CAPTURE_WINDOW_MS;
+  const captureDeadline = AbortSignal.timeout(Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0);
   // Also bound transports that ignore AbortSignal. Never let one candidate's
   // stalled read hold the recovery sweep forever; late responses are discarded.
   const boundedFetch: typeof fetch = async (url, init) => {
@@ -113,7 +115,16 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   };
   let event: GitHubReviewEventContext | null = input.automatic ?? null;
   let prepared = false;
+  let abortCapture!: () => void;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abortCapture = () => reject(captureDeadline.reason);
+    captureDeadline.addEventListener("abort", abortCapture, { once: true });
+  });
   try {
+    // Include response-body consumption: a transport may return headers but
+    // never finish json()/text(), or ignore the signal altogether.
+    return await Promise.race([cancelled, (async () => {
+    captureDeadline.throwIfAborted();
     const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
     const pr = await githubBotRequest<{
       title: string; body: string | null; draft: boolean;
@@ -139,13 +150,14 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
       { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId });
     return { event, snapshot };
+    })()]);
   } catch {
     // Selection/denominator survive token and metadata failure too. Automatic
     // events keep their authenticated head; manual unknowns stay explicitly null.
     // Recovery only projects these bytes, never reconstructs a later live view.
     return { event, ...(!event ? { unavailableEvent } : {}),
-      snapshotFailure: prepared ? "admission_snapshot_unavailable" : "source_preparation_failed" };
-  }
+      snapshotFailure: captureDeadline.aborted ? "admission_snapshot_late" : prepared ? "admission_snapshot_unavailable" : "source_preparation_failed" };
+  } finally { captureDeadline.removeEventListener("abort", abortCapture); }
 }
 
 interface Seed {
@@ -273,13 +285,15 @@ export async function githubRunCapability(db: Store, session: {
       eq(chatMessageLinks.direction, "inbound"), eq(chatConversations.issueId, session.issueId), eq(chatEndpoints.provider, "github"), eq(issues.assigneeAgentId, session.agentId)));
   if (!source || source.delivery.companyId !== session.companyId || source.delivery.endpointId !== source.endpoint.id || source.delivery.conversationId !== source.conversation.id) return null;
   if (source.conversation.executionScope === "primary" && source.endpoint.assignedAgentId === session.agentId) {
-    // A seed captured after this run began must never change its reader or its
-    // previous-assessment source mid-turn. Missing/legacy timestamps fail closed.
+    // Run start is not an input read. The first review-tool read seals a sticky
+    // source receipt; a timed-out/live reader must never switch mid-turn.
     const seed = source.delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
-    const admittedBeforeRun = !!seed?.admittedAt
-      && Date.parse(seed.admittedAt) <= (run.startedAt ?? run.createdAt).getTime();
-    const enrollment = admittedBeforeRun && seed?.envelope.event ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
-      baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
+    const receipt = run.contextSnapshot?.githubPrimaryReviewInput as PrimaryReviewInput | undefined;
+    const sealedBeforeFirstLiveRead = !receipt || (receipt.source === "snapshot"
+      && receipt.deliveryId === source.delivery.id && receipt.enrollmentId === seed?.id);
+    const enrollment = sealedBeforeFirstLiveRead && seed?.envelope.event && seed.envelope.snapshot
+      ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
+        baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
     return { ...source, candidate: null, enrollment };
   }
   const candidate = await githubCandidateBinding(db, { companyId: session.companyId, endpointId: source.endpoint.id,
@@ -290,6 +304,77 @@ export async function githubRunCapability(db: Store, session: {
     ? { ...source, candidate, enrollment: { ...enrollment, headSha: enrollment.headSha, baseSha: enrollment.baseSha,
         envelope: { ...enrollment.envelope, comparisonEligibility: githubRunComparisonEligibility(enrollment, candidate, session.runId,
           await githubPrimaryInputSource(db, enrollment)) } } } : null;
+}
+
+interface PrimaryReviewInput {
+  deliveryId: string;
+  source: "snapshot" | "live";
+  enrollmentId?: string;
+}
+export const GITHUB_PRIMARY_SEAL_WAIT_MS = 2_000;
+
+/** Called only after review-tool authorization, never by tool discovery/wakeup.
+ * Claim or await the same capture as the sweeper. The primary's first input
+ * read waits at most this small bound, then uses live inputs for the whole run.
+ * Capture may finish later for the candidate; it cannot upgrade this receipt. */
+export async function sealGitHubPrimaryReviewInputs(db: Db, run: typeof heartbeatRuns.$inferSelect,
+  delivery: typeof chatDeliveries.$inferSelect, fetchImpl: typeof fetch,
+) {
+  let seed = delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
+  let receipt = run.contextSnapshot?.githubPrimaryReviewInput as PrimaryReviewInput | undefined;
+  if (!receipt && !seed && !delivery.normalizedEvent.githubPairingPending) return null;
+  if (!receipt) {
+    // Older in-flight runs may have begun a live review before source receipts
+    // existed. Never promote those runs after a server upgrade or capture retry.
+    const [prior] = await db.select({ event: chatGitHubReviews.event }).from(chatGitHubReviews)
+      .where(and(eq(chatGitHubReviews.companyId, run.companyId), eq(chatGitHubReviews.runId, run.id),
+        isNull(chatGitHubReviews.shadowLabel))).limit(1);
+    if (prior && prior.event.inputSource !== "snapshot") seed = undefined;
+    else if (!seed && delivery.normalizedEvent.githubPairingPending) {
+      let stopped = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // The worker owns its 15s admission deadline; timing out this waiter must
+      // not cancel an otherwise valid candidate snapshot.
+      void capturePendingGitHubPairs(db, 1, fetchImpl, delivery.id).catch(() => {});
+      const observe = async () => {
+        while (!stopped) {
+          const [current] = await db.select({ event: chatDeliveries.normalizedEvent }).from(chatDeliveries)
+            .where(eq(chatDeliveries.id, delivery.id));
+          if (current?.event.githubPairingSeed) return current.event.githubPairingSeed as Seed;
+          if (!current?.event.githubPairingPending || (current.event.githubPairingCapture as PairCapture | undefined)?.lastError) return undefined;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return undefined;
+      };
+      try {
+        seed = await Promise.race([observe().catch(() => undefined), new Promise<undefined>(resolve => {
+          timer = setTimeout(() => resolve(undefined), GITHUB_PRIMARY_SEAL_WAIT_MS);
+        })]);
+      } finally { stopped = true; clearTimeout(timer); }
+    }
+    const choice: PrimaryReviewInput = { deliveryId: delivery.id,
+      source: seed?.envelope.snapshot && seed.envelope.event ? "snapshot" : "live",
+      ...(seed?.envelope.snapshot && seed.envelope.event ? { enrollmentId: seed.id } : {}) };
+    // Concurrent first reads race to the same append-once receipt. The loser
+    // follows the winner, even if its own capture completed in the meantime.
+    const [chosen] = await db.update(heartbeatRuns).set({ contextSnapshot:
+      sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ githubPrimaryReviewInput: choice })}::jsonb`,
+    }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      sql`${heartbeatRuns.contextSnapshot}->'githubPrimaryReviewInput' is null`)).returning({ context: heartbeatRuns.contextSnapshot });
+    if (chosen) receipt = chosen.context?.githubPrimaryReviewInput as PrimaryReviewInput;
+    else {
+      const [current] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      receipt = current?.context?.githubPrimaryReviewInput as PrimaryReviewInput | undefined;
+      if (receipt?.source === "snapshot") {
+        const [currentDelivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery.id));
+        seed = currentDelivery?.normalizedEvent.githubPairingSeed as Seed | undefined;
+      }
+    }
+  }
+  return seed && receipt?.source === "snapshot" && receipt.deliveryId === delivery.id && receipt.enrollmentId === seed.id
+    && seed.envelope.event && seed.envelope.snapshot
+    ? { id: seed.id, envelope: seed.envelope, headSha: seed.envelope.event.headSha,
+      baseSha: seed.envelope.event.baseSha, roundOrdinal: seed.roundOrdinal, configurationRevision: seed.revision } : null;
 }
 
 async function githubCandidateHeadMatchesPrimary(db: Store, candidate: Candidate): Promise<boolean> {
@@ -354,24 +439,25 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
     exists (select 1 from chat_github_reviews r where r.company_id = ${delivery.companyId}
       and r.endpoint_id = ${delivery.endpointId} and r.shadow_label is null
       and (r.delivery_id = ${delivery.id} or r.admission_delivery_id = ${delivery.id})
-      and (r.run_id is not null or r.assessment is not null or r.state <> 'queued'))
-    or exists (select 1 from chat_message_links l join heartbeat_runs r
-      on r.company_id = l.company_id and r.context_snapshot->>'wakeCommentId' = l.comment_id::text
-      where l.delivery_id = ${delivery.id} and l.direction = 'inbound'
-        and (r.started_at is not null or r.status not in ('queued', 'pending')))
+      and (r.assessment is not null or r.check_id is not null or r.summary_id is not null or r.state in ('completed', 'published')))
+    or exists (select 1 from chat_actions a where a.company_id = ${delivery.companyId}
+      and a.endpoint_id = ${delivery.endpointId} and a.conversation_id = ${delivery.conversationId}
+      and a.kind = 'github_review_publication' and a.status not in ('cancelled', 'failed')
+      and a.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
     or exists (select 1 from chat_publications p where p.company_id = ${delivery.companyId}
       and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
   ) as started`);
   return evidence?.started ? "admission_snapshot_late" : undefined;
 }
 
-async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch) {
+async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch, firstReadDeliveryId?: string) {
   const pendingRows = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'
     and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')
     and ${chatDeliveries.githubShadowLabel} is null
-    and exists (select 1 from chat_actions a where a.delivery_id = ${chatDeliveries.id}
+    and (${firstReadDeliveryId ?? null}::uuid is null or ${chatDeliveries.id} = ${firstReadDeliveryId ?? null}::uuid)
+    and (${firstReadDeliveryId ?? null}::uuid is not null or exists (select 1 from chat_actions a where a.delivery_id = ${chatDeliveries.id}
       and a.kind = 'inbound_wakeup' and a.status = 'processed'
-      and a.result->>'code' in ('inbound_wakeup_durable', 'inbound_wakeup_already_durable'))
+      and a.result->>'code' in ('inbound_wakeup_durable', 'inbound_wakeup_already_durable')))
     and (not (${chatDeliveries.normalizedEvent} ? 'githubPairingCapture')
       or (${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'startedAt')::timestamptz <= ${new Date(Date.now() - 30_000).toISOString()}::timestamptz)`)
     .orderBy(asc(chatDeliveries.receivedAt), asc(chatDeliveries.id)).limit(limit);
