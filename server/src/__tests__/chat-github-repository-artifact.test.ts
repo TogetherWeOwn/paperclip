@@ -8,7 +8,7 @@ import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execu
 import { awaitGitHubRepositoryArtifact, GitHubRepositoryArtifactError, githubRepositoryArtifactKey, pinGitHubRepositoryArtifact,
   produceGitHubRepositoryArtifact, pruneGitHubRepositoryArtifactStore, startGitHubRepositoryArtifact, githubRepositoryArtifactFile,
   type GitHubRepositoryArtifact, type GitHubRepositoryArtifactProducer, type GitHubRepositoryArtifactRequest } from "../services/chat-github-repository-artifact.js";
-import { materializeGitHubCandidateWorkspace, resolveGitHubCandidateCheckout } from "../services/chat-github-runtime-isolation.js";
+import { materializeGitHubCandidateWorkspace, holdGitHubCandidateCheckout, resolveGitHubCandidateCheckout } from "../services/chat-github-runtime-isolation.js";
 import { captureGitHubReviewSnapshot, githubSnapshotReader } from "../services/chat-github-review-snapshot.js";
 
 const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -256,6 +256,24 @@ describe("admission checkout manifest", () => {
     expect(Date.now() - t0).toBeLessThan(1_000);
     expect(await resolveGitHubCandidateCheckout({ ...(enrollment as object), envelope: { event: key, snapshot: { repositoryFailure: "repository_artifact_disabled" } } } as never))
       .toBeUndefined();
+  });
+
+  it("pins a resolved checkout until released, so the cap cannot evict it while the candidate queues for the lease", async () => {
+    const dir = root();
+    await start(dir, async () => fake());
+    mkdirSync(join(dir, "artifacts"), { recursive: true });
+    const file = join(dir, "artifacts", fake().path);
+    writeFileSync(file, Buffer.alloc(100));
+    const key = { ...admission, headSha: head, baseSha: base };
+    const enrollment = { admittedAt: new Date(), envelope: { event: key, snapshot: { headSha: head } } } as never;
+    const held = await holdGitHubCandidateCheckout(enrollment, { root: dir });
+    expect(held.checkout).toEqual({ repository: fake() });
+    try {
+      await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+      expect(existsSync(file)).toBe(true);
+    } finally { held.release(); held.release(); }
+    await pruneGitHubRepositoryArtifactStore({ root: dir, maxBytes: 1 });
+    expect(existsSync(file)).toBe(false);
   });
 });
 

@@ -391,6 +391,15 @@ export async function resolveGitHubCandidateCheckout(enrollment: Pick<typeof cha
     deadlineAt: (Number.isFinite(admittedAt) ? admittedAt : Date.now()) + (options.waitMs ?? GITHUB_REPOSITORY_ARTIFACT_DISPATCH_WAIT_MS) });
 }
 
+/** Resolve the admission checkout and pin it at once: the cap sweep must not
+ * evict it while the candidate queues for the host lease. `release` is idempotent. */
+export async function holdGitHubCandidateCheckout(enrollment: Parameters<typeof resolveGitHubCandidateCheckout>[0],
+  options: Parameters<typeof resolveGitHubCandidateCheckout>[1] = {}) {
+  const checkout = await resolveGitHubCandidateCheckout(enrollment, options);
+  const release = checkout?.repository ? pinGitHubRepositoryArtifact(checkout.repository.sha256) : () => undefined;
+  return { checkout, release };
+}
+
 export async function prepareGitHubCandidateRuntime(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
@@ -424,10 +433,8 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   // Wait for the admission's checkout BEFORE taking the host-wide lease. The
   // wait is bounded relative to admission; late or lost production becomes a
   // precise reason and the candidate runs with equivalence unverified.
-  const checkout = await resolveGitHubCandidateCheckout(boundary.enrollment);
-  // Pinned from resolution, not from materialisation: the cap sweep must not
-  // evict it while this candidate queues for the host lease. Idempotent.
-  const releasePin = checkout?.repository ? pinGitHubRepositoryArtifact(checkout.repository.sha256) : () => undefined;
+  // Pinned from resolution, not from materialisation (see holdGitHubCandidateCheckout).
+  const { checkout, release: releasePin } = await holdGitHubCandidateCheckout(boundary.enrollment);
   let releaseLease: () => Promise<void>;
   try { releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`); }
   catch (error) { releasePin(); throw error; }

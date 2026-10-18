@@ -302,7 +302,9 @@ let pruning: Promise<GitHubRepositoryArtifactPruneResult> | null = null;
 export function pruneGitHubRepositoryArtifactStore(options: {
   root?: string; maxBytes?: number; cacheMaxBytes?: number; retentionMs?: number; liveKeys?: ReadonlySet<string> | null;
 } = {}): Promise<GitHubRepositoryArtifactPruneResult> {
-  if (pruning) return pruning;
+  // Serialised, never coalesced: a sweep that started before this call may
+  // not have seen the latest write, and its options may differ.
+  if (pruning) return pruning.catch(() => undefined).then(() => pruneGitHubRepositoryArtifactStore(options));
   const run = (async () => {
     const root = options.root ?? githubRepositoryArtifactRoot();
     const maxBytes = options.maxBytes ?? envPositive("PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES", DEFAULT_TOTAL_MAX_BYTES);
@@ -451,9 +453,8 @@ export function startGitHubRepositoryArtifact(
     } finally { signal.removeEventListener("abort", onAbort); }
     try { await writeManifest(root, key, checkout); }
     catch { checkout = { repositoryFailure: "repository_artifact_manifest_unwritable" }; }
-    // After any in-flight sweep, so this write is always counted against the cap.
-    void (pruning ?? Promise.resolve()).catch(() => undefined)
-      .then(() => pruneGitHubRepositoryArtifactStore({ root })).catch(() => undefined);
+    // Sweeps are serialised, so this write is always counted against the cap.
+    void pruneGitHubRepositoryArtifactStore({ root }).catch(() => undefined);
     return checkout;
   })().finally(() => { inflight.delete(key); });
   inflight.set(key, work);

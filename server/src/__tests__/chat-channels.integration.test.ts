@@ -3841,8 +3841,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const { resolveGitHubCandidateCheckout } = await import("../services/chat-github-runtime-isolation.js");
       const requests: Array<Parameters<artifacts.GitHubRepositoryArtifactProducer>[0]> = [];
       const previousWindow = process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS;
-      process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS = "500";
+      // Long enough that a seal waiting on the checkout would visibly outlast it.
+      const artifactWindowMs = mode === "late" ? 3_000 : 500;
+      process.env.PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS = String(artifactWindowMs);
+      let producerStartedAt = 0;
       artifacts.setGitHubRepositoryArtifactProducer(mode === "disabled" ? null : async request => {
+        producerStartedAt ||= Date.now();
         requests.push(request);
         if (mode === "late") {
           // Ignores its signal entirely: only the store's own race ends it.
@@ -3883,6 +3887,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect((await githubLiveRepositoryArtifactKeys(db)).has(key)).toBe(false);
           } else {
             expect(checkout).toEqual({ repositoryFailure: "repository_artifact_late" });
+            // The seal never waited for the (hung) checkout window.
+            expect(Date.parse(snapshot.finishedAt)).toBeLessThan(producerStartedAt + artifactWindowMs);
             expect(Date.parse(snapshot.finishedAt) - Date.parse(snapshot.startedAt)).toBeLessThan(15_000);
           }
         }
