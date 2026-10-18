@@ -6108,6 +6108,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(row.normalizedEvent.githubPairingCapture).toBeUndefined();
       }
     });
+    it("deferred candidate snapshot still seals after only the primary's queued milestone", async () => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await pairedReviewFixture();
+      const primary = await deliverShadowTestMention(f, "queued-milestone-before-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      await db.execute(sql`insert into chat_publications (company_id, endpoint_id, conversation_id, issue_id, idempotency_key, payload, state)
+        values (${delivery!.companyId}, ${f.endpoint.id}, ${delivery!.conversationId}, ${primary.issueId},
+          ${`run:queued-milestone:queued:${f.endpoint.id}`}, ${JSON.stringify({ classification: "external", source: "safe_milestone",
+            text: "The assistant is queued.", progressState: "queued" })}::jsonb, 'published')`);
+      installShadowRecorder(f, "b".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+      expect(enrollment!.envelope.snapshot).toBeDefined();
+    });
     it("unsampled primary admission makes no candidate snapshot requests", async () => {
       const f = await pairedReviewFixture();
       const current = await f.management.configuration(f.endpoint.id, "owner-user");

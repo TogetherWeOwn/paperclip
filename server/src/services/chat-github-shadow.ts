@@ -464,7 +464,9 @@ async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$in
       and a.kind = 'github_review_publication' and a.status not in ('cancelled', 'failed')
       and a.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
     or exists (select 1 from chat_publications p where p.company_id = ${delivery.companyId}
-      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz)
+      and p.conversation_id = ${delivery.conversationId} and p.created_at >= ${new Date(admittedAt).toISOString()}::timestamptz
+      -- The bot-authored "queued" run milestone precedes any primary input read.
+      and coalesce(p.payload->>'progressState', '') <> 'queued')
   ) as started`);
   return evidence?.started ? "admission_snapshot_late" : undefined;
 }
