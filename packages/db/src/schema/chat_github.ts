@@ -186,6 +186,14 @@ export const chatGitHubReviews = pgTable(
       t.createdAt,
     ),
     index("chat_github_reviews_task_idx").on(t.companyId, t.issueId, t.runId),
+    // Every OR branch in chat_outbound_is_capture_only must be a bounded lookup.
+    // Keep cross-provider fencing: a candidate may emit through any provider.
+    index("chat_github_reviews_capture_issue_idx").on(t.companyId, t.issueId)
+      .where(sql`${t.shadowLabel} is not null`),
+    index("chat_github_reviews_capture_run_idx").on(t.companyId, t.runId)
+      .where(sql`${t.shadowLabel} is not null`),
+    index("chat_github_reviews_capture_delivery_idx").on(t.companyId, t.deliveryId)
+      .where(sql`${t.shadowLabel} is not null`),
     check("chat_github_review_pull_number_check", sql`${t.pullNumber} > 0`),
     check(
       "chat_github_review_state_check",

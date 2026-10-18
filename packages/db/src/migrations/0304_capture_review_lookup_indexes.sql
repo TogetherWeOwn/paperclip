@@ -1,0 +1,3 @@
+CREATE INDEX "chat_github_reviews_capture_issue_idx" ON "chat_github_reviews" USING btree ("company_id","issue_id") WHERE "chat_github_reviews"."shadow_label" is not null;--> statement-breakpoint
+CREATE INDEX "chat_github_reviews_capture_run_idx" ON "chat_github_reviews" USING btree ("company_id","run_id") WHERE "chat_github_reviews"."shadow_label" is not null;--> statement-breakpoint
+CREATE INDEX "chat_github_reviews_capture_delivery_idx" ON "chat_github_reviews" USING btree ("company_id","delivery_id") WHERE "chat_github_reviews"."shadow_label" is not null;

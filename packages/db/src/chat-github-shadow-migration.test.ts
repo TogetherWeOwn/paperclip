@@ -32,7 +32,7 @@ suite("GitHub shadow arm forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const migrationTag = "0295_new_sunspot";
+      const migrationTag = "0296_new_sunspot";
       const index = journal.entries.findIndex((entry) => entry.tag === migrationTag);
       expect(index).toBeGreaterThan(0);
       const apply = async (tag: string) => {

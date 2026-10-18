@@ -4777,6 +4777,54 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = await shadowTestSession(f, { issueId: primary.issue.id });
       expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
     });
+    it("unsampled primary admission makes no candidate snapshot requests", async () => {
+      const f = await pairedReviewFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      const sampleRate = 0.000001;
+      const saved = await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate }] },
+      }, "owner-user");
+      const [arm] = await db.execute(sql`select id from chat_github_review_arms where endpoint_id = ${f.endpoint.id} and retired_at is null`);
+      const eventId = "unsampled-no-capture";
+      const draw = parseInt(createHash("sha256").update(JSON.stringify([eventId, arm!.id, saved.revision])).digest("hex").slice(0, 13), 16) / 0x10000000000000;
+      expect(draw).toBeGreaterThan(sampleRate);
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      const { prepareGitHubPairEvent } = await import("../services/chat-github-shadow.js");
+      expect(await prepareGitHubPairEvent(db, { endpoint: f.endpoint, repositoryId: "97531", repository: "paperclipai/paperclip",
+        threadId: "github:paperclipai/paperclip:81", eventId, principal: { externalId: "42", handle: "octocat" } }, f.providerFetch)).toBeNull();
+      expect(recorder.fetches).toEqual([]);
+    });
+    it.each([false, true])("unpaired primary never inherits a candidate assessment (primary history %s)", async (hasPrimaryHistory) => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, `history-paired-${hasPrimaryHistory}`, "@maya first review", 81);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const service = githubChatReviewService(db, f.providerFetch);
+      if (hasPrimaryHistory) {
+        const session = await shadowTestSession(f, { issueId: primary.issueId! });
+        expect(await service.execute(session, "submit_review", { ...shadowTestAssessment(head), summary: "PRIMARY_OWN_HISTORY" })).toMatchObject({ status: "processed" });
+      }
+      const candidateSession = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await service.execute(candidateSession, "submit_review", { ...shadowTestAssessment(head), summary: "CANDIDATE_ONLY_FINDING_CANARY" })).toMatchObject({ status: "shadow_stored" });
+      // Force the candidate to be newest regardless of manual/automatic row timing.
+      await db.update(chatGitHubReviews).set({ createdAt: new Date(Date.now() + 1000) }).where(eq(chatGitHubReviews.issueId, candidate.issue.id));
+      await instanceSettingsService(db).updateExperimental({ githubReviewShadowEnabled: false });
+      const next = await deliverShadowTestMention(f, `history-unpaired-${hasPrimaryHistory}`, "@maya second unpaired review", 81);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, next.issueId!));
+      const comment = comments.find(c => c.body.includes("second unpaired review"))!;
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        invocationSource: "assignment", status: "running", contextSnapshot: { issueId: next.issueId, wakeCommentId: comment.id } }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: next.issueId!, runId: run!.id };
+      const metadata = await service.execute(session, "read_pull_request", { section: "metadata" }) as { previousAssessment: unknown };
+      expect(metadata.previousAssessment).toEqual(hasPrimaryHistory ? expect.objectContaining({ assessment: expect.objectContaining({ summary: "PRIMARY_OWN_HISTORY" }) }) : null);
+      expect(JSON.stringify(metadata)).not.toContain("CANDIDATE_ONLY_FINDING_CANARY");
+      const { githubPreviousAssessment } = await import("../services/chat-github-events.js");
+      const previous = await githubPreviousAssessment(db, f.endpoint, "97531", 81);
+      expect(previous?.shadowLabel ?? null).toBeNull();
+      expect(previous?.issueId ?? null).toBe(hasPrimaryHistory ? primary.issueId : null);
+    });
     it.each(["failed", "cancelled"])("paired primary retry publishes after its previous run %s", async (status) => {
       const f = await pairedReviewFixture();
       const head = "b".repeat(40);

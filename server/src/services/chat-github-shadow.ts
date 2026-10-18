@@ -27,6 +27,20 @@ export async function githubShadowEnabled(db: Store): Promise<boolean> {
   catch { return false; }
 }
 
+async function selectedGitHubPairArms(db: Store, endpoint: Endpoint,
+  config: typeof chatGitHubConfigurations.$inferSelect, eventId: string, repository: string,
+) {
+  const arms = await db.select().from(chatGitHubReviewArms).where(and(
+    eq(chatGitHubReviewArms.companyId, endpoint.companyId), eq(chatGitHubReviewArms.endpointId, endpoint.id), isNull(chatGitHubReviewArms.retiredAt),
+  ));
+  return arms.filter(arm => {
+    const route = config.configuration.shadowRoutes?.find(r => r.agentId === arm.agentId && r.label === arm.label && r.enabled);
+    const draw = parseInt(digest([eventId, arm.id, config.revision]).slice(0, 13), 16) / 0x10000000000000;
+    return route && draw < route.sampleRate
+      && (route.repos === undefined || route.repos.some(repo => repo.toLowerCase() === repository.toLowerCase()));
+  });
+}
+
 export async function prepareGitHubPairEvent(db: Db, input: {
   endpoint: Endpoint; repositoryId: string; repository: string; threadId: string;
   eventId: string; principal: { externalId: string; handle: string | null };
@@ -34,7 +48,10 @@ export async function prepareGitHubPairEvent(db: Db, input: {
 }, fetchImpl: typeof fetch): Promise<Pick<GitHubReviewEnrollmentEnvelope, "event" | "unavailableEvent" | "snapshot" | "snapshotFailure"> | null> {
   if (!(await githubShadowEnabled(db))) return null;
   const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
-  if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0 && (r.repos === undefined || r.repos.some(repo => repo.toLowerCase() === input.repository.toLowerCase()))) || config.configuration.shadow?.enabled) return null;
+  if (!config?.configuration.shadowRoutes?.some(r => r.enabled && r.sampleRate > 0) || config.configuration.shadow?.enabled) return null;
+  // Use the exact admission draw before minting a token or reading GitHub. An
+  // unsampled primary must not pay for the candidate's two snapshot sweeps.
+  if (!(await selectedGitHubPairArms(db, input.endpoint, config, input.eventId, input.repository)).length) return null;
   const captureDeadline = AbortSignal.timeout(15_000);
   const boundedFetch: typeof fetch = (url, init) => fetchImpl(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, captureDeadline]) : captureDeadline });
   const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(input.threadId);
@@ -114,22 +131,15 @@ export async function admitGitHubPair(tx: Tx, input: {
   if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed) return;
   const [config] = await tx.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
   if (!config || config.configuration.shadow?.enabled) return;
-  const arms = await tx.select().from(chatGitHubReviewArms).where(and(
-    eq(chatGitHubReviewArms.companyId, input.endpoint.companyId), eq(chatGitHubReviewArms.endpointId, input.endpoint.id), isNull(chatGitHubReviewArms.retiredAt),
-  ));
-  const selected = arms.filter(arm => {
-    const route = config.configuration.shadowRoutes?.find(r => r.agentId === arm.agentId && r.label === arm.label && r.enabled);
-    const draw = parseInt(digest([delivery.providerEventId, arm.id, config.revision]).slice(0, 13), 16) / 0x10000000000000;
-    const repository = (input.event ?? input.unavailableEvent)?.repository.toLowerCase();
-    return route && draw < route.sampleRate
-      && (route.repos === undefined || route.repos.some(repo => repo.toLowerCase() === repository));
-  });
+  const selected = await selectedGitHubPairArms(tx, input.endpoint, config, delivery.providerEventId,
+    (input.event ?? input.unavailableEvent)?.repository ?? "");
   if (!selected.length) return;
   const e = input.event ?? input.unavailableEvent;
   if (!e) throw new Error("paired_review_event_identity_missing");
   // Endpoint lock serializes allocation, including seeds not yet projected.
   const [prior] = await tx.select({ ordinal: sql<number>`coalesce(max((${chatDeliveries.normalizedEvent}->'githubPairingSeed'->>'roundOrdinal')::integer), 0)` })
     .from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, input.endpoint.id),
+      sql`${chatDeliveries.normalizedEvent} ? 'githubPairingSeed'`,
       sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'repositoryId', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'repositoryId') = ${e.repositoryId}`,
       sql`coalesce(${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'event'->>'pullNumber', ${chatDeliveries.normalizedEvent}->'githubPairingSeed'->'envelope'->'unavailableEvent'->>'pullNumber') = ${String(e.pullNumber)}`));
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;

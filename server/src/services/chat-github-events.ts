@@ -17,6 +17,7 @@ import {
   githubIdSchema,
   type GitHubReviewEventContext,
 } from "@paperclipai/shared";
+import { primaryGitHubReview } from "./chat-github-primary.js";
 import {
   effectiveGitHubReviewPolicy,
   githubReviewSchedulingDecision,
@@ -199,6 +200,7 @@ export async function githubPreviousAssessment(
         eq(chatGitHubReviews.repositoryId, repositoryId),
         eq(chatGitHubReviews.pullNumber, pullNumber),
         isNotNull(chatGitHubReviews.assessment),
+        primaryGitHubReview(),
       ),
     )
     .orderBy(desc(chatGitHubReviews.createdAt))
