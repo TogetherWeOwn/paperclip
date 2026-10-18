@@ -20,7 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { companySkillService } from "../services/company-skills.ts";
+import { __unstableExpireSkillInventoryCache, companySkillService } from "../services/company-skills.ts";
 import { removeRuntimeSkillCache } from "../services/runtime-skill-cache.js";
 import { folderService } from "../services/folders.js";
 
@@ -441,6 +441,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(next.source).toBe(source);
     expect(onDisk.source).toBe(source);
     await fs.unlink(path.join(source, "SKILL.md"));
+    // A removed SKILL.md is picked up by the next reconcile; reads inside the
+    // inventory TTL serve the persisted rows, so expire it to observe the removal.
+    __unstableExpireSkillInventoryCache(companyId);
     expect(await prepare()).toBeUndefined();
   });
 

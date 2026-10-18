@@ -426,6 +426,11 @@ export function __unstableGetSkillInventoryLastReconciledAt(companyId: string): 
   return skillInventoryLastReconciledAt.get(companyId);
 }
 
+/** Test hook: forget the last reconcile so the next read reconciles synchronously like a cold start. */
+export function __unstableExpireSkillInventoryCache(companyId: string): void {
+  skillInventoryLastReconciledAt.delete(companyId);
+}
+
 function selectCompanySkillColumns() {
   return {
     id: companySkills.id,
