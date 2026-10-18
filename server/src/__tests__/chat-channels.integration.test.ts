@@ -4931,7 +4931,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const [environment] = await db.insert(environments).values({ name: `Certified shadow SSH ${randomUUID()}`,
           driver: "ssh", config: { host: "127.0.0.1", port: 22, username: scenario === "wrong-ssh-user" ? "primary-user" : "paperclip-shadow",
             remoteWorkspacePath: "/home/paperclip-shadow/work", privateKey: null, knownHosts: scenario === "no-host-key" ? null : "fixture", strictHostKeyChecking: scenario !== "host-key-check-off" } }).returning();
-        await db.update(agents).set({ adapterType: "claude_local", defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
+        // The probe must exercise the arm's actual configured model (no synthetic default).
+        await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { model: "configured-arm-model" }, defaultEnvironmentId: environment!.id }).where(eq(agents.id, f.replacementAgentId));
         const [agent] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, session.runId));
         const old = process.env.PAPERCLIP_GITHUB_SHADOW_CERTIFIED_ENVIRONMENTS;
@@ -4959,7 +4960,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             username: scenario === "wrong-user-proof" ? "primary-user" : "paperclip-shadow",
             home: scenario === "wrong-home" ? "/primary-home" : input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
             namespaceBusy: scenario === "namespace-busy",
-            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: scenario !== "namespace-busy", providerToolsDenied: true } }), stderr: "" };
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: scenario !== "namespace-busy", providerToolsDenied: true,
+              allowedModelAccepted: input.model === "configured-arm-model", otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
         });
         let prepared: Awaited<ReturnType<typeof isolation.prepareGitHubCandidateRuntime>> = null;
         try {
@@ -5138,7 +5140,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           if (!options?.stdin || !command.includes("python3")) return { stdout: "", stderr: "" };
           const input = JSON.parse(options.stdin);
           return { stdout: JSON.stringify({ nonce: input.nonce, username: "paperclip-shadow", home: input.home, hooksDigest: scenario === "contaminated" ? null : input.hooks.digest,
-            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true, providerToolsDenied: true } }), stderr: "" };
+            checks: { primaryCanariesDenied: scenario !== "contaminated", githubDenied: true, configFresh: true, providerToolsDenied: true,
+              allowedModelAccepted: input.model === "configured-arm-model", otherModelDenied: true, rawProxyDenied: true } }), stderr: "" };
         });
         const originalAdapter = getServerAdapter("claude_local");
         const execute = vi.fn(async (input: Parameters<typeof originalAdapter.execute>[0]) => {
@@ -5195,7 +5198,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await db.update(agents).set({ adapterType: "claude_local", adapterConfig: { engine: "cli" },
             runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
             .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
-          await db.update(agents).set({ defaultEnvironmentId: environment!.id, adapterConfig: { engine: "cli", cwd: scratch,
+          await db.update(agents).set({ defaultEnvironmentId: environment!.id, adapterConfig: { engine: "cli", model: "configured-arm-model", cwd: scratch,
             workspaceStrategy: { type: "project_primary", provisionCommand: `touch '${provisionMarker}'` } } }).where(eq(agents.id, f.replacementAgentId));
           await deliverShadowTestMention(f, `certified-heartbeat-${scenario}`, "@maya review this", 81);
           await f.service.processPendingDeliveries();
