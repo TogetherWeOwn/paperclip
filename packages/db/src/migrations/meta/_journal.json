@@ -2052,6 +2052,13 @@
       "when": 1792217474961,
       "tag": "0294_cloudy_photon",
       "breakpoints": true
+    },
+    {
+      "idx": 295,
+      "version": "7",
+      "when": 1792278514945,
+      "tag": "0295_cold_sugar_man",
+      "breakpoints": true
     }
   ]
 }
