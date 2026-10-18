@@ -4777,6 +4777,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = await shadowTestSession(f, { issueId: primary.issue.id });
       expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
     });
+    it.each(["failed", "cancelled"])("paired primary retry publishes after its previous run %s", async (status) => {
+      const f = await pairedReviewFixture();
+      const head = "b".repeat(40);
+      const primary = await deliverShadowTestMention(f, `paired-primary-retry-${status}`, "@maya review this", 81);
+      const service = githubChatReviewService(db, f.providerFetch);
+      const first = await shadowTestSession(f, { issueId: primary.issueId! });
+      await service.execute(first, "begin_review", { reviewedCommit: head });
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, first.runId));
+      const retry = await shadowTestSession(f, { issueId: primary.issueId! });
+      await service.execute(retry, "begin_review", { reviewedCommit: head });
+      expect(await service.execute(retry, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "processed" });
+      const reviews = await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.issueId, primary.issueId!));
+      expect(reviews.find(r => r.runId === retry.runId)).toMatchObject({ state: "completed", assessment: { score: 2 } });
+      expect(reviews.find(r => r.runId === first.runId)?.assessment).toBeNull();
+      // Idempotent begin/submit belongs to the retry, not its predecessor.
+      expect(await service.execute(retry, "submit_review", shadowTestAssessment(head))).toMatchObject({ status: "processed" });
+    });
     it("paired admission never retargets candidate review to an advanced provider head", async () => {
       const f = await pairedReviewFixture();
       await deliverShadowTestMention(f, "paired-advanced", "@maya review this", 81);

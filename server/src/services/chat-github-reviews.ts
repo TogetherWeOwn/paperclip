@@ -428,7 +428,6 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       | undefined;
     const context: GitHubReviewEventContext = {
       event: manual?.event ?? "mention",
-      deliveryId: source.delivery.id,
       repositoryId: source.repositoryId,
       repository: source.repository,
       pullNumber: source.number,
@@ -455,6 +454,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       },
       labels: pull.labels.map((l) => l.name),
       ...(automatic ? automatic.context : {}),
+      // Keep the source admission identity even when retries get per-run rows.
+      deliveryId: source.delivery.id,
     };
     const [review] = await db
       .insert(chatGitHubReviews)
@@ -467,7 +468,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         repository: source.repository,
         pullNumber: source.number,
         headSha: pull.head.sha,
-        deliveryId: source.enrollment ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
+        deliveryId: source.candidate ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
         configurationRevision:
           source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
         policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,
@@ -497,7 +498,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           eq(chatGitHubReviews.endpointId, source.endpoint.id),
           eq(
             chatGitHubReviews.deliveryId,
-            source.enrollment ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
+            source.candidate ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
           ),
         ),
       );

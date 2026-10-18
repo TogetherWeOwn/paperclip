@@ -146,7 +146,8 @@ export async function admitGitHubPair(tx: Tx, input: {
         eq(chatGitHubReviewEnrollments.pullNumber, e.pullNumber),
         lt(chatGitHubReviewEnrollments.roundOrdinal, roundOrdinal),
         armId === "primary"
-          ? sql`${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text`
+          ? sql`(${chatGitHubReviews.deliveryId} = ${chatGitHubReviewEnrollments.originDeliveryId}::text
+              or ${chatGitHubReviews.event}->>'deliveryId' = ${chatGitHubReviewEnrollments.originDeliveryId}::text)`
           : sql`exists (select 1 from chat_github_review_candidates c where c.company_id = ${input.endpoint.companyId}
               and c.enrollment_id = ${chatGitHubReviewEnrollments.id} and c.arm_id = ${armId}
               and c.native_delivery_id::text = ${chatGitHubReviews.deliveryId})`,
