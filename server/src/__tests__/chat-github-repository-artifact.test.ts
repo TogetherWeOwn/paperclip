@@ -27,6 +27,8 @@ beforeAll(() => {
   writeFileSync(join(origin, "README.md"), "base\r\n");
   writeFileSync(join(origin, ".gitattributes"), "*.md text eol=lf\n");
   writeFileSync(join(origin, ".gitignore"), "ignored.txt\n");
+  // Stored with CRLF before any text attribute applies to it (see head commit).
+  writeFileSync(join(origin, "legacy.txt"), "one\r\ntwo\r\n");
   git(origin, "add", "-A");
   git(origin, "commit", "-q", "-m", "base");
   base = git(origin, "rev-parse", "HEAD");
@@ -35,13 +37,14 @@ beforeAll(() => {
   chmodSync(join(origin, "run.sh"), 0o755);
   symlinkSync("README.md", join(origin, "link"));
   writeFileSync(join(origin, "ignored.txt"), "tracked although ignored\n");
-  git(origin, "add", "-A");
+  writeFileSync(join(origin, ".gitattributes"), "*.md text eol=lf\n*.txt text\n");
+  git(origin, "add", "run.sh", "link", ".gitattributes"); // legacy.txt keeps its stored CRLF blob
   git(origin, "add", "-f", "ignored.txt");
   git(origin, "commit", "-q", "-m", "head");
   head = git(origin, "rev-parse", "HEAD");
   // A later fix commit (what the primary might find) and an unrelated branch.
   writeFileSync(join(origin, "fix.txt"), "LATER_FIX_LEAK\n");
-  git(origin, "add", "-A");
+  git(origin, "add", "fix.txt");
   git(origin, "commit", "-q", "-m", "later fix");
   later = git(origin, "rev-parse", "HEAD");
   git(origin, "checkout", "-q", "-b", "other", base);
@@ -120,6 +123,8 @@ describe("sealed repository artifact", () => {
     expect(git(clone, "rev-parse", "refs/heads/main^{tree}")).toBe(git(origin, "rev-parse", `${base}^{tree}`));
     expect(git(clone, "rev-parse", "refs/pull/7/head^")).toBe(artifact.commits.base);
     expect(git(clone, "rev-list", "--all").split("\n")).toHaveLength(2);
+    // The stored CRLF blob under a later `text` attribute survives byte-exactly.
+    expect(execFileSync("git", ["-C", clone, "cat-file", "-p", "refs/pull/7/head:legacy.txt"], { encoding: "utf8" })).toBe("one\r\ntwo\r\n");
     for (const leak of [later, other, head, base]) expect(() => git(clone, "cat-file", "-e", leak)).toThrow();
   });
 
@@ -211,10 +216,12 @@ describe("candidate workspace materialisation over SSH", () => {
     expect(git(ws, "rev-parse", "HEAD^{tree}")).toBe(git(origin, "rev-parse", `${head}^{tree}`));
     expect(git(ws, "remote", "-v").split("\n").every(line => line.includes(join(home, ".paperclip-review", "origin.git")))).toBe(true);
     git(ws, "fetch", "-q", "origin");
-    expect(git(ws, "diff", "--name-only", "origin/main...HEAD").split("\n").sort()).toEqual(["ignored.txt", "link", "run.sh"]);
+    expect(git(ws, "diff", "--name-only", "origin/main...HEAD").split("\n").sort()).toEqual([".gitattributes", "ignored.txt", "link", "run.sh"]);
     expect(existsSync(join(home, ".paperclip-review", "artifact", "repository.bundle"))).toBe(false);
     mkdirSync(join(ws, ".paperclip-runtime"));
-    expect(git(ws, "status", "--porcelain")).toBe("");
+    // Runtime assets never show as untracked; legacy.txt is git's ordinary
+    // CRLF-under-`text` renormalisation notice, identical in any clone.
+    expect(git(ws, "status", "--porcelain", "--untracked-files=all")).toBe("M legacy.txt");
     expect(() => git(ws, "cat-file", "-e", later)).toThrow();
   });
 

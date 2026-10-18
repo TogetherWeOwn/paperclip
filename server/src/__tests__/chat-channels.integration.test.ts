@@ -3820,6 +3820,49 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .innerJoin(issues, eq(issues.id, chatConversations.issueId))
         .where(eq(chatConversations.endpointId, endpointId));
     }
+    it.each(["sealed", "late", "disabled"] as const)("P11 seals the candidate checkout artifact with the snapshot (%s)", async mode => {
+      const { chatGitHubReviewEnrollments } = await import("@paperclipai/db");
+      const artifacts = await import("../services/chat-github-repository-artifact.js");
+      const requests: Array<Parameters<artifacts.GitHubRepositoryArtifactProducer>[0]> = [];
+      artifacts.setGitHubRepositoryArtifactProducer(mode === "disabled" ? null : async request => {
+        requests.push(request);
+        if (mode === "late") {
+          // Never resolves on its own: only the admission-bound signal ends it.
+          await new Promise(resolve => request.signal.addEventListener("abort", resolve, { once: true }));
+          throw new artifacts.GitHubRepositoryArtifactError("bundle:repository_artifact_late;synthetic:repository_artifact_late");
+        }
+        return { version: 1, kind: "bundle", path: `${"c".repeat(64)}.bundle`, sha256: "c".repeat(64), bytes: 1,
+          headSha: request.headSha, baseSha: request.baseSha, headTree: "d".repeat(40), baseTree: "e".repeat(40),
+          refs: { base: `refs/heads/${request.baseBranch}`, head: `refs/pull/${request.pullNumber}/head` },
+          commits: { base: request.baseSha, head: request.headSha } };
+      });
+      try {
+        const f = await pairedReviewFixture();
+        await deliverShadowTestMention(f, `p11-artifact-${mode}`, "@maya review this", 81);
+        await f.service.processPendingDeliveries();
+        const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+        // A slow or missing checkout never costs the sealed snapshot itself.
+        expect(enrollment!.envelope.snapshot).toBeDefined();
+        expect(enrollment!.envelope.snapshotFailure).toBeUndefined();
+        const snapshot = enrollment!.envelope.snapshot!;
+        if (mode === "sealed") {
+          expect(requests).toHaveLength(1);
+          expect(requests[0]).toMatchObject({ pullNumber: 81, headSha: snapshot.headSha, baseSha: snapshot.baseSha, token: expect.any(String) });
+          expect(snapshot.repository).toMatchObject({ kind: "bundle", headSha: snapshot.headSha, baseSha: snapshot.baseSha, sha256: "c".repeat(64) });
+          expect(snapshot.repositoryFailure).toBeUndefined();
+        } else {
+          expect(snapshot.repository).toBeUndefined();
+          expect(snapshot.repositoryFailure).toBe(mode === "late" ? "bundle:repository_artifact_late;synthetic:repository_artifact_late" : "repository_artifact_disabled");
+          if (mode === "late") expect(Date.parse(snapshot.finishedAt) - Date.parse(snapshot.startedAt)).toBeLessThan(15_000);
+        }
+        // The artifact is covered by the sealed digest: relabelling it is detected.
+        const { githubSnapshotReader } = await import("../services/chat-github-review-snapshot.js");
+        const expected = { headSha: snapshot.headSha, baseSha: snapshot.baseSha, pullNumber: 81 };
+        expect(() => githubSnapshotReader(snapshot, expected, async () => { throw new Error("live"); })).not.toThrow();
+        expect(() => githubSnapshotReader({ ...snapshot, repositoryFailure: "forged" }, expected, async () => { throw new Error("live"); }))
+          .toThrow("Invalid sealed review snapshot");
+      } finally { artifacts.setGitHubRepositoryArtifactProducer(undefined); }
+    }, 60_000);
     it.each(["idle-primary", "busy-primary"] as const)("P11 captures a pair when the primary wake starts immediately (%s)", async mode => {
       const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
       let candidateAgentId: string | undefined;

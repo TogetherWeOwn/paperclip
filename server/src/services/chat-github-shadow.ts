@@ -96,6 +96,7 @@ export async function prepareGitHubPairEvent(db: Db, input: {
   const remaining = input.pending ? Date.parse(input.pending.admittedAt) + PAIR_CAPTURE_WINDOW_MS - Date.now() : PAIR_CAPTURE_WINDOW_MS;
   const captureWindowMs = Number.isFinite(remaining) ? Math.max(0, Math.min(PAIR_CAPTURE_WINDOW_MS, remaining)) : 0;
   const captureDeadline = AbortSignal.timeout(captureWindowMs);
+  const captureStartedAt = Date.now();
   // Also bound transports that ignore AbortSignal. Never let one candidate's
   // stalled read hold the recovery sweep forever; late responses are discarded.
   const boundedFetch: typeof fetch = async (url, init) => {
@@ -154,15 +155,19 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     // commit-addressed, so it cannot see anything the primary publishes later.
     const producer = githubRepositoryArtifactProducer();
     const admitted = event;
+    // The artifact closes before the admission window so a slow repository can
+    // only cost the checkout (precise reason), never the sealed snapshot itself.
+    const artifactWindowMs = Math.max(0, captureWindowMs - (Date.now() - captureStartedAt) - PAIR_ARTIFACT_MARGIN_MS);
+    const artifactSignal = AbortSignal.any([captureDeadline, AbortSignal.timeout(artifactWindowMs)]);
     const repository = (async (): Promise<Pick<GitHubReviewInputSnapshot, "repository" | "repositoryFailure">> => {
       if (!producer) return { repositoryFailure: "repository_artifact_disabled" };
       try {
         return { repository: await producer({ repository: input.repository, pullNumber: admitted.pullNumber,
           headSha: admitted.headSha, baseSha: admitted.baseSha, baseBranch: admitted.baseBranch, token,
-          fetchImpl: boundedFetch, signal: captureDeadline, deadlineAt: Date.now() + captureWindowMs }) };
+          fetchImpl: boundedFetch, signal: artifactSignal, deadlineAt: Date.now() + artifactWindowMs }) };
       } catch (error) {
-        return { repositoryFailure: captureDeadline.aborted ? "repository_artifact_late"
-          : error instanceof GitHubRepositoryArtifactError ? error.reason : "repository_artifact_unavailable" };
+        return { repositoryFailure: error instanceof GitHubRepositoryArtifactError ? error.reason
+          : artifactSignal.aborted ? "repository_artifact_late" : "repository_artifact_unavailable" };
       }
     })();
     const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
@@ -442,6 +447,7 @@ async function failGitHubPairCapture(db: Store, deliveryId: string, capture: Pai
 }
 
 const PAIR_CAPTURE_WINDOW_MS = 15_000;
+const PAIR_ARTIFACT_MARGIN_MS = 2_000;
 
 async function pairCaptureFailure(db: Store, delivery: typeof chatDeliveries.$inferSelect, pending: PendingPair) {
   if (pending.disabled || !(await githubShadowEnabled(db))) return "admission_snapshot_disabled";
