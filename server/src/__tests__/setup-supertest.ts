@@ -4,6 +4,21 @@ import type { AddressInfo, Server as NetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
+import { beforeEach } from "vitest";
+import { gitHubPrimaryBlindingInternals } from "../services/chat-github-primary-blinding.js";
+import { gitHubPrimaryBlindingStateInternals } from "../services/chat-github-primary-blinding-state.js";
+import { gitHubPrimaryReviewersInternals } from "../services/chat-github-primary-reviewers.js";
+
+// Shadow-review modules keep Db-keyed module state (primary reviewer sets,
+// blinding enrollments, visibility snapshots). Suites that share one Db
+// handle across tests would otherwise observe bootstrap results from an
+// earlier test depending on execution order (TOG-30065). Reset before each
+// test; production code paths never call these helpers.
+beforeEach(() => {
+  gitHubPrimaryReviewersInternals.resetForTests();
+  gitHubPrimaryBlindingStateInternals.resetForTests();
+  gitHubPrimaryBlindingInternals.resetForTests();
+});
 
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
