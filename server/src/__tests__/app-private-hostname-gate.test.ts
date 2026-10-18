@@ -104,6 +104,10 @@ describe("createChatReconciliationCoordinator", () => {
     // The service integration tests hold real publication workers while this
     // scheduled method returns; app shutdown must also join those workers.
     expect(source).toContain("await chatChannels.shutdown()");
+    // Idle milestone recovery is on its own slow cadence while commit
+    // signals still wake it immediately.
+    expect(source).toContain("CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS");
+    expect(source).toContain("chatReconciliation.reconcileMilestones()");
   });
 
   it.each([false, true])(
@@ -134,6 +138,7 @@ describe("createChatReconciliationCoordinator", () => {
       });
       try {
         coordinator.reconcile();
+        coordinator.reconcileMilestones();
         await vi.waitFor(() => {
           expect(projectRunMilestones).toHaveBeenCalledTimes(1);
           expect(flushPublications).toHaveBeenCalledTimes(1);
@@ -196,6 +201,7 @@ describe("createChatReconciliationCoordinator", () => {
     });
     try {
       coordinator.reconcile();
+      coordinator.reconcileMilestones();
       await vi.waitFor(() => {
         expect(projectRunMilestones).toHaveBeenCalledOnce();
         expect(flushPublications).toHaveBeenCalledOnce();
@@ -349,6 +355,67 @@ describe("createChatReconciliationCoordinator", () => {
       }
     },
   );
+
+  it("keeps the milestone sweep off the fast idle poll", async () => {
+    const projectRunMilestones = vi.fn(async () => 0);
+    const flushPublications = vi.fn(async () => undefined);
+    const coordinator = createChatReconciliationCoordinator({
+      projectRunMilestones,
+      reconcileProviderRuntimes: async () => undefined,
+      processPendingDeliveries: async () => undefined,
+      flushPublications,
+      processPendingSlackFileUploadReceipts: async () => undefined,
+      processPendingSlackSessionSyncs: async () => undefined,
+      onError: vi.fn(),
+    });
+    try {
+      coordinator.reconcile();
+      await coordinator.drain();
+      expect(flushPublications).toHaveBeenCalledTimes(1);
+      expect(projectRunMilestones).not.toHaveBeenCalled();
+      coordinator.reconcileMilestones();
+      await coordinator.drain();
+      expect(projectRunMilestones).toHaveBeenCalledTimes(1);
+      coordinator.notifyPublications();
+      await coordinator.drain();
+      expect(projectRunMilestones).toHaveBeenCalledTimes(2);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("threads a steady-state delta window into later milestone sweeps", async () => {
+    const projectRunMilestones = vi.fn(async (_since?: Date) => 0);
+    const coordinator = createChatReconciliationCoordinator({
+      projectRunMilestones,
+      reconcileProviderRuntimes: async () => undefined,
+      processPendingDeliveries: async () => undefined,
+      flushPublications: async () => undefined,
+      processPendingSlackFileUploadReceipts: async () => undefined,
+      processPendingSlackSessionSyncs: async () => undefined,
+      onError: vi.fn(),
+    });
+    try {
+      coordinator.reconcileMilestones();
+      await coordinator.drain();
+      expect(projectRunMilestones).toHaveBeenCalledTimes(1);
+      // Cold sweep scans the trailing recovery window (no delta bound).
+      expect(projectRunMilestones.mock.calls[0]![0]).toBeUndefined();
+      coordinator.reconcileMilestones();
+      await coordinator.drain();
+      expect(projectRunMilestones).toHaveBeenCalledTimes(2);
+      // Steady-state sweep scans only the delta since the previous sweep.
+      const since = projectRunMilestones.mock.calls[1]![0];
+      expect(since).toBeInstanceOf(Date);
+      const ageMs = Date.now() - (since as Date).getTime();
+      expect(ageMs).toBeGreaterThan(4 * 60_000);
+      expect(ageMs).toBeLessThan(6 * 60_000);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
 });
 
 describe("shouldEnablePrivateHostnameGuard", () => {

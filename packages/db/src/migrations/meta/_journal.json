@@ -2059,6 +2059,13 @@
       "when": 1792278514945,
       "tag": "0295_cold_sugar_man",
       "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1792296920434,
+      "tag": "0296_volatile_star_brand",
+      "breakpoints": true
     }
   ]
 }
