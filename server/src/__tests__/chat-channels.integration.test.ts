@@ -19352,13 +19352,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId));
-      expect(rows).toHaveLength(8);
-    });
+    await vi.waitFor(
+      async () => {
+        const rows = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId));
+        expect(rows).toHaveLength(8);
+      },
+      // Eight comments plus eight durable wakes drain here. The default 1s
+      // waitFor budget flakes under full-shard CI load; the drain itself is
+      // asserted below, so wait generously for it to land.
+      { timeout: 15_000 },
+    );
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
@@ -19377,15 +19383,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Comment admission commits before the durable wake. Wait for this
     // company's last wake too, not merely its already-visible last comment.
     // The competing sweep may legitimately reconcile another fixture company.
-    await vi.waitFor(() => {
-      const calls = wakeup.mock.calls.filter(
-        (call) => call[0] === fixture.assignedAgentId,
-      );
-      expect(calls).toHaveLength(8);
-      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
-        comments.map((comment) => comment.id),
-      );
-    });
+    await vi.waitFor(
+      () => {
+        const calls = wakeup.mock.calls.filter(
+          (call) => call[0] === fixture.assignedAgentId,
+        );
+        expect(calls).toHaveLength(8);
+        expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+          comments.map((comment) => comment.id),
+        );
+      },
+      // Same eight-wake drain as above: generous budget under shard load.
+      { timeout: 15_000 },
+    );
     // The last comment and wakeup commit inside the lease. Under full-suite
     // load the assertions above can observe those effects one microtask before
     // the deferred owner's `finally` deletes its lease. Require prompt eventual
