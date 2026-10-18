@@ -39,6 +39,11 @@ describe("GitHub capture admission deadline", () => {
         if (stalled === "headers") { await blocked; return Response.json([]); }
         return new Response(new ReadableStream<Uint8Array>({ start(controller) { body = controller; } }));
       }
+      // One sweep reads its resources concurrently: every other read must be
+      // well-formed so only the stalled one decides the outcome.
+      if (String(url).includes("/compare/")) return Response.json({ merge_base_commit: { sha: "a".repeat(40) } });
+      if (String(url).includes("/check-runs?")) return Response.json({ check_runs: [] });
+      if (String(url).includes("?per_page=")) return Response.json([]);
       return Response.json({ title: "fixture", body: "", draft: false, labels: [],
         head: { sha: "b".repeat(40) }, base: { sha: "a".repeat(40), ref: "main" }, user: { id: 42, login: "author" } });
     });
