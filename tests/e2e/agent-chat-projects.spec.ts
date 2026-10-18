@@ -392,9 +392,26 @@ test("plan approval hands the preserved revision to an assigned project task", a
       approval: true,
     });
     const chat = await idle(request, f.chatPath);
-    const original = await json(
+    // The plan document can receive a trailing revision after the run goes
+    // idle. Wait for two consecutive reads to agree so the approval below is
+    // compared against the settled revision, not a mid-flight one.
+    let original = await json(
       await request.get(`/api/issues/${chat.id}/documents/plan`),
     );
+    await expect
+      .poll(
+        async () => {
+          const next = await json(
+            await request.get(`/api/issues/${chat.id}/documents/plan`),
+          );
+          const settled =
+            next.latestRevisionId === original.latestRevisionId;
+          original = next;
+          return settled;
+        },
+        { timeout: 30_000, intervals: [250, 500, 1000] },
+      )
+      .toBe(true);
     expect(
       await json(await request.get(`/api/companies/${f.company.id}/issues`)),
     ).toHaveLength(0);

@@ -154,7 +154,10 @@ import { createToolGatewayService } from "./services/tool-gateway.js";
 import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
-import { enqueueChatRunMilestones } from "./services/chat-run-publications.js";
+import {
+  CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT,
+  enqueueChatRunMilestones,
+} from "./services/chat-run-publications.js";
 import {
   createCoalescedAsyncTrigger,
   isChatPublicationCommitSignal,
@@ -187,6 +190,18 @@ import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostic
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
 const CHAT_PUBLICATION_FLUSH_INTERVAL_MS = 1_000;
+// The run-milestone sweep held a pool slot for ~122 s per idle execution.
+// Recovery polls run here on a slow cadence. Commit-signal wakes
+// (run.presentation.resolved and safe native progress events) notify dispatch
+// immediately via notifyPublications, but earlier lifecycle events for
+// non-native runs (queued/working/failed) still rely on this poll and lag by
+// up to one interval; a run that finishes inside one interval may never
+// project a working milestone.
+export const CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS = 15_000;
+// Overlap between consecutive milestone sweeps. A run that commits while a
+// sweep runs is re-scanned by the next sweep; projection is idempotent, so
+// the overlap only costs a small indexed range scan.
+export const CHAT_MILESTONE_SWEEP_OVERLAP_MS = 5 * 60_000;
 const VITE_DEV_ASSET_PREFIXES = [
   "/@fs/",
   "/@id/",
@@ -296,13 +311,18 @@ export function createChatReconciliationCoordinator(input: {
   reconcileProviderRuntimes: () => Promise<unknown>;
   processPendingDeliveries: () => Promise<unknown>;
   processFailedGitHubWebhookDeliveries?: () => Promise<unknown>;
-  projectRunMilestones: () => Promise<number>;
+  projectRunMilestones: (since?: Date) => Promise<number>;
   flushPublications: () => Promise<unknown>;
   processPendingSlackFileUploadReceipts: () => Promise<unknown>;
   processPendingSlackSessionSyncs: () => Promise<unknown>;
   onError: (lane: ChatReconciliationLane, error: unknown) => void;
 }) {
   let stopped = false;
+  // Steady-state milestone bound: the first sweep scans the trailing 24h
+  // recovery window; later sweeps scan only runs updated since the previous
+  // sweep started, minus an overlap that covers in-flight commits. A full
+  // window re-scan every idle pass held a pool slot for ~122 s per pass.
+  let lastMilestoneSweepStartedAt: Date | null = null;
   const inFlight = new Map<ChatReconciliationLane, Promise<void>>();
   const publicationReconciliation = createCoalescedAsyncTrigger({
     run: input.flushPublications,
@@ -310,7 +330,22 @@ export function createChatReconciliationCoordinator(input: {
   });
   const milestoneReconciliation = createCoalescedAsyncTrigger({
     run: async () => {
-      const inserted = await input.projectRunMilestones();
+      const sweepStartedAt = new Date();
+      const since =
+        lastMilestoneSweepStartedAt === null
+          ? undefined
+          : new Date(
+              lastMilestoneSweepStartedAt.getTime() -
+                CHAT_MILESTONE_SWEEP_OVERLAP_MS,
+            );
+      const inserted = await input.projectRunMilestones(since);
+      // Advance only on success so a failed sweep retries the same delta.
+      // A pass that hits the insert cap is truncated: more unprojected runs
+      // may remain in the same window, so hold the watermark and let the next
+      // sweep re-scan it instead of dropping the backlog.
+      if (inserted < CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT) {
+        lastMilestoneSweepStartedAt = sweepStartedAt;
+      }
       // Existing final/question publications never wait on this optional
       // projection. Newly committed milestones get a bounded dispatch wake;
       // an empty/contended pass does not create a self-sustaining loop.
@@ -343,10 +378,13 @@ export function createChatReconciliationCoordinator(input: {
           input.processFailedGitHubWebhookDeliveries,
         );
       }
-      milestoneReconciliation.poll();
       publicationReconciliation.poll();
       start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
       start("Slack session status", input.processPendingSlackSessionSyncs);
+    },
+    reconcileMilestones() {
+      if (stopped) return;
+      milestoneReconciliation.poll();
     },
     notifyPublications() {
       milestoneReconciliation.notify();
@@ -1175,9 +1213,10 @@ export async function createApp(
     processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
     processFailedGitHubWebhookDeliveries: () =>
       chatChannels.processFailedGitHubWebhookDeliveries(),
-    projectRunMilestones: () =>
+    projectRunMilestones: (since?: Date) =>
       enqueueChatRunMilestones(db, {
         publicBaseUrl: opts.authPublicBaseUrl,
+        ...(since ? { since } : {}),
       }),
     flushPublications: () => flushChatPublications(),
     processPendingSlackFileUploadReceipts: () =>
@@ -1201,7 +1240,15 @@ export async function createApp(
     CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
   );
   chatPublicationTimer.unref?.();
+  let chatMilestoneTimer: ReturnType<typeof setInterval> | null = setInterval(
+    () => {
+      chatReconciliation.reconcileMilestones();
+    },
+    CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS,
+  );
+  chatMilestoneTimer.unref?.();
   chatReconciliation.reconcile();
+  chatReconciliation.reconcileMilestones();
   // Abandoned chunked-import spool sweep: hourly (plus once at startup),
   // deleting spool dirs whose transfer saw no activity for 24h and cancelling
   // their still-open ledger runs. Same setInterval + unref + shutdown-clear
@@ -1330,6 +1377,10 @@ export async function createApp(
       if (chatPublicationTimer) {
         clearInterval(chatPublicationTimer);
         chatPublicationTimer = null;
+      }
+      if (chatMilestoneTimer) {
+        clearInterval(chatMilestoneTimer);
+        chatMilestoneTimer = null;
       }
       await chatReconciliation.drain();
       clearInterval(browserUseTimer);

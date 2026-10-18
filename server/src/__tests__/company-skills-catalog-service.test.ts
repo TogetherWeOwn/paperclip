@@ -204,6 +204,10 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
       .set({ folderId: null })
       .where(eq(companySkills.id, installed.skill.id));
 
+    // Reads inside the inventory TTL serve persisted rows; expire it so this
+    // read runs the reconcile that repairs the unfiled skill.
+    const { __unstableExpireSkillInventoryCache } = await import("../services/company-skills.js");
+    __unstableExpireSkillInventoryCache(companyId);
     const listed = await svc.list(companyId);
     const repaired = listed.find((skill) => skill.id === installed.skill.id);
     const folder = repaired?.folderId

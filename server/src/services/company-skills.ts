@@ -414,6 +414,23 @@ type RuntimeSkillSourceResolution =
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
 
+// Read/write split for the skills inventory. Reads serve the persisted rows
+// and refresh in the background once the TTL lapses; writes keep awaiting a
+// full reconcile. Cold start still reconciles synchronously before the first
+// serve so a fresh company never reads an empty library.
+export const SKILL_INVENTORY_CACHE_TTL_MS = 60_000;
+const skillInventoryLastReconciledAt = new Map<string, number>();
+
+/** Test hook: last successful inventory reconcile per company (ms epoch). */
+export function __unstableGetSkillInventoryLastReconciledAt(companyId: string): number | undefined {
+  return skillInventoryLastReconciledAt.get(companyId);
+}
+
+/** Test hook: forget the last reconcile so the next read reconciles synchronously like a cold start. */
+export function __unstableExpireSkillInventoryCache(companyId: string): void {
+  skillInventoryLastReconciledAt.delete(companyId);
+}
+
 function selectCompanySkillColumns() {
   return {
     id: companySkills.id,
@@ -3222,6 +3239,7 @@ export function companySkillService(db: Db) {
     skillInventoryRefreshPromises.set(companyId, refreshPromise);
     try {
       await refreshPromise;
+      skillInventoryLastReconciledAt.set(companyId, Date.now());
     } finally {
       if (skillInventoryRefreshPromises.get(companyId) === refreshPromise) {
         skillInventoryRefreshPromises.delete(companyId);
@@ -3229,8 +3247,32 @@ export function companySkillService(db: Db) {
     }
   }
 
+  function scheduleSkillInventoryBackgroundRefresh(companyId: string): void {
+    if (skillInventoryRefreshPromises.has(companyId)) return;
+    void ensureSkillInventoryCurrent(companyId).catch((err) => {
+      // Background refresh is best-effort; the next read retries. Never
+      // reject into a read path that already served cached rows.
+      logger.warn(
+        { err, companyId },
+        "Background skills inventory refresh failed; next read retries",
+      );
+    });
+  }
+
+  async function ensureSkillInventoryCached(companyId: string): Promise<void> {
+    const last = skillInventoryLastReconciledAt.get(companyId);
+    if (last !== undefined && Date.now() - last < SKILL_INVENTORY_CACHE_TTL_MS) {
+      return;
+    }
+    if (last === undefined) {
+      await ensureSkillInventoryCurrent(companyId);
+      return;
+    }
+    scheduleSkillInventoryBackgroundRefresh(companyId);
+  }
+
   async function list(companyId: string, query: CompanySkillListQuery = {}): Promise<CompanySkillListItem[]> {
-    await ensureSkillInventoryCurrent(companyId);
+    await ensureSkillInventoryCached(companyId);
     const [dbRows, folderListing] = await Promise.all([db
       .select({
         id: companySkills.id,
@@ -3335,7 +3377,7 @@ export function companySkillService(db: Db) {
   }
 
   async function listFull(companyId: string): Promise<CompanySkill[]> {
-    await ensureSkillInventoryCurrent(companyId);
+    await ensureSkillInventoryCached(companyId);
     const rows = await db
       .select(selectCompanySkillColumns())
       .from(companySkills)

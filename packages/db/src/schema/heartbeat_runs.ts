@@ -147,6 +147,14 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    // Milestone sweep recovery bound: enqueueChatRunMilestones scans runs
+    // updated in the trailing window ordered by (updatedAt, id) for cursor
+    // pagination. Without this the 24h window seq-scans the table back to
+    // back (~122 s/exec on prod, 1 pool slot held continuously).
+    updatedAtIdIdx: index("heartbeat_runs_updated_at_id_idx").on(
+      table.updatedAt,
+      table.id,
+    ),
     companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'issueId')`,
