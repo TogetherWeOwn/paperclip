@@ -972,8 +972,33 @@ export async function startSandboxCallbackBridgeWorker(input: {
     method: string;
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
+  // Files whose terminal response already landed but whose request-file remove
+  // timed out or failed. The response is delivered, so the request must never
+  // go through handleRequest again; later polls retry only the bounded remove.
+  // This keeps a hung remove from wedging the serial loop without re-running a
+  // possibly-committed mutation. Covers finalize, backstop, and recovery paths.
+  const deliveredPendingRemove = new Set<string>();
 
   const processRequestFile = async (fileName: string) => {
+    // A terminal response already landed for this file but its request-file
+    // remove timed out or failed. Retry only the bounded remove; never run the
+    // handler again, or a possibly-committed mutation applies twice.
+    if (deliveredPendingRemove.has(fileName)) {
+      const pendingRequestPath = path.posix.join(directories.requestsDir, fileName);
+      try {
+        await withTimeout(
+          input.client.remove(pendingRequestPath),
+          iterationTimeoutMs,
+          `Sandbox callback bridge remove request ${fileName}`,
+        );
+        deliveredPendingRemove.delete(fileName);
+        lastSuccessfulIterationAt = Date.now();
+      } catch {
+        // Keep the file in the set for the next poll; the bound kept the serial
+        // loop moving.
+      }
+      return;
+    }
     // Skip a request that already has an active attempt. The guard map holds only
     // in-flight attempts; the attempt's finally removes its guard when it ends. A
     // file that still has a guard is in flight, or it waits for its aborted-handler
@@ -1039,11 +1064,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
             iterationTimeoutMs,
             `Sandbox callback bridge write response for ${response.id}`,
           );
-          await withTimeout(
-            input.client.remove(requestPath),
-            iterationTimeoutMs,
-            `Sandbox callback bridge remove request ${fileName}`,
-          ).catch(() => undefined);
+          // The response landed. Remove the request file exactly once: a timed-out
+          // or failed remove must not look like completion. Mark the file for
+          // remove-only retry so the next poll never re-runs the host mutation.
+          try {
+            await withTimeout(
+              input.client.remove(requestPath),
+              iterationTimeoutMs,
+              `Sandbox callback bridge remove request ${fileName}`,
+            );
+            deliveredPendingRemove.delete(fileName);
+          } catch {
+            deliveredPendingRemove.add(fileName);
+          }
           // The response delivered: count it as loop progress.
           lastSuccessfulIterationAt = Date.now();
           return;
@@ -1407,12 +1440,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // The backstop reached the caller. Remove the request file, so the
         // poll loop does not list it again and re-run the mutation. Bound
         // like every other client call, so a hung remove never wedges the
-        // serial poll loop.
-        await withTimeout(
-          input.client.remove(requestPath),
-          iterationTimeoutMs,
-          `Sandbox callback bridge remove request ${fileName}`,
-        ).catch(() => undefined);
+        // serial poll loop. A timed-out or failed remove marks the file for
+        // remove-only retry; the terminal already landed, so the next poll
+        // must never re-run the handler.
+        try {
+          await withTimeout(
+            input.client.remove(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          deliveredPendingRemove.add(fileName);
+        }
         return;
       } catch (error) {
         console.warn(
@@ -1503,6 +1543,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
       "Sandbox callback bridge list pending requests",
     ).catch(() => [] as string[]);
     for (const fileName of fileNames) {
+      // A terminal response already landed for this file but its request-file
+      // remove timed out or failed. Retry only the bounded remove; never write
+      // another terminal or re-run the handler.
+      if (deliveredPendingRemove.has(fileName)) {
+        const pendingRequestPath = path.posix.join(directories.requestsDir, fileName);
+        try {
+          await withTimeout(
+            input.client.remove(pendingRequestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          // Keep the file in the set for the next pass.
+        }
+        continue;
+      }
       const guard = inFlightRequestGuards.get(fileName);
       if (guard && guard.claim === "handler" && (options.abandonInFlight || guard.controller.signal.aborted)) {
         // The handler already started this request's host operation, or it already
@@ -1630,12 +1687,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (wroteRecovery) {
         // The recovery response landed. Remove the request file, so the poll
         // loop does not re-process it. Bound like every other client call,
-        // so a hung remove never wedges the recovery pass.
-        await withTimeout(
-          input.client.remove(requestPath),
-          iterationTimeoutMs,
-          `Sandbox callback bridge remove request ${fileName}`,
-        ).catch(() => undefined);
+        // so a hung remove never wedges the recovery pass. A timed-out or
+        // failed remove marks the file for remove-only retry; the terminal
+        // already landed, so a later pass must never write again.
+        try {
+          await withTimeout(
+            input.client.remove(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          deliveredPendingRemove.add(fileName);
+        }
       } else {
         // Every recovery write failed. Keep the request file for a later recovery pass.
         console.warn(

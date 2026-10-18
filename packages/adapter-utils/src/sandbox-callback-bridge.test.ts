@@ -4137,6 +4137,8 @@ describe("sandbox callback bridge", () => {
     // must not wedge the serial poll loop. The remove gets the same
     // per-phase bound as every other client call, so the loop times it out
     // and serves the next request instead of stalling behind the first.
+    // The timed-out remove must not re-run the host mutation: the file stays
+    // queued, so the next poll retries only the remove, never the handler.
     const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -4156,7 +4158,7 @@ describe("sandbox callback bridge", () => {
     const responseB = path.posix.join(directories.responsesDir, fileB);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(pathA, bridgeRequestJson("req-remove-a", "GET"));
+    requestBodies.set(pathA, bridgeRequestJson("req-remove-a", "POST"));
     requestBodies.set(pathB, bridgeRequestJson("req-remove-b", "GET"));
     const responseWrites: Array<{ path: string; status: number; body: string }> = [];
     const handled: string[] = [];
@@ -4179,9 +4181,115 @@ describe("sandbox callback bridge", () => {
         return { wrote: true };
       },
       rename: async () => {},
-      // Delete the file so no duplicate work re-queues, but never settle the
-      // caller: a silently hung sandbox channel. Without the remove bound the
-      // loop stalls on the first request and the second is never handled.
+      // Never settle the caller and leave the file queued: a silently hung
+      // sandbox channel where the request file is still listed. Without the
+      // remove bound the loop stalls on the first request and the second is
+      // never handled. Without the delivered-pending-remove guard the next
+      // poll re-runs the host mutation and writes a duplicate response.
+      remove: async () => {
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // Both requests served exactly once with their real status, despite the
+    // hung removes behind them. The extra delay covers several poll intervals
+    // (100ms iteration): a replaying worker would forward the POST again and
+    // write duplicate responses here.
+    expect(handled).toContain("req-remove-a");
+    expect(handled).toContain("req-remove-b");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const handledA = handled.filter((id) => id === "req-remove-a");
+    const handledB = handled.filter((id) => id === "req-remove-b");
+    expect(handledA).toHaveLength(1);
+    expect(handledB).toHaveLength(1);
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(200);
+    expect(responsesB[0]?.status).toBe(200);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("bounds the backstop remove so a hung backstop cannot stall later requests", async () => {
+    // The finalize write fails, so finalize awaits the backstop inline. The
+    // backstop writes its terminal, then its remove hangs (file already
+    // deleted, caller never settles). Without the backstop remove bound the
+    // awaited backstop stalls processRequestFile and the second request is
+    // never served. Un-bounding the backstop remove must fail this test.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/backstop-remove-bound";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-backstop-a.json";
+    const fileB = "req-backstop-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-backstop-a", "POST"));
+    requestBodies.set(pathB, bridgeRequestJson("req-backstop-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        const status = JSON.parse(body.trim()).status as number;
+        // Fail the real response for fileA so finalize falls through to the
+        // awaited backstop; the backstop terminal and fileB succeed.
+        if (remotePath === responseA && status !== 504) {
+          throw new Error("transient write fault for backstop test");
+        }
+        responseWrites.push({ path: remotePath, status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
       remove: async (remotePath) => {
         requestBodies.delete(remotePath);
         return await new Promise<void>(() => {});
@@ -4210,18 +4318,113 @@ describe("sandbox callback bridge", () => {
       10_000,
     );
 
-    // Both requests served exactly once with their real status, despite the
-    // hung removes behind them.
-    expect(handled).toContain("req-remove-a");
-    expect(handled).toContain("req-remove-b");
+    // FileA got its backstop terminal (unsafe POST -> 504 indeterminate);
+    // fileB got its real response. The hung backstop remove did not stall it.
     const responsesA = responseWrites.filter((write) => write.path === responseA);
     const responsesB = responseWrites.filter((write) => write.path === responseB);
     expect(responsesA).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(504);
     expect(responsesB).toHaveLength(1);
-    expect(responsesA[0]?.status).toBe(200);
     expect(responsesB[0]?.status).toBe(200);
-    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
-    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+    expect(handled).toContain("req-backstop-a");
+    expect(handled).toContain("req-backstop-b");
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("bounds the recovery remove so a hung recovery cannot stall the loop", async () => {
+    // FileA's authorization hangs, so its attempt times out and the loop catch
+    // runs the recovery pass. Recovery writes 503s, then its remove hangs
+    // (files already deleted, caller never settles). Without the recovery
+    // remove bound the awaited recovery stalls and the test times out.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/recovery-remove-bound";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-recovery-a.json";
+    const fileB = "req-recovery-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-recovery-a", "GET"));
+    requestBodies.set(pathB, bridgeRequestJson("req-recovery-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      // Hang only fileA's authorization; fileB authorizes normally. The
+      // bounded authorize times out, the attempt throws to the loop catch,
+      // and recovery owns both unclaimed files (its own authorize hang for
+      // fileA falls through to the 503 path, not a skip).
+      authorizeRequest: async (request) => {
+        if (request.id === "req-recovery-a") {
+          return await new Promise<null>(() => {});
+        }
+        return null;
+      },
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // Recovery owned both unclaimed files: retryable 503s, no handler run, no
+    // stall behind the hung recovery remove.
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(503);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesB[0]?.status).toBe(503);
+    expect(handled).toHaveLength(0);
 
     await worker.stop({ drainTimeoutMs: 10 });
   });
