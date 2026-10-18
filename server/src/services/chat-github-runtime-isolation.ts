@@ -17,7 +17,8 @@ import { githubCandidateMayWake } from "./chat-github-shadow.js";
 import { resolveEnvironmentExecutionTarget } from "./environment-execution-target.js";
 import { githubComparisonEligibility, githubPrimaryInputSource, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 import { githubCandidateHooks } from "./chat-github-hooks.js";
-import { GitHubRepositoryArtifactError, githubRepositoryArtifactFile } from "./chat-github-repository-artifact.js";
+import { awaitGitHubRepositoryArtifact, GITHUB_REPOSITORY_ARTIFACT_DISPATCH_WAIT_MS, GitHubRepositoryArtifactError, githubRepositoryArtifactFile,
+  pinGitHubRepositoryArtifact, type GitHubRepositoryCheckout } from "./chat-github-repository-artifact.js";
 
 const certificateSchema = z.object({
   environmentId: z.string().uuid(),
@@ -232,15 +233,32 @@ export const GITHUB_WORKSPACE_MATERIALIZE_TIMEOUT_MS = 180_000;
  * candidate still runs with workspace equivalence unverified. */
 export async function materializeGitHubCandidateWorkspace(input: {
   snapshot: GitHubReviewInputSnapshot | undefined;
+  /** Checkout resolved from the admission manifest (artifact not sealed in the snapshot). */
+  checkout?: GitHubRepositoryCheckout;
   target: AdapterSshExecutionTarget;
   home: string;
   nonce: string;
   artifactRoot?: string;
 }): Promise<GitHubCandidateWorkspaceReceipt> {
-  const artifact = input.snapshot?.repository;
+  // Legacy snapshots sealed the artifact; newer ones carry only a known
+  // admission-time failure and resolve the checkout from the manifest.
+  const artifact = input.snapshot?.repository ?? (input.snapshot?.repositoryFailure ? undefined : input.checkout?.repository);
   if (!artifact) return { version: 1, status: "unavailable", kind: null,
-    reason: input.snapshot ? input.snapshot.repositoryFailure ?? "repository_artifact_missing" : "admission_snapshot_unavailable" };
-  const base = { version: 1 as const, kind: artifact.kind, artifactSha256: artifact.sha256 };
+    reason: !input.snapshot ? "admission_snapshot_unavailable"
+      : input.snapshot.repositoryFailure ?? input.checkout?.repositoryFailure ?? "repository_artifact_missing" };
+  // The comparison binds the receipt to these server-authored artifact facts.
+  const base = { version: 1 as const, kind: artifact.kind, artifactSha256: artifact.sha256,
+    ...(input.snapshot?.repository ? {} : { artifact }) };
+  // Never evicted while this candidate hashes and transfers it.
+  const release = pinGitHubRepositoryArtifact(artifact.sha256);
+  try { return await materializeArtifact(input, artifact, base); }
+  finally { release(); }
+}
+
+async function materializeArtifact(input: { target: AdapterSshExecutionTarget; home: string; nonce: string; artifactRoot?: string },
+  artifact: NonNullable<GitHubReviewInputSnapshot["repository"]>,
+  base: Pick<GitHubCandidateWorkspaceReceipt, "version" | "kind" | "artifactSha256" | "artifact">,
+): Promise<GitHubCandidateWorkspaceReceipt> {
   let file: string;
   try { file = await githubRepositoryArtifactFile(artifact, input.artifactRoot); }
   catch (error) { return { ...base, status: "unavailable", reason: error instanceof GitHubRepositoryArtifactError ? error.reason : "repository_artifact_missing" }; }
@@ -364,6 +382,15 @@ export function githubCandidateProbeModel(config: Record<string, unknown>): stri
   return configured || environment || null;
 }
 
+export async function resolveGitHubCandidateCheckout(enrollment: Pick<typeof chatGitHubReviewEnrollments.$inferSelect, "envelope" | "admittedAt">,
+  options: { root?: string; waitMs?: number; pollMs?: number } = {}): Promise<GitHubRepositoryCheckout | undefined> {
+  const { snapshot, event } = enrollment.envelope;
+  if (!snapshot || !event || snapshot.repository || snapshot.repositoryFailure) return undefined;
+  const admittedAt = enrollment.admittedAt instanceof Date ? enrollment.admittedAt.getTime() : Date.parse(String(enrollment.admittedAt));
+  return awaitGitHubRepositoryArtifact(event, { root: options.root, pollMs: options.pollMs,
+    deadlineAt: (Number.isFinite(admittedAt) ? admittedAt : Date.now()) + (options.waitMs ?? GITHUB_REPOSITORY_ARTIFACT_DISPATCH_WAIT_MS) });
+}
+
 export async function prepareGitHubCandidateRuntime(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
@@ -394,6 +421,10 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   const home = `/home/paperclip-shadow/.paperclip-runtime/isolated/${boundary.namespace}`;
   const nonce = randomUUID();
   const hooks = await githubCandidateHooks(home);
+  // Wait for the admission's checkout BEFORE taking the host-wide lease. The
+  // wait is bounded relative to admission; late or lost production becomes a
+  // precise reason and the candidate runs with equivalence unverified.
+  const checkout = await resolveGitHubCandidateCheckout(boundary.enrollment);
   const releaseLease = await acquireGitHubCandidateRuntimeLease(db, `${target.spec.host}:${target.spec.port ?? 22}:${target.spec.username}`);
   runtimeLeases.set(nonce, releaseLease);
   try {
@@ -437,7 +468,7 @@ export async function prepareGitHubCandidateRuntime(db: Db, input: {
   // Only a confined, fresh home receives repository bytes. A failed proof never
   // gets a checkout; materialisation failure leaves equivalence unverified.
   const workspace = passed ? await materializeGitHubCandidateWorkspace({ snapshot: boundary.enrollment.envelope.snapshot,
-    target, home, nonce }) : undefined;
+    checkout, target, home, nonce }) : undefined;
   const receipt = { version: 1, runId: run.id, candidateId: boundary.candidate.id, armId: boundary.candidate.armId,
     environmentId: environment.id, namespace: boundary.namespace, configurationDigest: certificate.configurationDigest,
     certificateDigest: certificateDigest(certificate),

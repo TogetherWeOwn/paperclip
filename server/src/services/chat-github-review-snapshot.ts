@@ -22,8 +22,9 @@ export function githubSnapshotDigest(value: unknown): string {
 export async function captureGitHubReviewSnapshot(
   api: GitHubReviewReader, event: GitHubReviewEventContext,
   bot?: { login: string; appId: string },
-  /** Produced concurrently inside the same capture window; sealed under the digest. */
-  repository?: Promise<Pick<GitHubReviewInputSnapshot, "repository" | "repositoryFailure">>,
+  /** Known-at-admission reason no checkout will be produced (e.g. disabled).
+   * The checkout itself is commit-addressed and never blocks this seal. */
+  repositoryFailure?: string,
 ): Promise<GitHubReviewInputSnapshot> {
   const startedAt = new Date().toISOString();
   const headSha = githubCommitSchema.parse(event.headSha);
@@ -50,13 +51,11 @@ export async function captureGitHubReviewSnapshot(
       responses[route] = result;
       return result;
     };
-    const pull = await read<{ head: { sha: string }; base: { sha: string } }>(`/pulls/${event.pullNumber}`);
-    if (pull.head.sha !== headSha || pull.base.sha !== baseSha) throw conflict("snapshot_capture_head_changed");
-    for (const route of [
-      `/pulls/${event.pullNumber}/files`, `/issues/${event.pullNumber}/comments`,
-      `/pulls/${event.pullNumber}/reviews`, `/pulls/${event.pullNumber}/comments`,
-      `/commits/${headSha}/check-runs`, `/commits/${headSha}/statuses`,
-    ]) {
+    // Resources are read concurrently (pages within one collection stay in
+    // order): sequential reads made a metadata-only seal take 5.5-7.1s.
+    // Concurrency changes no guarantee: GitHub has no atomic multi-resource
+    // revision either way, and the two-sweep digest check still detects change.
+    const collect = async (route: string) => {
       const retained: unknown[] = [];
       const checks = route.endsWith("/check-runs");
       let redacted = 0;
@@ -80,8 +79,17 @@ export async function captureGitHubReviewSnapshot(
         const items = retained.slice(offset, offset + 100);
         responses[`${route}?per_page=100&page=${offset / 100 + 1}`] = checks ? { check_runs: items } : items;
       }
-    }
-    const comparison = await read<{ merge_base_commit: { sha: string } }>(comparePath);
+    };
+    const [pull, comparison] = await Promise.all([
+      read<{ head: { sha: string }; base: { sha: string } }>(`/pulls/${event.pullNumber}`),
+      read<{ merge_base_commit: { sha: string } }>(comparePath),
+      ...[
+        `/pulls/${event.pullNumber}/files`, `/issues/${event.pullNumber}/comments`,
+        `/pulls/${event.pullNumber}/reviews`, `/pulls/${event.pullNumber}/comments`,
+        `/commits/${headSha}/check-runs`, `/commits/${headSha}/statuses`,
+      ].map(collect),
+    ] as const);
+    if (pull.head.sha !== headSha || pull.base.sha !== baseSha) throw conflict("snapshot_capture_head_changed");
     const diffBaseSha = githubCommitSchema.parse(comparison.merge_base_commit.sha);
     return { responses, diffBaseSha, ...(bot ? { redactions: {
       total: Object.values(byRoute).reduce((sum, n) => sum + n, 0), byRoute, botLogin: bot.login, appId: bot.appId,
@@ -90,11 +98,7 @@ export async function captureGitHubReviewSnapshot(
   const first = await sweep();
   const second = await sweep();
   if (githubSnapshotDigest(first) !== githubSnapshotDigest(second)) throw conflict("snapshot_capture_mutated");
-  const artifact = repository ? await repository : {};
-  // Bind the artifact to this exact admission; a mismatched artifact is dropped.
-  const checkout = !artifact.repository ? (artifact.repositoryFailure ? { repositoryFailure: artifact.repositoryFailure } : {})
-    : artifact.repository.headSha === headSha && artifact.repository.baseSha === baseSha ? { repository: artifact.repository }
-      : { repositoryFailure: "repository_artifact_binding_mismatch" };
+  const checkout = repositoryFailure ? { repositoryFailure } : {};
   const sealed = { version: 2 as const, startedAt, finishedAt: new Date().toISOString(), headSha, baseSha, ...first, ...checkout };
   // PostgreSQL jsonb rejects NUL and lone surrogates in decoded strings. Keep
   // exact JSON bytes, not a lossy sanitizer, and verify their decoded digest.
