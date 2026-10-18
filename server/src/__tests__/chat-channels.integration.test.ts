@@ -7,7 +7,7 @@ import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession } from "../services/chat-github-tools.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
-import { chatGitHubRegistrations, chatGitHubReviewCandidates, chatGitHubReviews, toolCatalogEntries } from "@paperclipai/db";
+import { chatGitHubRegistrations, chatGitHubReviewCandidates, chatGitHubReviews, toolCatalogEntries, toolMcpGateways, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as cloudRuntimeIdentity from "../services/cloud-runtime-identity.js";
 import {
@@ -4394,6 +4394,68 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ]) expect(await githubBotToolsForSession(db, unauthorized)).toEqual([]);
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: candidate.issue.id, wakeCommentId: primaryComments[0]!.id } }).where(eq(heartbeatRuns.id, session.runId));
       expect(await githubBotToolsForSession(db, session)).toEqual([]);
+    });
+    it("paired candidate runtime MCP assignment is granted only by the exact candidate capability", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "paired-runtime-mcp", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      const { githubCandidateReviewAssignmentForRun } = await import("../services/chat-github-tools.js");
+      const { buildPaperclipRuntimeMcpServers } = await import("../services/heartbeat.js");
+      const { resolveNativeRuntimeMcpSnapshot } = await import("../services/native-runtime/runtime-context.js");
+      const [clone] = await db.select().from(agents).where(eq(agents.id, f.replacementAgentId));
+      const [primaryAgent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+      const toolNames = async (ids: string[]) => ids.length ? (await db.select({ toolName: toolCatalogEntries.toolName })
+        .from(toolCatalogEntries).where(inArray(toolCatalogEntries.id, ids))).map(r => r.toolName).sort() : [];
+      const reviewTools = ["begin_review", "read_file", "read_pull_request", "submit_review"];
+      // Even a clone misconfigured with connection-wide access to the bot
+      // connection gets only the four catalog entries, never comment/formal_review.
+      const [wide] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `clone-wide:${randomUUID()}`, name: "Clone wide", defaultAction: "deny" }).returning();
+      const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.endpoint.connectionId));
+      await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: wide!.id, selectorType: "connection", effect: "include",
+        applicationId: connection!.applicationId, connectionId: connection!.id });
+      await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: wide!.id, targetType: "agent", targetId: f.replacementAgentId });
+
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      const grant = await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId);
+      expect(grant?.connection.id).toBe(f.endpoint.connectionId);
+      expect(await toolNames(grant!.tools.map(t => t.id))).toEqual(reviewTools);
+      expect((await githubBotToolsForSession(db, session)).map(t => t.upstreamToolName).sort()).toEqual(reviewTools);
+      const servers = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId: session.runId, apiBaseUrl: "http://127.0.0.1:3100" });
+      expect(servers).toHaveLength(1);
+      const [gatewayRow] = (await db.select().from(toolMcpGateways).where(eq(toolMcpGateways.companyId, f.companyId)))
+        .filter(g => servers[0]!.url.endsWith(`/${g.gatewayPublicId}`));
+      const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, gatewayRow!.profileId!));
+      expect(entries.every(e => e.selectorType === "catalog_entry" && e.connectionId === f.endpoint.connectionId)).toBe(true);
+      expect(await toolNames(entries.map(e => e.catalogEntryId!))).toEqual(reviewTools);
+      // The native runtime snapshot pins the same assignment the gateway realizes.
+      expect((await resolveNativeRuntimeMcpSnapshot({ db, agent: clone!, runId: session.runId })).digest)
+        .toBe(gatewayRow!.metadata?.nativeRuntimeAssignmentDigest);
+
+      const primaryComment = (await db.select({ id: issueComments.id }).from(issueComments)
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, primary.issue.id), eq(chatMessageLinks.direction, "inbound"))))[0]!;
+      const cloneRun = async (contextSnapshot: Record<string, unknown>) => (await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+        agentId: f.replacementAgentId, invocationSource: "assignment", status: "running", contextSnapshot }).returning())[0]!.id;
+      for (const runId of [
+        await cloneRun({ issueId: candidate.issue.id }), // another run of the clone, no admitted wake
+        await cloneRun({ issueId: candidate.issue.id, wakeCommentId: primaryComment.id }), // wrong conversation
+        await cloneRun({ issueId: primary.issue.id, wakeCommentId: primaryComment.id }), // primary task
+      ]) {
+        expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, runId)).toBeNull();
+        const other = await buildPaperclipRuntimeMcpServers({ db, agent: clone!, runId, apiBaseUrl: "http://127.0.0.1:3100" });
+        expect(other.map(s => s.url)).not.toContain(servers[0]!.url);
+      }
+      // The primary keeps its configured (non-candidate) assignment.
+      const primarySession = await shadowTestSession(f, { issueId: primary.issue.id });
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.assignedAgentId, primarySession.runId)).toBeNull();
+      expect((await buildPaperclipRuntimeMcpServers({ db, agent: primaryAgent!, runId: primarySession.runId, apiBaseUrl: "http://127.0.0.1:3100" })).map(s => s.url))
+        .not.toContain(servers[0]!.url);
+      // A voided candidate loses the grant.
+      await db.update(chatGitHubReviewCandidates).set({ state: "voided" }).where(eq(chatGitHubReviewCandidates.issueId, candidate.issue.id));
+      expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId)).toBeNull();
     });
     it("paired admission enrolls authenticated automatic PR events with the same guest authority", async () => {
       const f = await pairedReviewFixture();
