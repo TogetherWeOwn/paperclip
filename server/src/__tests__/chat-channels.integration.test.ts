@@ -7,7 +7,7 @@ import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession } from "../services/chat-github-tools.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
-import { chatGitHubRegistrations, chatGitHubReviews, toolCatalogEntries } from "@paperclipai/db";
+import { chatGitHubRegistrations, chatGitHubReviewCandidates, chatGitHubReviews, toolCatalogEntries } from "@paperclipai/db";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as cloudRuntimeIdentity from "../services/cloud-runtime-identity.js";
 import {
@@ -5202,6 +5202,55 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const [after] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
       expect(after!.normalizedEvent.githubPairingSeed).toEqual(seed);
     });
+    /**
+     * The CLI sees only the MCP config written from runtimeMcp, so drive the
+     * exact per-run gateway bearer through the real MCP protocol route (named
+     * gateway session resolution, native profile policy and candidate
+     * boundary), never a hand-built session or an agent API session.
+     */
+    async function expectCandidateRuntimeMcpReviewTools(
+      f: Awaited<ReturnType<typeof reviewBotFixture>>,
+      gateway: Parameters<typeof import("../routes/tool-gateway.js").mcpGatewayProtocolRoutes>[0],
+      servers: Array<{ url: string; token: string }>,
+    ) {
+      expect(servers).toHaveLength(1);
+      const { mcpGatewayProtocolRoutes } = await import("../routes/tool-gateway.js");
+      const app = express();
+      app.use(express.json());
+      app.use(mcpGatewayProtocolRoutes(gateway));
+      app.use(errorHandler);
+      const server = servers[0]!;
+      const rpc = (id: number, method: string, params?: Record<string, unknown>) => request(app)
+        .post(new URL(server.url).pathname).set("Authorization", `Bearer ${server.token}`)
+        .set("Accept", "application/json, text/event-stream").send({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+      const listed = await rpc(1, "tools/list");
+      expect(listed.status).toBe(200);
+      const names: string[] = listed.body.result.tools.map((t: { name: string }) => t.name);
+      const reviewTools = names.filter(n => n.startsWith(`github-bot.${f.endpoint.id}:`));
+      // Exactly the snapshot-backed review surface: no comment/formal_review,
+      // no live GitHub, Paperclip or other connected tools.
+      expect(reviewTools.map(n => n.split(":").pop()).sort()).toEqual(["begin_review", "read_file", "read_pull_request", "submit_review"]);
+      expect(names.filter(n => !reviewTools.includes(n) && !/^paperclip_(list|read|get)_(resources|resource|prompts|prompt)$/.test(n))).toEqual([]);
+      const tool = (name: string) => reviewTools.find(n => n.endsWith(`:${name}`))!;
+      const call = async (id: number, name: string, args: Record<string, unknown>) => {
+        const res = await rpc(id, "tools/call", { name, arguments: args });
+        expect({ status: res.status, error: res.body.error ?? null }).toEqual({ status: 200, error: null });
+        return res.body.result;
+      };
+      await call(2, tool("read_pull_request"), { section: "metadata" });
+      const head = "b".repeat(40);
+      await call(3, tool("begin_review"), { reviewedCommit: head });
+      expect(JSON.stringify(await call(4, tool("submit_review"), shadowTestAssessment(head)))).toContain("shadow_stored");
+      for (const denied of [`github-bot.${f.endpoint.id}:comment`, `github-bot.${f.endpoint.id}:formal_review`, "read_pull_request"]) {
+        const res = await rpc(5, "tools/call", { name: denied, arguments: { body: "x" } });
+        expect(res.body.error?.data?.reasonCode).toBe("github_candidate_tool_denied");
+      }
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.agentId, f.replacementAgentId));
+      const [stored] = await db.select().from(chatGitHubReviews).where(and(eq(chatGitHubReviews.issueId, candidate!.issueId), eq(chatGitHubReviews.state, "completed")));
+      expect(stored).toMatchObject({ shadowLabel: "paired-meta", headSha: head, assessment: expect.objectContaining({ reviewedCommit: head, score: 2, complete: true }) });
+      // I1: capture-only. The candidate stages no outbound publication intent.
+      expect(await db.select().from(chatPublications).where(eq(chatPublications.issueId, candidate!.issueId))).toEqual([]);
+    }
     it.each(["certified", "disabled-at-dispatch", "contaminated", "changed-realization"] as const)(
       "paired certified heartbeat %s reaches only the permitted adapter",
       async scenario => {
@@ -5313,6 +5362,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             const readTool = tools.find(t => t.upstreamToolName === "read_pull_request")!;
             expect(await gateway.executeTool({ sessionToken: sessionResponse.body.token, tool: readTool.name, parameters: { section: "metadata" } }))
               .toMatchObject({ status: "completed", result: { data: { previousAssessment: null } } });
+            await expectCandidateRuntimeMcpReviewTools(f, gateway, input.runtimeMcp?.getServers() ?? []);
             expect(input.config.cwd).not.toBe(scratch);
             expect(existsSync(provisionMarker)).toBe(false);
           }

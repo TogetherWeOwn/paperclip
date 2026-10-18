@@ -292,6 +292,9 @@ export async function githubBotToolsForSession(
           entry.toolName === candidate.name,
       );
       if (!tool) return [];
+      // A paired candidate reviews a sealed snapshot and only captures its
+      // assessment: never expose comment/formal_review to it.
+      if (capability?.candidate && !isGitHubCandidateReviewTool(tool.name)) return [];
       // Catalog state still governs access. Built-in contracts come from the
       // running server, not a snapshot last refreshed by a configuration save.
       return [{
@@ -311,6 +314,65 @@ export async function githubBotToolsForSession(
         providerMetadata: { endpointId: endpoint.id },
       }];
     });
+}
+
+/** The snapshot-backed, capture-only review surface of a paired candidate. */
+export const GITHUB_CANDIDATE_REVIEW_TOOL_NAMES = ["read_pull_request", "read_file", "begin_review", "submit_review"] as const;
+function isGitHubCandidateReviewTool(name: string) {
+  return (GITHUB_CANDIDATE_REVIEW_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * The runtime MCP assignment of a dispatched paired candidate run. A clone is
+ * deliberately not installed on, nor profiled for, its endpoint's bot
+ * connection; the exact delivery/comment/run capability is its only grant, so
+ * derive the assignment from that capability, never from configuration. Any
+ * other run (including other runs of the same clone) gets null.
+ */
+export async function githubCandidateReviewAssignmentForRun(
+  db: Db,
+  companyId: string,
+  agentId: string,
+  runId: string,
+): Promise<{
+  connection: typeof toolConnections.$inferSelect;
+  tools: Array<{ id: string; connectionId: string; applicationId: string }>;
+} | null> {
+  const [run] = await db
+    .select({ issueId: heartbeatRuns.nativeIssueId, context: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.id, runId)));
+  const issueId = run?.issueId ?? run?.context?.issueId;
+  if (typeof issueId !== "string") return null;
+  const capability = await githubRunCapability(db, { companyId, agentId, runId, issueId });
+  if (!capability?.candidate) return null;
+  const [config] = await db
+    .select({ configuration: chatGitHubConfigurations.configuration })
+    .from(chatGitHubConfigurations)
+    .where(eq(chatGitHubConfigurations.endpointId, capability.endpoint.id));
+  if (!config?.configuration.toolsEnabled || !["active", "verifying"].includes(capability.endpoint.status)) return null;
+  const [connection] = await db
+    .select()
+    .from(toolConnections)
+    .where(and(
+      eq(toolConnections.companyId, companyId),
+      eq(toolConnections.id, capability.endpoint.connectionId),
+      eq(toolConnections.enabled, true),
+      eq(toolConnections.status, "active"),
+    ));
+  if (!connection) return null;
+  const entries = await db
+    .select({ id: toolCatalogEntries.id, name: toolCatalogEntries.name, toolName: toolCatalogEntries.toolName })
+    .from(toolCatalogEntries)
+    .where(and(
+      eq(toolCatalogEntries.connectionId, connection.id),
+      eq(toolCatalogEntries.status, "active"),
+      isNull(toolCatalogEntries.quarantinedAt),
+    ));
+  const tools = entries
+    .filter((entry) => isGitHubCandidateReviewTool(entry.toolName) && entry.name === `github_bot:${entry.toolName}`)
+    .map((entry) => ({ id: entry.id, connectionId: connection.id, applicationId: connection.applicationId }));
+  return tools.length ? { connection, tools } : null;
 }
 
 /** Only a run on the endpoint's bound task may realize its channel tools. */
