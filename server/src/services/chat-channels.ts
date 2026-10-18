@@ -99,6 +99,8 @@ import {
   GITHUB_WORKFLOW_REVIEWER_HANDLE,
   githubReviewPrompt,
   githubWorkflowReviewTriggerHeadSha,
+  githubWorkflowTriggerPersonAllowed,
+  type GitHubWorkflowTriggerMarker,
 } from "./chat-github-review-policy.js";
 import { chatGitHubConfigurations, chatGitHubReviews } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
@@ -3097,6 +3099,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const runtime = options.runtime ?? createChatSdkRuntime();
   const githubManualMessages = new WeakMap<object, { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" }>();
   const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy }>();
+  const githubWorkflowTriggerMessages = new WeakMap<object, GitHubWorkflowTriggerMarker>();
   const runtimeVersions = new Map<string, string>();
   const runtimeLocalEpochs = new Map<string, number>();
   // One bounded publication lane per endpoint; credential/reconnect fencing
@@ -14581,55 +14584,126 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
    * mention is matched against this endpoint's GitHub App identity, never
    * against a handle taken from comment text; endpoints without a discovered
    * bot username keep the default reviewer handle. Own-bot (`isMe`) and
-   * system messages are never admitted, and label/draft/head policy stays
-   * at review time so comment-then-label ordering keeps working.
+   * system messages are never admitted.
+   *
+   * Ingress admission only opens the delivery. The returned marker pins the
+   * parsed head SHA and sender to the delivery; draft/head/allow-list policy
+   * is re-enforced at review time against the live PR (see
+   * githubWorkflowTriggerReviewDecision and the review-service recheck), so
+   * comment-then-label ordering keeps working while a stale or revoked
+   * trigger cannot create a review.
    */
   async function githubWorkflowReviewTriggerAdmitted(
     endpoint: EndpointRow,
     message: Message,
-  ): Promise<boolean> {
-    if (endpoint.provider !== "github") return false;
-    if (message.author.isMe || message.author.isSystem) return false;
-    if (message.author.isBot !== true) return false;
+  ): Promise<GitHubWorkflowTriggerMarker | null> {
+    if (endpoint.provider !== "github") return null;
     const reviewerHandle =
       endpoint.botUsername?.replace(/\[bot\]$/i, "") ||
       GITHUB_WORKFLOW_REVIEWER_HANDLE;
-    if (
-      githubWorkflowReviewTriggerHeadSha(message.text, reviewerHandle) ===
-      null
-    )
-      return false;
-    if (!endpoint.allowUnlinkedPeople) return false;
+    const triggerHeadSha = githubWorkflowReviewTriggerHeadSha(
+      message.text,
+      reviewerHandle,
+    );
+    if (!endpoint.allowUnlinkedPeople) return null;
     const [saved] = await db
+      .select()
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
+    if (!saved) return null;
+    const person = saved.configuration.people.find(
+      (candidate) => candidate.githubUserId === message.author.userId,
+    );
+    let sponsor:
+      | { status?: string | null; membershipRole?: string | null }
+      | undefined;
+    if (person?.kind === "guest") {
+      const [row] = await db
+        .select({
+          status: companyMemberships.status,
+          membershipRole: companyMemberships.membershipRole,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, endpoint.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, person.sponsorUserId),
+          ),
+        );
+      sponsor = row;
+    }
+    if (
+      !githubWorkflowTriggerPersonAllowed({
+        provider: endpoint.provider,
+        isMe: message.author.isMe,
+        isSystem: message.author.isSystem === true,
+        isBot: message.author.isBot === true,
+        triggerHeadSha,
+        allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+        person,
+        sponsor,
+      })
+    )
+      return null;
+    return {
+      headSha: triggerHeadSha as string,
+      senderGithubUserId: message.author.userId,
+    };
+  }
+
+  /**
+   * Live allow-list recheck for a persisted workflow-trigger marker.
+   *
+   * The drain rebuilds the author with `isBot:false`, so the ingress gate is
+   * not re-entered there. Task mutation and the review service call this
+   * instead: the marker proves the delivery was admitted as a trigger, and
+   * the current configuration decides whether that sender is still allowed.
+   * Revocation (automaticReviews off, sponsor inactive/viewer/missing, or
+   * unlinked people disabled) fails closed.
+   */
+  async function githubWorkflowTriggerStillAllowed(
+    tx: Db | Parameters<Parameters<Db["transaction"]>[0]>[0],
+    endpoint: EndpointRow,
+    marker: GitHubWorkflowTriggerMarker,
+  ): Promise<boolean> {
+    const [saved] = await tx
       .select()
       .from(chatGitHubConfigurations)
       .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
     if (!saved) return false;
     const person = saved.configuration.people.find(
-      (candidate) => candidate.githubUserId === message.author.userId,
+      (candidate) => candidate.githubUserId === marker.senderGithubUserId,
     );
-    if (
-      !person ||
-      person.kind !== "guest" ||
-      person.automaticReviews !== true
-    )
-      return false;
-    const [sponsor] = await db
-      .select({
-        status: companyMemberships.status,
-        membershipRole: companyMemberships.membershipRole,
-      })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, endpoint.companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.principalId, person.sponsorUserId),
-        ),
-      );
-    return (
-      sponsor?.status === "active" && sponsor.membershipRole !== "viewer"
-    );
+    let sponsor:
+      | { status?: string | null; membershipRole?: string | null }
+      | undefined;
+    if (person?.kind === "guest") {
+      const [row] = await tx
+        .select({
+          status: companyMemberships.status,
+          membershipRole: companyMemberships.membershipRole,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, endpoint.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, person.sponsorUserId),
+          ),
+        );
+      sponsor = row;
+    }
+    return githubWorkflowTriggerPersonAllowed({
+      provider: endpoint.provider,
+      isMe: false,
+      isSystem: false,
+      isBot: true,
+      triggerHeadSha: marker.headSha,
+      allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+      person,
+      sponsor,
+    });
   }
 
   async function processMessage(
@@ -14670,15 +14744,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         isTelegramMigrationRaw(message.raw))
     )
       return;
+    let githubWorkflowTrigger: GitHubWorkflowTriggerMarker | null = endpoint.provider === "github"
+      ? (githubWorkflowTriggerMessages.get(message) ?? null)
+      : null;
     if (
       message.author.isMe ||
       message.author.isBot === true ||
       message.author.isSystem
     ) {
-      if (
-        !(await githubWorkflowReviewTriggerAdmitted(endpoint, message))
-      )
-        return;
+      githubWorkflowTrigger = await githubWorkflowReviewTriggerAdmitted(
+        endpoint,
+        message,
+      );
+      if (!githubWorkflowTrigger) return;
+      githubWorkflowTriggerMessages.set(message, githubWorkflowTrigger);
     }
     // One provider message can match both a mention handler and the catch-all
     // new-message handler. The trigger is policy metadata, not provider event
@@ -14843,6 +14922,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       },
       ...(githubAutomatic ? { githubAutomatic } : {}),
       ...(githubManual ? { githubManual } : {}),
+      ...(githubWorkflowTrigger ? { githubWorkflowTrigger } : {}),
       principal: {
         externalId: stableExternalPrincipalId(
           endpoint.provider,
@@ -16625,6 +16705,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const automaticAdmission = githubAutomatic ? await githubAutomaticAdmission(tx, currentEndpoint, githubAutomatic.context) : null;
         if (githubAutomatic && !automaticAdmission?.allowed) currentPrincipalAuthorization.allowed = false;
         if (automaticAdmission?.allowed) currentPrincipalAuthorization.userId = automaticAdmission.responsibleUserId ?? null;
+        if (githubWorkflowTrigger) {
+          const stillAllowed = await githubWorkflowTriggerStillAllowed(
+            tx,
+            currentEndpoint,
+            githubWorkflowTrigger,
+          );
+          if (!stillAllowed) currentPrincipalAuthorization.allowed = false;
+        }
         const endpointStillAllowed =
           currentEndpoint.status === "verifying" ||
           currentEndpoint.status === "active";
@@ -17441,6 +17529,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const githubAutomatic = delivery.normalizedEvent.githubAutomatic;
     if (endpointRuntime.provider === "github" && githubAutomatic && typeof githubAutomatic === "object") {
       githubAutomaticMessages.set(message, githubAutomatic as { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy });
+    }
+    const githubWorkflowTrigger = delivery.normalizedEvent.githubWorkflowTrigger;
+    if (endpointRuntime.provider === "github" && githubWorkflowTrigger && typeof githubWorkflowTrigger === "object") {
+      githubWorkflowTriggerMessages.set(message, githubWorkflowTrigger as GitHubWorkflowTriggerMarker);
     }
     if (
       endpointRuntime.provider === "github" ||
