@@ -3,7 +3,6 @@ import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { aiBindingForAuthRecovery, isAiAuthenticationFailure } from "./ai-auth-failure.js";
-import { hasAssignedModelLaneInSnapshot } from "./run-model-decision.js";
 import { and, eq, desc, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1024,12 +1023,6 @@ export function connectionIntentService(db: Db) {
     requestForRunAuthFailure: async (runId: string) => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (!run || run.status !== "failed" || !isAiAuthenticationFailure(run.errorCode) || !run.responsibleUserId) return null;
-      // TOG-22796: the router assigned this run a model lane, so a reconnect
-      // card for the agent's personal AI connection cannot repair the run.
-      // Only the enforced current-run decide/keep record counts as a lane;
-      // advisory suggestions, skipped/deferred/timed-out/exempt outcomes,
-      // historical decisions and adapter config never suppress the card.
-      if (hasAssignedModelLaneInSnapshot(run.contextSnapshot)) return null;
       const context = await loadRunContext({ sub: run.agentId, company_id: run.companyId, run_id: run.id, responsible_user_id: run.responsibleUserId }, true);
       const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, run.companyId),

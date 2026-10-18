@@ -655,7 +655,6 @@ import {
   RUN_MODEL_DECISION_RETRY_REASON,
   RunModelDecisionDeferral,
   applyRunModelDecisionToAdapterConfig,
-  hasAssignedModelLane,
   isRunModelDecisionDeferral,
   readPreviousRunModelDecision,
   resolveRunModelDecision,
@@ -22391,14 +22390,7 @@ export function heartbeatService(
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
             return;
           }
-          // TOG-22796: the model decision was resolved and recorded before
-          // provider preparation, so the in-scope record is this run's
-          // enforced lane. A decided or authoritatively kept lane suppresses
-          // the card (reconnecting the personal AI connection cannot repair a
-          // router-assigned run); advisory, skipped, deferred, timed-out and
-          // exempt outcomes still open it. The run still fails with the
-          // configuration-incomplete receipt below.
-          if (responsibleUserId && issueId && !hasAssignedModelLane(modelDecision.record)) {
+          if (responsibleUserId && issueId) {
             await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
               logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
             });
