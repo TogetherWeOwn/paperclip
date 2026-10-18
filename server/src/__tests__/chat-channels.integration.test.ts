@@ -4777,6 +4777,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = await shadowTestSession(f, { issueId: primary.issue.id });
       expect(await githubChatReviewService(db, f.providerFetch).execute(session, "begin_review", { reviewedCommit: "b".repeat(40) })).toBeDefined();
     });
+    it("unsampled primary admission makes no candidate snapshot requests", async () => {
+      const f = await pairedReviewFixture();
+      const current = await f.management.configuration(f.endpoint.id, "owner-user");
+      const sampleRate = 0.000001;
+      const saved = await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: current.revision,
+        configuration: { ...current.configuration, shadowRoutes: [{ label: "paired-meta", agentId: f.replacementAgentId, enabled: true, sampleRate }] },
+      }, "owner-user");
+      const [arm] = await db.execute(sql`select id from chat_github_review_arms where endpoint_id = ${f.endpoint.id} and retired_at is null`);
+      const eventId = "unsampled-no-capture";
+      const draw = parseInt(createHash("sha256").update(JSON.stringify([eventId, arm!.id, saved.revision])).digest("hex").slice(0, 13), 16) / 0x10000000000000;
+      expect(draw).toBeGreaterThan(sampleRate);
+      const recorder = installShadowRecorder(f, "b".repeat(40));
+      const { prepareGitHubPairEvent } = await import("../services/chat-github-shadow.js");
+      expect(await prepareGitHubPairEvent(db, { endpoint: f.endpoint, repositoryId: "97531", repository: "paperclipai/paperclip",
+        threadId: "github:paperclipai/paperclip:81", eventId, principal: { externalId: "42", handle: "octocat" } }, f.providerFetch)).toBeNull();
+      expect(recorder.fetches).toEqual([]);
+    });
     it.each([false, true])("unpaired primary never inherits a candidate assessment (primary history %s)", async (hasPrimaryHistory) => {
       const f = await pairedReviewFixture();
       const head = "b".repeat(40);
