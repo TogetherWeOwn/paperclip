@@ -17,6 +17,8 @@ const serviceMocks = vi.hoisted(() => ({
 
 vi.mock("../chat-github-tools.js", () => ({
   githubBotConnectionIdsForRun: serviceMocks.githubBotConnectionIdsForRun,
+  // These runs are not paired candidates (covered by the chat-channels suite).
+  githubCandidateReviewAssignmentForRun: async () => null,
 }));
 
 vi.mock("../agent-instructions.js", () => ({
