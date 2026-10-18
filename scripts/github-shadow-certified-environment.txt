@@ -37,6 +37,19 @@ Primary input provenance
   opportunistic certification of same-head live primaries is deliberately NOT
   implemented. A future opt-in needs that evidence, not an inferred clean label.
 
+Deferred capture failures and denominator accounting
+  githubPairingCapture.attempts bounds recovery to three claims. Missing source,
+  invalid context, and admission exceptions record the failure reason; the third
+  failure (or recovery after an interrupted third claim) atomically removes both
+  pending/capture markers and retains the frozen selected arms in
+  githubPairingFailure { reason, attempts, arms, revision, providerEventId }.
+  Do not count only enrollment rows: terminal capture failures have none.
+  scripts/github-shadow-pair-accounting.sql is the executable ALL_ASSIGNED
+  accounting query (bind company UUID, endpoint UUID). It includes pending and
+  terminal selections as missing pairs, and counts each frozen selected arm once
+  even before enrollment projection. A missing assessment is not an exclusion
+  from the operational denominator or evidence of a passing review.
+
 1. Provision ONLY after host-operator review, on staging first
   scripts/provision-github-shadow-host.sh is a new-account template, not an
   automatically executed installer. With no --apply it prints usage and exits.

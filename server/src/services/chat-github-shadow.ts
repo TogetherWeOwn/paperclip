@@ -60,7 +60,8 @@ export async function stageGitHubPair(tx: Tx, input: {
 }) {
   if (!(await githubShadowEnabled(tx))) return;
   const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, input.deliveryId));
-  if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed || delivery.normalizedEvent.githubPairingPending) return;
+  if (!delivery || delivery.githubShadowLabel || delivery.normalizedEvent.githubPairingSeed
+    || delivery.normalizedEvent.githubPairingPending || delivery.normalizedEvent.githubPairingFailure) return;
   const [config] = await tx.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, input.endpoint.id));
   if (!config || config.configuration.shadow?.enabled) return;
   const arms = await selectedGitHubPairArms(tx, input.endpoint, config, delivery.providerEventId, input.repository);
@@ -285,6 +286,23 @@ export async function githubCandidateMayWake(db: Store, candidate: Candidate): P
     && config?.configuration.shadowRoutes?.some(r => r.enabled && r.agentId === candidate.agentId && r.label === candidate.shadowLabel) === true;
 }
 
+interface PairCapture { id: string; startedAt: string; attempts: number; lastError?: string }
+const MAX_PAIR_CAPTURE_ATTEMPTS = 3;
+
+async function failGitHubPairCapture(db: Store, deliveryId: string, capture: PairCapture, reason: string) {
+  // Preserve the selected arms for ALL_ASSIGNED/missing-pair accounting even
+  // when no enrollment could be projected. Fence late workers by capture id.
+  const normalizedEvent = capture.attempts >= MAX_PAIR_CAPTURE_ATTEMPTS
+    ? sql`(${chatDeliveries.normalizedEvent} - 'githubPairingPending' - 'githubPairingCapture') ||
+        jsonb_build_object('githubPairingFailure', (${chatDeliveries.normalizedEvent}->'githubPairingPending') ||
+          ${JSON.stringify({ reason, attempts: capture.attempts })}::jsonb)`
+    : sql`jsonb_set(${chatDeliveries.normalizedEvent}, '{githubPairingCapture,lastError}', to_jsonb(${reason}::text))`;
+  await db.update(chatDeliveries).set({ normalizedEvent }).where(and(eq(chatDeliveries.id, deliveryId),
+    sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'`,
+    sql`not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`,
+    sql`${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'id' = ${capture.id}`));
+}
+
 async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeof fetch) {
   const pendingRows = await db.select().from(chatDeliveries).where(sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'
     and not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')
@@ -296,18 +314,25 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
       or (${chatDeliveries.normalizedEvent}->'githubPairingCapture'->>'startedAt')::timestamptz <= ${new Date(Date.now() - 30_000).toISOString()}::timestamptz)`)
     .orderBy(asc(chatDeliveries.receivedAt), asc(chatDeliveries.id)).limit(limit);
   for (const row of pendingRows) {
+    let capture: PairCapture | undefined;
     try {
       const claim = await db.transaction(async tx => {
         const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, row.id)).for("update", { skipLocked: true });
         if (!delivery || delivery.normalizedEvent.githubPairingSeed || !delivery.normalizedEvent.githubPairingPending) return null;
-        const previous = delivery.normalizedEvent.githubPairingCapture as { id: string; startedAt: string } | undefined;
+        const previous = delivery.normalizedEvent.githubPairingCapture as PairCapture | undefined;
         if (previous && Date.now() - Date.parse(previous.startedAt) < 30_000) return null;
-        const capture = { id: randomUUID(), startedAt: new Date().toISOString() };
+        if (previous && previous.attempts >= MAX_PAIR_CAPTURE_ATTEMPTS) {
+          await failGitHubPairCapture(tx, delivery.id, previous, previous.lastError ?? "pair_capture_interrupted");
+          return null;
+        }
+        const capture: PairCapture = { id: randomUUID(), startedAt: new Date().toISOString(),
+          attempts: (previous ? previous.attempts ?? 1 : 0) + 1 };
         await tx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubPairingCapture: capture })}::jsonb` })
           .where(eq(chatDeliveries.id, delivery.id));
         return { delivery, capture, interrupted: !!previous };
       });
       if (!claim) continue;
+      capture = claim.capture;
       const { delivery } = claim;
       const pending = delivery.normalizedEvent.githubPairingPending as PendingPair;
       const [source] = await db.select({ endpoint: chatEndpoints, conversation: chatConversations, resource: chatEndpointResources, comment: issueComments })
@@ -316,7 +341,10 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
         .innerJoin(chatEndpointResources, eq(chatEndpointResources.id, chatConversations.resourceId))
         .innerJoin(issueComments, eq(issueComments.id, chatMessageLinks.commentId))
         .where(and(eq(chatMessageLinks.deliveryId, delivery.id), eq(chatMessageLinks.direction, "inbound"), eq(chatMessageLinks.companyId, delivery.companyId))).limit(1);
-      if (!source) continue;
+      if (!source) {
+        await failGitHubPairCapture(db, delivery.id, capture, "pair_source_missing");
+        continue;
+      }
       const automatic = delivery.normalizedEvent.githubAutomatic as { context: GitHubReviewEventContext; policy: GitHubReviewPolicy } | undefined;
       const manual = delivery.normalizedEvent.githubManual as { event: "mention" | "comment"; policy: GitHubReviewPolicy } | undefined;
       const policy = (manual ?? automatic)?.policy;
@@ -324,7 +352,10 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
       const authority = delivery.normalizedEvent.githubAuthority as GitHubReviewEnrollmentEnvelope["authority"];
       const threadId = source.conversation.externalThreadId;
       const match = /^github:([^:]+):([1-9][0-9]*)(?::rc:[1-9][0-9]*)?$/.exec(threadId);
-      if (!policy || !authority || !match) continue;
+      if (!policy || !authority || !match) {
+        await failGitHubPairCapture(db, delivery.id, capture, "pair_context_invalid");
+        continue;
+      }
       const repositoryId = String(source.resource.metadata?.providerRepositoryId ?? "");
       // A crashed capture is an unavailable observation, never a fresh live
       // recapture. A pending selection that has not started may capture once.
@@ -351,8 +382,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
           request: source.comment.body, policy, revision: pending.revision, authority });
       });
     } catch {
-      await db.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || '{"githubPairingFailure":"pair_admission_failed"}'::jsonb` })
-        .where(eq(chatDeliveries.id, row.id));
+      if (capture) await failGitHubPairCapture(db, row.id, capture, "pair_admission_failed");
     }
   }
 }

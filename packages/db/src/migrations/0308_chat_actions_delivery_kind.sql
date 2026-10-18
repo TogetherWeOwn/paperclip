@@ -1,0 +1,1 @@
+CREATE INDEX "chat_actions_delivery_kind_idx" ON "chat_actions" USING btree ("delivery_id","kind");

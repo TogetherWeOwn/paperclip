@@ -4054,7 +4054,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
         expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
         const rows = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
-        expect(rows.some(r => r.normalizedEvent.githubPairingFailure === "pair_admission_failed")).toBe(true);
+        expect(rows.find(r => r.normalizedEvent.githubPairingPending)?.normalizedEvent).toMatchObject({
+          githubPairingCapture: { attempts: 1, lastError: "pair_admission_failed" },
+        });
+        expect(rows.every(r => !r.normalizedEvent.githubPairingSeed)).toBe(true);
       } finally {
         await db.execute(sql`drop trigger test_fail_pair_seed on chat_deliveries`);
         await db.execute(sql`drop function test_fail_pair_seed()`);
@@ -5164,6 +5167,78 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await admission;
         await recovery;
       }
+    });
+    it.each(["source", "authority", "exception"] as const)("terminates deferred capture after three %s failures and accounts for the missing pair", async (failure) => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, `capture-terminal-${failure}`, "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      if (failure === "source") await db.delete(chatMessageLinks).where(eq(chatMessageLinks.deliveryId, delivery!.id));
+      if (failure === "authority") await db.execute(sql`update chat_deliveries
+        set normalized_event = normalized_event - 'githubAuthority' where id = ${delivery!.id}`);
+      // The interrupted-capture branch needs sender identity; corrupting it
+      // exercises the outer exception path on every subsequent attempt.
+      if (failure === "exception") await db.execute(sql`update chat_deliveries set normalized_event =
+        (normalized_event - 'principal') || ${JSON.stringify({ githubPairingCapture: { id: randomUUID(),
+          startedAt: new Date(0).toISOString(), attempts: 0 } })}::jsonb where id = ${delivery!.id}`);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await f.service.processPendingDeliveries();
+        const [current] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+        if (attempt < 3) {
+          expect(current!.normalizedEvent.githubPairingCapture).toMatchObject({ attempts: attempt });
+          expect(current!.normalizedEvent.githubPairingPending).toBeDefined();
+          await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event,
+            '{githubPairingCapture,startedAt}', to_jsonb(${new Date(0).toISOString()}::text)) where id = ${delivery!.id}`);
+        } else {
+          expect(current!.normalizedEvent.githubPairingPending).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingCapture).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingSeed).toBeUndefined();
+          expect(current!.normalizedEvent.githubPairingFailure).toMatchObject({ attempts: 3,
+            reason: failure === "source" ? "pair_source_missing" : failure === "authority" ? "pair_context_invalid" : "pair_admission_failed",
+            arms: [{ agentId: f.replacementAgentId, label: "paired-meta" }] });
+          await f.service.processPendingDeliveries();
+          expect((await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id)))[0]!.normalizedEvent)
+            .toEqual(current!.normalizedEvent);
+        }
+      }
+      const { readFileSync } = await import("node:fs");
+      const accountingSql = readFileSync(new URL("../../../scripts/github-shadow-pair-accounting.sql", import.meta.url), "utf8");
+      expect([...(await db.$client.unsafe(accountingSql, [f.companyId, f.endpoint.id]))])
+        .toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "1" }]);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+    });
+    it("counts a pending assignment once through projection and candidate assessment", async () => {
+      const f = await pairedReviewFixture();
+      const { readFileSync } = await import("node:fs");
+      const accountingSql = readFileSync(new URL("../../../scripts/github-shadow-pair-accounting.sql", import.meta.url), "utf8");
+      const counts = async () => [...await db.$client.unsafe(accountingSql, [f.companyId, f.endpoint.id])];
+      await deliverShadowTestMention(f, "capture-accounting", "@maya review this", 81);
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "0" }]);
+      await f.service.processPendingDeliveries();
+      const candidate = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expect(candidate).toBeDefined();
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "1", capture_failed_pairs: "0" }]);
+      const session = await shadowTestSession({ ...f, assignedAgentId: f.replacementAgentId }, { issueId: candidate.issue.id });
+      expect(await githubChatReviewService(db, f.providerFetch).execute(session, "submit_review", shadowTestAssessment("b".repeat(40))))
+        .toMatchObject({ status: "shadow_stored" });
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "0", capture_failed_pairs: "0" }]);
+      await f.service.processPendingDeliveries();
+      expect(await counts()).toMatchObject([{ assigned_pairs: "1", missing_pairs: "0", capture_failed_pairs: "0" }]);
+    });
+    it("terminates an interrupted third capture without starting a fourth attempt", async () => {
+      const f = await pairedReviewFixture();
+      await deliverShadowTestMention(f, "interrupted-final-capture", "@maya review this", 81);
+      const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      await db.execute(sql`update chat_deliveries set normalized_event = normalized_event || ${JSON.stringify({
+        githubPairingCapture: { id: randomUUID(), startedAt: new Date(0).toISOString(), attempts: 3 },
+      })}::jsonb where id = ${delivery!.id}`);
+      const recorder = installShadowRecorder(f, "c".repeat(40));
+      await f.service.processPendingDeliveries();
+      const [current] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, delivery!.id));
+      expect(current!.normalizedEvent.githubPairingFailure).toMatchObject({ reason: "pair_capture_interrupted", attempts: 3 });
+      expect(current!.normalizedEvent.githubPairingPending).toBeUndefined();
+      expect(current!.normalizedEvent.githubPairingCapture).toBeUndefined();
+      expect(current!.normalizedEvent.githubPairingSeed).toBeUndefined();
+      expect(recorder.fetches).toEqual([]);
     });
     it("interrupted deferred capture stays unavailable instead of recapturing later provider bytes", async () => {
       const f = await pairedReviewFixture();
