@@ -3963,14 +3963,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const head = "b".repeat(40);
       installShadowRecorder(f, head, async url => url.endsWith("/pulls/81") ? new Response("temporary failure", { status: 503 }) : undefined);
       const admitted = await admitShadowTestPullRequest(f, head);
-      // The mock can resolve before dispatch commits its durable wake receipt.
-      // Capture intentionally ignores a still-processing inbound_wakeup action.
-      await expect.poll(async () => (await db.select().from(chatActions).where(and(
-        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup"),
-      )))[0]?.status, { timeout: 10000 }).toBe("processed");
-      await f.service.processPendingDeliveries();
-      const rows = [...await db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
-        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`)];
+      // Wake acceptance and candidate projection commit independently. A webhook
+      // recovery can already own the capture when our explicit sweep returns, so
+      // neither a resolved mock nor a processed wake proves the candidate exists.
+      // Wait for the durable condition we assert, driving recovery if needed.
+      const candidateRows = () => db.execute(sql`select e.head_sha, e.envelope, c.state from chat_github_review_enrollments e
+        join chat_github_review_candidates c on c.enrollment_id = e.id where e.endpoint_id = ${f.endpoint.id}`);
+      await expect.poll(async () => {
+        await f.service.processPendingDeliveries();
+        return [...await candidateRows()];
+      }, { timeout: 10000 }).toMatchObject([{ state: "unavailable" }]);
+      const rows = [...await candidateRows()];
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ head_sha: admitted.headSha, state: "unavailable",
         envelope: { event: { deliveryId: admitted.event.deliveryId, headSha: head }, snapshotFailure: "source_preparation_failed" } });
@@ -4620,7 +4623,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       finally { failure.mockRestore(); }
       expect(await githubPrimaryBlinding(db, f.companyId)).toBe(refreshed);
       const retryAlias = await issueService(db).addComment(candidate.issue.id, "retry alias", { agentId: f.replacementAgentId });
-      const loadFailure = vi.spyOn(db, "select").mockImplementationOnce(() => { throw new Error("aliases unavailable"); });
+      // Watermark and alias reload are now the same MVCC statement.
+      const loadFailure = vi.spyOn(db, "execute").mockRejectedValueOnce(new Error("aliases unavailable"));
       try { await expect(githubPrimaryBlinding(db, f.companyId)).rejects.toThrow("aliases unavailable"); }
       finally { loadFailure.mockRestore(); }
       const recovered = await githubPrimaryBlinding(db, f.companyId);
