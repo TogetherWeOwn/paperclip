@@ -46,15 +46,17 @@ const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 // never fails at the bridge before the server ever sees it.
 const BRIDGE_MULTIPART_FRAMING_HEADROOM_BYTES = 64 * 1024;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 10 * 1024 * 1024 + BRIDGE_MULTIPART_FRAMING_HEADROOM_BYTES;
-// Per-iteration timeout for one poll-loop client call. A healthy control-plane
+// Per-phase budget for each sandbox-channel client call. A healthy control-plane
 // round trip finishes in well under one second, so 10s is far above a normal
-// iteration and never false-fires on a slow-but-live call. It is also well
-// under the in-sandbox 30s response deadline
-// (PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS), so the host loop fails fast and writes
-// 503 responses before the in-sandbox client gives up. A silently unresponsive
-// sandbox channel makes a client call hang with no reject; this timeout turns
-// that hang into a caught error, so the poll loop can back off and retry while
-// the watchdog below decides when to fail the queued requests.
+// phase and never false-fires on a slow-but-live call. Each phase gets its own
+// full budget starting at that phase, so a request's phases can sum past the
+// in-sandbox 30s response deadline (PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS) on a
+// very slow channel; the relay still fails safe (retryable 502 for safe
+// methods, indeterminate 504/409 for unsafe), and the gateway's own deadline
+// maps the same way. A silently unresponsive sandbox channel makes a client
+// call hang with no reject; this timeout turns that hang into a caught error,
+// so the phase recovers (or the poll loop backs off and retries) while the
+// watchdog below decides when to fail the queued requests.
 const DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS = 10_000;
 // Watchdog backstop for a hang that the per-iteration timeout does not catch
 // (for example many slow-but-under-timeout calls, or a stall outside the awaited
@@ -800,9 +802,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
-  // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
-  // poll and one `processRequestFile`). On timeout the loop `catch` runs
-  // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
+  // Per-phase budget for each sandbox-channel client call (the `listJsonFiles`
+  // poll, queue stat/read, authorize, host forward, response/backstop/recovery
+  // writes and request removes). A forward-phase timeout aborts the handler
+  // and delivers its own terminal (502 safe / 504 indeterminate) with no
+  // recovery pass; any other phase timeout rejects to the loop `catch`, which
+  // runs `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
   iterationTimeoutMs?: number | null;
   // Watchdog threshold. When the loop makes no successful iteration within this
   // time, the watchdog runs `failPendingRequests` and surfaces a run-level error
@@ -1034,7 +1039,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
             iterationTimeoutMs,
             `Sandbox callback bridge write response for ${response.id}`,
           );
-          await input.client.remove(requestPath).catch(() => undefined);
+          await withTimeout(
+            input.client.remove(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          ).catch(() => undefined);
           // The response delivered: count it as loop progress.
           lastSuccessfulIterationAt = Date.now();
           return;
@@ -1396,8 +1405,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
           `Sandbox callback bridge write ${backstopLabel} backstop for ${requestId}`,
         );
         // The backstop reached the caller. Remove the request file, so the
-        // poll loop does not list it again and re-run the mutation.
-        await input.client.remove(requestPath).catch(() => undefined);
+        // poll loop does not list it again and re-run the mutation. Bound
+        // like every other client call, so a hung remove never wedges the
+        // serial poll loop.
+        await withTimeout(
+          input.client.remove(requestPath),
+          iterationTimeoutMs,
+          `Sandbox callback bridge remove request ${fileName}`,
+        ).catch(() => undefined);
         return;
       } catch (error) {
         console.warn(
@@ -1614,8 +1629,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
       if (wroteRecovery) {
         // The recovery response landed. Remove the request file, so the poll
-        // loop does not re-process it.
-        await input.client.remove(requestPath).catch(() => undefined);
+        // loop does not re-process it. Bound like every other client call,
+        // so a hung remove never wedges the recovery pass.
+        await withTimeout(
+          input.client.remove(requestPath),
+          iterationTimeoutMs,
+          `Sandbox callback bridge remove request ${fileName}`,
+        ).catch(() => undefined);
       } else {
         // Every recovery write failed. Keep the request file for a later recovery pass.
         console.warn(

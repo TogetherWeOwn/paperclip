@@ -4042,6 +4042,190 @@ describe("sandbox callback bridge", () => {
     await worker.stop({ drainTimeoutMs: 10 });
   });
 
+  it("writes the safe 502 backstop when the aborted handler never settles", async () => {
+    // The cooperating-handler test above only exercises the handler's own
+    // abort response (the forward-timeout catch finalizes it). The backstop
+    // itself runs only when an outside recovery aborts an in-flight forward
+    // whose handler then never settles: here the watchdog fires long before
+    // the forward's own phase budget, aborts the handler, and the grace
+    // expires with no settlement, so `writeAbortedHandlerBackstop` must
+    // deliver a retryable 502 with no indeterminate marker, never 504.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/safe-abort-backstop";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-safe-backstop.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-safe-backstop", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let handlerCalls = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      // The forward budget is deliberately long so the watchdog (not the
+      // forward phase) owns the abort; the backstop then owns the terminal.
+      iterationTimeoutMs: 1_000,
+      watchdogTimeoutMs: 50,
+      abortedHandlerGraceMs: 30,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      // Non-cooperating safe handler: ignores the abort signal and never
+      // settles, so only the backstop can terminate the request.
+      handleRequest: async () => {
+        handlerCalls += 1;
+        return await new Promise<{ status: number; body?: string }>(() => {});
+      },
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 5_000);
+
+    expect(workerErrors.length).toBeGreaterThan(0);
+    expect(handlerCalls).toBe(1);
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // Safe backstop stays retryable: 502 with no indeterminate marker.
+    expect(requestResponses[0]?.status).toBe(502);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(502);
+    expect(parsed.headers?.["x-paperclip-bridge-outcome"]).toBeUndefined();
+    const responseBody = JSON.parse(parsed.body);
+    expect(responseBody.outcome).toBeUndefined();
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("keeps serving later requests when a delivered request hangs on remove", async () => {
+    // A response that delivered but whose request-file remove never settles
+    // must not wedge the serial poll loop. The remove gets the same
+    // per-phase bound as every other client call, so the loop times it out
+    // and serves the next request instead of stalling behind the first.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/hung-remove";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-remove-a.json";
+    const fileB = "req-remove-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-remove-a", "GET"));
+    requestBodies.set(pathB, bridgeRequestJson("req-remove-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      // Delete the file so no duplicate work re-queues, but never settle the
+      // caller: a silently hung sandbox channel. Without the remove bound the
+      // loop stalls on the first request and the second is never handled.
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // Both requests served exactly once with their real status, despite the
+    // hung removes behind them.
+    expect(handled).toContain("req-remove-a");
+    expect(handled).toContain("req-remove-b");
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(200);
+    expect(responsesB[0]?.status).toBe(200);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
   it("keeps an authorization denial denied (403) through recovery instead of converting it to 503", async () => {
     // Recovery must not weaken authorization. A denied route never runs its
     // mutation, so its terminal stays 403. Converting it to retryable 503 would
