@@ -1461,7 +1461,11 @@ test.describe("Exact failed chat run retry", () => {
           },
         });
         if (outcome === "denied") {
-          await expect(page.getByText(denial, { exact: true })).toBeVisible();
+          // 15 s: the denial renders after the mocked 409 settles through
+          // mutation state; a loaded CI worker can need more than 5 s.
+          await expect(page.getByText(denial, { exact: true })).toBeVisible({
+            timeout: 15_000,
+          });
           if (surface !== "agent run") {
             await expect(
               page.getByText("Run retry failed", { exact: true }),
