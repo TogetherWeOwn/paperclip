@@ -38,6 +38,7 @@ import {
   desc,
   eq,
   inArray,
+  innerJoin,
   isNotNull,
   like,
   notInArray,
@@ -3375,10 +3376,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         eq(chatActions.endpointId, f.endpoint.id),
         eq(chatActions.kind, "github_review_check"),
       ))).toHaveLength(0);
+      // The mention is the earliest comment on a fresh review issue. Never let
+      // unspecified row ordering select a later comment for these assertions.
       const comments = await db
         .select()
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .where(eq(issueComments.issueId, admitted.issueId))
+        .orderBy(asc(issueComments.createdAt));
       // Prompt parity: the shadow reviewer is never told it is shadow.
       expect(comments[0].body).not.toContain("meta-shadow");
       expect(comments[0].body.toLowerCase()).not.toContain("shadow");
@@ -3640,16 +3644,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       f: Awaited<ReturnType<typeof reviewBotFixture>>,
       admitted: { issueId: string },
     ) {
-      const comments = await db
-        .select()
+      // The wake comment must be the admission mention: it is the only comment
+      // carrying the inbound message link the capability resolver requires.
+      // Never let unspecified row ordering select a later unlinked comment.
+      const [wakeComment] = await db
+        .select({ id: issueComments.id })
         .from(issueComments)
-        .where(eq(issueComments.issueId, admitted.issueId));
+        .innerJoin(chatMessageLinks, eq(chatMessageLinks.commentId, issueComments.id))
+        .where(and(eq(issueComments.issueId, admitted.issueId), eq(chatMessageLinks.direction, "inbound")))
+        .orderBy(asc(issueComments.createdAt))
+        .limit(1);
+      if (!wakeComment) throw new Error(`shadow fixture has no linked wake comment for issue ${admitted.issueId}`);
       const [run] = await db.insert(heartbeatRuns).values({
         companyId: f.companyId,
         agentId: f.assignedAgentId,
         invocationSource: "assignment",
         status: "running",
-        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: comments[0].id },
+        contextSnapshot: { issueId: admitted.issueId, wakeCommentId: wakeComment.id },
       }).returning();
       return {
         companyId: f.companyId,
