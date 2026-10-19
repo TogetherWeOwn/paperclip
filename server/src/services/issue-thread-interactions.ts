@@ -584,17 +584,26 @@ function isUserCommentSupersedableKind(
 }
 
 function isIssueThreadInteractionIdempotencyConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const err = error as {
-    code?: string;
-    constraint?: string;
-    constraint_name?: string;
-  };
-  const constraint = err.constraint ?? err.constraint_name;
-  return (
-    err.code === "23505" &&
-    constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT
-  );
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const err = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = err.constraint ?? err.constraint_name;
+    if (
+      err.code === "23505" &&
+      constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT
+    ) {
+      return true;
+    }
+    current = err.cause;
+  }
+  return false;
 }
 
 function isEquivalentCreateRequest(
