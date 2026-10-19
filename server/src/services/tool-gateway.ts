@@ -10605,6 +10605,7 @@ export function createToolGatewayService(
           argumentsSummary: effectiveArgumentsSummary,
           resultSummary: resultValidation.summary,
           metadata: {
+            timeoutMs: executionTimeoutMs,
             ...(virtualToolName
               ? { virtualToolName, targetToolName: tool.name }
               : {}),
