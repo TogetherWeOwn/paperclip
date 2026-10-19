@@ -18,6 +18,10 @@ import {
 } from "./host-executor.js";
 import { resolveCommandForLogs, ensureCommandResolvable, runChildProcess } from "./server-utils.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import {
+  runAdapterExecutionTargetProcess,
+  type AdapterSshExecutionTarget,
+} from "./execution-target.js";
 
 const keys = generateKeyPairSync("ed25519");
 const publicKeyPem = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -258,6 +262,53 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
     });
     await expect(runWithNativeSshHostExecutor(good, () => launchWith(bad))).rejects.toThrow(/expired/i);
     expect(childStarted()).toBe(false);
+  });
+});
+
+describe("execution-target process entry forwards the run's executor", () => {
+  const sshTarget: AdapterSshExecutionTarget = {
+    kind: "remote",
+    transport: "ssh",
+    remoteCwd: spec.remoteCwd,
+    spec,
+  };
+
+  function launchViaTarget(hostExecutor?: NativeSshHostExecutorTarget | null) {
+    return runAdapterExecutionTargetProcess(RUN, sshTarget, COMMAND, ARGS, {
+      cwd: sandbox,
+      env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
+      timeoutSec: 10,
+      graceSec: 1,
+      onLog: async () => {},
+      ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    });
+  }
+
+  it("authorizes the SSH launch exactly once through the forwarded executor", async () => {
+    const inner = executor(async (recorded) => sign(recorded));
+    const authorizeLaunch = vi.fn((input: Parameters<typeof inner.authorizeLaunch>[0]) =>
+      inner.authorizeLaunch(input),
+    );
+    const counting = { kind: "native_ssh" as const, authorizeLaunch };
+
+    const result = await launchViaTarget(counting);
+
+    expect(result.exitCode).toBe(0);
+    expect(childStarted()).toBe(true);
+    expect(authorizeLaunch).toHaveBeenCalledOnce();
+  });
+
+  it("starts no child when the forwarded executor refuses the launch", async () => {
+    const refusing = executor(async () => Promise.reject(new Error("signer down")));
+    await expect(launchViaTarget(refusing)).rejects.toThrow(/signer down/i);
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses the launch when no executor is forwarded under required authority", async () => {
+    await expect(launchViaTarget()).rejects.toThrow(/Native SSH execution requires/i);
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
   });
 });
 

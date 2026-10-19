@@ -517,76 +517,86 @@ export function createNativeSshHostExecutorTarget(
   const now = input.now ?? (() => new Date());
   const nextOpaqueRequestId = input.nextOpaqueRequestId ?? (() => randomUUID());
   const usedRequestIds = new Set<string>();
+  // One authority slot per run ledger: concurrent launches must not interleave
+  // persist -> sign -> digest, or the second persist overwrites the first before
+  // the signer reads it. A failure never blocks later launches.
+  let authorizeTail: Promise<unknown> = Promise.resolve();
+
+  async function authorizeLaunchInner(launchInput: NativeSshLaunchInput): Promise<NativeSshSignedEnvelope> {
+    assertLaunchInput(launchInput);
+    // Fail before any ledger write or signer round trip when trust roots are missing.
+    if (!input.signer || typeof input.signer.requestEnvelope !== "function") {
+      throw new NativeSshAuthorityError(
+        "native_ssh_signer_unavailable",
+        "Native SSH signer transport is unavailable",
+      );
+    }
+    if (typeof input.verifyEnvelope !== "function") {
+      throw new NativeSshAuthorityError(
+        "native_ssh_signer_unavailable",
+        "Native SSH signer verification key is unavailable",
+      );
+    }
+    const opaqueRequestId = nextOpaqueRequestId();
+    assertOpaqueRequestId(opaqueRequestId);
+    if (usedRequestIds.has(opaqueRequestId)) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_replayed",
+        "Native SSH opaque request id was already used",
+      );
+    }
+    usedRequestIds.add(opaqueRequestId);
+
+    const issuedAt = now();
+    if (Number.isNaN(issuedAt.getTime())) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_invalid",
+        "Native SSH authority clock returned an invalid time",
+      );
+    }
+    const authority = buildAuthority(
+      input,
+      opaqueRequestId,
+      launchInput,
+      issuedAt,
+      new Date(issuedAt.getTime() + maxLifetimeMs),
+    );
+    await recordInLedger("authority", () => input.persistAuthority(authority));
+    const envelope = parseEnvelope(
+      await askSigner(input.signer, { version: NATIVE_SSH_SIGNER_REQUEST_VERSION, opaqueRequestId }, signerTimeoutMs),
+    );
+    if (!(await input.verifyEnvelope(envelope))) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_signature_invalid",
+        "Native SSH signer envelope signature is not valid",
+      );
+    }
+    if (stableJson(envelope.authority) !== stableJson(authority)) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_mismatch",
+        "Native SSH signer envelope does not match server-derived launch authority",
+      );
+    }
+    if (isExpired(envelope.authority, now())) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_expired",
+        "Native SSH authority expired before the launch",
+      );
+    }
+    await recordInLedger("envelope digest", async () =>
+      input.persistEnvelope?.({ authority, envelopeSha256: sha256CanonicalJson(envelope) }),
+    );
+    const proof = deepFreezeEnvelope(envelope);
+    issuedProofs.add(proof);
+    return proof;
+  }
 
   return Object.freeze({
     kind: "native_ssh" as const,
-    async authorizeLaunch(launchInput: NativeSshLaunchInput) {
-      assertLaunchInput(launchInput);
-      // Fail before any ledger write or signer round trip when trust roots are missing.
-      if (!input.signer || typeof input.signer.requestEnvelope !== "function") {
-        throw new NativeSshAuthorityError(
-          "native_ssh_signer_unavailable",
-          "Native SSH signer transport is unavailable",
-        );
-      }
-      if (typeof input.verifyEnvelope !== "function") {
-        throw new NativeSshAuthorityError(
-          "native_ssh_signer_unavailable",
-          "Native SSH signer verification key is unavailable",
-        );
-      }
-      const opaqueRequestId = nextOpaqueRequestId();
-      assertOpaqueRequestId(opaqueRequestId);
-      if (usedRequestIds.has(opaqueRequestId)) {
-        throw new NativeSshAuthorityError(
-          "native_ssh_authority_replayed",
-          "Native SSH opaque request id was already used",
-        );
-      }
-      usedRequestIds.add(opaqueRequestId);
-
-      const issuedAt = now();
-      if (Number.isNaN(issuedAt.getTime())) {
-        throw new NativeSshAuthorityError(
-          "native_ssh_authority_invalid",
-          "Native SSH authority clock returned an invalid time",
-        );
-      }
-      const authority = buildAuthority(
-        input,
-        opaqueRequestId,
-        launchInput,
-        issuedAt,
-        new Date(issuedAt.getTime() + maxLifetimeMs),
-      );
-      await recordInLedger("authority", () => input.persistAuthority(authority));
-      const envelope = parseEnvelope(
-        await askSigner(input.signer, { version: NATIVE_SSH_SIGNER_REQUEST_VERSION, opaqueRequestId }, signerTimeoutMs),
-      );
-      if (!(await input.verifyEnvelope(envelope))) {
-        throw new NativeSshAuthorityError(
-          "native_ssh_signature_invalid",
-          "Native SSH signer envelope signature is not valid",
-        );
-      }
-      if (stableJson(envelope.authority) !== stableJson(authority)) {
-        throw new NativeSshAuthorityError(
-          "native_ssh_authority_mismatch",
-          "Native SSH signer envelope does not match server-derived launch authority",
-        );
-      }
-      if (isExpired(envelope.authority, now())) {
-        throw new NativeSshAuthorityError(
-          "native_ssh_authority_expired",
-          "Native SSH authority expired before the launch",
-        );
-      }
-      await recordInLedger("envelope digest", async () =>
-        input.persistEnvelope?.({ authority, envelopeSha256: sha256CanonicalJson(envelope) }),
-      );
-      const proof = deepFreezeEnvelope(envelope);
-      issuedProofs.add(proof);
-      return proof;
+    authorizeLaunch(launchInput: NativeSshLaunchInput) {
+      const run = authorizeTail.then(() => authorizeLaunchInner(launchInput));
+      authorizeTail = run.catch(() => {});
+      return run;
     },
   });
 }

@@ -294,6 +294,52 @@ describe("createNativeSshHostExecutorTarget", () => {
     expect(envelope.authority.envKeys).toEqual(["ANTHROPIC_API_KEY", "PATH"]);
     expect(JSON.stringify(envelope)).not.toContain("secret-value-never-in-authority");
   });
+
+  it("authorizes concurrent launches without one overwriting the other's recorded authority", async () => {
+    // The run ledger holds one authority slot. The out-of-process signer is
+    // handed only the opaque id and reads the recorded authority after a delay,
+    // so interleaved persist -> sign sequences would hand launch A the envelope
+    // for launch B and refuse a valid launch. The executor serializes launches.
+    const slot: { authority: NativeSshLaunchAuthority | null; digest: string | null } = {
+      authority: null,
+      digest: null,
+    };
+    const ids = ["73efe034-f471-4a3c-a5f0-50187895d34a", "73efe034-f471-4a3c-a5f0-50187895d34b"];
+    const launchB = { ...launchInput, args: ["--model", "claude-haiku-4-5"] };
+    const target = createNativeSshHostExecutorTarget({
+      ...seed(),
+      signer: {
+        requestEnvelope: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return signEnvelope(slot.authority!);
+        },
+      },
+      verifyEnvelope: createEd25519NativeSshEnvelopeVerifier(publicKeyPem),
+      persistAuthority: async (authority) => {
+        slot.authority = authority;
+        slot.digest = null;
+      },
+      persistEnvelope: async ({ envelopeSha256 }) => {
+        slot.digest = envelopeSha256;
+      },
+      nextOpaqueRequestId: () => ids.shift() as string,
+      now: () => NOW,
+    });
+
+    const [proofA, proofB] = await Promise.all([
+      target.authorizeLaunch(launchInput),
+      target.authorizeLaunch(launchB),
+    ]);
+
+    expect(proofA.authority.args).toEqual(launchInput.args);
+    expect(proofB.authority.args).toEqual(launchB.args);
+    expect(proofA.authority.opaqueRequestId).not.toBe(proofB.authority.opaqueRequestId);
+    // Each proof verifies its own launch: no cross-signed envelope, no paired digest.
+    expect(() => assertNativeSshLaunchAuthority(proofA, launchInput, { now: () => NOW })).not.toThrow();
+    expect(() => assertNativeSshLaunchAuthority(proofB, launchB, { now: () => NOW })).not.toThrow();
+    expect(slot.authority).toEqual(proofB.authority);
+    expect(slot.digest).toBe(sha256CanonicalJson(proofB));
+  });
 });
 
 describe("isNativeSshAuthorityRequired", () => {

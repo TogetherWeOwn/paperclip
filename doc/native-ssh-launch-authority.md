@@ -44,7 +44,7 @@ Not gated yet: the Paperclip Runner (`paperclip_runner` adapter with the native 
    - the signed authority equals the recorded authority;
    - the authority has not expired. The lifetime is at most 60 seconds.
 
-   The executor then records the envelope SHA-256 (`nativeSshEnvelopeSha256`). Each new launch replaces the recorded authority and clears the digest.
+   The executor then records the envelope SHA-256 (`nativeSshEnvelopeSha256`). Each new launch replaces the recorded authority and clears the digest. Concurrent launches in one run are authorized one at a time, so a second launch cannot overwrite the recorded authority before the signer reads the first.
 5. The proof is single-use. These are refused: a replayed request id, a reused proof, a proof for a different command, arguments, environment or target, and a JSON copy of a proof.
 
 Signer transport failures, signer silence and ledger write failures refuse the launch. Their codes are `native_ssh_signer_unavailable` and `native_ssh_ledger_unavailable`.
