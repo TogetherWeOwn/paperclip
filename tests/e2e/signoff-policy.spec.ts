@@ -57,7 +57,7 @@ async function createAgentRequest(token: string): Promise<APIRequestContext> {
   });
 }
 
-/** Invoke a heartbeat run for an agent, returning the run ID. */
+/** Invoke a no-op heartbeat and return an issue-bound, successfully settled run ID. */
 async function invokeHeartbeat(
   board: APIRequestContext,
   agentId: string,
@@ -71,13 +71,12 @@ async function invokeHeartbeat(
   });
   expect(res.ok()).toBe(true);
   const run = await res.json();
-  if (typeof run.id === "string" && run.id.length > 0) return run.id;
-
-  // A stage transition can already be replacing the previous executor's run
-  // with the participant's queued run. If the legacy invoke is skipped and
-  // that run has already released the issue lock, recover it from the agent's
-  // recent run receipts.
-  const deadline = Date.now() + 3_000;
+  // Let the no-op processes finish before submitting a stage decision. A PATCH
+  // during execution cancels the old participant and can correctly leave a
+  // recovery hold that prevents the next participant from starting.
+  // Assignment and manual wakes can overlap, so wait for all issue-bound runs,
+  // including the one recovered when the manual invocation was skipped.
+  const deadline = Date.now() + 10_000;
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agentId) {
@@ -87,6 +86,7 @@ async function invokeHeartbeat(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
     const candidates = new Set<string>([
+      run.id,
       run.executionRunId,
       issueRunLock.executionRunId,
       issueRunLock.checkoutRunId,
@@ -100,22 +100,26 @@ async function invokeHeartbeat(
         if (typeof recentRun.id === "string") candidates.add(recentRun.id);
       }
     }
+    let settledRunId: string | undefined;
+    let hasActiveRun = false;
     for (const candidate of candidates) {
       const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidate}`);
       if (!runRes.ok()) continue;
       const candidateRun = await runRes.json();
       const context = candidateRun.contextSnapshot ?? {};
-      if (
-        candidateRun.agentId === agentId &&
-        (context.issueId === issueId || context.taskId === issueId)
-      ) {
-        return candidate;
+      if (context.issueId !== issueId && context.taskId !== issueId) continue;
+      if (candidateRun.status === "queued" || candidateRun.status === "running") {
+        hasActiveRun = true;
+      }
+      if (candidateRun.agentId === agentId && candidateRun.status === "succeeded") {
+        settledRunId = candidate;
       }
     }
+    if (settledRunId && !hasActiveRun) return settledRunId;
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
 
-  throw new Error(`No issue-bound heartbeat run became available for agent ${agentId}`);
+  throw new Error(`No successfully settled issue-bound heartbeat run became available for agent ${agentId}`);
 }
 
 async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
@@ -311,7 +315,9 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
         adapterType: "process",
         adapterConfig: {
           command: process.execPath,
-          args: ["-e", "process.stdout.write('done\\n')"],
+          // Keep a short asynchronous window so the helper must wait for the
+          // process to settle instead of relying on an immediate exit.
+          args: ["-e", "process.stdout.write('done\\n'); setTimeout(() => {}, 250)"],
         },
       },
     });
@@ -402,6 +408,18 @@ test.describe("Signoff execution policy", () => {
     }
     await board.delete(`${BASE_URL}/api/companies/${ctx.companyId}`).catch(() => {});
     await board.dispose();
+  });
+
+  test("heartbeat helper waits for the no-op process to succeed", async () => {
+    const issue = await createIssueWithPolicy(ctx, "Signoff settled heartbeat");
+    const runId = await invokeHeartbeat(ctx.boardRequest, ctx.executor.agentId, issue.id);
+    const runRes = await ctx.boardRequest.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
+    expect(runRes.ok()).toBe(true);
+    expect(await runRes.json()).toMatchObject({
+      agentId: ctx.executor.agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId: issue.id },
+    });
   });
 
   test("happy path: executor → review → approval → done", async ({ page }) => {
