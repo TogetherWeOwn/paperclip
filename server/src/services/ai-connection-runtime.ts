@@ -12,7 +12,7 @@ import {
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
-import type { NativeSshHostExecutorTarget } from "@paperclipai/adapter-utils";
+import type { NativeSshHostExecutorTarget } from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";

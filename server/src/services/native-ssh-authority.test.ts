@@ -6,7 +6,7 @@ import {
   nativeSshEnvelopeSigningPayload,
   NativeSshAuthorityError,
   type NativeSshLaunchAuthority,
-} from "@paperclipai/adapter-utils";
+} from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { RUN_MODEL_DECISION_SEAM_VIOLATION_ASSIGNED_MODEL_MISSING } from "./run-model-decision.js";
 import {

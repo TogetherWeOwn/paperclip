@@ -7,7 +7,7 @@ import {
   runWithNativeSshHostExecutor,
   type CreateNativeSshHostExecutorTargetInput,
   type NativeSshHostExecutorTarget,
-} from "@paperclipai/adapter-utils";
+} from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { unprocessable } from "../errors.js";
 import {

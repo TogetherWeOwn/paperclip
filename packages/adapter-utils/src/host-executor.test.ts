@@ -1,4 +1,6 @@
 import { generateKeyPairSync, sign as cryptoSign } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -374,5 +376,18 @@ describe("runWithNativeSshHostExecutor", () => {
       expect(getActiveNativeSshHostExecutor()).toBe(target);
     });
     expect(getActiveNativeSshHostExecutor()).toBeNull();
+  });
+});
+
+describe("barrel browser safety", () => {
+  it("keeps the host executor out of the shared barrel", () => {
+    // host-executor.ts instantiates AsyncLocalStorage at module top level. The UI
+    // imports the shared barrel, so re-exporting it here ships node:async_hooks
+    // into browser chunks: the chunk throws at evaluation and every route that
+    // loads it renders "Paperclip couldn't start". Server code imports the
+    // subpath "@paperclipai/adapter-utils/host-executor" instead.
+    const root = path.dirname(new URL(import.meta.url).pathname);
+    const barrel = readFileSync(path.join(root, "index.ts"), "utf8");
+    expect(barrel).not.toContain("host-executor");
   });
 });

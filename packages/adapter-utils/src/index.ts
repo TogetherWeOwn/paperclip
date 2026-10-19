@@ -69,30 +69,6 @@ export {
   redactCommandText,
   redactDiagnosticText,
 } from "./command-redaction.js";
-export {
-  assertNativeSshLaunchAuthority,
-  createEd25519NativeSshEnvelopeVerifier,
-  createNativeSshHostExecutorTarget,
-  getActiveNativeSshHostExecutor,
-  isNativeSshAuthorityRequired,
-  NATIVE_SSH_AUTHORITY_ENV,
-  NativeSshAuthorityError,
-  nativeSshEnvelopeSigningPayload,
-  runWithNativeSshHostExecutor,
-  sha256CanonicalJson,
-} from "./host-executor.js";
-export type {
-  CreateNativeSshHostExecutorTargetInput,
-  NativeSshAuthorityErrorCode,
-  NativeSshEnvelopeVerifier,
-  NativeSshHostExecutorTarget,
-  NativeSshLaunchAuthority,
-  NativeSshLaunchInput,
-  NativeSshRemoteTarget,
-  NativeSshSignedEnvelope,
-  NativeSshSignerRequest,
-  NativeSshSignerTransport,
-} from "./host-executor.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
   buildAdapterEnvConfig,

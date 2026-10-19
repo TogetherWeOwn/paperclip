@@ -7,7 +7,7 @@ import {
   nativeSshEnvelopeSigningPayload,
   sha256CanonicalJson,
   type NativeSshSignerRequest,
-} from "@paperclipai/adapter-utils";
+} from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
   getEmbeddedPostgresTestSupport,

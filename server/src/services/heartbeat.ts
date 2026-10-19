@@ -596,14 +596,16 @@ import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
-  NativeSshAuthorityError,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
-  type NativeSshEnvelopeVerifier,
-  type NativeSshSignerTransport,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import {
+  NativeSshAuthorityError,
+  type NativeSshEnvelopeVerifier,
+  type NativeSshSignerTransport,
+} from "@paperclipai/adapter-utils/host-executor";
 import {
   createNativeSshHostExecutorForRun,
   nativeSshAuthorityRunLedger,
