@@ -27,31 +27,57 @@ function sanitizeManifestText(value: string, maxLength: number): string {
   return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
 }
 
+function namespaceOf(key: string): string {
+  const slash = key.lastIndexOf("/");
+  return slash > 0 ? key.slice(0, slash) : "";
+}
+
+function leafOf(key: string): string {
+  const slash = key.lastIndexOf("/");
+  return slash >= 0 ? key.slice(slash + 1) : key;
+}
+
 export function buildSkillLibraryManifestMarkdown(input: {
   entries: readonly PaperclipSkillEntry[];
   desiredSkillKeys: ReadonlySet<string>;
 }): string | null {
   if (input.entries.length === 0) return null;
-  const lines = [...input.entries]
-    .sort((left, right) => left.key.localeCompare(right.key))
-    .map((entry) => {
-      const enabled = input.desiredSkillKeys.has(entry.key);
-      const key = sanitizeManifestText(entry.key, 200);
-      if (enabled && entry.sourceStatus === "missing") {
-        const detail = entry.missingDetail ? sanitizeManifestText(entry.missingDetail, 200) : "";
-        return `- ${key} — enabled but unavailable${detail ? `: ${detail}` : ""}`;
-      }
-      return `- ${key} — ${enabled ? "enabled" : "installed, not enabled for you"}`;
-    });
+  const sorted = [...input.entries].sort((left, right) => left.key.localeCompare(right.key));
+  const enabledLines: string[] = [];
+  const notEnabledByNamespace = new Map<string, string[]>();
+  for (const entry of sorted) {
+    const key = sanitizeManifestText(entry.key, 200);
+    if (!input.desiredSkillKeys.has(entry.key)) {
+      const namespace = namespaceOf(key);
+      const leaves = notEnabledByNamespace.get(namespace) ?? [];
+      leaves.push(leafOf(key));
+      notEnabledByNamespace.set(namespace, leaves);
+      continue;
+    }
+    if (entry.sourceStatus === "missing") {
+      const detail = entry.missingDetail ? sanitizeManifestText(entry.missingDetail, 200) : "";
+      enabledLines.push(`- ${key} — enabled but unavailable${detail ? `: ${detail}` : ""}`);
+      continue;
+    }
+    const runtimeName = sanitizeManifestText(entry.runtimeName || leafOf(key), 120);
+    enabledLines.push(`- ${key} — enabled; load it with the Skill tool as \`${runtimeName}\``);
+  }
+  // Sent with every request, so not-enabled skills are grouped one line per namespace.
+  const notEnabledLines = [...notEnabledByNamespace.entries()].map(([namespace, leaves]) =>
+    namespace ? `- ${namespace}/: ${leaves.join(", ")}` : `- ${leaves.join(", ")}`,
+  );
   return [
     "## Company skill library",
     "",
-    'Skills marked "enabled" are loaded into your runtime. Skills marked',
-    '"installed, not enabled for you" exist in this company\'s skill library but',
-    "are not attached to you — never report those as not installed; say they",
-    "are installed but not enabled for you, and ask an operator to enable them",
-    'for you (the skill page\'s "Add to agent" control) when you need one.',
+    "Enabled skills are loaded into your runtime: load one with the Skill tool by the",
+    "name in backticks, never by its library key. The other skills listed are",
+    "installed in this company's skill library but not attached to you — never",
+    "report those as not installed; say they are installed but not enabled for you,",
+    'and ask an operator to enable them for you (the skill page\'s "Add to agent"',
+    "control) when you need one.",
     "",
-    ...lines,
+    "Enabled for you:",
+    ...(enabledLines.length > 0 ? enabledLines : ["- none"]),
+    ...(notEnabledLines.length > 0 ? ["", "Installed, not enabled for you:", ...notEnabledLines] : []),
   ].join("\n");
 }
