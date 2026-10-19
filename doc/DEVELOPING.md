@@ -82,13 +82,15 @@ Issue execution may also use project execution workspace policies and workspace 
 
 ### SSH workspace synchronization
 
-SSH execution excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
+SSH execution for task workspaces excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
 `node_modules/`, and `target/` from export and sync-back. These directories contain
 local runtime state, nested agent checkouts, and build outputs. Restore preserves
 the local copies. The remote run must install dependencies or rebuild outputs.
 Nested source such as `src/commands/target/` still transfers. Do not use a root
 `target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
-tracks it.
+tracks it. Plain persistent directories (agent instruction directories and
+`workspaceFileMode: "all"` syncs) are exempt: they transfer and restore every file
+except workspace-root `.paperclip-runtime/`.
 
 The archive creator selects root-relative exclude syntax from its own `tar
 --version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server

@@ -438,6 +438,9 @@ describe("candidate workspace materialisation over SSH", () => {
     expect(git(ws, "diff", "--name-only", "origin/main...HEAD").split("\n").sort()).toEqual([".gitattributes", "ignored.txt", "link", "run.sh"]);
     expect(existsSync(join(home, ".paperclip-review", "artifact", "repository.bundle"))).toBe(false);
     mkdirSync(join(ws, ".paperclip-runtime"));
+    // An empty dir never shows in status output, so seed a file: without the
+    // .paperclip-runtime/ exclude this shows as untracked and fails the test.
+    writeFileSync(join(ws, ".paperclip-runtime", "state.json"), "{}");
     // Runtime assets never show as untracked; legacy.txt is git's ordinary
     // CRLF-under-`text` renormalisation notice, identical in any clone.
     expect(git(ws, "status", "--porcelain", "--untracked-files=all")).toBe("M legacy.txt");

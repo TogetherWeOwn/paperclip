@@ -437,6 +437,15 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
 
 export { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES };
 
+/** Runtime state that sync-back guards even when the broader scratch
+ * exclusions are off: it is never a deliverable and restoring over it
+ * would clear the local runtime it holds. Plain persistent directories
+ * (`excludeAgentLocalScratch: false`) transfer everything else. */
+const SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES: readonly string[] = [".paperclip-runtime"];
+const SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES: readonly string[] = SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES.map(
+  (entry) => `./${entry}`,
+);
+
 /**
  * Return `baseline` with the SSH agent-local scratch treated as out of scope
  * for the restore merge. The sync-back no longer carries these paths, so a
@@ -1966,9 +1975,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : [])],
+      exclude: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES)],
       // Excluded from the download, so nothing replaces them: keep the local copies.
-      preserveLocalEntries: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : [])],
+      preserveLocalEntries: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES)],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1979,8 +1988,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES] : [],
-    preserveLocalEntries: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES] : [],
+    exclude: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES] : [...SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES],
+    preserveLocalEntries: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES] : [...SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

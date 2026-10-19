@@ -33,9 +33,18 @@ describe("evidence-derived paired review eligibility", () => {
           allowedModelAccepted: true, otherModelDenied: true, rawProxyDenied: true } },
     } } as unknown as typeof chatGitHubReviewEnrollments.$inferSelect;
     expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot")).toEqual({ certifiedClean: false, reasons: unverified });
-    for (const [candidateId, armId, runId] of [["other", "arm", "run"], ["candidate", "other", "run"], ["candidate", "arm", "retry"]]) {
-      expect(githubRunComparisonEligibility(enrollment, { id: candidateId!, armId: armId! }, runId!)).toMatchObject({ certifiedClean: false });
+    // Bind the run with a sealed snapshot source: any loosening of the binding
+    // checks must fail these exact reasons, not a vacuous false.
+    const unbound = ["candidate_runtime_not_certified", "candidate_isolation_self_test_not_recorded",
+      ...unverified, "candidate_isolation_receipt_binding_mismatch"];
+    for (const [candidateId, armId] of [["other", "arm"], ["candidate", "other"]]) {
+      expect(githubRunComparisonEligibility(enrollment, { id: candidateId!, armId: armId! }, "run", "snapshot"))
+        .toEqual({ certifiedClean: false, reasons: unbound });
     }
+    // A retry id with no receipt also loses the receipt-side namespace evidence.
+    expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "retry", "snapshot"))
+      .toEqual({ certifiedClean: false, reasons: ["primary_namespace_not_isolated", "candidate_runtime_not_certified",
+        "candidate_isolation_self_test_not_recorded", ...unverified] });
     enrollment.isolationTests.run!.checks.githubDenied = false;
     expect(githubRunComparisonEligibility(enrollment, { id: "candidate", armId: "arm" }, "run", "snapshot").reasons).toContain("candidate_isolation_self_test_failed");
   });
