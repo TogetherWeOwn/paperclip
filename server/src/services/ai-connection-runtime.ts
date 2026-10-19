@@ -12,6 +12,7 @@ import {
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
+import type { NativeSshHostExecutorTarget } from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
@@ -69,6 +70,8 @@ export async function assertManagedAiProjectAuth(
   config: Record<string, unknown>,
   provider: AiConnectionBinding["provider"],
   target?: AdapterExecutionTarget | null,
+  /** The run's native SSH authority issuer; the probe is a launch on the SSH host too. */
+  hostExecutor?: NativeSshHostExecutorTarget | null,
 ) {
   const extraArgs = [
     ...(Array.isArray(config.extraArgs) ? config.extraArgs : []),
@@ -131,6 +134,7 @@ done`,
         timeoutSec: 15,
         graceSec: 1,
         onLog: async () => {},
+        hostExecutor,
       },
     );
     if (result.exitCode !== 0)
