@@ -341,35 +341,74 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(await db.select().from(issueQuestionResponseDeliveries)).toHaveLength(1);
   });
 
+  async function raceInteractionCreates(requests: Array<() => ReturnType<typeof interactionsSvc.create>>) {
+    const transaction = db.transaction.bind(db);
+    let arrivals = 0;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => { release = resolve; });
+    const databaseErrors: unknown[] = [];
+    const spy = vi.spyOn(db, "transaction").mockImplementation(async (...args) => {
+      // Both preflight lookups must miss before either transaction starts.
+      if (++arrivals === requests.length) release();
+      await ready;
+      try {
+        return await transaction(...args);
+      } catch (error) {
+        databaseErrors.push(error);
+        throw error;
+      }
+    });
+    try {
+      const results = await Promise.allSettled(requests.map(async (request) => {
+        try {
+          return await request();
+        } finally {
+          release();
+        }
+      }));
+      return { results, databaseErrors };
+    } finally {
+      release();
+      spy.mockRestore();
+    }
+  }
+
   it("reuses concurrent omitted and explicit chat-owner requests and legacy omitted recipients", async () => {
     const fixture = await seedChatQuestion();
     const scope = { id: fixture.issueId, companyId: fixture.companyId };
     const input = { ...questionCreateInput(fixture.runId), idempotencyKey: "chat-question" };
     const actor = { agentId: fixture.agentId };
-    // Both callers must finish their optimistic lookup before either transaction
-    // inserts, forcing the unique-conflict recovery path instead of relying on timing.
-    const transaction = db.transaction.bind(db);
-    let arrivals = 0;
-    let release!: () => void;
-    const ready = new Promise<void>(resolve => { release = resolve; });
-    const gate = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
-      if (++arrivals === 2) release();
-      await ready;
-      return transaction(callback, config);
-    });
-    let omitted!: Awaited<ReturnType<typeof interactionsSvc.create>>;
-    let explicit!: Awaited<ReturnType<typeof interactionsSvc.create>>;
-    try {
-      [omitted, explicit] = await Promise.all([
-        interactionsSvc.create(scope, input, actor),
-        interactionsSvc.create(scope, { ...input, addresseeUserId: fixture.userId }, actor),
-      ]);
-    } finally { gate.mockRestore(); }
-    expect(explicit.id).toBe(omitted.id);
-    expect(explicit.addresseeUserId).toBe(fixture.userId);
+    const { results, databaseErrors } = await raceInteractionCreates([
+      () => interactionsSvc.create(scope, input, actor),
+      () => interactionsSvc.create(scope, { ...input, addresseeUserId: fixture.userId }, actor),
+    ]);
+    expect(databaseErrors).toEqual([expect.objectContaining({ cause: expect.objectContaining({
+      code: "23505", constraint_name: "issue_thread_interactions_company_issue_idempotency_uq",
+    }) })]);
+    const [omitted, explicit] = await Promise.all(results.map((result) =>
+      result.status === "fulfilled" ? result.value : Promise.reject(result.reason)));
+    expect(explicit!.id).toBe(omitted!.id);
+    expect(explicit!.addresseeUserId).toBe(fixture.userId);
     expect(await db.select().from(issueThreadInteractions)).toHaveLength(1);
-    await db.update(issueThreadInteractions).set({ addresseeUserId: null }).where(eq(issueThreadInteractions.id, omitted.id));
-    expect((await interactionsSvc.create(scope, input, actor)).id).toBe(omitted.id);
+    await db.update(issueThreadInteractions).set({ addresseeUserId: null }).where(eq(issueThreadInteractions.id, omitted!.id));
+    expect((await interactionsSvc.create(scope, input, actor)).id).toBe(omitted!.id);
+  });
+
+  it("rejects a different request after a concurrent idempotency conflict", async () => {
+    const fixture = await seedChatQuestion();
+    const scope = { id: fixture.issueId, companyId: fixture.companyId };
+    const input = { ...questionCreateInput(fixture.runId), idempotencyKey: "chat-question" };
+    const actor = { agentId: fixture.agentId };
+    const { results, databaseErrors } = await raceInteractionCreates([
+      () => interactionsSvc.create(scope, input, actor),
+      () => interactionsSvc.create(scope, { ...input, title: "Different request" }, actor),
+    ]);
+    expect(databaseErrors).toHaveLength(1);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({
+      status: "rejected", reason: { status: 409 },
+    });
+    expect(await db.select().from(issueThreadInteractions)).toHaveLength(1);
   });
 
   it.each(["question-owner", "paperclip-id:another-member"])("rejects contradictory chat recipient %s before saving", async (addresseeUserId) => {
