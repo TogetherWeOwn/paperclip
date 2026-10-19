@@ -252,6 +252,33 @@ describe("SSH workspace entry points", () => {
     expect(await pathExists(path.join(localDir, "target"))).toBe(false);
   }, TEST_TIMEOUT_MS);
 
+  it("restoreWorkspaceFromSshExecution keeps the runtime guard with scratch excludes off and no baseline", async () => {
+    const { fixtureDir, keepBytes } = await buildRemoteWorkspace();
+    const spec = buildStubSpec(fixtureDir);
+    const localDir = await createFixtureRootDir("paperclip-sync-back-restore-no-baseline-");
+    await mkdir(path.join(localDir, ".paperclip-runtime"), { recursive: true });
+    await writeFile(path.join(localDir, ".paperclip-runtime", "state.json"), "{\"local\":true}");
+    // Scratch transfers too here (~4 MiB fixture), so the cap must clear the
+    // unexcluded total; the guard under test is the runtime dir, not the cap.
+    process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(keepBytes * 4096);
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: FAKE_REMOTE_ROOT,
+      excludeAgentLocalScratch: false,
+    });
+
+    // Everything else transfers; only the runtime dir stays guarded.
+    await expect(readFile(path.join(localDir, "keep.txt"))).resolves.toEqual(Buffer.alloc(2048, 0x41));
+    expect(await pathExists(path.join(localDir, ".claude", "worktrees"))).toBe(true);
+    expect(await pathExists(path.join(localDir, "node_modules"))).toBe(true);
+    expect(await pathExists(path.join(localDir, "target"))).toBe(true);
+    await expect(readFile(path.join(localDir, ".paperclip-runtime", "state.json"), "utf8")).resolves.toBe(
+      "{\"local\":true}",
+    );
+  }, TEST_TIMEOUT_MS);
+
   it("restoreWorkspaceFromSshExecution excludes scratch on the baseline staging path", async () => {
     const { fixtureDir, keepBytes } = await buildRemoteWorkspace();
     const spec = buildStubSpec(fixtureDir);

@@ -437,14 +437,6 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
 
 export { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES };
 
-/**
- * Return `baseline` with the SSH agent-local scratch treated as out of scope
- * for the restore merge. The sync-back no longer carries these paths, so a
- * baseline that still lists them would make the merge read them as remote
- * deletions and remove the local copies (including uncommitted work in nested
- * agent worktrees). Dropping the entries and adding the excludes makes the
- * merge ignore these paths on both sides, however the baseline was captured.
- */
 /** Runtime state that sync-back guards even when the broader scratch
  * exclusions are off: it is never a deliverable and restoring over it
  * would clear the local runtime it holds. Plain persistent directories
@@ -454,6 +446,14 @@ const SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES: readonly string[] = SSH_SYNC_BACK
   (entry) => `./${entry}`,
 );
 
+/**
+ * Return `baseline` with the SSH agent-local scratch treated as out of scope
+ * for the restore merge. The sync-back no longer carries these paths, so a
+ * baseline that still lists them would make the merge read them as remote
+ * deletions and remove the local copies (including uncommitted work in nested
+ * agent worktrees). Dropping the entries and adding the excludes makes the
+ * merge ignore these paths on both sides, however the baseline was captured.
+ */
 export function withSshAgentLocalExcludes(baseline: DirectorySnapshot): DirectorySnapshot {
   return {
     exclude: [...new Set([...baseline.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],

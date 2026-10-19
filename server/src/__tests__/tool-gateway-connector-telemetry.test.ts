@@ -40,6 +40,25 @@ vi.mock("../telemetry.js", () => ({
   getTelemetryClient: () => ({ track, isRegisteredEventName }),
 }));
 
+// Every gateway emit path calls emitConnectionInvoked as detached background
+// work that never throws, so the afterEach drain can await every emitted
+// promise instead of waiting out a wall-clock quiet window.
+const pendingTelemetryEmits: Array<Promise<void>> = [];
+vi.mock("../services/connector-telemetry.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../services/connector-telemetry.js")>();
+  return {
+    ...actual,
+    emitConnectionInvoked: (
+      ...args: Parameters<typeof actual.emitConnectionInvoked>
+    ) => {
+      const pending = actual.emitConnectionInvoked(...args);
+      pendingTelemetryEmits.push(pending);
+      return pending;
+    },
+  };
+});
+
 // Deterministic reproduction of "post-execution bookkeeping failure": the
 // gateway's success path awaits writeAudit -> logActivity after the succeeded
 // save; failing that call lands in the catch that overwrites the row to
@@ -293,24 +312,10 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
     // counts order-dependent (TOG-30065). Drain after the deletes: any emit
     // whose read resolves now finds its rows gone and returns without
     // emitting, while an already-resolved emit lands here before the clear.
-    // Quiescence = no new `connection.invoked` call for 250ms straight (5s
-    // cap); nothing in this hook issues new gateway work.
-    const quiesceStart = Date.now();
-    let lastCount = -1;
-    let stableSince = quiesceStart;
-    for (;;) {
-      const count = track.mock.calls.filter(
-        ([name]) => name === "connection.invoked",
-      ).length;
-      const now = Date.now();
-      if (count === lastCount) {
-        if (now - stableSince >= 250) break;
-      } else {
-        lastCount = count;
-        stableSince = now;
-      }
-      if (now - quiesceStart > 5000) break;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+    // Await the tracked promises rather than a wall-clock quiet window; the
+    // emitter never rejects, but allSettled keeps the drain safe regardless.
+    while (pendingTelemetryEmits.length > 0) {
+      await Promise.allSettled(pendingTelemetryEmits.splice(0));
     }
     track.mockClear();
   });
