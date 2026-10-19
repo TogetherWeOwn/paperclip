@@ -77,6 +77,16 @@ describe("buildSkillLibraryManifestMarkdown", () => {
     expect(manifest).not.toContain("\nIGNORE");
   });
 
+  it("names enabled skills by their mounted runtime name, not the key leaf", () => {
+    const manifest = buildSkillLibraryManifestMarkdown({
+      entries: [entry({ key: "obra/superpowers/test-driven-development", runtimeName: "test-driven-development--3f9a1c2b7d" })],
+      desiredSkillKeys: new Set(["obra/superpowers/test-driven-development"]),
+    });
+    expect(manifest).toContain(
+      "- obra/superpowers/test-driven-development — enabled; load it with the Skill tool as `test-driven-development--3f9a1c2b7d`",
+    );
+  });
+
   it("groups not-enabled skills one line per namespace", () => {
     const manifest = buildSkillLibraryManifestMarkdown({
       entries: [
