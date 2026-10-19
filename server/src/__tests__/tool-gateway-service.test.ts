@@ -2029,6 +2029,45 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(serialized).not.toContain(maliciousContent);
   });
 
+  it("runs plugin tools with the 30s provider default when the caller sets no timeout", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: {
+        initialize: async () => {},
+        teardown: () => {},
+        listToolsForAgent: () => [
+          {
+            name: "fixture:read_status",
+            displayName: "Read status",
+            description: "Returns a status payload.",
+            parametersSchema: { type: "object" },
+            pluginId: "fixture-plugin",
+          },
+        ],
+        getTool: () => null,
+        executeTool: async () => ({ pluginId: "fixture-plugin", toolName: "read_status", result: { ok: true } }),
+        registerPluginTools: () => {},
+        unregisterPluginTools: () => {},
+        toolCount: () => 1,
+        getRegistry: () => {
+          throw new Error("not implemented");
+        },
+      },
+    });
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Allow read fixture",
+      policyType: "allow",
+      selectors: { toolName: "fixture:read_status" },
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    await gateway.executeTool({ sessionToken: session.token, tool: "fixture:read_status", parameters: {} });
+
+    const [completed] = await db.select().from(toolCallEvents).where(eq(toolCallEvents.eventType, "call_completed"));
+    expect(completed?.metadata).toMatchObject({ timeoutMs: 30_000 });
+  });
+
   it("passes original sensitive arguments to plugin executors while redacting stored summaries", async () => {
     const { company, agent, run } = await createRunFixture(db);
     let executedParameters: unknown;

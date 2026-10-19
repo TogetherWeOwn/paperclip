@@ -745,6 +745,18 @@ function timeoutMs(value: number | undefined) {
   );
 }
 
+// Review-bot tools (`submit_review` posts the review and its inline comments) and plugin tools chain several
+// upstream calls, and a timed-out call keeps running server-side, so the 10s interactive default made callers
+// retry work that was still in flight.
+const PROVIDER_DEFAULT_TIMEOUT_MS: Readonly<Record<string, number>> = Object.freeze({
+  paperclip_github_chat: 45_000,
+  paperclip_plugin: 30_000,
+});
+
+export function interactiveToolTimeoutMs(providerType: string, requested: number | undefined) {
+  return timeoutMs(requested ?? PROVIDER_DEFAULT_TIMEOUT_MS[providerType]);
+}
+
 function sessionTtlMs(value: number | undefined) {
   if (!Number.isFinite(value)) return DEFAULT_SESSION_TTL_MS;
   return Math.max(
@@ -7295,7 +7307,7 @@ export function createToolGatewayService(
 
     const startedAt = Date.now();
     try {
-      const executionTimeoutMs = timeoutMs(args.timeoutMs);
+      const executionTimeoutMs = interactiveToolTimeoutMs(args.tool.providerType, args.timeoutMs);
       const connectedMcpExecution =
         (args.tool.providerType === "mcp_remote_http" || args.tool.providerType === "provider_rest")
           ? await executeRemoteHttpTool(
@@ -10677,7 +10689,7 @@ export function createToolGatewayService(
       try {
         primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
         if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(effectiveParameters);
-        const executionTimeoutMs = timeoutMs(input.timeoutMs);
+        const executionTimeoutMs = interactiveToolTimeoutMs(tool.providerType, input.timeoutMs);
         if (
           tool.providerType === "paperclip_plugin" &&
           (!session.agentId || !session.runId)
@@ -10837,6 +10849,7 @@ export function createToolGatewayService(
           argumentsSummary: effectiveArgumentsSummary,
           resultSummary: resultValidation.summary,
           metadata: {
+            timeoutMs: executionTimeoutMs,
             ...(virtualToolName
               ? { virtualToolName, targetToolName: tool.name }
               : {}),
