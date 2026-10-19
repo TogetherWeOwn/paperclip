@@ -1,3 +1,22 @@
+/**
+ * SHA-256 digests of every earlier managed launcher that shipped on the deploy line
+ * (`git log -- github-launcher.ts` on deploy/tog6):
+ * 1cc45086d, 297d8741f, 82f662656, 5442f2d86 (shared history, digests identical to
+ * master), 9cb38d571 (tog6 deploy candidate), a84b53251 (launcher recursion port).
+ * Master-only launchers (ffb01ff3d, ab832bc02, b721d24ca, 7d7871b58) never shipped
+ * here and are deliberately absent.
+ * A directory is skipped on `PATH` only when every `git`/`gh` in it is byte-identical to the running launcher
+ * or to one of these exact sources. Append the digest of the previous launcher whenever the source changes.
+ */
+export const LEGACY_GITHUB_LAUNCHER_SHA256 = [
+  "1d13f3cb49ed8e9ef4269eed5cce84e601297f09e471a02da3bee1c3f9f37e32",
+  "4508e67b73fe779e8a6188cb6ef1b0e28ea797c34f9c4f9f2e09cc9d9375f2d3",
+  "348c30b04c0e57a0acc285a417b56bc05d426801ddd4af5cee3badbdc0ce1f43",
+  "f20da49d465c4dbcb33fbedd92d587e884ecdaebf47f617e4040bbc3c841ffdc",
+  "4eccdf10792cf5dd19c72e0b828361600d019e14c14a9215eed89c10473957fe",
+  "cf736bf394b7fda8f095703f2bff19f9e09f1f18f2e9a182908ffa77767abcf1",
+] as const;
+
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
 export function githubLauncherSource(): string {
   return String.raw`#!/usr/bin/env node
@@ -5,10 +24,30 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
-const directory = path.dirname(fs.realpathSync(process.argv[1]));
+const crypto = require('node:crypto');
+const launcherPath = fs.realpathSync(process.argv[1]);
+const directory = path.dirname(launcherPath);
 const program = path.basename(process.argv[1]);
+const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+// A launcher is managed only when its complete bytes match this launcher or a known earlier release.
+const managedDigests = new Set(${JSON.stringify(LEGACY_GITHUB_LAUNCHER_SHA256)});
+try { managedDigests.add(digest(fs.readFileSync(launcherPath))); } catch {}
+function hasManagedLauncher(dir) {
+  // Mixed directories keep their other tools: skip only when every git/gh present is a known launcher.
+  let managed = false;
+  for (const name of ['git', 'gh']) {
+    const candidate = path.join(dir, name);
+    let stat;
+    try { stat = fs.statSync(candidate); } catch { continue; }
+    if (!stat.isFile()) continue;
+    try { if (stat.size > 16384 || !managedDigests.has(digest(fs.readFileSync(candidate)))) return false; } catch { return false; }
+    managed = true;
+  }
+  return managed;
+}
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
-  try { return fs.realpathSync(p) !== directory; } catch { return true; }
+  try { if (fs.realpathSync(p) === directory) return false; } catch {}
+  return !hasManagedLauncher(p);
 });
 const executable = originalPath.map(p => path.join(p, program)).find(p => {
   try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
@@ -17,8 +56,8 @@ if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
 }
-async function main() {
   let env = { ...process.env };
+  delete env.PAPERCLIP_GITHUB_SHIM_ACTIVE;
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
