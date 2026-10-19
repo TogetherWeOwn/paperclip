@@ -181,7 +181,9 @@ The active-lock lifecycle is part of the checkout contract:
 - checkout and checkout-owner checks may self-heal lock columns that point at terminal or missing runs before evaluating conflicts
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
-Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
+A never-started queued `interaction_pending` notification is obsolete when its referenced interaction has resolved and its recipient is not the current agent assignee. The normal queued-run scheduler retires that notification before checking recipient lane capacity. It skips the wake receipt and uses normal execution release and deferred-wake promotion. The cancellation locks the issue before the run, rechecks the interaction and current assignee, and compare-and-clears only the cancelled run's lock. Pending decisions, started or running executions, and queued assignee work are not eligible for this retirement. Delayed creation events must still name a pending interaction addressed to their recipient when admission holds the issue lock; otherwise they create no run or reservation.
+
+Stale-lock recovery is crash recovery, not a retry loop. Except for the obsolete never-started notification lifecycle above, Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
 ### Known execution waits at admission
 

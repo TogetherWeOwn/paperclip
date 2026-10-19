@@ -20278,7 +20278,13 @@ export function heartbeatService(
     }
 
     const queuedRuns = await db
-      .select({ agentId: heartbeatRuns.agentId })
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        startedAt: heartbeatRuns.startedAt,
+        wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'`,
+      })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(
@@ -20288,6 +20294,25 @@ export function heartbeatService(
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
       );
+
+    // Obsolete attention must not wait for capacity in its recipient's lane.
+    // The semantic cancellation rechecks issue/run ownership under their locks.
+    for (const run of queuedRuns) {
+      if (run.startedAt || run.wakeReason !== "interaction_pending") continue;
+      try {
+        const cancellation = await runDispatch.cancelStaleQueuedRun({
+          runId: run.id,
+          companyId: run.companyId,
+          expectedStatus: "queued",
+          onlyResolvedInteractionPending: true,
+        });
+        if (cancellation.outcome !== "cancelled") continue;
+        applyRunDispatchPostCommitEffects(cancellation.postCommitEffects);
+        await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true });
+      } catch (err) {
+        logger.error({ err, runId: run.id }, "failed to retire resolved queued interaction attention");
+      }
+    }
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
@@ -27849,6 +27874,23 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          // Creation events can arrive after their interaction has resolved.
+          // Reject them before adopting a queued holder or creating a receipt.
+          if (reason === "interaction_pending") {
+            const interactionId = readNonEmptyString(enrichedContextSnapshot.interactionId);
+            const [pendingInteraction] = interactionId ? await tx
+              .select({ id: issueThreadInteractions.id })
+              .from(issueThreadInteractions)
+              .where(and(
+                eq(issueThreadInteractions.id, interactionId),
+                eq(issueThreadInteractions.companyId, agent.companyId),
+                eq(issueThreadInteractions.issueId, issueId),
+                eq(issueThreadInteractions.status, "pending"),
+                eq(issueThreadInteractions.addresseeAgentId, agentId),
+              )) : [];
+            if (!pendingInteraction) return { kind: "skipped" as const };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(

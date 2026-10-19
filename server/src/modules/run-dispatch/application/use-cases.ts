@@ -53,6 +53,7 @@ export function createCancelStaleQueuedRun(deps: { writer: RunDispatchWriter }) 
     runId: string;
     companyId: string;
     expectedStatus: "queued" | "running";
+    onlyResolvedInteractionPending?: boolean;
     now?: Date;
   }) => deps.writer.cancelStaleQueuedRun({ ...input, now: input.now ?? new Date() });
 }

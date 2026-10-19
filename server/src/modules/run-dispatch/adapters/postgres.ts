@@ -971,6 +971,31 @@ export function createPostgresRunDispatchAdapter(
   ): Promise<CancelStaleQueuedRunOutcome> {
     const cancelLockedRun = async (tx: Db, run: HeartbeatRun) => {
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
+      if (input.onlyResolvedInteractionPending) {
+        const context = parseObject(run.contextSnapshot);
+        const issueId = readNonEmptyString(context.issueId);
+        const interactionId = readNonEmptyString(context.interactionId);
+        if (run.status !== "queued" || run.startedAt || context.wakeReason !== "interaction_pending" ||
+            !issueId || !interactionId) return { outcome: "not_stale" as const };
+        const [interaction] = await tx.select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .innerJoin(issues, and(eq(issues.id, issueThreadInteractions.issueId),
+            eq(issues.companyId, issueThreadInteractions.companyId)))
+          .where(and(
+            eq(issueThreadInteractions.id, interactionId),
+            eq(issueThreadInteractions.companyId, run.companyId),
+            eq(issueThreadInteractions.issueId, issueId),
+            sql`${issueThreadInteractions.status} <> 'pending'`,
+            sql`${issues.assigneeAgentId} <> ${run.agentId}::uuid`,
+          ));
+        if (!interaction) return { outcome: "not_stale" as const };
+        return cancelStaleRunInTx(tx, run, issueId, {
+          stale: true,
+          errorCode: "issue_assignee_changed",
+          reason: "Cancelled because the pending interaction resolved before its attention run started",
+          details: { issueId, interactionId },
+        }, "queued", input.now);
+      }
       const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
       if (!decision.stale || !issueId) {
         if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
