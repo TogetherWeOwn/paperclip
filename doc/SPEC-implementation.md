@@ -1905,6 +1905,19 @@ when the run fails, before generic recovery retries. Reconnect preserves account
 identity and permissions. Compatible legacy agents may explicitly adopt a
 validated connection inline; late failures must not invalidate newer credentials.
 
+### External channel failure scope
+
+Publication, provider-reply, and form-open permission failures fail the affected
+operation. An unclassified provider 403 does not establish that the whole
+connection is unusable. Known destination failures quarantine only that resource;
+provider rate limits retain their retry deadlines. Confirmed authentication
+failures put the endpoint in attention and mark connection health failed without
+changing the connection's enabled setting. Admission and background reconciliation
+block sends, assigned channel tools, and background receiver restart until
+credentials are repaired. Signed provider lifecycle events remain admissible so
+installation revocation still takes effect during an authentication stop.
+Explicit disable and disconnect retain their existing behavior.
+
 ### Task-bound email
 
 AgentMail is a default connection and does not require the experimental chat

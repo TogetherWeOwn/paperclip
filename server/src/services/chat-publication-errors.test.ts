@@ -143,7 +143,17 @@ describe("chat publication error classification", () => {
     });
   });
 
-  it("does not mistake an ordinary GitHub permission denial for rate limiting", () => {
+  it.each([
+    Object.assign(new Error("Operation denied"), { status: 403 }),
+    new HttpError(403, "Operation denied", { providerStatus: 403 }),
+    providerError("PermissionError", "PERMISSION_DENIED"),
+    Object.assign(new Error("Missing scope"), { data: { error: "missing_scope" } }),
+    Object.assign(new Error("No permission"), { data: { error: "no_permission" } }),
+  ])("keeps permission rejection scoped to its operation: %s", (error) => {
+    expect(classifyChatPublicationError(error, 1)).toMatchObject({ kind: "failed" });
+  });
+
+  it("fails an ordinary GitHub permission denial without pausing the endpoint", () => {
     expect(
       classifyChatPublicationError(
         Object.assign(new Error("Resource not accessible by integration"), {
@@ -153,7 +163,7 @@ describe("chat publication error classification", () => {
         }),
         1,
       ),
-    ).toMatchObject({ kind: "endpoint_attention" });
+    ).toMatchObject({ kind: "failed" });
   });
 
   it("keeps Paperclip's own authorization failures scoped to the publication", () => {
@@ -174,7 +184,7 @@ describe("chat publication error classification", () => {
         }),
         1,
       ),
-    ).toMatchObject({ kind: "endpoint_attention" });
+    ).toMatchObject({ kind: "failed" });
   });
 
   it("does not call explicit GitHub 4xx rejections ambiguous delivery", () => {
@@ -216,13 +226,13 @@ describe("chat publication error classification", () => {
   });
 
   it.each([
-    ["AuthenticationError", "AUTH_FAILED"],
-    ["PermissionError", "PERMISSION_DENIED"],
-  ])("moves definite %s rejections to repair", (name, code) => {
+    ["AuthenticationError", "AUTH_FAILED", "endpoint_attention"],
+    ["PermissionError", "PERMISSION_DENIED", "failed"],
+  ])("scopes definite %s rejections", (name, code, kind) => {
     expect(
       classifyChatPublicationError(providerError(name, code), 1),
     ).toMatchObject({
-      kind: "endpoint_attention",
+      kind,
     });
   });
 
@@ -275,7 +285,7 @@ describe("chat publication error classification", () => {
     },
   );
 
-  it("keeps Teams authentication and generic permission failures endpoint-scoped", () => {
+  it("distinguishes Teams authentication from operation permission failures", () => {
     expect(
       classifyChatPublicationError(
         providerError("AuthenticationError", "AUTH_FAILED", {
@@ -295,7 +305,7 @@ describe("chat publication error classification", () => {
         }),
         1,
       ),
-    ).toMatchObject({ kind: "endpoint_attention" });
+    ).toMatchObject({ kind: "failed" });
   });
 
   it.each([50001, 50013])(
@@ -324,7 +334,7 @@ describe("chat publication error classification", () => {
     },
   );
 
-  it("keeps Discord token and generic app permission failures endpoint-scoped", () => {
+  it("distinguishes Discord token and generic app permission failures", () => {
     for (const { status, providerCode } of [
       { status: 401, providerCode: 0 },
       { status: 403, providerCode: 20012 },
@@ -345,7 +355,7 @@ describe("chat publication error classification", () => {
           }),
           1,
         ),
-      ).toMatchObject({ kind: "endpoint_attention" });
+      ).toMatchObject({ kind: status === 401 ? "endpoint_attention" : "failed" });
     }
   });
 

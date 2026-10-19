@@ -3395,7 +3395,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }
 
   function runtimeContextForRecord(
-    record: NonNullable<Awaited<ReturnType<typeof endpointRecord>>>,
+    record: Pick<NonNullable<Awaited<ReturnType<typeof endpointRecord>>>, "endpoint" | "credentialSecretRefs">,
   ): RuntimeContext {
     const generation = runtimeGeneration(record.endpoint.setup);
     const refsFingerprint = credentialFingerprint(record.credentialSecretRefs);
@@ -3560,6 +3560,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         endpoint: chatEndpoints,
         assignedAgentName: agents.name,
         connectionName: toolConnections.name,
+        connectionHealthStatus: toolConnections.healthStatus,
         applicationId: toolConnections.applicationId,
         credentialSecretRefs: toolConnections.credentialSecretRefs,
       })
@@ -4781,9 +4782,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         await tx
           .update(toolConnections)
           .set({
-            status: "disabled",
-            enabled: false,
-            healthStatus: "degraded",
+            healthStatus: "failed",
             healthMessage: "Provider credentials or permissions need attention",
             lastError: failure,
             healthCheckedAt: new Date(),
@@ -5536,8 +5535,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       runtimeGeneration(endpoint.setup) !== context.generation
     )
       return null;
-    const refs = await tx
-      .select({ refs: toolConnections.credentialSecretRefs })
+    const connection = await tx
+      .select({ refs: toolConnections.credentialSecretRefs, healthStatus: toolConnections.healthStatus })
       .from(toolConnections)
       .where(
         and(
@@ -5545,8 +5544,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           eq(toolConnections.id, endpoint.connectionId),
         ),
       )
-      .then((rows) => rows[0]?.refs ?? []);
-    if (credentialFingerprint(refs) !== context.credentialFingerprint) {
+      .then((rows) => rows[0]);
+    if (
+      (leasedChatProvider(endpoint.provider) && endpoint.status === "attention" && connection?.healthStatus === "failed") ||
+      credentialFingerprint(connection?.refs ?? []) !== context.credentialFingerprint
+    ) {
       return null;
     }
     const runtimeContext = context as RuntimeContext;
@@ -5574,6 +5576,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return null;
     }
     return record &&
+      !(leasedChatProvider(record.endpoint.provider) && record.endpoint.status === "attention" && record.connectionHealthStatus === "failed") &&
       allowedStatuses.includes(record.endpoint.status) &&
       runtimeGeneration(record.endpoint.setup) === context.generation &&
       credentialFingerprint(record.credentialSecretRefs) ===
@@ -5836,7 +5839,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }
 
   function serializeEndpoint(
-    row: Awaited<ReturnType<typeof endpointRecord>>,
+    // R11 port: upstream serializes from the endpoints module's record, which has
+    // no connectionHealthStatus; list() rows omit it here as well.
+    row: Omit<NonNullable<Awaited<ReturnType<typeof endpointRecord>>>, "connectionHealthStatus"> | null | undefined,
   ): ChatEndpoint {
     if (!row) throw notFound("Chat endpoint not found");
     const endpoint = row.endpoint;
@@ -7699,7 +7704,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (
         record.endpoint.status === "archived" ||
         record.endpoint.status === "paused" ||
-        record.endpoint.status === "draft"
+        record.endpoint.status === "draft" ||
+        (leasedChatProvider(record.endpoint.provider) && record.endpoint.status === "attention" && record.connectionHealthStatus === "failed")
       ) {
         throw conflict("Chat endpoint runtime is not available in this state", {
           code: "chat_endpoint_runtime_unavailable",
@@ -7842,7 +7848,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   const current = await runtimeCallbackEndpoint(tx, endpoint.id, context, ["attention"]);
                   if (!current) return;
                   const connection = await tx.select().from(toolConnections).where(eq(toolConnections.id, current.connectionId)).then((rows) => rows[0]);
-                  if (!connection?.enabled) throw new Error("Photon endpoint requires operator recovery");
+                  if (!connection?.enabled || connection.healthStatus === "failed") throw new Error("Photon endpoint requires operator recovery");
                   await notifyChatEndpointWork(tx);
                   await tx.update(chatEndpoints).set({ status: current.setup.step === "complete" ? "active" : "verifying", healthMessage: "Photon receiver connected", lastError: null, updatedAt: new Date() }).where(eq(chatEndpoints.id, endpoint.id));
                 });
@@ -7980,6 +7986,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           inArray(chatEndpoints.status, ["verifying", "active", "attention"]),
           eq(toolConnections.status, "active"),
           eq(toolConnections.enabled, true),
+          or(ne(chatEndpoints.status, "attention"), ne(toolConnections.healthStatus, "failed")),
         ),
       );
     const eligibleIds = new Set(eligibleRows.map((row) => row.endpointId));
@@ -19455,9 +19462,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             await tx
               .update(toolConnections)
               .set({
-                status: "disabled",
-                enabled: false,
-                healthStatus: "degraded",
+                healthStatus: "failed",
                 healthMessage:
                   "Provider credentials or permissions need attention",
                 lastError: failure,
@@ -35725,9 +35730,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         await tx
           .update(toolConnections)
           .set({
-            status: "disabled",
-            enabled: false,
-            healthStatus: "degraded",
+            healthStatus: "failed",
             healthMessage: "Provider credentials or permissions need attention",
             lastError: failure,
             healthCheckedAt: new Date(),

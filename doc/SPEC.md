@@ -651,6 +651,13 @@ Operators must release the effective task or ancestor pause before sending a new
 message. The draft stays intact. This applies to both task interfaces and to
 board comment API requests; an agent may still report interrupted work.
 
+### External channel failure scope
+
+An operation-level permission denial must not disable unrelated channel work.
+Authentication failures pause runtime use while preserving the user's connection
+setting. Explicit disconnect and provider installation revocation remain enforced.
+See the implementation spec for publication, provider-reply, and form-open rules.
+
 ### Experimental iMessage Photon channel
 
 A Photon Cloud project can represent one agent through the existing
