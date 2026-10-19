@@ -21,7 +21,8 @@ import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js
 // (GitHub tokens, unrelated env, other agents' bindings) stays refused.
 // Paths and base URLs stay out: they are configuration, not credentials.
 export { LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS, lowTrustModelCredentialConfigPaths, filterLowTrustModelBindingIds } from "./chat-github-task-trust.js";
-import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
+import { initializeGitHubReviewTaskTrust, reconcileGitHubReviewTaskTrust, githubReviewDeliveryTrust, githubReviewTaskIsLowTrust } from "./chat-github-task-trust.js";
+import { readGitHubReviewProvenance, resolveGitHubReviewExecutionTrust } from "./chat-github-review-trust.js";
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { githubAutomaticReviewEvent, githubAutomaticAdmission, githubPreviousAssessment, githubPullThreadKey, reuseOpenGitHubPullConversation } from "./chat-github-events.js";
@@ -14636,6 +14637,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       );
       if (context.delivery.state !== "processed")
         throw new Error("chat_inbound_wakeup_acceptance_not_committed");
+      const githubTrust = context.endpoint.provider === "github"
+        ? githubReviewDeliveryTrust(context.delivery.normalizedEvent.githubExecutionTrust) : null;
+      if (githubTrust?.denied) throw forbidden("The admitted GitHub execution policy is invalid", {
+        code: "chat_action_authorization_changed",
+      });
       await queueIssueAssignmentWakeup({
         heartbeat: options.heartbeat,
         issue: context.issue,
@@ -14650,6 +14656,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           | Record<string, number>
           | undefined,
         durableChatRequest: request,
+        ...(githubTrust ? { executionPolicy: githubTrust.executionPolicy, allowRunCoalescing: false } : {}),
         rethrowOnError: true,
       });
       const durable = await receipt();
@@ -16441,6 +16448,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return;
       }
 
+      // Read authoritative PR provenance before taking task/endpoint locks. A
+      // failed API read never falls back to webhook authors or comment text.
+      const githubPullThread = endpoint.provider === "github" &&
+        /^github:[^:]+:[1-9][0-9]*(?::rc:[1-9][0-9]*)?$/.test(thread.id);
+      const githubTrustRepositoryId = String(resource.metadata?.providerRepositoryId ?? "");
+      const githubProvenance = githubPullThread ? await readGitHubReviewProvenance(db, {
+        companyId: endpoint.companyId, endpointId: endpoint.id,
+        repositoryId: githubTrustRepositoryId, repository: resource.providerResourceId,
+        threadId: thread.id, expectedHeadSha: githubAutomatic?.context.headSha,
+      }, fetchImpl) : null;
       // Candidate selection is staged with the primary below. Snapshot capture
       // belongs exclusively to recovery, after the primary can already wake.
       const inboundActivityPublications: ActivityPublication[] = [];
@@ -16539,7 +16556,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             "Could not bind external conversation to a Paperclip task",
           );
 
-        const issue =
+        let issue =
           existingIssue?.id === conversation.issueId
             ? existingIssue
             : await taskTx
@@ -16548,10 +16565,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .where(eq(issues.id, conversation.issueId))
                 .then((rows) => rows[0] ?? null);
         if (!issue) throw notFound("Bound task not found");
-          const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
-        if (!taskUserId || (githubAutomatic && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
-            await initializeGitHubReviewTaskTrust(taskTx, issue, taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId);
-          }
+        const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
+        let githubExecutionTrust: Record<string, unknown> | null = null;
+        if (githubPullThread) {
+          const decision = await resolveGitHubReviewExecutionTrust(taskTx, {
+            companyId: taskEndpoint.companyId, endpointId: taskEndpoint.id,
+            repositoryId: githubTrustRepositoryId, provenance: githubProvenance,
+          });
+          const lowTrust = decision.lowTrust || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET;
+          issue = await reconcileGitHubReviewTaskTrust(taskTx, {
+            companyId: taskEndpoint.companyId, issueId: issue.id,
+            agentId: taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId, lowTrust,
+          });
+          const effectiveLowTrust = lowTrust || githubReviewTaskIsLowTrust(issue);
+          githubExecutionTrust = {
+            version: 1, ...decision, lowTrust: effectiveLowTrust,
+            repositoryId: githubTrustRepositoryId, provenance: githubProvenance,
+            executionPolicy: issue.executionPolicy,
+          };
+          await logActivity(taskTx as Db, {
+            companyId: taskEndpoint.companyId, actorType: "system", actorId: "chat:github",
+            action: "github.review_trust_evaluated", entityType: "issue", entityId: issue.id,
+            details: { deliveryId: activeDelivery.id, reason: decision.reason,
+              lowTrust: githubExecutionTrust.lowTrust, repositoryId: githubTrustRepositoryId,
+              provenance: githubProvenance },
+          }, inboundActivityPublications);
+        } else if (!taskUserId || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
+          await initializeGitHubReviewTaskTrust(taskTx, issue, taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId);
+        }
 
         if (issue.status === "done" || issue.status === "cancelled") {
           await issuesSvc.update(
@@ -16726,7 +16767,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .where(eq(toolConnections.id, taskEndpoint.connectionId));
         if (endpoint.provider === "github") {
           const guest = !principalResolution.userId;
-          await taskTx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({ githubAuthority: { guest, responsibleUserId: taskUserId, sponsorUserId: guest ? taskEndpoint.sponsorUserId : null } })}::jsonb` }).where(eq(chatDeliveries.id, activeDelivery.id));
+          await taskTx.update(chatDeliveries).set({ normalizedEvent: sql`${chatDeliveries.normalizedEvent} || ${JSON.stringify({
+            githubAuthority: { guest, responsibleUserId: taskUserId, sponsorUserId: guest ? taskEndpoint.sponsorUserId : null },
+            ...(githubExecutionTrust ? { githubExecutionTrust } : {}),
+          })}::jsonb` }).where(eq(chatDeliveries.id, activeDelivery.id));
         }
         if (githubAutomatic) {
           await taskTx.insert(chatGitHubReviews).values({
