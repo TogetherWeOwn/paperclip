@@ -193,7 +193,9 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   if (originalTmpdir === undefined) delete process.env.TMPDIR;
   else process.env.TMPDIR = originalTmpdir;
-  await fs.rm(sandbox, { recursive: true, force: true });
+  // Never mask a setup failure: if mkdtemp threw, sandbox is unset and there
+  // is nothing to remove.
+  await fs.rm(sandbox, { recursive: true, force: true }).catch(() => undefined);
 });
 
 describe("hostile fixtures: self-disable attempts fail closed", () => {

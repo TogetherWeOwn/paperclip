@@ -19,8 +19,15 @@ interface SeamCitation {
   file: string;
   /** Substring that must occur in the file. */
   anchor: string;
-  /** Substring that must occur AFTER the anchor (ordering pin), if any. */
+  /**
+   * Substring that must occur after the anchor within the same function
+   * body (ordering pin), if any. The search is bounded to
+   * mustPrecedeWithinLines lines so a distant, unrelated later site
+   * (another function resolving ssh, another key-staging call) cannot
+   * satisfy a guard that was reordered behind its own effect.
+   */
   mustPrecede?: string;
+  mustPrecedeWithinLines?: number;
   why: string;
 }
 
@@ -32,18 +39,19 @@ const SEAM_CITATIONS: SeamCitation[] = [
   },
   {
     file: "packages/adapter-utils/src/server-utils.ts",
-    anchor: "getActiveNativeSshHostExecutor()",
+    anchor: "options.hostExecutor ?? getActiveNativeSshHostExecutor()",
     why: "run-scope executor fallback, no adapter forwarding needed",
   },
   {
     file: "packages/adapter-utils/src/server-utils.ts",
-    anchor: "isNativeSshAuthorityRequired()",
+    anchor: "!hostExecutor && isNativeSshAuthorityRequired()",
     why: "fail-closed enforcement switch read from the server environment",
   },
   {
     file: "packages/adapter-utils/src/server-utils.ts",
     anchor: "authorizeLaunch(",
     mustPrecede: 'resolveCommandPath("ssh"',
+    mustPrecedeWithinLines: 50,
     why: "the launch is authorized before ssh is resolved or a target built",
   },
   {
@@ -55,6 +63,7 @@ const SEAM_CITATIONS: SeamCitation[] = [
     file: "packages/adapter-utils/src/ssh.ts",
     anchor: "assertNativeSshLaunchAuthority(",
     mustPrecede: "await createSshAuthArgs(",
+    mustPrecedeWithinLines: 50,
     why: "the builder asserts an issued authority before staging key material",
   },
   {
@@ -74,7 +83,7 @@ const SEAM_CITATIONS: SeamCitation[] = [
   },
   {
     file: "packages/adapter-utils/src/host-executor.ts",
-    anchor: "issuedProofs",
+    anchor: "issuedProofs.add(proof)",
     why: "identity-checked proofs: hand-built envelopes never verify",
   },
   {
@@ -122,10 +131,40 @@ function checkCitation(source: string, citation: SeamCitation): CitationResult {
   const at = source.indexOf(citation.anchor);
   if (at === -1) return { ...citation, verdict: "absent", anchorLine: null };
   if (citation.mustPrecede !== undefined) {
-    const later = source.indexOf(citation.mustPrecede, at + citation.anchor.length);
-    if (later === -1) return { ...citation, verdict: "misordered", anchorLine: lineOf(source, at) };
+    const anchorLine = lineOf(source, at);
+    const windowLines =
+      citation.mustPrecedeWithinLines === undefined
+        ? source.slice(at + citation.anchor.length).split("\n")
+        : source
+            .slice(at + citation.anchor.length)
+            .split("\n")
+            .slice(0, citation.mustPrecedeWithinLines);
+    const preceded = windowLines.some((line) => line.includes(citation.mustPrecede!));
+    if (!preceded)
+      return { ...citation, verdict: "misordered", anchorLine };
   }
   return { ...citation, verdict: "present", anchorLine: lineOf(source, at) };
+}
+
+/** Code identifiers, not prose: comments are stripped so a refactor note
+ *  naming a retired symbol does not trip the gate. */
+function stripLineComments(source: string): string {
+  return source
+    .split("\n")
+    .map((line) => {
+      const commentAt = line.indexOf("//");
+      if (commentAt === -1) return line;
+      // Keep URL-looking values (protocol://) intact; seam files carry none
+      // in positions that matter, and a miss only weakens one negative pin.
+      return line.slice(0, commentAt);
+    })
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function containsCodeIdentifier(source: string, symbol: string): boolean {
+  const code = stripLineComments(source);
+  return new RegExp(`(?<![A-Za-z0-9_$])${symbol}(?![A-Za-z0-9_$])`).test(code);
 }
 
 function checkSeamSources(sources: Record<string, string>): CitationResult[] {
@@ -183,6 +222,18 @@ describe("seam citation checker", () => {
     expect(checkCitation(source, citation).verdict).toBe("misordered");
   });
 
+  it("ignores an unrelated later site outside the ordering window", () => {
+    const windowed: SeamCitation = { ...citation, mustPrecedeWithinLines: 3 };
+    // The effect occurs, but only far below the guard: a reorder inside the
+    // guarded function must still trip, not borrow the distant site.
+    const far = ["await authorizeLaunch(x);", ...Array(9).fill("unrelated();"), 'resolveCommandPath("ssh"'].join(
+      "\n",
+    );
+    expect(checkCitation(far, windowed).verdict).toBe("misordered");
+    const near = ['await authorizeLaunch(x);', 'resolveCommandPath("ssh"'].join("\n");
+    expect(checkCitation(near, windowed).verdict).toBe("present");
+  });
+
   it("throws naming the missing citation, the exit-1-on-absent path", () => {
     const sources = { "packages/adapter-utils/src/server-utils.ts": "nothing seam-like here" };
     expect(() => assertSeamPresent(sources)).toThrow(
@@ -229,7 +280,16 @@ describe("native SSH launch-authority seam is present (flipped gate)", () => {
 
   it("keeps the retired vocabulary out of the seam files", () => {
     for (const { file, symbol } of RETIRED_SYMBOLS) {
-      expect(readTreeSource(file).includes(symbol), `${file} must not contain ${symbol}`).toBe(false);
+      expect(containsCodeIdentifier(readTreeSource(file), symbol), `${file} must not contain ${symbol}`).toBe(
+        false,
+      );
     }
+  });
+
+  it("ignores retired symbols named only in comments", () => {
+    expect(containsCodeIdentifier("// replaced assertAssignedModel with the executor path", "assertAssignedModel")).toBe(
+      false,
+    );
+    expect(containsCodeIdentifier("const assertAssignedModel = null;", "assertAssignedModel")).toBe(true);
   });
 });
