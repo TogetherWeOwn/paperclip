@@ -371,7 +371,9 @@ export function createChatReconciliationCoordinator(input: {
       // Advance only on success so a failed sweep retries the same delta.
       // A pass that hits the insert cap is truncated: more unprojected runs
       // may remain in the same window, so hold the watermark and let the next
-      // sweep re-scan it instead of dropping the backlog.
+      // sweep re-scan it instead of dropping the backlog. A truncated pass
+      // therefore drains one cap per tick by design; the slow cadence is the
+      // point of the bounded sweep, not a stall to re-arm immediately.
       if (inserted < CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT) {
         lastMilestoneSweepStartedAt = sweepStartedAt;
       }

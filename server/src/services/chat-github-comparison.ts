@@ -77,7 +77,7 @@ export function githubComparisonEligibility(evidence: {
 }
 
 export const GITHUB_SHADOW_PROTOCOL = {
-  version: 3,
+  version: 4,
   primaryBlindingVersion: GITHUB_PRIMARY_BLINDING_VERSION,
   eligibilitySource: "runCapability.envelope.comparisonEligibility",
   deviations: {

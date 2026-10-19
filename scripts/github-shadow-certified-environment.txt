@@ -76,8 +76,9 @@ Evidence-based tool/workspace equivalence
   dirty-tree/content digest; this does not prove all filesystem bytes identical.
   Effective_tool_equivalence_unverified clears only for equal CLI versions,
   permission modes, MCP name sets and tool sets across every init and every
-  primary retry bound to this admission/head. Only candidate WebSearch/WebFetch
-  removals are allowed; model identity intentionally differs. Missing/malformed
+  primary retry bound to this admission/head. Only the candidate-only denials
+  recorded in the protocol deviations are allowed; model identity intentionally
+  differs. Missing/malformed
   evidence stays unverified. workspace_equivalence_unverified: see "Sealed
   candidate checkout" below.
   Primary run IDs are joined through exact admission/head review rows; candidate
@@ -90,9 +91,12 @@ Sealed candidate checkout (repository artifact)
   runs): 79 used Bash, 75 used git/gh; 1,592 Bash calls (938 starting with cd)
   vs 664 github-bot tool calls. The primary reviews mainly from local clones.
   A candidate limited to an empty non-git workspace was handicapped.
-  Capture: in the same 15 s admission window/abort as the snapshot (before the
-  primary has published anything; pairCaptureFailure rechecks after I/O), the
-  server produces one artifact with the endpoint's installation token:
+  Capture: in parallel with the snapshot seal, under its own window (90 s
+  default, PAPERCLIP_GITHUB_SHADOW_ARTIFACT_WINDOW_MS), the server produces
+  one artifact with the endpoint's installation token. The checkout holds only
+  immutable objects addressed by the admitted head/base SHAs, so nothing the
+  primary publishes later can enter it. A failed seal aborts the capture and
+  no admission then references a checkout:
     bundle (preferred): git fetch BY SHA of the admitted head and PR base into a
       server cache clone (<instance>/data/github-shadow-repositories/cache, or
       PAPERCLIP_GITHUB_SHADOW_REPOSITORY_DIR), then `git bundle create` from a
@@ -109,12 +113,17 @@ Sealed candidate checkout (repository artifact)
       tree GitHub reports for the admitted commit; export-ignore/export-subst/
       submodules make that impossible and fail closed.
   The artifact (content-addressed <sha256>.bundle under .../artifacts, 512 MiB
-  cap, 7-day retention) is recorded in the sealed snapshot as
-  snapshot.repository {kind, path, sha256, headSha, baseSha, headTree, baseTree,
-  refs, commits} UNDER the snapshot digest. No artifact => snapshot.
-  repositoryFailure carries a precise reason (repository_artifact_late,
-  bundle:<reason>;synthetic:<reason>, repository_artifact_disabled, ...); the
-  candidate still runs and workspace equivalence stays unverified.
+  per-artifact cap, 10 GiB total cap PAPERCLIP_GITHUB_SHADOW_ARTIFACT_MAX_BYTES,
+  4 GiB cache cap PAPERCLIP_GITHUB_SHADOW_CACHE_MAX_BYTES, 7-day retention,
+  30-minute unreferenced grace, pinned while a candidate transfers it) is
+  recorded in the per-admission manifest (<root>/manifests/<key>.json),
+  OUTSIDE the snapshot digest. Only legacy rows still carry
+  snapshot.repository; newer admissions seal only an admission-time
+  repositoryFailure. No artifact => the manifest carries a precise reason
+  (repository_artifact_late, bundle:<reason>;synthetic:<reason>,
+  repository_artifact_disabled, ...); the candidate still runs and workspace
+  equivalence stays unverified. Dispatch waits at most 120 s after admission
+  for the manifest, else repository_artifact_not_ready.
   PAPERCLIP_GITHUB_SHADOW_REPOSITORY_ARTIFACTS=off disables production.
   Dispatch: only after a PASSED isolation probe, the controller re-hashes the
   local artifact, transfers it over the certified SSH channel (tar stream) into
@@ -126,7 +135,9 @@ Sealed candidate checkout (repository artifact)
   remote is the local path. The claude adapter does not sync/restore the
   workspace for certified candidates, so the CLI cwd IS that checkout. The
   receipt (isolationTests[run].workspace) records status/kind/head/tree/base
-  commit/base tree or a precise reason. Namespace cleanup removes it all.
+  commit/base tree or a precise reason, plus the server-authored artifact
+  facts when the checkout resolved from the manifest. Namespace cleanup
+  removes it all.
   Equivalence: workspace_equivalence_unverified clears only when
     candidate: receipt materialized for this exact artifact; bundle => HEAD =
       admitted head and origin/<base> = admitted base; synthetic => HEAD tree =
@@ -144,6 +155,15 @@ Sealed candidate checkout (repository artifact)
     - the primary has network gh/curl/GitHub API; the candidate only the sealed
       snapshot tools and the local checkout;
     - the candidate lacks WebSearch/WebFetch (protocol deviation webTools);
+    - the candidate lacks the Paperclip projects/connections MCP servers and
+      tools (protocol deviation paperclipBoardMcp);
+    - the candidate cannot publish a comment or formal review (protocol
+      deviation githubPublication);
+    - the candidate lacks every paperclip-assigned app MCP tool, including any
+      web-capable app tool assigned to the primary in future (protocol
+      deviation webCapableMcpApps);
+    - the candidate lacks the shared Hindsight memory tools (protocol
+      deviation sharedMemory);
     - primary "agent_home_with_network_git" is a recorded kind, not a proof
       that the primary actually cloned the admitted head in that run.
 
@@ -283,9 +303,13 @@ Deferred capture failures and denominator accounting
 5. Stage, verify, and retain evidence before any enablement
   Each run uses the persisted arm/head/run namespace, creates HOME atomically,
   tests canary denial and GitHub TCP/443 denial, and appends an immutable receipt
-  to chat_github_review_enrollments.isolation_tests[runId]. A failed probe marks
-  the candidate voided; neither recovery nor tools can revive it. A missing grant
-  starts no probe/provider. Replay cannot overwrite a previous receipt.
+  to chat_github_review_enrollments.isolation_tests[runId]. A failed probe that
+  produced a proof voids the candidate; neither recovery nor tools can revive
+  it. When the probe produces no proof -- an allowed-model-only outage
+  (allowed_model_unavailable) or another infrastructure error -- the candidate
+  is recorded unavailable (github_candidate_isolation_error), not voided.
+  A missing grant starts no probe/provider. Replay cannot overwrite a
+  previous receipt.
   Probe, provider execution and nonce-owned cleanup hold a PostgreSQL advisory
   lease keyed by SSH host/port/principal, using a separate connection so waiting
   candidates do not exhaust the primary pool. Use one canonical host name for all

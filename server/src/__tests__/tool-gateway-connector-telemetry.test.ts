@@ -40,6 +40,25 @@ vi.mock("../telemetry.js", () => ({
   getTelemetryClient: () => ({ track, isRegisteredEventName }),
 }));
 
+// Every gateway emit path calls emitConnectionInvoked as detached background
+// work that never throws, so the afterEach drain can await every emitted
+// promise instead of waiting out a wall-clock quiet window.
+const pendingTelemetryEmits: Array<Promise<void>> = [];
+vi.mock("../services/connector-telemetry.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../services/connector-telemetry.js")>();
+  return {
+    ...actual,
+    emitConnectionInvoked: (
+      ...args: Parameters<typeof actual.emitConnectionInvoked>
+    ) => {
+      const pending = actual.emitConnectionInvoked(...args);
+      pendingTelemetryEmits.push(pending);
+      return pending;
+    },
+  };
+});
+
 // Deterministic reproduction of "post-execution bookkeeping failure": the
 // gateway's success path awaits writeAudit -> logActivity after the succeeded
 // save; failing that call lands in the catch that overwrites the row to
@@ -289,6 +308,18 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
+    // emitConnectionInvoked runs as detached background work (one DB read,
+    // then a track call). An in-flight emit from this test can otherwise land
+    // after track.mockClear() and be counted by the next test, making event
+    // counts order-dependent (TOG-30065). Drain after the deletes: any emit
+    // whose read resolves now finds its rows gone and returns without
+    // emitting, while an already-resolved emit lands here before the clear.
+    // Await the tracked promises rather than a wall-clock quiet window; the
+    // emitter never rejects, but allSettled keeps the drain safe regardless.
+    while (pendingTelemetryEmits.length > 0) {
+      await Promise.allSettled(pendingTelemetryEmits.splice(0));
+    }
+    track.mockClear();
   });
 
   afterAll(async () => {

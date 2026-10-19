@@ -103,7 +103,10 @@ to another open record of the same issue — it archives the unbound
 orphan with a conditional write (`status = 'unrealized'` and
 `closed_at IS NULL`) and leaves the issue binding untouched, so the
 orphan never blocks a later allocation; this is also the cleanup path
-the PATCH 409 points at. Any other binding change keeps the
+the PATCH 409 points at. If the issue was rebound to a record that is
+not an open allocation of the same issue (another issue's or a shared
+workspace), clear the issue's `executionWorkspaceId` and call rollback
+again. Any other binding change keeps the
 `binding_conflict` deny (409), as do records that are not this issue's
 open allocation. Realized workspaces refuse with
 `workspace_not_unrealized` (409) and close through the normal workspace
