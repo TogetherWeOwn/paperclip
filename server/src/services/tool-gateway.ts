@@ -2651,6 +2651,30 @@ export function createToolGatewayService(
     };
   }
 
+  async function prepareGatewayResultDelivery(input: Parameters<typeof prepareToolResultDelivery>[0] & {
+    scope: ToolGatewaySession;
+    tool: ToolGatewayDescriptor;
+    parameters?: unknown;
+  }) {
+    let resultMaxBytes: number | undefined;
+    let configUnavailable = false;
+    if (input.originalSizeBytes > 1024 && input.scope.runId && input.scope.agentId) {
+      try {
+        resultMaxBytes = await policyService.resolveResultMaxBytes(policyInputForTool({
+          session: input.scope, tool: input.tool, parameters: input.parameters,
+        }));
+      } catch {
+        // Delivery config cannot fail an already-executed provider action.
+        configUnavailable = true;
+      }
+    }
+    const delivery = await prepareToolResultDelivery({ ...input, resultMaxBytes });
+    return { ...delivery, metadata: {
+      ...delivery.metadata,
+      ...(configUnavailable ? { resultCapConfigUnavailable: true } : {}),
+    } };
+  }
+
   function policyErrorStatus(decision: ToolAccessDecision) {
     if (decision.decision === "rate_limited") return 429;
     return 403;
@@ -8021,10 +8045,11 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
-      const delivery = await prepareToolResultDelivery({
+      const delivery = await prepareGatewayResultDelivery({
         scope: session,
         invocationId: invocation.id,
         tool,
+        parameters,
         value: resultValidation.value,
         originalSizeBytes: resultValidation.summary.sizeBytes,
       });
@@ -10570,10 +10595,11 @@ export function createToolGatewayService(
             { execution: connectedMcpExecution?.execution },
           );
         }
-        const delivery = await prepareToolResultDelivery({
+        const delivery = await prepareGatewayResultDelivery({
           scope: session,
           invocationId,
           tool,
+          parameters: effectiveParameters,
           value: resultValidation.value,
           originalSizeBytes: resultValidation.summary.sizeBytes,
         });
@@ -11018,10 +11044,11 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
-        const delivery = await prepareToolResultDelivery({
+        const delivery = await prepareGatewayResultDelivery({
           scope: sessionLike,
           invocationId,
           tool,
+          parameters: requestedParameters,
           value: resultValidation.value,
           originalSizeBytes: resultValidation.summary.sizeBytes,
         });

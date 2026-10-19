@@ -8,9 +8,10 @@ cap. JSON escaping and UTF-8 boundaries count toward that budget. Plugin result
 envelopes retain their plugin identity and replace only the result body. A capped
 response is a delivery wrapper, not an instance of the tool's original output
 schema: its structured content contains the spill pointer rather than partial
-provider data. Consumers that require the original typed result must read and
-parse the complete JSON spill. The footer's byte count describes that JSON,
-including quotes and escapes for a top-level string.
+provider data. Consumers that require the original typed result must read the
+complete spill. Objects and arrays are saved as JSON; a top-level string is saved
+as raw UTF-8 text. The footer reports the original serialized result byte count,
+which can differ from the spill's file size because of JSON quoting or redaction.
 
 This applies to ordinary run-bound gateway calls and direct plugin calls. It
 includes GitHub action lists, commit lists, pull-request lists, file reads,
@@ -26,9 +27,19 @@ reviewer protocol's `read_file` is also exempt. Exemptions use canonical upstrea
 tool identity, not a display title. Caps never remove the reviewer's full diff.
 Normal secret redaction and prompt-injection validation still apply.
 
-## Instance configuration
+## Profile and instance configuration
 
-The server reads these optional environment settings:
+A matching include entry in an effective tool profile can set
+`conditions.resultMaxBytes` to an integer cap. Existing selector, actor, argument
+and context conditions must match. An excluded profile does not supply a cap.
+When several valid entries match, the smallest positive cap wins; zero means
+unlimited only when no positive cap matches. Profile caps override instance
+settings but never the mandatory reviewer exemptions. This is delivery
+configuration, not an authorization grant. If profile lookup fails after provider
+execution, instance settings apply and `metadata.resultCapConfigUnavailable=true`
+makes that degradation visible without replaying the action.
+
+The server also reads these optional environment settings:
 
 - `PAPERCLIP_TOOL_RESULT_MAX_BYTES`: default cap, initially `16384`.
 - `PAPERCLIP_TOOL_RESULT_CAPS`: a JSON object of per-tool overrides.

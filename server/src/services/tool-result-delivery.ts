@@ -29,8 +29,7 @@ const scopeKey = (scope: ToolResultScope) => JSON.stringify([scope.companyId, sc
 export function registerToolResultSpillWriter(scope: ToolResultScope, writer: SpillWriter) {
   if (!scope.agentId || !scope.runId) throw new Error("Tool-result writer requires a run binding");
   const key = scopeKey(scope);
-  // A same-run controller resume can replace its writer. The returned cleanup
-  // is identity-checked so the old owner cannot unregister the successor.
+  if (spillWriters.has(key)) throw new Error("Tool-result writer already registered for run");
   spillWriters.set(key, writer);
   return () => {
     if (spillWriters.get(key) === writer) spillWriters.delete(key);
@@ -76,10 +75,12 @@ function configuredCap(value: unknown): number | undefined {
     (cap === 0 || (cap >= 1024 && cap <= MAX_CONFIGURED_BYTES)) ? cap : undefined;
 }
 
-export function resolveToolResultCap(tool: ResultTool, env = process.env): number {
+export function resolveToolResultCap(tool: ResultTool, env = process.env, resultMaxBytes?: number): number {
   const name = (tool.upstreamToolName ?? tool.name).replaceAll("-", "_");
   // These are the reviewer protocol's canonical reads, not tool display labels.
   if (name === "read_pull_request" || (tool.providerType === "paperclip_github_chat" && name === "read_file")) return 0;
+  const profileCap = configuredCap(resultMaxBytes);
+  if (profileCap !== undefined) return profileCap;
   let overrides: Record<string, unknown> = {};
   try {
     const parsed: unknown = JSON.parse(env.PAPERCLIP_TOOL_RESULT_CAPS ?? "{}");
@@ -137,11 +138,12 @@ export async function prepareToolResultDelivery(input: {
   tool: ResultTool;
   value: unknown;
   originalSizeBytes: number;
+  resultMaxBytes?: number;
 }) {
   // Defense in depth for string/array roots as well as nested text content.
   const value = redactEventPayload({ result: input.value })!.result;
   const size = (result: unknown) => Buffer.byteLength(JSON.stringify(result) ?? "null", "utf8");
-  const cap = resolveToolResultCap(input.tool);
+  const cap = resolveToolResultCap(input.tool, process.env, input.resultMaxBytes);
   const unchanged = (reason?: string) => ({
     value,
     metadata: { truncated: false, deliveredSizeBytes: size(value), ...(reason ? { resultCapSkipped: reason } : {}) },
@@ -155,9 +157,10 @@ export async function prepareToolResultDelivery(input: {
   if (text === null) return unchanged("non_text_result");
   const writer = spillWriters.get(scopeKey(input.scope));
   if (!writer) return unchanged("spill_writer_unavailable");
+  const spillText = typeof value === "string" ? value : JSON.stringify(value);
   let file: string;
   try {
-    file = await writer({ invocationId: input.invocationId, text: JSON.stringify(value) });
+    file = await writer({ invocationId: input.invocationId, text: spillText });
   } catch {
     // The provider may already have made a write. Do not fail or replay it just
     // because a private spill could not be made; make degradation measurable.
