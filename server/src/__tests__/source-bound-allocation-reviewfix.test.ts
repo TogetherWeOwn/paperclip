@@ -21,8 +21,10 @@
  * Finding 3 (round 4): an unbound orphaned allocation must keep an exit.
  * Rollback archives a still-open record whose issue binding moved on
  * without touching the issue binding, so re-allocation succeeds after
- * the cleanup; heartbeat fails closed on `realization_incomplete`
- * instead of inserting a second source-bound row.
+ * the cleanup. Heartbeat failing closed on `realization_incomplete`
+ * instead of inserting a second source-bound row is covered by review
+ * only; no test drives that branch. The helper-side deny is pinned in
+ * the contract suite (`source-bound-workspace-allocation.contract.test.ts`).
  */
 import express from "express";
 import request from "supertest";
