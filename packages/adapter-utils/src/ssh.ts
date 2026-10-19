@@ -6,6 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import {
+  assertNativeSshLaunchAuthority,
+  isNativeSshAuthorityRequired,
+  type NativeSshSignedEnvelope,
+} from "./host-executor.js";
 import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remote-execution-env.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -1564,48 +1569,89 @@ export async function runSshCommand(
   }
 }
 
+// Source the login profiles first, then run `env KEY=VAL cmd` so
+// user-supplied identity overrides win over anything a profile re-exports.
+// The SSH target is an operator-configured host, not a Paperclip sandbox
+// image, so it can expose `node` or an agent CLI only through a login
+// profile; a non-login SSH command would miss that PATH. Source
+// `/etc/profile` first so a host that exposes the PATH through
+// `/etc/profile.d` scripts still resolves node and the agent CLI. The script
+// no longer sources `nvm.sh`; a profile that adds nvm still runs.
+// .bash_profile typically sources .bashrc itself; only source .bashrc
+// directly when no .bash_profile exists, so a host that adds nvm in
+// .bashrc still resolves node without a double-run of the setup.
+const SSH_LOGIN_PROFILE_LINES = [
+  'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+];
+
+function sshRemoteCommandParts(input: { command: string; args: string[] }): string {
+  return [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
+}
+
+/**
+ * The environment an SSH agent launch actually sends, after the size budget.
+ * The whole remote env is folded into a single `sh -c` argv string, so the
+ * assembled env block needs a per-argument byte budget as well (E2BIG).
+ * Reserve the env-independent part of the argument (profile lines, the
+ * quoted command and args, wrappers) so a large command shrinks the env
+ * budget instead of overflowing the assembled argument. Pure: no key
+ * material or connection, so an authority can be issued for its result.
+ */
+export function sshLaunchEnv(input: {
+  spec: Pick<SshRemoteExecutionSpec, "remoteCwd">;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}): { env: Record<string, string>; dropped: string[] } {
+  const envFreeScript = [
+    ...SSH_LOGIN_PROFILE_LINES,
+    `cd ${shellQuote(input.spec.remoteCwd)}`,
+    `exec env  ${sshRemoteCommandParts(input)}`,
+  ].join(" && ");
+  const reservedArgBytes = 6 + sshScriptOuterQuotedBytes(envFreeScript);
+  return budgetSshRemoteEnvWithReport(input.env, { reservedArgBytes });
+}
+
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
   command: string;
   args: string[];
   env: Record<string, string>;
+  /**
+   * Executor-issued proof that this exact command, argv, environment and
+   * remote target was signed for this launch. Checked and spent before any
+   * argv, environment or key material is touched, so a refused launch leaves
+   * nothing behind. Required when the server requires native SSH authority.
+   */
+  authority?: NativeSshSignedEnvelope | null;
 }): Promise<{
   command: string;
   args: string[];
   cleanup: () => Promise<void>;
 }> {
-  // Source the login profiles first, then run `env KEY=VAL cmd` so
-  // user-supplied identity overrides win over anything a profile re-exports.
-  // The SSH target is an operator-configured host, not a Paperclip sandbox
-  // image, so it can expose `node` or an agent CLI only through a login
-  // profile; a non-login SSH command would miss that PATH. Source
-  // `/etc/profile` first so a host that exposes the PATH through
-  // `/etc/profile.d` scripts still resolves node and the agent CLI. The script
-  // no longer sources `nvm.sh`; a profile that adds nvm still runs.
-  // .bash_profile typically sources .bashrc itself; only source .bashrc
-  // directly when no .bash_profile exists, so a host that adds nvm in
-  // .bashrc still resolves node without a double-run of the setup.
-  const profileLines = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-  ];
-  // The whole remote env is folded into a single `sh -c` argv string, so the
-  // assembled env block needs a per-argument byte budget as well (E2BIG).
-  // Reserve the env-independent part of the argument (profile lines, the
-  // quoted command and args, wrappers) so a large command shrinks the env
-  // budget instead of overflowing the assembled argument.
-  const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  const envFreeScript = [
-    ...profileLines,
-    `cd ${shellQuote(input.spec.remoteCwd)}`,
-    `exec env  ${remoteCommandParts}`,
-  ].join(" && ");
-  const reservedArgBytes = 6 + sshScriptOuterQuotedBytes(envFreeScript);
-  const { env: launchEnv, dropped } = budgetSshRemoteEnvWithReport(input.env, {
-    reservedArgBytes,
-  });
+  const { env: launchEnv, dropped } = sshLaunchEnv(input);
+  // The authority covers the environment the remote command actually gets,
+  // after the size budget, so it is checked here and not on `input.env`.
+  if (input.authority != null || isNativeSshAuthorityRequired()) {
+    assertNativeSshLaunchAuthority(
+      input.authority,
+      {
+        command: input.command,
+        args: input.args,
+        remote: {
+          host: input.spec.host,
+          port: input.spec.port,
+          username: input.spec.username,
+          remoteCwd: input.spec.remoteCwd,
+        },
+        env: launchEnv,
+      },
+      { consume: true },
+    );
+  }
   if (dropped.length) {
     console.warn(
       { droppedKeys: dropped },
@@ -1617,13 +1663,14 @@ export async function buildSshSpawnTarget(input: {
       throw new Error(`Invalid SSH environment variable key: ${key}`);
     }
   }
+  const remoteCommandParts = sshRemoteCommandParts(input);
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
   const envArgs = Object.entries(launchEnv)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteScript = [
-    ...profileLines,
+    ...SSH_LOGIN_PROFILE_LINES,
     `cd ${shellQuote(input.spec.remoteCwd)}`,
     envArgs.length > 0
       ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`

@@ -1276,6 +1276,16 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       await expect(assertManagedAiProjectAuth({ args: ["--api-key=override"] }, "xai", target)).rejects.toThrow("overrides");
     } finally { execute.mockRestore(); }
   });
+  it("launches the remote project-auth probe under the run's native SSH executor", async () => {
+    const execute = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess");
+    const target = { kind: "remote", transport: "ssh", remoteCwd: "/srv/project" } as Parameters<typeof assertManagedAiProjectAuth>[2];
+    const hostExecutor = { kind: "native_ssh" as const, authorizeLaunch: vi.fn() };
+    try {
+      execute.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", signal: null, timedOut: false } as Awaited<ReturnType<typeof executionTarget.runAdapterExecutionTargetProcess>>);
+      await expect(assertManagedAiProjectAuth({}, "openai", target, hostExecutor)).resolves.toBeUndefined();
+      expect(execute.mock.calls[0][4]).toMatchObject({ hostExecutor });
+    } finally { execute.mockRestore(); }
+  });
   it("keeps personal defaults separate and does not replace the first default", async () => {
     const first = await create("alice", "Alice first");
     await create("alice", "Alice second");
@@ -1945,6 +1955,44 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     } finally {
       delivery.mockRestore(); providerRequest.mockRestore(); probe.mockRestore(); runtime.mockRestore(); resolveTarget.mockRestore();
       await settings.update({ defaultEnvironmentId: previous.defaultEnvironmentId });
+    }
+  });
+
+  it("refuses runner account adoption on SSH while native SSH authority is required", async () => {
+    // Adoption validation probes the agent's environment outside any run, so
+    // the managed-environment probe guard refuses it with 422 before any
+    // adapter probe or provider key check. The SSH test context resolves its
+    // target without a lease, so only the target resolver is stubbed.
+    const { agentRoutes } = await import("../routes/agents.js");
+    const targetModule = await import("../services/environment-execution-target.js");
+    const { requireServerAdapter } = await import("../adapters/index.js");
+    const [environment] = await db.insert(environments).values({ name: "Adoption SSH", driver: "ssh", config: { host: "ssh.example.test" } }).returning();
+    const id = randomUUID();
+    await db.insert(agents).values({ id, companyId, name: "SSH adoption", adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.6-sol" }, defaultEnvironmentId: environment.id });
+    const account = await service.save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "SSH adoption account", apiKey: "fixture-adoption-key", agentIds: [id], allAgents: false }, "fixture-adoption-key");
+    await service.setDefault(companyId, "alice", account.grantId);
+    const sshTarget = { kind: "remote", transport: "ssh", remoteCwd: "/srv/paperclip/run", spec: { host: "ssh.example.test" } };
+    const resolveTarget = vi.spyOn(targetModule, "resolveEnvironmentExecutionTarget").mockResolvedValue(sshTarget as never);
+    const probe = vi.spyOn(requireServerAdapter("paperclip_runner"), "testEnvironment").mockImplementation(async () => ({ adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [] }));
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: "alice", companyIds: [companyId] }; next(); });
+    app.use("/api", agentRoutes(db));
+    app.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => { res.status(error.status ?? 500).json({ error: error.message }); });
+    const selected = { provider: "openai", method: "api_key", mode: "responsible_user" } as const;
+    const providerRequest = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(null, { status: 200 }));
+    const previousSwitch = process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY;
+    process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY = "required";
+    try {
+      const res = await request(app).patch(`/api/agents/${id}`).send({ runtimeConfig: { aiConnection: selected } });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(probe).not.toHaveBeenCalled();
+      expect(providerRequest).not.toHaveBeenCalled();
+      expect((await db.select().from(agents).where(eq(agents.id, id)))[0].runtimeConfig.aiConnection).toBeUndefined();
+    } finally {
+      if (previousSwitch === undefined) delete process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY;
+      else process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY = previousSwitch;
+      providerRequest.mockRestore(); probe.mockRestore(); resolveTarget.mockRestore();
     }
   });
 
