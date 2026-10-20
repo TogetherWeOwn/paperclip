@@ -289,6 +289,84 @@ describePostgres("queued-run claim cancellation", () => {
     expect(maxInFlight).toBe(1);
   }, 45_000);
 
+  it("defers promoted interaction wake starts until the claim lock is released", async () => {
+    const { companyId, agentId, rejected, first, second } = await seedQueue();
+    const commentId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rejected.issueId,
+      authorUserId: "board-user",
+      authorType: "user",
+      body: "Explain the paused work.",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      reason: "issue_commented",
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      payload: {
+        issueId: rejected.issueId,
+        _paperclipWakeContext: {
+          wakeReason: "issue_commented",
+          source: "issue.comment",
+          wakeCommentId: commentId,
+        },
+      },
+    });
+    const warn = vi.spyOn(logger, "warn");
+    const started = performance.now();
+    await heartbeat.resumeQueuedRuns();
+    const elapsedMs = performance.now() - started;
+    const [wake] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId));
+    expect(wake?.runId).toBeTruthy();
+    if (!wake?.runId)
+      throw new Error("Deferred interaction wake was not promoted");
+    const promotedRunId = wake.runId;
+    runIssues.set(promotedRunId, rejected.issueId);
+    expect(elapsedMs).toBeLessThan(5_000);
+    await waitFor(() => dispatched.length > 0);
+    expect(dispatched).toEqual([first.runId]);
+    const running = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    expect(running.map((run) => run.id)).toEqual([first.runId]);
+    const [promoted] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, promotedRunId));
+    expect(promoted?.status).toBe("queued");
+    expect(
+      warn.mock.calls.filter((args) =>
+        args.some(
+          (arg) =>
+            typeof arg === "string" &&
+            arg.includes("continuing queued-run start"),
+        ),
+      ),
+    ).toEqual([]);
+
+    gate.resolve();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    // Keep the existing queue order and dispatch every successor exactly once.
+    expect(dispatched).toEqual([first.runId, second.runId, promotedRunId]);
+    expect(maxInFlight).toBe(1);
+  }, 45_000);
+
   it("still dispatches a successor after cancellation outside the scheduler claim loop", async () => {
     const { rejected, first, second } = await seedQueue();
     await heartbeat.cancelRun(rejected.runId, "Cancelled by test operator");

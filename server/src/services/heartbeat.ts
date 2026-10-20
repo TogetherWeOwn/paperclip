@@ -10081,7 +10081,10 @@ export function heartbeatService(
   // the original release function did before its writes moved into that
   // module: publish + dispatch a promoted or recovery run, log a reopened
   // issue's activity entry.
-  async function applyWakeQueuePostCommitEffects(effects: WakeQueuePostCommitEffect[]) {
+  async function applyWakeQueuePostCommitEffects(
+    effects: WakeQueuePostCommitEffect[],
+    deferredQueueStarts?: Set<string>,
+  ) {
     for (const effect of effects) {
       if (effect.kind === "conversation_retry_requested") {
         const [source] = await db.select().from(heartbeatRuns).where(and(
@@ -10106,7 +10109,11 @@ export function heartbeatService(
             wakeupRequestId: effect.run.wakeupRequestId,
           },
         });
-        await startNextQueuedRunForAgent(effect.run.agentId);
+        if (deferredQueueStarts) {
+          deferredQueueStarts.add(effect.run.agentId);
+        } else {
+          await startNextQueuedRunForAgent(effect.run.agentId);
+        }
       } else {
         await logActivity(db, {
           companyId: effect.companyId,
@@ -17514,6 +17521,7 @@ export function heartbeatService(
     dailyCapBlock: NonNullable<
       Awaited<ReturnType<typeof getHeartbeatDailyCapBlock>>
     >,
+    deferredQueueStarts?: Set<string>,
   ) {
     const now = new Date();
     const reason =
@@ -17554,6 +17562,7 @@ export function heartbeatService(
 
     await releaseIssueExecutionAndPromote(cancelled, {
       suppressImmediateRecovery: true,
+      deferredQueueStarts,
     });
 
     return cancelled;
@@ -17962,7 +17971,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
-    cancellationOptions: { skipQueuedRunStart?: boolean } = {},
+    cancellationOptions: { deferredQueueStarts?: Set<string> } = {},
   ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -18010,7 +18019,7 @@ export function heartbeatService(
       },
     );
     if (dailyCapBlock) {
-      await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
+      await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock, cancellationOptions.deferredQueueStarts);
       return null;
     }
 
@@ -20607,6 +20616,7 @@ export function heartbeatService(
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
+    const deferredQueueStarts = new Set<string>();
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -20727,7 +20737,7 @@ export function heartbeatService(
           // This loop already advances past rejected candidates while holding
           // the start lock. Cancellation must not recursively acquire that lock.
           const claimed = await claimQueuedRun(queuedRun, companyAgents, {
-            skipQueuedRunStart: true,
+            deferredQueueStarts,
           });
           if (claimed) claimedRuns.push(claimed);
         } catch (error) {
@@ -20795,6 +20805,17 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+    }).finally(async () => {
+      // Release effects can queue runs that were not in the claim snapshot.
+      // Start them only after the lock is released, with fresh slot counts.
+      for (const nextAgentId of deferredQueueStarts) {
+        try {
+          await startNextQueuedRunForAgent(nextAgentId);
+        } catch (err) {
+          // Do not replace the original claim result or abandon other agents.
+          logger.error({ err, agentId: nextAgentId }, "deferred queued-run start failed");
+        }
+      }
     });
   }
 
@@ -27256,7 +27277,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; deferredQueueStarts?: Set<string> } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -27265,7 +27286,7 @@ export function heartbeatService(
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
       });
-      await applyWakeQueuePostCommitEffects(postCommitEffects);
+      await applyWakeQueuePostCommitEffects(postCommitEffects, options.deferredQueueStarts);
       const completed = await getRun(run.id);
       const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
         ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
@@ -29954,7 +29975,7 @@ export function heartbeatService(
   async function cancelRunInternal(
     runId: string,
     reason = "Cancelled by control plane",
-    options: CancelRunOptions & { skipQueuedRunStart?: boolean } = {},
+    options: CancelRunOptions & { deferredQueueStarts?: Set<string> } = {},
   ) {
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
@@ -30233,11 +30254,14 @@ export function heartbeatService(
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
+          deferredQueueStarts: options.deferredQueueStarts,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        if (!options.skipQueuedRunStart) {
+        if (options.deferredQueueStarts) {
+          options.deferredQueueStarts.add(run.agentId);
+        } else {
           await startNextQueuedRunForAgent(run.agentId);
         }
       }
