@@ -21,21 +21,24 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..dc24963ce2dd0a219f366f80ba984754
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc93248ec8c9c6 100644
+index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9e878885b661cc677acb4f60a20e1b105e9ac9fc 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
-@@ -207,5 +207,9 @@ function Postgres(a, b) {
+@@ -206,8 +206,12 @@ function Postgres(a, b) {
+       ? open.shift()
        : await new Promise((resolve, reject) => {
          const query = { reserve: resolve, reject }
 -        queries.push(query)
 -        closed.length && connect(closed.shift(), query)
-+        if (queries.length < options.max_queue) {
++        if (closed.length || queries.length < options.max_queue) {
 +          queries.push(query)
 +          closed.length && connect(closed.shift(), query)
 +        } else {
 +          query.reject(Errors.generic('QUERY_QUEUE_FULL', 'pending query queue is full (' + options.max_queue + ')'))
 +        }
        })
+ 
+     move(c, reserved)
 @@ -216,8 +220,19 @@ function Postgres(a, b) {
        : move(c, reserved)
      c.reserved.release = true
@@ -95,9 +98,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc9324
          c.queue === full
            ? queries.push(q)
            : c.execute(q) || move(c, full)
-@@ -336,9 +361,11 @@ function Postgres(a, b) {
-     if (closed.length)
-       return connect(closed.shift(), query)
+@@ -338,7 +363,9 @@ function Postgres(a, b) {
  
      busy.length
        ? go(busy.shift(), query)
@@ -108,8 +109,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc9324
    }
  
    function go(c, query) {
-@@ -443,8 +470,8 @@ function parseOptions(a, b) {
-   query.sslmode && (query.ssl = query.sslmode, delete query.sslmode)
+@@ -444,7 +471,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -126,6 +126,20 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc9324
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
+diff --git a/cjs/src/queue.js b/cjs/src/queue.js
+index 8438f5da92cf7637d98a33491d75c75b1c817c25..71116de79304538321e455b9607a54afeb1afef3 100644
+--- a/cjs/src/queue.js
++++ b/cjs/src/queue.js
+@@ -21,6 +21,9 @@ function Queue(initial = []) {
+       if (index === xs.length) {
+         index = 0
+         xs = []
++      } else if (index > 1024) {
++        xs = xs.slice(index)
++        index = 0
+       } else {
+         xs[index - 1] = undefined
+       }
 diff --git a/src/connection.js b/src/connection.js
 index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..c95c326a2747c680c2c22b04b1c5f2e27a4e8c90 100644
 --- a/src/connection.js
@@ -149,21 +163,24 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..c95c326a2747c680c2c22b04b1c5f2e2
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..f0888986add8ba02c8853f792ae42dd1cec88c82 100644
+index c7fba3dace20173f4cb13f3f138bb6d213b43683..95882704c8a5b06aba49e0afaf64fc847b40bf01 100644
 --- a/src/index.js
 +++ b/src/index.js
-@@ -207,5 +207,9 @@ function Postgres(a, b) {
+@@ -206,8 +206,12 @@ function Postgres(a, b) {
+       ? open.shift()
        : await new Promise((resolve, reject) => {
          const query = { reserve: resolve, reject }
 -        queries.push(query)
 -        closed.length && connect(closed.shift(), query)
-+        if (queries.length < options.max_queue) {
++        if (closed.length || queries.length < options.max_queue) {
 +          queries.push(query)
 +          closed.length && connect(closed.shift(), query)
 +        } else {
 +          query.reject(Errors.generic('QUERY_QUEUE_FULL', 'pending query queue is full (' + options.max_queue + ')'))
 +        }
        })
+ 
+     move(c, reserved)
 @@ -216,8 +220,19 @@ function Postgres(a, b) {
        : move(c, reserved)
      c.reserved.release = true
@@ -223,9 +240,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..f0888986add8ba02c8853f792ae42dd1
          c.queue === full
            ? queries.push(q)
            : c.execute(q) || move(c, full)
-@@ -336,9 +361,11 @@ function Postgres(a, b) {
-     if (closed.length)
-       return connect(closed.shift(), query)
+@@ -338,7 +363,9 @@ function Postgres(a, b) {
  
      busy.length
        ? go(busy.shift(), query)
@@ -236,8 +251,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..f0888986add8ba02c8853f792ae42dd1
    }
  
    function go(c, query) {
-@@ -443,8 +470,8 @@ function parseOptions(a, b) {
-   query.sslmode && (query.ssl = query.sslmode, delete query.sslmode)
+@@ -444,7 +471,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -254,31 +268,11 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..f0888986add8ba02c8853f792ae42dd1
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-diff --git a/cjs/src/queue.js b/cjs/src/queue.js
-index 8438f5da92cf7637d98a33491d75c75b1c817c25..8438f5da92cf7637d98a33491d75c75b1c817c25 100644
---- a/cjs/src/queue.js
-+++ b/cjs/src/queue.js
-@@ -18,9 +18,12 @@ function Queue(initial = []) {
-     shift: () => {
-       const out = xs[index++]
- 
-       if (index === xs.length) {
-         index = 0
-         xs = []
-+      } else if (index > 1024) {
-+        xs = xs.slice(index)
-+        index = 0
-       } else {
-         xs[index - 1] = undefined
-       }
 diff --git a/src/queue.js b/src/queue.js
-index c4ef97164f057db99dce1b9af3401dbb1af37e31..c4ef97164f057db99dce1b9af3401dbb1af37e31 100644
+index c4ef97164f057db99dce1b9af3401dbb1af37e31..3630e90da8217ba24f4d407c6fd132897b542162 100644
 --- a/src/queue.js
 +++ b/src/queue.js
-@@ -18,9 +18,12 @@ function Queue(initial = []) {
-     shift: () => {
-       const out = xs[index++]
- 
+@@ -21,6 +21,9 @@ function Queue(initial = []) {
        if (index === xs.length) {
          index = 0
          xs = []
