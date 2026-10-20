@@ -1846,6 +1846,7 @@ export {
   assignmentAuthorizationPolicySchema,
   protectedAgentAuthorizationPolicySchema,
   trustAuthorizationPolicySchema,
+  sourceTrustMetadataSchema,
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSettings,
   type CreateSmokeRun,

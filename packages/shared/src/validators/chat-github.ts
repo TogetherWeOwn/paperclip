@@ -89,6 +89,9 @@ export const githubChatConfigurationSchema = z
     responsibleUserId: z.string().min(1),
     memberAccess: z.enum(["all_linked", "selected"]),
     people: z.array(githubAllowedPersonSchema).max(500),
+    trustedBotAuthorIds: z.array(githubIdSchema).max(100)
+      .refine(ids => new Set(ids).size === ids.length, "Trusted bot author IDs must be unique")
+      .optional(),
     defaults: githubReviewPolicySchema,
     repositories: z
       .record(githubIdSchema, githubReviewPolicySchema.partial())

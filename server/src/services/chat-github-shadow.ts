@@ -15,7 +15,7 @@ import { withGitHubPrimaryBlindingAdmission } from "./chat-github-primary-blindi
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
-import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
+import { initializeGitHubReviewTaskTrust, githubReviewDeliveryTrust } from "./chat-github-task-trust.js";
 import { githubComparisonEligibility, githubPrimaryInputSource, githubRunComparisonEligibility, GITHUB_SHADOW_PROTOCOL } from "./chat-github-comparison.js";
 import { githubPairRunEvidence } from "./chat-github-run-evidence.js";
 
@@ -239,7 +239,9 @@ export async function admitGitHubPair(tx: Tx, input: {
     endpointId: input.endpoint.id, repositoryId: e.repositoryId, pullNumber: e.pullNumber,
   });
   const roundOrdinal = Number(prior?.ordinal ?? 0) + 1;
-  const [primaryIssue] = await tx.select({ sourceTrust: issues.sourceTrust }).from(issues).where(eq(issues.id, input.conversation.issueId));
+  // Capture can run after another trigger changed the primary issue. Only the
+  // originating delivery's decision describes this admission; legacy is low.
+  const executionTrust = githubReviewDeliveryTrust(delivery.normalizedEvent.githubExecutionTrust);
   const previousAssessments: NonNullable<GitHubReviewEnrollmentEnvelope["previousAssessments"]> = {};
   for (const armId of ["primary", ...selected.map(a => a.id)]) {
     previousAssessments[armId] = null;
@@ -264,8 +266,9 @@ export async function admitGitHubPair(tx: Tx, input: {
       primaryToolPolicy: primaryAgent ? { adapterType: primaryAgent.adapterType,
         engine: typeof primaryAgent.adapterConfig.engine === "string" ? primaryAgent.adapterConfig.engine : null,
         configDigest: digest(primaryAgent.adapterConfig), effectiveToolsVerified: false } : undefined,
-      request: input.request, lowTrust: primaryIssue?.sourceTrust?.preset === "low_trust_review", policy: input.policy, authority: input.authority,
-      snapshot: input.snapshot, snapshotFailure: input.snapshotFailure, previousAssessments,
+      request: input.request, lowTrust: executionTrust?.lowTrust ?? true, policy: input.policy, authority: input.authority,
+      snapshot: executionTrust?.denied ? undefined : input.snapshot,
+      snapshotFailure: executionTrust?.denied ?? input.snapshotFailure, previousAssessments,
       normalizedEvent,
       conversation: { resourceId: input.conversation.resourceId, externalConversationId: input.conversation.externalConversationId,
         externalThreadId: input.conversation.externalThreadId, externalLabel: input.conversation.externalLabel,
@@ -621,8 +624,14 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
         if (!(await githubChatPrincipalAccess(tx, endpoint, enrollment.principalId))?.allowed) return defer("candidate_principal_unavailable");
         const e = enrollment.envelope;
         const event = enrollment.envelope.event;
+        const pinnedTrust = githubReviewDeliveryTrust(e.normalizedEvent.githubExecutionTrust);
+        if (pinnedTrust?.denied) {
+          await tx.update(chatGitHubReviewCandidates).set({ state: "unavailable", lastError: pinnedTrust.denied,
+            nextAttemptAt: null, updatedAt: new Date() }).where(eq(chatGitHubReviewCandidates.id, candidate.id));
+          return null;
+        }
         const scope = `shadow:${candidate.armId}:${enrollment.id}`;
-        const issue = await issueService(db).create(candidate.companyId, {
+        let issue = await issueService(db).create(candidate.companyId, {
           title: `PR #${enrollment.pullNumber}: ${event.title}`, description: `Started from GitHub: ${e.conversation.externalLabel}`,
           status: "todo", priority: "medium", assigneeAgentId: candidate.agentId,
           createdByUserId: e.authority.responsibleUserId ?? e.authority.sponsorUserId,
@@ -630,8 +639,8 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
           originKind: "chat_channel", originId: scope, idempotencyKey: scope,
         }, tx);
         const [agent] = await tx.select().from(agents).where(eq(agents.id, candidate.agentId));
-        const lowTrust = e.lowTrust || e.authority.guest || agent?.permissions?.trustPreset === "low_trust_review";
-        if (lowTrust) await initializeGitHubReviewTaskTrust(tx, issue, candidate.agentId);
+        const lowTrust = e.lowTrust || !pinnedTrust || pinnedTrust.lowTrust || agent?.permissions?.trustPreset === "low_trust_review";
+        if (lowTrust) issue = { ...issue, ...await initializeGitHubReviewTaskTrust(tx, issue, candidate.agentId) };
         const [conversation] = await tx.insert(chatConversations).values({
           ...e.conversation, companyId: candidate.companyId, endpointId: endpoint.id, issueId: issue.id,
           executionScope: scope, githubShadowLabel: candidate.shadowLabel, state: "active", lastActivityAt: new Date(),
@@ -642,6 +651,8 @@ export async function recoverGitHubReviewCandidates(db: Db, input: {
           principalId: enrollment.principalId, providerEventId: `paired:${enrollment.id}:${candidate.armId}`, deduplicationKey: scope,
           eventKind: origin!.eventKind, githubShadowLabel: candidate.shadowLabel, state: "processed", processedAt: new Date(),
           normalizedEvent: { ...e.normalizedEvent, githubAuthority: e.authority, githubPairedCandidate: candidate.id,
+            // Keep sender text quarantined, but pin this candidate's OWN boundary.
+            githubExecutionTrust: { version: 1, lowTrust, executionPolicy: issue.executionPolicy ?? null },
             // Candidate reads/review validation must use this frozen event.
             githubPairedEvent: e.event, githubPairedPolicy: e.policy, githubPairedRevision: enrollment.configurationRevision },
         });

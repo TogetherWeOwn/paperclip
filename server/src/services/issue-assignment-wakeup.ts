@@ -39,6 +39,9 @@ export function queueIssueAssignmentWakeup(input: {
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
   durableChatRequest?: DurableChatWakeupRequest;
+  /** Server-admitted containment follows a wake even if its issue later changes. */
+  executionPolicy?: unknown;
+  allowRunCoalescing?: boolean;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
@@ -55,12 +58,14 @@ export function queueIssueAssignmentWakeup(input: {
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
+      ...(input.allowRunCoalescing !== undefined ? { allowRunCoalescing: input.allowRunCoalescing } : {}),
       ...(input.durableChatRequest
         ? { durableChatRequest: input.durableChatRequest }
         : {}),
       contextSnapshot: {
         issueId: input.issue.id,
         source: input.contextSource,
+        ...(input.executionPolicy !== undefined ? { executionPolicy: input.executionPolicy } : {}),
         ...(input.taskKey ? { taskKey: input.taskKey } : {}),
         ...(input.wakeCommentId ? { wakeCommentId: input.wakeCommentId } : {}),
         ...(input.wakeCommentId && input.attachmentOmissionReasons

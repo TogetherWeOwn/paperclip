@@ -62,6 +62,8 @@ export interface GitHubChatConfiguration {
   responsibleUserId: string;
   memberAccess: "all_linked" | "selected";
   people: GitHubAllowedPerson[];
+  /** Stable GitHub Bot user IDs trusted only as same-repository PR authors. No trigger access. */
+  trustedBotAuthorIds?: string[];
   defaults: GitHubReviewPolicy;
   /** Keys are stable GitHub repository IDs; labels never grant access. */
   repositories: Record<string, Partial<GitHubReviewPolicy>>;
