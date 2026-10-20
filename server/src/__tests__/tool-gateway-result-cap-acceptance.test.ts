@@ -8,8 +8,16 @@ import {
   agents, companies, connectionGrants, createDb, heartbeatRuns, issues,
   toolApplications, toolCallEvents, toolCatalogEntries, toolConnections,
   toolInvocations, toolProfileBindings, toolProfileEntries, toolProfiles,
+  toolActionRequests, toolPolicies,
 } from "@paperclipai/db";
 import { createToolGatewayService } from "../services/tool-gateway.js";
+import { initializeRunIdentity } from "../services/run-identity.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { registerServerAdapter, unregisterServerAdapter, type ServerAdapterModule } from "../adapters/index.js";
+import { createToolResultSpillWriter, prepareToolResultDelivery, registerToolResultSpillWriter } from "../services/tool-result-delivery.js";
+import { HEARTBEAT_RUN_SCRATCH_MARKER } from "../services/run-scratch.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -57,7 +65,7 @@ describeDatabase("gateway result cap integration acceptance", () => {
     if (scratch) await fs.rm(scratch, { recursive: true, force: true });
   });
 
-  async function fixture(toolName: string, content: string, structuredContent?: Record<string, unknown>) {
+  async function fixture(toolName: string, content: string, structuredContent?: Record<string, unknown>, isError = false) {
     vi.stubEnv("PAPERCLIP_TOOL_RESULT_CAPS", "{}");
     vi.stubEnv("PAPERCLIP_TOOL_RESULT_MAX_BYTES", "16384");
     const [company] = await db.insert(companies).values({ name: "Result cap acceptance", issuePrefix: `RC${randomUUID().slice(0, 6)}` }).returning();
@@ -86,7 +94,7 @@ describeDatabase("gateway result cap integration acceptance", () => {
         jsonrpc: "2.0", id: request.id,
         result: request.method === "initialize"
           ? { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "cap-fixture", version: "1" } }
-          : { content: [{ type: "text", text: content }], ...(structuredContent ? { structuredContent } : {}) },
+          : { content: [{ type: "text", text: content }], ...(isError ? { isError: true } : {}), ...(structuredContent ? { structuredContent } : {}) },
       }), { headers: { "content-type": "application/json" } });
     });
     const gateway = createToolGatewayService(db, { toolActionSigningSecret: "result-cap-test-only", remoteHttpRequest });
@@ -95,16 +103,176 @@ describeDatabase("gateway result cap integration acceptance", () => {
     const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.catalogEntryId === entry.id)!;
     expect(tool).toBeDefined();
     const execute = (parameters: Record<string, unknown> = {}) => gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters });
-    return { scope, profile, entry, execute, dispatched, gateway, session, tool };
+    return { scope, issue, profile, entry, execute, dispatched, gateway, session, tool };
   }
 
   async function enableSpills(scope: { companyId: string; agentId: string; runId: string }) {
-    // Dynamic only so baseline dispatch/audit assertions can run before this
-    // new helper exists; missing-helper errors are not counted as behavioral red.
-    const modulePath = "../services/tool-result-delivery.js";
-    const { registerToolResultSpillWriter, createToolResultSpillWriter } = await import(modulePath) as typeof import("../services/tool-result-delivery.js");
     cleanups.push(registerToolResultSpillWriter(scope, createToolResultSpillWriter({ scope, target: null, cwd: scratch, scratchDir: scratch })));
   }
+
+  it.each(["executeTool", "executeApprovedAgentInvocation"])("caps and spills an MCP error through %s without retrying the provider", async (executionPath) => {
+    const token = "ghp_" + "q".repeat(36);
+    const content = `BEGIN ${token}\n${"x".repeat(201 * 1024)}\nEND ${token}`;
+    const sanitized = content.replaceAll(token, REDACTED_EVENT_VALUE);
+    const f = await fixture("read_report", content, undefined, true);
+    await enableSpills(f.scope);
+    if (executionPath === "executeApprovedAgentInvocation") {
+      await initializeRunIdentity(db, {
+        companyId: f.scope.companyId, runId: f.scope.runId, issueId: f.issue.id,
+        responsibleUserId: null, cause: "company_default",
+      });
+      await db.insert(toolPolicies).values({
+        companyId: f.scope.companyId, name: "Ask before report", policyType: "require_approval", selectors: { toolName: f.tool.name },
+      });
+      await expect(f.execute()).rejects.toMatchObject({ reasonCode: "approval_required" });
+      expect(f.dispatched).toHaveLength(0);
+      const [request] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.scope.companyId));
+      expect(request.signedArguments).toEqual(expect.any(String));
+      // Fixture-only decision: keep the real signed payload and route the next
+      // matching call through executeApprovedAgentInvocation, not the normal path.
+      await db.update(toolActionRequests).set({ status: "approved", decidedAt: new Date(), resolvedByUserId: "board-user" })
+        .where(eq(toolActionRequests.id, request.id));
+    }
+    const error = await f.execute().then(() => { throw new Error("MCP isError must reject"); }, (error: unknown) => error) as Error;
+    expect.soft(error).toMatchObject({ status: 502, reasonCode: "tool_error" });
+    expect.soft(Buffer.byteLength(error.message, "utf8")).toBeLessThanOrEqual(16_384);
+    expect.soft(error.message.includes(token), "agent-facing errors must be sanitized").toBe(false);
+    expect(f.dispatched).toEqual([{}]);
+    const saved = error.message.match(/full result saved to (.+); read it with a ranged read/);
+    expect(saved, "MCP errors must pass through delivery before being thrown").not.toBeNull();
+    const normalizedError = (text: string) => ({
+      content: text,
+      data: { content: [{ type: "text", text }], isError: true, transport: "mcp_http", spawnedLocalProcess: false },
+      error: "MCP tool returned an error result",
+    });
+    expect(JSON.parse(await fs.readFile(saved![1]!, "utf8"))).toEqual(normalizedError(sanitized));
+    expect(path.relative(scratch, saved![1]!)).not.toMatch(/^\.\./);
+    expect((await fs.stat(saved![1]!)).mode & 0o777).toBe(0o600);
+    // Existing audit semantics measure the full sanitized result before capping.
+    const originalSize = bytes(normalizedError(sanitized));
+    expect(error.message).toContain(`${originalSize} bytes total`);
+    const [invocation] = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, f.scope.companyId));
+    expect(invocation).toMatchObject({ status: "failed", errorCode: "tool_error", resultSizeBytes: originalSize });
+    const events = await db.select().from(toolCallEvents).where(eq(toolCallEvents.invocationId, invocation.id));
+    expect(events.filter((event) => event.eventType === "call_completed")).toHaveLength(0);
+    const failed = events.filter((event) => event.eventType === "call_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      reasonCode: "tool_error", resultSizeBytes: originalSize,
+      metadata: { truncated: true, deliveredSizeBytes: expect.any(Number) },
+    });
+    expect(Number(failed[0].metadata?.deliveredSizeBytes)).toBeLessThanOrEqual(16_384);
+    expect(Number(failed[0].metadata?.deliveredSizeBytes)).toBeGreaterThanOrEqual(Buffer.byteLength(error.message, "utf8"));
+  });
+
+  it.each(["short", "cap-disabled"])("preserves %s MCP error semantics", async (kind) => {
+    const content = kind === "short" ? "Report unavailable" : "x".repeat(201 * 1024);
+    const f = await fixture("read_report", content, undefined, true);
+    if (kind === "cap-disabled") vi.stubEnv("PAPERCLIP_TOOL_RESULT_CAPS", JSON.stringify({ read_report: 0 }));
+    await enableSpills(f.scope);
+    const error = await f.execute().catch((error: Error) => error);
+    expect(error).toMatchObject({ status: 502, reasonCode: "tool_error", message: content });
+    expect(f.dispatched).toEqual([{}]);
+  });
+
+  it("caps a dispatched plugin result without dropping the plugin envelope", async () => {
+    const f = await fixture("unused_remote", "unused");
+    await enableSpills(f.scope);
+    const token = "ghp_" + "q".repeat(36);
+    const content = `BEGIN ${token}\n${"x".repeat(201 * 1024)}\nEND ${token}`;
+    const full = { pluginId: "fixture-plugin", toolName: "read_report", result: { content, data: { complete: content } } };
+    const executeTool = vi.fn(async () => full);
+    const pluginToolDispatcher: PluginToolDispatcher = {
+      initialize: async () => {}, teardown: () => {},
+      listToolsForAgent: () => [{ name: "fixture:read_report", pluginId: full.pluginId, displayName: "Read report", description: "Read a synthetic report", parametersSchema: { type: "object" } }],
+      getTool: () => null, executeTool, registerPluginTools: () => {}, unregisterPluginTools: () => {}, toolCount: () => 1,
+      getRegistry: () => { throw new Error("not used"); },
+    };
+    const gateway = createToolGatewayService(db, { toolActionSigningSecret: "result-cap-test-only", pluginToolDispatcher });
+    await db.insert(toolPolicies).values({ companyId: f.scope.companyId, name: "Allow plugin report", policyType: "allow", selectors: { toolName: "fixture:read_report" } });
+    const session = await gateway.createSession(f.scope);
+    const response = await gateway.executeTool({ sessionToken: session.token, tool: "fixture:read_report", parameters: {} });
+    expect(executeTool).toHaveBeenCalledTimes(1);
+    expect(Object.keys(response.result as object).sort()).toEqual(["pluginId", "result", "toolName"]);
+    expect(response.result).toMatchObject({ pluginId: full.pluginId, toolName: full.toolName });
+    expect(bytes(response.result)).toBeLessThanOrEqual(16_384);
+    expect(JSON.stringify(response.result)).not.toContain(token);
+    const delivered = (response.result as { result: { content: Array<{ text: string }> } }).result.content[0].text;
+    const saved = delivered.match(/full result saved to (.+); read it with a ranged read/);
+    expect(saved).not.toBeNull();
+    const sanitized = content.replaceAll(token, REDACTED_EVENT_VALUE);
+    expect(JSON.parse(await fs.readFile(saved![1]!, "utf8"))).toEqual({ ...full, result: { content: sanitized, data: { complete: sanitized } } });
+    const event = await completion(db, response.invocationId);
+    const fullSanitized = { ...full, result: { content: sanitized, data: { complete: sanitized } } };
+    expect(event).toMatchObject({ resultSizeBytes: bytes(fullSanitized), metadata: { truncated: true, deliveredSizeBytes: bytes(response.result) } });
+  });
+
+  it("registers the exact spill scope in real heartbeat execution and removes it on completion", async () => {
+    const content = "BEGIN\n" + "x".repeat(201 * 1024) + "\nEND";
+    const f = await fixture("read_report", content);
+    // Replace the gateway fixture's synthetic run with one created by the real
+    // heartbeat controller. No test-side writer registration is used here.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.scope.runId));
+    await db.update(companies).set({ defaultResponsibleUserId: "responsible-user", requireBoardApprovalForNewAgents: false })
+      .where(eq(companies.id, f.scope.companyId));
+    await db.update(agents).set({ status: "idle", adapterType: "codex_local", adapterConfig: { cwd: scratch }, runtimeConfig: {} })
+      .where(eq(agents.id, f.scope.agentId));
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    let observedScope: typeof f.scope | undefined;
+    let runScratch: string | undefined;
+    let observedResult: unknown;
+    let adapterError: unknown;
+    const execute = vi.fn<ServerAdapterModule["execute"]>(async (ctx) => {
+      try {
+        observedScope = { companyId: ctx.agent.companyId, agentId: ctx.agent.id, runId: ctx.runId };
+        runScratch = (ctx.context.paperclipScratch as { dir: string }).dir;
+        expect((ctx.config.env as Record<string, unknown>).PAPERCLIP_RUN_SCRATCH_DIR).toBe(runScratch);
+        const marker = JSON.parse(await fs.readFile(path.join(runScratch, HEARTBEAT_RUN_SCRATCH_MARKER), "utf8"));
+        expect(marker).toMatchObject(observedScope);
+        const session = await f.gateway.createSession(observedScope);
+        const response = await f.gateway.executeTool({ sessionToken: session.token, tool: f.tool.name, parameters: {} });
+        observedResult = response.result;
+        expect(bytes(response.result)).toBeLessThanOrEqual(16_384);
+        const delivered = (response.result as { content: Array<{ text: string }> }).content[0].text;
+        const file = delivered.match(/full result saved to (.+); read it with a ranged read/);
+        expect(file).not.toBeNull();
+        expect(path.relative(runScratch, file![1]!)).not.toMatch(/^\.\./);
+        expect(path.isAbsolute(file![1]!)).toBe(true);
+        expect(JSON.parse(await fs.readFile(file![1]!, "utf8"))).toEqual(normalized(content));
+        expect((await fs.stat(file![1]!)).mode & 0o777).toBe(0o600);
+        for (const key of ["companyId", "agentId", "runId"] as const) {
+          const wrongScope = { ...observedScope, [key]: randomUUID() };
+          const wrong = await prepareToolResultDelivery({ scope: wrongScope, invocationId: randomUUID(), tool: f.tool, value: content, originalSizeBytes: bytes(content) });
+          expect(wrong.metadata).toMatchObject({ truncated: false, resultCapSkipped: "spill_writer_unavailable" });
+        }
+        return { exitCode: 0, signal: null, timedOut: false, provider: "test", model: "fixture", summary: "Spill lifecycle verified", resultJson: {} };
+      } catch (error) {
+        adapterError = error;
+        throw error;
+      }
+    });
+    registerServerAdapter({
+      type: "codex_local", supportsLocalAgentJwt: false, execute,
+      testEnvironment: async () => ({ adapterType: "codex_local", status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+    });
+    try {
+      const queued = await heartbeat.invoke(f.scope.agentId, "on_demand", {}, "manual");
+      expect(queued).not.toBeNull();
+      await heartbeat.drainActiveRunExecutions();
+      expect(adapterError).toBeUndefined();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(await heartbeat.getRun(queued!.id)).toMatchObject({ status: "succeeded" });
+      expect(observedScope).toEqual({ ...f.scope, runId: queued!.id });
+      expect(bytes(observedResult)).toBeLessThanOrEqual(16_384);
+      expect(f.dispatched).toEqual([{}]);
+      const after = await prepareToolResultDelivery({ scope: observedScope!, invocationId: randomUUID(), tool: f.tool, value: content, originalSizeBytes: bytes(content) });
+      expect(after.metadata).toMatchObject({ truncated: false, resultCapSkipped: "spill_writer_unavailable" });
+      await expect(fs.stat(runScratch!)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      unregisterServerAdapter("codex_local");
+    }
+  }, 30_000);
 
   it("defaults failed_only=true at actual remote dispatch", async () => {
     const f = await fixture("get-job-logs", "ok");
