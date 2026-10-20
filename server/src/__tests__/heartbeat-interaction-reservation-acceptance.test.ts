@@ -115,7 +115,9 @@ describe("resolved queued interaction reservation acceptance", () => {
     await temporary?.cleanup();
   });
 
-  async function seed(): Promise<Fixture> {
+  async function seed(
+    addressee: "assignee" | "recipient" = "recipient",
+  ): Promise<Fixture> {
     const companyId = randomUUID();
     const issueId = randomUUID();
     const assigneeId = randomUUID();
@@ -158,7 +160,7 @@ describe("resolved queued interaction reservation acceptance", () => {
     await db.insert(heartbeatRuns).values({
       id: busyRunId,
       companyId,
-      agentId: attentionAgentId,
+      agentId: addressee === "assignee" ? assigneeId : attentionAgentId,
       status: "running",
       invocationSource: "on_demand",
       startedAt: new Date(),
@@ -169,7 +171,8 @@ describe("resolved queued interaction reservation acceptance", () => {
       {
         kind: "request_confirmation",
         continuationPolicy: "wake_assignee",
-        addresseeAgentId: attentionAgentId,
+        addresseeAgentId:
+          addressee === "assignee" ? assigneeId : attentionAgentId,
         resolverPolicy: "anyone",
         payload: { version: 1, prompt: "Continue the bounded task?" },
       },
@@ -479,6 +482,237 @@ describe("resolved queued interaction reservation acceptance", () => {
     });
     expect((await run(legitimate.runId)).status).toBe("queued");
     expect(adapterExecute).not.toHaveBeenCalled();
+  });
+
+  // Removing only the cancellation adapter's cross-assignee predicate must not
+  // turn this resolved attention notification into a cancelled assignee run.
+  it("preserves the current assignee's resolved attention reservation while their lane is full", async () => {
+    const f = await seed("assignee");
+    const legitimate = await queuedReservation(f, f.assigneeId);
+    const beforeRun = await run(legitimate.runId);
+    const [beforeReceipt] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, legitimate.wakeupRequestId));
+    expect(beforeRun).toMatchObject({
+      agentId: f.assigneeId,
+      status: "queued",
+      startedAt: null,
+      contextSnapshot: {
+        wakeReason: "interaction_pending",
+        interactionId: f.interactionId,
+      },
+    });
+    expect(await issue(f)).toMatchObject({
+      assigneeAgentId: f.assigneeId,
+      executionRunId: legitimate.runId,
+      executionAgentNameKey: "task assignee",
+      executionLockedAt: lockedAt,
+    });
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      {
+        id: f.issueId,
+        companyId: f.companyId,
+        projectId: null,
+        goalId: null,
+      },
+      f.interactionId,
+      {},
+      { userId: "local-board" },
+    );
+    expect(accepted.interaction).toMatchObject({
+      status: "accepted",
+      addresseeAgentId: f.assigneeId,
+      resolvedByUserId: "local-board",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect.soft(await run(legitimate.runId)).toEqual(beforeRun);
+    const [afterReceipt] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, legitimate.wakeupRequestId));
+    expect.soft(afterReceipt).toEqual(beforeReceipt);
+    expect.soft(await issue(f)).toMatchObject({
+      assigneeAgentId: f.assigneeId,
+      executionRunId: legitimate.runId,
+      executionAgentNameKey: "task assignee",
+      executionLockedAt: lockedAt,
+    });
+    expect(await run(f.busyRunId)).toMatchObject({
+      agentId: f.assigneeId,
+      status: "running",
+    });
+    expect(adapterExecute).not.toHaveBeenCalled();
+  });
+
+  // The real pending interaction is addressed to A, but B is the task assignee
+  // and has capacity. Removing only admission's recipient predicate must fail
+  // on persisted admission, not merely on an adapter that has not started yet.
+  it("skips a pending attention wake delivered to an agent other than its named recipient", async () => {
+    const f = await seed();
+    const beforeRuns = await db.select().from(heartbeatRuns);
+    const [beforeInteraction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(beforeInteraction).toMatchObject({
+      status: "pending",
+      addresseeAgentId: f.attentionAgentId,
+    });
+    holdAdapter();
+
+    const wake = attentionWake(f);
+    // Match the creation route's real envelope. Without mutation: interaction,
+    // context normalization drops interactionId and masks the recipient guard.
+    const realAttentionWake = {
+      ...wake,
+      requestedByActorType: "user" as const,
+      requestedByActorId: "local-board",
+      payload: {
+        ...wake.payload,
+        sourceCommentId: null,
+        sourceRunId: null,
+        mutation: "interaction",
+      },
+      contextSnapshot: {
+        ...wake.contextSnapshot,
+        sourceCommentId: null,
+        sourceRunId: null,
+      },
+    };
+    const result = await heartbeat.wakeup(f.assigneeId, realAttentionWake);
+
+    expect.soft(result).toBeNull();
+    expect.soft(await db.select().from(heartbeatRuns)).toEqual(beforeRuns);
+    expect.soft(await issue(f)).toMatchObject({
+      assigneeAgentId: f.assigneeId,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+    const receipts = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, f.assigneeId));
+    expect(receipts.every((receipt) => receipt.status === "skipped")).toBe(
+      true,
+    );
+    const [afterInteraction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(afterInteraction).toEqual(beforeInteraction);
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    // A positive control prevents an unrelated admission gate from making the
+    // negative assertions vacuous: the same event is admitted for its addressee.
+    const addressed = await heartbeat.wakeup(
+      f.attentionAgentId,
+      realAttentionWake,
+    );
+    if (!addressed) {
+      throw new Error("Correctly addressed pending attention was not admitted");
+    }
+    expect(addressed).toMatchObject({
+      agentId: f.attentionAgentId,
+      status: "queued",
+      startedAt: null,
+    });
+    expect(await run(addressed.id)).toMatchObject({
+      agentId: f.attentionAgentId,
+      status: "queued",
+      contextSnapshot: { interactionId: f.interactionId },
+    });
+    expect(adapterExecute).not.toHaveBeenCalled();
+  });
+
+  // A fixture-only trigger faults exactly one queued -> cancelled transition.
+  // Sequence increments survive transaction rollback, proving the fault fired
+  // without depending on candidate order, logger mocks, timers, or live rows.
+  // Removing the per-candidate try/catch must reject the same resume pass.
+  it("isolates a queued attention retirement fault so an unrelated queued agent still starts", async () => {
+    const faulty = await seed();
+    const obsolete = await queuedReservation(faulty);
+    await resolve(faulty);
+    const unrelated = await seed();
+    const eligible = await queuedReservation(
+      unrelated,
+      unrelated.assigneeId,
+      "issue_assigned",
+    );
+    holdAdapter();
+    await db.execute(
+      sql`CREATE SEQUENCE reservation_retirement_fault_attempts`,
+    );
+    try {
+      await db.execute(sql`
+        CREATE FUNCTION reservation_retirement_fault() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM nextval('reservation_retirement_fault_attempts');
+          RAISE EXCEPTION 'synthetic queued attention retirement fault';
+        END;
+        $$
+      `);
+      await db.execute(
+        sql.raw(`
+        CREATE TRIGGER reservation_retirement_fault_trigger
+        BEFORE UPDATE ON heartbeat_runs
+        FOR EACH ROW
+        WHEN (OLD.id = '${obsolete.runId}'::uuid
+          AND OLD.status = 'queued' AND NEW.status = 'cancelled')
+        EXECUTE FUNCTION reservation_retirement_fault()
+      `),
+      );
+
+      await expect(heartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+
+      const attempts = await db.execute<{
+        last_value: string;
+        is_called: boolean;
+      }>(
+        sql`SELECT last_value, is_called FROM reservation_retirement_fault_attempts`,
+      );
+      expect(attempts[0]).toMatchObject({ is_called: true });
+      expect(Number(attempts[0].last_value)).toBe(1);
+      expect(await run(obsolete.runId)).toMatchObject({
+        status: "queued",
+        startedAt: null,
+      });
+      expect(await issue(faulty)).toMatchObject({
+        executionRunId: obsolete.runId,
+        executionAgentNameKey: "interaction recipient",
+        executionLockedAt: lockedAt,
+      });
+      const [receipt] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, obsolete.wakeupRequestId));
+      expect(receipt.status).toBe("queued");
+      await expectAssigneeStarted(unrelated);
+      expect(await run(eligible.runId)).toMatchObject({
+        agentId: unrelated.assigneeId,
+        status: "running",
+      });
+      await expect.poll(() => adapterExecute.mock.calls.length).toBe(1);
+      expect(adapterExecute.mock.calls[0][0]).toMatchObject({
+        runId: eligible.runId,
+        agent: { id: unrelated.assigneeId },
+      });
+    } finally {
+      await db.execute(sql`
+        DROP TRIGGER IF EXISTS reservation_retirement_fault_trigger
+        ON heartbeat_runs
+      `);
+      await db.execute(
+        sql`DROP FUNCTION IF EXISTS reservation_retirement_fault()`,
+      );
+      await db.execute(
+        sql`DROP SEQUENCE reservation_retirement_fault_attempts`,
+      );
+    }
   });
 
   // The task row is locked before the stale wake enters admission. A successor
