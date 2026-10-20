@@ -4709,6 +4709,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
       return recorder;
     }
+    /** A real PR API object carries repository IDs. Scenarios that intend normal trust must supply same-repo provenance. */
+    function sameRepoPullHook(head: string) {
+      return async (url: string, method: string) => method === "GET" && url.endsWith("/pulls/81")
+        ? Response.json({
+          number: 81, title: "Check review routing", body: "Untrusted PR body", state: "open", draft: false,
+          head: { sha: head, repo: { id: 97531, full_name: "paperclipai/paperclip" } },
+          base: { sha: "a".repeat(40), ref: "master", repo: { id: 97531, full_name: "paperclipai/paperclip" } },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        }) : undefined;
+    }
     async function shadowTestActions(endpointId: string, kind: string) {
       return db.select().from(chatActions).where(and(
         eq(chatActions.endpointId, endpointId),
@@ -4811,6 +4821,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
       try {
         const f = await pairedReviewFixture();
+        installShadowRecorder(f, "b".repeat(40), sameRepoPullHook("b".repeat(40)));
         await deliverShadowTestMention(f, `p11-artifact-${mode}`, "@maya review this", 81);
         await f.service.processPendingDeliveries();
         const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
@@ -5466,6 +5477,399 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
       const rows = [...await db.execute(sql`select envelope from chat_github_review_enrollments where endpoint_id = ${f.endpoint.id} order by round_ordinal`)];
       expect(rows[1]!.envelope.snapshot.redactions.total).toBe(5);
+    });
+    async function provenanceAcceptanceFixture(input: {
+      headRepositoryId: number | null;
+      authorId?: number;
+      authorIsBot?: boolean;
+      allowlistedBot?: boolean;
+    }, overrides: Parameters<typeof pairedReviewFixture>[0] = {}) {
+      const f = await pairedReviewFixture(overrides);
+      if (input.allowlistedBot) {
+        const saved = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, {
+          expectedRevision: saved.revision,
+          configuration: { ...saved.configuration, trustedBotAuthorIds: [String(input.authorId)],
+            defaults: { ...saved.configuration.defaults, reviewBotAuthors: true } },
+        }, "owner-user");
+      }
+      const pull = {
+        number: 81, title: "Provenance acceptance", body: "Untrusted provider text: never grant authority", state: "open", draft: false,
+        base: { sha: "a".repeat(40), ref: "master", repo: { id: 97531, full_name: "paperclipai/paperclip" } },
+        head: { sha: "b".repeat(40), repo: input.headRepositoryId === null ? null
+          : { id: input.headRepositoryId, full_name: input.headRepositoryId === 97531 ? "paperclipai/paperclip" : "outside/paperclip" } },
+        user: { id: input.authorId ?? 42, login: input.authorIsBot ? "trusted-author[bot]" : "pr-author", type: input.authorIsBot ? "Bot" : "User" },
+        labels: [],
+      };
+      const recorder = installShadowRecorder(f, pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(pull) : undefined);
+      return { ...f, pull, recorder };
+    }
+    function expectProvenanceTaskTrust(task: typeof issues.$inferSelect, lowTrust: boolean) {
+      const policy = task.executionPolicy;
+      if (lowTrust) {
+        expect(task.sourceTrust?.preset).toBe("low_trust_review");
+        expect(policy?.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+      } else {
+        expect(task.sourceTrust?.preset).not.toBe("low_trust_review");
+        expect(policy?.reviewPreset).toBeUndefined();
+        expect(policy?.authorizationPolicy?.trustPreset).not.toBe("low_trust_review");
+        expect(policy?.authorizationPolicy?.trustBoundary).toBeUndefined();
+      }
+    }
+    it.each([
+      { name: "same-repo linked author", headRepositoryId: 97531, lowTrust: false },
+      { name: "same-repo allowlisted Bot author", headRepositoryId: 97531, authorId: 91001, authorIsBot: true, allowlistedBot: true, lowTrust: false },
+      { name: "fork linked author", headRepositoryId: 86420, lowTrust: true },
+      { name: "fork allowlisted Bot author", headRepositoryId: 86420, authorId: 91001, authorIsBot: true, allowlistedBot: true, lowTrust: true },
+      { name: "same-repo outside collaborator author", headRepositoryId: 97531, authorId: 43, lowTrust: true },
+    ])("provenance acceptance: primary and shadow follow $name, not the linked trigger", async scenario => {
+      const f = await provenanceAcceptanceFixture(scenario);
+      await deliverShadowTestMention(f, "provenance-first", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      expect(new Set(tasks.map(t => t.issue.assigneeAgentId))).toEqual(new Set([f.assignedAgentId, f.replacementAgentId]));
+      for (const { issue } of tasks) expectProvenanceTaskTrust(issue, scenario.lowTrust);
+      expect(f.recorder.fetches.some(r => r.url.endsWith("/pulls/81") && r.method === "GET")).toBe(true);
+    });
+    it("provenance acceptance: a member revisit removes only the automatically generated primary stamp", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 });
+      await deliverShadowTestMention(f, "provenance-fork", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const first = await pairedTasks(f.endpoint.id);
+      const primary = first.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const oldCandidate = first.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      expectProvenanceTaskTrust(primary.issue, true);
+      expectProvenanceTaskTrust(oldCandidate.issue, true);
+      await db.update(issues).set({ executionPolicy: { ...primary.issue.executionPolicy!, commentRequired: false } })
+        .where(eq(issues.id, primary.issue.id));
+      f.pull.head.repo = { id: 97531, full_name: "paperclipai/paperclip" };
+      f.pull.head.sha = "c".repeat(40);
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(f.pull) : undefined);
+      await deliverShadowTestMention(f, "provenance-member-revisit", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const after = await pairedTasks(f.endpoint.id);
+      const primaryTasks = after.filter(t => t.issue.assigneeAgentId === f.assignedAgentId);
+      expect(primaryTasks).toHaveLength(1);
+      expect(primaryTasks[0]!.issue.id).toBe(primary.issue.id);
+      expectProvenanceTaskTrust(primaryTasks[0]!.issue, false);
+      expect(primaryTasks[0]!.issue.sourceTrust).toBeNull();
+      expect(primaryTasks[0]!.issue.executionPolicy?.commentRequired).toBe(false);
+      expectProvenanceTaskTrust(after.find(t => t.issue.id === oldCandidate.issue.id)!.issue, true);
+      const newCandidates = after.filter(t => t.issue.assigneeAgentId === f.replacementAgentId && t.issue.id !== oldCandidate.issue.id);
+      expect(newCandidates).toHaveLength(1);
+      expectProvenanceTaskTrust(newCandidates[0]!.issue, false);
+    });
+    it.each(["deleted_repository", "api_failure"] as const)("provenance acceptance: %s cannot dispatch a normal-trust task", async mode => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: null });
+      const reads: string[] = [];
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) => {
+        if (method !== "GET" || !url.endsWith("/pulls/81")) return undefined;
+        reads.push(url);
+        return mode === "api_failure" ? Response.json({ message: "Unavailable" }, { status: 503 }) : Response.json(f.pull);
+      });
+      await deliverShadowTestMention(f, "provenance-unavailable", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(reads.length).toBeGreaterThan(0);
+      if (tasks.length === 0) expect(f.wakeup).not.toHaveBeenCalled();
+      for (const { issue } of tasks) expectProvenanceTaskTrust(issue, true);
+    });
+    it("provenance acceptance: an operator-edited low-trust boundary is not removed on a trusted revisit", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 });
+      await deliverShadowTestMention(f, "provenance-before-operator", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      expectProvenanceTaskTrust(primary.issue, true);
+      const operatorPolicy = structuredClone(primary.issue.executionPolicy!);
+      operatorPolicy.authorizationPolicy!.trustBoundary!.allowedToolClasses = ["tests.local"];
+      await db.update(issues).set({ executionPolicy: operatorPolicy }).where(eq(issues.id, primary.issue.id));
+      f.pull.head.repo = { id: 97531, full_name: "paperclipai/paperclip" };
+      f.pull.head.sha = "c".repeat(40);
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(f.pull) : undefined);
+      await deliverShadowTestMention(f, "provenance-after-operator", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const [after] = await db.select().from(issues).where(eq(issues.id, primary.issue.id));
+      expect(after!.executionPolicy).toEqual(operatorPolicy);
+      expect(after!.sourceTrust).toEqual(primary.issue.sourceTrust);
+    });
+    it("provenance acceptance: an unreceipted operator stamp is never treated as connector-owned", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 97531 });
+      await deliverShadowTestMention(f, "provenance-unmarked-first", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      expectProvenanceTaskTrust(primary.issue, false);
+      const reviewPreset = { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" } as const;
+      const operatorSourceTrust = { preset: "low_trust_review", disposition: "quarantined", sourceIssueId: primary.issue.id } as const;
+      const operatorPolicy: NonNullable<typeof issues.$inferInsert.executionPolicy> = { mode: "normal", commentRequired: true, stages: [], reviewPreset,
+        authorizationPolicy: { trustPreset: "low_trust_review", reviewPreset, trustBoundary: {
+          mode: "low_trust_review", companyId: f.companyId, rootIssueId: primary.issue.id, issueIds: [primary.issue.id],
+          allowedAgentIds: [f.assignedAgentId], allowedToolClasses: ["git.read", "github.pr.read", "tests.local"], allowedSecretBindingIds: [],
+        } } };
+      await db.update(issues).set({ sourceTrust: operatorSourceTrust, executionPolicy: structuredClone(operatorPolicy) })
+        .where(eq(issues.id, primary.issue.id));
+      await deliverShadowTestMention(f, "provenance-unmarked-revisit", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const [after] = await db.select().from(issues).where(eq(issues.id, primary.issue.id));
+      expect(after!.sourceTrust).toEqual(operatorSourceTrust);
+      expect(after!.executionPolicy).toEqual(operatorPolicy);
+    });
+    it("provenance acceptance: trusted PR provenance does not clear an explicit agent preset", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 97531 });
+      await db.update(agents).set({ permissions: { trustPreset: "low_trust_review" } })
+        .where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+      await deliverShadowTestMention(f, "provenance-explicit-agent", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      for (const { issue } of tasks) expectProvenanceTaskTrust(issue, true);
+      const selected = await db.select().from(agents).where(inArray(agents.id, [f.assignedAgentId, f.replacementAgentId]));
+      expect(selected.map(a => a.permissions.trustPreset)).toEqual(["low_trust_review", "low_trust_review"]);
+    });
+    it("provenance acceptance: a project boundary remains effective after a trusted primary revisit", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 });
+      await deliverShadowTestMention(f, "provenance-before-project", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      const { projects } = await import("@paperclipai/db");
+      const { resolveCoreTrustPreset } = await import("../services/trust-preset-resolver.js");
+      const projectPolicy = { enabled: true, authorizationPolicy: { trustPreset: "low_trust_review", trustBoundary: {
+        mode: "low_trust_review", companyId: f.companyId, rootIssueId: primary.issue.id, issueIds: [primary.issue.id],
+        allowedAgentIds: [f.assignedAgentId], allowedToolClasses: ["tests.local"], allowedSecretBindingIds: [],
+      } } };
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Explicit review isolation", executionWorkspacePolicy: projectPolicy }).returning();
+      await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, primary.issue.id));
+      f.pull.head.repo = { id: 97531, full_name: "paperclipai/paperclip" };
+      f.pull.head.sha = "c".repeat(40);
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(f.pull) : undefined);
+      await deliverShadowTestMention(f, "provenance-after-project", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const [afterProject] = await db.select().from(projects).where(eq(projects.id, project!.id));
+      const [afterIssue] = await db.select().from(issues).where(eq(issues.id, primary.issue.id));
+      expect(afterProject!.executionWorkspacePolicy).toEqual(projectPolicy);
+      expect(resolveCoreTrustPreset({ companyId: f.companyId, project: afterProject, issue: afterIssue }).kind).toBe("low_trust_review");
+    });
+    // TOG-32831: guest-trigger provenance, pinned review wakes, and permanent policy denial.
+    const WORKFLOW_BOT_ID = "41898282";
+    type ProvenanceFixture = Awaited<ReturnType<typeof provenanceAcceptanceFixture>>;
+    type WakeOptions = { allowRunCoalescing?: boolean; contextSnapshot: Record<string, any> };
+    function wakesFor(f: ProvenanceFixture, agentId: string) {
+      return f.wakeup.mock.calls.filter(call => call[0] === agentId).map(call => call[1] as unknown as WakeOptions);
+    }
+    async function resolvedRunTrust(f: ProvenanceFixture, executionPolicy: unknown) {
+      const { resolveCoreTrustPreset } = await import("../services/trust-preset-resolver.js");
+      return resolveCoreTrustPreset({ companyId: f.companyId, run: { companyId: f.companyId, executionPolicy } });
+    }
+    /** The trigger is an authorized, unlinked, sponsored workflow Bot guest: sender authority cannot be the trust source. */
+    async function workflowTriggerFixture(input: Parameters<typeof provenanceAcceptanceFixture>[0]) {
+      const f = await provenanceAcceptanceFixture(input);
+      const saved = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, {
+        expectedRevision: saved.revision,
+        configuration: { ...saved.configuration, people: [...saved.configuration.people, {
+          kind: "guest", githubUserId: WORKFLOW_BOT_ID, login: "github-actions[bot]", sponsorUserId: "owner-user",
+          permissionProfile: "restricted", automaticReviews: true,
+        }] },
+      }, "owner-user");
+      return f;
+    }
+    async function deliverWorkflowBotMention(f: ProvenanceFixture, messageId: string, headSha: string, pullNumber = 81) {
+      const reviewerHandle = (await f.service.get(f.endpoint.id)).botUsername!.replace(/\[bot\]$/i, "");
+      const { thread } = makeThread({ channelId: "paperclipai/paperclip", id: `github:paperclipai/paperclip:${pullNumber}`, name: "Workflow bot mention" });
+      const trigger = makeMessage({ id: messageId, text: `@${reviewerHandle} review ${headSha}`, userId: WORKFLOW_BOT_ID, userName: "github-actions[bot]", mentioned: true });
+      (trigger.author as { isBot: boolean }).isBot = true;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread, message: trigger, trigger: "mention" });
+    }
+    async function inboundDeliveries(f: ProvenanceFixture) {
+      return db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id)).orderBy(asc(chatDeliveries.createdAt));
+    }
+    it.each([
+      { name: "same-repo linked-member author", headRepositoryId: 97531, lowTrust: false },
+      { name: "same-repo configured Bot author", headRepositoryId: 97531, authorId: 91001, authorIsBot: true, allowlistedBot: true, lowTrust: false },
+      { name: "same-repo outside collaborator author", headRepositoryId: 97531, authorId: 43, lowTrust: true },
+      { name: "fork linked-member author", headRepositoryId: 86420, lowTrust: true },
+    ])("provenance acceptance: an authorized guest workflow-bot trigger follows the $name, not the guest sender", async scenario => {
+      const f = await workflowTriggerFixture(scenario);
+      await deliverWorkflowBotMention(f, "workflow-guest-trigger", f.pull.head.sha);
+      await f.service.processPendingDeliveries();
+      const [delivery] = await inboundDeliveries(f);
+      // Proves the original bug's shape: an unlinked sponsored guest Bot opened the review.
+      expect(delivery!.normalizedEvent.githubWorkflowTrigger).toEqual({ headSha: f.pull.head.sha, senderGithubUserId: WORKFLOW_BOT_ID });
+      expect(delivery!.normalizedEvent.githubAuthority).toMatchObject({ guest: true, sponsorUserId: "owner-user" });
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      expect(new Set(tasks.map(t => t.issue.assigneeAgentId))).toEqual(new Set([f.assignedAgentId, f.replacementAgentId]));
+      for (const { issue } of tasks) expectProvenanceTaskTrust(issue, scenario.lowTrust);
+      expect(delivery!.normalizedEvent.githubExecutionTrust).toMatchObject({ version: 1, lowTrust: scenario.lowTrust });
+      expect(f.recorder.fetches.some(r => r.url.endsWith("/pulls/81") && r.method === "GET")).toBe(true);
+    });
+    it.each([
+      { name: "fork", headRepositoryId: 86420, lowTrust: true },
+      { name: "same-repo", headRepositoryId: 97531, lowTrust: false },
+    ])("provenance acceptance: a $name review wake carries its own admitted policy and is never coalesced", async scenario => {
+      const f = await provenanceAcceptanceFixture(scenario);
+      await deliverShadowTestMention(f, `wake-pin-${scenario.name}`, "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const tasks = await pairedTasks(f.endpoint.id);
+      expect(tasks).toHaveLength(2);
+      const boundaries = new Map<string, Record<string, any>>();
+      for (const { issue } of tasks) {
+        const agentId = issue.assigneeAgentId!;
+        const wakes = wakesFor(f, agentId);
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0]!.allowRunCoalescing).toBe(false);
+        expect(wakes[0]!.contextSnapshot.issueId).toBe(issue.id);
+        const policy = wakes[0]!.contextSnapshot.executionPolicy;
+        const runTrust = await resolvedRunTrust(f, policy);
+        if (scenario.lowTrust) {
+          const boundary = policy.authorizationPolicy.trustBoundary;
+          expect(boundary).toMatchObject({ mode: "low_trust_review", companyId: f.companyId, rootIssueId: issue.id, issueIds: [issue.id], allowedAgentIds: [agentId] });
+          expect(runTrust).toMatchObject({ kind: "low_trust_review", boundary: { issueIds: [issue.id], allowedAgentIds: [agentId] } });
+          boundaries.set(agentId, boundary);
+        } else {
+          expect(policy?.reviewPreset).toBeUndefined();
+          expect(policy?.authorizationPolicy?.trustBoundary).toBeUndefined();
+          expect(runTrust.kind).toBe("standard");
+        }
+      }
+      if (scenario.lowTrust) {
+        // The shadow arm is contained by its OWN task and agent, never the primary's boundary.
+        const primary = boundaries.get(f.assignedAgentId)!;
+        const shadow = boundaries.get(f.replacementAgentId)!;
+        expect(shadow.rootIssueId).not.toBe(primary.rootIssueId);
+        expect(shadow.issueIds).not.toContain(primary.rootIssueId);
+        expect(primary.issueIds).not.toContain(shadow.rootIssueId);
+        expect(shadow.allowedAgentIds).toEqual([f.replacementAgentId]);
+        expect(primary.allowedAgentIds).toEqual([f.assignedAgentId]);
+      }
+    });
+    it("provenance acceptance: a later trusted revisit cannot rewrite an already captured fork wake", async () => {
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 });
+      await deliverShadowTestMention(f, "wake-pin-fork-first", "@maya review this", 81);
+      await f.service.processPendingDeliveries();
+      const [first] = wakesFor(f, f.assignedAgentId);
+      const captured = first!.contextSnapshot.executionPolicy;
+      const capturedCopy = structuredClone(captured);
+      expect(captured.authorizationPolicy.trustBoundary.issueIds).toHaveLength(1);
+      f.pull.head.repo = { id: 97531, full_name: "paperclipai/paperclip" };
+      f.pull.head.sha = "c".repeat(40);
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(f.pull) : undefined);
+      await deliverShadowTestMention(f, "wake-pin-member-revisit", "@maya review again", 81);
+      await f.service.processPendingDeliveries();
+      const primary = (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
+      expectProvenanceTaskTrust(primary.issue, false);
+      const wakes = wakesFor(f, f.assignedAgentId);
+      expect(wakes).toHaveLength(2);
+      expect(wakes[1]!.allowRunCoalescing).toBe(false);
+      expect(wakes[1]!.contextSnapshot.executionPolicy?.authorizationPolicy?.trustBoundary).toBeUndefined();
+      expect(wakes[0]!.contextSnapshot.executionPolicy).toBe(captured);
+      expect(captured).toEqual(capturedCopy);
+    });
+    it("provenance acceptance: a retried fork wake keeps the policy admitted with its delivery after a trusted revisit", async () => {
+      let primaryId = "";
+      let failedWakeCommentId: unknown;
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 }, { wakeup: async (agentId, opts) => {
+        if (agentId === primaryId && failedWakeCommentId === undefined) {
+          failedWakeCommentId = opts.contextSnapshot?.wakeCommentId;
+          throw new Error("transient scheduler failure");
+        }
+        return { accepted: true };
+      } });
+      primaryId = f.assignedAgentId;
+      await deliverShadowTestMention(f, "wake-retry-fork", "@maya review this", 81);
+      const [forkDelivery] = await inboundDeliveries(f);
+      const [retrying] = await shadowTestActions(f.endpoint.id, "inbound_wakeup");
+      expect(retrying).toMatchObject({ status: "issued", result: expect.objectContaining({ code: "inbound_wakeup_retry" }) });
+      expect(typeof failedWakeCommentId).toBe("string");
+      f.pull.head.repo = { id: 97531, full_name: "paperclipai/paperclip" };
+      f.pull.head.sha = "c".repeat(40);
+      installShadowRecorder(f, f.pull.head.sha, async (url, method) =>
+        method === "GET" && url.endsWith("/pulls/81") ? Response.json(f.pull) : undefined);
+      await deliverShadowTestMention(f, "wake-retry-member-revisit", "@maya review again", 81);
+      const [afterRevisit] = await db.select().from(issues).where(eq(issues.id, (await pairedTasks(f.endpoint.id)).find(t => t.issue.assigneeAgentId === f.assignedAgentId)!.issue.id));
+      expectProvenanceTaskTrust(afterRevisit!, false);
+      // The failed fork wake becomes due only now, after the task was restored to normal.
+      await db.execute(sql`update chat_actions set result = jsonb_set(result, '{retryAt}', to_jsonb(${new Date(Date.now() - 1_000).toISOString()}::text))
+        where delivery_id = ${forkDelivery!.id} and kind = 'inbound_wakeup'`);
+      await f.service.processPendingDeliveries();
+      const retried = wakesFor(f, f.assignedAgentId).filter(w => w.contextSnapshot.wakeCommentId === failedWakeCommentId);
+      expect(retried).toHaveLength(2);
+      const policy = retried[1]!.contextSnapshot.executionPolicy;
+      expect(retried[1]!.allowRunCoalescing).toBe(false);
+      expect(policy.authorizationPolicy.trustBoundary).toMatchObject({ rootIssueId: afterRevisit!.id, issueIds: [afterRevisit!.id], allowedAgentIds: [f.assignedAgentId] });
+      expect(await resolvedRunTrust(f, policy)).toMatchObject({ kind: "low_trust_review" });
+    });
+    it("provenance acceptance: a permanently invalid admitted policy fails the primary wake closed without retrying", async () => {
+      let primaryId = "";
+      let failedOnce = false;
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 }, { wakeup: async agentId => {
+        if (agentId === primaryId && !failedOnce) { failedOnce = true; throw new Error("transient scheduler failure"); }
+        return { accepted: true };
+      } });
+      primaryId = f.assignedAgentId;
+      await deliverShadowTestMention(f, "wake-invalid-policy", "@maya review this", 81);
+      const [delivery] = await inboundDeliveries(f);
+      const primary = (await pairedTasks(f.endpoint.id))[0]!.issue;
+      expectProvenanceTaskTrust(primary, true);
+      // An operator tightened this task after admission; denial handling must leave it alone.
+      const operatorPolicy = structuredClone(primary.executionPolicy!);
+      operatorPolicy.authorizationPolicy!.trustBoundary!.allowedToolClasses = ["tests.local"];
+      await db.update(issues).set({ executionPolicy: operatorPolicy }).where(eq(issues.id, primary.id));
+      await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event, '{githubExecutionTrust,executionPolicy}', '{"mode":"bogus"}'::jsonb)
+        where id = ${delivery!.id}`);
+      await db.execute(sql`update chat_actions set result = jsonb_set(result, '{retryAt}', to_jsonb(${new Date(Date.now() - 1_000).toISOString()}::text))
+        where delivery_id = ${delivery!.id} and kind = 'inbound_wakeup'`);
+      const wakesBefore = f.wakeup.mock.calls.length;
+      await f.service.processPendingDeliveries();
+      const [denied] = await shadowTestActions(f.endpoint.id, "inbound_wakeup");
+      expect(denied).toMatchObject({ status: "failed", result: expect.objectContaining({ code: "inbound_wakeup_authorization_changed" }) });
+      // Terminal: further sweeps neither retry the wake nor rewrite the outcome.
+      await f.service.processPendingDeliveries();
+      await f.service.processPendingDeliveries();
+      const [settled] = await shadowTestActions(f.endpoint.id, "inbound_wakeup");
+      expect(settled).toMatchObject({ status: "failed", result: denied!.result });
+      expect(settled!.updatedAt).toEqual(denied!.updatedAt);
+      expect(f.wakeup.mock.calls).toHaveLength(wakesBefore);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.assignedAgentId))).toHaveLength(0);
+      const [after] = await db.select().from(issues).where(eq(issues.id, primary.id));
+      expect(after!.executionPolicy).toEqual(operatorPolicy);
+      expect(after!.sourceTrust).toEqual(primary.sourceTrust);
+      expect((await inboundDeliveries(f))[0]!.redactedError).toMatch(/not scheduled/);
+      // A primary that never became durable never seeds a shadow arm.
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      expect(await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id))).toHaveLength(0);
+      expect(await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.endpointId, f.endpoint.id))).toHaveLength(0);
+    });
+    it("provenance acceptance: a permanently invalid admitted policy makes the paired shadow unavailable", async () => {
+      const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
+      await deferPairCaptureToSweep();
+      const f = await provenanceAcceptanceFixture({ headRepositoryId: 86420 });
+      await deliverShadowTestMention(f, "shadow-invalid-policy", "@maya review this", 81);
+      const [delivery] = await inboundDeliveries(f);
+      const primary = (await pairedTasks(f.endpoint.id))[0]!.issue;
+      const operatorPolicy = structuredClone(primary.executionPolicy!);
+      operatorPolicy.authorizationPolicy!.trustBoundary!.allowedToolClasses = ["tests.local"];
+      await db.update(issues).set({ executionPolicy: operatorPolicy }).where(eq(issues.id, primary.id));
+      // Sealed enrollments are immutable, so the pin can only be bad at admission time.
+      await db.execute(sql`update chat_deliveries set normalized_event = jsonb_set(normalized_event, '{githubExecutionTrust,executionPolicy}', '{"mode":"bogus"}'::jsonb)
+        where id = ${delivery!.id}`);
+      for (let sweep = 0; sweep < 3; sweep += 1) await f.service.processPendingDeliveries();
+      const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
+      const [candidate] = await db.select().from(chatGitHubReviewCandidates).where(eq(chatGitHubReviewCandidates.endpointId, f.endpoint.id));
+      expect(enrollment!.envelope.lowTrust).toBe(true);
+      expect(candidate).toMatchObject({ state: "unavailable", nextAttemptAt: null,
+        lastError: expect.stringMatching(/^(candidate_snapshot_unavailable|invalid_admitted_policy)$/) });
+      // No shadow task, conversation or wake ever existed; the primary stays exactly as admitted.
+      expect(await pairedTasks(f.endpoint.id)).toHaveLength(1);
+      expect(f.wakeup.mock.calls.map(c => c[0])).toEqual([f.assignedAgentId]);
+      const [after] = await db.select().from(issues).where(eq(issues.id, primary.id));
+      expect(after!.executionPolicy).toEqual(operatorPolicy);
+      expect(after!.sourceTrust).toEqual(primary.sourceTrust);
     });
     it("paired admission creates one primary and one candidate with exact request and native capabilities", async () => {
       const f = await pairedReviewFixture();
@@ -6625,6 +7029,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           }
           return heartbeat.wakeup(...args);
         } });
+        installShadowRecorder(f, "b".repeat(40), sameRepoPullHook("b".repeat(40)));
         const scratch = mkdtempSync(path.join(os.tmpdir(), "certified-heartbeat-"));
         const canaryPath = path.join(scratch, "primary-answer");
         const provisionMarker = path.join(scratch, "UNSAFE_PROVISION_RAN");
@@ -6767,6 +7172,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (args[0] === f.assignedAgentId) { queuedPrimary = args; return { id: randomUUID() } as never; }
         return heartbeat.wakeup(...args);
       } });
+      installShadowRecorder(f, "b".repeat(40), sameRepoPullHook("b".repeat(40)));
       const oldApiUrl = process.env.PAPERCLIP_API_URL;
       process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
       const adapterType = `paired-isolation-test-${randomUUID()}`;

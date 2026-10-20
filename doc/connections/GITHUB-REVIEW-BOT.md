@@ -62,6 +62,46 @@ Automatic events use the configured responsible member. The PR author and
 webhook sender are recorded independently. Follow-ups preserve task ownership
 while checking the current requester's authority.
 
+## PR execution trust
+
+Sender access and execution trust are separate controls. An authorized guest
+trigger does not make a company-authored PR low trust by itself. Before admitting
+PR work, the server reads the PR through the bot's repository-scoped GitHub API
+client. Normal execution requires both:
+
+- The API's `head.repo.id` and `base.repo.id` match each other and the enabled
+  repository ID.
+- The API's `user.id` identifies a currently linked, active company member
+  allowed by the endpoint's member selection, or a bot explicitly trusted by
+  the endpoint configuration.
+
+The optional `trustedBotAuthorIds` configuration list contains stable GitHub
+**user IDs**, not login names or App IDs. It defaults to empty. A listed author
+must also have API account type `Bot`. This list grants no permission to trigger
+work: bot guests, sponsorship, `automaticReviews`, and repository/event controls
+still apply independently. Administrators can set the list through the existing
+revision-checked configuration API.
+
+Forks remain low trust for every author and sender. Outside authors on same-repo
+branches, missing/deleted repository metadata, and failed API reads also remain
+low trust. Low-trust execution still requires a sandbox and fails closed without
+one. Explicit agent, project, and operator trust restrictions remain in force.
+PR text, repository content, and guest messages remain untrusted data even when
+execution uses normal trust.
+
+Each trigger records its trust decision separately from sender authority.
+Connector-created restrictions have an audited ownership receipt. A later trusted
+trigger can undo those generated trust fields only while they still match that
+receipt. It preserves unrelated execution settings and never rewrites an
+already-running run's trust. Legacy unmarked or subsequently edited restrictions
+remain fail-closed and require an administrator to inspect and clear them.
+
+After deploying this change, restore any intentionally removed bot guests in a
+new configuration revision and set their existing `automaticReviews` choices.
+Add only verified bot user IDs to `trustedBotAuthorIds` when their same-repo PRs
+should run at normal trust. Verify a company-authored same-repo review and a
+fork refusal separately; enabling this feature does not provision a sandbox.
+
 ## Mentions and pushes
 
 Use **mentions only** for reviews initiated by an authorized `@your-bot` request.
