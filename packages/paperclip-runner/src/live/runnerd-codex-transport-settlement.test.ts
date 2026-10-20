@@ -91,6 +91,7 @@ it.each([
   { alreadyEnded: true, appendFailure: false, holdSpawned: true },
   { alreadyEnded: true, appendFailure: false, completedTerminalAck: "pending" },
   { alreadyEnded: true, appendFailure: false, completedTerminalAck: "completed" },
+  { alreadyEnded: true, appendFailure: false, completedTerminalAck: "completed", delayTerminalResult: true },
   { alreadyEnded: true, appendFailure: false, completedTerminalAck: "repeat" },
   { alreadyEnded: true, appendFailure: false, finalRetirementRevocation: "abort" },
   { alreadyEnded: true, appendFailure: false, finalRetirementRevocation: "revoked" },
@@ -106,7 +107,7 @@ it.each([
     terminalReplay: true,
   },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit) startup-failure-proof=$startupFailureProof completed-ack=$completedTerminalAck retired-revocation=$finalRetirementRevocation",
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit) startup-failure-proof=$startupFailureProof completed-ack=$completedTerminalAck retired-revocation=$finalRetirementRevocation delayed-result=$delayTerminalResult",
   async ({
     alreadyEnded,
     appendFailure,
@@ -115,6 +116,7 @@ it.each([
     terminalReplay,
     holdSpawned,
     completedTerminalAck,
+    delayTerminalResult,
     finalRetirementRevocation,
     homeScoped,
     missingHome,
@@ -122,6 +124,14 @@ it.each([
     startupFailureProof,
   }) => {
     const replaySpyRestorers: Array<() => void> = [];
+    let maintenanceStarted = false;
+    let deliveredBaseline = 0;
+    // Engagement evidence for the delayTerminalResult row: set on the
+    // per-attachment hold path below. Asserted after settlement so a
+    // silently disengaged hold (or a neutered close gate) cannot pass as
+    // a duplicate of the plain completed row.
+    let delayedResultDeliveryObserved = false;
+    let delayedResultHeldFrames = 0;
     const replayRetirements: ReturnType<typeof maintenanceReplaySnapshot>[] = [];
     const withheldTerminalFrames: Array<{
       epoch: number;
@@ -130,6 +140,20 @@ it.each([
       controllerSeq: number;
       count: number;
     }> = [];
+    const gatedCloseDeliveries: Array<{
+      epoch: number;
+      delivered: boolean;
+      deliver: () => void;
+    }> = [];
+    const deliverGatedClose = (
+      gated: (typeof gatedCloseDeliveries)[number],
+    ): void => {
+      if (gated.delivered) return;
+      gated.delivered = true;
+      const index = gatedCloseDeliveries.indexOf(gated);
+      if (index >= 0) gatedCloseDeliveries.splice(index, 1);
+      gated.deliver();
+    };
     const fixtureId = randomUUID();
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
@@ -974,6 +998,8 @@ it.each([
                 (completedTerminalAck === "repeat" && epoch === 1));
             let attachment: ReturnType<typeof originalAttach> | undefined;
             let withheld: (typeof withheldTerminalFrames)[number] | undefined;
+            let gatedClose: (typeof gatedCloseDeliveries)[number] | null =
+              null;
             const shouldWithhold = (candidate: typeof direction): boolean => {
               if (
                 !inject ||
@@ -1030,18 +1056,95 @@ it.each([
                 count: 1,
               };
               withheldTerminalFrames.push(withheld);
+              if (gatedClose !== null) deliverGatedClose(gatedClose);
               return true;
             };
+            let receive: ((value: unknown) => void) | undefined;
+            const delayed: unknown[] = [];
+            // Per-attachment latch: each attachment tracks redelivery
+            // independently alongside its own delayed queue and receiver.
+            // Detection still compares against the outer deliveredBaseline
+            // captured before settlement, so behavior is unchanged.
+            let deliveryObserved = false;
             attachment = originalAttach.call(this, {
               sendJson(value) {
                 if (!shouldWithhold("outbound")) wire.sendJson(value);
               },
               close: (code) => wire.close(code),
-              onJson: (listener) =>
+              onJson: (listener) => {
+                receive = listener;
                 wire.onJson((value) => {
+                  if (
+                    delayTerminalResult &&
+                    inject &&
+                    attachment?.isAuthenticated()
+                  ) {
+                    // Late schedule: once the maintenance settlement
+                    // redelivers the retained suspend, hold every further
+                    // frame until the transport closes, so the terminal result
+                    // necessarily commits after the close it raced. The core
+                    // increments the delivery count and saves before sending,
+                    // so the count is always visible before the result can
+                    // arrive. Earlier frames flow normally, so epoch progress
+                    // is unaffected. The close gate below must still observe
+                    // the outbound injection; without it this row fails
+                    // exactly like the CI length-zero flake.
+                    if (!deliveryObserved && maintenanceStarted) {
+                      const control = JSON.parse(
+                        readFileSync(join(copy, files[0]!), "utf8"),
+                      );
+                      const suspend = control.commands.find(
+                        (command: { type: string; status: string }) =>
+                          command.type === "runner.suspend" &&
+                          command.status === "pending",
+                      );
+                      if (
+                        suspend &&
+                        (control.commandDeliveryCounts[suspend.commandId] ??
+                          0) > deliveredBaseline
+                      ) {
+                        deliveryObserved = true;
+                        delayedResultDeliveryObserved = true;
+                      }
+                    }
+                    if (deliveryObserved) {
+                      delayed.push(value);
+                      delayedResultHeldFrames += 1;
+                      return;
+                    }
+                  }
                   if (!shouldWithhold("inbound")) listener(value);
+                });
+              },
+              onClose: (listener) =>
+                wire.onClose(() => {
+                  for (const value of delayed) receive!(value);
+                  delayed.length = 0;
+                  // A terminal result committed after the runner's ACK
+                  // deadline closes the transport never reaches this wire:
+                  // AuthorityConnection.sendJson drops post-close emissions
+                  // before they reach sendJson, so the injection hook above
+                  // cannot observe them and the length-one assertion fails
+                  // even though the producer reconciles exactly as covered.
+                  // Hold the close notification until the outbound injection
+                  // fires, so the emission always reaches the hook. The gate
+                  // releases when the injected epoch retires without one,
+                  // which fails safe with the joined-state diagnostics below
+                  // instead of hanging. Retirement is process-driven and
+                  // control-plane stop never waits on wire close, so holding
+                  // this notification cannot stall settlement.
+                  if (
+                    inject &&
+                    direction === "outbound" &&
+                    !withheld &&
+                    epoch >= replayRetirements.length
+                  ) {
+                    gatedClose = { epoch, delivered: false, deliver: listener };
+                    gatedCloseDeliveries.push(gatedClose);
+                    return;
+                  }
+                  listener();
                 }),
-              onClose: (listener) => wire.onClose(listener),
             });
             return attachment;
           });
@@ -1051,6 +1154,10 @@ it.each([
           const snapshot = maintenanceReplaySnapshot(copy);
           expect(snapshot.fingerprint).toBe(receipt.finalFingerprint);
           replayRetirements.push(snapshot);
+          for (const gated of [...gatedCloseDeliveries]) {
+            if (gated.epoch < replayRetirements.length)
+              deliverGatedClose(gated);
+          }
         });
       }
       if (epochFailure) {
@@ -1256,6 +1363,19 @@ it.each([
         recordEpoch.mockClear();
         appendEvent.mockClear();
       }
+      if (delayTerminalResult) {
+        const control = JSON.parse(
+          readFileSync(join(copy, files[0]!), "utf8"),
+        );
+        const suspend = control.commands.find(
+          (command: { type: string; status: string }) =>
+            command.type === "runner.suspend" && command.status === "pending",
+        );
+        deliveredBaseline = suspend
+          ? (control.commandDeliveryCounts[suspend.commandId] ?? 0)
+          : 0;
+        maintenanceStarted = true;
+      }
       const pendingProof = settleRetainedRunnerdSession(input);
       if (finalRetirementRevocation) {
         await expect(pendingProof).rejects.toThrow(
@@ -1453,6 +1573,13 @@ it.each([
       if (completedTerminalAck) {
         const before = replayRetirements[0]!;
         const after = replayRetirements[1]!;
+        if (delayTerminalResult) {
+          // Pin the forced late schedule: without the hold this row is a
+          // duplicate of the plain completed row and would pass while
+          // exercising nothing. Fail here, not silently.
+          expect(delayedResultDeliveryObserved).toBe(true);
+          expect(delayedResultHeldFrames).toBeGreaterThan(0);
+        }
         // A result can commit after its connection closes, without an outbound
         // ACK reaching the injection hook. Report the joined producer evidence;
         // a missed injection alone does not identify a settlement defect.
