@@ -102,12 +102,14 @@ describeEmbeddedPostgres("executionWorkspaceService cleanup_failed retry", () =>
 
   function createService(options?: {
     beforeTerminalWorkspaceCleanup?: (workspace: { id: string }) => Promise<void>;
+    beforeResolvePullRequestDetails?: () => Promise<void>;
   }) {
     return executionWorkspaceService(db, {
-      resolvePullRequestDetails: vi.fn(async (companyId, reference) =>
-        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
-        ?? { state: "unknown", headRef: null, headSha: null }
-      ),
+      resolvePullRequestDetails: vi.fn(async (companyId, reference) => {
+        await options?.beforeResolvePullRequestDetails?.();
+        return pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null };
+      }),
       workspaceReaperCooldownDays: 0,
       ...(options?.beforeTerminalWorkspaceCleanup
         ? { beforeTerminalWorkspaceCleanup: options.beforeTerminalWorkspaceCleanup }
@@ -267,6 +269,56 @@ describeEmbeddedPostgres("executionWorkspaceService cleanup_failed retry", () =>
     });
     await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, sourceIssueId));
   }
+
+  it.each(["status-only", "generation-only"] as const)(
+    "skips a %s lifecycle race before the archive transaction without touching the worktree",
+    async (race) => {
+      const seeded = await seedTerminalWorkspace();
+      const originalMetadata = { lifecycleGeneration: 7, retained: "concurrent owner metadata" };
+      await db.update(executionWorkspaces).set({
+        metadata: originalMetadata,
+        cleanupReason: "original cleanup reason",
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      const gitfile = await fs.readFile(path.join(seeded.worktreePath, ".git"), "utf8");
+      const beforeCleanup = vi.fn(async () => undefined);
+      // Delivery assessment calls the resolver AFTER candidate selection but
+      // BEFORE the archive transaction. The cleanup hook runs after archive,
+      // so mutating there would only test the later physical-removal fence.
+      const mutateLifecycle = vi.fn(async () => {
+        expect(await readWorkspace(seeded.executionWorkspaceId)).toMatchObject({
+          status: "active", closedAt: null,
+        });
+        await db.update(executionWorkspaces).set(race === "status-only"
+          ? { status: "idle" }
+          : { metadata: { ...originalMetadata, lifecycleGeneration: 8 } }
+        ).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      });
+
+      const result = await createService({
+        beforeResolvePullRequestDetails: mutateLifecycle,
+        beforeTerminalWorkspaceCleanup: beforeCleanup,
+      }).sweepTerminalWorkspaces();
+
+      expect(mutateLifecycle).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ checked: 1, eligible: 1, skippedRace: 1, archived: 0, cleanupFailed: 0 });
+      expect(beforeCleanup).not.toHaveBeenCalled();
+      const [workspace] = await db.select().from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(workspace).toMatchObject({
+        status: race === "status-only" ? "idle" : "active",
+        closedAt: null,
+        cleanupEligibleAt: null,
+        cleanupReason: "original cleanup reason",
+        metadata: race === "status-only" ? originalMetadata : { ...originalMetadata, lifecycleGeneration: 8 },
+      });
+      await expect(fs.readFile(path.join(seeded.worktreePath, ".git"), "utf8")).resolves.toBe(gitfile);
+      await expect(fs.readFile(path.join(seeded.worktreePath, "delivered.txt"), "utf8")).resolves.toBe("delivered\n");
+      const { stdout } = await execFileAsync("git", ["-C", seeded.worktreePath, "rev-parse", "--show-toplevel"]);
+      expect(stdout.trim()).toBe(seeded.worktreePath);
+      await runGit(seeded.worktreePath, ["diff", "--exit-code", "HEAD"]);
+    },
+    60_000,
+  );
 
   it("retries a failed removal on the next sweep and keeps the original closedAt", async () => {
     const seeded = await seedTerminalWorkspace();

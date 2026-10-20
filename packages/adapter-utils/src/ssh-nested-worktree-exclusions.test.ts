@@ -225,6 +225,95 @@ describe("SSH task-workspace nested worktree exclusions", () => {
     expect(await pathExists(path.join(backDir, "weird [brackets] (name)"))).toBe(false);
   }, GIT_TIMEOUT_MS);
 
+  it.each([
+    { gitBacked: false, label: "plain" },
+    { gitBacked: true, label: "git-backed" },
+  ])("preserves a local linked worktree on a non-baseline $label restore", async ({ gitBacked }) => {
+    const localDir = await createFixtureRootDir("paperclip-nested-replace-local-");
+    await writeTree(localDir, { "keep.txt": "before remote edit\n" });
+    if (gitBacked) {
+      await git(localDir, "init", "-q", "-b", "main");
+      await git(localDir, "add", "keep.txt");
+      await git(localDir, "commit", "-q", "-m", "primary");
+    }
+    const mainRepo = await initMainRepo();
+    const nestedName = "nested [linked]";
+    const nestedDir = path.join(localDir, nestedName);
+    await addLinkedWorktree(mainRepo, nestedDir, "preserved-local");
+    await writeFile(path.join(nestedDir, "marker.txt"), "local work must survive\n");
+    const gitfile = await readFile(path.join(nestedDir, ".git"), "utf8");
+    const nestedHead = await git(nestedDir, "rev-parse", "HEAD");
+    const nestedStatus = await git(nestedDir, "status", "--porcelain");
+    const remoteDir = await createFixtureRootDir("paperclip-nested-replace-remote-");
+    const spec = buildStubSpec(remoteDir);
+    const prepared = await prepareWorkspaceForSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+    expect(prepared.gitBacked).toBe(gitBacked);
+    expect(await pathExists(path.join(remoteDir, nestedName))).toBe(false);
+
+    await writeTree(remoteDir, { "keep.txt": "remote edit\n", "added.txt": "remote addition\n" });
+    // Only the local discovery can exclude this path: the remote collision is
+    // an ordinary directory, not a linked checkout. It must neither transfer
+    // over the cap nor replace the excluded local worktree.
+    await mkdir(path.join(remoteDir, nestedName));
+    await writeFile(path.join(remoteDir, nestedName, "payload.bin"), Buffer.alloc(1024 * 1024, 0x41));
+    process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+    await restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir: FAKE_REMOTE_ROOT });
+
+    await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("remote edit\n");
+    await expect(readFile(path.join(localDir, "added.txt"), "utf8")).resolves.toBe("remote addition\n");
+    await expect(readFile(path.join(nestedDir, "marker.txt"), "utf8")).resolves.toBe("local work must survive\n");
+    await expect(readFile(path.join(nestedDir, ".git"), "utf8")).resolves.toBe(gitfile);
+    expect(await pathExists(path.join(nestedDir, "payload.bin"))).toBe(false);
+    expect(await git(nestedDir, "rev-parse", "--show-toplevel")).toBe(`${nestedDir}\n`);
+    expect(await git(nestedDir, "rev-parse", "HEAD")).toBe(nestedHead);
+    expect(await git(nestedDir, "status", "--porcelain")).toBe(nestedStatus);
+    if (gitBacked) expect((await git(localDir, "rev-parse", "--is-inside-work-tree")).trim()).toBe("true");
+  }, GIT_TIMEOUT_MS);
+
+  it.each([
+    { shape: "CRLF", direction: "seed" },
+    { shape: "CRLF", direction: "restore" },
+    { shape: "symlink", direction: "seed" },
+    { shape: "symlink", direction: "restore" },
+  ] as const)("excludes a real $shape gitfile linked checkout on $direction", async ({ shape, direction }) => {
+    const sourceDir = await createFixtureRootDir("paperclip-nested-shape-source-");
+    await writeTree(sourceDir, { "keep.txt": "deliverable\n" });
+    const mainRepo = await initMainRepo();
+    const nestedDir = path.join(sourceDir, "linked checkout");
+    await addLinkedWorktree(mainRepo, nestedDir, "gitfile-shape");
+    const gitfilePath = path.join(nestedDir, ".git");
+    const gitfile = await readFile(gitfilePath, "utf8");
+    if (shape === "CRLF") {
+      await writeFile(gitfilePath, gitfile.replace(/\n$/, "\r\n"));
+      expect(await readFile(gitfilePath, "utf8")).toMatch(/\r\n$/);
+    } else {
+      const regularGitfile = path.join(mainRepo, "linked-gitfile");
+      await writeFile(regularGitfile, gitfile);
+      await rm(gitfilePath);
+      await symlink(regularGitfile, gitfilePath);
+      expect((await lstat(gitfilePath)).isSymbolicLink()).toBe(true);
+    }
+    // These are Git-usable checkouts, not merely strings resembling gitfiles.
+    expect(await git(nestedDir, "rev-parse", "--show-toplevel")).toBe(`${nestedDir}\n`);
+    expect(await git(nestedDir, "rev-parse", "HEAD")).toBe(await git(mainRepo, "rev-parse", "HEAD"));
+    await writeFile(path.join(nestedDir, "marker.bin"), Buffer.alloc(1024 * 1024, 0x42));
+    const targetDir = await createFixtureRootDir("paperclip-nested-shape-target-");
+    process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+    if (direction === "seed") {
+      const spec = buildStubSpec(targetDir);
+      await prepareWorkspaceForSshExecution({ spec, localDir: sourceDir, remoteDir: FAKE_REMOTE_ROOT });
+    } else {
+      // The local target has never seen this remote-created linked worktree.
+      const spec = buildStubSpec(sourceDir);
+      await restoreWorkspaceFromSshExecution({ spec, localDir: targetDir, remoteDir: FAKE_REMOTE_ROOT });
+    }
+    await expect(readFile(path.join(targetDir, "keep.txt"), "utf8")).resolves.toBe("deliverable\n");
+    expect(await pathExists(path.join(targetDir, "linked checkout"))).toBe(false);
+    expect((await lstat(path.join(nestedDir, "marker.bin"))).size).toBe(1024 * 1024);
+    expect(await git(nestedDir, "rev-parse", "--show-toplevel")).toBe(`${nestedDir}\n`);
+  }, GIT_TIMEOUT_MS);
+
   it("still seeds a primary root linked checkout", async () => {
     // The workspace root itself is a linked checkout: its `.git` file must
     // keep working through the git-backed path, not be mistaken for a nested
