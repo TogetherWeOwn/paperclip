@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupRemoteHeartbeatRunScratch,
-  prepareRemoteHeartbeatRunScratch,
+  HEARTBEAT_RUN_SCRATCH_MARKER,
   type HeartbeatRunScratch,
+  prepareRemoteHeartbeatRunScratch,
   type RemoteHeartbeatRunScratchExec,
   type RemoteHeartbeatRunScratchShellResult,
 } from "./run-scratch.js";
@@ -30,26 +30,44 @@ class FakeRemoteShell {
       this.failNext = null;
       return this.result({ exitCode, stderr });
     }
-    const mktemp = command.match(/^mktemp -d "\$\{TMPDIR:-\/tmp\}\/([A-Za-z0-9._-]+)XXXXXX"$/);
+    const mktemp = command.match(
+      /^mktemp -d "\$\{TMPDIR:-\/tmp\}\/([A-Za-z0-9._-]+)XXXXXX"$/,
+    );
     if (mktemp) {
       this.mktempCounter += 1;
       const dir = `/tmp/${mktemp[1]}${String(this.mktempCounter).padStart(6, "0")}`;
       this.dirs.add(dir);
       return this.result({ stdout: `${dir}\n` });
     }
-    const write = command.match(/^printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d > '([^']+)' && chmod 600 '([^']+)'$/);
+    const write = command.match(
+      /^printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d > '([^']+)' && chmod 600 '([^']+)'$/,
+    );
     if (write) {
       const [, encoded, target, chmodTarget] = write;
-      if (target !== chmodTarget) throw new Error(`fake remote shell: chmod target mismatch in ${command}`);
+      if (target !== chmodTarget)
+        throw new Error(
+          `fake remote shell: chmod target mismatch in ${command}`,
+        );
       const parent = target.slice(0, target.lastIndexOf("/")) || "/";
-      if (!this.dirs.has(parent)) return this.result({ exitCode: 1, stderr: "No such file or directory" });
-      this.files.set(target, { content: Buffer.from(encoded, "base64").toString("utf8"), mode: 0o600 });
+      if (!this.dirs.has(parent))
+        return this.result({
+          exitCode: 1,
+          stderr: "No such file or directory",
+        });
+      this.files.set(target, {
+        content: Buffer.from(encoded, "base64").toString("utf8"),
+        mode: 0o600,
+      });
       return this.result({});
     }
     const cat = command.match(/^cat '([^']+)'$/);
     if (cat) {
       const file = this.files.get(cat[1]);
-      if (!file) return this.result({ exitCode: 1, stderr: "No such file or directory" });
+      if (!file)
+        return this.result({
+          exitCode: 1,
+          stderr: "No such file or directory",
+        });
       return this.result({ stdout: file.content });
     }
     const rm = command.match(/^rm -rf -- '([^']+)'$/);
@@ -59,7 +77,8 @@ class FakeRemoteShell {
         if (file === dir || file.startsWith(`${dir}/`)) this.files.delete(file);
       }
       for (const entry of Array.from(this.dirs)) {
-        if (entry === dir || entry.startsWith(`${dir}/`)) this.dirs.delete(entry);
+        if (entry === dir || entry.startsWith(`${dir}/`))
+          this.dirs.delete(entry);
       }
       return this.result({});
     }
@@ -78,12 +97,22 @@ class FakeRemoteShell {
     this.dirs.add(dir);
   }
 
-  private result(overrides: Partial<RemoteHeartbeatRunScratchShellResult>): RemoteHeartbeatRunScratchShellResult {
-    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, ...overrides };
+  private result(
+    overrides: Partial<RemoteHeartbeatRunScratchShellResult>,
+  ): RemoteHeartbeatRunScratchShellResult {
+    return {
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      ...overrides,
+    };
   }
 }
 
-function provisionInput(overrides: Partial<{ runId: string; issueIdentifier: string }> = {}) {
+function provisionInput(
+  overrides: Partial<{ runId: string; issueIdentifier: string }> = {},
+) {
   return {
     companyId: "company-1",
     agentId: "agent-1",
@@ -99,13 +128,23 @@ describe("remote heartbeat run scratch", () => {
   it("provisions a run-unique remote dir with an ownership marker via the shell channel", async () => {
     const shell = new FakeRemoteShell();
 
-    const first = await prepareRemoteHeartbeatRunScratch(provisionInput({ runId: "run-aaa" }), { exec: shell.exec });
-    const second = await prepareRemoteHeartbeatRunScratch(provisionInput({ runId: "run-bbb" }), { exec: shell.exec });
+    const first = await prepareRemoteHeartbeatRunScratch(
+      provisionInput({ runId: "run-aaa" }),
+      { exec: shell.exec },
+    );
+    const second = await prepareRemoteHeartbeatRunScratch(
+      provisionInput({ runId: "run-bbb" }),
+      { exec: shell.exec },
+    );
 
     expect(first.dir).not.toBe(second.dir);
     expect(first.dir).toMatch(/^\/tmp\/paperclip-run-demo-123-run-aaa-/);
-    expect(shell.commands[0]).toMatch(/^mktemp -d "\$\{TMPDIR:-\/tmp\}\/paperclip-run-demo-123-run-aaa-XXXXXX"$/);
-    const marker = shell.readFile(`${first.dir}/${HEARTBEAT_RUN_SCRATCH_MARKER}`);
+    expect(shell.commands[0]).toMatch(
+      /^mktemp -d "\$\{TMPDIR:-\/tmp\}\/paperclip-run-demo-123-run-aaa-XXXXXX"$/,
+    );
+    const marker = shell.readFile(
+      `${first.dir}/${HEARTBEAT_RUN_SCRATCH_MARKER}`,
+    );
     expect(marker?.mode).toBe(0o600);
     expect(JSON.parse(marker?.content ?? "{}")).toMatchObject({
       version: 1,
@@ -113,12 +152,16 @@ describe("remote heartbeat run scratch", () => {
       agentId: "agent-1",
       runId: "run-aaa",
     });
-    expect(first.markerPath).toBe(`${first.dir}/${HEARTBEAT_RUN_SCRATCH_MARKER}`);
+    expect(first.markerPath).toBe(
+      `${first.dir}/${HEARTBEAT_RUN_SCRATCH_MARKER}`,
+    );
   });
 
   it("builds run env pointing at the run-unique remote dir", async () => {
     const shell = new FakeRemoteShell();
-    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec });
+    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), {
+      exec: shell.exec,
+    });
 
     const result = buildHeartbeatRunScratchEnv({}, scratch);
 
@@ -134,9 +177,14 @@ describe("remote heartbeat run scratch", () => {
 
   it("removes the marked remote dir at cleanup", async () => {
     const shell = new FakeRemoteShell();
-    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec });
+    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), {
+      exec: shell.exec,
+    });
 
-    const result = await cleanupRemoteHeartbeatRunScratch({ scratch }, { exec: shell.exec });
+    const result = await cleanupRemoteHeartbeatRunScratch(
+      { scratch },
+      { exec: shell.exec },
+    );
 
     expect(result).toEqual({ removed: true, dir: scratch.dir });
     expect(shell.hasDir(scratch.dir)).toBe(false);
@@ -160,23 +208,47 @@ describe("remote heartbeat run scratch", () => {
       },
     };
 
-    const result = await cleanupRemoteHeartbeatRunScratch({ scratch }, { exec: shell.exec });
+    const result = await cleanupRemoteHeartbeatRunScratch(
+      { scratch },
+      { exec: shell.exec },
+    );
 
-    expect(result).toEqual({ removed: false, dir: scratch.dir, reason: "unmarked" });
+    expect(result).toEqual({
+      removed: false,
+      dir: scratch.dir,
+      reason: "unmarked",
+    });
     expect(shell.hasDir(scratch.dir)).toBe(true);
-    expect(shell.commands.some((command) => command.startsWith("rm -rf"))).toBe(false);
+    expect(shell.commands.some((command) => command.startsWith("rm -rf"))).toBe(
+      false,
+    );
   });
 
   it("preserves remote scratch when the marker owner does not match the run", async () => {
     const shell = new FakeRemoteShell();
-    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput({ runId: "run-aaa" }), { exec: shell.exec });
-    const mismatched = { ...scratch, metadata: { ...scratch.metadata, runId: "run-bbb" } };
+    const scratch = await prepareRemoteHeartbeatRunScratch(
+      provisionInput({ runId: "run-aaa" }),
+      { exec: shell.exec },
+    );
+    const mismatched = {
+      ...scratch,
+      metadata: { ...scratch.metadata, runId: "run-bbb" },
+    };
 
-    const result = await cleanupRemoteHeartbeatRunScratch({ scratch: mismatched }, { exec: shell.exec });
+    const result = await cleanupRemoteHeartbeatRunScratch(
+      { scratch: mismatched },
+      { exec: shell.exec },
+    );
 
-    expect(result).toEqual({ removed: false, dir: scratch.dir, reason: "owner_mismatch" });
+    expect(result).toEqual({
+      removed: false,
+      dir: scratch.dir,
+      reason: "owner_mismatch",
+    });
     expect(shell.hasDir(scratch.dir)).toBe(true);
-    expect(shell.commands.some((command) => command.startsWith("rm -rf"))).toBe(false);
+    expect(shell.commands.some((command) => command.startsWith("rm -rf"))).toBe(
+      false,
+    );
   });
 
   it("refuses to remove remote paths outside paperclip-run-*", async () => {
@@ -196,38 +268,69 @@ describe("remote heartbeat run scratch", () => {
       },
     };
 
-    const result = await cleanupRemoteHeartbeatRunScratch({ scratch }, { exec: shell.exec });
+    const result = await cleanupRemoteHeartbeatRunScratch(
+      { scratch },
+      { exec: shell.exec },
+    );
 
-    expect(result).toEqual({ removed: false, dir: "/tmp/other", reason: "unmarked" });
+    expect(result).toEqual({
+      removed: false,
+      dir: "/tmp/other",
+      reason: "unmarked",
+    });
     expect(shell.commands).toEqual([]);
   });
 
   it("propagates provisioning shell failures so dispatch can continue without scratch env", async () => {
     const shell = new FakeRemoteShell();
-    shell.failNext = { prefix: "mktemp -d", exitCode: 1, stderr: "mktemp: failed" };
+    shell.failNext = {
+      prefix: "mktemp -d",
+      exitCode: 1,
+      stderr: "mktemp: failed",
+    };
 
-    await expect(prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec })).rejects.toThrow(
+    await expect(
+      prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec }),
+    ).rejects.toThrow(
       /Could not create the remote heartbeat run scratch directory/,
     );
   });
 
   it("removes the remote dir when the marker write fails after mktemp succeeds", async () => {
     const shell = new FakeRemoteShell();
-    shell.failNext = { prefix: "printf '%s'", exitCode: 1, stderr: "base64: command not found" };
+    shell.failNext = {
+      prefix: "printf '%s'",
+      exitCode: 1,
+      stderr: "base64: command not found",
+    };
 
-    await expect(prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec })).rejects.toThrow(
-      /Could not write the remote run scratch marker/,
+    await expect(
+      prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec }),
+    ).rejects.toThrow(/Could not write the remote run scratch marker/);
+    expect(shell.hasDir("/tmp/paperclip-run-demo-123-run-1-000001")).toBe(
+      false,
     );
-    expect(shell.hasDir("/tmp/paperclip-run-demo-123-run-1-000001")).toBe(false);
-    expect(shell.commands.some((command) => command.startsWith("rm -rf -- '/tmp/paperclip-run-"))).toBe(true);
+    expect(
+      shell.commands.some((command) =>
+        command.startsWith("rm -rf -- '/tmp/paperclip-run-"),
+      ),
+    ).toBe(true);
   });
 
   it("propagates remote removal failures like the local rm path", async () => {
     const shell = new FakeRemoteShell();
-    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), { exec: shell.exec });
-    shell.failNext = { prefix: "rm -rf", exitCode: 1, stderr: "rm: permission denied" };
+    const scratch = await prepareRemoteHeartbeatRunScratch(provisionInput(), {
+      exec: shell.exec,
+    });
+    shell.failNext = {
+      prefix: "rm -rf",
+      exitCode: 1,
+      stderr: "rm: permission denied",
+    };
 
-    await expect(cleanupRemoteHeartbeatRunScratch({ scratch }, { exec: shell.exec })).rejects.toThrow(
+    await expect(
+      cleanupRemoteHeartbeatRunScratch({ scratch }, { exec: shell.exec }),
+    ).rejects.toThrow(
       /Could not remove the remote heartbeat run scratch directory/,
     );
   });

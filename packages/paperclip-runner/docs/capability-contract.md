@@ -8,9 +8,9 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 
 ## Baseline Counts
 
-- Skill/reference headings: 155
+- Skill/reference headings: 156
 - Eval cases: 106 across 16 groups
-- Total normative rows: 261
+- Total normative rows: 262
 - Legacy MCP aliases folded into normative rows: 42
 
 | Eval group | Cases |
@@ -64,13 +64,14 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/SKILL.md:issue-workspace-runtime-controls:507 | optional_agent_tool | skills/paperclip/SKILL.md:507 |
 | skill:skills/paperclip/SKILL.md:proposing-credentials-safely:514 | optional_agent_tool | skills/paperclip/SKILL.md:514 |
 | skill:skills/paperclip/SKILL.md:reading-granted-secrets:521 | optional_agent_tool | skills/paperclip/SKILL.md:521 |
-| skill:skills/paperclip/SKILL.md:critical-rules:547 | optional_agent_tool | skills/paperclip/SKILL.md:547 |
-| skill:skills/paperclip/SKILL.md:comment-style-required:571 | always_agent_tool | skills/paperclip/SKILL.md:571 |
-| skill:skills/paperclip/SKILL.md:update:603 | optional_agent_tool | skills/paperclip/SKILL.md:603 |
-| skill:skills/paperclip/SKILL.md:planning-required-when-planning-requested:613 | optional_agent_tool | skills/paperclip/SKILL.md:613 |
-| skill:skills/paperclip/SKILL.md:key-endpoints-hot-routes:646 | optional_agent_tool | skills/paperclip/SKILL.md:646 |
-| skill:skills/paperclip/SKILL.md:searching-issues:675 | optional_agent_tool | skills/paperclip/SKILL.md:675 |
-| skill:skills/paperclip/SKILL.md:full-reference:685 | optional_agent_tool | skills/paperclip/SKILL.md:685 |
+| skill:skills/paperclip/SKILL.md:temporary-payload-files:547 | optional_agent_tool | skills/paperclip/SKILL.md:547 |
+| skill:skills/paperclip/SKILL.md:critical-rules:564 | optional_agent_tool | skills/paperclip/SKILL.md:564 |
+| skill:skills/paperclip/SKILL.md:comment-style-required:588 | always_agent_tool | skills/paperclip/SKILL.md:588 |
+| skill:skills/paperclip/SKILL.md:update:620 | optional_agent_tool | skills/paperclip/SKILL.md:620 |
+| skill:skills/paperclip/SKILL.md:planning-required-when-planning-requested:630 | optional_agent_tool | skills/paperclip/SKILL.md:630 |
+| skill:skills/paperclip/SKILL.md:key-endpoints-hot-routes:663 | optional_agent_tool | skills/paperclip/SKILL.md:663 |
+| skill:skills/paperclip/SKILL.md:searching-issues:692 | optional_agent_tool | skills/paperclip/SKILL.md:692 |
+| skill:skills/paperclip/SKILL.md:full-reference:702 | optional_agent_tool | skills/paperclip/SKILL.md:702 |
 | skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1 | always_agent_tool | skills/paperclip/references/artifacts.md:1 |
 | skill:skills/paperclip/references/artifacts.md:workspace-only-file-references:15 | optional_agent_tool | skills/paperclip/references/artifacts.md:15 |
 | skill:skills/paperclip/references/cases.md:cases:1 | optional_agent_tool | skills/paperclip/references/cases.md:1 |
