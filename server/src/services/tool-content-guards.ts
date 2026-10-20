@@ -227,7 +227,11 @@ export function validateToolContent(input: {
 }) {
   const sensitiveMode = input.sensitiveMode ?? "redact";
   const promptInjectionMode = input.promptInjectionMode ?? (input.direction === "result" ? "block" : "ignore");
-  const redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
+  const redactedValue = isPlainObject(input.value)
+    ? redactEventPayload(input.value)
+    : input.direction === "result"
+      ? redactEventPayload({ result: input.value })?.result
+      : input.value;
   const redactedSummary = summarizeToolValue(redactedValue);
   const findings: string[] = [];
 

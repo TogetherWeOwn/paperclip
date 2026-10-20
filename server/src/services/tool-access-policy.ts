@@ -1198,6 +1198,28 @@ export function toolAccessPolicyService(db: Db) {
     return { profiles: activeProfiles, entries };
   }
 
+  async function resolveResultMaxBytes(input: ToolAccessDecisionInput): Promise<number | undefined> {
+    const loaded = await loadContext(input);
+    if (!loaded.ok) return undefined;
+    const { ctx } = loaded;
+    const state = await effectiveProfiles(ctx);
+    const caps: number[] = [];
+    for (const profile of state.profiles) {
+      const matching = state.entries.filter((entry) => entry.profileId === profile.id && profileEntryMatches(entry, ctx));
+      if (matching.some((entry) => entry.effect === "exclude")) continue;
+      for (const entry of matching) {
+        if (entry.effect !== "include") continue;
+        const cap = entry.conditions?.resultMaxBytes;
+        if (typeof cap === "number" && Number.isSafeInteger(cap) &&
+            (cap === 0 || (cap >= 1024 && cap <= 1024 * 1024))) caps.push(cap);
+      }
+    }
+    // Zero is unlimited. Multiple matched settings use the strictest bound,
+    // independent of database row order; no match leaves instance settings in force.
+    const bounded = caps.filter((cap) => cap > 0);
+    return bounded.length > 0 ? Math.min(...bounded) : caps.length > 0 ? 0 : undefined;
+  }
+
   async function explicitGrant(ctx: ToolAccessContext, cache?: ToolAccessDecisionCache): Promise<boolean> {
     const principalType = ctx.actorType === "agent" ? "agent" : ctx.actorType === "user" ? "user" : null;
     const principalId = ctx.actorType === "agent" ? ctx.agentId : ctx.actorId;
@@ -2027,6 +2049,7 @@ export function toolAccessPolicyService(db: Db) {
 
   return {
     decide,
+    resolveResultMaxBytes,
     writeAudit,
     recordInvocation,
     summarizeAndRedact,
