@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, toSshTarExcludes } from "./ssh-workspace-excludes.js";
-
-const execFileAsync = promisify(execFile);
 
 // Run the same discovery on the archive's creating host. Do not follow links,
 // enter Git metadata, or descend into a linked checkout after identifying it.
@@ -48,7 +45,8 @@ export function parseSshNestedWorktrees(stdout: string): string[] {
 }
 
 export async function discoverSshNestedWorktrees(localDir: string): Promise<string[]> {
-  const { stdout } = await execFileAsync("sh", ["-c", SSH_NESTED_WORKTREES_SCRIPT], {
+  const { execFile } = await import("node:child_process");
+  const { stdout } = await promisify(execFile)("sh", ["-c", SSH_NESTED_WORKTREES_SCRIPT], {
     cwd: localDir,
     timeout: 60_000,
     maxBuffer: 1024 * 1024,
