@@ -56,6 +56,7 @@ import { initializeGitHubPrimaryBlinding } from "./services/chat-github-primary-
 import { initializeGitHubPrimaryReviewers } from "./services/chat-github-primary-reviewers.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { installUncaughtExceptionPolicy } from "./fatal-exception-policy.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -2142,6 +2143,21 @@ function isMainModule(metaUrl: string): boolean {
 }
 
 if (isMainModule(import.meta.url)) {
+  // Replaces Node's default print-and-exit. Tests import this module, so the
+  // handler is installed only for the real server process.
+  installUncaughtExceptionPolicy(
+    process,
+    (message, error) => {
+      logger.fatal({ err: error }, message);
+    },
+    async (error) => {
+      // Capture after the client exists. captureException is a no-op until
+      // bootstrap finishes, and a synchronous exit would drop the flush.
+      await sentryReady;
+      captureException(error);
+      await shutdownSentry();
+    },
+  );
   void startServer().catch(async (err) => {
     logger.error({ err }, "Paperclip server failed to start");
     // Supervised-transient refusals in managed-cloud deployments are an

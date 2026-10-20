@@ -137,7 +137,10 @@ DATABASE_IDLE_TIMEOUT_SECONDS=60     # close idle pooled connections; default: 6
 DATABASE_CONNECT_TIMEOUT_SECONDS=10  # default: 30
 DATABASE_MAX_LIFETIME_SECONDS=1800   # recycle a pooled connection after this long; default: 30-60 min (random)
 DATABASE_APPLICATION_NAME=paperclip  # application_name in pg_stat_activity; default: paperclip
+DATABASE_MAX_PENDING_QUERIES=10000   # waiting queries past this fail with QUERY_QUEUE_FULL; default: 10000
 ```
+
+Queries that cannot get a pooled connection wait, up to `DATABASE_MAX_PENDING_QUERIES`. The next one fails with `QUERY_QUEUE_FULL` instead of growing the driver queue until the process crashes. The vendored driver default stops a client opened without `max_queue` at 10000. `DATABASE_MAX_PENDING_QUERIES` applies to the server pool and to short-lived utility clients used for migrations and probes. Other direct `postgres()` calls keep the driver default unless they pass `max_queue`.
 
 ### Push the schema
 

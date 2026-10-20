@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DATABASE_APPLICATION_NAME,
   DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
+  DEFAULT_DATABASE_MAX_PENDING_QUERIES,
   databaseClientOptionsFromEnv,
   postgresJsOptions,
   resolveDatabaseClientOptions,
+  utilitySqlDriverOptions,
 } from "./client.js";
 
 describe("databaseClientOptionsFromEnv", () => {
@@ -37,6 +39,7 @@ describe("databaseClientOptionsFromEnv", () => {
         DATABASE_CONNECT_TIMEOUT_SECONDS: "10",
         DATABASE_MAX_LIFETIME_SECONDS: "1800",
         DATABASE_APPLICATION_NAME: " paperclip-web ",
+        DATABASE_MAX_PENDING_QUERIES: "500",
       }),
     ).toEqual({
       maxConnections: 25,
@@ -44,6 +47,7 @@ describe("databaseClientOptionsFromEnv", () => {
       connectTimeoutSeconds: 10,
       maxLifetimeSeconds: 1800,
       applicationName: "paperclip-web",
+      maxPendingQueries: 500,
     });
   });
 
@@ -72,6 +76,9 @@ describe("databaseClientOptionsFromEnv", () => {
     expect(() => databaseClientOptionsFromEnv({ DATABASE_MAX_LIFETIME_SECONDS: "NaN" })).toThrow(
       /DATABASE_MAX_LIFETIME_SECONDS/,
     );
+    expect(() => databaseClientOptionsFromEnv({ DATABASE_MAX_PENDING_QUERIES: "0" })).toThrow(
+      /DATABASE_MAX_PENDING_QUERIES/,
+    );
   });
 
   it("maps to postgres.js option names", () => {
@@ -83,6 +90,7 @@ describe("databaseClientOptionsFromEnv", () => {
         connectTimeoutSeconds: 10,
         maxLifetimeSeconds: 1800,
         applicationName: "paperclip-web",
+        maxPendingQueries: 500,
       }),
     ).toEqual({
       prepare: false,
@@ -90,6 +98,7 @@ describe("databaseClientOptionsFromEnv", () => {
       idle_timeout: 60,
       connect_timeout: 10,
       max_lifetime: 1800,
+      max_queue: 500,
       connection: { application_name: "paperclip-web" },
     });
   });
@@ -100,9 +109,11 @@ describe("resolveDatabaseClientOptions", () => {
     expect(resolveDatabaseClientOptions({})).toEqual({
       idleTimeoutSeconds: DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
       applicationName: DEFAULT_DATABASE_APPLICATION_NAME,
+      maxPendingQueries: DEFAULT_DATABASE_MAX_PENDING_QUERIES,
     });
     expect(postgresJsOptions(resolveDatabaseClientOptions(databaseClientOptionsFromEnv({})))).toEqual({
       idle_timeout: DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
+      max_queue: DEFAULT_DATABASE_MAX_PENDING_QUERIES,
       connection: { application_name: DEFAULT_DATABASE_APPLICATION_NAME },
     });
   });
@@ -114,9 +125,29 @@ describe("resolveDatabaseClientOptions", () => {
         idleTimeoutSeconds: 0,
         applicationName: "paperclip-cli",
       }),
-    ).toEqual({ maxConnections: 3, idleTimeoutSeconds: 0, applicationName: "paperclip-cli" });
+    ).toEqual({
+      maxConnections: 3,
+      idleTimeoutSeconds: 0,
+      applicationName: "paperclip-cli",
+      maxPendingQueries: DEFAULT_DATABASE_MAX_PENDING_QUERIES,
+    });
     expect(postgresJsOptions(resolveDatabaseClientOptions({ idleTimeoutSeconds: 0 }))).toMatchObject({
       idle_timeout: 0,
     });
+  });
+});
+
+describe("utilitySqlDriverOptions", () => {
+  it("caps pending queries on the one-connection utility client", () => {
+    const tuned = utilitySqlDriverOptions({
+      DATABASE_MAX_PENDING_QUERIES: "25",
+      DATABASE_POOL_MAX: "40",
+    });
+    expect(tuned.max).toBe(1);
+    expect(tuned.max_queue).toBe(25);
+    expect(typeof tuned.onnotice).toBe("function");
+
+    expect(utilitySqlDriverOptions({}).max_queue).toBe(DEFAULT_DATABASE_MAX_PENDING_QUERIES);
+    expect(utilitySqlDriverOptions({}).max).toBe(1);
   });
 });
