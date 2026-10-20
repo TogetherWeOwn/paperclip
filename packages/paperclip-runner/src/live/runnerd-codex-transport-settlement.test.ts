@@ -125,8 +125,13 @@ it.each([
   }) => {
     const replaySpyRestorers: Array<() => void> = [];
     let maintenanceStarted = false;
-    let deliveryObserved = false;
     let deliveredBaseline = 0;
+    // Engagement evidence for the delayTerminalResult row: set on the
+    // per-attachment hold path below. Asserted after settlement so a
+    // silently disengaged hold (or a neutered close gate) cannot pass as
+    // a duplicate of the plain completed row.
+    let delayedResultDeliveryObserved = false;
+    let delayedResultHeldFrames = 0;
     const replayRetirements: ReturnType<typeof maintenanceReplaySnapshot>[] = [];
     const withheldTerminalFrames: Array<{
       epoch: number;
@@ -1056,6 +1061,11 @@ it.each([
             };
             let receive: ((value: unknown) => void) | undefined;
             const delayed: unknown[] = [];
+            // Per-attachment latch: each attachment tracks redelivery
+            // independently alongside its own delayed queue and receiver.
+            // Detection still compares against the outer deliveredBaseline
+            // captured before settlement, so behavior is unchanged.
+            let deliveryObserved = false;
             attachment = originalAttach.call(this, {
               sendJson(value) {
                 if (!shouldWithhold("outbound")) wire.sendJson(value);
@@ -1092,11 +1102,14 @@ it.each([
                         suspend &&
                         (control.commandDeliveryCounts[suspend.commandId] ??
                           0) > deliveredBaseline
-                      )
+                      ) {
                         deliveryObserved = true;
+                        delayedResultDeliveryObserved = true;
+                      }
                     }
                     if (deliveryObserved) {
                       delayed.push(value);
+                      delayedResultHeldFrames += 1;
                       return;
                     }
                   }
@@ -1560,6 +1573,13 @@ it.each([
       if (completedTerminalAck) {
         const before = replayRetirements[0]!;
         const after = replayRetirements[1]!;
+        if (delayTerminalResult) {
+          // Pin the forced late schedule: without the hold this row is a
+          // duplicate of the plain completed row and would pass while
+          // exercising nothing. Fail here, not silently.
+          expect(delayedResultDeliveryObserved).toBe(true);
+          expect(delayedResultHeldFrames).toBeGreaterThan(0);
+        }
         // A result can commit after its connection closes, without an outbound
         // ACK reaching the injection hook. Report the joined producer evidence;
         // a missed injection alone does not identify a settlement defect.
