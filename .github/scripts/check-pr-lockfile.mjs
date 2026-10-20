@@ -6,12 +6,19 @@
  */
 import { fileURLToPath } from 'node:url';
 
+// One bot-owned head per refreshed base (see refresh-lockfile.yml). Keep in
+// sync with the Block manual lockfile edits exemption in pr-trusted.yml.
+const REFRESH_BOT_HEADS = new Set([
+  'chore/refresh-lockfile',
+  'chore/refresh-lockfile-deploy-tog6',
+]);
+
 export function checkLockfile(files, prAuthor, prBranch) {
   const lockfileChanged = files.some(f => f.filename === 'pnpm-lock.yaml');
   if (!lockfileChanged) return { passed: true, failures: [] };
 
   const isRefreshBot =
-    prAuthor === 'github-actions[bot]' && prBranch === 'chore/refresh-lockfile';
+    prAuthor === 'github-actions[bot]' && REFRESH_BOT_HEADS.has(prBranch);
 
   return {
     passed: isRefreshBot,
