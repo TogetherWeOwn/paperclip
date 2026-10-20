@@ -35,7 +35,105 @@ async function loadPatchedQueue(href: string): Promise<(initial?: unknown[]) => 
   return mod.default;
 }
 
+type ReservationState = "pending" | "resolved" | { rejected: unknown };
+
+async function withStalledReservations(
+  build: "esm" | "cjs",
+  max: number,
+  maxQueue: number,
+  check: (fixture: {
+    sql: ReturnType<typeof postgres>;
+    sockets: Set<net.Socket>;
+    states: ReservationState[];
+    reserve: () => void;
+  }) => Promise<void>,
+): Promise<void> {
+  // Load the actual, distinct driver entries, not just their queue helpers.
+  const entry = new URL("./index.js", patchedQueueHrefs()[build]);
+  const { default: driver } = (await import(entry.href)) as { default: typeof postgres };
+  const sockets = new Set<net.Socket>();
+  let closing = false;
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.on("close", () => sockets.delete(socket));
+    if (closing) socket.destroy();
+    // No PostgreSQL handshake response: every admitted reserve stays pending.
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected the stall server to bind a TCP port");
+  }
+  const sql = driver({
+    host: "127.0.0.1",
+    port: address.port,
+    max,
+    max_queue: maxQueue,
+    fetch_types: false,
+    connect_timeout: 30,
+  } as unknown as postgres.Options<Record<string, never>>);
+  const states: ReservationState[] = [];
+  const pending: Promise<unknown>[] = [];
+  const reserve = () => {
+    const index = states.push("pending") - 1;
+    pending.push(sql.reserve().then(
+      (reserved) => {
+        states[index] = "resolved";
+        reserved.release();
+      },
+      (error: unknown) => { states[index] = { rejected: error }; },
+    ));
+  };
+  try {
+    await check({ sql, sockets, states, reserve });
+  } finally {
+    closing = true;
+    for (const socket of sockets) socket.destroy();
+    await Promise.all([
+      new Promise<void>((resolve) => server.close(() => resolve())),
+      sql.end({ timeout: 0 }),
+    ]);
+    await Promise.all(pending);
+  }
+}
+
 describe("postgres query queue backpressure", () => {
+  it.each(["esm", "cjs"] as const)(
+    "%s reserve fills all three cold connections before rejecting a waiter at max_queue:1",
+    async (build) => {
+      await withStalledReservations(build, 3, 1, async ({ sql, sockets, states, reserve }) => {
+        for (let count = 1; count <= 3; count += 1) {
+          reserve();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect([...states]).toEqual(Array(count).fill("pending"));
+          await expect.poll(() => sockets.size, { timeout: 2000 }).toBe(count);
+          expect([...states]).toEqual(Array(count).fill("pending"));
+        }
+        await expect(sql.reserve()).rejects.toMatchObject({ code: "QUERY_QUEUE_FULL" });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(sockets.size).toBe(3);
+        expect([...states]).toEqual(["pending", "pending", "pending"]);
+      });
+    },
+  );
+
+  it.each(["esm", "cjs"] as const)(
+    "%s reserve opens the first cold connection with max_queue:0 and rejects only when occupied",
+    async (build) => {
+      await withStalledReservations(build, 1, 0, async ({ sql, sockets, states, reserve }) => {
+        reserve();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect([...states]).toEqual(["pending"]);
+        await expect.poll(() => sockets.size, { timeout: 2000 }).toBe(1);
+        expect([...states]).toEqual(["pending"]);
+        await expect(sql.reserve()).rejects.toMatchObject({ code: "QUERY_QUEUE_FULL" });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(sockets.size).toBe(1);
+        expect([...states]).toEqual(["pending"]);
+      });
+    },
+  );
   it("rejects the next waiter with QUERY_QUEUE_FULL when the pending queue is full", async () => {
     const sockets = new Set<net.Socket>();
     let closing = false;
