@@ -57,83 +57,7 @@ async function createAgentRequest(token: string): Promise<APIRequestContext> {
   });
 }
 
-// The wait below follows the server's own deferral signal. It does not guess
-// a delay. WAKEUP_WAIT_TOTAL_MS is a per-call ceiling, not a fixed wait: one
-// test can call invokeHeartbeat several times under the suite's 60_000 ms
-// per-test timeout (see tests/e2e/playwright.config.ts), so each call caps
-// itself to the test's own remaining time, minus a reserve left for the
-// assertions that still have to run after the call returns. A stuck wait
-// then throws a named error, not a generic Playwright timeout.
-// The server's rewake cooldown (ISSUE_REWAKE_BASE_COOLDOWN_MS, 120_000 ms in
-// server/src/services/issue-rewake-throttle.ts) can outlast one test's life.
-// When that happens, this helper still fails fast and states the reason.
-const WAKEUP_WAIT_TOTAL_MS = 45_000;
-const WAKEUP_WAIT_RESERVE_MS = 10_000;
-const WAKEUP_POLL_INTERVAL_MS = 100;
-const MAX_CONSECUTIVE_RUN_READ_FAILURES = 5;
-
-// First-seen start time for the current test, keyed by Playwright's own
-// TestInfo object. Playwright does not expose a test start timestamp, so
-// this helper records one the first time a test calls invokeHeartbeat.
-const testStartTimesMs = new WeakMap<ReturnType<typeof test.info>, number>();
-
-/**
- * Return how long one invokeHeartbeat call may wait this time: the smaller
- * of WAKEUP_WAIT_TOTAL_MS and the current test's remaining time, after
- * WAKEUP_WAIT_RESERVE_MS is set aside for whatever the test still does once
- * this call returns. Returns 0 when the test has no time left to spare, so
- * the caller fails fast instead of starting a wait it cannot finish.
- */
-function wakeupWaitBudgetMs(): number {
-  const info = test.info();
-  const testTimeoutMs = info.timeout;
-  if (testTimeoutMs <= 0) return WAKEUP_WAIT_TOTAL_MS; // no test timeout set
-
-  let startedAtMs = testStartTimesMs.get(info);
-  if (startedAtMs === undefined) {
-    startedAtMs = Date.now();
-    testStartTimesMs.set(info, startedAtMs);
-  }
-
-  const elapsedMs = Date.now() - startedAtMs;
-  const remainingMs = testTimeoutMs - elapsedMs - WAKEUP_WAIT_RESERVE_MS;
-  return Math.max(0, Math.min(WAKEUP_WAIT_TOTAL_MS, remainingMs));
-}
-
-/**
- * Fetch a candidate run and confirm it belongs to this agent and this issue.
- * Return null when the run fails to load, or when it names a different
- * agent or a different issue. A caller must never treat an unverified lock
- * field as the answer.
- */
-async function fetchVerifiedRun(
-  board: APIRequestContext,
-  candidateRunId: string | null | undefined,
-  agentId: string,
-  issueId: string,
-): Promise<{ id: string; status: string } | null> {
-  if (!candidateRunId) return null;
-  const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidateRunId}`);
-  if (!runRes.ok()) return null;
-  const candidateRun = await runRes.json();
-  const context = candidateRun.contextSnapshot ?? {};
-  if (candidateRun.agentId !== agentId) return null;
-  if (context.issueId !== issueId && context.taskId !== issueId) return null;
-  return { id: candidateRunId, status: candidateRun.status };
-}
-
-/**
- * Invoke a heartbeat run for an agent, returning the run ID.
- *
- * Posts the wakeup exactly once. A second on-demand wake for the same
- * (agent, issue) pair while the first has not yet produced visible progress
- * reads as a redundant re-poll to the server's rewake throttle, so this
- * never re-posts — it only reads state after the single post.
- *
- * Every returned run ID passes `fetchVerifiedRun` first. The issue's
- * run-lock fields name a candidate, not a verified answer, because the lock
- * holder and the issue assignee can differ during a stage transition.
- */
+/** Invoke a no-op heartbeat and return an issue-bound, successfully settled run ID. */
 async function invokeHeartbeat(
   board: APIRequestContext,
   agentId: string,
@@ -148,85 +72,25 @@ async function invokeHeartbeat(
   });
   expect(res.ok()).toBe(true);
   const run = await res.json();
-  if (typeof run.id === "string" && run.id.length > 0) return run.id;
-
-  const waitBudgetMs = wakeupWaitBudgetMs();
-  const deadline = Date.now() + waitBudgetMs;
-  const lastSeen = {
-    reason: typeof run.reason === "string" ? run.reason : null,
-    checkoutRunId: null as string | null,
-    executionRunId: typeof run.executionRunId === "string" ? run.executionRunId : null,
-    blockingRunStatus: null as string | null,
-    blockingRunReadFailed: false,
-  };
-
-  // A stage transition can invoke the next participant before the prior
-  // stage's run releases the issue's execution lock. The server names the
-  // run that holds the lock for two skip reasons: `issue_execution_deferred`
-  // (an active execution run) and `execution_reconciliation_required` (an
-  // execution blocker). Both name the blocking run in the same two fields,
-  // so this code handles them the same way.
-  // A third reason, `wakeup_skipped`, can also carry an `executionRunId`,
-  // but only when that run already finished. A finished run is never this
-  // agent's turn. So for `wakeup_skipped`, this code ignores `executionRunId`
-  // and falls through to the verified wait below.
-  if (
-    (lastSeen.reason === "issue_execution_deferred" || lastSeen.reason === "execution_reconciliation_required") &&
-    typeof run.executionRunId === "string"
-  ) {
-    if (run.executionAgentId === agentId) {
-      // A run for this same agent on this same issue already holds the lock
-      // (for example one started when the issue was assigned). Verify it
-      // before this code treats it as the agent's current turn.
-      const verified = await fetchVerifiedRun(board, run.executionRunId, agentId, issueId);
-      if (verified) return verified.id;
-    } else {
-      // A different agent holds the lock (the prior stage's participant, or
-      // the blocker's owner). Wait for that run to finish. It promotes this
-      // wake into a real run as part of releasing the lock, so this code
-      // waits for that instead of guessing how long the release takes.
-      let consecutiveRunReadFailures = 0;
-      while (Date.now() < deadline) {
-        const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${run.executionRunId}`);
-        if (runRes.ok()) {
-          consecutiveRunReadFailures = 0;
-          const blockingRun = await runRes.json();
-          lastSeen.blockingRunStatus = typeof blockingRun.status === "string" ? blockingRun.status : null;
-          if (lastSeen.blockingRunStatus !== "queued" && lastSeen.blockingRunStatus !== "running") break;
-        } else {
-          // A 404 or a 500 response must not spin this loop forever. Count
-          // repeated read failures and stop once they dominate the wait.
-          // The failure then reads as "the run read kept failing", not as a
-          // generic timeout.
-          consecutiveRunReadFailures += 1;
-          if (consecutiveRunReadFailures >= MAX_CONSECUTIVE_RUN_READ_FAILURES) {
-            lastSeen.blockingRunReadFailed = true;
-            break;
-          }
-        }
-        await new Promise((resolve) => setTimeout(resolve, WAKEUP_POLL_INTERVAL_MS));
-      }
-    }
-  }
-
-  // Read the issue's own run-lock fields, and this agent's recent runs,
-  // until this agent's run for this issue appears and passes verification.
-  // Negative-authorization tests invoke a non-participant on purpose, so an
-  // assignee mismatch is a genuine rejection to return untouched, not a
-  // signal to keep waiting for a run that must never exist for that agent.
-  while (Date.now() < deadline) {
+  // Let the no-op processes finish before submitting a stage decision. A PATCH
+  // during execution cancels the old participant and can correctly leave a
+  // recovery hold that prevents the next participant from starting.
+  // Assignment and manual wakes can overlap, so wait for all issue-bound runs,
+  // including the one recovered when the manual invocation was skipped.
+  const deadline = Date.now() + 10_000;
+  do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
     lastSeen.checkoutRunId = issueRunLock.checkoutRunId;
     lastSeen.executionRunId = issueRunLock.executionRunId;
     if (issueRunLock.assigneeAgentId !== agentId) {
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
-
-    const verifiedCheckout = await fetchVerifiedRun(board, issueRunLock.checkoutRunId, agentId, issueId);
-    if (verifiedCheckout) return verifiedCheckout.id;
-    const verifiedExecution = await fetchVerifiedRun(board, issueRunLock.executionRunId, agentId, issueId);
-    if (verifiedExecution) return verifiedExecution.id;
-
+    const candidates = new Set<string>([
+      run.id,
+      run.executionRunId,
+      issueRunLock.executionRunId,
+      issueRunLock.checkoutRunId,
+    ].filter((candidate): candidate is string => Boolean(candidate)));
     const recentRunsRes = await board.get(
       `${BASE_URL}/api/companies/${issueRunLock.companyId}/heartbeat-runs?agentId=${agentId}&limit=20`,
     );
@@ -243,19 +107,26 @@ async function invokeHeartbeat(
         }
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, WAKEUP_POLL_INTERVAL_MS));
-  }
+    let settledRunId: string | undefined;
+    let hasActiveRun = false;
+    for (const candidate of candidates) {
+      const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidate}`);
+      if (!runRes.ok()) continue;
+      const candidateRun = await runRes.json();
+      const context = candidateRun.contextSnapshot ?? {};
+      if (context.issueId !== issueId && context.taskId !== issueId) continue;
+      if (candidateRun.status === "queued" || candidateRun.status === "running") {
+        hasActiveRun = true;
+      }
+      if (candidateRun.agentId === agentId && candidateRun.status === "succeeded") {
+        settledRunId = candidate;
+      }
+    }
+    if (settledRunId && !hasActiveRun) return settledRunId;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
 
-  throw new Error(
-    `No verified heartbeat run became available for agent ${agentId} on issue ${issueId} ` +
-      `within ${waitBudgetMs}ms` +
-      `${waitBudgetMs <= 0 ? " (the test's remaining time budget was already spent before this wait could start)" : ""}. ` +
-      `Last skip reason: ${lastSeen.reason ?? "none"}. ` +
-      `Last checkoutRunId: ${lastSeen.checkoutRunId ?? "none"}. ` +
-      `Last executionRunId: ${lastSeen.executionRunId ?? "none"}. ` +
-      `Blocking run status: ${lastSeen.blockingRunStatus ?? "none"}` +
-      `${lastSeen.blockingRunReadFailed ? " (the blocking run read failed repeatedly)" : ""}.`,
-  );
+  throw new Error(`No successfully settled issue-bound heartbeat run became available for agent ${agentId}`);
 }
 
 async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
@@ -451,7 +322,9 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
         adapterType: "process",
         adapterConfig: {
           command: process.execPath,
-          args: ["-e", "process.stdout.write('done\\n')"],
+          // Keep a short asynchronous window so the helper must wait for the
+          // process to settle instead of relying on an immediate exit.
+          args: ["-e", "process.stdout.write('done\\n'); setTimeout(() => {}, 250)"],
         },
       },
     });
@@ -542,6 +415,18 @@ test.describe("Signoff execution policy", () => {
     }
     await board.delete(`${BASE_URL}/api/companies/${ctx.companyId}`).catch(() => {});
     await board.dispose();
+  });
+
+  test("heartbeat helper waits for the no-op process to succeed", async () => {
+    const issue = await createIssueWithPolicy(ctx, "Signoff settled heartbeat");
+    const runId = await invokeHeartbeat(ctx.boardRequest, ctx.executor.agentId, issue.id);
+    const runRes = await ctx.boardRequest.get(`${BASE_URL}/api/heartbeat-runs/${runId}`);
+    expect(runRes.ok()).toBe(true);
+    expect(await runRes.json()).toMatchObject({
+      agentId: ctx.executor.agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId: issue.id },
+    });
   });
 
   test("happy path: executor → review → approval → done", async ({ page }) => {
