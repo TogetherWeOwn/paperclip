@@ -110,11 +110,10 @@ const SEAM_CITATIONS: SeamCitation[] = [
 
 /** Retired vocabulary: present means a second, unreviewed seam. */
 const RETIRED_SYMBOLS: Array<{ file: string; symbol: string }> = [
-  { file: "packages/adapter-utils/src/server-utils.ts", symbol: "assertAssignedModel" },
-  { file: "packages/adapter-utils/src/server-utils.ts", symbol: "launchAuthorization" },
-  { file: "packages/adapter-utils/src/ssh.ts", symbol: "assertAssignedModel" },
-  { file: "packages/adapter-utils/src/ssh.ts", symbol: "launchAuthorization" },
-];
+  ...new Set(SEAM_CITATIONS.map((citation) => citation.file)),
+].flatMap((file) =>
+  ["assertAssignedModel", "launchAuthorization"].map((symbol) => ({ file, symbol })),
+);
 
 type CitationVerdict = "present" | "absent" | "misordered";
 
@@ -165,6 +164,14 @@ function stripLineComments(source: string): string {
 function containsCodeIdentifier(source: string, symbol: string): boolean {
   const code = stripLineComments(source);
   return new RegExp(`(?<![A-Za-z0-9_$])${symbol}(?![A-Za-z0-9_$])`).test(code);
+}
+
+function assertNoRetiredSymbols(sources: Record<string, string>): void {
+  for (const { file, symbol } of RETIRED_SYMBOLS) {
+    if (containsCodeIdentifier(sources[file] ?? "", symbol)) {
+      throw new Error(`${file} must not contain ${symbol}`);
+    }
+  }
 }
 
 function checkSeamSources(sources: Record<string, string>): CitationResult[] {
@@ -279,11 +286,24 @@ describe("native SSH launch-authority seam is present (flipped gate)", () => {
   });
 
   it("keeps the retired vocabulary out of the seam files", () => {
-    for (const { file, symbol } of RETIRED_SYMBOLS) {
-      expect(containsCodeIdentifier(readTreeSource(file), symbol), `${file} must not contain ${symbol}`).toBe(
-        false,
-      );
-    }
+    expect(() => assertNoRetiredSymbols(readRealTree())).not.toThrow();
+  });
+
+  it.each(
+    [
+      "packages/adapter-utils/src/server-utils.ts",
+      "packages/adapter-utils/src/ssh.ts",
+      "packages/adapter-utils/src/host-executor.ts",
+      "server/src/services/native-ssh-authority.ts",
+      "server/src/services/heartbeat.ts",
+      "server/src/routes/agents.ts",
+    ].flatMap((file) =>
+      ["assertAssignedModel", "launchAuthorization"].map((symbol) => ({ file, symbol })),
+    ),
+  )("trips when $symbol returns in $file", ({ file, symbol }) => {
+    const sources = readRealTree();
+    sources[file] += `\nconst ${symbol} = null;\n`;
+    expect(() => assertNoRetiredSymbols(sources)).toThrow(`${file} must not contain ${symbol}`);
   });
 
   it("ignores retired symbols named only in comments", () => {
