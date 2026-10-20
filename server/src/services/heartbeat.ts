@@ -56,7 +56,9 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
@@ -454,7 +456,9 @@ import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
+  cleanupRemoteHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
+  prepareRemoteHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
@@ -21031,6 +21035,10 @@ export function heartbeatService(
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
+    // Set alongside runScratch only when the scratch dir lives on a remote
+    // (SSH/sandbox) execution target. Routes terminal cleanup through the
+    // remote shell channel before the environment lease is released.
+    let runScratchTarget: AdapterExecutionTarget | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
@@ -23418,7 +23426,62 @@ export function heartbeatService(
           );
         }
       } else {
-        delete context.paperclipScratch;
+        // Remote (SSH/sandbox) targets get the same per-run scratch env via a
+        // run-unique directory on the target itself. Without it, agents fall
+        // back to fixed /tmp payload paths on hosts whose /tmp is shared
+        // across runs and days.
+        try {
+          runScratch = await prepareRemoteHeartbeatRunScratch(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              issueId: issueRef?.id ?? null,
+              issueIdentifier: issueRef?.identifier ?? null,
+            },
+            {
+              exec: (command) =>
+                runAdapterExecutionTargetShellCommand(run.id, executionTarget, command, {
+                  cwd: executionTarget.remoteCwd,
+                  env: {},
+                  timeoutSec: 15,
+                }),
+            },
+          );
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const scratchEnv = buildHeartbeatRunScratchEnv(
+            existingRuntimeEnv,
+            runScratch,
+          );
+          runtimeConfig = {
+            ...runtimeConfig,
+            env: {
+              ...existingRuntimeEnv,
+              ...scratchEnv.env,
+            },
+          };
+          runScratchTarget = executionTarget;
+          context.paperclipScratch = {
+            type: "heartbeat_run",
+            dir: runScratch.dir,
+            cleanupPolicy: "terminal_run",
+            marker: HEARTBEAT_RUN_SCRATCH_MARKER,
+            tempKeysApplied: scratchEnv.tempKeysApplied,
+          };
+        } catch (scratchPrepareError) {
+          runScratch = null;
+          runScratchTarget = null;
+          delete context.paperclipScratch;
+          logger.warn(
+            {
+              err: scratchPrepareError,
+              runId: run.id,
+              issueId,
+              agentId: agent.id,
+            },
+            "failed to prepare remote heartbeat run scratch directory; continuing without scratch env",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -27103,6 +27166,79 @@ export function heartbeatService(
               },
             );
           }
+          // Remote run scratch must be removed through the target's shell
+          // channel while the lease is still held; after release the target
+          // may be unreachable. Nulling runScratch here keeps the local
+          // cleanup block below from touching a remote path.
+          if (
+            runScratch &&
+            runScratchTarget?.kind === "remote" &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            const scratchForCleanup = runScratch;
+            const targetForCleanup = runScratchTarget;
+            runScratch = null;
+            runScratchTarget = null;
+            let scratchCleanup: Awaited<
+              ReturnType<typeof cleanupRemoteHeartbeatRunScratch>
+            > | null = null;
+            try {
+              scratchCleanup = await cleanupRemoteHeartbeatRunScratch(
+                { scratch: scratchForCleanup },
+                {
+                  exec: (command) =>
+                    runAdapterExecutionTargetShellCommand(run.id, targetForCleanup, command, {
+                      cwd: targetForCleanup.remoteCwd,
+                      env: {},
+                      timeoutSec: 15,
+                    }),
+                },
+              );
+            } catch (scratchCleanupError) {
+              logger.warn(
+                {
+                  err: scratchCleanupError,
+                  runId: run.id,
+                  scratchDir: scratchForCleanup.dir,
+                },
+                "failed to clean remote heartbeat run scratch directory",
+              );
+              await appendRunEvent(latestRun, {
+                eventType: "error",
+                stream: "system",
+                level: "warn",
+                message: "remote run scratch cleanup failed",
+                payload: {
+                  dir: scratchForCleanup.dir,
+                  error:
+                    scratchCleanupError instanceof Error
+                      ? scratchCleanupError.message
+                      : String(scratchCleanupError),
+                },
+              }).catch(() => undefined);
+            }
+            if (scratchCleanup) {
+              await appendRunEvent(latestRun, {
+                eventType: "lifecycle",
+                stream: "system",
+                level: scratchCleanup.removed ? "info" : "warn",
+                message: scratchCleanup.removed
+                  ? "remote run scratch cleaned"
+                  : `remote run scratch cleanup skipped: ${scratchCleanup.reason}`,
+                payload: scratchCleanup,
+              }).catch((scratchCleanupEventError) => {
+                logger.warn(
+                  {
+                    err: scratchCleanupEventError,
+                    runId: run.id,
+                    scratchDir: scratchForCleanup.dir,
+                  },
+                  "failed to record remote heartbeat run scratch cleanup event",
+                );
+              });
+            }
+          }
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -27157,6 +27293,10 @@ export function heartbeatService(
         }
         if (
           runScratch &&
+          // runScratchTarget is set only for remote scratch (see the remote
+          // provision branch above): a non-null target means the local
+          // fs-based cleanup must not touch this path.
+          !runScratchTarget &&
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {
