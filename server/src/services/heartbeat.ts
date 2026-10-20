@@ -17962,6 +17962,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
+    cancellationOptions: { skipQueuedRunStart?: boolean } = {},
   ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -17969,6 +17970,7 @@ export function heartbeatService(
       await cancelRunInternal(
         run.id,
         "Cancelled because the agent no longer exists",
+        cancellationOptions,
       );
       return null;
     }
@@ -17979,6 +17981,7 @@ export function heartbeatService(
       await cancelRunInternal(
         run.id,
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
+        cancellationOptions,
       );
       return null;
     }
@@ -17993,7 +17996,7 @@ export function heartbeatService(
       },
     );
     if (budgetBlock) {
-      await cancelRunInternal(run.id, budgetBlock.reason);
+      await cancelRunInternal(run.id, budgetBlock.reason, cancellationOptions);
       return null;
     }
 
@@ -18048,6 +18051,7 @@ export function heartbeatService(
         await cancelRunInternal(
           run.id,
           "Cancelled because issue is held by an active subtree pause hold",
+          cancellationOptions,
         );
         await logActivity(db, {
           companyId: run.companyId,
@@ -20720,7 +20724,11 @@ export function heartbeatService(
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
         try {
-          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          // This loop already advances past rejected candidates while holding
+          // the start lock. Cancellation must not recursively acquire that lock.
+          const claimed = await claimQueuedRun(queuedRun, companyAgents, {
+            skipQueuedRunStart: true,
+          });
           if (claimed) claimedRuns.push(claimed);
         } catch (error) {
           // claimQueuedRun also does work after its claim transaction commits
@@ -29946,7 +29954,7 @@ export function heartbeatService(
   async function cancelRunInternal(
     runId: string,
     reason = "Cancelled by control plane",
-    options: CancelRunOptions = {},
+    options: CancelRunOptions & { skipQueuedRunStart?: boolean } = {},
   ) {
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
@@ -30229,7 +30237,9 @@ export function heartbeatService(
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        if (!options.skipQueuedRunStart) {
+          await startNextQueuedRunForAgent(run.agentId);
+        }
       }
       return cancelled;
     } finally {
