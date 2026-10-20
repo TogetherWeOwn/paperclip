@@ -1,23 +1,25 @@
 import { promisify } from "node:util";
 import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, toSshTarExcludes } from "./ssh-workspace-excludes.js";
 
-// Run the same discovery on the archive's creating host. Do not follow links,
+// Run the same discovery on the archive's creating host. Do not follow directory links,
 // enter Git metadata, or descend into a linked checkout after identifying it.
 // A gitfile alone is not enough: submodules and separate-git-dir repositories
 // have them too. A linked worktree's gitdir has a commondir file.
 // NUL-delimited output keeps spaces, newlines and shell metacharacters literal.
 export const SSH_NESTED_WORKTREES_SCRIPT = [
   "set -e",
+  "carriage_return=$(printf '\\r')",
   "walk() {",
   '  for candidate in "$1"/* "$1"/.[!.]* "$1"/..?*; do',
   '    [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue',
   '    case "$candidate" in',
   `      ${SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((entry) => `"./${entry}"`).join("|")}|*/.git) continue ;;`,
   "    esac",
-  '    if [ -f "$candidate/.git" ] && [ ! -L "$candidate/.git" ]; then',
+  '    if [ -f "$candidate/.git" ]; then',
   '      gitdir_line=""',
   '      [ -r "$candidate/.git" ] || exit 1',
   '      IFS= read -r gitdir_line < "$candidate/.git" || :',
+  '      gitdir_line=${gitdir_line%"$carriage_return"}',
   '      case "$gitdir_line" in',
   '        "gitdir: "*)',
   '          gitdir=${gitdir_line#"gitdir: "}',

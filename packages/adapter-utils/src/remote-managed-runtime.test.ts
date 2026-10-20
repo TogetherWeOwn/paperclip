@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -139,6 +141,23 @@ describe("remote managed runtime", () => {
     await writeFile(path.join(workspaceDir, "target", "debug", "binary"), "built\n");
     await writeFile(path.join(workspaceDir, "src", "commands", "target", "index.ts"), "export {};\n");
     await writeFile(path.join(workspaceDir, "keep.txt"), "keep\n");
+    // A discovered linked checkout outside every fixed scratch root. Keep its
+    // real admin dir outside the workspace and require the literal path in the
+    // baseline even when its name contains glob metacharacters.
+    const mainRepo = path.join(rootDir, "main");
+    const nestedName = "nested [linked]";
+    const nestedDir = path.join(workspaceDir, nestedName);
+    const git = async (cwd: string, ...args: string[]) => await promisify(execFile)("git", [
+      "-c", "user.name=Test", "-c", "user.email=test@example.invalid", ...args,
+    ], { cwd });
+    await mkdir(mainRepo);
+    await git(mainRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(mainRepo, "README.md"), "main\n");
+    await git(mainRepo, "add", "README.md");
+    await git(mainRepo, "commit", "-q", "-m", "initial");
+    await git(mainRepo, "worktree", "add", nestedDir, "-b", "baseline-linked");
+    expect((await git(nestedDir, "rev-parse", "--show-toplevel")).stdout.trim()).toBe(nestedDir);
+    await writeFile(path.join(nestedDir, "marker.txt"), "local linked work\n");
     prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
 
     const prepared = await prepareRemoteManagedRuntime({
@@ -164,6 +183,9 @@ describe("remote managed runtime", () => {
     };
     const { exclude, entries } = restoreInput.baselineSnapshot;
     expect(exclude).toEqual(expect.arrayContaining([".paperclip-runtime", ".claude/worktrees", "node_modules", "target"]));
+    expect(exclude).toContain(nestedName);
+    expect(entries.has(`${nestedName}/marker.txt`)).toBe(false);
+    expect([...entries.keys()].filter((key) => key === nestedName || key.startsWith(`${nestedName}/`))).toEqual([]);
     // Root scratch is out of the baseline; nested source named like it stays in.
     expect([...entries.keys()].filter((key) => /^(\.claude\/worktrees|node_modules|target)(\/|$)/.test(key))).toEqual([]);
     expect(entries.has("src/commands/target/index.ts")).toBe(true);

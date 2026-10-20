@@ -93,7 +93,8 @@ SSH execution for task workspaces excludes workspace-root `.paperclip-runtime/`,
 `.claude/worktrees/`, `.paperclip/worktrees/`, `.worktrees/`, `node_modules/`, and
 `target/` from export, baseline capture, size measurement, and sync-back. It also
 excludes nested linked Git worktrees at other paths: their `.git` file points to
-Git metadata with a `commondir` file. Discovery runs on the creating host before
+Git metadata with a `commondir` file. CRLF gitfiles and symlinks to regular
+gitfiles are recognized too. Discovery runs on the creating host before
 archiving, so worktrees created remotely are excluded too. It does not follow
 symlink directories. The workspace root itself, independent nested repositories,
 submodules, and separate-git-dir repositories remain in scope.
