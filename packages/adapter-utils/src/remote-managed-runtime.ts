@@ -8,6 +8,7 @@ import {
   syncDirectoryToSsh,
 } from "./ssh.js";
 import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES } from "./ssh-workspace-excludes.js";
+import { discoverSshNestedWorktrees } from "./ssh-nested-worktrees.js";
 import {
   mergeExcludes,
   referencedSourceIgnoreExcludeEntries,
@@ -148,6 +149,9 @@ export async function prepareRemoteManagedRuntime(input: {
     : null;
   const projectRepositories = preparedWorkspace?.repositories ?? [];
   const excludeAgentLocalScratch = input.workspaceFileMode !== "all";
+  const nestedWorktrees = preparedWorkspace && excludeAgentLocalScratch
+    ? await discoverSshNestedWorktrees(input.workspaceLocalDir)
+    : [];
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         // Task workspaces keep agent-local scratch out of the baseline, so the
@@ -160,10 +164,12 @@ export async function prepareRemoteManagedRuntime(input: {
               ".paperclip-runtime",
               ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
+              ...nestedWorktrees,
             ]
           : [
               ".paperclip-runtime",
               ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : []),
+              ...nestedWorktrees,
               ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
             ],
       })

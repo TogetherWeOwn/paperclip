@@ -2570,9 +2570,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       terminalSweepInProgress = true;
       try {
+      // Failed cleanup closes the row but leaves its worktree behind. Retry it
+      // through the same delivery, terminality, run and Git safety checks.
+      const cleanupCandidateFilter = or(
+        and(
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+        ),
+        eq(executionWorkspaces.status, "cleanup_failed"),
+      );
       const baseCandidateFilter = and(
-        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-        isNull(executionWorkspaces.closedAt),
+        cleanupCandidateFilter,
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
       // Continue the scan after the previous sweep's last row. The keyset
@@ -2761,11 +2769,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          const fresh = await tx.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspace.id)).then((rows) => rows[0] ?? null);
+          if (
+            !fresh || fresh.status !== workspace.status
+            || readExecutionWorkspaceLifecycleGeneration(fresh.metadata) !== readExecutionWorkspaceLifecycleGeneration(workspace.metadata)
+          ) return null;
           return tx
             .update(executionWorkspaces)
             .set({
               status: "archived",
-              closedAt,
+              closedAt: workspace.closedAt ?? closedAt,
               cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
               cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
               metadata: archivedMetadata,
@@ -2774,8 +2788,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .where(and(
               eq(executionWorkspaces.id, workspace.id),
               eq(executionWorkspaces.companyId, workspace.companyId),
-              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-              isNull(executionWorkspaces.closedAt),
+              cleanupCandidateFilter,
               sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
               sql<boolean>`EXISTS (
                 SELECT 1

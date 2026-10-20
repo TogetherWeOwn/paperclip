@@ -14,6 +14,8 @@
 export const SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES = [
   ".paperclip-runtime",
   ".claude/worktrees",
+  ".paperclip/worktrees",
+  ".worktrees",
   "node_modules",
   "target",
 ] as const;
@@ -33,9 +35,11 @@ export function resolveSshTarFlavor(version: string): SshTarFlavor {
 }
 
 /** Translate workspace snapshot excludes into root-relative transfer patterns. */
-export function toSshTarExcludes(exclude: readonly string[]): string[] {
-  const scratch = new Set<string>(SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES);
-  return [...new Set(exclude.map((entry) => scratch.has(entry) ? `./${entry}` : entry))];
+export function toSshTarExcludes(exclude: readonly string[], literalPaths: readonly string[] = []): string[] {
+  const scratch = new Set<string>([...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...literalPaths]);
+  return [...new Set(exclude.map((entry) => scratch.has(entry)
+    ? `./${entry.replace(/[\\*?\[]/g, "\\$&")}`
+    : entry))];
 }
 
 /**

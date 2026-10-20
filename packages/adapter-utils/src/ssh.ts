@@ -28,6 +28,12 @@ import {
   translateSshTarExcludes,
   type SshTarFlavor,
 } from "./ssh-workspace-excludes.js";
+import {
+  discoverSshNestedWorktrees,
+  nestedWorktreeTarExcludes,
+  parseSshNestedWorktrees,
+  SSH_NESTED_WORKTREES_SCRIPT,
+} from "./ssh-nested-worktrees.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -460,13 +466,16 @@ const SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES: readonly string[] = SSH_SYNC_BACK
  * agent worktrees). Dropping the entries and adding the excludes makes the
  * merge ignore these paths on both sides, however the baseline was captured.
  */
-export function withSshAgentLocalExcludes(baseline: DirectorySnapshot): DirectorySnapshot {
+export function withSshAgentLocalExcludes(
+  baseline: DirectorySnapshot,
+  nestedWorktrees: readonly string[] = [],
+): DirectorySnapshot {
+  const exclude = [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...nestedWorktrees];
   return {
-    exclude: [...new Set([...baseline.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],
+    ...baseline,
+    exclude: [...new Set([...baseline.exclude, ...exclude])],
     entries: new Map(
-      [...baseline.entries].filter(
-        ([relative]) => !shouldExcludePath(relative, SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES),
-      ),
+      [...baseline.entries].filter(([relative]) => !shouldExcludePath(relative, exclude)),
     ),
   };
 }
@@ -1323,6 +1332,7 @@ async function transportGitWorkspaceToSsh(input: {
   remoteDir: string;
   snapshot: LocalGitWorkspaceSnapshot;
   exclude?: string[];
+  excludeNestedWorktrees?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel: string;
 }): Promise<void> {
@@ -1338,6 +1348,7 @@ async function transportGitWorkspaceToSsh(input: {
     localDir: input.localDir,
     remoteDir: input.remoteDir,
     exclude: [".git", ".paperclip-runtime", ...(input.exclude ?? [])],
+    excludeNestedWorktrees: input.excludeNestedWorktrees,
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });
@@ -1696,6 +1707,7 @@ export async function syncDirectoryToSsh(input: {
   localDir: string;
   remoteDir: string;
   exclude?: string[];
+  excludeNestedWorktrees?: boolean;
   followSymlinks?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
@@ -1703,6 +1715,12 @@ export async function syncDirectoryToSsh(input: {
    * promise rejects with `SshSyncTimeoutError`. Unset = unbounded (legacy). */
   timeoutMs?: number;
 }): Promise<void> {
+  const exclude = [
+    ...(input.exclude ?? []),
+    ...(input.excludeNestedWorktrees
+      ? nestedWorktreeTarExcludes(await discoverSshNestedWorktrees(input.localDir))
+      : []),
+  ];
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
     ...auth.args,
@@ -1724,7 +1742,7 @@ export async function syncDirectoryToSsh(input: {
       label: input.progressLabel,
       totalBytes: estimateLocalDirSize({
         localDir: input.localDir,
-        exclude: input.exclude,
+        exclude,
         followSymlinks: input.followSymlinks,
       }),
       estimated: true,
@@ -1732,7 +1750,7 @@ export async function syncDirectoryToSsh(input: {
     : null;
 
   try {
-    const flavor = hasRootRelativeTarExcludes(input.exclude)
+    const flavor = hasRootRelativeTarExcludes(exclude)
       ? resolveSshTarFlavor((await execFileText("tar", ["--version"])).stdout)
       : "gnu";
     await new Promise<void>((resolve, reject) => {
@@ -1740,7 +1758,7 @@ export async function syncDirectoryToSsh(input: {
       ...(input.followSymlinks ? ["-h"] : []),
       "-C",
       input.localDir,
-      ...tarExcludeArgs(input.exclude, flavor),
+      ...tarExcludeArgs(exclude, flavor),
       "-cf",
       "-",
       ".",
@@ -1841,13 +1859,23 @@ export async function syncDirectoryFromSsh(input: {
   remoteDir: string;
   localDir: string;
   exclude?: string[];
+  excludeNestedWorktrees?: boolean;
   preserveLocalEntries?: readonly string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
+  const nestedWorktrees = input.excludeNestedWorktrees
+    ? parseSshNestedWorktrees((await runSshScript(
+        input.spec,
+        `cd ${shellQuote(input.remoteDir)} && ${SSH_NESTED_WORKTREES_SCRIPT}`,
+        { timeoutMs: 60_000, maxBuffer: 1024 * 1024 },
+      )).stdout)
+    : [];
+  // Resolve once, then use the same exclusions for measurement and transfer.
+  const exclude = [...(input.exclude ?? []), ...nestedWorktreeTarExcludes(nestedWorktrees)];
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
-  const remoteTarScript = buildRemoteWorkspaceDownloadScript(input.remoteDir, input.exclude);
+  const remoteTarScript = buildRemoteWorkspaceDownloadScript(input.remoteDir, exclude);
   const sshArgs = [
     ...auth.args,
     "-p",
@@ -1880,7 +1908,7 @@ export async function syncDirectoryFromSsh(input: {
     const estimatedBytes = await measureRemoteWorkspaceDownloadBytes({
       spec: input.spec,
       remoteDir: input.remoteDir,
-      exclude: input.exclude,
+      exclude,
     });
     assertSshSyncBackSizeWithinCap({ sourceBytes: estimatedBytes, capBytes, remoteDir: input.remoteDir });
 
@@ -1987,6 +2015,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       remoteDir,
       snapshot: gitSnapshot,
       exclude: [...(repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []), ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      excludeNestedWorktrees: true,
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -2023,6 +2052,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       ...(input.workspaceFileMode === "all" ? [] : SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES),
       ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
     ],
+    excludeNestedWorktrees: input.workspaceFileMode !== "all",
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -2098,11 +2128,14 @@ async function restoreWorkspaceRootFromSsh(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir;
   const excludeAgentLocalScratch = input.excludeAgentLocalScratch !== false;
+  const nestedWorktrees = excludeAgentLocalScratch
+    ? await discoverSshNestedWorktrees(input.localDir)
+    : [];
   if (input.baselineSnapshot) {
     // The sync-back never carries agent-local scratch in task-workspace mode,
     // so the merge must not mistake its absence for a remote deletion.
     const baseline = excludeAgentLocalScratch
-      ? withSshAgentLocalExcludes(input.baselineSnapshot)
+      ? withSshAgentLocalExcludes(input.baselineSnapshot, nestedWorktrees)
       : input.baselineSnapshot;
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
@@ -2128,7 +2161,8 @@ async function restoreWorkspaceRootFromSsh(input: {
         // scratch anchored to the root so this inner transfer (staging
         // directory into staging directory) carries neither nested worktrees
         // nor build outputs, yet keeps nested source named like them.
-        exclude: toSshTarExcludes(baseline.exclude),
+        exclude: toSshTarExcludes(baseline.exclude, nestedWorktrees),
+        excludeNestedWorktrees: excludeAgentLocalScratch,
         onProgress: input.onProgress,
         progressLabel: input.progressLabel,
       });
@@ -2172,9 +2206,10 @@ async function restoreWorkspaceRootFromSsh(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES), ...projectRepositoryEntries],
+      exclude: [".git", ".paperclip-runtime", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES), ...nestedWorktreeTarExcludes(nestedWorktrees), ...projectRepositoryEntries],
+      excludeNestedWorktrees: excludeAgentLocalScratch,
       // Excluded from the download, so nothing replaces them: keep the local copies.
-      preserveLocalEntries: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES), ...projectRepositoryEntries],
+      preserveLocalEntries: [".git", ...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES), ...nestedWorktrees, ...projectRepositoryEntries],
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
     });
@@ -2185,8 +2220,9 @@ async function restoreWorkspaceRootFromSsh(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES] : [...SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES],
-    preserveLocalEntries: excludeAgentLocalScratch ? [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES] : [...SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES],
+    exclude: [...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_TAR_EXCLUDES), ...nestedWorktreeTarExcludes(nestedWorktrees)],
+    excludeNestedWorktrees: excludeAgentLocalScratch,
+    preserveLocalEntries: [...(excludeAgentLocalScratch ? SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES : SSH_SYNC_BACK_ALWAYS_GUARD_EXCLUDES), ...nestedWorktrees],
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });
