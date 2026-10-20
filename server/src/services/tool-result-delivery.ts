@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { runAdapterExecutionTargetProcess, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { NativeSshHostExecutorTarget } from "@paperclipai/adapter-utils/host-executor";
@@ -48,8 +49,9 @@ export function createToolResultSpillWriter(input: {
   return async ({ invocationId, text }) => {
     if (!root || !input.scope.runId) throw new Error("Tool-result spill target unavailable");
     const program = await readFile(new URL("./scripts/tool-result-spill.mjs", import.meta.url), "utf8");
+    // Auxiliary children must not replace the agent's run-keyed Stop handle.
     const result = await runAdapterExecutionTargetProcess(
-      input.scope.runId, input.target, "node", ["--input-type=module", "-e", program], {
+      `tool-result-spill-${randomUUID()}`, input.target, "node", ["--input-type=module", "-e", program], {
         cwd: input.cwd,
         env: {},
         stdin: JSON.stringify({ root, remote, runId: input.scope.runId, invocationId, text }),

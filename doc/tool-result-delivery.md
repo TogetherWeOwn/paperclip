@@ -20,6 +20,13 @@ truncated. Tool discovery and non-run connection Test calls keep their protocol
 responses. Approved actions that execute after their run has stopped do not have
 a live spill writer and retain their existing response behavior.
 
+Connected MCP error results use the same validation, redaction and delivery path
+before the gateway throws an error. Both ordinary and approved calls keep HTTP
+502 and `tool_error`; the message contains the bounded preview and spill pointer.
+Small errors and tools with caps disabled retain their full sanitized message.
+Failed invocations and `call_failed` events retain the full sanitized size and
+hash, plus delivery metadata. Provider actions are not retried.
+
 ## Exempt reviewer reads
 
 Canonical `read_pull_request` is always exempt. The `paperclip_github_chat`

@@ -5801,6 +5801,13 @@ export function createToolGatewayService(
       .join("\n");
   }
 
+  function toolResultErrorMessage(value: unknown, fallback: unknown): string {
+    const content = asRecord(value)?.content;
+    return Array.isArray(content)
+      ? normalizeMcpContent(content)
+      : String(content || fallback);
+  }
+
   function normalizeMcpToolResult(
     result: unknown,
     transport: "mcp_http" | "local_stdio" | "cognee_cloud" = "mcp_http",
@@ -7535,6 +7542,7 @@ export function createToolGatewayService(
     claimUpdatedAt: Date;
     expectedInvocationStatus: "awaiting_approval" | "executing";
     error: unknown;
+    resultSummary?: ReturnType<typeof summarizeToolValue>;
   }) {
     const reasonCode =
       input.error instanceof ToolGatewayHttpError
@@ -7580,6 +7588,11 @@ export function createToolGatewayService(
           idempotencyKey: null,
           errorCode: reasonCode,
           errorMessage: message,
+          ...(input.resultSummary ? {
+            resultHash: input.resultSummary.sha256,
+            resultSummary: input.resultSummary,
+            resultSizeBytes: input.resultSummary.sizeBytes,
+          } : {}),
           completedAt: now,
           updatedAt: now,
         })
@@ -7998,6 +8011,8 @@ export function createToolGatewayService(
       status: "executing",
     });
 
+    let resultSummary: ReturnType<typeof summarizeToolValue> | undefined;
+    let deliveryMetadata: Record<string, unknown> | undefined;
     try {
       const executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
       const result =
@@ -8032,13 +8047,6 @@ export function createToolGatewayService(
                     "approved_execution_unsupported",
                   );
                 })();
-      const resultRecord = asRecord(result);
-      if (resultRecord?.error)
-        throw new ToolGatewayHttpError(
-          502,
-          String(resultRecord.content || resultRecord.error),
-          "tool_execution_failed",
-        );
       const resultValidation = validateToolContent({
         value: result,
         direction: "result",
@@ -8053,6 +8061,18 @@ export function createToolGatewayService(
         value: resultValidation.value,
         originalSizeBytes: resultValidation.summary.sizeBytes,
       });
+      resultSummary = resultValidation.summary;
+      deliveryMetadata = delivery.metadata;
+      const resultRecord = asRecord(resultValidation.value);
+      if (resultRecord?.error) {
+        const connectedMcp = tool.providerType === "mcp_remote_http" ||
+          tool.providerType === "provider_rest" || tool.providerType === "mcp_local_stdio";
+        throw new ToolGatewayHttpError(
+          502,
+          toolResultErrorMessage(delivery.value, resultRecord.error),
+          connectedMcp ? "tool_error" : "tool_execution_failed",
+        );
+      }
       const now = new Date();
       await db
         .update(toolInvocations)
@@ -8101,6 +8121,7 @@ export function createToolGatewayService(
         claimUpdatedAt: claimed.updatedAt,
         expectedInvocationStatus: "executing",
         error,
+        resultSummary,
       });
       await writeToolCallEvent({
         invocationId: invocation.id,
@@ -8112,7 +8133,8 @@ export function createToolGatewayService(
         policyDecision: "deny",
         reasonCode,
         argumentsSummary,
-        metadata: { durationMs: Date.now() - startedAt },
+        resultSummary,
+        metadata: { durationMs: Date.now() - startedAt, ...deliveryMetadata },
         tool,
       });
       throw error;
@@ -10477,6 +10499,8 @@ export function createToolGatewayService(
         },
       });
 
+      let resultSummary: ReturnType<typeof summarizeToolValue> | undefined;
+      let deliveryMetadata: Record<string, unknown> | undefined;
       try {
         primaryBlinding ||= nonCandidateAgent && isGitHubPrimaryReviewer(db, session.companyId, session.agentId!);
         if (primaryBlinding) (await githubPrimaryBlinding(db, session.companyId)).assertVisible(effectiveParameters);
@@ -10587,14 +10611,6 @@ export function createToolGatewayService(
         const validatedMcpResult = connectedMcpExecution
           ? asRecord(resultValidation.value)
           : null;
-        if (validatedMcpResult?.error) {
-          throw new ToolGatewayHttpError(
-            502,
-            String(validatedMcpResult.content || validatedMcpResult.error),
-            "tool_error",
-            { execution: connectedMcpExecution?.execution },
-          );
-        }
         const delivery = await prepareGatewayResultDelivery({
           scope: session,
           invocationId,
@@ -10603,6 +10619,16 @@ export function createToolGatewayService(
           value: resultValidation.value,
           originalSizeBytes: resultValidation.summary.sizeBytes,
         });
+        resultSummary = resultValidation.summary;
+        deliveryMetadata = delivery.metadata;
+        if (validatedMcpResult?.error) {
+          throw new ToolGatewayHttpError(
+            502,
+            toolResultErrorMessage(delivery.value, validatedMcpResult.error),
+            "tool_error",
+            { execution: connectedMcpExecution?.execution },
+          );
+        }
         await db
           .update(toolInvocations)
           .set({
@@ -10743,6 +10769,11 @@ export function createToolGatewayService(
                   : "failed",
             errorCode: reasonCode,
             errorMessage: message,
+            ...(resultSummary ? {
+              resultHash: resultSummary.sha256,
+              resultSummary,
+              resultSizeBytes: resultSummary.sizeBytes,
+            } : {}),
             completedAt,
             updatedAt: completedAt,
           })
@@ -10782,7 +10813,9 @@ export function createToolGatewayService(
           policyDecision: isDeferred ? "defer_runtime" : "deny",
           reasonCode,
           argumentsSummary: effectiveArgumentsSummary,
+          resultSummary,
           metadata: {
+            ...deliveryMetadata,
             ...(virtualToolName
               ? { virtualToolName, targetToolName: tool.name }
               : {}),
@@ -10815,6 +10848,8 @@ export function createToolGatewayService(
             argumentsSummary: effectiveArgumentsSummary,
             durationMs: Date.now() - startedAt,
             error: message,
+            resultSummary,
+            ...deliveryMetadata,
             ...(executionAuditFromError(normalizedError)
               ? { execution: executionAuditFromError(normalizedError) }
               : {}),
