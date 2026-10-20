@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runChildProcess, runningProcesses } from "@paperclipai/adapter-utils/server-utils";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import {
   createToolResultSpillWriter,
@@ -71,6 +72,28 @@ describe("gateway result delivery acceptance", () => {
     expect(path.relative(root, saved.file)).not.toMatch(/^\.\./);
     expect((await fs.lstat(saved.file)).mode & 0o777).toBe(0o600);
     expect((await fs.lstat(path.dirname(saved.file))).mode & 0o777).toBe(0o700);
+    expect(result.metadata).toMatchObject({ truncated: true, deliveredSizeBytes: bytes(result.value) });
+  });
+
+  it("preserves the plugin envelope and spills its full sanitized JSON", async () => {
+    useDiskWriter();
+    const token = "ghp_" + "q".repeat(36);
+    const value = {
+      pluginId: "fixture-plugin", toolName: "large_read",
+      result: { content: `prefix ${token}\n${LARGE}\nsuffix ${token}`, data: { complete: LARGE } },
+    };
+    const result = await deliver(value, { ...normalTool, providerType: "paperclip_plugin" });
+    expect(Object.keys(result.value as object).sort()).toEqual(["pluginId", "result", "toolName"]);
+    expect(result.value).toMatchObject({ pluginId: value.pluginId, toolName: value.toolName, result: { isError: false } });
+    expect(bytes(result.value)).toBeLessThanOrEqual(CAP);
+    expect(JSON.stringify(result.value)).not.toContain(token);
+    const saved = footer((result.value as typeof value).result);
+    // The unit caller supplies raw originalSizeBytes; gateway callers supply
+    // their pre-cap sanitized summary. Delivery must preserve its supplied total.
+    expect(saved.total).toBe(bytes(value));
+    expect(JSON.parse(await fs.readFile(saved.file, "utf8"))).toEqual({
+      ...value, result: { ...value.result, content: value.result.content.replaceAll(token, REDACTED_EVENT_VALUE) },
+    });
     expect(result.metadata).toMatchObject({ truncated: true, deliveredSizeBytes: bytes(result.value) });
   });
 
@@ -222,6 +245,37 @@ describe("gateway result delivery acceptance", () => {
 });
 
 describe("controller-owned private spill filesystem", () => {
+  it("does not replace or remove the live agent child in the real process registry", async () => {
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const childResult = runChildProcess(scope.runId, process.execPath, [
+      "-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)",
+    ], {
+      cwd: root, env: {}, inheritServerEnv: false, timeoutSec: 10, graceSec: 1,
+      onLog: async (_stream, chunk) => { if (chunk.includes("ready")) ready(); },
+    });
+    let dummy: NonNullable<ReturnType<typeof runningProcesses.get>>["child"] | undefined;
+    let writes: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await Promise.race([started, childResult.then(() => { throw new Error("dummy exited before readiness"); })]);
+      dummy = runningProcesses.get(scope.runId)?.child;
+      expect(dummy).toBeDefined();
+      writes = vi.spyOn(runningProcesses, "set");
+      const writer = createToolResultSpillWriter({ scope, target: null, cwd: root, scratchDir: root });
+      const file = await writer({ invocationId: randomUUID(), text: LARGE });
+      expect(await fs.readFile(file, "utf8")).toBe(LARGE);
+      // Records the in-flight registrations as well as checking the final state.
+      expect.soft(writes.mock.calls.filter(([key]) => key === scope.runId)
+        .every(([, entry]) => entry.child === dummy), "spill must never overwrite the agent registry entry").toBe(true);
+      expect(runningProcesses.get(scope.runId)?.child, "agent remains cancellable after spill").toBe(dummy);
+    } finally {
+      writes?.mockRestore();
+      dummy?.kill("SIGTERM");
+      await childResult;
+    }
+    expect(runningProcesses.has(scope.runId)).toBe(false);
+  }, 30_000);
+
   it("refuses a symlink in the spill directory without writing into its target", async () => {
     const outside = path.join(root, "outside");
     await fs.mkdir(outside, { mode: 0o700 });
