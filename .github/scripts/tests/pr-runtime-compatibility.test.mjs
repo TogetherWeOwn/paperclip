@@ -21,9 +21,9 @@ function runSmoke(t, { runtime = false, script = true, dockerCommand = legacyCom
   write('server/package.json', manifest ?? JSON.stringify({ scripts: runtime ? { 'build:runtime': 'bundle' } : {} }));
   write('Dockerfile', `FROM node:24\nCMD ${JSON.stringify(dockerCommand)}\n`);
   write('bin/pnpm', '#!/bin/sh\nprintf "build:%s\\n" "$*" >> "$CALL_LOG"\nexit "$BUILD_EXIT"\n', true);
-  const harness = '#!/bin/sh\nprintf "smoke:%s\\n" "$*" >> "$CALL_LOG"\nexit "$SMOKE_EXIT"\n';
-  if (script) write('scripts/server-boot-smoke.sh', harness, true);
-  write('.ci-boot-smoke/scripts/server-boot-smoke.sh', harness, true);
+  const harness = (source) => `#!/bin/sh\nprintf "smoke:${source}:%s\\n" "$*" >> "$CALL_LOG"\nexit "$SMOKE_EXIT"\n`;
+  if (script) write('scripts/server-boot-smoke.sh', harness('source'), true);
+  else write('.ci-boot-smoke/scripts/server-boot-smoke.sh', harness('trusted'), true);
   if (built) {
     write('server/node_modules/tsx/dist/loader.mjs', '');
     write('server/dist/index.js', '');
@@ -52,7 +52,7 @@ function runSmoke(t, { runtime = false, script = true, dockerCommand = legacyCom
 test('bundled source retains the runtime build and bundle smoke', (t) => {
   const result = runSmoke(t, { runtime: true });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.calls, 'build:--filter @paperclipai/server build:runtime\nsmoke:node server/dist-runtime/index.mjs\n');
+  assert.equal(result.calls, 'build:--filter @paperclipai/server build:runtime\nsmoke:source:node server/dist-runtime/index.mjs\n');
 });
 
 test('a declared runtime build failure never falls back to the legacy entrypoint', (t) => {
@@ -76,7 +76,7 @@ for (const script of [true, false]) {
   test(`recognized legacy source boots its Dockerfile entrypoint with ${script ? 'source' : 'trusted'} harness`, (t) => {
     const result = runSmoke(t, { script });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.calls, `smoke:node --import ${result.root}/server/node_modules/tsx/dist/loader.mjs ${result.root}/server/dist/index.js\n`);
+    assert.equal(result.calls, `smoke:${script ? 'source' : 'trusted'}:node --import ${result.root}/server/node_modules/tsx/dist/loader.mjs ${result.root}/server/dist/index.js\n`);
   });
 }
 
@@ -109,9 +109,16 @@ test('a present but invalid runtime declaration does not select legacy boot', (t
   assert.equal(result.calls, 'build:--filter @paperclipai/server build:runtime\n');
 });
 
+test('trusted harness checkout precedes production runtime boot', () => {
+  const checkoutIndex = workflow.indexOf('      - name: Checkout the trusted boot smoke harness\n');
+  const bootIndex = workflow.indexOf('      - name: Boot the production runtime\n');
+  assert.ok(checkoutIndex >= 0, 'the trusted harness checkout must exist');
+  assert.ok(bootIndex > checkoutIndex, 'check out the trusted harness before booting a source without one');
+});
+
 test('legacy harness is from an immutable trusted checkout without persisted credentials', () => {
-  assert.match(workflow, /name: Checkout the trusted boot smoke harness\n[\s\S]*?if:.*hashFiles\('scripts\/server-boot-smoke.sh'\) == ''/);
   const checkout = workflow.match(/name: Checkout the trusted boot smoke harness\n([\s\S]*?)\n      - name:/)?.[1];
+  assert.match(checkout ?? '', /if:.*hashFiles\('scripts\/server-boot-smoke.sh'\) == ''/);
   assert.match(checkout ?? '', /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1/);
   assert.match(checkout, /repository: paperclipai\/paperclip/);
   assert.match(checkout, /ref: d20cb69ce5b1cdde08eea36c5a4badc72e3d7326/);
