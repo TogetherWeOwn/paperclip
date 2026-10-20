@@ -265,10 +265,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # The refresh-lockfile automation only covers the default branch, while
+      # deploy release lines must keep a frozen-installable lockfile
+      # (Dockerfile deps stage). Allow reviewed lockfile-only repair PRs on
+      # deploy/* bases so a stale hash on a release line can be fixed lawfully.
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
+          github.event.pull_request.user.login != 'dependabot[bot]' &&
+          !startsWith(github.base_ref, 'deploy/')
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
