@@ -80,12 +80,28 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+The terminal workspace sweep retries `cleanup_failed` rows on later scans. Each
+retry rechecks terminal issues and descendants, merged delivery, cooldown,
+active runs, and clean Git state. It keeps the original close timestamp and uses
+the same lifecycle lock, generation fence, and non-forced worktree removal as
+initial cleanup. A failed retry stays `cleanup_failed`; it does not force removal
+or run cleanup hooks.
+
 ### SSH workspace synchronization
 
-SSH execution for task workspaces excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
-`node_modules/`, and `target/` from export and sync-back. These directories contain
-local runtime state, nested agent checkouts, and build outputs. Restore preserves
-the local copies. The remote run must install dependencies or rebuild outputs.
+SSH execution for task workspaces excludes workspace-root `.paperclip-runtime/`,
+`.claude/worktrees/`, `.paperclip/worktrees/`, `.worktrees/`, `node_modules/`, and
+`target/` from export, baseline capture, size measurement, and sync-back. It also
+excludes nested linked Git worktrees at other paths: their `.git` file points to
+Git metadata with a `commondir` file. CRLF gitfiles and symlinks to regular
+gitfiles are recognized too. Discovery runs on the creating host before
+archiving, so worktrees created remotely are excluded too. It does not follow
+symlink directories. The workspace root itself, independent nested repositories,
+submodules, and separate-git-dir repositories remain in scope.
+
+These directories contain local runtime state, nested agent checkouts, and build
+outputs. Restore preserves the local copies. The remote run must install
+dependencies or rebuild outputs.
 Nested source such as `src/commands/target/` still transfers. Do not use a root
 `target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
 tracks it. Plain persistent directories (agent instruction directories and
