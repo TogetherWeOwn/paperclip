@@ -3126,7 +3126,7 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
   return null;
 }
 
-async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
+export async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
   // Diagnostic evidence only: a null here (including an unusable truncated
   // list) makes the safe-repair path ineligible, which is the conservative side.
   const entries = await readGitWorktreeList(repoRoot).catch(() => null);

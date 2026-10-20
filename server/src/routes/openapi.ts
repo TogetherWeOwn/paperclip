@@ -1382,6 +1382,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/remote-agent-profiles",
   "POST /api/companies/{companyId}/remote-agent-profiles",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
+  "POST /api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence",
   "POST /api/execution-workspaces/{id}/login-handoff",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
@@ -8252,6 +8253,21 @@ registry.registerPath({
     query: workspaceOverviewQuerySchema,
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence",
+  tags: ["execution-workspaces"],
+  summary: "Dry-run the workspace validation recovery sweep for a company",
+  description:
+    "Board only. Reports, per parked branch-incoherence recovery, whether the scheduled sweep " +
+    "would restore the recorded branch or skip it and why. Requires dryRun=true and makes no changes.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ dryRun: z.literal("true") }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
