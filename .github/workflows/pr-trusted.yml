@@ -296,9 +296,13 @@ jobs:
             echo "::notice title=Quality gates::base parent $base_sha has no test:quality-gates script; the phase-1 lane is skipped for this base line"
           fi
 
+      # The lockfile bot owns pnpm-lock.yaml from one head per refreshed base
+      # (see refresh-lockfile.yml). Each head is force-pushed by the bot, so no
+      # other PR can productively use one.
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
+          github.head_ref != 'chore/refresh-lockfile-deploy-tog6' &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
