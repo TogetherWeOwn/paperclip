@@ -45,6 +45,7 @@ import {
   SOURCE_BOUND_WORKSPACE_ALLOCATION_OPERATION_VERSION,
   type SourceBoundAllocationActor,
 } from "../services/source-bound-workspace-allocation.js";
+import { sweepWorkspaceValidationRecoveries } from "../services/workspace-validation-sweep.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -73,7 +74,7 @@ import {
   issueWorkspaceLoginHandoff,
   workspaceLoginHandoffFailureStatus,
 } from "../services/workspace-login-handoff-issuer.js";
-import { conflict, unprocessable } from "../errors.js";
+import { badRequest, conflict, unprocessable } from "../errors.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -1294,6 +1295,17 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       },
     );
     res.status(sourceBoundAllocationStatus(result)).json(result);
+  });
+
+  router.post("/companies/:companyId/execution-workspaces/sweep-branch-incoherence", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    if (req.query.dryRun !== "true") {
+      throw badRequest("Only dryRun=true is supported here; the scheduled sweep performs the repairs");
+    }
+    const result = await sweepWorkspaceValidationRecoveries(db, { companyId, limit: 50, dryRun: true });
+    res.json(result);
   });
 
   router.patch("/execution-workspaces/:id", validate(updateExecutionWorkspaceSchema), async (req, res) => {

@@ -41,6 +41,7 @@ const {
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
+  sweepWorkspaceValidationRecoveriesMock,
 } = vi.hoisted(() => {
   const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
@@ -159,6 +160,17 @@ const {
     close: vi.fn((callback?: (error?: Error) => void) => callback?.()),
   };
   const loadConfigMock = vi.fn();
+  const sweepWorkspaceValidationRecoveriesMock = vi.fn(async () => ({
+    enabled: false,
+    dryRun: false,
+    scanned: 0,
+    deferred: 0,
+    restored: 0,
+    wouldRestore: 0,
+    refused: 0,
+    skipped: {},
+    items: [],
+  }));
 
   return {
     completionSweepMock,
@@ -185,6 +197,7 @@ const {
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
+    sweepWorkspaceValidationRecoveriesMock,
   };
 });
 
@@ -267,6 +280,11 @@ vi.mock("../services/native-runtime/native-session-executor.js", () => ({
 // exercised by the dedicated DB-backed recovery suites.
 vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
   reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
+}));
+
+// Sweep decisions are exercised by the DB-backed workspace validation sweep suite.
+vi.mock("../services/workspace-validation-sweep.js", () => ({
+  sweepWorkspaceValidationRecoveries: sweepWorkspaceValidationRecoveriesMock,
 }));
 
 vi.mock("../config.js", () => ({
@@ -819,6 +837,39 @@ describe("startServer feedback export wiring", () => {
       expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+      expect(sweepWorkspaceValidationRecoveriesMock).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("runs the workspace validation recovery sweep on the tick when heartbeat scheduling is not suppressed", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: false,
+      reason: null,
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(sweepWorkspaceValidationRecoveriesMock).not.toHaveBeenCalled();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sweepWorkspaceValidationRecoveriesMock).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }

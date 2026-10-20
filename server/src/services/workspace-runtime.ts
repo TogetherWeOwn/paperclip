@@ -2736,7 +2736,12 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
   return null;
 }
 
-async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
+export async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
+  // Diagnostic evidence only: a null here makes the safe-repair path
+  // ineligible, which is the conservative side.
+  // NOTE(lane-c): the fork reads via readGitWorktreeList (truncation-safe;
+  // Lane A owns that bundle helper in workspace-runtime.ts). The parent
+  // integration should prefer Lane A's body with this export.
   const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
   if (!raw) return null;
 

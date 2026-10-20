@@ -338,7 +338,7 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
   enableWorkspaceDirtyQuarantineRepair: {
     title: "Workspace Dirty Quarantine Repair",
     description:
-      "Let workspace runtime recovery quarantine and repair dirty execution workspaces before runs.",
+      "Let workspace runtime recovery quarantine and repair dirty execution workspaces before runs, check the recorded branch back out in clean workspaces whose HEAD drifted off it, and run a background sweep that restores parked issues blocked by that drift.",
     tier: "managed",
     cloudDefault: true,
     selfHostedDefault: true,
