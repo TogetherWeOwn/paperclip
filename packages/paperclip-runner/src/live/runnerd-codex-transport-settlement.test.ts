@@ -1453,7 +1453,29 @@ it.each([
       if (completedTerminalAck) {
         const before = replayRetirements[0]!;
         const after = replayRetirements[1]!;
-        expect(withheldTerminalFrames).toHaveLength(1);
+        // A result can commit after its connection closes, without an outbound
+        // ACK reaching the injection hook. Report the joined producer evidence;
+        // a missed injection alone does not identify a settlement defect.
+        expect(withheldTerminalFrames, JSON.stringify({
+          completedTerminalAck,
+          epochs: replayRetirements.map((state, epoch) => ({
+            epoch,
+            lifecycle: state.runner.lifecycle,
+            pendingTerminalDelivery: state.runner.pendingTerminalDelivery ?? null,
+            diagnostics: state.runner.diagnostics,
+            terminalCommands: state.control.commands.filter(
+              (command: { type: string }) => command.type === "runner.suspend",
+            ),
+          })),
+          retirements: epochReceipts
+            .filter((receipt) => receipt.phase === "retired")
+            .map((receipt) => ({
+              epoch: receipt.epoch,
+              exitCode: receipt.exitCode,
+              exitSignal: receipt.exitSignal,
+              processGroupAbsent: receipt.processGroupAbsent,
+            })),
+        })).toHaveLength(1);
         expect(withheldTerminalFrames[0]).toMatchObject({
           epoch: 0,
           direction:
