@@ -29,6 +29,8 @@ import type {
 
 import {
   runChildProcess,
+  RUN_PID_LIMIT_EXCEEDED,
+  resolveRunPidLimit,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   renderTemplate,
@@ -342,6 +344,7 @@ export async function execute(
   const model = cfgString(config.model) || DEFAULT_MODEL;
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
+  const runPidLimit = resolveRunPidLimit(config.runPidLimit);
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
@@ -559,9 +562,19 @@ export async function execute(
     env,
     timeoutSec,
     graceSec,
+    pidLimit: runPidLimit,
     onLog: wrappedOnLog,
     onSpawn: ctx.onSpawn,
   });
+
+  // A typed transport failure (today: the per-run PID budget) fails the run
+  // even for signal-kill shapes: without this the errorCode is dropped and a
+  // SIGTERM-trapped exit 0 reads as success.
+  const transportErrorMessage = !result.errorCode
+    ? null
+    : result.errorCode === RUN_PID_LIMIT_EXCEEDED
+      ? `Run PID limit exceeded (budget ${result.pidStats?.limit ?? runPidLimit}); this run only was stopped`
+      : `Hermes run failed (${result.errorCode})`;
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
@@ -583,10 +596,16 @@ export async function execute(
     model,
   };
 
-  if (parsed.errorMessage) {
+  if (transportErrorMessage) {
+    executionResult.errorMessage = transportErrorMessage;
+  } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  }
+
+  if (result.errorCode) {
+    executionResult.errorCode = result.errorCode;
   }
 
   if (parsed.usage) {
@@ -608,6 +627,7 @@ export async function execute(
     session_id: parsed.sessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
+    ...(result.pidStats ? { pidStats: result.pidStats } : {}),
   };
 
   // Store session ID for next run

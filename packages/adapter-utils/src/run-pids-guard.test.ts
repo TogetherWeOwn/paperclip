@@ -5,23 +5,62 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   countProcessesInGroup,
+  countRunTree,
   DEFAULT_RUN_PID_GUARD_INTERVAL_MS,
   DEFAULT_RUN_PID_LIMIT,
   getLiveRunPidsSnapshot,
+  getRunPidsSharedScannerStats,
   MAX_RUN_PID_GUARD_INTERVAL_MS,
   MAX_RUN_PID_LIMIT,
   MIN_RUN_PID_GUARD_INTERVAL_MS,
   MIN_RUN_PID_LIMIT,
+  parseStatFields,
   parseStatProcessGroup,
+  readCgroupPidsMaxEvents,
   resolveRunPidGuardIntervalMs,
   resolveRunPidLimit,
   RUN_PID_GUARD_INTERVAL_ENV_KEY,
   RUN_PID_LIMIT_ENV_KEY,
+  scanProcessEntries,
   startRunPidsGuard,
   tryAttachRunPidsCgroup,
 } from "./run-pids-guard.js";
 
 const isLinux = process.platform === "linux";
+
+// Build a realistic /proc/<pid>/stat line: `pid (comm) state ppid pgrp ...`
+// with num_threads (stat field 20) at post-comm index 17.
+function statLine(
+  pid: number,
+  comm: string,
+  ppid: number,
+  pgrp: number,
+  threads: number,
+): string {
+  const tail = [
+    "S",
+    ppid,
+    pgrp,
+    pgrp,
+    0,
+    -1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    threads,
+    0,
+    0,
+  ].join(" ");
+  return `${pid} (${comm}) ${tail}`;
+}
 
 describe("resolveRunPidLimit", () => {
   const saved = process.env[RUN_PID_LIMIT_ENV_KEY];
@@ -286,5 +325,246 @@ describe("startRunPidsGuard", () => {
     const stats = guard.stop();
     expect(stats.enforced).toBe("none");
     expect(stats.exceeded).toBe(false);
+  });
+});
+
+describe("parseStatFields", () => {
+  it("parses ppid, pgrp and num_threads", () => {
+    expect(parseStatFields(statLine(1234, "node", 1000, 1234, 7))).toEqual({
+      ppid: 1000,
+      pgrp: 1234,
+      numThreads: 7,
+    });
+  });
+
+  it("anchors on the last paren when comm has spaces and parens", () => {
+    expect(
+      parseStatFields(statLine(99, "my (weird) proc", 1, 4242, 3)),
+    ).toEqual({ ppid: 1, pgrp: 4242, numThreads: 3 });
+  });
+
+  it("defaults num_threads to 1 on truncated lines", () => {
+    expect(parseStatFields("1234 (node) S 1000 1234 0 0 0")).toEqual({
+      ppid: 1000,
+      pgrp: 1234,
+      numThreads: 1,
+    });
+  });
+
+  it("returns null for malformed input", () => {
+    expect(parseStatFields("")).toBeNull();
+    expect(parseStatFields("no parens here")).toBeNull();
+    expect(parseStatFields("1 (x) S")).toBeNull();
+  });
+});
+
+describe("countRunTree", () => {
+  // Synthetic tree: 10 leads group 10; 11 is a setsid'd child (new group
+  // 99) with child 12; 13 is unrelated. Thread counts are uneven so a
+  // leader-counting implementation cannot pass by accident.
+  function writeTree(root: string) {
+    for (
+      const [pid, ppid, pgrp, threads] of [
+        [10, 1, 10, 2],
+        [11, 10, 99, 1],
+        [12, 11, 99, 3],
+        [13, 1, 13, 9],
+      ] as const
+    ) {
+      mkdirSync(path.join(root, String(pid)));
+      writeFileSync(
+        path.join(root, String(pid), "stat"),
+        statLine(pid, `p${pid}`, ppid, pgrp, threads),
+      );
+    }
+  }
+
+  it("counts group members plus descendants, thread-weighted", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "pids-guard-tree-"));
+    writeTree(root);
+    const entries = scanProcessEntries(root);
+    expect(entries).toHaveLength(4);
+    const { count, pids } = countRunTree({
+      entries,
+      processGroupId: 10,
+      rootPid: 10,
+    });
+    expect(count).toBe(2 + 1 + 3);
+    expect(new Set(pids)).toEqual(new Set([10, 11, 12]));
+  });
+
+  it("counts a bare group without a root pid", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "pids-guard-tree-"));
+    writeTree(root);
+    const entries = scanProcessEntries(root);
+    expect(
+      countRunTree({ entries, processGroupId: 99, rootPid: null }).count,
+    ).toBe(1 + 3);
+    expect(
+      countRunTree({ entries, processGroupId: 13, rootPid: null }).count,
+    ).toBe(9);
+  });
+
+  it.runIf(isLinux)("countProcessesInGroup is thread-weighted", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "pids-guard-tree-"));
+    writeTree(root);
+    expect(countProcessesInGroup(10, { procRoot: root })).toBe(2);
+    expect(countProcessesInGroup(99, { procRoot: root })).toBe(4);
+    expect(countProcessesInGroup(4242, { procRoot: root })).toBe(0);
+  });
+
+  it("scanProcessEntries throws on an unreadable root", () => {
+    expect(() =>
+      scanProcessEntries(path.join(os.tmpdir(), "pids-guard-no-such-root"))
+    ).toThrow();
+  });
+});
+
+describe("readCgroupPidsMaxEvents", () => {
+  it("parses the max counter and returns null when missing", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "pids-guard-events-"));
+    writeFileSync(path.join(dir, "pids.events"), "max 3\n");
+    expect(readCgroupPidsMaxEvents(dir)).toBe(3);
+    expect(
+      readCgroupPidsMaxEvents(path.join(os.tmpdir(), "pids-guard-no-such-dir")),
+    ).toBeNull();
+    writeFileSync(path.join(dir, "pids.events"), "garbage\n");
+    expect(readCgroupPidsMaxEvents(dir)).toBeNull();
+  });
+});
+
+describe("shared scanner", () => {
+  it.runIf(isLinux)("fans one scan out to every live guard", async () => {
+    const child = spawn("sh", ["-c", "sleep 30 & sleep 30 & sleep 30 & wait"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const pgid = child.pid as number;
+    const scansBefore = getRunPidsSharedScannerStats().scansPerformed;
+    const seenA: number[] = [];
+    const seenB: number[] = [];
+    const stamp = Date.now();
+    const guardA = startRunPidsGuard({
+      runId: `guard-shared-a-${stamp}`,
+      processGroupId: pgid,
+      rootPid: child.pid,
+      limit: 2,
+      intervalMs: 25,
+      onExceeded: (stats) => {
+        seenA.push(stats.lastCount);
+      },
+    });
+    const guardB = startRunPidsGuard({
+      runId: `guard-shared-b-${stamp}`,
+      processGroupId: pgid,
+      rootPid: child.pid,
+      limit: 2,
+      intervalMs: 25,
+      onExceeded: (stats) => {
+        seenB.push(stats.lastCount);
+      },
+    });
+    try {
+      expect(
+        getRunPidsSharedScannerStats().activeGuards,
+      ).toBeGreaterThanOrEqual(2);
+      for (
+        let i = 0;
+        i < 120 && (seenA.length === 0 || seenB.length === 0);
+        i += 1
+      ) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(seenA.length).toBe(1);
+      expect(seenB.length).toBe(1);
+      // Both guards fired off shared ticks: at least one shared scan ran
+      // while both were registered (immediate first samples don't count).
+      expect(
+        getRunPidsSharedScannerStats().scansPerformed,
+      ).toBeGreaterThan(scansBefore);
+      // The tree pids fed to the kill path cover the whole fixture.
+      expect(guardA.getTreePids().length).toBeGreaterThanOrEqual(3);
+    } finally {
+      guardA.stop();
+      guardB.stop();
+      expect(guardA.getTreePids()).toEqual([]);
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      child.unref();
+    }
+  });
+
+  it.runIf(isLinux)("fires on cgroup max events below the poll count", async () => {
+    const child = spawn("sleep", ["30"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const pgid = child.pid as number;
+    const cgroupDir = mkdtempSync(path.join(os.tmpdir(), "pids-guard-ev-"));
+    writeFileSync(path.join(cgroupDir, "pids.events"), "max 3\n");
+    const seen: number[] = [];
+    const guard = startRunPidsGuard({
+      runId: `guard-events-${Date.now()}`,
+      processGroupId: child.pid as number,
+      rootPid: child.pid,
+      limit: 4096,
+      intervalMs: 25,
+      cgroupAttached: true,
+      cgroupPath: cgroupDir,
+      onExceeded: (stats) => {
+        seen.push(stats.lastCount);
+      },
+    });
+    try {
+      // The immediate first sample already sees the max events.
+      expect(seen.length).toBe(1);
+      expect(guard.getStats().exceeded).toBe(true);
+      expect(guard.getStats().enforced).toBe("cgroup+poll");
+    } finally {
+      guard.stop();
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      child.unref();
+    }
+  });
+
+  it.runIf(isLinux)("stays quiet when the cgroup reports no max events", async () => {
+    const child = spawn("sleep", ["30"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const pgid = child.pid as number;
+    const cgroupDir = mkdtempSync(path.join(os.tmpdir(), "pids-guard-ev-"));
+    writeFileSync(path.join(cgroupDir, "pids.events"), "max 0\n");
+    const guard = startRunPidsGuard({
+      runId: `guard-events-quiet-${Date.now()}`,
+      processGroupId: child.pid as number,
+      rootPid: child.pid,
+      limit: 4096,
+      intervalMs: 25,
+      cgroupAttached: true,
+      cgroupPath: cgroupDir,
+      onExceeded: () => {
+        throw new Error("must not fire without max events");
+      },
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      expect(guard.getStats().exceeded).toBe(false);
+    } finally {
+      guard.stop();
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      child.unref();
+    }
   });
 });

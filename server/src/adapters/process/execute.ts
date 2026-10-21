@@ -13,7 +13,10 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
-import { resolveRunPidLimit } from "@paperclipai/adapter-utils/server-utils";
+import {
+  RUN_PID_LIMIT_EXCEEDED,
+  resolveRunPidLimit,
+} from "@paperclipai/adapter-utils/server-utils";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -80,6 +83,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: true,
       errorMessage: `Timed out after ${timeoutSec}s`,
+    };
+  }
+
+  // A typed transport failure (today: the per-run PID budget) fails the run
+  // even without a nonzero exit: the SIGTERM-kill shape is exitCode null +
+  // signal SIGTERM, which the exitCode test below would read as success and
+  // drop the typed code. Signal-only kills without an errorCode keep the
+  // historical success shape (terminal-result cleanup relies on it).
+  if (proc.errorCode) {
+    const pidLimit = proc.errorCode === RUN_PID_LIMIT_EXCEEDED;
+    return {
+      exitCode: proc.exitCode,
+      signal: proc.signal,
+      timedOut: false,
+      errorMessage: pidLimit
+        ? `Run PID limit exceeded (budget ${proc.pidStats?.limit ?? runPidLimit}); this run only was stopped`
+        : `Process failed (${proc.errorCode})`,
+      errorCode: proc.errorCode,
+      resultJson: {
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        ...(proc.pidStats ? { pidStats: proc.pidStats } : {}),
+      },
     };
   }
 

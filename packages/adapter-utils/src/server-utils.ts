@@ -187,6 +187,23 @@ export function signalRunningProcess(
   }
 }
 
+// Best-effort direct signal to individually sampled pids. Used only by the
+// run-PID-limit kill path to reach tree members that escaped the wrapper's
+// process group (bwrap --new-session, setsid). Callers gate on leader
+// liveness to bound the pid-reuse window: a sampled pid is only signaled
+// while the run's leader is still alive, and dead pids fail with ESRCH.
+function signalPidList(pids: readonly number[], signal: NodeJS.Signals) {
+  if (process.platform === "win32") return;
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Dead since the sample, or already reaped by the group signal.
+    }
+  }
+}
+
 export const runningProcesses = new Map<string, RunningProcess>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
@@ -5006,9 +5023,10 @@ export async function runChildProcess(
         let terminalResultStderrScanOffset = 0;
 
         // Per-run PID budget. Polling needs no privileges, so it
-        // guards every lane that spawns locally (plain local runs and the
-        // local ssh-client side of remote runs). Sandbox runs execute
-        // provider-side and never reach this spawn path.
+        // guards every lane that spawns locally: plain local runs, the
+        // local ssh-client side of remote runs, and bwrap-sandboxed local
+        // runs (descendant counting covers their --new-session trees).
+        // Only provider-side sandbox-remote runs never reach this path.
         let pidLimitExceeded = false;
         let pidsGuard: RunPidsGuard | null = null;
         let pidsCgroup: RunPidsCgroupAttachment | null = null;
@@ -5030,13 +5048,15 @@ export async function runChildProcess(
           pidsGuard = startRunPidsGuard({
             runId,
             processGroupId,
+            rootPid: child.pid,
             limit: pidLimit,
             intervalMs: resolveRunPidGuardIntervalMs(opts.pidGuardIntervalMs),
             cgroupAttached: pidsCgroup !== null,
+            cgroupPath: pidsCgroup?.path ?? null,
             onExceeded: (exceededStats) => {
               pidLimitExceeded = true;
               const marker =
-                `[paperclip] run PID limit exceeded: ${exceededStats.lastCount} processes ` +
+                `[paperclip] run PID limit exceeded: ${exceededStats.lastCount} processes/threads ` +
                 `over the ${exceededStats.limit} budget; stopping this run only ` +
                 `(code ${RUN_PID_LIMIT_EXCEEDED})\n`;
               stderr = appendWithCap(stderr, marker);
@@ -5051,9 +5071,23 @@ export async function runChildProcess(
                 "run PID limit exceeded; run tree stopped",
               );
               signalRunningProcess({ child, processGroupId }, "SIGTERM");
+              // The group signal misses members that escaped into a new
+              // session (bwrap --new-session, setsid): signal the sampled
+              // tree union directly. The leader is definitionally alive at
+              // exceed time, which bounds the pid-reuse window.
+              signalPidList(pidsGuard?.getTreePids() ?? [], "SIGTERM");
               setTimeout(
                 () => {
                   signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  // Escalate to direct pids only while the leader is still
+                  // alive; once it exits, sampled pids may be reused by
+                  // unrelated processes.
+                  if (
+                    child.exitCode === null &&
+                    child.signalCode === null
+                  ) {
+                    signalPidList(pidsGuard?.getTreePids() ?? [], "SIGKILL");
+                  }
                 },
                 Math.max(1, opts.graceSec) * 1000,
               );
@@ -5248,8 +5282,15 @@ export async function runChildProcess(
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .finally(() => {
+                  // A child that traps SIGTERM and exits 0 would otherwise
+                  // read as a clean success with the typed code buried in
+                  // pidStats: no downstream outcome keys on errorCode alone.
+                  // Mirror the duplex seam and synthesize a failure shape.
+                  const cleanExitAfterPidKill =
+                    pidLimitExceeded &&
+                    (code === 0 || (code === null && signal === null));
                   resolve({
-                    exitCode: code,
+                    exitCode: cleanExitAfterPidKill ? 1 : code,
                     signal,
                     timedOut,
                     stdout,

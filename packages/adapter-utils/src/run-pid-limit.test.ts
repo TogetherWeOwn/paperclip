@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -9,9 +10,20 @@ import {
 import { RUN_PID_LIMIT_EXCEEDED, runChildProcess } from "./server-utils.js";
 
 const isLinux = process.platform === "linux";
-// Unique fixture marker: no other test binary uses this sleep duration.
+// Unique fixture markers: no other test binary uses these sleep durations.
 const FORK_MARKER = "29731";
+const SETSID_MARKER = "29732";
+const TRAP_MARKER = "29733";
 const FORK_CHILDREN = 48;
+
+const hasSetsid = (() => {
+  if (!isLinux) return false;
+  try {
+    return spawnSync("setsid", ["--version"], { stdio: "ignore" }).status === 0;
+  } catch {
+    return false;
+  }
+})();
 
 function procCmdlinesContain(marker: string): number[] {
   const hits: number[] = [];
@@ -35,11 +47,13 @@ function procCmdlinesContain(marker: string): number[] {
 
 async function killFixtureLeftovers(): Promise<void> {
   if (!isLinux) return;
-  for (const pid of procCmdlinesContain(FORK_MARKER)) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone.
+  for (const marker of [FORK_MARKER, SETSID_MARKER, TRAP_MARKER]) {
+    for (const pid of procCmdlinesContain(marker)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
     }
   }
 }
@@ -163,4 +177,104 @@ describe("runChildProcess per-run PID limit", () => {
     expect(result.pidStats?.limit).toBe(128);
     expect(result.pidStats?.exceeded).toBe(false);
   });
+
+  it.runIf(hasSetsid)(
+    "catches runaways that escape into a new session (setsid)",
+    async () => {
+      // Same shape as a bwrap --new-session sandbox payload: the leader's
+      // group holds only the wrapper while the tree runs in a new session.
+      // The trap reaps the session synchronously so no straggler outlives
+      // the kill list snapshot.
+      const script = [
+        "trap 'kill 0; exit 0' TERM",
+        "i=0",
+        `while [ $i -lt ${FORK_CHILDREN} ]; do sleep ${SETSID_MARKER} & i=$((i+1)); done`,
+        "wait",
+      ].join("; ");
+      const result = await runChildProcess(
+        randomUUID(),
+        "setsid",
+        ["-w", "sh", "-c", script],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 30,
+          graceSec: 1,
+          pidLimit: 32,
+          pidGuardIntervalMs: 50,
+          onLog: async () => {},
+        },
+      );
+      expect(result.errorCode).toBe(RUN_PID_LIMIT_EXCEEDED);
+      expect(result.stderr).toContain("run PID limit exceeded");
+      expect(result.pidStats?.exceeded).toBe(true);
+      expect(result.pidStats?.peak).toBeGreaterThan(32);
+      // Either the signal shape or the synthesized trap-exit shape, but
+      // never a clean 0: the typed failure must survive the wrapper.
+      expect(result.exitCode).not.toBe(0);
+      expect(procCmdlinesContain(SETSID_MARKER)).toEqual([]);
+    },
+    30_000,
+  );
+
+  it.runIf(isLinux)(
+    "counts threads against the budget (worker_threads)",
+    async () => {
+      // One process, ~50 OS threads: the pids cgroup charges tasks, so the
+      // guard must fire even though the group holds a single leader.
+      const workerScript = [
+        "const { Worker } = require('node:worker_threads');",
+        `for (let i = 0; i < ${FORK_CHILDREN}; i += 1) {`,
+        "  new Worker('setTimeout(() => {}, 60000);', { eval: true });",
+        "}",
+        "setTimeout(() => {}, 60000);",
+      ].join("\n");
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", workerScript],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 30,
+          graceSec: 1,
+          pidLimit: 32,
+          pidGuardIntervalMs: 50,
+          onLog: async () => {},
+        },
+      );
+      expect(result.errorCode).toBe(RUN_PID_LIMIT_EXCEEDED);
+      expect(result.pidStats?.exceeded).toBe(true);
+      expect(result.pidStats?.peak).toBeGreaterThan(32);
+    },
+    30_000,
+  );
+
+  it.runIf(isLinux)(
+    "a SIGTERM-trapping child that exits 0 still fails the run",
+    async () => {
+      const script = [
+        "trap 'exit 0' TERM",
+        "i=0",
+        `while [ $i -lt ${FORK_CHILDREN} ]; do sleep ${TRAP_MARKER} & i=$((i+1)); done`,
+        "wait",
+      ].join("; ");
+      const result = await runChildProcess(randomUUID(), "sh", ["-c", script], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 30,
+        graceSec: 1,
+        pidLimit: 32,
+        pidGuardIntervalMs: 50,
+        onLog: async () => {},
+      });
+      expect(result.errorCode).toBe(RUN_PID_LIMIT_EXCEEDED);
+      expect(result.exitCode).toBe(1);
+      expect(result.signal).toBeNull();
+      expect(result.stderr).toContain("run PID limit exceeded");
+      expect(result.pidStats?.exceeded).toBe(true);
+      expect(procCmdlinesContain(TRAP_MARKER)).toEqual([]);
+    },
+    30_000,
+  );
 });
