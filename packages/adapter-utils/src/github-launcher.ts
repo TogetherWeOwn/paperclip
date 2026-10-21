@@ -1,6 +1,6 @@
 /**
  * SHA-256 digests of every earlier managed launcher that shipped (`git log -- github-launcher.ts`):
- * 1cc45086d, 297d8741f, 82f662656, ffb01ff3d, ab832bc02 (= d2ecec335), 5442f2d86, b721d24ca, 7d7871b58.
+ * 1cc45086d, 297d8741f, 82f662656, ffb01ff3d, ab832bc02 (= d2ecec335), 5442f2d86, b721d24ca, 7d7871b58, e3afc6b86.
  * Production before this fix ran 5442f2d86. Interim heads of the recursion fix were only ever staged in
  * unbuilt pin candidates and are deliberately absent.
  * A directory is skipped on `PATH` only when every `git`/`gh` in it is byte-identical to the running launcher
@@ -15,10 +15,28 @@ export const LEGACY_GITHUB_LAUNCHER_SHA256 = [
   "f20da49d465c4dbcb33fbedd92d587e884ecdaebf47f617e4040bbc3c841ffdc",
   "b63aaf0b636af06c9bb2fdd84917721de67e020b12db1f9ef13b8e78a9c92fe0",
   "deb6e64cf0d529d29e4aab3054be3212fd809d544ec6a760da2634eeb4735806",
+  "c8c3de47810be11c441f704357fe44e95b9bec78d162984cc7df86c412905463",
 ] as const;
 
+/**
+ * Normalize a stager-provided broker base to its http(s) origin, or `""`
+ * when absent or invalid. Host authority only: never feed caller env here.
+ */
+export function brokerOriginOf(value: string | null | undefined): string {
+  const trimmed = (value ?? "").trim();
+  if (trimmed.length === 0) return "";
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.origin;
+  } catch {
+    return "";
+  }
+}
+
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
-export function githubLauncherSource(): string {
+export function githubLauncherSource(options?: { expectedBrokerOrigin?: string }): string {
+  const expectedBrokerOrigin = brokerOriginOf(options?.expectedBrokerOrigin);
   return String.raw`#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -95,11 +113,33 @@ async function main() {
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
-    const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    const brokerVar = env.PAPERCLIP_GITHUB_BROKER_URL;
+    const base = brokerVar || env.PAPERCLIP_API_URL;
+    // Host authority baked at stage time ('' when the stager passed none).
+    // An explicit broker base is accepted only at this origin when baked, or
+    // only same-origin with the run API URL otherwise. An unset broker base
+    // keeps the existing API-URL fallback (bridge-mediated broker). Attacker
+    // path segments in the base never steer: only the base origin is used and
+    // the credentials endpoint path is fixed (T8.1a/T8.1b).
+    const expectedBrokerOrigin = ${JSON.stringify(expectedBrokerOrigin)};
+    const brokerEndpoint = (() => {
+      if (!base) return null;
+      let origin;
+      try {
+        const parsed = new URL(base);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        origin = parsed.origin;
+      } catch { return null; }
+      if (!(brokerVar && brokerVar.trim())) return origin + '/runtime-tools/github/credentials';
+      if (expectedBrokerOrigin) return origin === expectedBrokerOrigin ? origin + '/runtime-tools/github/credentials' : null;
+      try {
+        return new URL(env.PAPERCLIP_API_URL).origin === origin ? origin + '/runtime-tools/github/credentials' : null;
+      } catch { return null; }
+    })();
     try {
     let response;
-    if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
-      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
+    if (brokerEndpoint && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
+      const url = brokerEndpoint;
       for (let attempt = 0; attempt < 30; attempt++) {
         response = await fetch(url, {
           method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
@@ -127,7 +167,7 @@ async function main() {
         }
       }
       }
-    } else { diagnostic('capability_missing'); }
+    } else { diagnostic(!env.PAPERCLIP_GITHUB_BROKER_TOKEN || !base ? 'capability_missing' : 'broker_base_rejected'); }
     } catch { diagnostic('broker_transport_unavailable'); }
   }
   // Only this invocation and its children inherit the captured credential.

@@ -1728,6 +1728,13 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
 /** Stage token-free launchers next to the execution, not in shared global Git config. */
 export async function prepareGitHubOperationLaunchers(input: {
   runId: string; target: AdapterExecutionTarget | null | undefined; cwd: string; env: Record<string, string>;
+  /**
+   * Host-authoritative broker origin baked into the staged launcher. The
+   * launcher accepts an explicit broker base only at this origin (or, when
+   * empty, only same-origin with the run API URL). This reconciles loopback
+   * run API URLs with the explicit host broker identity (T8.1a).
+   */
+  expectedBrokerOrigin?: string | null;
 }): Promise<Record<string, string>> {
   const remote = input.target?.kind === "remote" ? input.target : null;
   const directory = githubOperationLauncherDirectory(input);
@@ -1747,7 +1754,7 @@ export async function prepareGitHubOperationLaunchers(input: {
     // Remote launchers live beneath the checkout. Pin their own package scope
     // so an enclosing project's "type": "module" cannot reinterpret require().
     ["package.json", '{"type":"commonjs"}\n'],
-    ...["git", "gh"].map((name) => [name, githubLauncherSource()] as const),
+    ...["git", "gh"].map((name) => [name, githubLauncherSource({ expectedBrokerOrigin: input.expectedBrokerOrigin ?? "" })] as const),
     ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
   ]);
   if (remote) {
@@ -4685,11 +4692,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   });
 
   // PAPERCLIP_BRIDGE_DEBUG opts into verbose stdout logs of every bridge proxy
-  // request/response. The query string is logged verbatim, so callers who pass
-  // auth tokens or other sensitive values as query parameters should be aware
-  // those values appear in the host process's stdout when this flag is enabled.
-  // Only intended for active debugging in trusted environments.
+  // request/response. Only the forwarded origin and path are logged: the query
+  // string and the body stay out, so credential-shaped query parameters or
+  // body values cannot reach the host process's stdout (T4.1). Only intended
+  // for active debugging in trusted environments.
   const bridgeDebugEnabled = isBridgeDebugEnabled(process.env);
+  const bridgeDebugOrigin = (() => {
+    try {
+      return new URL(hostApiUrl).origin;
+    } catch {
+      return "unparseable-bridge-origin";
+    }
+  })();
 
   // One forward of a relayed sandbox request onto the existing Paperclip API
   // path. The forward applies the real host token and the signed run id, so the
@@ -4716,15 +4730,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
   ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
     const method = request.method.trim().toUpperCase() || "GET";
-    // The per-request debug log prints the method, the path, and the query. The
-    // duplex path suppresses it, so no route or query rides a log line there. The
-    // file path keeps the existing behavior.
+    // The per-request debug log prints the method and the sanitized
+    // origin+path. The duplex path suppresses it, so no route rides a log line
+    // there. The file path keeps the existing behavior minus the query.
     const emitDebugLog = bridgeDebugEnabled && options?.suppressDebugLog !== true;
     if (emitDebugLog) {
-      await onLog(
-        "stdout",
-        `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
-      );
+      await onLog("stdout", `[paperclip] Bridge proxy ${method} ${bridgeDebugOrigin}${request.path}\n`);
     }
     const headers = new Headers();
     for (const [key, value] of Object.entries(request.headers)) {
@@ -4749,15 +4760,37 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       method,
       headers,
       signal: forwardSignal,
+      // Never follow redirects: a 307/308 from the pinned host to a foreign
+      // origin would otherwise re-send the host Authorization header and the
+      // request body to that origin (T2.1). Redirects are refused below.
+      redirect: "manual",
     };
     if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
       forwardInit.body = request.body as BodyInit;
     }
     const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+    // `manual` surfaces a redirect as an opaqueredirect response instead of
+    // following it. Refuse it here: passing the foreign Location back to the
+    // sandbox caller would launder the redirect (and a re-issued body) to an
+    // origin the bridge never approved.
+    const redirectLocation = response.headers.get("location");
+    const isRedirectResponse =
+      response.type === "opaqueredirect" ||
+      ([301, 302, 303, 307, 308].includes(response.status) && redirectLocation !== null);
+    if (isRedirectResponse) {
+      if (emitDebugLog) {
+        await onLog("stdout", `[paperclip] Bridge refused to follow redirect for ${method} ${bridgeDebugOrigin}${request.path}\n`);
+      }
+      return {
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "bridge refused to follow redirect" }), "utf8"),
+      };
+    }
     if (emitDebugLog) {
       await onLog(
         "stdout",
-        `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+        `[paperclip] Bridge proxy response ${response.status} for ${method} ${bridgeDebugOrigin}${request.path}\n`,
       );
     }
     // The host delivered response headers, so the response-body read starts after
