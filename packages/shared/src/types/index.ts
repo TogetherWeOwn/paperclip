@@ -809,6 +809,7 @@ export type {
   IssueWatchdog,
   IssueWatchdogStatus,
   IssueWatchdogSummary,
+  RestoreCompletedReviewResult,
 } from "./issue.js";
 export type {
   IssueTreeControlPreview,
@@ -1053,6 +1054,7 @@ export type {
   PluginManagedSkillDeclaration,
   PluginManagedSkillFileDeclaration,
   PluginLocalFolderDeclaration,
+  PluginModelRoutingDeclaration,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
   PluginManagedRoutineResolution,

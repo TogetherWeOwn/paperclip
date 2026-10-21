@@ -14,6 +14,10 @@ permissions:
 
 jobs:
   review:
+    # Upstream-only: the job mints a token from COMMITPERCLIP_KEY, a secret that
+    # exists only in paperclipai/paperclip. In a fork it always fails, which
+    # leaves every PR with a red check that no change can fix. Skipped here.
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

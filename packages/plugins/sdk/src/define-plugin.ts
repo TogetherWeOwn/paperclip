@@ -87,6 +87,8 @@ import type {
   PluginExternalObjectResolveResult,
   RefreshExternalObjectsParams,
   RefreshExternalObjectsResult,
+  ResolveRunModelParams,
+  ResolveRunModelResult,
   PluginLoginPtyOpenParams,
   PluginLoginPtyOpenResult,
   PluginLoginPtyInputParams,
@@ -382,6 +384,17 @@ export interface PluginDefinition {
   onRefreshExternalObjects?(
     params: RefreshExternalObjectsParams,
   ): Promise<RefreshExternalObjectsResult>;
+
+  /**
+   * Called inside an issue run, before the adapter config merge, to decide
+   * which model the run uses. Must answer within `params.deadlineMs`; past
+   * it the host defers the run. Never fetch remote data on this path.
+   *
+   * Requires `run.model.resolve` (one holder per company).
+   */
+  onResolveRunModel?(
+    params: ResolveRunModelParams,
+  ): Promise<ResolveRunModelResult>;
 
   /**
    * Called to validate provider-specific configuration for a plugin-hosted

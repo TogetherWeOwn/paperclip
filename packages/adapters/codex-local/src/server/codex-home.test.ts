@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CODEX_SYNC_ALLOWLIST,
   codexHomeHasUsableAuth,
@@ -13,6 +13,7 @@ import {
   reconcileManagedCodexHome,
   seedManagedCodexHome,
   stageCodexHomeForSync,
+  removeManagedCodexMcpBlock,
   writeManagedCodexMcpConfig,
 } from "./codex-home.js";
 
@@ -1031,6 +1032,89 @@ describe("evaluateCodexCredentialReadiness", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  describe("releasing the managed MCP block", () => {
+    const gateway = (token: string) => ({
+      name: "alpha",
+      endpointPath: "/api/tool-gateway/gateways/alpha/mcp",
+      bearerToken: token,
+    });
+    let root: string;
+
+    beforeEach(async () => {
+      root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-release-"));
+    });
+
+    afterEach(async () => {
+      await fs.rm(root, { recursive: true, force: true });
+    });
+
+    it("removes the block on release and keeps user config", async () => {
+      const configPath = path.join(root, "config.toml");
+      await fs.writeFile(configPath, 'model = "gpt-5"\n');
+      const written = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [gateway("run-token")],
+        scrubOnRelease: true,
+      });
+      expect(await fs.readFile(configPath, "utf8")).toContain("run-token");
+
+      await written.release();
+      await written.release();
+
+      expect(await fs.readFile(configPath, "utf8")).toBe('model = "gpt-5"\n');
+    });
+
+    it("keeps the block until the last of several holders releases", async () => {
+      const first = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [gateway("first-token")],
+        scrubOnRelease: true,
+      });
+      const second = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [gateway("second-token")],
+        scrubOnRelease: true,
+      });
+
+      await second.release();
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).toContain("Bearer");
+      await first.release();
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).not.toContain("Bearer");
+    });
+
+    it("does nothing on release unless the home was marked for scrubbing", async () => {
+      const written = await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [gateway("user-home-token")],
+      });
+
+      await written.release();
+
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).toContain("user-home-token");
+    });
+
+    it("scrubs a truncated block and a duplicated block", async () => {
+      const configPath = path.join(root, "config.toml");
+      const block = (token: string) =>
+        `# BEGIN PAPERCLIP MANAGED MCP\n[mcp_servers."a"]\nheaders = { Authorization = "Bearer ${token}" }\n# END PAPERCLIP MANAGED MCP`;
+      await fs.writeFile(
+        configPath,
+        `model = "gpt-5"\n\n${block("one")}\n\n${block("two")}\n\n# BEGIN PAPERCLIP MANAGED MCP\n[mcp_servers."b"]\nheaders = { Authorization = "Bearer cut-off`,
+      );
+
+      expect(await removeManagedCodexMcpBlock(root)).toBe(true);
+
+      const after = await fs.readFile(configPath, "utf8");
+      expect(after).toBe('model = "gpt-5"\n');
+      expect(await removeManagedCodexMcpBlock(root)).toBe(false);
+      expect(await removeManagedCodexMcpBlock(path.join(root, "missing"))).toBe(false);
+    });
   });
 
   it("restricts permissions on an existing managed MCP config", async () => {
