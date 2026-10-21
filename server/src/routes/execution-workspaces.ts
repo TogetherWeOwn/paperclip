@@ -34,7 +34,7 @@ import {
   LEASED_WORKSPACE_RUNTIME_ACTIONS,
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
-import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
+import { EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON, mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -1237,7 +1237,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         // artifact cleanup, so the archive control never removes the rebuilt
         // worktree during the reopen consumption window.
         res.status(409).json({
-          error: "Execution workspace was reopened and cannot be archived right now",
+          error: EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON,
         });
         return;
       }
