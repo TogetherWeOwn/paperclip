@@ -159,6 +159,12 @@ export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingCon
 // same write that sets the flag, and every clear removes both keys together.
 export const EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY = "reopenPendingConsumptionSince";
 
+// The blocker text the close-readiness preflight and the archive route both
+// report for a reopen-pending workspace. One constant keeps the preflight
+// consistent with the authoritative under-lock archive guard by construction.
+export const EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON =
+  "Execution workspace was reopened and cannot be archived right now";
+
 export function metadataHasReopenPendingConsumption(
   metadata: Record<string, unknown> | null | undefined,
 ): boolean {
@@ -763,6 +769,9 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
       heartbeatRunId: input.actor.runId,
       enableWorkspaceBranchReconcileForward: false,
       enableWorkspaceDirtyQuarantineRepair: true,
+      // This mode repairs a dirty worktree only. It must not switch a branch
+      // in a worktree that turned clean after the inspection.
+      enableWorkspaceCleanRestore: false,
       persistForwardReconcile: false,
       reconcileOperationPhase: "worktree_prepare",
       recorder: null,
@@ -2251,6 +2260,93 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return null;
     },
 
+    /**
+     * Finds a run that is executing in a worktree right now. A git worktree has
+     * one HEAD, so moving it under a running run breaks that run. Every open
+     * workspace row that points at the path counts, and so does the caller's
+     * own row (`executionWorkspaceId`): sibling issues that reuse one parent
+     * workspace share the row and the directory. Queued runs do not block,
+     * because a queued run validates the branch again when it starts.
+     * `excludingRunId` is the run that is asking, which is itself running while
+     * it prepares the workspace.
+     *
+     * The query starts from the running runs, a small set, so a workspace that
+     * many issues share cannot push the running run out of a row limit.
+     */
+    findRunningRunInWorktree: async (input: {
+      companyId: string;
+      worktreePath: string;
+      executionWorkspaceId?: string | null;
+      excludingRunId?: string | null;
+    }): Promise<{
+      id: string;
+      issueId: string | null;
+      issueIdentifier: string | null;
+    } | null> => {
+      const pathVariants = new Set([input.worktreePath, path.resolve(input.worktreePath)]);
+      const realPath = await fs.realpath(input.worktreePath).catch(() => null);
+      if (realPath) pathVariants.add(realPath);
+      const pathMatches = [...pathVariants].flatMap((value) => [
+        eq(executionWorkspaces.providerRef, value),
+        eq(executionWorkspaces.cwd, value),
+      ]);
+      const workspaceRows = await db
+        .select({ id: executionWorkspaces.id, sourceIssueId: executionWorkspaces.sourceIssueId })
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.companyId, input.companyId),
+          isNull(executionWorkspaces.closedAt),
+          ne(executionWorkspaces.status, "archived"),
+          or(
+            ...pathMatches,
+            ...(input.executionWorkspaceId ? [eq(executionWorkspaces.id, input.executionWorkspaceId)] : []),
+          ),
+        ));
+      if (workspaceRows.length === 0) return null;
+      const workspaceIds = new Set(workspaceRows.map((row) => row.id));
+      const sourceIssueIds = new Set(
+        workspaceRows.map((row) => row.sourceIssueId).filter((value): value is string => Boolean(value)),
+      );
+
+      const runningRuns = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "running"),
+          input.excludingRunId ? ne(heartbeatRuns.id, input.excludingRunId) : sql`true`,
+        ))
+        .orderBy(desc(heartbeatRuns.startedAt))
+        .limit(1000);
+      if (runningRuns.length === 0) return null;
+      const runIds = runningRuns.map((row) => row.id);
+
+      const runningIssues = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          executionWorkspaceId: issues.executionWorkspaceId,
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, input.companyId),
+          or(inArray(issues.executionRunId, runIds), inArray(issues.checkoutRunId, runIds)),
+        ));
+      for (const issue of runningIssues) {
+        const linkedToWorktree =
+          (issue.executionWorkspaceId !== null && workspaceIds.has(issue.executionWorkspaceId))
+          || sourceIssueIds.has(issue.id);
+        if (!linkedToWorktree) continue;
+        const runId = [issue.executionRunId, issue.checkoutRunId].find(
+          (candidate): candidate is string => candidate !== null && runIds.includes(candidate),
+        );
+        if (runId) return { id: runId, issueId: issue.id, issueIdentifier: issue.identifier ?? null };
+      }
+      return null;
+    },
+
     getById: async (id: string) => {
       const row = await db
         .select()
@@ -2349,6 +2445,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const blockingReasons: string[] = [];
       if (!statusInspectionSucceeded) {
         blockingReasons.push("Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
+      }
+      if (metadataHasReopenPendingConsumption(workspace.metadata as Record<string, unknown> | null)) {
+        // A reopen published this row as active while its source issue is still
+        // terminal. The under-lock archive guard refuses this row with 409, so the
+        // preflight reports the same blocker: callers check readiness before they
+        // preserve and archive, and a stale "ready" would waste a preservation
+        // upload on a refusal. Unmerged-work warnings stay separate below, and the
+        // archive guard stays authoritative for a reopen that lands after this read.
+        blockingReasons.push(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
       }
       const isSharedWorkspace = executionWorkspace.mode === "shared_workspace";
       const workspacePath = readNullableString(executionWorkspace.providerRef) ?? readNullableString(executionWorkspace.cwd);

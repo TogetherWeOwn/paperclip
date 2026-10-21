@@ -1113,8 +1113,14 @@ export function createHeartbeatRunState(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(
+    agentId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -1151,8 +1157,12 @@ export function createHeartbeatRunState(db: Db) {
     agentId: string,
     adapterType: string,
     taskKey: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
-    return db
+    return queryDb
       .select()
       .from(agentTaskSessions)
       .where(
@@ -1385,6 +1395,9 @@ export function createHeartbeatRunState(db: Db) {
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` for the same
+    // nested-pool reason as getTaskSession.
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -1393,6 +1406,7 @@ export function createHeartbeatRunState(db: Db) {
         agent.id,
         agent.adapterType,
         taskKey,
+        queryDb,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -1404,7 +1418,7 @@ export function createHeartbeatRunState(db: Db) {
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, queryDb);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -1426,6 +1440,10 @@ export function createHeartbeatRunState(db: Db) {
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the session
+    // read reuses the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -1442,6 +1460,7 @@ export function createHeartbeatRunState(db: Db) {
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.queryDb,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,
@@ -1454,11 +1473,15 @@ export function createHeartbeatRunState(db: Db) {
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the resume
+    // reads reuse the transaction's connection instead of acquiring a second
+    // pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
 
-    const resumeRun = await db
+    const resumeRun = await queryDb
       .select({
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -1485,6 +1508,7 @@ export function createHeartbeatRunState(db: Db) {
           agent.id,
           agent.adapterType,
           resumeTaskKey,
+          queryDb,
         )
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);

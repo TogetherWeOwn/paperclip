@@ -1,3 +1,14 @@
+import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
+import {
+  NativeSshAuthorityError,
+  type NativeSshEnvelopeVerifier,
+  type NativeSshSignerTransport,
+} from "@paperclipai/adapter-utils/host-executor";
+import {
+  createNativeSshHostExecutorForRun,
+  nativeSshAuthorityRunLedger,
+} from "./native-ssh-authority.js";
+import { createGitHubRunEvidenceCollector, githubWorkspaceState, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
@@ -132,6 +143,7 @@ export {
   revokeHeartbeatRunGatewayTokens,
   buildPaperclipRuntimeMcpServers,
   createManagedMcpRunConfig,
+  heartbeatRunGatewayTokenTtlMs,
   mergeCoalescedContextSnapshot,
   resolveExternalChatWakeProvider,
   attestReviewedExternalChatRun,
@@ -491,15 +503,25 @@ import {
   prepareHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
+import { createToolResultSpillWriter, registerToolResultSpillWriter } from "./tool-result-delivery.js";
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
+  mergeIssueAdapterConfigOverrides,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceMode,
   selectEnvironmentExecutionWorkspaceSettings,
 } from "./execution-workspace-policy.js";
+import { pluginRegistryService } from "./plugin-registry.js";
+import { toBoundedReapReceipt } from "./budget-receipt.js";
+import {
+  applyRunModelDecisionToAdapterConfig,
+  isRunModelDecisionDeferral,
+  RunModelDecisionDeferral,
+  type RunModelDecideAnswer,
+} from "./run-model-decision.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
@@ -841,6 +863,12 @@ export interface HeartbeatServiceOptions {
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
   /**
+   * Out-of-process signer for native SSH launch authorities and the check of
+   * its signature. Without both, every SSH-target launch is refused.
+   */
+  nativeSshSigner?: NativeSshSignerTransport;
+  nativeSshEnvelopeVerifier?: NativeSshEnvelopeVerifier;
+  /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
    * session loop, persistence port, and finalizer without spawning a provider.
@@ -932,6 +960,15 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export {
+  derivePresentationWakeProvenance,
+  isMonitorOnlyIssueUpdateDetails,
+  PRESENTATION_MONITOR_HOUSEKEEPING_ACTIONS,
+  PRESENTATION_MONITOR_ONLY_UPDATE_KEYS,
+  readPresentationRunMadeIssueProgress,
+  type PresentationProgressInput,
+  type PresentationWakeProvenance,
+} from "./heartbeat/presentation-progress.js";
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -1929,6 +1966,7 @@ export function heartbeatService(
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+    pluginWorkerManager: options.pluginWorkerManager,
   });
 
   async function executeRun(
@@ -1959,6 +1997,10 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // TOG-28460: the cap is enforced atomically inside claimQueuedRun's
+      // claim transactions (agents-row lock + recount on the claim
+      // connection), so direct executeRun callers are gated there too. At cap
+      // the claim leaves the run queued for a later drain pass.
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
@@ -2085,7 +2127,9 @@ export function heartbeatService(
     executionControl.phases.enter("host_execution");
     const executionPhaseContext = { onExecutionPhase: executionControl.phases.enter };
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    let candidateRuntime: Awaited<ReturnType<typeof prepareGitHubCandidateRuntime>> = null;
     let runScratch: HeartbeatRunScratch | null = null;
+    let unregisterToolResultSpillWriter: (() => void) | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
@@ -2133,6 +2177,10 @@ export function heartbeatService(
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
       }
+
+      // Before session restoration, workspace setup, plugins or model work.
+      // Only a server-certified SSH environment with fresh per-run proof enters.
+      candidateRuntime = await prepareGitHubCandidateRuntime(db, { run, agent });
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -2377,6 +2425,36 @@ export function heartbeatService(
           : null;
       const experimentalInstanceSettings =
         await instanceSettings.getExperimental();
+      // TOG-11792: the model router decides this run's model before the
+      // adapter config merge and before any workspace or provider work. With
+      // `requireRunModelDecision` off the answer is only recorded (advisory).
+      const modelDecision = await runCompletion.resolveModelDecisionForRun({
+        run,
+        agent,
+        context,
+        issueId,
+        issueContext,
+        issueOverrideModel: readNonEmptyString(
+          issueAssigneeOverrides?.adapterConfig?.model,
+        ),
+        requireDecision: experimentalInstanceSettings.requireRunModelDecision,
+      });
+      context.modelDecision = modelDecision.record;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ modelDecision: modelDecision.record })}::jsonb`,
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+      if (modelDecision.action === "park") {
+        throw new RunModelDecisionDeferral({
+          retryAfterMs: modelDecision.retryAfterMs,
+          reason: modelDecision.reason,
+          record: modelDecision.record,
+        });
+      }
+      const decidedModel: RunModelDecideAnswer | null =
+        modelDecision.answer?.kind === "decide" ? modelDecision.answer : null;
       const isolatedWorkspacesEnabled =
         experimentalInstanceSettings.enableIsolatedWorkspaces;
       // Inert on its own: the operator default only reaches the resolver when
@@ -3042,6 +3120,7 @@ export function heartbeatService(
         useIsolatedTaskDirectory,
       } = await selectHeartbeatEnvironment(db, {
         run, agent,
+        candidateRuntime,
         task: { issueRef, issueContext, issueId, context, executionProjectId, projectContext },
         policy: {
           trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled,
@@ -3058,9 +3137,21 @@ export function heartbeatService(
         legacyUseProjectWorkspace:
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
+      // TOG-11791: merge override `env` per key so a pin that sets one key
+      // keeps the base credentials it omits. All other keys keep shallow
+      // replace semantics. Router-managed keys are stripped from the override
+      // first (upstream router mode), then the remainder merges per-key.
+      const overrideMergedConfig = mergeIssueAdapterConfigOverrides(
+        workspaceManagedConfig,
+        Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
+      );
+      // TOG-11792: the router's decision is run-scoped and lands before secret
+      // resolution; its env keys were validated against the manifest
+      // allowlist and the base config's secret bindings.
       const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
+        ...(decidedModel
+          ? applyRunModelDecisionToAdapterConfig(overrideMergedConfig, decidedModel)
+          : overrideMergedConfig),
         ...(requestedAiBinding?.mode === "router" ? parseObject(parseObject(context.aiRouterSelection).runtimeConfig) : {}),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
@@ -3094,7 +3185,7 @@ export function heartbeatService(
         },
       );
       const useHostGitHub =
-        !githubSelection.configured &&
+        !candidateRuntime && !githubSelection.configured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -3342,7 +3433,7 @@ export function heartbeatService(
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
       });
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        Boolean(candidateRuntime) || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
@@ -3350,7 +3441,7 @@ export function heartbeatService(
         db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
         throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
       }) : undefined;
-      const previousSessionParams =
+      const previousSessionParams = candidateRuntime ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
           agent.adapterType,
@@ -3391,8 +3482,10 @@ export function heartbeatService(
         workspaceRealization,
         executionTarget,
         workspaceRestoreSource,
+        candidateWorkspaceDir,
       } = await prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans,
+        candidateRuntime,
         task: {
           issueRef,
           issueId,
@@ -3445,6 +3538,24 @@ export function heartbeatService(
           appendRunEvent,
         },
       });
+      if (candidateRuntime) {
+        runtimeConfig = githubCandidateAdapterConfig(candidateRuntime, runtimeConfig, executionWorkspace.cwd);
+      }
+      // Every launch on an SSH host needs a signer-verified authority bound to the
+      // decided model. Built once per run; a missing model refuses the run here.
+      const nativeSshHostExecutor = createNativeSshHostExecutorForRun({
+        runId: run.id,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId: issueRef?.id ?? null,
+        adapterType: agent.adapterType,
+        target: executionTarget,
+        holder: modelDecision.holder,
+        decision: modelDecision.record,
+        signer: options.nativeSshSigner,
+        verifyEnvelope: options.nativeSshEnvelopeVerifier,
+        ...nativeSshAuthorityRunLedger(db, run.id, context),
+      });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const instructionPreparationKey = createHash("sha256").update(JSON.stringify({
@@ -3489,10 +3600,12 @@ export function heartbeatService(
         retirementFailed: async () => { await instructionCopies.reportRetirementUnconfirmed(agent.companyId, run.id); },
       } : undefined;
       if (managedAiRuntime && aiBinding) {
-        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
-        catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
+        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget, nativeSshHostExecutor); }
+        catch (error) {
+          if (error instanceof NativeSshAuthorityError) throw error;
+          throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
-      const remoteExecution = realizationResult.remoteExecution;
+      const remoteExecution = candidateRuntime ? candidateRuntime.target.spec : realizationResult.remoteExecution;
       if (
         nativeChatWorkspaceScope &&
         (executionTarget?.kind === "remote" ||
@@ -3546,6 +3659,7 @@ export function heartbeatService(
           (!isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
+          if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
@@ -3557,6 +3671,7 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
+        if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
         const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
           runId: run.id,
           companyId: run.companyId,
@@ -3642,7 +3757,19 @@ export function heartbeatService(
       } else {
         delete context.paperclipScratch;
       }
-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
+      // Bind spill writes to the exact realized target, including sandbox/SSH
+      // filesystems. A gateway caller never supplies a destination or runner.
+      const toolResultScope = { companyId: run.companyId, agentId: run.agentId, runId: run.id };
+      unregisterToolResultSpillWriter = registerToolResultSpillWriter(toolResultScope, createToolResultSpillWriter({
+        scope: toolResultScope,
+        target: executionTarget,
+        cwd: executionWorkspace.cwd,
+        scratchDir: runScratch?.dir ?? null,
+        hostExecutor: nativeSshHostExecutor,
+      }));
+      const gitExecutionEnv = candidateRuntime ? Object.fromEntries(
+        Object.entries(parseObject(runtimeConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ) : await prepareGitHubExecutionEnvironment({
         target: executionTarget,
         cwd: executionWorkspace.cwd,
         env: Object.fromEntries(
@@ -3660,7 +3787,7 @@ export function heartbeatService(
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
-      if (!useHostGitHub) {
+      if (!useHostGitHub && !candidateRuntime) {
         const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
           githubConfigured: githubSelection.configured,
@@ -3901,6 +4028,14 @@ export function heartbeatService(
           delete executionContinuation?.resumeDelta;
         }
       }
+      if (candidateRuntime) {
+        runtimeSessionIdForAdapter = null;
+        runtimeSessionParamsForAdapter = null;
+        previousSessionDisplayId = null;
+        delete executionContinuation?.resumeDelta;
+        delete context.paperclipSessionHandoffMarkdown;
+        delete context.paperclipPreviousSessionId;
+      }
       const runtimeForAdapter = {
         sessionId: runtimeSessionIdForAdapter,
         sessionParams: runtimeSessionParamsForAdapter,
@@ -4093,7 +4228,24 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
+        // Observe both arms before their first tool read. Default-off runs do no
+        // parsing, Git I/O, or evidence writes. A missing/error observation never
+        // fails a primary run; comparison eligibility remains fail-closed.
+        const collectGitHubEvidence = resolvedInstanceSettings.experimental.githubReviewShadowEnabled === true
+          && agent.adapterType === "claude_local" && typeof context.wakeCommentId === "string"
+          ? createGitHubRunEvidenceCollector({
+            expectedCwd: executionTarget?.kind === "remote" ? executionTarget.remoteCwd : executionWorkspace.cwd,
+            workspaceHead: () => runtimeConfig.isolateRuntime === true ? Promise.resolve(null)
+              : githubWorkspaceState({ runId: run.id, target: executionTarget, cwd: executionWorkspace.cwd, env: gitExecutionEnv }),
+            // Isolated primaries have neither a checkout nor recorded network git.
+            ...(runtimeConfig.isolateRuntime === true ? {} : { role: candidateRuntime ? "candidate" as const : "primary" as const }),
+            record: async evidence => { await appendRunEvent(currentRun, { eventType: GITHUB_REVIEW_RUN_EVIDENCE,
+              stream: "system", payload: { ...evidence } }); },
+          }) : null;
         const appendIdentityRedactedLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          if (collectGitHubEvidence) await collectGitHubEvidence(stream, chunk).catch(error => {
+            logger.warn({ err: error, runId: run.id }, "GitHub review runtime evidence unavailable");
+          });
           const sanitizedChunk = compactRunLogChunk(
             redactCurrentUserText(chunk, currentUserRedactionOptions),
           );
@@ -4332,7 +4484,9 @@ export function heartbeatService(
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
           : !["claude_managed_agents_api", "aws_agentcore_harness_api", "openai_dot_mcp"].includes(nativeRuntimeResolution.profile.backend);
-        if (hasInstructionFilesystem) {
+        // Preserve the same instruction text, but do not restore an agent-home
+        // directory (which may include primary memory or previous answers).
+        if (hasInstructionFilesystem && !candidateRuntime) {
           try {
             // Missing contract fields on a restored session mean the deployed
             // legacy format. New sessions opt into whole-directory persistence.
@@ -4430,6 +4584,7 @@ export function heartbeatService(
           run,
           agent,
           nativeRuntimeResolution,
+          decidedModel,
           task: {
             issueRef,
             issueContext,
@@ -4486,9 +4641,20 @@ export function heartbeatService(
         });
         if (!runtimeSelection.selected) return;
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
+        // isolateRuntime is applied by the legacy codex adapter. The native runner
+        // would run the agent without it, so refuse rather than silently widen.
+        if (
+          nativeRuntimeResolution.kind === "native" &&
+          agent.adapterType === "codex_local" &&
+          parseObject(agent.adapterConfig).isolateRuntime === true
+        ) {
+          throw new Error("isolate_runtime_unsupported_on_native_runtime");
+        }
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
         const execution = await executeHeartbeatRuntime(db, {
           run, agent, options,
+          candidateRuntime,
+          nativeSshHostExecutor,
           task: {
             issueRef,
             issueContext,
@@ -4857,12 +5023,26 @@ export function heartbeatService(
             );
           },
         );
+      } else if (isRunModelDecisionDeferral(outerErr)) {
+        // TOG-11792: no model decision yet. The run never starts on the
+        // default; park it as a bounded `model_decision_pending` retry.
+        await runCompletion.finalizeRunModelDecisionDeferral(run, outerErr).catch(
+          (deferralErr) => {
+            logger.error(
+              { err: deferralErr, runId },
+              "failed to finalize model-decision deferral",
+            );
+          },
+        );
       } else {
         await runCompletion.failRunSetup({
           run, runId, outerErr, identityRedactor, readFailureReportSecrets,
         });
       }
     } finally {
+      unregisterToolResultSpillWriter?.();
+      if (candidateRuntime) await cleanupGitHubCandidateRuntime(candidateRuntime).catch(error =>
+        logger.warn({ runId: run.id, err: error }, "Candidate isolated home cleanup failed; later sibling probes will fail closed"));
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
@@ -4969,6 +5149,61 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // Run-end reap of router async invocations. Never throws: lookup
+          // and call failures are logged, orphans linger to TTL. Company
+          // scope is mandatory (worker throws without it). Success emits a
+          // bounded receipt (counts only); no result payload passthrough.
+          try {
+            const manager = options.pluginWorkerManager;
+            if (manager && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+              const routerRow = await pluginRegistryService(db)
+                .getByKey("togetherweown.paperclip-model-router")
+                .catch(() => null);
+              if (routerRow) {
+                await manager
+                  .call(
+                    routerRow.id,
+                    "performAction",
+                    {
+                      key: "cancel-run-invocations",
+                      params: { runId: run.id },
+                      actorContext: {
+                        type: "system",
+                        userId: null,
+                        agentId: null,
+                        runId: run.id,
+                        companyId: run.companyId,
+                      },
+                    },
+                    10_000,
+                  )
+                  .then((reapResult) => {
+                    const receipt = toBoundedReapReceipt(reapResult);
+                    logger.info(
+                      {
+                        runId: run.id,
+                        cancelled: receipt.cancelled,
+                        alreadyTerminal: receipt.alreadyTerminal,
+                        failed: receipt.failed,
+                        unshaped: receipt.unshaped,
+                      },
+                      "router run-end reap completed",
+                    );
+                  })
+                  .catch((reapErr) => {
+                    logger.warn(
+                      { err: reapErr, runId: run.id },
+                      "router run-end reap failed; orphans linger to TTL",
+                    );
+                  });
+              }
+            }
+          } catch (reapLookupErr) {
+            logger.warn(
+              { err: reapLookupErr, runId: run.id },
+              "router run-end reap lookup failed; orphans linger to TTL",
+            );
+          }
         }
         if (
           runScratch &&
@@ -5053,6 +5288,7 @@ export function heartbeatService(
           inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
 
       } finally {
+        if (candidateWorkspaceDir) await fs.rm(candidateWorkspaceDir, { recursive: true, force: true }).catch(() => {});
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,

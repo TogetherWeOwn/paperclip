@@ -13,13 +13,18 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import {
+  isReviewWaitNeverStartedCancellation,
+  LEGACY_RECOVERY_CAUSE,
+} from "./review-wait-cancellation.js";
+
+export { isReviewWaitNeverStartedCancellation, LEGACY_RECOVERY_CAUSE };
 
 type Run = typeof heartbeatRuns.$inferSelect;
-export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt" | "processStartedAt" | "processPid" | "processGroupId" | "lastOutputAt" | "lastOutputSeq">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -28,6 +33,9 @@ export function legacyExecutionNeedsReconciliation(
     return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
+  // A gate-cancelled review-wait continuation never reached a provider, so
+  // there is no action outcome to reconcile and no retry budget to spend.
+  if (isReviewWaitNeverStartedCancellation(run)) return false;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
@@ -45,6 +53,9 @@ export function legacyExecutionNeedsReconciliation(
       evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
+  // Waiting for the model router's decision also precedes provider execution.
+  if (run.status === "cancelled" && run.errorCode === "model_decision_pending" &&
+      evidence?.kind === "model_decision_pending" && evidence.providerWorkStarted === false) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
@@ -195,6 +206,10 @@ export async function terminalizeLegacyExecution(input: {
       // Periodic stranded-work checks may revisit this terminal run before its
       // reconciled continuation is dispatched. Preserve the recorded decision
       // and an existing unsafe-workspace hold instead of creating another one.
+      // The same applies once automatic recovery already settled this exact
+      // run without replay: re-settling identical evidence must not mint a
+      // new generation (and re-block the task) on every sweep. A later run
+      // carries a different run id and still creates its own incident.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
@@ -209,6 +224,12 @@ export async function terminalizeLegacyExecution(input: {
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
                 sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
           ),

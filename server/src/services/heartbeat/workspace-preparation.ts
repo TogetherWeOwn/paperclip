@@ -16,6 +16,8 @@ import {
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { tmpdir } from "node:os";
+import { ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { and, asc, eq } from "drizzle-orm";
 import { type ExecutionWorkspace } from "@paperclipai/shared";
 import { heartbeatRuns, projectWorkspaces } from "@paperclipai/db";
@@ -60,6 +62,10 @@ import type { environmentRunOrchestrator } from "../environment-run-orchestrator
 import type { instanceSettingsService } from "../instance-settings.js";
 import type { issueService } from "../issues.js";
 import type { executionWorkspaceService } from "../execution-workspaces.js";
+import {
+  createDbSourceBoundWorkspaceAllocationDeps,
+  markAllocatedWorkspaceRealized,
+} from "../source-bound-workspace-allocation.js";
 import type { workspaceOperationService } from "../workspace-operations.js";
 import type { watchLegacyControllerLease } from "../legacy-controller-lease.js";
 import type {
@@ -137,6 +143,8 @@ export interface HeartbeatWorkspacePreparationInput {
   };
   controllerLease: Pick<ReturnType<typeof watchLegacyControllerLease>, "assertOwned">;
   nativeRunnerPreparationSpans: NativeRunHistoricalSpan[];
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -145,6 +153,8 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspacePreparationInput) {
   const { run, agent, controllerLease, nativeRunnerPreparationSpans } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
+  let candidateWorkspaceDir: string | null = null;
   const {
     issueRef,
     issueId,
@@ -218,6 +228,15 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       return preflightEnvironment.driver;
     },
     resolveWorkspace: async () => {
+      if (candidateRuntime) {
+        // Never synchronize an agent home, prior worktree, or cached answer.
+        // Repository reads remain the sealed, commit-addressed gateway tools.
+        candidateWorkspaceDir = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-workspace-"));
+        return { cwd: candidateWorkspaceDir, source: "task_session" as const,
+          projectId: null, workspaceId: null, repoUrl: null, repoRef: null,
+          workspaceHints: [], warnings: [], baseCwdFallback: false,
+          materializationFailures: [], additionalWorkspaces: [], referencedProjectFailures: [] };
+      }
       if (isDotRun) {
         // This is private controller storage, never a provider filesystem.
         // v6 projects workspace.access=none and cwd=null to Dot.
@@ -320,7 +339,11 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
         : workspace;
     },
   });
-  const hostExecutionWorkspaceConfig = isDotRun ? {} :
+  // The candidate reviews the sealed snapshot through tools, not a host
+  // checkout. Never execute host provisioning or restore a previous tree.
+  const hostExecutionWorkspaceConfig = candidateRuntime
+    ? { workspaceStrategy: { type: "project_primary" } }
+    : isDotRun ? {} :
     stripHostWorkspaceProvisionForLowTrustSandbox({
       config: mergedConfig,
       trustPreset,
@@ -647,12 +670,24 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       }
     }
   };
+  // A Board-allocated unrealized record bound to this issue is adopted
+  // at persistence: realization flips that exact record instead of
+  // inserting a second source-bound workspace.
+  const allocatedUnrealizedExecutionWorkspace =
+    existingExecutionWorkspace?.status === "unrealized" &&
+    existingExecutionWorkspace.companyId === agent.companyId &&
+    issueRef?.id &&
+    existingExecutionWorkspace.sourceIssueId === issueRef.id
+      ? existingExecutionWorkspace
+      : null;
   const baseExecutionWorkspaceMetadata =
     mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata:
         resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
           ? (reusableExistingExecutionWorkspace?.metadata ?? null)
-          : null,
+          : // Adoption keeps the allocation provenance recorded on the
+            // unrealized record (actor, selection, prior binding).
+            (allocatedUnrealizedExecutionWorkspace?.metadata ?? null),
       source: executionWorkspace.source,
       // Attaching a new worktree to a pre-existing branch reports a fresh
       // workspace, but must not make cleanup own the operator's branch.
@@ -718,7 +753,71 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   const branchNameForInitialPersistence =
     pendingForwardBranchReconcile?.recordedBranchName ??
     executionWorkspace.branchName;
+  // Guarded adoption: the allocated record was captured before
+  // realization, and a Board rollback in between (archived + binding
+  // restored) must not be resurrected by this run. The flip runs inside
+  // the allocation transaction (issue FOR UPDATE lock with status and
+  // binding re-checked), so a rollback that commits first makes the
+  // adoption deny and this run falls through to a fresh insert. This
+  // replaces a getById-then-update sequence whose window between the
+  // two awaits let a rollback be overwritten back to active.
+  const tryAdoptAllocatedExecutionWorkspace = async () => {
+    if (
+      !allocatedUnrealizedExecutionWorkspace ||
+      resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace ||
+      !issueRef?.id
+    ) {
+      return null;
+    }
+    const adoption = await markAllocatedWorkspaceRealized(
+      createDbSourceBoundWorkspaceAllocationDeps(db),
+      {
+        companyId: agent.companyId,
+        sourceIssueId: issueRef.id,
+        workspaceId: allocatedUnrealizedExecutionWorkspace.id,
+        cwd: executionWorkspace.cwd,
+        // A null worktree path fails the helper's completeness check
+        // with `realization_incomplete` (handled below).
+        providerRef: executionWorkspace.worktreePath ?? "",
+        branchName:
+          branchNameForInitialPersistence ??
+          executionWorkspace.branchName ??
+          "",
+        repoUrl: executionWorkspace.repoUrl,
+        providerType:
+          executionWorkspace.strategy === "git_worktree"
+            ? "git_worktree"
+            : "local_fs",
+        baseRef: executionWorkspace.repoRef,
+        metadata: nextExecutionWorkspaceMetadata,
+      },
+    );
+    if (!adoption.ok) {
+      // Fail closed when the allocation is still open and bound but
+      // this run cannot realize into it (e.g. it resolved to
+      // project_primary with no worktree path). Falling through to a
+      // fresh insert here would rebind the issue and orphan the
+      // allocation with a second open source-bound row. Other denies
+      // (binding_conflict / workspace_not_unrealized) mean the
+      // allocation is already gone, so falling through is correct.
+      if (adoption.errorCode === "realization_incomplete") {
+        throw new Error(
+          "Source-bound allocation exists but this run cannot realize into it; failing instead of orphaning the allocation with a second record",
+        );
+      }
+      return null;
+    }
+    return executionWorkspacesSvc.getById(
+      allocatedUnrealizedExecutionWorkspace.id,
+    );
+  };
   try {
+    // Attempted inside persistence so a thrown error still runs the
+    // worktree cleanup below; a denial (rollback won the race) returns
+    // null and falls through to insert, while incomplete facts throw
+    // above instead of orphaning the allocation.
+    const adoptedAllocatedExecutionWorkspace =
+      await tryAdoptAllocatedExecutionWorkspace();
     persistedExecutionWorkspace =
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
       reusableExistingExecutionWorkspace
@@ -744,43 +843,44 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
                 ),
             },
           )
-        : resolvedProjectId
-          ? await executionWorkspacesSvc.create({
-              companyId: agent.companyId,
-              projectId: resolvedProjectId,
-              projectWorkspaceId: resolvedProjectWorkspaceId,
-              sourceIssueId: issueRef?.id ?? null,
-              mode:
-                requestedExecutionWorkspaceMode === "isolated_workspace"
-                  ? "isolated_workspace"
-                  : requestedExecutionWorkspaceMode === "operator_branch"
-                    ? "operator_branch"
-                    : requestedExecutionWorkspaceMode === "agent_default"
-                      ? "adapter_managed"
-                      : "shared_workspace",
-              strategyType:
-                executionWorkspace.strategy === "git_worktree"
-                  ? "git_worktree"
-                  : "project_primary",
-              name:
-                branchNameForInitialPersistence ??
-                issueRef?.identifier ??
-                `workspace-${agent.id.slice(0, 8)}`,
-              status: "active",
-              cwd: executionWorkspace.cwd,
-              repoUrl: executionWorkspace.repoUrl,
-              baseRef: executionWorkspace.repoRef,
-              branchName: branchNameForInitialPersistence,
-              providerType:
-                executionWorkspace.strategy === "git_worktree"
-                  ? "git_worktree"
-                  : "local_fs",
-              providerRef: executionWorkspace.worktreePath,
-              lastUsedAt: new Date(),
-              openedAt: new Date(),
-              metadata: nextExecutionWorkspaceMetadata,
-            })
-          : null;
+        : (adoptedAllocatedExecutionWorkspace ??
+            (resolvedProjectId
+              ? await executionWorkspacesSvc.create({
+                  companyId: agent.companyId,
+                  projectId: resolvedProjectId,
+                  projectWorkspaceId: resolvedProjectWorkspaceId,
+                  sourceIssueId: issueRef?.id ?? null,
+                  mode:
+                    requestedExecutionWorkspaceMode === "isolated_workspace"
+                      ? "isolated_workspace"
+                      : requestedExecutionWorkspaceMode === "operator_branch"
+                        ? "operator_branch"
+                        : requestedExecutionWorkspaceMode === "agent_default"
+                          ? "adapter_managed"
+                          : "shared_workspace",
+                  strategyType:
+                    executionWorkspace.strategy === "git_worktree"
+                      ? "git_worktree"
+                      : "project_primary",
+                  name:
+                    branchNameForInitialPersistence ??
+                    issueRef?.identifier ??
+                    `workspace-${agent.id.slice(0, 8)}`,
+                  status: "active",
+                  cwd: executionWorkspace.cwd,
+                  repoUrl: executionWorkspace.repoUrl,
+                  baseRef: executionWorkspace.repoRef,
+                  branchName: branchNameForInitialPersistence,
+                  providerType:
+                    executionWorkspace.strategy === "git_worktree"
+                      ? "git_worktree"
+                      : "local_fs",
+                  providerRef: executionWorkspace.worktreePath,
+                  lastUsedAt: new Date(),
+                  openedAt: new Date(),
+                  metadata: nextExecutionWorkspaceMetadata,
+                })
+              : null));
   } catch (error) {
     if (executionWorkspace.created) {
       try {
@@ -879,6 +979,9 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     });
     const paths = new Map(repositories.map((repo) => [repo.workspaceId, repo.cwd]));
     projectRepositoryPaths.push(...repositories.map((repo) => path.relative(executionWorkspace.cwd, repo.cwd)));
+    for (const repo of repositories) {
+      if (repo.warnings?.length) resolvedWorkspace.warnings.push(...repo.warnings);
+    }
     if (resolvedWorkspace.workspaceId) paths.set(resolvedWorkspace.workspaceId, executionWorkspace.cwd);
     resolvedWorkspace.workspaceHints = resolvedWorkspace.workspaceHints.map((hint) => ({
       ...hint, cwd: paths.get(hint.workspaceId) ?? hint.cwd,
@@ -1045,7 +1148,23 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   // and lease scope instead of silently creating a per-run replacement.
   await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
   const workspaceRealization = realizationResult.workspaceRealization;
-  const executionTarget = realizationResult.executionTarget;
+  const realizedTarget = realizationResult.executionTarget;
+  if (candidateRuntime && (realizedTarget?.kind !== "remote" || realizedTarget.transport !== "ssh"
+    || realizedTarget.environmentId !== candidateRuntime.target.environmentId
+    || realizedTarget.spec.host !== candidateRuntime.target.spec.host
+    || realizedTarget.spec.username !== candidateRuntime.target.spec.username)) {
+    throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: SSH realization changed", {
+      configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+    });
+  }
+  const executionTarget = candidateRuntime ? { ...candidateRuntime.target, leaseId: realizedTarget?.leaseId } : realizedTarget;
+  if (candidateRuntime) {
+    if (executionWorkspace.cwd !== candidateWorkspaceDir) {
+      throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: workspace changed", {
+        configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+      });
+    }
+  }
   // Preserve the host-owned source before adapter context can share lease
   // metadata. A later copy-back failure must not adopt a rebound source.
   const workspaceRestoreSource = structuredClone(realizationResult.lease);
@@ -1068,5 +1187,6 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     workspaceRealization,
     executionTarget,
     workspaceRestoreSource,
+    candidateWorkspaceDir,
   };
 }

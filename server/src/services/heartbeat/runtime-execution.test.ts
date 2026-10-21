@@ -73,6 +73,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     }) : null;
     const input: HeartbeatRuntimeExecutionInput = {
       run, agent, options: {},
+      nativeSshHostExecutor: null as never,
       task: { issueRef: issue, issueContext: null, context: {}, issueId: issue.id, taskKey: issue.id, executionContinuation: null },
       runtime: { nativeExecution, nativeRunnerInstanceId: native ? randomUUID() : null, getNativeFreshSessionHandoff: undefined,
         nativeRuntimeResolution: resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: native, runtimeConfig: {}, adapterConfig: agent.adapterConfig, agent, issue, target: null, workspaceId: null }),

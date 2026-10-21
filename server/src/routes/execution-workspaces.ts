@@ -5,6 +5,7 @@ import { accessSync, constants as fsConstants, existsSync, readFileSync } from "
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
@@ -33,7 +34,7 @@ import {
   LEASED_WORKSPACE_RUNTIME_ACTIONS,
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
-import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
+import { EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON, mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -715,7 +716,12 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             ], {
               cwd: baseWorkspaceCwd,
               env: {
-                ...process.env,
+                // TOG-9729: repair is agent-reachable (runtime:manage allows
+                // same-company agents), so strip inherited server secrets from
+                // the base. The CLI reads DB/secret material from the source
+                // config + .env entries, plus PAPERCLIP_SEED_* guardrails set
+                // explicitly below — never from the inherited server env.
+                ...sanitizeInheritedPaperclipEnv(process.env),
                 PAPERCLIP_SEED_EXPECTED_COMPANY_ID: existing.companyId,
                 PAPERCLIP_WORKSPACE_BASE_CWD: baseWorkspaceCwd,
                 PAPERCLIP_PROJECT_WORKSPACE_ID: existing.projectWorkspaceId ?? "",
@@ -1231,7 +1237,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         // artifact cleanup, so the archive control never removes the rebuilt
         // worktree during the reopen consumption window.
         res.status(409).json({
-          error: "Execution workspace was reopened and cannot be archived right now",
+          error: EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON,
         });
         return;
       }

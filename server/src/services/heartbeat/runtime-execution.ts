@@ -41,6 +41,8 @@ import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@pap
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
+import { ConfigurationIncompleteFailure } from "./run-preparation.js";
+import { runWithRunNativeSshHostExecutor } from "../native-ssh-authority.js";
 import {
   buildNativeProviderEnvironment,
   executePaperclipNativeSession,
@@ -105,6 +107,10 @@ export interface HeartbeatRuntimeExecutionInput {
     nativeSessionBackendFactory?: (execution: NativeExecutionInput) => NativeSessionBackend;
     pluginWorkerManager?: PluginWorkerManager;
   };
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
+  /** Run-bound native SSH launch authority executor. */
+  nativeSshHostExecutor: ReturnType<typeof import("../native-ssh-authority.js").createNativeSshHostExecutorForRun>;
   task: Pick<Selection["task"], "issueContext" | "context" | "executionContinuation"> & {
     issueRef: (NonNullable<Selection["task"]["issueRef"]> & { projectId: string | null }) | null;
     issueId: string | null;
@@ -222,6 +228,8 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
   const { run, agent, options } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
+  const { nativeSshHostExecutor } = input;
   const { issueRef, issueContext, context, issueId, taskKey, executionContinuation } = input.task;
   const { nativeRuntimeResolution, nativeExecution, nativeRunnerInstanceId, adapter, runtimeForAdapter, getNativeFreshSessionHandoff, getFreshSessionHandoff, runOptions } = input.runtime;
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
@@ -342,8 +350,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             ) {
               repairedExpectedBranchName = coherence.branchName;
               executionWorkspace.branchName = coherence.branchName;
-              executionWorkspace.warnings.push(...coherence.warnings);
             }
+            // A repair that keeps the recorded branch (a restore) still
+            // changed the worktree, and its warning names any rescue branch.
+            executionWorkspace.warnings.push(...coherence.warnings);
           } catch (repairErr) {
             const workspaceValidationFailure =
               isWorkspaceValidationFailure(repairErr) ? repairErr : null;
@@ -736,13 +746,28 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             }
           : {}),
       };
-      const runtimeTools = createAdapterRuntimeToolAccess({
-        agentId: agent.id,
-        companyId: agent.companyId,
-        runId: run.id,
-        responsibleUserId: run.responsibleUserId,
-      });
-      if (!runtimeTools) {
+      // An isolated codex run (adapterConfig.isolateRuntime) is handed no MCP
+      // gateway and no run token, so none is minted for it.
+      const isolatedRuntime =
+        agent.adapterType === "codex_local" &&
+        parseObject(runtimeConfig).isolateRuntime === true;
+      // Connection-intent brokers and generic managed MCP credentials are
+      // not snapshot review tools. Candidates get only the run-bound API
+      // credential and gateways whose discovery/dispatch enforce I4.
+      const runtimeTools = isolatedRuntime || candidateRuntime
+        ? undefined
+        : createAdapterRuntimeToolAccess({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            runId: run.id,
+            responsibleUserId: run.responsibleUserId,
+          });
+      if (candidateRuntime && !authToken) {
+        throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: scoped tools unavailable", {
+          configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+        });
+      }
+      if (!runtimeTools && !isolatedRuntime && !candidateRuntime) {
         logger.warn(
           {
             companyId: agent.companyId,
@@ -752,11 +777,14 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           "runtime connection tools could not be delivered",
         );
       }
-      const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
-        db,
-        agent,
-        runId: run.id,
-      });
+      const runtimeMcpServers = isolatedRuntime
+        ? []
+        : await buildPaperclipRuntimeMcpServers({
+            db,
+            agent,
+            runId: run.id,
+            apiBaseUrl: candidateRuntime ? "http://127.0.0.1:3100" : undefined,
+          });
       const runtimeToolDelivery =
         adapter.runtimeToolDelivery ?? "invocation_context";
       if (runtimeTools && runtimeToolDelivery === "native_mcp") {
@@ -767,7 +795,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           connectionId: "paperclip-runtime-tools",
         });
       }
-      if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+      if (!isolatedRuntime && !candidateRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
       }
@@ -775,14 +803,16 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {
         adapterContext.paperclipRuntimeTools = runtimeTools;
       }
-      const managedMcpConfig = await createManagedMcpRunConfig({
-        db,
-        agent,
-        runId: run.id,
-        config: runtimeConfig,
-        projectId: issueRef?.projectId ?? null,
-        issueId: issueRef?.id ?? null,
-      });
+      const managedMcpConfig = isolatedRuntime || candidateRuntime
+        ? null
+        : await createManagedMcpRunConfig({
+            db,
+            agent,
+            runId: run.id,
+            config: runtimeConfig,
+            projectId: issueRef?.projectId ?? null,
+            issueId: issueRef?.id ?? null,
+          });
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
@@ -790,7 +820,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchResolvedInteractionContinuationWithAtomicGate(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            // Every SSH launch inside the adapter needs the run's executor bound.
+            return runWithRunNativeSshHostExecutor(nativeSshHostExecutor, () => withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               runId: run.id,
@@ -867,8 +898,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   startedAt: meta.startedAt,
                 });
               },
-              authToken: authToken ?? undefined,
-            }));
+              authToken: isolatedRuntime ? undefined : authToken ?? undefined,
+            })));
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };

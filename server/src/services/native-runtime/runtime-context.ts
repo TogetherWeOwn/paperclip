@@ -1,5 +1,5 @@
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
-import { githubBotConnectionIdsForRun } from "../chat-github-tools.js";
+import { githubBotConnectionIdsForRun, githubCandidateReviewAssignmentForRun } from "../chat-github-tools.js";
 import { isBrowserUseConnection } from "../browser-use-client.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -231,7 +231,15 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
       || !isToolConnectionAttentionHealth(connection.healthStatus))
     && (["mcp_remote", "local_stdio"].includes(connection.transport) || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id))
   ).map((connection) => connection.id));
-  const assignment = {
+  // Must mirror buildPaperclipRuntimeMcpServers: a dispatched paired candidate
+  // is assigned exactly its capability-granted review tools.
+  const candidateReview = await githubCandidateReviewAssignmentForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const assignment = candidateReview ? {
+    version: 1,
+    agentId: input.agent.id,
+    connections: [candidateReview.connection.id],
+    tools: candidateReview.tools.map((tool) => tool.id).sort(),
+  } : {
     version: 1,
     agentId: input.agent.id,
     connections: [...availableConnectionIds].sort(),

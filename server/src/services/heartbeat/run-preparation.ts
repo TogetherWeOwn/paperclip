@@ -3,7 +3,7 @@ import { githubConfiguredInstructionSources } from "../chat-github-review-policy
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "../mcp-tool-names.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
-import { githubBotConnectionIdsForRun } from "../chat-github-tools.js";
+import { githubBotConnectionIdsForRun, githubCandidateReviewAssignmentForRun } from "../chat-github-tools.js";
 import { isBrowserUseConnection } from "../browser-use-client.js";
 import { explicitOperatorRunIdentity } from "../run-identity.js";
 import {
@@ -23,7 +23,7 @@ import type { Db } from "@paperclipai/db";
 import {
   CHAT_PROVIDERS,
   CONNECTION_INTENT_AGENT_GUIDANCE,
-  CONNECTION_RUNTIME_TOOL_NAMES,
+  RUNTIME_TOOL_NAMES,
   envBindingSchema,
   isToolConnectionAttentionHealth,
   type ChatProvider,
@@ -869,6 +869,21 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
+const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
+const RUN_GATEWAY_TOKEN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export function heartbeatRunGatewayTokenTtlMs(): number {
+  const raw = readNonEmptyString(process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS);
+  // Digits only: "24h" or "8.64e7" must not be read as 24 ms or 8 ms.
+  if (!raw || !/^\d+$/.test(raw)) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (parsed <= 0) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  // The gateway rejects tokens whose run is no longer active, so a long TTL
+  // only keeps tools working for the lifetime of a still-running run. The cap
+  // keeps an oversized value from producing an invalid expiry date.
+  return Math.min(parsed, RUN_GATEWAY_TOKEN_MAX_TTL_MS);
+}
+
 export function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
   return configured
@@ -910,6 +925,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
   expectedAssignmentDigest?: string | null;
+  /** Host-selected endpoint for a certified SSH principal; never agent config. */
+  apiBaseUrl?: string;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const access = toolAccessService(input.db);
   const effective = await access.getEffectiveProfilesForAgent(
@@ -985,7 +1002,10 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         identityContextId: runIdentity?.activeIdentityContextId,
       })).map(tool => tool.connectionId))
     : new Set<string>();
-  const assignedConnections = resolvedInstalledConnections.filter(
+  // A dispatched paired candidate is granted by its exact capability alone:
+  // only its snapshot-backed review tools, never the clone's other access.
+  const candidateReview = await githubCandidateReviewAssignmentForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const assignedConnections = candidateReview ? [candidateReview.connection] : resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
       connection.status === "active" &&
@@ -1212,7 +1232,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       clientLabel: `${input.agent.name} heartbeat run`,
       ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: new Date(Date.now() + heartbeatRunGatewayTokenTtlMs()),
     },
     actor: { agentId: input.agent.id },
   });
@@ -1220,7 +1240,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   return [
     {
       name: ASSIGNED_MCP_SERVER_NAME,
-      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
+      url: `${input.apiBaseUrl ?? paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
     },
@@ -1267,7 +1287,7 @@ export function createAdapterRuntimeToolAccess(input: {
     },
     bearerToken: minted.token,
     expiresAt: minted.expiresAt,
-    tools: CONNECTION_RUNTIME_TOOL_NAMES,
+    tools: RUNTIME_TOOL_NAMES,
   });
 }
 
@@ -1521,7 +1541,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + heartbeatRunGatewayTokenTtlMs());
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({
@@ -2574,6 +2594,12 @@ export async function buildPaperclipWakePayload(input: {
     issueDescriptionTruncated ||
     planReviewContext?.truncated === true ||
     documentReviewContext?.truncated === true;
+  const continuationEnvelope = parseObject(
+    input.contextSnapshot.executionContinuation,
+  );
+  const continuationTruncated =
+    continuationEnvelope.truncated === true ||
+    continuationEnvelope.fallbackFetchNeeded === true;
   const recoveryActionId = readNonEmptyString(
     input.contextSnapshot.recoveryActionId,
   );
@@ -2800,8 +2826,11 @@ export async function buildPaperclipWakePayload(input: {
       includedCount: comments.length,
       missingCount: missingCommentCount,
     },
-    truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    truncated: payloadTruncated || continuationTruncated,
+    fallbackFetchNeeded:
+      payloadTruncated ||
+      continuationTruncated ||
+      missingCommentCount > 0,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -2814,6 +2843,19 @@ export async function buildPaperclipWakePayload(input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export function isManualUserRun(input: {
+  contextSnapshot: Record<string, unknown>;
+  requestedByActorType?: "user" | "agent" | "system" | null;
+  source?: WakeupOptions["source"] | null;
+  triggerDetail?: WakeupOptions["triggerDetail"] | null;
+}) {
+  if (input.requestedByActorType !== "user") return false;
+  const wakeReason = readNonEmptyString(input.contextSnapshot.wakeReason);
+  if (wakeReason && ISSUE_RESPONSIBLE_USER_WAKE_REASONS.has(wakeReason))
+    return false;
+  return input.source === "on_demand" || input.triggerDetail === "manual";
 }
 
 /** Issue context and responsible-user resolution bound to one service database. */
@@ -2861,8 +2903,15 @@ export function createHeartbeatRunPreparation(db: Db) {
     return byCompany;
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(
+    companyId: string,
+    issueId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
@@ -2889,6 +2938,7 @@ export function createHeartbeatRunPreparation(db: Db) {
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
@@ -2975,6 +3025,10 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (
       !issueContext ||
@@ -2985,7 +3039,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await queryDb
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -3002,7 +3056,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await queryDb
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -3031,7 +3085,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       }
     }
 
-    const routine = await db
+    const routine = await queryDb
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -3052,8 +3106,14 @@ export function createHeartbeatRunPreparation(db: Db) {
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(
+    companyId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    const company = await queryDb
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -3063,7 +3123,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -3079,7 +3139,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -3098,9 +3158,13 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await queryDb
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -3109,19 +3173,6 @@ export function createHeartbeatRunPreparation(db: Db) {
       .where(and(eq(issues.companyId, companyId), eq(issues.id, parentId)))
       .then((rows) => rows[0] ?? null);
     return parent?.responsibleUserId ?? null;
-  }
-
-  function isManualUserRun(input: {
-    contextSnapshot: Record<string, unknown>;
-    requestedByActorType?: "user" | "agent" | "system" | null;
-    source?: WakeupOptions["source"] | null;
-    triggerDetail?: WakeupOptions["triggerDetail"] | null;
-  }) {
-    if (input.requestedByActorType !== "user") return false;
-    const wakeReason = readNonEmptyString(input.contextSnapshot.wakeReason);
-    if (wakeReason && ISSUE_RESPONSIBLE_USER_WAKE_REASONS.has(wakeReason))
-      return false;
-    return input.source === "on_demand" || input.triggerDetail === "manual";
   }
 
   async function resolveResponsibleUserIdForRunSeed(input: {
@@ -3136,7 +3187,12 @@ export function createHeartbeatRunPreparation(db: Db) {
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the reads
+    // reuse the transaction's connection instead of acquiring a second pooled
+    // connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
+    const queryDb = input.queryDb ?? db;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -3156,7 +3212,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await queryDb
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -3181,7 +3237,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await queryDb
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -3203,11 +3259,12 @@ export function createHeartbeatRunPreparation(db: Db) {
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      queryDb,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, queryDb);
   }
 
   async function resolveResponsibleUserIdForRun(input: {

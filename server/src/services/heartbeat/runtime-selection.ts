@@ -75,6 +75,10 @@ import { buildPlanReviewContext } from "../plan-review-context.js";
 import { resolvePaperclipRunnerIdleTimeoutMs } from "@paperclipai/adapter-utils";
 import { selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
+import {
+  applyRunModelDecisionToAdapterConfig,
+  type RunModelDecideAnswer,
+} from "../run-model-decision.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -92,6 +96,8 @@ export interface HeartbeatRuntimeSelectionInput {
   run: Run;
   agent: Agent;
   nativeRuntimeResolution: ReturnType<typeof resolveHeartbeatNativeRuntimeMode>;
+  /** TOG-11792 run-scoped model decision answer, or null when advisory/absent. */
+  decidedModel?: RunModelDecideAnswer | null;
   task: {
     issueRef: IssueRef | null;
     issueContext: IssueContext;
@@ -248,7 +254,7 @@ function readNonEmptyString(value: unknown): string | null {
 
 /** Prepare and persist the selected runtime before the executor dispatches provider work. */
 export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSelectionInput): Promise<HeartbeatRuntimeSelectionResult> {
-  const { run, agent, nativeRuntimeResolution, issuesSvc, runtimeEnv, beforeNativeRuntimeSelection, onAdapterEvent,
+  const { run, agent, nativeRuntimeResolution, decidedModel, issuesSvc, runtimeEnv, beforeNativeRuntimeSelection, onAdapterEvent,
     onNativeLifecycleSelected, onProviderResourceDisposition, onNativeOwnershipHeld, stopControllerLease } = input;
   const { issueRef, issueContext, context, executionContinuation, safeWakeComments, safeWakeCommentContext,
     paperclipWakePayload, acceptedPlanContinuationWake } = input.task;
@@ -695,7 +701,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       });
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
-      const nativeProviderConfig = nativeRuntimeResolution.profile.backend === "codex_app_server"
+      const nativeProviderBase = nativeRuntimeResolution.profile.backend === "codex_app_server"
         || nativeRuntimeResolution.profile.backend === "opencode_server"
         ? projectPaperclipRunnerTaskConfig(
             nativeRuntimeResolution.profile.backend,
@@ -704,6 +710,11 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             managedAiRuntime ? readNonEmptyString(resolvedConfig.model) ?? undefined : undefined,
           )
         : agent.adapterConfig;
+      // TOG-11792: the router's run-scoped model decision lands on the native
+      // provider config too; without a decision the base passes through.
+      const nativeProviderConfig = decidedModel
+        ? applyRunModelDecisionToAdapterConfig(parseObject(nativeProviderBase), decidedModel)
+        : nativeProviderBase;
       const requestedNativeProvider = resolvePaperclipRunnerNativeProviderInput({
         backend: nativeRuntimeResolution.profile.backend,
         adapterConfig: nativeProviderConfig, managedProfile, agentCoreProfile, dotBinding,

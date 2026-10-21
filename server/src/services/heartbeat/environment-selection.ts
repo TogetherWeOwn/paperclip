@@ -1,6 +1,7 @@
 import type { Db, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueExecutionWorkspaceSettings, ProjectExecutionWorkspacePolicy } from "@paperclipai/shared";
 import { parseObject } from "../../adapters/utils.js";
+import { resolveLowTrustSandboxEnvironment } from "../low-trust-sandbox-environment.js";
 import { logger } from "../../middleware/logger.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
@@ -55,6 +56,8 @@ export interface HeartbeatEnvironmentSelectionInput {
     config: Record<string, unknown>;
     issueAssigneeOverrides: { adapterConfig: Record<string, unknown> | null } | null;
   };
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
   services: {
     executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "getById">;
     environmentsSvc: Pick<ReturnType<typeof environmentService>,
@@ -70,6 +73,7 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnvironmentSelectionInput) {
   const { run, agent } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
   const { issueRef, issueContext, issueId, context, executionProjectId, projectContext } = input.task;
   const {
     trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled,
@@ -114,9 +118,9 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
         existingExecutionWorkspace?.status ?? null,
     });
   const requestedShouldReuseExisting =
-    workspaceReuseRequest.requestedShouldReuseExisting;
+    !candidateRuntime && workspaceReuseRequest.requestedShouldReuseExisting;
   const reusableExistingExecutionWorkspace =
-    workspaceReuseRequest.existingExecutionWorkspaceAvailable
+    !candidateRuntime && workspaceReuseRequest.existingExecutionWorkspaceAvailable
       ? existingExecutionWorkspace
       : null;
   const requestedReusableExecutionWorkspaceConfig =
@@ -137,6 +141,32 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   const managedSandboxEnvironment = managedSandboxOnly
     ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
     : null;
+  // Trust-aware placement: only a `low_trust_review` run reads the
+  // instance's designated low-trust sandbox, and only when its selection
+  // would land on local. The designation is re-verified here; an unusable
+  // one is dropped (and logged) so the low-trust gate fails closed with
+  // `low_trust_requires_sandbox_environment` rather than running on local.
+  const isLowTrustReviewRun = trustPreset.kind === "low_trust_review";
+  const lowTrustSandboxDesignation = isLowTrustReviewRun
+    ? await resolveLowTrustSandboxEnvironment({
+        designatedEnvironmentId:
+          resolvedInstanceSettings.general.lowTrustSandboxEnvironmentId ??
+          null,
+        companyId: agent.companyId,
+        environments: environmentsSvc,
+      })
+    : null;
+  if (lowTrustSandboxDesignation?.rejection) {
+    logger.warn(
+      {
+        runId: run.id,
+        agentId: agent.id,
+        companyId: agent.companyId,
+        rejection: lowTrustSandboxDesignation.rejection,
+      },
+      "Ignoring the designated low-trust sandbox environment: it is not usable for this run",
+    );
+  }
   const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
     lowTrustIssueEnvironmentId: trustPreset.kind === "low_trust_review"
       ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, {includeEnvironmentId: true})?.environmentId : null,
@@ -146,6 +176,9 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     localDefaultEnvironmentId: localEnvironment.id,
     managedSandboxOnly,
     managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
+    lowTrustReview: isLowTrustReviewRun,
+    lowTrustSandboxEnvironmentId:
+      lowTrustSandboxDesignation?.environmentId ?? null,
   });
   const effectiveExecutionWorkspaceMode: ReturnType<
     typeof resolveExecutionWorkspaceMode
@@ -235,6 +268,11 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       : selectedEnvironmentId
         ? await environmentsSvc.getById(selectedEnvironmentId)
         : null;
+  if (candidateRuntime && selectedEnvironmentForConfig?.id !== candidateRuntime.target.environmentId) {
+    throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: selected environment changed", {
+      configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+    });
+  }
   const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
     adapterType: agent.adapterType,
     environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
