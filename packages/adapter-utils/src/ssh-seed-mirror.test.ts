@@ -74,6 +74,30 @@ async function installStubSsh(): Promise<void> {
   process.env.PATH = `${binDir}${path.delimiter}${originalPath}`;
 }
 
+// A stub variant whose same-host proof always fails: the nonce `cat` returns
+// a decoy secret, so the seed must fall back to the full copy. Only the proof
+// read mentions the nonce marker, so intercepting it cannot misroute any
+// other remote command.
+const STUB_DECOY_SOURCE = `#!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  "sh -c "*) payload=\${last#"sh -c "};;
+  *) echo "stub-ssh: unexpected trailing arg: $last" >&2; exit 99;;
+esac
+case "$payload" in
+  *ssh-same-host-*) printf '%s' "stub-decoy-secret"; exit 0;;
+esac
+rewritten=$(printf '%s' "$payload" | sed "s|$STUB_SSH_REMOTE_ROOT|$STUB_SSH_FIXTURE_DIR|g")
+eval "sh -c $rewritten"
+`;
+
+async function installDecoyStubSsh(): Promise<void> {
+  const binDir = await createFixtureRootDir("paperclip-seed-decoy-stub-ssh-bin-");
+  await writeFile(path.join(binDir, "ssh"), STUB_DECOY_SOURCE, { mode: 0o755 });
+  process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? originalPath}`;
+}
+
 function buildStubSpec(fixtureDir: string): SshRemoteExecutionSpec {
   process.env.STUB_SSH_REMOTE_ROOT = FAKE_REMOTE_ROOT;
   process.env.STUB_SSH_FIXTURE_DIR = fixtureDir;
@@ -525,6 +549,13 @@ describe("ssh seed mirror", () => {
     "preserves local-only ignored files across a baseline restore",
     async () => {
       const { repoDir } = await initSeedTestRepo();
+      // A tracked file an UNESCAPED `./strange[1].log` tar exclude would also
+      // match, plus the ignored file carrying the glob metacharacters. `*.log`
+      // is ignored, so the tracked one is force-added.
+      await writeFile(path.join(repoDir, "strange1.log"), "tracked log\n");
+      await git(repoDir, ["add", "-f", "strange1.log"]);
+      await git(repoDir, ["commit", "-m", "tracked log file"]);
+      await writeFile(path.join(repoDir, "strange[1].log"), "ignored log\n");
       const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
       const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
       const spec = buildStubSpec(fixtureDir);
@@ -547,14 +578,29 @@ describe("ssh seed mirror", () => {
         ],
       });
 
-      // The remote run edits a tracked file, writes its own ignored files, and
-      // deletes a tracked file nested under an ignored name.
+      // The remote run edits tracked files, writes its own ignored files, and
+      // deletes a tracked file. The `src/nested/keep.txt` change is an EDIT,
+      // not a delete: an unanchored `nested` exclude would prune it from the
+      // sync-back and the merge would then delete the local file instead of
+      // applying the edit.
       await writeFile(
         path.join(localRemoteDir, "tracked.txt"),
         "v1\nremote-edit\n",
       );
       await writeFile(path.join(localRemoteDir, ".env"), "REMOTE=1\n");
-      await rm(path.join(localRemoteDir, "src", "nested", "keep.txt"));
+      await writeFile(
+        path.join(localRemoteDir, "strange[1].log"),
+        "REMOTE IGNORED\n",
+      );
+      await writeFile(
+        path.join(localRemoteDir, "strange1.log"),
+        "tracked log\nremote-edit\n",
+      );
+      await rm(path.join(localRemoteDir, "modified.txt"));
+      await writeFile(
+        path.join(localRemoteDir, "src", "nested", "keep.txt"),
+        "nested source\nremote-edit\n",
+      );
 
       await restoreWorkspaceFromSshExecution({
         spec,
@@ -565,8 +611,7 @@ describe("ssh seed mirror", () => {
         ignoredPaths: prepared.ignoredPaths,
       });
 
-      // Tracked remote edits land; local-only ignored files survive untouched;
-      // the anchored `nested` exclude does not hide `src/nested/` changes.
+      // Tracked remote edits land; local-only ignored files survive untouched.
       await expect(
         readFile(path.join(repoDir, "tracked.txt"), "utf8"),
       ).resolves.toBe("v1\nremote-edit\n");
@@ -574,17 +619,26 @@ describe("ssh seed mirror", () => {
         "LOCAL=1\n",
       );
       await expect(
+        readFile(path.join(repoDir, "strange[1].log"), "utf8"),
+      ).resolves.toBe("ignored log\n");
+      // The escaped `./strange\\[1].log` exclude must not swallow the tracked
+      // `strange1.log`: the remote edit lands.
+      await expect(
+        readFile(path.join(repoDir, "strange1.log"), "utf8"),
+      ).resolves.toBe("tracked log\nremote-edit\n");
+      await expect(
         readFile(
           path.join(repoDir, "nested", "node_modules", "junk.txt"),
           "utf8",
         ),
       ).resolves.toBe("ignored junk\n");
+      // Remote deletions of tracked files still propagate ...
+      expect(await pathExists(path.join(repoDir, "modified.txt"))).toBe(false);
+      // ... while the anchored `nested` exclude keeps `src/nested/` visible:
+      // the remote edit lands instead of reading as a deletion.
       await expect(
-        readFile(path.join(repoDir, "modified.txt"), "utf8"),
-      ).resolves.toBe("changed\n");
-      expect(
-        await pathExists(path.join(repoDir, "src", "nested", "keep.txt")),
-      ).toBe(false);
+        readFile(path.join(repoDir, "src", "nested", "keep.txt"), "utf8"),
+      ).resolves.toBe("nested source\nremote-edit\n");
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
@@ -718,6 +772,436 @@ describe("ssh seed mirror", () => {
           String(args[1] ?? args[0]).includes("restore command budget"),
         ),
       ).toBe(true);
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "excludes agent-local scratch from the mirror seed",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      // Scratch the repo does NOT gitignore (a missing .gitignore entry):
+      // the legacy seed excludes these unconditionally, so the mirror seed
+      // must too — including a whole nested agent worktree.
+      await mkdir(path.join(repoDir, "target", "debug"), { recursive: true });
+      await writeFile(
+        path.join(repoDir, "target", "debug", "binary"),
+        "built\n",
+      );
+      await mkdir(path.join(repoDir, ".claude", "worktrees", "wt"), {
+        recursive: true,
+      });
+      await writeFile(
+        path.join(repoDir, ".claude", "worktrees", "wt", "work.txt"),
+        "uncommitted\n",
+      );
+      await mkdir(path.join(repoDir, ".paperclip-runtime"), { recursive: true });
+      await writeFile(
+        path.join(repoDir, ".paperclip-runtime", "state.json"),
+        "{}\n",
+      );
+      await mkdir(path.join(repoDir, "node_modules", "dep"), {
+        recursive: true,
+      });
+      await writeFile(
+        path.join(repoDir, "node_modules", "dep", "index.js"),
+        "module.exports = {};\n",
+      );
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("shared-mirror");
+      for (const scratch of [
+        "target",
+        ".claude/worktrees",
+        ".paperclip-runtime",
+        "node_modules",
+      ]) {
+        expect(
+          await pathExists(path.join(localRemoteDir, scratch)),
+          scratch,
+        ).toBe(false);
+      }
+      // ... while nested source merely named like scratch still transfers.
+      await expect(
+        readFile(path.join(localRemoteDir, "src", "nested", "keep.txt"), "utf8"),
+      ).resolves.toBe("nested source\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "preserves ignored files across a plain restore after a mirror seed",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const remoteDir = `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`;
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({ spec, localDir: repoDir, remoteDir }),
+      );
+      expect(prepared.seedMode).toBe("shared-mirror");
+
+      // The remote run edits a tracked file and writes its own ignored copy.
+      // The plain restore (no baseline snapshot) must still keep the local
+      // ignored files: the seed omitted them, the run never owned them.
+      await writeFile(
+        path.join(localRemoteDir, "tracked.txt"),
+        "v1\nremote-edit\n",
+      );
+      await writeFile(path.join(localRemoteDir, ".env"), "REMOTE=1\n");
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir: repoDir,
+        remoteDir,
+        ignoredPaths: prepared.ignoredPaths,
+      });
+
+      await expect(
+        readFile(path.join(repoDir, "tracked.txt"), "utf8"),
+      ).resolves.toBe("v1\nremote-edit\n");
+      await expect(readFile(path.join(repoDir, ".env"), "utf8")).resolves.toBe(
+        "LOCAL=1\n",
+      );
+      // Untouched by the remote run and absent remotely: still survives.
+      await expect(
+        readFile(path.join(repoDir, "app.log"), "utf8"),
+      ).resolves.toBe("ignored log\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "preserves ignored entries across a plain restore of a non-git directory",
+    async () => {
+      const localDir = await createTempDir("paperclip-ssh-plain-local-");
+      await writeFile(path.join(localDir, "keep-local.txt"), "local\n");
+      await writeFile(path.join(localDir, "drop.txt"), "v1\n");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const remoteDir = `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`;
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+      await mkdir(localRemoteDir, { recursive: true });
+      await writeFile(
+        path.join(localRemoteDir, "drop.txt"),
+        "v1\nremote-edit\n",
+      );
+      await writeFile(path.join(localRemoteDir, "keep-local.txt"), "REMOTE\n");
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir,
+        ignoredPaths: ["keep-local.txt"],
+      });
+
+      await expect(
+        readFile(path.join(localDir, "drop.txt"), "utf8"),
+      ).resolves.toBe("v1\nremote-edit\n");
+      await expect(
+        readFile(path.join(localDir, "keep-local.txt"), "utf8"),
+      ).resolves.toBe("local\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "seeded workspaces survive deletion of the mirror",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const remoteDir = `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`;
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({ spec, localDir: repoDir, remoteDir }),
+      );
+      expect(prepared.seedMode).toBe("shared-mirror");
+      // The seed dissociates the clone: no alternates survive it.
+      expect(
+        await pathExists(
+          path.join(localRemoteDir, ".git", "objects", "info", "alternates"),
+        ),
+      ).toBe(false);
+
+      // The mirror is a deletable cache: remove it mid-run.
+      await rm(mirrorRoot, { recursive: true, force: true });
+
+      // History, integrity, and the export bundle all work without it.
+      await expect(git(localRemoteDir, ["log", "--oneline"])).resolves.toMatch(
+        "initial",
+      );
+      await git(localRemoteDir, ["fsck"]);
+      const baselineSnapshot = await captureDirectorySnapshot(repoDir, {
+        exclude: [
+          ...GIT_ARCHIVE_EXCLUDES,
+          ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+          ...(prepared.ignoredPaths ?? []),
+        ],
+      });
+      await writeFile(
+        path.join(localRemoteDir, "tracked.txt"),
+        "v1\nremote-edit\n",
+      );
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir: repoDir,
+        remoteDir,
+        baselineSnapshot,
+        restoreGitHistory: true,
+        ignoredPaths: prepared.ignoredPaths,
+      });
+      await expect(
+        readFile(path.join(repoDir, "tracked.txt"), "utf8"),
+      ).resolves.toBe("v1\nremote-edit\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "legacy fallback strips a reused shared clone's mirror dependency",
+    async () => {
+      const { repoDir, head } = await initSeedTestRepo();
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      // A mid-seed leftover: a shared clone of a bare mirror, origin pointing
+      // at the mirror path — what the fallback inherits when the mirror seed
+      // throws after cloning.
+      const fakeMirror = await createTempDir("paperclip-ssh-fake-mirror-");
+      const fakeMirrorRepo = path.join(fakeMirror, "mirror.git");
+      await git(repoDir, ["clone", "--bare", "--quiet", repoDir, fakeMirrorRepo]);
+      await mkdir(path.dirname(localRemoteDir), { recursive: true });
+      await git(path.dirname(localRemoteDir), [
+        "clone",
+        "--shared",
+        "--quiet",
+        fakeMirrorRepo,
+        localRemoteDir,
+      ]);
+      expect(
+        await pathExists(
+          path.join(localRemoteDir, ".git", "objects", "info", "alternates"),
+        ),
+      ).toBe(true);
+
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        withIncrementalEnv("0", () =>
+          prepareWorkspaceForSshExecution({
+            spec,
+            localDir: repoDir,
+            remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+          }),
+        ),
+      );
+
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(
+        await pathExists(
+          path.join(localRemoteDir, ".git", "objects", "info", "alternates"),
+        ),
+      ).toBe(false);
+      // Mirror origin replaced with the workspace's real origin ...
+      expect(await git(localRemoteDir, ["remote", "get-url", "origin"])).toBe(
+        "https://example.com/test/seed-repo.git",
+      );
+      // ... and the workspace is complete without the mirror.
+      await rm(fakeMirror, { recursive: true, force: true });
+      expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
+      await git(localRemoteDir, ["fsck"]);
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy for workspaces with submodules",
+    async () => {
+      const submoduleSrc = await createTempDir("paperclip-ssh-submodule-src-");
+      await git(submoduleSrc, ["init", "-b", "main"]);
+      await git(submoduleSrc, ["config", "user.email", "seed-test@example.com"]);
+      await git(submoduleSrc, ["config", "user.name", "Seed Test"]);
+      await writeFile(
+        path.join(submoduleSrc, "lib.txt"),
+        "submodule content\n",
+      );
+      await git(submoduleSrc, ["add", "-A"]);
+      await git(submoduleSrc, ["commit", "-m", "submodule initial"]);
+
+      const { repoDir } = await initSeedTestRepo();
+      await git(repoDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--quiet",
+        submoduleSrc,
+        "vendor/sub",
+      ]);
+      await git(repoDir, ["commit", "-m", "add submodule"]);
+
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(prepared.ignoredPaths).toBeUndefined();
+      // The fallback carries the submodule files the mirror checkout omits.
+      await expect(
+        readFile(path.join(localRemoteDir, "vendor", "sub", "lib.txt"), "utf8"),
+      ).resolves.toBe("submodule content\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy for workspaces with content filters",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      // A smudge/clean filter pair defined in the local repo config (the
+      // git-crypt class): working bytes differ from the blob while diff
+      // reports clean, so a HEAD checkout plus diff overlay would seed the
+      // wrong bytes.
+      await git(repoDir, ["config", "filter.paperclip-test.smudge", "tr a-z A-Z"]);
+      await git(repoDir, ["config", "filter.paperclip-test.clean", "tr A-Z a-z"]);
+      await writeFile(
+        path.join(repoDir, ".gitattributes"),
+        "data.bin filter=paperclip-test\n",
+      );
+      await writeFile(path.join(repoDir, "data.bin"), "ABC\n");
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "filtered content"]);
+      // Sanity: the diff overlay would omit this file (clean through the
+      // clean filter), which is exactly why the seed must not use it.
+      const dirty = await git(repoDir, ["diff", "--name-only", "HEAD"]);
+      expect(dirty.split("\n")).not.toContain("data.bin");
+
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(prepared.ignoredPaths).toBeUndefined();
+      // The fallback carries the smudged working bytes.
+      await expect(
+        readFile(path.join(localRemoteDir, "data.bin"), "utf8"),
+      ).resolves.toBe("ABC\n");
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "carries whitespace-edged filenames byte-exact",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      await writeFile(path.join(repoDir, "notes.txt "), "v1\n");
+      await writeFile(path.join(repoDir, "gone.txt "), "gone\n");
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "whitespace names"]);
+      await writeFile(path.join(repoDir, "notes.txt "), "v2\n");
+      await rm(path.join(repoDir, "gone.txt "));
+
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("shared-mirror");
+      // A trimming parse would stage `notes.txt` (missing) and leave the HEAD
+      // bytes remotely; the exact parse carries the edit.
+      await expect(
+        readFile(path.join(localRemoteDir, "notes.txt "), "utf8"),
+      ).resolves.toBe("v2\n");
+      expect(await pathExists(path.join(localRemoteDir, "gone.txt "))).toBe(
+        false,
+      );
+      expect(await pathExists(path.join(localRemoteDir, "gone.txt"))).toBe(
+        false,
+      );
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy when the same-host secret proof fails",
+    async () => {
+      await installDecoyStubSsh();
+      const { repoDir, head } = await initSeedTestRepo();
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      // A mismatched secret is a cross-host (or unreadable-path) signal: the
+      // legacy full copy runs, ignored files included, with no mirror built.
+      expect(prepared.gitBacked).toBe(true);
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(prepared.ignoredPaths).toBeUndefined();
+      expect(await readdir(mirrorRoot)).toHaveLength(0);
+      expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
+      await expect(
+        readFile(path.join(localRemoteDir, ".env"), "utf8"),
+      ).resolves.toBe("LOCAL=1\n");
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );

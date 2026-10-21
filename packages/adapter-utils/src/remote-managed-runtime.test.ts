@@ -369,4 +369,90 @@ describe("remote managed runtime", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("threads mirror-seed ignoredPaths through the baseline and restore", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-ignored-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    await writeFile(path.join(workspaceDir, ".env"), "LOCAL=1\n");
+    await writeFile(path.join(workspaceDir, "keep.txt"), "keep\n");
+    // The hoisted mock factory types the result as { gitBacked: boolean };
+    // the extra fields are what the real prepare returns for a mirror seed.
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({
+      gitBacked: true,
+      seedMode: "shared-mirror",
+      ignoredPaths: [".env"],
+    } as unknown as { gitBacked: boolean });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote",
+        remoteCwd: "/remote",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "KNOWN HOSTS",
+        strictHostKeyChecking: true,
+      },
+      runId: "run-ignored",
+      adapterKey: "codex",
+      workspaceLocalDir: workspaceDir,
+    });
+    await prepared.restoreWorkspace();
+
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
+      baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> };
+      ignoredPaths?: string[];
+    };
+    // The seed's ignored list lands in the baseline exclude (so the merge
+    // stays blind to it) and rides the restore input (so the inner transfer
+    // prunes it with anchored, escaped patterns).
+    expect(restoreInput.baselineSnapshot.exclude).toEqual(expect.arrayContaining([".env"]));
+    expect(restoreInput.baselineSnapshot.entries.has(".env")).toBe(false);
+    expect(restoreInput.baselineSnapshot.entries.has("keep.txt")).toBe(true);
+    expect(restoreInput.ignoredPaths).toEqual([".env"]);
+  });
+
+  it("threads mirror-seed ignoredPaths through the asset-failure restore", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-ignored-failure-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const homeDir = path.join(rootDir, "home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(homeDir, { recursive: true });
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({
+      gitBacked: true,
+      seedMode: "shared-mirror",
+      ignoredPaths: [".env"],
+    } as unknown as { gitBacked: boolean });
+    syncDirectoryToSsh.mockRejectedValueOnce(new Error("asset transfer failed"));
+
+    await expect(
+      prepareRemoteManagedRuntime({
+        spec: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote",
+          remoteCwd: "/remote",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "KNOWN HOSTS",
+          strictHostKeyChecking: true,
+        },
+        runId: "run-ignored-failure",
+        adapterKey: "codex",
+        workspaceLocalDir: workspaceDir,
+        assets: [{ key: "home", localDir: homeDir }],
+      }),
+    ).rejects.toThrow("asset transfer failed");
+
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
+      ignoredPaths?: string[];
+    };
+    expect(restoreInput.ignoredPaths).toEqual([".env"]);
+  });
 });

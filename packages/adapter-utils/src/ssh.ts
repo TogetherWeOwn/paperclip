@@ -343,8 +343,13 @@ async function runLocalGit(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    stdin?: string;
   } = {},
 ): Promise<SshCommandResult> {
+  // execFile cannot feed stdin; route piped input through the spawn helper.
+  if (options.stdin != null) {
+    return await spawnText("git", ["-C", localDir, ...args], options);
+  }
   return await execFileText("git", ["-C", localDir, ...args], options);
 }
 
@@ -814,7 +819,6 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
       branchName: branchName && branchName !== "HEAD" ? branchName : null,
       deletedPaths: deletedResult.stdout
         .split("\0")
-        .map((entry) => entry.trim())
         .filter(Boolean),
     };
   } catch {
@@ -957,6 +961,7 @@ async function importGitWorkspaceToSsh(input: {
       maxBuffer: 1024 * 1024,
     });
     const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
+    const alternatesPath = path.posix.join(input.remoteDir, ".git", "objects", "info", "alternates");
 
     const remoteSetupScript = [
       "set -e",
@@ -965,16 +970,26 @@ async function importGitWorkspaceToSsh(input: {
       'trap \'rm -f "$tmp_bundle"\' EXIT',
       'cat > "$tmp_bundle"',
       `if [ ! -d ${shellQuote(path.posix.join(input.remoteDir, ".git"))} ]; then git init ${shellQuote(input.remoteDir)} >/dev/null; fi`,
+      `git -C ${shellQuote(input.remoteDir)} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
+      // A fallback reuse of a mirror-seeded clone still borrows the mirror
+      // through `objects/info/alternates`, with `origin` pointing at the
+      // mirror path. The workspace must not depend on a deletable cache, so
+      // dissociate it the same way the mirror seed does: `repack -a` copies
+      // every borrowed object home (a plain fetch would NOT — it negotiates
+      // the alternates-visible objects as already present and transfers
+      // nothing), then the alternates file and the mirror origin go. Repos
+      // without an alternates file (every normal reuse) skip this untouched.
+      `if [ -f ${shellQuote(alternatesPath)} ]; then git -C ${shellQuote(input.remoteDir)} repack -a -d >/dev/null; rm -f ${shellQuote(alternatesPath)}; git -C ${shellQuote(input.remoteDir)} remote remove origin >/dev/null 2>&1 || true; fi`,
       // Carry the workspace's (credential-scrubbed) origin into the transported
       // repo so branches there keep a publishable remote instead of reading as
       // remote-less snapshots. set-url covers a reused workspace whose origin
-      // changed; add covers the fresh-init case. Best-effort under `set -e`.
+      // changed; add covers the fresh-init and stripped-shared-clone cases.
+      // Best-effort under `set -e`.
       ...(originUrl
         ? [
           `{ git -C ${shellQuote(input.remoteDir)} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || git -C ${shellQuote(input.remoteDir)} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
         ]
         : []),
-      `git -C ${shellQuote(input.remoteDir)} fetch --force "$tmp_bundle" '${tempRef}:${tempRef}' >/dev/null`,
       input.snapshot.branchName
         ? `git -C ${shellQuote(input.remoteDir)} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
         : `git -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
@@ -1798,8 +1813,9 @@ export async function syncDirectoryFromSsh(input: {
 /** How a git-backed SSH workspace seed moved its bytes. */
 export type SshSeedMode =
   /** Same-host fast path: history via `git clone --shared` from a local bare
-   * mirror (zero history bytes over the wire) plus an overlay tar of only the
-   * files that differ from HEAD. Git-ignored files never transfer. */
+   * mirror (zero history bytes over the wire, dissociated right after
+   * checkout) plus an overlay tar of only the files that differ from HEAD.
+   * Git-ignored files never transfer. */
   | "shared-mirror"
   /** Legacy path: a full-history bundle plus a full-tree tar. */
   | "full-copy";
@@ -1871,8 +1887,9 @@ async function readSshSeedMirrorInput(
  * explicit SHA, never a mirror branch).
  *
  * The mirror is append-only by construction: `gc.auto` is disabled at init so
- * fetched objects are never pruned, which keeps every `--shared` clone's
- * alternates valid for the life of its run, even across branch force-pushes.
+ * fetched objects are never pruned, even across branch force-pushes. Seeded
+ * clones are dissociated right after checkout (repacked, then alternates
+ * dropped), so a deleted mirror can never break a running workspace.
  */
 async function ensureSshSeedMirror(input: SshSeedMirrorInput & { headCommit: string }): Promise<void> {
   const initialized = await fs.stat(path.join(input.mirrorPath, "HEAD")).then(() => true, () => false);
@@ -1964,8 +1981,26 @@ function isSafeSeedRelativePath(value: string): boolean {
     !value.split(/[\\/]/).some((part) => part === ".." || part === ".");
 }
 
+/**
+ * True when a seed-snapshot path falls under the agent-local scratch roots.
+ * The legacy seed excludes these unconditionally; the mirror seed must drop
+ * them from its selection too, because un-ignored scratch (a missing
+ * `.gitignore` entry — Paperclip and Claude Code create these directories
+ * inside workspaces) would otherwise ride the overlay onto the remote,
+ * including whole nested agent worktrees. Root-anchored, like the transfer
+ * excludes: nested source merely named like scratch still transfers.
+ */
+function isSshSeedAgentLocalScratchPath(relative: string): boolean {
+  return SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.some(
+    (root) => relative === root || relative.startsWith(`${root}/`),
+  );
+}
+
 function parseNulPathList(stdout: string): string[] {
-  return stdout.split("\0").map((entry) => entry.trim()).filter(Boolean).filter(isSafeSeedRelativePath);
+  // No trimming: `git -z` emits byte-exact names, and a filename may legally
+  // start or end with whitespace. Only the trailing empty entry is dropped
+  // (a filename cannot be empty), which filter(Boolean) already does.
+  return stdout.split("\0").filter(Boolean).filter(isSafeSeedRelativePath);
 }
 
 /**
@@ -1978,6 +2013,12 @@ function parseNulPathList(stdout: string): string[] {
  * the overlay scan when modified (so the seed carries them) but hidden from
  * the restore baseline by the ignored entry (so remote edits to them do not
  * merge back). The same trade-off as the sandbox lane's ignore handling.
+ *
+ * Returns null (full copy) for workspaces whose bytes a HEAD checkout plus
+ * diff overlay cannot reproduce: submodules (gitlinks) and content filters
+ * (smudge/clean drivers such as git-crypt or LFS). Agent-local scratch is
+ * dropped from every selection, matching the legacy seed's unconditional
+ * excludes.
  */
 async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnapshot | null> {
   try {
@@ -1996,7 +2037,7 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
     ]);
     if (!toplevelPhysical || workspacePhysical !== toplevelPhysical) return null;
 
-    const [headResult, branchResult, overlayDiff, untracked, deleted, ignored] = await Promise.all([
+    const [headResult, branchResult, overlayDiff, untracked, deleted, ignored, staged, tracked] = await Promise.all([
       runLocalGit(localDir, ["rev-parse", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
       runLocalGit(localDir, ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
       runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", "HEAD", "--"], {
@@ -2017,14 +2058,44 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
+      runLocalGit(localDir, ["ls-files", "--stage", "-z"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+      runLocalGit(localDir, ["ls-files", "-z"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
     ]);
     const headCommit = headResult.stdout.trim();
     if (!headCommit) return null;
     const branchName = branchResult.stdout.trim();
+    // A clean gitlink appears in neither the diff nor the untracked scan, and
+    // the mirror clone checks it out as an empty directory — the full copy
+    // carries the submodule files instead. `--stage` entries are
+    // `<mode> <sha> <stage>\t<path>`; 160000 is the gitlink mode.
+    if (staged.stdout.split("\0").some((entry) => entry.startsWith("160000 "))) return null;
+    // A set `filter` attribute means the working bytes differ from the blob
+    // (git-crypt, LFS, custom smudge/clean) while `git diff` reports the file
+    // clean through the clean filter — the overlay would omit it, and the
+    // clone (which has no filter config) would check out raw blob bytes. Any
+    // value other than unset/unspecified falls back to the full copy, whose
+    // tar carries the working bytes. `check-attr -z` emits path/attr/value
+    // triples; a buffer overrun throws into the full-copy fallback below.
+    const filterAttrs = await runLocalGit(localDir, ["check-attr", "-z", "filter", "--stdin"], {
+      timeout: 60_000,
+      maxBuffer: 64 * 1024 * 1024,
+      stdin: tracked.stdout,
+    });
+    const filterFields = filterAttrs.stdout.split("\0");
+    for (let index = 2; index < filterFields.length; index += 3) {
+      const value = filterFields[index];
+      if (value && value !== "unset" && value !== "unspecified") return null;
+    }
     const overlayPaths = [
       ...parseNulPathList(overlayDiff.stdout),
       ...parseNulPathList(untracked.stdout),
-    ];
+    ].filter((entry) => !isSshSeedAgentLocalScratchPath(entry));
     const overlaySet = new Set(overlayPaths);
     return {
       headCommit,
@@ -2034,8 +2105,13 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
       // D scan reports while the file is still on disk) must never be
       // deleted remotely: the overlay carries it, and deleting it after the
       // overlay would read back as a remote deletion of a local file.
-      deletedPaths: parseNulPathList(deleted.stdout).filter((entry) => !overlaySet.has(entry)),
-      ignoredPaths: parseNulPathList(ignored.stdout).map((entry) => entry.replace(/\/+$/, "")).filter(Boolean),
+      deletedPaths: parseNulPathList(deleted.stdout).filter(
+        (entry) => !overlaySet.has(entry) && !isSshSeedAgentLocalScratchPath(entry),
+      ),
+      ignoredPaths: parseNulPathList(ignored.stdout)
+        .map((entry) => entry.replace(/\/+$/, ""))
+        .filter(Boolean)
+        .filter((entry) => !isSshSeedAgentLocalScratchPath(entry)),
     };
   } catch {
     return null;
@@ -2076,7 +2152,9 @@ async function stageSshOverlayPaths(
  * Seed a git workspace through the shared mirror. History arrives via a remote
  * `git clone --shared` of the mirror (same filesystem, verified by the
  * caller), so no history bytes cross the wire; the working tree is the HEAD
- * checkout plus an overlay tar of exactly the snapshot's overlay paths.
+ * checkout plus an overlay tar of exactly the snapshot's overlay paths. The
+ * clone is dissociated before return, so the mirror stays safe to delete at
+ * any time without breaking the seeded run.
  * Returns the git-ignored paths so the caller can keep the restore baseline
  * blind to the files this seed deliberately omits.
  */
@@ -2111,6 +2189,12 @@ async function seedGitWorkspaceToSshViaMirror(input: {
       : `git -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
     `git -C ${shellQuote(input.remoteDir)} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
     `git -C ${shellQuote(input.remoteDir)} clean -fdx -e .paperclip-runtime >/dev/null`,
+    // Dissociate from the mirror: the mirror is a deletable object cache, so
+    // the seeded repo must not borrow from it past this script. `repack -a`
+    // copies every reachable object (including alternates') into a local pack
+    // before the alternates file is dropped.
+    `git -C ${shellQuote(input.remoteDir)} repack -a -d >/dev/null`,
+    `rm -f ${shellQuote(path.posix.join(input.remoteDir, ".git", "objects", "info", "alternates"))}`,
   ].join("\n");
 
   // No history bytes cross the wire, but keep the phase's completion line so
@@ -2297,12 +2381,24 @@ export async function restoreWorkspaceFromSshExecution(input: {
    * inner transfer prune them with root-anchored, glob-escaped patterns
    * instead of the unanchored passthrough `toSshTarExcludes` gives
    * non-scratch entries (an unanchored `nested` would also prune a tracked
-   * `src/nested/` from the sync-back).
+   * `src/nested/` from the sync-back). The plain (no-baseline) paths honor
+   * the same entries as download excludes plus preserved local entries, so
+   * a mirror seed followed by a plain restore keeps local-only ignored
+   * files instead of deleting them.
    */
   ignoredPaths?: string[];
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
+  // Seed-omitted ignored paths, for the plain restores below: their remote
+  // copies (if any) must not download over the local ones, and the local
+  // ones must survive the clear that precedes the copy-back.
+  const ignoredRestorePaths = (input.ignoredPaths ?? [])
+    .map((entry) => entry.replace(/\/+$/, ""))
+    .filter(Boolean);
+  const ignoredRestoreTarExcludes = ignoredRestorePaths.map(
+    (entry) => `./${escapeTarExcludeLiteral(entry)}`,
+  );
   if (input.baselineSnapshot) {
     // The sync-back never carries the agent-local scratch, so the merge must
     // not read its absence as a remote deletion of the local copies.
@@ -2381,9 +2477,9 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
       // Excluded from the download, so nothing replaces them: keep the local copies.
-      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -2394,8 +2490,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
-    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
+    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
