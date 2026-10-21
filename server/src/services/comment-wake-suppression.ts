@@ -31,7 +31,8 @@
  * - Human-authored comments always wake. Owner/CEO board comments arrive as
  *   `user` actors, so "no lost human or owner wakes" holds by construction.
  * - Reopened issues, explicit resumes, review-path recovery, interrupted-run
- *   recovery, force-fresh sessions, and interaction-mutation wakes bypass.
+ *   recovery, force-fresh sessions, liveness continuations, child stop-relay
+ *   notifications, and interaction-mutation wakes bypass.
  * - A missing or deleted triggering comment fails open (wake).
  * - A last run that did not succeed fails open (its follow-up is recovery).
  *
@@ -62,6 +63,18 @@ export const COMMENT_WAKE_SUPPRESSION_REASONS: ReadonlyArray<string> = [
 export const COMMENT_WAKE_SUPPRESSION_ENABLED_DEFAULT = true;
 export const COMMENT_WAKE_DEBOUNCE_MINUTES_DEFAULT = 5;
 export const WAKE_RECENT_RUN_GUARD_MINUTES_DEFAULT = 10;
+
+/**
+ * First-party provenance of the child stop-relay wake: when a child issue
+ * transitions to `blocked`/`cancelled`, the parent assignee is woken with
+ * this `requestedByActorId` and `contextSnapshot.source` (shared with the
+ * wake site in `routes/issues.ts`). The relay comment body matches no
+ * actionable marker, so the gate keys the bypass on this identity instead
+ * of the body. Integration tests use the raw literals so a value change
+ * breaks the suite rather than silently desyncing route and gate.
+ */
+export const CHILD_STOP_RELAY_ACTOR_ID = "issue_stop_relay";
+export const CHILD_STOP_RELAY_WAKE_SOURCE = "issue.stop_relay";
 const SUPPRESSION_WINDOW_MINUTES_MIN = 1;
 const SUPPRESSION_WINDOW_MINUTES_MAX = 1440;
 
@@ -170,13 +183,18 @@ export interface CommentWakeSuppressionCandidateInput {
   hasReviewPathLost: boolean;
   hasReopenedFrom: boolean;
   hasInterruptedRunId: boolean;
+  /** Liveness continuation (e.g. a quarantined low-trust handoff): deliberate. */
+  hasLivenessContinuation: boolean;
+  /** Child stop-relay notification to the parent assignee: first-party. */
+  hasStopRelay: boolean;
 }
 
 /**
  * Whether a wake is even eligible for comment-wake suppression. Deliberate
  * and recovery-shaped wakes always pass: reopens (a different reason),
  * resumes, review-path recovery, interrupted-run recovery, fresh sessions,
- * interaction continuations, and causally-isolated wakes.
+ * liveness continuations, child stop-relay notifications, interaction
+ * continuations, and causally-isolated wakes.
  */
 export function isCommentWakeSuppressionCandidate(
   input: CommentWakeSuppressionCandidateInput,
@@ -190,6 +208,7 @@ export function isCommentWakeSuppressionCandidate(
   if (input.forceFreshSession) return false;
   if (input.hasResumeIntent || input.hasExplicitResume) return false;
   if (input.hasReviewPathLost || input.hasReopenedFrom || input.hasInterruptedRunId) return false;
+  if (input.hasLivenessContinuation || input.hasStopRelay) return false;
   return true;
 }
 

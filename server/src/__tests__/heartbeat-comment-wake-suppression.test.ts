@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { findActionableCommentMarkers } from "../services/comment-wake-suppression.ts";
 import { replayWakeSuppression } from "../services/wake-suppression-replay.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses } from "../adapters/index.ts";
@@ -192,9 +193,12 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
     issueId: string;
     commentId: string;
     requestedByActorType: "user" | "agent" | "system";
+    requestedByActorId?: string;
     reason?: string;
     mutation?: string;
+    allowRunCoalescing?: boolean;
     extraPayload?: Record<string, unknown>;
+    extraContextSnapshot?: Record<string, unknown>;
   }) {
     return heartbeat.wakeup(input.agentId, {
       source: "automation",
@@ -210,10 +214,15 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
         issueId: input.issueId,
         wakeReason: input.reason ?? "issue_commented",
         wakeCommentId: input.commentId,
+        ...(input.extraContextSnapshot ?? {}),
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId:
-        input.requestedByActorType === "user" ? "board-user" : "test-automation",
+        input.requestedByActorId ??
+        (input.requestedByActorType === "user" ? "board-user" : "test-automation"),
+      ...(input.allowRunCoalescing === undefined
+        ? {}
+        : { allowRunCoalescing: input.allowRunCoalescing }),
     });
   }
 
@@ -525,6 +534,153 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
     expect(interaction).not.toBeNull();
   });
 
+  it("never suppresses child stop-relay notifications to the parent assignee", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    // Exact production relay body (services/issues.ts addStopRelayCommentIfNeeded).
+    const body = "System relay: [TOG-1](/TOG/issues/TOG-1) transitioned to `blocked`.";
+    // Prove the test is meaningful: the body matches no actionable marker, so
+    // without the provenance bypass the gate would suppress this wake.
+    expect(findActionableCommentMarkers(body)).toEqual([]);
+    const commentId = await seedComment({ companyId, issueId, authorType: "system", body });
+
+    // Raw literals, not the shared constants: these must match the values the
+    // real wake site in routes/issues.ts sends, so a desync breaks this test.
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "system",
+      requestedByActorId: "issue_stop_relay",
+      extraContextSnapshot: { source: "issue.stop_relay" },
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("never suppresses liveness-continuation wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    // Quarantined low-trust handoff shape: a markerless agent comment that must
+    // still wake because the continuation is deliberate recovery, not chatter.
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "system",
+      extraContextSnapshot: {
+        livenessContinuationState: "quarantined_low_trust_handoff",
+        livenessContinuationAttempt: 1,
+        livenessContinuationMaxAttempts: 2,
+        livenessContinuationReason: "Low-trust review output requires sanitized follow-up.",
+      },
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("never suppresses review-path recovery wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "agent",
+      extraPayload: { reviewPathLost: true },
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("never suppresses interrupted-run recovery wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "agent",
+      extraPayload: { interruptedRunId: randomUUID() },
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("never suppresses force-fresh-session wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "agent",
+      extraContextSnapshot: { forceFreshSession: true },
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("never suppresses causally-isolated wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId,
+      requestedByActorType: "agent",
+      allowRunCoalescing: false,
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("fails open when the triggering comment is deleted", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+    await db
+      .update(issueComments)
+      .set({ deletedAt: new Date() })
+      .where(eq(issueComments.id, commentId));
+
+    const wake = await commentWake({ agentId, issueId, commentId, requestedByActorType: "agent" });
+    expect(wake).not.toBeNull();
+  });
+
   it("stays disabled with COMMENT_WAKE_SUPPRESSION_ENABLED=false", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const commentId = await seedComment({
@@ -565,10 +721,17 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
       authorType: "user",
       body: "Please confirm the launch plan.",
     });
+    const relayCommentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "system",
+      body: "System relay: [TOG-1](/TOG/issues/TOG-1) transitioned to `blocked`.",
+    });
 
     async function seedWake(input: {
       commentId: string;
-      requestedByActorType: "user" | "agent";
+      requestedByActorType: "user" | "agent" | "system";
+      requestedByActorId?: string;
       status?: string;
     }) {
       await db.insert(agentWakeupRequests).values({
@@ -580,12 +743,23 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
         payload: { issueId, commentId: input.commentId, mutation: "comment" },
         status: input.status ?? "queued",
         requestedByActorType: input.requestedByActorType,
-        requestedByActorId: "replay-fixture",
+        requestedByActorId: input.requestedByActorId ?? "replay-fixture",
       });
     }
     await seedWake({ commentId: botCommentId, requestedByActorType: "agent" });
     await seedWake({ commentId: humanCommentId, requestedByActorType: "user" });
     await seedWake({ commentId: botCommentId, requestedByActorType: "agent", status: "skipped" });
+    await seedWake({ commentId: botCommentId, requestedByActorType: "agent", status: "coalesced" });
+    await seedWake({
+      commentId: botCommentId,
+      requestedByActorType: "agent",
+      status: "deferred_issue_execution",
+    });
+    await seedWake({
+      commentId: relayCommentId,
+      requestedByActorType: "system",
+      requestedByActorId: "issue_stop_relay",
+    });
 
     const report = await replayWakeSuppression(db, {
       windowStart: new Date(Date.now() - 3_600_000),
@@ -595,14 +769,28 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
       companyIds: [companyId],
     });
 
-    expect(report.wakesScanned).toBe(3);
+    expect(report.wakesScanned).toBe(6);
     expect(report.alreadySkipped).toBe(1);
-    expect(report.classified).toBe(2);
+    // Coalesced/deferred rows never started a run: outside the denominator.
+    expect(report.notRunStarting).toBe(2);
+    expect(report.notRunStartingByStatus).toEqual({
+      coalesced: 1,
+      deferred_issue_execution: 1,
+    });
+    expect(report.classified).toBe(3);
     expect(report.suppressedTotal).toBe(1);
     expect(report.suppressedByReason.automation_comment_no_marker).toBe(1);
-    expect(report.admitted).toBe(1);
-    expect(report.projectedRunReduction).toBe(0.5);
+    // Human wake + stop-relay wake admitted.
+    expect(report.admitted).toBe(2);
+    expect(report.projectedRunReduction).toBeCloseTo(1 / 3, 4);
     expect(report.humanWakesSeen).toBe(1);
     expect(report.humanWakesSuppressed).toBe(0);
+    // Receipt parity: ids and reason only, never comment bodies.
+    expect(report.suppressedWakeSample).toHaveLength(1);
+    expect(report.suppressedWakeSample[0]).not.toHaveProperty("bodyPrefix");
+    expect(report.suppressedWakeSample[0]).toMatchObject({
+      reason: "automation_comment_no_marker",
+      commentId: botCommentId,
+    });
   });
 });

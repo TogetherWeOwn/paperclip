@@ -21,6 +21,7 @@ import {
   issueComments,
 } from "@paperclipai/db";
 import {
+  CHILD_STOP_RELAY_ACTOR_ID,
   NON_COMMENT_NEW_INPUT_ACTIVITY_ACTIONS,
   SUPPRESSION_REASON_AUTOMATION_NO_MARKER,
   SUPPRESSION_REASON_DEBOUNCED,
@@ -33,6 +34,21 @@ import {
   isCommentWakeSuppressionCandidate,
 } from "./comment-wake-suppression.js";
 
+/**
+ * Wake-row statuses that never started a run: absorbed by a live run
+ * (`coalesced`), still pending (`deferred_issue_execution`), or terminal
+ * without execution (`failed`, `cancelled`, `expired`). These are excluded
+ * from the `classified` denominator so the projected run reduction reads as
+ * "runs prevented / runs that ran", and reported separately for audit.
+ */
+export const NON_RUN_STARTING_WAKE_STATUSES: ReadonlySet<string> = new Set([
+  "coalesced",
+  "deferred_issue_execution",
+  "failed",
+  "cancelled",
+  "expired",
+]);
+
 export interface WakeSuppressionReplayOptions {
   windowStart: Date;
   limit: number;
@@ -44,6 +60,9 @@ export interface WakeSuppressionReplayOptions {
 export interface WakeSuppressionReplayReport {
   wakesScanned: number;
   alreadySkipped: number;
+  /** Rows that never started a run (coalesced/deferred/failed/…): outside the denominator. */
+  notRunStarting: number;
+  notRunStartingByStatus: Record<string, number>;
   classified: number;
   admitted: number;
   suppressedTotal: number;
@@ -52,11 +71,11 @@ export interface WakeSuppressionReplayReport {
   projectedRunReduction: number;
   humanWakesSeen: number;
   humanWakesSuppressed: number;
+  /** Wake/comment ids and reason only: never comment bodies (receipt parity). */
   suppressedWakeSample: Array<{
     wakeId: string;
     reason: string;
     commentId: string;
-    bodyPrefix: string;
   }>;
 }
 
@@ -67,6 +86,7 @@ export async function replayWakeSuppression(
   const tallies = {
     wakesScanned: 0,
     alreadySkipped: 0,
+    notRunStartingByStatus: {} as Record<string, number>,
     admitted: 0,
     suppressedByReason: {
       [SUPPRESSION_REASON_AUTOMATION_NO_MARKER]: 0,
@@ -87,6 +107,7 @@ export async function replayWakeSuppression(
       status: agentWakeupRequests.status,
       payload: agentWakeupRequests.payload,
       requestedByActorType: agentWakeupRequests.requestedByActorType,
+      requestedByActorId: agentWakeupRequests.requestedByActorId,
       requestedAt: agentWakeupRequests.requestedAt,
     })
     .from(agentWakeupRequests)
@@ -108,6 +129,11 @@ export async function replayWakeSuppression(
       tallies.alreadySkipped += 1;
       continue;
     }
+    if (NON_RUN_STARTING_WAKE_STATUSES.has(wake.status)) {
+      tallies.notRunStartingByStatus[wake.status] =
+        (tallies.notRunStartingByStatus[wake.status] ?? 0) + 1;
+      continue;
+    }
     const payload = (wake.payload ?? {}) as Record<string, unknown>;
     const commentId = typeof payload.commentId === "string" ? payload.commentId : null;
     const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
@@ -115,10 +141,13 @@ export async function replayWakeSuppression(
       tallies.admitted += 1;
       continue;
     }
-    // allowRunCoalescing is not persisted on the wake row; the replay cannot
-    // observe causally-isolated wakes, so it treats every row as coalescible.
-    // That can only over-count suppression for those rare rows, never hide a
-    // human wake (human content bypasses every rule below).
+    // allowRunCoalescing, forceFreshSession, explicit resumes, and liveness
+    // continuations are not persisted on the wake row (they ride the live wake
+    // options/context snapshot); the replay cannot observe them, so it treats
+    // every row as coalescible, non-fresh, non-resume, non-liveness. That can
+    // only over-count suppression for those rare rows, never hide a human
+    // wake (human content bypasses every rule below). The stop-relay bypass
+    // IS observable via the persisted requestedByActorId, so it is honored.
     const candidate = isCommentWakeSuppressionCandidate({
       reason: wake.reason,
       mutation: payload.mutation,
@@ -131,6 +160,8 @@ export async function replayWakeSuppression(
       hasReopenedFrom: payload.reopenedFrom !== undefined && payload.reopenedFrom !== null,
       hasInterruptedRunId:
         payload.interruptedRunId !== undefined && payload.interruptedRunId !== null,
+      hasLivenessContinuation: false,
+      hasStopRelay: wake.requestedByActorId === CHILD_STOP_RELAY_ACTOR_ID,
     });
     if (!candidate) {
       tallies.admitted += 1;
@@ -272,7 +303,6 @@ export async function replayWakeSuppression(
           wakeId: wake.id,
           reason: decision.reason,
           commentId,
-          bodyPrefix: comment.body.slice(0, 120),
         });
       }
     } else {
@@ -280,7 +310,11 @@ export async function replayWakeSuppression(
     }
   }
 
-  const classified = tallies.wakesScanned - tallies.alreadySkipped;
+  const notRunStarting = Object.values(tallies.notRunStartingByStatus).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
+  const classified = tallies.wakesScanned - tallies.alreadySkipped - notRunStarting;
   const suppressedTotal =
     tallies.suppressedByReason[SUPPRESSION_REASON_AUTOMATION_NO_MARKER] +
     tallies.suppressedByReason[SUPPRESSION_REASON_DEBOUNCED] +
@@ -289,6 +323,8 @@ export async function replayWakeSuppression(
   return {
     wakesScanned: tallies.wakesScanned,
     alreadySkipped: tallies.alreadySkipped,
+    notRunStarting,
+    notRunStartingByStatus: tallies.notRunStartingByStatus,
     classified,
     admitted: tallies.admitted,
     suppressedTotal,

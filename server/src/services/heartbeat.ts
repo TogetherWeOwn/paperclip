@@ -390,6 +390,8 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import {
+  CHILD_STOP_RELAY_ACTOR_ID,
+  CHILD_STOP_RELAY_WAKE_SOURCE,
   COMMENT_WAKE_SUPPRESSED_WAKE_REASON,
   NON_COMMENT_NEW_INPUT_ACTIVITY_ACTIONS,
   evaluateAutomationCommentSkip,
@@ -29484,7 +29486,8 @@ export function heartbeatService(
           // bursts (PR-controller notes, age alerts, receipts) are the top
           // no-op wake source; skip them before the event-free throttle
           // below. Human comments, reopens, resumes, review-path recovery,
-          // and interaction continuations always pass through.
+          // liveness continuations, child stop-relay notifications, and
+          // interaction continuations always pass through.
           const suppressionConfig = readCommentWakeSuppressionConfig(runtimeEnv);
           const suppressionPayload = (payload ?? {}) as Record<string, unknown>;
           if (
@@ -29506,6 +29509,17 @@ export function heartbeatService(
               hasInterruptedRunId:
                 suppressionPayload.interruptedRunId !== undefined &&
                 suppressionPayload.interruptedRunId !== null,
+              // A liveness continuation is deliberate recovery (e.g. the
+              // quarantined low-trust handoff), never chatter.
+              hasLivenessContinuation:
+                (typeof enrichedContextSnapshot.livenessContinuationState === "string" &&
+                  enrichedContextSnapshot.livenessContinuationState.length > 0) ||
+                typeof enrichedContextSnapshot.livenessContinuationAttempt === "number",
+              // The child stop-relay comment matches no actionable marker;
+              // key the bypass on its first-party provenance instead.
+              hasStopRelay:
+                opts.requestedByActorId === CHILD_STOP_RELAY_ACTOR_ID ||
+                enrichedContextSnapshot.source === CHILD_STOP_RELAY_WAKE_SOURCE,
             }) &&
             wakeCommentId
           ) {

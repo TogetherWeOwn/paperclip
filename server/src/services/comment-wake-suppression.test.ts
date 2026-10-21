@@ -113,6 +113,8 @@ describe("isCommentWakeSuppressionCandidate", () => {
     hasReviewPathLost: false,
     hasReopenedFrom: false,
     hasInterruptedRunId: false,
+    hasLivenessContinuation: false,
+    hasStopRelay: false,
   };
 
   it("admits plain comment wakes with a triggering comment", () => {
@@ -142,6 +144,13 @@ describe("isCommentWakeSuppressionCandidate", () => {
     expect(isCommentWakeSuppressionCandidate({ ...base, hasReviewPathLost: true })).toBe(false);
     expect(isCommentWakeSuppressionCandidate({ ...base, hasReopenedFrom: true })).toBe(false);
     expect(isCommentWakeSuppressionCandidate({ ...base, hasInterruptedRunId: true })).toBe(false);
+  });
+
+  it("rejects liveness continuations and child stop-relay notifications", () => {
+    expect(isCommentWakeSuppressionCandidate({ ...base, hasLivenessContinuation: true })).toBe(
+      false,
+    );
+    expect(isCommentWakeSuppressionCandidate({ ...base, hasStopRelay: true })).toBe(false);
   });
 });
 

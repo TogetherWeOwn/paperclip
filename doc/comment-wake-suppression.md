@@ -35,8 +35,12 @@ Safety properties (pinned by unit + embedded-Postgres integration tests):
 - Human-authored comments always wake. Owner/CEO board comments arrive as
   `user` actors, so no human or owner wake is ever suppressed.
 - Reopens, explicit resumes, review-path recovery, interrupted-run recovery,
-  force-fresh sessions, interaction continuations, and `allowRunCoalescing:
-  false` wakes bypass.
+  force-fresh sessions, liveness continuations (e.g. quarantined low-trust
+  handoffs), child stop-relay notifications (keyed on first-party
+  provenance, `requestedByActorId: issue_stop_relay` /
+  `contextSnapshot.source: issue.stop_relay`, since the relay body matches
+  no marker), interaction continuations, and `allowRunCoalescing: false`
+  wakes bypass.
 - A missing/deleted triggering comment fails open (wake).
 - A last run that did not succeed fails open (its follow-up is recovery).
 
@@ -90,3 +94,14 @@ It reports the projected run reduction (acceptance target: >= 30% fewer
 runs on 24h of real wakes) and exits 1 if any human/owner wake would have
 been suppressed. See `--help`-style flags in the script header (`--limit`,
 `--debounce-minutes`, `--guard-minutes`, `--json`, repeatable `--company`).
+
+Accounting notes: the `classified` denominator counts only wakes that
+started (or will start) a run — already-`skipped` rows and non-run-starting
+rows (`coalesced`, `deferred_issue_execution`, `failed`, `cancelled`,
+`expired`) are excluded and reported separately, so the figure reads as
+"runs prevented / runs that ran". The suppressed-wake sample carries ids
+and reason only, never comment bodies. `allowRunCoalescing`,
+`forceFreshSession`, explicit resumes, and liveness continuations ride the
+live wake options/snapshot rather than the persisted row, so the replay
+treats every row as coalescible/non-fresh/non-resume/non-liveness; that can
+only over-count suppression for those rare rows, never hide a human wake.

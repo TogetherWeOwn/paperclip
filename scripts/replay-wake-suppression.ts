@@ -76,51 +76,61 @@ async function main() {
   const asJson = process.argv.includes("--json");
 
   const db = createDb(dbUrl);
-  const report = await replayWakeSuppression(db, {
-    windowStart: new Date(Date.now() - hours * 3_600_000),
-    limit,
-    debounceMs: debounceMinutes * 60_000,
-    guardMs: guardMinutes * 60_000,
-    companyIds,
-  });
+  try {
+    const report = await replayWakeSuppression(db, {
+      windowStart: new Date(Date.now() - hours * 3_600_000),
+      limit,
+      debounceMs: debounceMinutes * 60_000,
+      guardMs: guardMinutes * 60_000,
+      companyIds,
+    });
 
-  if (asJson) {
-    console.log(
-      JSON.stringify(
-        { windowHours: hours, debounceMinutes, guardMinutes, ...report },
-        null,
-        2,
-      ),
-    );
-  } else {
-    console.log(`Wake-suppression replay (last ${hours}h, limit ${limit})`);
-    console.log(`- wakes scanned:            ${report.wakesScanned}`);
-    console.log(`- already skipped (old):    ${report.alreadySkipped}`);
-    console.log(`- classified:               ${report.classified}`);
-    console.log(`- admitted:                 ${report.admitted}`);
-    console.log(`- would suppress:           ${report.suppressedTotal}`);
-    for (const [reason, count] of Object.entries(report.suppressedByReason)) {
-      console.log(`    - ${reason}: ${count}`);
-    }
-    console.log(
-      `- projected run reduction:  ${(report.projectedRunReduction * 100).toFixed(1)}% (target >= 30%)`,
-    );
-    console.log(
-      `- human/owner wakes:        ${report.humanWakesSeen} seen, ${report.humanWakesSuppressed} suppressed (required 0)`,
-    );
-    if (report.suppressedWakeSample.length > 0) {
-      console.log("- sample suppressed wakes:");
-      for (const sample of report.suppressedWakeSample) {
-        console.log(`    - ${sample.wakeId} [${sample.reason}] ${JSON.stringify(sample.bodyPrefix)}`);
+    if (asJson) {
+      console.log(
+        JSON.stringify(
+          { windowHours: hours, debounceMinutes, guardMinutes, ...report },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(`Wake-suppression replay (last ${hours}h, limit ${limit})`);
+      console.log(`- wakes scanned:            ${report.wakesScanned}`);
+      console.log(`- already skipped (old):    ${report.alreadySkipped}`);
+      console.log(`- not run-starting:         ${report.notRunStarting}`);
+      for (const [status, count] of Object.entries(report.notRunStartingByStatus)) {
+        console.log(`    - ${status}: ${count}`);
+      }
+      console.log(`- classified:               ${report.classified}`);
+      console.log(`- admitted:                 ${report.admitted}`);
+      console.log(`- would suppress:           ${report.suppressedTotal}`);
+      for (const [reason, count] of Object.entries(report.suppressedByReason)) {
+        console.log(`    - ${reason}: ${count}`);
+      }
+      console.log(
+        `- projected run reduction:  ${(report.projectedRunReduction * 100).toFixed(1)}% (target >= 30%)`,
+      );
+      console.log(
+        `- human/owner wakes:        ${report.humanWakesSeen} seen, ${report.humanWakesSuppressed} suppressed (required 0)`,
+      );
+      if (report.suppressedWakeSample.length > 0) {
+        console.log("- sample suppressed wakes (ids only, no bodies):");
+        for (const sample of report.suppressedWakeSample) {
+          console.log(`    - ${sample.wakeId} [${sample.reason}] comment ${sample.commentId}`);
+        }
       }
     }
-  }
 
-  if (report.humanWakesSuppressed > 0) {
-    console.error(
-      `FAIL: ${report.humanWakesSuppressed} human/owner wake(s) would be suppressed. Refusing.`,
-    );
-    process.exitCode = 1;
+    if (report.humanWakesSuppressed > 0) {
+      console.error(
+        `FAIL: ${report.humanWakesSuppressed} human/owner wake(s) would be suppressed. Refusing.`,
+      );
+      process.exitCode = 1;
+    }
+  } finally {
+    // Gate-shaped CLI: close the pool so the process exits promptly with its
+    // verdict instead of lingering on idle sockets.
+    await db.$client.end().catch(() => {});
   }
 }
 

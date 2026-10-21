@@ -1,3 +1,7 @@
+import {
+  CHILD_STOP_RELAY_ACTOR_ID,
+  CHILD_STOP_RELAY_WAKE_SOURCE,
+} from "../services/comment-wake-suppression.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -14882,7 +14886,7 @@ export function issueRoutes(
           await logActivity(db, {
             companyId: issue.companyId,
             actorType: "system",
-            actorId: "issue_stop_relay",
+            actorId: CHILD_STOP_RELAY_ACTOR_ID,
             agentId: null,
             runId: actor.runId,
             agentApiKeyId: actor.agentApiKeyId,
@@ -14911,13 +14915,13 @@ export function issueRoutes(
                 mutation: "comment",
               },
               requestedByActorType: "system",
-              requestedByActorId: "issue_stop_relay",
+              requestedByActorId: CHILD_STOP_RELAY_ACTOR_ID,
               contextSnapshot: {
                 issueId: stopRelay.parent.id,
                 taskId: stopRelay.parent.id,
                 commentId: stopRelay.comment.id,
                 wakeCommentId: stopRelay.comment.id,
-                source: "issue.stop_relay",
+                source: CHILD_STOP_RELAY_WAKE_SOURCE,
                 wakeReason: "issue_commented",
                 childIssueId: issue.id,
                 childStatus: issue.status,
