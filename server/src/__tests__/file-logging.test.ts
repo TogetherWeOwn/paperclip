@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveDefaultLogsDir } from "../home-paths.js";
 import {
   __resetFileLoggingForTests,
@@ -27,8 +27,29 @@ function tempDir(): string {
   return dir;
 }
 
+function writeConfig(dir: string, logDir: string): string {
+  const configPath = path.join(dir, "config.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      $meta: {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        source: "onboard",
+      },
+      database: {},
+      logging: { mode: "file", logDir },
+      server: {},
+      telemetry: {},
+    }),
+  );
+  return configPath;
+}
+
 describe("parseFileLoggingConfig", () => {
   it("defaults to enabled with the instance logs dir and 10MB x 5 caps", () => {
+    // Hermetic: an ambient instance config must not redirect the default dir.
+    vi.stubEnv("PAPERCLIP_CONFIG", path.join(tempDir(), "no-config.json"));
     const config = parseFileLoggingConfig({});
     expect(config.enabled).toBe(true);
     expect(config.dir).toBe(resolveDefaultLogsDir());
@@ -57,6 +78,57 @@ describe("parseFileLoggingConfig", () => {
     expect(config.serverMaxBytes).toBe(10 * 1024 * 1024);
     expect(config.serverMaxFiles).toBe(5);
     expect(config.accessMaxBytes).toBe(10 * 1024 * 1024);
+  });
+
+  it("rejects suffixed, scientific, and below-floor sizes (no partial parse)", () => {
+    // parseInt would read 10 from "10MB" and 1 from "1e9": a byte-sized
+    // rotation cap would then rotate on every line.
+    const suffixed = parseFileLoggingConfig({
+      PAPERCLIP_SERVER_LOG_MAX_BYTES: "10MB",
+      PAPERCLIP_ACCESS_LOG_MAX_BYTES: "1e9",
+      PAPERCLIP_SERVER_LOG_MAX_FILES: "5x",
+    });
+    expect(suffixed.serverMaxBytes).toBe(10 * 1024 * 1024);
+    expect(suffixed.accessMaxBytes).toBe(10 * 1024 * 1024);
+    expect(suffixed.serverMaxFiles).toBe(5);
+    const tiny = parseFileLoggingConfig({
+      PAPERCLIP_SERVER_LOG_MAX_BYTES: "100",
+      PAPERCLIP_ACCESS_LOG_MAX_BYTES: "65535",
+    });
+    expect(tiny.serverMaxBytes).toBe(10 * 1024 * 1024);
+    expect(tiny.accessMaxBytes).toBe(10 * 1024 * 1024);
+    const floor = parseFileLoggingConfig({
+      PAPERCLIP_SERVER_LOG_MAX_BYTES: String(64 * 1024),
+      PAPERCLIP_SERVER_LOG_MAX_FILES: "2",
+    });
+    expect(floor.serverMaxBytes).toBe(64 * 1024);
+    expect(floor.serverMaxFiles).toBe(2);
+  });
+
+  it("honours the configured logging.logDir when no env dir is set", () => {
+    const dir = tempDir();
+    const logsDir = path.join(dir, "configured-logs");
+    vi.stubEnv("PAPERCLIP_CONFIG", writeConfig(dir, logsDir));
+    expect(parseFileLoggingConfig({}).dir).toBe(logsDir);
+  });
+
+  it("prefers explicit PAPERCLIP_LOG_DIR over the configured dir", () => {
+    const dir = tempDir();
+    vi.stubEnv(
+      "PAPERCLIP_CONFIG",
+      writeConfig(dir, path.join(dir, "configured-logs")),
+    );
+    expect(
+      parseFileLoggingConfig({ PAPERCLIP_LOG_DIR: "/tmp/explicit-logs" }).dir,
+    ).toBe("/tmp/explicit-logs");
+  });
+
+  it("ignores an unreadable config file instead of breaking logging setup", () => {
+    const dir = tempDir();
+    const badPath = path.join(dir, "config.json");
+    writeFileSync(badPath, "{not json");
+    vi.stubEnv("PAPERCLIP_CONFIG", badPath);
+    expect(parseFileLoggingConfig({}).dir).toBe(resolveDefaultLogsDir());
   });
 });
 

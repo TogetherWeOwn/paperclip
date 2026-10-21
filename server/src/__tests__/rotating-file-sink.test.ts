@@ -126,6 +126,40 @@ describe("RotatingFileSink", () => {
     expect(readFileSync(path.join(dir, "server.log"), "utf8")).toBe("kept\n");
   });
 
+  it("recovers on a later write after one transient rotation-reopen failure", () => {
+    const dir = tempDir();
+    const seen: Array<{ err: unknown; context: string }> = [];
+    const sink = new RotatingFileSink({
+      dir,
+      filename: "server.log",
+      maxBytes: 10,
+      maxFiles: 3,
+      onError: (err, context) => seen.push({ err, context }),
+    });
+    sinks.push(sink);
+    sink.write("aaaa\n"); // 5 bytes, live
+    sink.write("bbbb\n"); // 10 bytes total, still live
+    const failure = new Error("EMFILE: simulated transient reopen failure");
+    const spy = vi.spyOn(fs, "openSync").mockImplementationOnce(() => {
+      throw failure;
+    });
+    try {
+      // Triggers rotation; the reopen fails. The triggering line is lost.
+      sink.write("cccc\n");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(seen.some((entry) => entry.context.includes("reopen"))).toBe(true);
+    // Later writes reopen the live file and land instead of dropping forever.
+    sink.write("recovered\n");
+    expect(readFileSync(path.join(dir, "server.log"), "utf8")).toBe(
+      "recovered\n",
+    );
+    expect(readFileSync(path.join(dir, "server.log.1"), "utf8")).toBe(
+      "aaaa\nbbbb\n",
+    );
+  });
+
   it("throws when the directory cannot be created (owner falls back to stdout-only)", () => {
     const dir = tempDir();
     const blocker = path.join(dir, "blocker");

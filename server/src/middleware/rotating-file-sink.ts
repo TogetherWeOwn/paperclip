@@ -28,6 +28,10 @@ export interface RotatingFileSinkOptions {
 }
 
 const ERROR_REPORT_INTERVAL_MS = 60_000;
+// A transient reopen failure (EMFILE/ENOSPC/EACCES during rotation) must not
+// disable the sink for the rest of the process: later writes retry the open,
+// throttled so a persistently broken disk costs one syscall per interval.
+const REOPEN_RETRY_INTERVAL_MS = 5_000;
 
 export class RotatingFileSink {
   private readonly filePath: string;
@@ -39,6 +43,7 @@ export class RotatingFileSink {
   private closed = false;
   private failures = 0;
   private lastReportAt = 0;
+  private lastReopenAttemptAt = 0;
 
   constructor(opts: RotatingFileSinkOptions) {
     this.filePath = path.resolve(opts.dir, opts.filename);
@@ -63,7 +68,16 @@ export class RotatingFileSink {
 
   /** Append bytes. Never throws; failures are counted and reported. */
   write(chunk: string | Uint8Array): void {
-    if (this.closed || this.fd === null) return;
+    if (this.closed) return;
+    if (this.fd === null) {
+      this.maybeReopen();
+      if (this.fd === null) {
+        // Still down (throttled retry or persistent failure): count the loss
+        // with the same throttled diagnostic as every other sink failure.
+        this.report(new Error("live file unavailable"), "write dropped");
+        return;
+      }
+    }
     const buf =
       typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
     if (buf.length === 0) return;
@@ -123,12 +137,33 @@ export class RotatingFileSink {
       }
       this.size = 0;
     } finally {
+      // An unconditional attempt: rotations are rare by design, and a success
+      // here means the triggering write below still lands. A failure leaves
+      // fd null without touching the retry throttle, so the next write gets
+      // its own immediate attempt via maybeReopen.
+      this.openLiveFile("reopen");
+    }
+  }
+
+  /** Retry a failed open on a later write, at most once per interval. */
+  private maybeReopen(): void {
+    const now = Date.now();
+    if (now - this.lastReopenAttemptAt < REOPEN_RETRY_INTERVAL_MS) return;
+    this.lastReopenAttemptAt = now;
+    this.openLiveFile("reopen");
+  }
+
+  private openLiveFile(context: string): void {
+    try {
+      this.fd = fs.openSync(this.filePath, "a");
       try {
-        this.fd = fs.openSync(this.filePath, "a");
-      } catch (err) {
-        this.fd = null;
-        this.report(err, "reopen");
+        this.size = fs.statSync(this.filePath).size;
+      } catch {
+        this.size = 0;
       }
+    } catch (err) {
+      this.fd = null;
+      this.report(err, context);
     }
   }
 

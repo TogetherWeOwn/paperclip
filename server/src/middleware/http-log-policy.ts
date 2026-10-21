@@ -92,11 +92,26 @@ function privateWebhookLogUrl(url: unknown) {
 }
 
 /**
+ * Bearer tokens carried in path segments must never persist in logs: the raw
+ * invite / board-claim token is the credential itself (only its hash is
+ * stored, and the raw value is shown once at creation), so anyone able to
+ * read a retained log could otherwise replay an unexpired link. Collapse the
+ * token segment to `:token` and keep any sub-path (accept, logo, claim, …)
+ * for forensics. Other `:id`-style segments (company, token, session, key
+ * ids) are resource identifiers, not bearer secrets, and stay as-is.
+ */
+function collapseTokenInPath(url: string): string {
+  return url
+    .replace(/\/api\/invites\/[^/?#]+/i, "/api/invites/:token")
+    .replace(/\/api\/board-claim\/[^/?#]+/i, "/api/board-claim/:token");
+}
+
+/**
  * The single URL form every HTTP log line uses: provider webhooks collapse
- * to a content-free route template, everything else keeps its path with
- * secret-bearing parts (credentials, query) stripped. Shared by the
- * pino-http messages and the retained access log so both stay greppable
- * with the same patterns.
+ * to a content-free route template, bearer tokens in path segments collapse
+ * to `:token`, and everything else keeps its path with secret-bearing parts
+ * (credentials, query) stripped. Shared by the pino-http messages and the
+ * retained access log so both stay greppable with the same patterns.
  */
 export function requestLogUrl(req: {
   method?: string;
@@ -112,7 +127,9 @@ export function requestLogUrl(req: {
   if (isPrivateWebhookHttpRequest(req.method, url)) {
     return privateWebhookLogUrl(url);
   }
-  return stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
+  return collapseTokenInPath(
+    stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : ""),
+  );
 }
 
 export function shouldSilenceHttpSuccessLog(

@@ -114,6 +114,27 @@ describe("formatAccessLogLine", () => {
     );
     expect(webhook.p).toBe("/api/chat-webhooks/:publicId/:provider");
   });
+
+  it("never persists raw invite or board-claim bearer tokens", () => {
+    for (const originalUrl of [
+      "/api/invites/pcp_invite_SECRETTOKEN123",
+      "/api/invites/pcp_invite_SECRETTOKEN123/accept",
+      "/api/board-claim/rawtoken456/claim",
+    ]) {
+      const raw = formatAccessLogLine({
+        finishedAt: new Date("2026-10-20T01:56:00.000Z"),
+        method: "GET",
+        originalUrl,
+        url: originalUrl,
+        statusCode: 200,
+        durationMs: 1,
+        requestId: null,
+      });
+      expect(raw).not.toContain("SECRETTOKEN123");
+      expect(raw).not.toContain("rawtoken456");
+      expect(JSON.parse(raw).p).toContain(":token");
+    }
+  });
 });
 
 describe("createAccessLogger", () => {

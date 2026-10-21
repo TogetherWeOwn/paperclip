@@ -8,10 +8,7 @@ import {
   requestLogUrl,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
-import {
-  redactSensitive,
-  stripSecretBearingUrlParts,
-} from "./redact-sensitive.js";
+import { redactSensitive } from "./redact-sensitive.js";
 import { getFileLogging } from "./file-logging.js";
 
 const sharedOpts = {
@@ -38,7 +35,13 @@ function withFileCopy(stream: DestinationStream): DestinationStream {
   if (!fileLogStream) return stream;
   // Each leg gets the same serialized JSON chunk; the pretty transport
   // formats its copy for stdout while the file keeps greppable JSON.
-  return pino.multistream([{ stream }, { stream: fileLogStream }]);
+  // Both legs pin level trace: multistream defaults a leg without a level
+  // to info, which would silently drop debug/trace lines from stdout AND
+  // the file (dev defaults to debug). The logger level alone governs.
+  return pino.multistream([
+    { level: "trace", stream },
+    { level: "trace", stream: fileLogStream },
+  ]);
 }
 
 export const logger = isProduction
@@ -135,10 +138,14 @@ export function createHttpLogger(baseLogger: Logger) {
         }
         return {
           ...req,
-          url:
-            typeof req.url === "string"
-              ? stripSecretBearingUrlParts(req.url)
-              : req.url,
+          // Same shared policy as the log messages (query strip plus bearer
+          // token-in-path collapse), so serialized request URLs can never
+          // persist an invite/board-claim token the message redacted.
+          url: requestLogUrl({
+            method: typeof req.method === "string" ? req.method : undefined,
+            originalUrl: req.originalUrl,
+            url: req.url,
+          }),
           // The URL policy intentionally drops all query parameters. The default
           // serializer also exposes the parsed query separately, so omit that
           // duplicate path instead of letting credentials bypass the URL scrub.
@@ -182,7 +189,7 @@ export function createHttpLogger(baseLogger: Logger) {
         err?.message ||
         (res as any).err?.message ||
         "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`;
     },
     customErrorObject(req, _res, _err, value) {
       // pino-http serializes res.err independently of customProps/errorContext.

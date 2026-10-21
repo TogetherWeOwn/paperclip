@@ -561,6 +561,16 @@ export async function createApp(
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
 
+  // Request logging sits before the body parsers on purpose: a parser
+  // rejection (malformed JSON, oversized bodies) calls next(err),
+  // which skips all downstream non-error middleware, so anything mounted
+  // after the parsers never sees exactly the abusive traffic the access log
+  // exists to count. Both loggers only read the outcome at finish time, so
+  // running their entry step earlier changes nothing else.
+  app.use(httpLogger);
+  // Retained one-line-per-request log (access.log). Mounted right after
+  // httpLogger so the logged request id matches the pino-http lines.
+  app.use(accessLogger);
   app.use(
     COMPANY_IMPORT_API_PATH,
     express.json({
@@ -583,10 +593,6 @@ export async function createApp(
     }),
   );
   app.use("/api", apiCompression());
-  app.use(httpLogger);
-  // Retained one-line-per-request log (access.log). Mounted right after
-  // httpLogger so the logged request id matches the pino-http lines.
-  app.use(accessLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,

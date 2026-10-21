@@ -16,7 +16,8 @@
 // behavior the server relies on). Anything that fails during setup degrades
 // to stdout-only logging; logging must never break request serving.
 
-import { resolveDefaultLogsDir } from "../home-paths.js";
+import { readConfigFile } from "../config-file.js";
+import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { RotatingFileSink } from "./rotating-file-sink.js";
 
 export const SERVER_LOG_FILENAME = "server.log";
@@ -51,20 +52,49 @@ export interface FileLoggingState {
   accessSink: RotatingFileSink | null;
 }
 
+const MIN_LOG_BYTES = 64 * 1024;
+
 function parsePositiveInt(
   raw: string | undefined,
   fallback: number,
   label: string,
+  min = 1,
 ): number {
   if (raw === undefined || raw.trim() === "") return fallback;
-  const value = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(value) || value < 1) {
+  // Strict digits only: parseInt would silently turn "10MB" into 10 and
+  // "1e9" into 1, and a byte-sized rotation cap would then rotate on every
+  // line, churning the forensic history away.
+  const trimmed = raw.trim();
+  const value = /^\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : NaN;
+  if (!Number.isFinite(value) || value < min) {
     process.stderr.write(
       `[paperclip] ignoring invalid ${label}=${JSON.stringify(raw)} (using ${fallback})\n`,
     );
     return fallback;
   }
   return value;
+}
+
+/**
+ * The operator's configured log dir (onboarding "Log directory" prompt,
+ * stored as `logging.logDir`), or null when there is no config file, the
+ * file is unreadable, or no dir is configured. Never throws and never warns:
+ * the server's own config load stays authoritative for validity errors, and
+ * logging setup must never break serving.
+ */
+function configFileLogDir(): string | null {
+  let logDir: unknown;
+  try {
+    logDir = readConfigFile()?.logging.logDir;
+  } catch {
+    return null;
+  }
+  if (typeof logDir !== "string" || logDir.trim() === "") return null;
+  try {
+    return resolveHomeAwarePath(logDir.trim());
+  } catch {
+    return null;
+  }
 }
 
 export function parseFileLoggingConfig(
@@ -77,11 +107,17 @@ export function parseFileLoggingConfig(
       : !["0", "false", "no", "off"].includes(rawFlag);
   return {
     enabled,
-    dir: env.PAPERCLIP_LOG_DIR?.trim() || resolveDefaultLogsDir(),
+    // Explicit env wins, then the operator's configured dir, then the default
+    // instance logs dir (see doc/file-logging.md for the precedence).
+    dir:
+      env.PAPERCLIP_LOG_DIR?.trim() ||
+      configFileLogDir() ||
+      resolveDefaultLogsDir(),
     serverMaxBytes: parsePositiveInt(
       env.PAPERCLIP_SERVER_LOG_MAX_BYTES,
       DEFAULT_MAX_BYTES,
       "PAPERCLIP_SERVER_LOG_MAX_BYTES",
+      MIN_LOG_BYTES,
     ),
     serverMaxFiles: parsePositiveInt(
       env.PAPERCLIP_SERVER_LOG_MAX_FILES,
@@ -92,6 +128,7 @@ export function parseFileLoggingConfig(
       env.PAPERCLIP_ACCESS_LOG_MAX_BYTES,
       DEFAULT_MAX_BYTES,
       "PAPERCLIP_ACCESS_LOG_MAX_BYTES",
+      MIN_LOG_BYTES,
     ),
     accessMaxFiles: parsePositiveInt(
       env.PAPERCLIP_ACCESS_LOG_MAX_FILES,

@@ -4,18 +4,27 @@ The server keeps a retained copy of its logs on disk so crash forensics
 survive container recreates. Container-stdout logging (`docker logs`) is
 unchanged; the files are additive.
 
-This is separate from the three paths in `AGENTS.md` §7: it is not Telemetry
-(nothing leaves the host), not Observability (no OTLP endpoint involved),
-and not the run log (no database rows). No privacy review is needed for
-changes confined to these files: the data stays on the instance volume and
-every line passes through the existing HTTP log redaction policy.
+This is separate from the three paths in `AGENTS.md` §5 item 7: it is not
+Telemetry (nothing leaves the host), not Observability (no OTLP endpoint
+involved), and not the run log (no database rows).
+
+Privacy: the pino lines in `server.log` and every `access.log` line pass
+through the existing HTTP log redaction policy. The stdio-tee copies in
+`server.log` do NOT: they are raw process output with only ANSI codes
+stripped, so anything the process prints (subprocess stderr passthrough,
+fatal-error prints) persists verbatim on the instance volume, where it used
+to live only in ephemeral container stdout. Treat new stdio writers as
+unredacted retained data — they need a privacy review. Changes confined to
+rotation, file layout, or the already-redacted lines do not.
 
 ## Files
 
-Both live in the instance logs dir (`$PAPERCLIP_HOME/instances/<id>/logs`,
-overridable with `PAPERCLIP_LOG_DIR`). In container deployments that dir is
-on the retained `/paperclip` volume, so recreating the container does not
-delete them; the new process appends to the existing files.
+Both live in one directory, resolved in this order: `PAPERCLIP_LOG_DIR`
+when set, else the operator's configured `logging.logDir` from the instance
+config file (when the server runs under one), else the default instance logs
+dir (`$PAPERCLIP_HOME/instances/<id>/logs`). In container deployments that
+dir is on the retained `/paperclip` volume, so recreating the container does
+not delete them; the new process appends to the existing files.
 
 - `server.log`: every pino line (app logs plus the pino-http request lines)
   plus timestamped copies of direct stdout/stderr writes (`console.*`, Node
@@ -28,8 +37,10 @@ delete them; the new process appends to the existing files.
   `r` matched route pattern when the router matched one). `p` is the true
   request path, snapshotted before mounted routers strip `req.url`; `r` is
   the pattern inside the mounted router (often just `/`). Paths use the same
-  redaction policy as the pino-http lines: no query strings, no credentials,
-  webhook ids collapsed to route templates.
+  redaction policy as the pino-http lines: no query strings, no credentials
+  (invite and board-claim bearer tokens collapse to `:token`), webhook ids
+  collapsed to route templates. The loggers mount before the body parsers, so
+  parser rejects (malformed JSON, oversized bodies) are logged too.
 
 ## Rotation and crash-safety
 
@@ -44,21 +55,25 @@ delete them; the new process appends to the existing files.
   generation. A single oversized line lands oversized rather than spinning
   rotation.
 - Logging never breaks serving: an unwritable dir, disk-full, or rotation
-  error degrades to stdout-only with a throttled stderr diagnostic.
+  error degrades to stdout-only with a throttled stderr diagnostic. A
+  transient reopen failure does not disable the sink: later writes retry the
+  open (at most once per 5s) and logging resumes on its own.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PAPERCLIP_FILE_LOGGING` | `true` | `false`/`0`/`no`/`off` disables both files (stdout-only) |
-| `PAPERCLIP_LOG_DIR` | instance logs dir | Directory for both files |
+| `PAPERCLIP_LOG_DIR` | config `logging.logDir`, else instance logs dir | Directory for both files (explicit env wins) |
 | `PAPERCLIP_SERVER_LOG_MAX_BYTES` | `10485760` | Rotation size for `server.log` |
 | `PAPERCLIP_SERVER_LOG_MAX_FILES` | `5` | Generations kept for `server.log` |
 | `PAPERCLIP_ACCESS_LOG_MAX_BYTES` | `10485760` | Rotation size for `access.log` |
 | `PAPERCLIP_ACCESS_LOG_MAX_FILES` | `5` | Generations kept for `access.log` |
 
-Invalid sizes fall back to defaults with a stderr warning. Unit tests run
-stdout-only unless they opt in explicitly.
+Sizes accept plain bytes only (`10485760`, not `10MB` or `1e9`); invalid,
+suffixed, or below-floor values (minimum 64 KiB for byte caps) fall back to
+defaults with a stderr warning. Unit tests run stdout-only unless they opt
+in explicitly.
 
 ## Forensics recipes
 
