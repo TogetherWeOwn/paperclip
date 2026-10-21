@@ -27267,8 +27267,8 @@ export function heartbeatService(
         }
         if (
           runScratch &&
-          // runScratchTarget is set only for remote scratch (see the remote
-          // provision branch above): a non-null target means the local
+          // runScratchTarget is set only for remote scratch (see the unified
+          // provision block above): a non-null target means the local
           // fs-based cleanup must not touch this path.
           !runScratchTarget &&
           latestRun &&
