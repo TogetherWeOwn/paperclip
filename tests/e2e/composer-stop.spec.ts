@@ -275,12 +275,22 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         await request.get(`/api/issues/${parent.id}/comments`),
       );
       expect(JSON.stringify(comments)).toContain("Please check mobile too.");
-      const queue = await json(
-        await request.get(`/api/issues/${parent.id}/queued-comments`),
-      );
-      expect(JSON.stringify(queue.entries)).toContain(
-        "Please check mobile too.",
-      );
+      // The comment POST returns 201 before the detached agent wake lands,
+      // so the wake-derived queue snapshot can lag the Send by hundreds of
+      // ms under load. Poll: a wake that never arrives still fails here.
+      await expect
+        .poll(
+          async () =>
+            JSON.stringify(
+              (
+                await json(
+                  await request.get(`/api/issues/${parent.id}/queued-comments`),
+                )
+              ).entries,
+            ),
+          { timeout: 15_000 },
+        )
+        .toContain("Please check mobile too.");
 
       let dispatchedAt = 0;
       page.on("request", (req) => {

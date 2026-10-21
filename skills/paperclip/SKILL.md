@@ -544,6 +544,25 @@ curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 
 Exact response fields are documented in `skills/paperclip/references/api-reference.md`.
 
+## Temporary payload files
+
+`/tmp` on an execution host is shared across runs, agents, and days. A fixed payload filename (e.g. `/tmp/comment.json`) can silently resolve to another run's stale bytes.
+
+- Write API payload files under `$PAPERCLIP_RUN_SCRATCH_DIR` (run-owned; Paperclip removes it after the run). When the scratch vars are unset, `mktemp -d` first, or use unique `/tmp/$PAPERCLIP_RUN_ID-*` names. Never use a fixed `/tmp` filename.
+- Always POST the exact file just written. Never re-select with `[ -f default ] || fallback` — a stale default that exists wins over the intended fallback.
+- Verify the POST response echoes the intended bytes before claiming success.
+
+```bash
+scratch="${PAPERCLIP_RUN_SCRATCH_DIR:-$(mktemp -d)}"
+payload="$scratch/comment.json"
+jq -n --arg body "$comment" '{body: $body}' > "$payload"
+response=$(curl -sS -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H 'X-Paperclip-Run-Id: '"$PAPERCLIP_RUN_ID" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$payload" "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/comments")
+echo "$response" | jq -e --arg body "$comment" '.body == $body' > /dev/null
+```
+
 ## Critical Rules
 
 - **Never retry a 409.** The task belongs to someone else.
