@@ -656,14 +656,24 @@ describe("ssh env-lab fixture", () => {
     const spec = { ...config, remoteCwd: started.workspaceDir } as const;
 
     const lines: ParsedProgressLine[] = [];
-    await prepareWorkspaceForSshExecution({
-      spec,
-      localDir: localRepo,
-      remoteDir: started.workspaceDir,
-      onProgress: (line) => {
-        lines.push(parseProgressLine(line));
-      },
-    });
+    // This test pins the legacy bundle import's exact-percentage reporting.
+    // The lab fixture is same-host, so without the kill switch the seed takes
+    // the mirror path (zero history bytes, no bundle percentage to report).
+    const previousIncrementalSync = process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC;
+    process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC = "0";
+    try {
+      await prepareWorkspaceForSshExecution({
+        spec,
+        localDir: localRepo,
+        remoteDir: started.workspaceDir,
+        onProgress: (line) => {
+          lines.push(parseProgressLine(line));
+        },
+      });
+    } finally {
+      if (previousIncrementalSync === undefined) delete process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC;
+      else process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC = previousIncrementalSync;
+    }
 
     const importLines = lines.filter((line) => line.raw.includes("Importing git history to ssh"));
     expect(importLines.length).toBeGreaterThan(0);

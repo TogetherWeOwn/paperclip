@@ -1999,7 +1999,7 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
     const [headResult, branchResult, overlayDiff, untracked, deleted, ignored] = await Promise.all([
       runLocalGit(localDir, ["rev-parse", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
       runLocalGit(localDir, ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
-      runLocalGit(localDir, ["diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD", "--"], {
+      runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", "HEAD", "--"], {
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
@@ -2007,7 +2007,9 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
-      runLocalGit(localDir, ["diff", "--name-only", "-z", "--diff-filter=D", "HEAD", "--"], {
+      // --no-renames decomposes staged renames into delete+add so the remote
+      // drops the old name instead of keeping a stale HEAD checkout of it.
+      runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=D", "HEAD", "--"], {
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
@@ -2019,14 +2021,20 @@ async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnaps
     const headCommit = headResult.stdout.trim();
     if (!headCommit) return null;
     const branchName = branchResult.stdout.trim();
+    const overlayPaths = [
+      ...parseNulPathList(overlayDiff.stdout),
+      ...parseNulPathList(untracked.stdout),
+    ];
+    const overlaySet = new Set(overlayPaths);
     return {
       headCommit,
       branchName: branchName && branchName !== "HEAD" ? branchName : null,
-      overlayPaths: [
-        ...parseNulPathList(overlayDiff.stdout),
-        ...parseNulPathList(untracked.stdout),
-      ],
-      deletedPaths: parseNulPathList(deleted.stdout),
+      overlayPaths,
+      // A path present in the working tree (e.g. `git rm --cached`, which the
+      // D scan reports while the file is still on disk) must never be
+      // deleted remotely: the overlay carries it, and deleting it after the
+      // overlay would read back as a remote deletion of a local file.
+      deletedPaths: parseNulPathList(deleted.stdout).filter((entry) => !overlaySet.has(entry)),
       ignoredPaths: parseNulPathList(ignored.stdout).map((entry) => entry.replace(/\/+$/, "")).filter(Boolean),
     };
   } catch {
@@ -2153,12 +2161,40 @@ async function seedGitWorkspaceToSshViaMirror(input: {
 }
 
 /**
+ * Cap on the serialized restore-command bytes the seed's ignored-path
+ * excludes may add. Every ignored entry becomes a quoted `--exclude` pair in
+ * the sync-back tar script — twice over, since root-relative excludes ship
+ * both the GNU and bsdtar dialects — and the whole script travels as one
+ * `sh -c` argv entry with a 128 KiB per-string exec limit
+ * (see `SSH_REMOTE_ARG_MAX_BYTES`). Past this budget the mirror seed would
+ * succeed and then fail every restore with E2BIG, with no fallback at
+ * restore time, so the seed falls back to the legacy full copy instead
+ * (which transfers ignored files and needs no excludes).
+ */
+const SSH_SEED_MAX_IGNORED_EXCLUDE_BYTES = 32 * 1024;
+
+/**
+ * Estimate the final ssh-argument bytes the ignored excludes add to the
+ * restore command: both tar dialect branches plus shell quoting, the outer
+ * re-quote expansion, and entry separators. Conservative on purpose — an
+ * over-estimate only selects the safe legacy copy.
+ */
+function sshSeedIgnoredExcludeBytes(ignoredPaths: readonly string[]): number {
+  let total = 0;
+  for (const entry of ignoredPaths) {
+    total += 2 * Buffer.byteLength(`./${escapeTarExcludeLiteral(entry)}`, "utf8") + 64;
+  }
+  return total;
+}
+
+/**
  * Attempt the mirror seed. Returns the ignored paths on success, or null when
- * the fast path is unavailable (cross-host remote, non-toplevel workspace, or
- * an unreadable checkout) so the caller runs the legacy full copy instead. A
- * throw means the fast path started and failed partway — the caller still
- * falls back, since the legacy import heals any partial remote state
- * (init-if-missing, forced checkout, hard reset, clean).
+ * the fast path is unavailable (cross-host remote, non-toplevel workspace, an
+ * unreadable checkout, or an ignored list too large for the restore command)
+ * so the caller runs the legacy full copy instead. A throw means the fast
+ * path started and failed partway — the caller still falls back, since the
+ * legacy import heals any partial remote state (init-if-missing, forced
+ * checkout, hard reset, clean).
  */
 async function trySeedGitWorkspaceViaMirror(input: {
   spec: SshRemoteExecutionSpec;
@@ -2171,6 +2207,13 @@ async function trySeedGitWorkspaceViaMirror(input: {
   if (!mirror) return null;
   const snapshot = await readSshSeedGitSnapshot(input.localDir);
   if (!snapshot) return null;
+  if (sshSeedIgnoredExcludeBytes(snapshot.ignoredPaths) > SSH_SEED_MAX_IGNORED_EXCLUDE_BYTES) {
+    console.warn(
+      { ignoredEntries: snapshot.ignoredPaths.length },
+      "[paperclip] SSH mirror seed skipped: ignored-path excludes exceed the restore command budget; falling back to full copy",
+    );
+    return null;
+  }
   return await seedGitWorkspaceToSshViaMirror({ ...input, snapshot, mirror });
 }
 
