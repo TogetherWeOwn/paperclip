@@ -12,6 +12,7 @@ export type {
   AdapterExecutionContext,
   AdapterRuntimeToolAccess,
   AdapterRuntimeToolDelivery,
+  AdapterRuntimeToolName,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestStatus,
