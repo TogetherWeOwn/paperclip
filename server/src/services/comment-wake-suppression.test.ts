@@ -175,6 +175,8 @@ describe("evaluateAutomationCommentSkip", () => {
 describe("evaluateCommentWakeDebounce", () => {
   const base = {
     nowMs: NOW_MS,
+    isAutomationAuthor: true,
+    requestedByActorType: "agent" as string | null,
     lastRunFinishedAtMs: NOW_MS - 60_000,
     lastRunSucceeded: true,
     debounceMs: 5 * 60_000,
@@ -208,11 +210,22 @@ describe("evaluateCommentWakeDebounce", () => {
       suppress: false,
     });
   });
+
+  it("wakes human-authored and user-requested wakes even with markers", () => {
+    expect(evaluateCommentWakeDebounce({ ...base, isAutomationAuthor: false })).toEqual({
+      suppress: false,
+    });
+    expect(evaluateCommentWakeDebounce({ ...base, requestedByActorType: "user" })).toEqual({
+      suppress: false,
+    });
+  });
 });
 
 describe("evaluateRecentRunGuard", () => {
   const base = {
     nowMs: NOW_MS,
+    isAutomationAuthor: true,
+    requestedByActorType: "agent" as string | null,
     lastRunFinishedAtMs: NOW_MS - 3 * 60_000,
     lastRunSucceeded: true,
     guardMs: 10 * 60_000,
@@ -239,6 +252,15 @@ describe("evaluateRecentRunGuard", () => {
       suppress: false,
     });
     expect(evaluateRecentRunGuard({ ...base, lastRunSucceeded: false })).toEqual({
+      suppress: false,
+    });
+  });
+
+  it("wakes human-authored and user-requested wakes even with markers", () => {
+    expect(evaluateRecentRunGuard({ ...base, isAutomationAuthor: false })).toEqual({
+      suppress: false,
+    });
+    expect(evaluateRecentRunGuard({ ...base, requestedByActorType: "user" })).toEqual({
       suppress: false,
     });
   });

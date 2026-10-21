@@ -226,12 +226,20 @@ export function evaluateAutomationCommentSkip(input: {
 /** Rule 1: one wake per N minutes for marker-bearing automation chatter. */
 export function evaluateCommentWakeDebounce(input: {
   nowMs: number;
+  isAutomationAuthor: boolean;
+  requestedByActorType: string | null | undefined;
   /** Finish time of the last run, or null when there is none. */
   lastRunFinishedAtMs: number | null;
   lastRunSucceeded: boolean;
   debounceMs: number;
   hasHumanCommentSinceLastFinish: boolean;
 }): CommentWakeSuppressionDecision {
+  // Human-authored and user-requested wakes always pass, even when the
+  // comment carries markers. The human-comment reset query excludes the
+  // triggering comment itself, so the evaluators must enforce this; the gate
+  // cannot rely on the reset to catch the trigger.
+  if (!input.isAutomationAuthor) return { suppress: false };
+  if (input.requestedByActorType === "user") return { suppress: false };
   if (input.lastRunFinishedAtMs === null) return { suppress: false };
   // A non-succeeded last run makes this wake recovery, not chatter.
   if (!input.lastRunSucceeded) return { suppress: false };
@@ -252,12 +260,18 @@ export function evaluateCommentWakeDebounce(input: {
 /** Rule 3: no run when the last run just finished and nothing changed. */
 export function evaluateRecentRunGuard(input: {
   nowMs: number;
+  isAutomationAuthor: boolean;
+  requestedByActorType: string | null | undefined;
   /** Finish time of the last run, or null when there is none. */
   lastRunFinishedAtMs: number | null;
   lastRunSucceeded: boolean;
   guardMs: number;
   hasChangesSinceLastFinish: boolean;
 }): CommentWakeSuppressionDecision {
+  // Human-authored and user-requested wakes always pass, even when the
+  // comment carries markers (see evaluateCommentWakeDebounce).
+  if (!input.isAutomationAuthor) return { suppress: false };
+  if (input.requestedByActorType === "user") return { suppress: false };
   if (input.lastRunFinishedAtMs === null) return { suppress: false };
   // A non-succeeded last run makes this wake recovery, not a re-poll.
   if (!input.lastRunSucceeded) return { suppress: false };

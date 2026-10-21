@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { replayWakeSuppression } from "../services/wake-suppression-replay.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -307,6 +308,37 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
     expect(wake).not.toBeNull();
   });
 
+  it("wakes human comments with markers inside the debounce window", async () => {
+    const { agentId, issueId, companyId } = await seedCompanyAgentIssue();
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 60 });
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "user",
+      body: "@codexcoder please confirm the launch plan.",
+    });
+
+    // The debounce reset query excludes the triggering comment itself, so the
+    // gate must bypass human authors explicitly instead of relying on it.
+    const wake = await commentWake({ agentId, issueId, commentId, requestedByActorType: "user" });
+    expect(wake).not.toBeNull();
+  });
+
+  it("wakes user-requested wakes that reference marked automation comments", async () => {
+    const { agentId, issueId, companyId } = await seedCompanyAgentIssue();
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 60 });
+    const commentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "Review finished with 2 findings.",
+    });
+
+    const wake = await commentWake({ agentId, issueId, commentId, requestedByActorType: "user" });
+    expect(wake).not.toBeNull();
+  });
+
   it("wakes for automation comments carrying an actionable marker", async () => {
     const { agentId, issueId, companyId } = await seedCompanyAgentIssue();
     const commentId = await seedComment({
@@ -404,6 +436,35 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
 
   // One wake per test: a second wake in the same test would hit the live run
   // from the first via wake-queue coalesce/defer instead of this gate.
+  it("fails open when the triggering comment belongs to another issue", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId,
+      title: "Sibling issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+    });
+    const foreignCommentId = await seedComment({
+      companyId,
+      issueId: otherIssueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+
+    const wake = await commentWake({
+      agentId,
+      issueId,
+      commentId: foreignCommentId,
+      requestedByActorType: "agent",
+    });
+    expect(wake).not.toBeNull();
+  });
+
   it("never suppresses reopen wakes", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const commentId = await seedComment({
@@ -487,5 +548,61 @@ describeEmbeddedPostgres("heartbeat comment wake suppression", () => {
       requestedByActorId: "test-automation",
     });
     expect(wake).not.toBeNull();
+  });
+
+  it("replays wake history with suppression tallies and zero human loss", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const botCommentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "agent",
+      authorAgentId: agentId,
+      body: "PR #235 merged.",
+    });
+    const humanCommentId = await seedComment({
+      companyId,
+      issueId,
+      authorType: "user",
+      body: "Please confirm the launch plan.",
+    });
+
+    async function seedWake(input: {
+      commentId: string;
+      requestedByActorType: "user" | "agent";
+      status?: string;
+    }) {
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: input.commentId, mutation: "comment" },
+        status: input.status ?? "queued",
+        requestedByActorType: input.requestedByActorType,
+        requestedByActorId: "replay-fixture",
+      });
+    }
+    await seedWake({ commentId: botCommentId, requestedByActorType: "agent" });
+    await seedWake({ commentId: humanCommentId, requestedByActorType: "user" });
+    await seedWake({ commentId: botCommentId, requestedByActorType: "agent", status: "skipped" });
+
+    const report = await replayWakeSuppression(db, {
+      windowStart: new Date(Date.now() - 3_600_000),
+      limit: 100,
+      debounceMs: 5 * 60_000,
+      guardMs: 10 * 60_000,
+      companyIds: [companyId],
+    });
+
+    expect(report.wakesScanned).toBe(3);
+    expect(report.alreadySkipped).toBe(1);
+    expect(report.classified).toBe(2);
+    expect(report.suppressedTotal).toBe(1);
+    expect(report.suppressedByReason.automation_comment_no_marker).toBe(1);
+    expect(report.admitted).toBe(1);
+    expect(report.projectedRunReduction).toBe(0.5);
+    expect(report.humanWakesSeen).toBe(1);
+    expect(report.humanWakesSuppressed).toBe(0);
   });
 });

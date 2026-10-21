@@ -29522,28 +29522,40 @@ export function heartbeatService(
               .where(
                 and(
                   eq(issueComments.companyId, issue.companyId),
+                  eq(issueComments.issueId, issue.id),
                   eq(issueComments.id, wakeCommentId),
                 ),
               )
               .limit(1);
-            // A missing or deleted triggering comment fails open: wake.
+            // A missing or deleted triggering comment fails open: wake. So
+            // does a comment that does not belong to the wake's issue.
             const triggerComment = triggerCommentRows[0] ?? null;
             if (triggerComment && !triggerComment.deletedAt) {
               const suppressionMarkers = findActionableCommentMarkers(
                 triggerComment.body,
               );
+              const triggerIsAutomationAuthor = isAutomationCommentAuthor({
+                authorType: triggerComment.authorType,
+                authorAgentId: triggerComment.authorAgentId,
+                createdByRunId: triggerComment.createdByRunId,
+              });
+              const suppressionRequestedByActorType =
+                opts.requestedByActorType ?? null;
               let suppressionDecision = evaluateAutomationCommentSkip({
-                isAutomationAuthor: isAutomationCommentAuthor({
-                  authorType: triggerComment.authorType,
-                  authorAgentId: triggerComment.authorAgentId,
-                  createdByRunId: triggerComment.createdByRunId,
-                }),
-                requestedByActorType: opts.requestedByActorType ?? null,
+                isAutomationAuthor: triggerIsAutomationAuthor,
+                requestedByActorType: suppressionRequestedByActorType,
                 markers: suppressionMarkers,
               });
               // Rules 2 and 3 need the last finished run; rule 1 (markerless
-              // automation) short-circuits without further reads.
-              if (!suppressionDecision.suppress && suppressionMarkers.length > 0) {
+              // automation) short-circuits without further reads. Human and
+              // user-requested wakes skip the reads: the evaluators admit
+              // them unconditionally, even when the comment carries markers.
+              if (
+                !suppressionDecision.suppress &&
+                suppressionMarkers.length > 0 &&
+                triggerIsAutomationAuthor &&
+                suppressionRequestedByActorType !== "user"
+              ) {
                 const suppressionNowMs = Date.now();
                 const lastRunRows = await tx
                   .select({
@@ -29591,6 +29603,8 @@ export function heartbeatService(
                   const lastRunSucceeded = lastRun?.status === "succeeded";
                   suppressionDecision = evaluateCommentWakeDebounce({
                     nowMs: suppressionNowMs,
+                    isAutomationAuthor: triggerIsAutomationAuthor,
+                    requestedByActorType: suppressionRequestedByActorType,
                     lastRunFinishedAtMs: lastRunFinishedAt.getTime(),
                     lastRunSucceeded,
                     debounceMs: suppressionConfig.debounceMs,
@@ -29616,6 +29630,8 @@ export function heartbeatService(
                       : [];
                     suppressionDecision = evaluateRecentRunGuard({
                       nowMs: suppressionNowMs,
+                      isAutomationAuthor: triggerIsAutomationAuthor,
+                      requestedByActorType: suppressionRequestedByActorType,
                       lastRunFinishedAtMs: lastRunFinishedAt.getTime(),
                       lastRunSucceeded,
                       guardMs: suppressionConfig.recentRunGuardMs,
