@@ -23,7 +23,7 @@ import type { Db } from "@paperclipai/db";
 import {
   CHAT_PROVIDERS,
   CONNECTION_INTENT_AGENT_GUIDANCE,
-  CONNECTION_RUNTIME_TOOL_NAMES,
+  RUNTIME_TOOL_NAMES,
   envBindingSchema,
   isToolConnectionAttentionHealth,
   type ChatProvider,
@@ -1287,7 +1287,7 @@ export function createAdapterRuntimeToolAccess(input: {
     },
     bearerToken: minted.token,
     expiresAt: minted.expiresAt,
-    tools: CONNECTION_RUNTIME_TOOL_NAMES,
+    tools: RUNTIME_TOOL_NAMES,
   });
 }
 
