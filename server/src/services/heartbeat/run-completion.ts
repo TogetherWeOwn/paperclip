@@ -471,7 +471,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
     }
     const agentConfig = parseObject(agent.adapterConfig);
-    return resolveRunModelDecision({
+    const resolution = await resolveRunModelDecision({
       requireDecision: input.requireDecision,
       skip: {
         issueId,
@@ -500,6 +500,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ? manager.call(pluginId, "resolveRunModel", params, timeoutMs)
           : Promise.reject(new Error("plugin worker manager unavailable")),
     });
+    // The holder selection is what the native SSH seam enforces against.
+    return { ...resolution, holder };
   }
 
   /**

@@ -1,4 +1,13 @@
 import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
+import {
+  NativeSshAuthorityError,
+  type NativeSshEnvelopeVerifier,
+  type NativeSshSignerTransport,
+} from "@paperclipai/adapter-utils/host-executor";
+import {
+  createNativeSshHostExecutorForRun,
+  nativeSshAuthorityRunLedger,
+} from "./native-ssh-authority.js";
 import { createGitHubRunEvidenceCollector, githubWorkspaceState, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -852,6 +861,12 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * Out-of-process signer for native SSH launch authorities and the check of
+   * its signature. Without both, every SSH-target launch is refused.
+   */
+  nativeSshSigner?: NativeSshSignerTransport;
+  nativeSshEnvelopeVerifier?: NativeSshEnvelopeVerifier;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
@@ -3524,6 +3539,21 @@ export function heartbeatService(
       if (candidateRuntime) {
         runtimeConfig = githubCandidateAdapterConfig(candidateRuntime, runtimeConfig, executionWorkspace.cwd);
       }
+      // Every launch on an SSH host needs a signer-verified authority bound to the
+      // decided model. Built once per run; a missing model refuses the run here.
+      const nativeSshHostExecutor = createNativeSshHostExecutorForRun({
+        runId: run.id,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId: issueRef?.id ?? null,
+        adapterType: agent.adapterType,
+        target: executionTarget,
+        holder: modelDecision.holder,
+        decision: modelDecision.record,
+        signer: options.nativeSshSigner,
+        verifyEnvelope: options.nativeSshEnvelopeVerifier,
+        ...nativeSshAuthorityRunLedger(db, run.id, context),
+      });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const instructionPreparationKey = createHash("sha256").update(JSON.stringify({
@@ -3568,8 +3598,10 @@ export function heartbeatService(
         retirementFailed: async () => { await instructionCopies.reportRetirementUnconfirmed(agent.companyId, run.id); },
       } : undefined;
       if (managedAiRuntime && aiBinding) {
-        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
-        catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
+        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget, nativeSshHostExecutor); }
+        catch (error) {
+          if (error instanceof NativeSshAuthorityError) throw error;
+          throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
       const remoteExecution = candidateRuntime ? candidateRuntime.target.spec : realizationResult.remoteExecution;
       if (
@@ -4610,6 +4642,7 @@ export function heartbeatService(
         const execution = await executeHeartbeatRuntime(db, {
           run, agent, options,
           candidateRuntime,
+          nativeSshHostExecutor,
           task: {
             issueRef,
             issueContext,

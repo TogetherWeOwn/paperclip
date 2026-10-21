@@ -42,6 +42,7 @@ import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
 import { ConfigurationIncompleteFailure } from "./run-preparation.js";
+import { runWithRunNativeSshHostExecutor } from "../native-ssh-authority.js";
 import {
   buildNativeProviderEnvironment,
   executePaperclipNativeSession,
@@ -108,6 +109,8 @@ export interface HeartbeatRuntimeExecutionInput {
   };
   /** Paired shadow-review candidate runtime, or null for ordinary runs. */
   candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
+  /** Run-bound native SSH launch authority executor. */
+  nativeSshHostExecutor: ReturnType<typeof import("../native-ssh-authority.js").createNativeSshHostExecutorForRun>;
   task: Pick<Selection["task"], "issueContext" | "context" | "executionContinuation"> & {
     issueRef: (NonNullable<Selection["task"]["issueRef"]> & { projectId: string | null }) | null;
     issueId: string | null;
@@ -226,6 +229,7 @@ function readNonEmptyString(value: unknown): string | null {
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
   const { run, agent, options } = input;
   const candidateRuntime = input.candidateRuntime ?? null;
+  const { nativeSshHostExecutor } = input;
   const { issueRef, issueContext, context, issueId, taskKey, executionContinuation } = input.task;
   const { nativeRuntimeResolution, nativeExecution, nativeRunnerInstanceId, adapter, runtimeForAdapter, getNativeFreshSessionHandoff, getFreshSessionHandoff, runOptions } = input.runtime;
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
@@ -816,7 +820,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchResolvedInteractionContinuationWithAtomicGate(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            // Every SSH launch inside the adapter needs the run's executor bound.
+            return runWithRunNativeSshHostExecutor(nativeSshHostExecutor, () => withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               runId: run.id,
@@ -894,7 +899,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: isolatedRuntime ? undefined : authToken ?? undefined,
-            }));
+            })));
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
