@@ -23,6 +23,35 @@ vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
 }));
 
+function createSelectChain(rows: unknown[]) {
+  const query = {
+    then(resolve: (value: unknown[]) => unknown) {
+      return Promise.resolve(rows).then(resolve);
+    },
+    where() {
+      return query;
+    },
+  };
+  return {
+    from() {
+      return query;
+    },
+  };
+}
+
+function createDbStub(selectResponses: unknown[][]) {
+  let selectCall = 0;
+  return {
+    db: {
+      select() {
+        const rows = selectResponses[selectCall] ?? [];
+        selectCall += 1;
+        return createSelectChain(rows);
+      },
+    },
+  };
+}
+
 // Budget behavior is exercised against PostgreSQL below and in
 // cost-accounting-reliability.test.ts, including transaction and retry paths.
 

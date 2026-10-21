@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   companies,
   companySkills,
+  costEvents,
   createDb,
   documentRevisions,
   documents,
@@ -168,6 +169,7 @@ describeEmbeddedPostgres("heartbeat burst overlap (TOG-28460)", () => {
     await db.delete(issueTreeHolds);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);

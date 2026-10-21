@@ -11,8 +11,11 @@ import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclip
 // (the closing quote/colon must follow); longer names are not masked there.
 // Port of the live v2026.916 operator overlay (same limits); preserves all
 // PRP v2 / public-executor-selector semantics below. Keyword core and suffix
-// alternation are upstream's broadened set; the {0,64} bounds are the fork's.
-const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*[A-Za-z0-9_-]{0,64}`;
+// alternation are upstream's broadened set; the leading {0,64} bound is the
+// fork's. No trailing affix: SECRET_PAYLOAD_KEY_RE full-matches, so a
+// trailing wildcard would redact metadata keys such as credentialHeaderNames
+// (header *names*, asserted visible by the gateway acceptance tests).
+const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]{0,64}(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(`^(?:${SECRET_FIELD_NAME_PATTERN})(?:_plain|_ref)?$`, "i");
 // Authorization reasons are policy decision codes, not credentials. They must

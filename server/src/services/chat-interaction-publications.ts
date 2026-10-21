@@ -422,73 +422,78 @@ export async function enqueueIssueInteractionChatPublications(
         },
       },
     });
-    const rows = await insertChatPublications(db, {
-        companyId: interaction.companyId,
-        endpointId: endpoint.id,
-        conversationId: conversation.id,
-        issueId: interaction.issueId,
-        idempotencyKey: `interaction:${interaction.id}:${endpoint.id}`,
-        payload,
-        state: "pending",
-      }, { onConflictDoNothing: true });
-    const publication = rows[0];
-    if (publication && endpoint.provider === "imessage-photon" && nativePhotonInteraction(interaction)) {
-      const reference = randomBytes(9).toString("base64url");
-      await insertChatActions(db, { companyId: interaction.companyId, endpointId: endpoint.id, conversationId: conversation.id,
-        kind: "photon_interaction", providerActionId: `photon:${reference}`,
-        payload: { version: 1, reference, interactionId: interaction.id, publicationId: publication.id, sessionGeneration: conversation.sessionGeneration,
-          expiresAt: new Date(publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS).toISOString() }, status: "issued" });
-    } else if (publication && formDraft) {
-      await insertChatActions(db, chatQuestionFormActionRecords(formDraft, {
+    const rows = await db.transaction(async (tx) => {
+      // One transaction per endpoint: a callback-token failure rolls
+      // the publication back instead of stranding a tokenless card.
+      const published = await insertChatPublications(tx, {
           companyId: interaction.companyId,
           endpointId: endpoint.id,
           conversationId: conversation.id,
-          publicationId: publication.id,
-        }));
-    } else if (publication && question && questionActionTokens.length > 0) {
-      const expiresAt = new Date(
-        publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS,
-      ).toISOString();
-      await insertChatActions(db, questionActionTokens.map(({ actionId, option }) => ({
-          companyId: interaction.companyId,
-          endpointId: endpoint.id,
-          conversationId: conversation.id,
-          kind: "question_answer",
-          providerActionId: actionId,
-          payload: {
-            version: 1,
+          issueId: interaction.issueId,
+          idempotencyKey: `interaction:${interaction.id}:${endpoint.id}`,
+          payload,
+          state: "pending",
+        }, { onConflictDoNothing: true });
+      const publication = published[0];
+      if (publication && endpoint.provider === "imessage-photon" && nativePhotonInteraction(interaction)) {
+        const reference = randomBytes(9).toString("base64url");
+        await insertChatActions(tx, { companyId: interaction.companyId, endpointId: endpoint.id, conversationId: conversation.id,
+          kind: "photon_interaction", providerActionId: `photon:${reference}`,
+          payload: { version: 1, reference, interactionId: interaction.id, publicationId: publication.id, sessionGeneration: conversation.sessionGeneration,
+            expiresAt: new Date(publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS).toISOString() }, status: "issued" });
+      } else if (publication && formDraft) {
+        await insertChatActions(tx, chatQuestionFormActionRecords(formDraft, {
+            companyId: interaction.companyId,
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
             publicationId: publication.id,
-            interactionId: interaction.id,
-            questionId: question.id,
-            optionId: option.id,
-            expiresAt,
-          },
-          status: "issued",
-        })));
-    } else if (
-      publication &&
-      confirmation &&
-      confirmationActionTokens.length > 0
-    ) {
-      const expiresAt = new Date(
-        publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS,
-      ).toISOString();
-      await insertChatActions(db, confirmationActionTokens.map(({ actionId, decision }) => ({
-          companyId: interaction.companyId,
-          endpointId: endpoint.id,
-          conversationId: conversation.id,
-          kind: "confirmation_response",
-          providerActionId: actionId,
-          payload: {
-            version: 1,
-            publicationId: publication.id,
-            interactionId: interaction.id,
-            decision,
-            expiresAt,
-          },
-          status: "issued",
-        })));
-    }
+          }));
+      } else if (publication && question && questionActionTokens.length > 0) {
+        const expiresAt = new Date(
+          publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS,
+        ).toISOString();
+        await insertChatActions(tx, questionActionTokens.map(({ actionId, option }) => ({
+            companyId: interaction.companyId,
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
+            kind: "question_answer",
+            providerActionId: actionId,
+            payload: {
+              version: 1,
+              publicationId: publication.id,
+              interactionId: interaction.id,
+              questionId: question.id,
+              optionId: option.id,
+              expiresAt,
+            },
+            status: "issued",
+          })));
+      } else if (
+        publication &&
+        confirmation &&
+        confirmationActionTokens.length > 0
+      ) {
+        const expiresAt = new Date(
+          publication.createdAt.getTime() + CHAT_QUESTION_ACTION_TOKEN_TTL_MS,
+        ).toISOString();
+        await insertChatActions(tx, confirmationActionTokens.map(({ actionId, decision }) => ({
+            companyId: interaction.companyId,
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
+            kind: "confirmation_response",
+            providerActionId: actionId,
+            payload: {
+              version: 1,
+              publicationId: publication.id,
+              interactionId: interaction.id,
+              decision,
+              expiresAt,
+            },
+            status: "issued",
+          })));
+      }
+      return published;
+    });
     inserted.push(...rows);
   }
   return inserted;

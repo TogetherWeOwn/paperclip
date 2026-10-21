@@ -257,7 +257,7 @@ export const GITHUB_SHADOW_CANDIDATE_DENIALS = {
    * `paperclip-assigned` gateway, where `github-bot.<endpointId>:<tool>` is
    * exposed as `github-bot_<endpointId>_<tool>`. */
   githubPublication: {
-    toolPattern: `^mcp__paperclip-assigned__github-bot_${UUID}_(?:comment|formal_review)$`,
+    toolPattern: `^mcp__paperclip-assigned__github-bot_${UUID}_(?:comment|formal_review|update_comment)$`,
   },
   webCapableMcpApps: { toolPrefixes: ["mcp__paperclip-assigned__mcp_"] },
   sharedMemory: { toolPrefixes: ["mcp__paperclip-assigned__paperclip-plugin-hindsight_"] },

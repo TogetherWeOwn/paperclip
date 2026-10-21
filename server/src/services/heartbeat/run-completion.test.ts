@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, companies, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -206,6 +206,13 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     f.input.issueId = issue.id;
     f.input.issueRef = issue;
     f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    // The run made issue-visible progress, so no-progress suppression must
+    // not skip the comment attempt this test breaks on purpose.
+    await db.insert(activityLog).values({
+      companyId: f.run.companyId, actorType: "agent", actorId: f.agent.id,
+      action: "issue.comment_added", entityType: "issue", entityId: issue.id,
+      agentId: f.agent.id, runId: f.run.id, details: {},
+    });
     f.deps.issuesSvc.addComment.mockRejectedValueOnce(new Error("comment unavailable"));
     await f.completion.completeRun(f.input);
     expect(f.deps.issuesSvc.addComment).toHaveBeenCalledOnce();

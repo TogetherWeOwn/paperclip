@@ -3268,9 +3268,11 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
 }
 
-// The default capture bound stays upstream's 256KB: managed-worktree-inspection.test.ts
-// pins that a 300KB probe truncates. Callers that enumerate genuinely large
-// registries opt into a bigger bound via worktreeListMaxBytes.
+// Registry enumeration defaults to the 16MB worktree-list bound: large
+// registries must inspect by default. The 256KB managed-exec default still
+// applies to single-shot probes (runGit callers without an explicit bound).
+// managed-worktree-inspection.test.ts pins fail-closed truncation with an
+// explicit small bound.
 async function listLinkedGitWorktreePaths(
   repoRoot: string,
   opts?: { maxStdoutBytes?: number },
@@ -3311,7 +3313,7 @@ export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
   repoRoot?: string | null;
-  /** Bound on the `git worktree list --porcelain` capture. Defaults to the managed-exec cap (upstream 256KB); callers with large registries opt in via this bound. */
+  /** Bound on the `git worktree list --porcelain` capture. Defaults to GIT_WORKTREE_LIST_MAX_STDOUT_BYTES (registries routinely exceed the 256KB probe cap). */
   worktreeListMaxBytes?: number;
 }): Promise<ManagedGitWorktreeBranchInspection> {
   const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
@@ -3345,7 +3347,7 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot, { maxStdoutBytes: input.worktreeListMaxBytes });
+  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot, { maxStdoutBytes: input.worktreeListMaxBytes ?? GIT_WORKTREE_LIST_MAX_STDOUT_BYTES });
   if (listedWorktrees.diagnostic) {
     return {
       ...base,

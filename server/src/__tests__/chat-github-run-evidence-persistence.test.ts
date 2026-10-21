@@ -59,9 +59,11 @@ describe("paired shadow run evidence survives persistence", () => {
   });
 
   it("documents why the version-1 receipt was never verifiable once stored", () => {
-    // Before the storage encoding: dotted version masked, 60 tools cut to 50 + marker.
+    // Before the storage encoding: 60 tools cut to 50 + marker. Dotted
+    // versions are retained verbatim: upstream narrowed JWT redaction to
+    // encoded-JSON headers, so a bare CLI version is no longer masked.
     const legacy = persist({ version: 1, cli: githubCliInitFacts(primaryInit), workspaceHead: null });
-    expect((legacy.cli as Record<string, unknown>).claudeCodeVersion).toBe(REDACTED_EVENT_VALUE);
+    expect((legacy.cli as Record<string, unknown>).claudeCodeVersion).toBe("2.1.284");
     expect(JSON.stringify(legacy)).toContain("_truncated");
     expect(githubRunEvidence(legacy)?.cli).toBeNull();
   });
@@ -181,6 +183,6 @@ describe("deviation protocol", () => {
     for (const tool of GITHUB_BOT_TOOLS.map(entry => entry.name)) {
       expect(githubShadowCandidateDeniedTool(`mcp__paperclip-assigned__github-bot_${endpoint}_${tool}`)).toBe(omitted.includes(tool));
     }
-    expect(omitted.sort()).toEqual(["comment", "formal_review"]);
+    expect(omitted.sort()).toEqual(["comment", "formal_review", "update_comment"]);
   });
 });

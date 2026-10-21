@@ -63,7 +63,9 @@ describe("managed worktree registration inspection", () => {
   it("fails closed on truncated output even if a matching registration was captured", async () => {
     const { root, repo, worktree } = await fixture();
     await replaceListProbe(root, `process.stdout.write("x".repeat(300_000) + ${JSON.stringify(`\nworktree ${worktree}\n\n`)});`);
-    expect(await inspectManagedGitWorktreeBranch({ repoRoot: repo, worktreePath: worktree, expectedBranchName: "work" })).toMatchObject({
+    // Explicit small bound: registry enumeration defaults to 16MB, so force
+    // the truncation this fail-closed path requires.
+    expect(await inspectManagedGitWorktreeBranch({ repoRoot: repo, worktreePath: worktree, expectedBranchName: "work", worktreeListMaxBytes: 100_000 })).toMatchObject({
       valid: false, reasonCode: "git_inspection_failed", inspectionDiagnostic: { command: "worktree_list", failure: "output_truncated" },
     });
   });

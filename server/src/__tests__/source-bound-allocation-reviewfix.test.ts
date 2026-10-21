@@ -79,6 +79,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(),
 }));
 
+vi.mock("../services/authorization.js", async (importActual) => ({
+  ...(await importActual<typeof import("../services/authorization.js")>()),
+  canActorReadExecutionWorkspace: async () => true,
+}));
+
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
