@@ -306,6 +306,10 @@ export function createPaperclipCloudConnector(input: {
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(15_000),
+        // Never follow redirects: a 307/308 would re-send the POST body
+        // secret to the redirect target (T8.3/T8.4). A redirect surfaces as
+        // a transport failure through the existing catch below.
+        redirect: "error",
       });
     } catch {
       throw new PaperclipCloudConnectorError("Paperclip Cloud connector is unavailable", "CONNECTOR_UNAVAILABLE");

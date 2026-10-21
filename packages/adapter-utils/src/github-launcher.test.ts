@@ -29,7 +29,7 @@ describe("managed GitHub launchers", () => {
     // Other copies of this launcher are only recognised below 16 KiB.
     expect(Buffer.byteLength(githubLauncherSource())).toBeLessThan(16384);
     // When this digest changes, append the previous value to LEGACY_GITHUB_LAUNCHER_SHA256 first.
-    expect(sha256(githubLauncherSource())).toBe("c8c3de47810be11c441f704357fe44e95b9bec78d162984cc7df86c412905463");
+    expect(sha256(githubLauncherSource())).toBe("fe1cb92400861f2a9f7b86381df4dbe0712435e783993fd4a8539398d65dd431");
   });
 
   it("passes the shim-free PATH to wrappers and reaches the next Git executable once", async () => {
@@ -93,6 +93,8 @@ process.stdout.write("real git reached\\n");
     const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
       ...process.env,
       ...githubBrokerEnvironment({ WRAPPER_BIN: wrapperDir, WRAPPER_TRACE: wrapperTrace, REAL_TRACE: realTrace }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      // The launcher accepts the explicit broker base only same-origin with the run API URL.
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: path.join(root, "config"),
       PATH: [launcherDir, wrapperDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, realDir, mixedDir, process.env.PATH].join(path.delimiter),
     } });
@@ -148,6 +150,7 @@ process.stdout.write(JSON.stringify({
     const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
       ...process.env,
       ...environment,
+      PAPERCLIP_API_URL: broker.url,
       GH_CONFIG_DIR: configRoot,
       GH_TOKEN: "caller-token",
       GIT_CONFIG_GLOBAL: "/caller/config",
@@ -208,12 +211,14 @@ process.stdout.write(JSON.stringify({
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
     const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   });
@@ -232,7 +237,7 @@ process.stdout.write(JSON.stringify({
     await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
     cleanups.push(() => new Promise<void>((resolve,reject) => server.close(error => error ? reject(error) : resolve())));
     const {port} = server.address() as {port:number};
-    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
+    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PAPERCLIP_API_URL:`http://127.0.0.1:${port}`,PATH:`${bin}:${realBin}:${process.env.PATH}`}});
     expect(JSON.parse(result.stdout)).toEqual({token:null});
     expect(result.stderr).toContain("More than one managed GitHub identity matches this run");
     expect(result.stderr).not.toMatch(/host-token|must-not-be-used|run-capability/);
@@ -270,7 +275,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     const address = server.address() as { port: number };
     const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
-    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${otherBin}:${realBin}:${process.env.PATH}` };
+    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PAPERCLIP_API_URL: `http://127.0.0.1:${address.port}`, PATH: `${bin}:${otherBin}:${realBin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
     await git("config", "user.name", "Repository Author");
