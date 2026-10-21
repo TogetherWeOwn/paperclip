@@ -100,8 +100,18 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await page.getByRole("textbox", { name: "editable markdown" }).fill("Please continue the pending follow-up.");
         await page.getByRole("button", { name: "Send", exact: true }).click();
       } else {
+        const retryResponse = action === "inbox_retry"
+          ? page.waitForResponse((response) =>
+              response.request().method() === "POST" &&
+              new URL(response.url()).pathname.endsWith(`/agents/${agent.id}/wakeup`),
+            )
+          : null;
         await page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true }).click();
-        if (action === "inbox_retry") await page.goto(taskUrl);
+        if (retryResponse) {
+          const response = await retryResponse;
+          expect(response.ok(), `Retry failed with ${response.status()}: ${await response.text()}`).toBe(true);
+          await page.goto(taskUrl);
+        }
       }
       await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);
