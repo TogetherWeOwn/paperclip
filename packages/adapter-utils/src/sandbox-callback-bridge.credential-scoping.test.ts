@@ -27,7 +27,9 @@ describe("bridge route and header scoping units", () => {
       ["POST", "/runtime-tools/github/credentials"],
     ];
     for (const [method, path] of allowed) {
-      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path })).toBeNull();
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path }),
+      ).toBeNull();
     }
 
     const denied: Array<[string, string]> = [
@@ -45,13 +47,23 @@ describe("bridge route and header scoping units", () => {
       ["POST", "/api/issues/issue-1/comments/extra/depth"],
     ];
     for (const [method, path] of denied) {
-      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path })).toMatch(/^Route not allowed:/);
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path }),
+      ).toMatch(/^Route not allowed:/);
     }
   });
 
   it("T3.3: caller authorization/cookie/capability headers are stripped; the five allowlisted headers pass", () => {
-    expect([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST].sort()).toEqual(
-      ["accept", "content-type", "if-match", "if-none-match", "x-paperclip-github-capability"].sort(),
+    expect(
+      [...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST].sort(),
+    ).toEqual(
+      [
+        "accept",
+        "content-type",
+        "if-match",
+        "if-none-match",
+        "x-paperclip-github-capability",
+      ].sort(),
     );
 
     const sanitized = sanitizeSandboxCallbackBridgeHeaders({
@@ -91,7 +103,9 @@ describe("bridge route and header scoping units", () => {
     const token = createSandboxCallbackBridgeToken();
     expect(compareBridgeTokensConstantTime(token, token)).toBe(true);
     expect(compareBridgeTokensConstantTime(token, `${token}x`)).toBe(false);
-    expect(compareBridgeTokensConstantTime(token, token.slice(0, -1))).toBe(false);
+    expect(compareBridgeTokensConstantTime(token, token.slice(0, -1))).toBe(
+      false,
+    );
     expect(compareBridgeTokensConstantTime(token, "")).toBe(false);
     expect(compareBridgeTokensConstantTime(token, null)).toBe(false);
     expect(compareBridgeTokensConstantTime(token, undefined)).toBe(false);

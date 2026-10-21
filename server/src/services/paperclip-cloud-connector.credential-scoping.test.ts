@@ -11,8 +11,9 @@
  * ed25519/x25519 keypairs are generated per test. Builder must not edit this
  * file.
  */
-import { createServer } from "node:http";
+
 import { generateKeyPairSync, type KeyObject } from "node:crypto";
+import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -63,7 +64,9 @@ describe("cloud connector redirect scoping", () => {
     }
   });
 
-  it("T8.4: a 307/308 from the connector endpoint forwards no body secret to the foreign origin", { timeout: 30_000 }, async () => {
+  it("T8.4: a 307/308 from the connector endpoint forwards no body secret to the foreign origin", {
+    timeout: 30_000,
+  }, async () => {
     const foreignBodies: string[] = [];
     const foreign = createServer((req, res) => {
       let body = "";
@@ -76,16 +79,32 @@ describe("cloud connector redirect scoping", () => {
         res.end(JSON.stringify({ ok: true }));
       });
     });
-    await new Promise<void>((resolve) => foreign.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve, reject) => foreign.close((error) => (error ? reject(error) : resolve()))));
+    await new Promise<void>((resolve) =>
+      foreign.listen(0, "127.0.0.1", resolve),
+    );
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve, reject) =>
+          foreign.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
     const foreignPort = (foreign.address() as { port: number }).port;
 
     const endpoint = createServer((_req, res) => {
-      res.writeHead(307, { location: `http://127.0.0.1:${foreignPort}/collect` });
+      res.writeHead(307, {
+        location: `http://127.0.0.1:${foreignPort}/collect`,
+      });
       res.end(JSON.stringify({ redirect: true }));
     });
-    await new Promise<void>((resolve) => endpoint.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve, reject) => endpoint.close((error) => (error ? reject(error) : resolve()))));
+    await new Promise<void>((resolve) =>
+      endpoint.listen(0, "127.0.0.1", resolve),
+    );
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve, reject) =>
+          endpoint.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
     const endpointPort = (endpoint.address() as { port: number }).port;
 
     const connector = createPaperclipCloudConnector({

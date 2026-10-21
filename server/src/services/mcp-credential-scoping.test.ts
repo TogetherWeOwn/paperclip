@@ -24,14 +24,24 @@ const GITHUB_APP_DEFINITION = new URL(
 
 describe("managed MCP GitHub origin binding", () => {
   it("T5.3: both GitHub MCP methods target the vendor MCP endpoint, never api.github.com", async () => {
-    const definition = JSON.parse(await readFile(GITHUB_APP_DEFINITION, "utf8")) as {
-      methods: Array<{ key: string; transport: string; defaults?: { serverUrl?: string } }>;
+    const definition = JSON.parse(
+      await readFile(GITHUB_APP_DEFINITION, "utf8"),
+    ) as {
+      methods: Array<{
+        key: string;
+        transport: string;
+        defaults?: { serverUrl?: string };
+      }>;
     };
-    const mcpMethods = definition.methods.filter((method) => method.key === "managed" || method.key === "mcp-key");
+    const mcpMethods = definition.methods.filter(
+      (method) => method.key === "managed" || method.key === "mcp-key",
+    );
     expect(mcpMethods).toHaveLength(2);
     for (const method of mcpMethods) {
       expect(method.transport).toBe("mcp_remote");
-      expect(method.defaults?.serverUrl).toBe("https://api.githubcopilot.com/mcp/");
+      expect(method.defaults?.serverUrl).toBe(
+        "https://api.githubcopilot.com/mcp/",
+      );
       expect(method.defaults?.serverUrl).not.toContain("api.github.com");
     }
   });
@@ -39,20 +49,36 @@ describe("managed MCP GitHub origin binding", () => {
   it("T5.4: a rotated vault URL must still match the reviewed public origin+path", () => {
     const publicUrl = "https://mcp.example.test/mcp?format=json";
     expect(
-      remoteUrlCredentialMatchesPublicUrl(publicUrl, "https://mcp.example.test/mcp?format=json&token=SYNTHETIC-1"),
+      remoteUrlCredentialMatchesPublicUrl(
+        publicUrl,
+        "https://mcp.example.test/mcp?format=json&token=SYNTHETIC-1",
+      ),
     ).toBe(true);
     expect(
-      remoteUrlCredentialMatchesPublicUrl(publicUrl, "https://mcp.example.test/mcp?format=json&token=SYNTHETIC-2"),
+      remoteUrlCredentialMatchesPublicUrl(
+        publicUrl,
+        "https://mcp.example.test/mcp?format=json&token=SYNTHETIC-2",
+      ),
     ).toBe(true);
     // A different origin or path is not the reviewed endpoint.
     expect(
-      remoteUrlCredentialMatchesPublicUrl(publicUrl, "https://evil.example.test/mcp?format=json&token=SYNTHETIC-1"),
+      remoteUrlCredentialMatchesPublicUrl(
+        publicUrl,
+        "https://evil.example.test/mcp?format=json&token=SYNTHETIC-1",
+      ),
     ).toBe(false);
     expect(
-      remoteUrlCredentialMatchesPublicUrl(publicUrl, "https://mcp.example.test/other?format=json&token=SYNTHETIC-1"),
+      remoteUrlCredentialMatchesPublicUrl(
+        publicUrl,
+        "https://mcp.example.test/other?format=json&token=SYNTHETIC-1",
+      ),
     ).toBe(false);
-    expect(remoteUrlCredentialMatchesPublicUrl(publicUrl, "not a url")).toBe(false);
-    expect(remoteUrlCredentialMatchesPublicUrl("not a url", publicUrl)).toBe(false);
+    expect(remoteUrlCredentialMatchesPublicUrl(publicUrl, "not a url")).toBe(
+      false,
+    );
+    expect(remoteUrlCredentialMatchesPublicUrl("not a url", publicUrl)).toBe(
+      false,
+    );
   });
 
   it("T5.5: credential-bearing URL parts stay out of the stored public URL", () => {

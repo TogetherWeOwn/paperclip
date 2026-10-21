@@ -24,7 +24,10 @@ describe("ghFetch redirect posture", () => {
   });
 
   async function startStub(
-    handler: (req: { url?: string; authorization: unknown }, body: string) => { status: number; headers?: Record<string, string>; body: string },
+    handler: (
+      req: { url?: string; authorization: unknown },
+      body: string,
+    ) => { status: number; headers?: Record<string, string>; body: string },
     observed: Array<{ url?: string; authorization: unknown; body: string }>,
   ): Promise<string> {
     const server = createServer((req, res) => {
@@ -33,28 +36,59 @@ describe("ghFetch redirect posture", () => {
         body += chunk;
       });
       req.on("end", () => {
-        const record = { url: req.url, authorization: req.headers.authorization, body };
+        const record = {
+          url: req.url,
+          authorization: req.headers.authorization,
+          body,
+        };
         observed.push(record);
-        const out = handler({ url: req.url, authorization: req.headers.authorization }, body);
-        res.writeHead(out.status, out.headers ?? { "content-type": "application/json" });
+        const out = handler(
+          { url: req.url, authorization: req.headers.authorization },
+          body,
+        );
+        res.writeHead(
+          out.status,
+          out.headers ?? { "content-type": "application/json" },
+        );
         res.end(out.body);
       });
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
     const { port } = server.address() as { port: number };
     return `http://127.0.0.1:${port}`;
   }
 
-  it("T8.5: a cross-origin redirect carries no Authorization to the foreign origin", { timeout: 30_000 }, async () => {
-    const foreignObserved: Array<{ url?: string; authorization: unknown; body: string }> = [];
+  it("T8.5: a cross-origin redirect carries no Authorization to the foreign origin", {
+    timeout: 30_000,
+  }, async () => {
+    const foreignObserved: Array<{
+      url?: string;
+      authorization: unknown;
+      body: string;
+    }> = [];
     const foreign = await startStub(
       () => ({ status: 200, body: JSON.stringify({ ok: true }) }),
       foreignObserved,
     );
-    const firstObserved: Array<{ url?: string; authorization: unknown; body: string }> = [];
+    const firstObserved: Array<{
+      url?: string;
+      authorization: unknown;
+      body: string;
+    }> = [];
     const first = await startStub(
-      () => ({ status: 302, headers: { location: `${foreign}/target` }, body: JSON.stringify({}) }),
+      () => ({
+        status: 302,
+        headers: { location: `${foreign}/target` },
+        body: JSON.stringify({}),
+      }),
       firstObserved,
     );
 
@@ -65,23 +99,32 @@ describe("ghFetch redirect posture", () => {
     await response.arrayBuffer().catch(() => undefined);
 
     expect(firstObserved).toHaveLength(1);
-    expect(firstObserved[0]?.authorization).toBe(`Bearer ${SYNTHETIC_GH_TOKEN}`);
+    expect(firstObserved[0]?.authorization).toBe(
+      `Bearer ${SYNTHETIC_GH_TOKEN}`,
+    );
     expect(foreignObserved).toHaveLength(1);
     expect(foreignObserved[0]?.authorization).toBeUndefined();
   });
 
-  it("T8.6: a same-origin redirect preserves Authorization (documented undici behavior)", { timeout: 30_000 }, async () => {
-    const observed: Array<{ url?: string; authorization: unknown; body: string }> = [];
+  it("T8.6: a same-origin redirect preserves Authorization (documented undici behavior)", {
+    timeout: 30_000,
+  }, async () => {
+    const observed: Array<{
+      url?: string;
+      authorization: unknown;
+      body: string;
+    }> = [];
     let origin = "";
-    origin = await startStub(
-      (req) => {
-        if (req.url === "/start") {
-          return { status: 302, headers: { location: `${origin}/final` }, body: JSON.stringify({}) };
-        }
-        return { status: 200, body: JSON.stringify({ ok: true }) };
-      },
-      observed,
-    );
+    origin = await startStub((req) => {
+      if (req.url === "/start") {
+        return {
+          status: 302,
+          headers: { location: `${origin}/final` },
+          body: JSON.stringify({}),
+        };
+      }
+      return { status: 200, body: JSON.stringify({ ok: true }) };
+    }, observed);
 
     const response = await ghFetch(`${origin}/start`, {
       headers: { authorization: `Bearer ${SYNTHETIC_GH_TOKEN}` },
@@ -95,13 +138,10 @@ describe("ghFetch redirect posture", () => {
 
   it("T8.7: ghFetch sets an explicit redirect posture instead of relying on the fetch default", async () => {
     const seen: RequestInit[] = [];
-    vi.stubGlobal(
-      "fetch",
-      (async (_url: unknown, init?: RequestInit) => {
-        if (init) seen.push(init);
-        return Response.json({ ok: true });
-      }) as typeof fetch,
-    );
+    vi.stubGlobal("fetch", (async (_url: unknown, init?: RequestInit) => {
+      if (init) seen.push(init);
+      return Response.json({ ok: true });
+    }) as typeof fetch);
     const response = await ghFetch("https://api.github.com/rate_limit", {
       headers: { authorization: `Bearer ${SYNTHETIC_GH_TOKEN}` },
     });
@@ -111,9 +151,9 @@ describe("ghFetch redirect posture", () => {
   });
 
   it("T8.8: connect failures map to an unprocessable host error without leaking the URL", async () => {
-    const error = await ghFetch(`https://github-unreachable.invalid/x?token=${SYNTHETIC_GH_TOKEN}`).catch(
-      (value: unknown) => value,
-    );
+    const error = await ghFetch(
+      `https://github-unreachable.invalid/x?token=${SYNTHETIC_GH_TOKEN}`,
+    ).catch((value: unknown) => value);
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain("github-unreachable.invalid");
     expect((error as Error).message).not.toContain(SYNTHETIC_GH_TOKEN);

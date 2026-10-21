@@ -19,8 +19,8 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const {
   runChildProcess,
@@ -31,21 +31,45 @@ const {
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async (_runId: string, _command: string, args: string[]): Promise<RunProcessResult> => ({
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    stdout: args.includes("--version")
-      ? "2.1.280 (Claude Code)\n"
-      : [
-          JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
-          JSON.stringify({ type: "assistant", session_id: "claude-session-1", message: { content: [{ type: "text", text: "hello" }] } }),
-          JSON.stringify({ type: "result", session_id: "claude-session-1", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }),
-        ].join("\n"),
-    stderr: "",
-    pid: 123,
-    startedAt: new Date().toISOString(),
-  })),
+  runChildProcess: vi.fn(
+    async (
+      _runId: string,
+      _command: string,
+      args: string[],
+    ): Promise<RunProcessResult> => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: args.includes("--version")
+        ? "2.1.280 (Claude Code)\n"
+        : [
+            JSON.stringify({
+              type: "system",
+              subtype: "init",
+              session_id: "claude-session-1",
+              model: "claude-sonnet",
+            }),
+            JSON.stringify({
+              type: "assistant",
+              session_id: "claude-session-1",
+              message: { content: [{ type: "text", text: "hello" }] },
+            }),
+            JSON.stringify({
+              type: "result",
+              session_id: "claude-session-1",
+              result: "hello",
+              usage: {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+              },
+            }),
+          ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    }),
+  ),
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "claude"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
@@ -62,9 +86,9 @@ const {
 }));
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
-    "@paperclipai/adapter-utils/server-utils",
-  );
+  const actual = await vi.importActual<
+    typeof import("@paperclipai/adapter-utils/server-utils")
+  >("@paperclipai/adapter-utils/server-utils");
   return {
     ...actual,
     ensureCommandResolvable,
@@ -74,9 +98,9 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
 });
 
 vi.mock("@paperclipai/adapter-utils/ssh", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/ssh")>(
-    "@paperclipai/adapter-utils/ssh",
-  );
+  const actual = await vi.importActual<
+    typeof import("@paperclipai/adapter-utils/ssh")
+  >("@paperclipai/adapter-utils/ssh");
   return {
     ...actual,
     prepareWorkspaceForSshExecution,
@@ -86,21 +110,22 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
 });
 
 vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
-    "@paperclipai/adapter-utils/execution-target",
-  );
+  const actual = await vi.importActual<
+    typeof import("@paperclipai/adapter-utils/execution-target")
+  >("@paperclipai/adapter-utils/execution-target");
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
   };
 });
 
-import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
+import { execute } from "./execute.js";
 
 // Synthetic credentials. The host JWT is JWT-shaped (three dot segments);
 // nothing here is a real credential and nothing leaves the test process.
-const SYNTHETIC_HOST_JWT = "c3ludGhldGljLWxlZ2FjeS1ob3N0.SU5KRy1IQ09TVC1UT0tFTg.c3ludGhldGljLXNpZ25hdHVyZQ";
+const SYNTHETIC_HOST_JWT =
+  "c3ludGhldGljLWxlZ2FjeS1ob3N0.SU5KRy1IQ09TVC1UT0tFTg.c3ludGhldGljLXNpZ25hdHVyZQ";
 const SYNTHETIC_HOST_URL = "https://paperclip-host.invalid";
 
 describe("legacy child-env credential separation", () => {
@@ -118,7 +143,9 @@ describe("legacy child-env credential separation", () => {
   });
 
   async function localWorkspace() {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-credscoping-legacy-"));
+    const rootDir = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-credscoping-legacy-"),
+    );
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     const instructionsPath = path.join(rootDir, "instructions.md");
@@ -128,15 +155,24 @@ describe("legacy child-env credential separation", () => {
   }
 
   function childSpawnEnv(): Record<string, string> {
-    const calls = runChildProcess.mock.calls as unknown as Array<[string, string, string[], { env?: Record<string, string> }]>;
-    const main = calls.find((call) => call[2].includes("--add-dir")) ?? calls.at(-1);
-    if (!main?.[3]?.env) throw new Error("Expected the child spawn env to be captured by the runChildProcess mock.");
+    const calls = runChildProcess.mock.calls as unknown as Array<
+      [string, string, string[], { env?: Record<string, string> }]
+    >;
+    const main =
+      calls.find((call) => call[2].includes("--add-dir")) ?? calls.at(-1);
+    if (!main?.[3]?.env)
+      throw new Error(
+        "Expected the child spawn env to be captured by the runChildProcess mock.",
+      );
     return main[3].env;
   }
 
   function childSpawnCommand(): { command: string; args: string[] } {
-    const calls = runChildProcess.mock.calls as unknown as Array<[string, string, string[], { env?: Record<string, string> }]>;
-    const main = calls.find((call) => call[2].includes("--add-dir")) ?? calls.at(-1);
+    const calls = runChildProcess.mock.calls as unknown as Array<
+      [string, string, string[], { env?: Record<string, string> }]
+    >;
+    const main =
+      calls.find((call) => call[2].includes("--add-dir")) ?? calls.at(-1);
     if (!main) throw new Error("Expected a child spawn call.");
     return { command: main[1], args: main[2] };
   }
@@ -199,7 +235,9 @@ describe("legacy child-env credential separation", () => {
     const env = childSpawnEnv();
     expect(env.PAPERCLIP_API_KEY).toBeDefined();
     expect(env.PAPERCLIP_API_KEY).not.toBe(SYNTHETIC_HOST_JWT);
-    expect(env.PAPERCLIP_API_KEY).not.toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    expect(env.PAPERCLIP_API_KEY).not.toMatch(
+      /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+    );
   });
 
   it("T1.2: the legacy child env points PAPERCLIP_API_URL at the loopback bridge", async () => {
@@ -220,7 +258,9 @@ describe("legacy child-env credential separation", () => {
 
   it("T1.4 (remote parity control): the remote child env holds a bridge token plus a loopback URL", async () => {
     vi.stubEnv("PAPERCLIP_API_URL", SYNTHETIC_HOST_URL);
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-credscoping-remote-"));
+    const rootDir = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-credscoping-remote-"),
+    );
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     const instructionsPath = path.join(rootDir, "instructions.md");

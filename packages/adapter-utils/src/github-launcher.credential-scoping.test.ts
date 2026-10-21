@@ -12,13 +12,16 @@
  * only. Builder must not edit this file.
  */
 import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
+import {
+  githubBrokerEnvironment,
+  githubLauncherSource,
+} from "./github-launcher.js";
 
 const exec = promisify(execFile);
 
@@ -41,23 +44,31 @@ describe("launcher broker-base scoping", () => {
   });
 
   async function stageLauncher() {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-launcher-scoping-"));
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-launcher-scoping-"),
+    );
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
     const realBin = path.join(root, "real");
     await mkdir(bin);
     await mkdir(realBin);
-    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), {
+      mode: 0o700,
+    });
     await writeFile(
       path.join(realBin, "gh"),
-      '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));',
+      "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));",
       { mode: 0o700 },
     );
     return { root, bin, realBin };
   }
 
   async function startRecorder(
-    handler: (recorded: RecordedRequest) => { status: number; headers?: Record<string, string>; body: string },
+    handler: (recorded: RecordedRequest) => {
+      status: number;
+      headers?: Record<string, string>;
+      body: string;
+    },
   ): Promise<{ origin: string; requests: RecordedRequest[] }> {
     const requests: RecordedRequest[] = [];
     const server = createServer((req, res) => {
@@ -75,24 +86,42 @@ describe("launcher broker-base scoping", () => {
         };
         requests.push(recorded);
         const out = handler(recorded);
-        res.writeHead(out.status, out.headers ?? { "content-type": "application/json" });
+        res.writeHead(
+          out.status,
+          out.headers ?? { "content-type": "application/json" },
+        );
         res.end(out.body);
       });
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    cleanups.push(
+      () =>
+        new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
     const { port } = server.address() as { port: number };
     return { origin: `http://127.0.0.1:${port}`, requests };
   }
 
-  it("T8.1a: a broker base outside the API origin is refused before the capability is sent", { timeout: 30_000 }, async () => {
+  it("T8.1a: a broker base outside the API origin is refused before the capability is sent", {
+    timeout: 30_000,
+  }, async () => {
     const { root, bin, realBin } = await stageLauncher();
-    const evil = await startRecorder(() => ({ status: 200, body: JSON.stringify({ status: "available", env: {} }) }));
+    const evil = await startRecorder(() => ({
+      status: 200,
+      body: JSON.stringify({ status: "available", env: {} }),
+    }));
 
     const result = await exec(path.join(bin, "gh"), [], {
       env: {
         ...process.env,
-        ...githubBrokerEnvironment({}, { url: evil.origin, token: SYNTHETIC_BROKER_TOKEN }),
+        ...githubBrokerEnvironment(
+          {},
+          { url: evil.origin, token: SYNTHETIC_BROKER_TOKEN },
+        ),
         PAPERCLIP_API_URL: SYNTHETIC_API_URL,
         GH_CONFIG_DIR: root,
         PATH: `${bin}:${realBin}:${process.env.PATH}`,
@@ -104,9 +133,14 @@ describe("launcher broker-base scoping", () => {
     expect(JSON.parse(result.stdout)).toEqual({ token: null });
   });
 
-  it("T8.1b: an attacker path smuggled in the broker base never steers the credentials request", { timeout: 30_000 }, async () => {
+  it("T8.1b: an attacker path smuggled in the broker base never steers the credentials request", {
+    timeout: 30_000,
+  }, async () => {
     const { root, bin, realBin } = await stageLauncher();
-    const evil = await startRecorder(() => ({ status: 200, body: JSON.stringify({ status: "available", env: {} }) }));
+    const evil = await startRecorder(() => ({
+      status: 200,
+      body: JSON.stringify({ status: "available", env: {} }),
+    }));
 
     await exec(path.join(bin, "gh"), [], {
       env: {
@@ -126,13 +160,17 @@ describe("launcher broker-base scoping", () => {
     for (const request of evil.requests) {
       expect(request.url).toBe("/runtime-tools/github/credentials");
     }
-    expect(evil.requests.map((request) => request.url)).not.toContain("/evil-path/runtime-tools/github/credentials");
+    expect(evil.requests.map((request) => request.url)).not.toContain(
+      "/evil-path/runtime-tools/github/credentials",
+    );
     if (evil.requests.length > 0) {
       expect(evil.requests).toHaveLength(1);
     }
   });
 
-  it("T5.2: managed GitHub via the launcher broker succeeds against the stub broker", { timeout: 30_000 }, async () => {
+  it("T5.2: managed GitHub via the launcher broker succeeds against the stub broker", {
+    timeout: 30_000,
+  }, async () => {
     const { root, bin, realBin } = await stageLauncher();
     const broker = await startRecorder((recorded) => {
       expect(recorded.capability).toBe(SYNTHETIC_BROKER_TOKEN);
@@ -141,7 +179,10 @@ describe("launcher broker-base scoping", () => {
         status: 200,
         body: JSON.stringify({
           status: "available",
-          env: { GH_TOKEN: SYNTHETIC_GH_TOKEN, GITHUB_TOKEN: SYNTHETIC_GH_TOKEN },
+          env: {
+            GH_TOKEN: SYNTHETIC_GH_TOKEN,
+            GITHUB_TOKEN: SYNTHETIC_GH_TOKEN,
+          },
         }),
       };
     });
@@ -149,7 +190,10 @@ describe("launcher broker-base scoping", () => {
     const result = await exec(path.join(bin, "gh"), [], {
       env: {
         ...process.env,
-        ...githubBrokerEnvironment({ GH_TOKEN: "ambient-host-token" }, { url: broker.origin, token: SYNTHETIC_BROKER_TOKEN }),
+        ...githubBrokerEnvironment(
+          { GH_TOKEN: "ambient-host-token" },
+          { url: broker.origin, token: SYNTHETIC_BROKER_TOKEN },
+        ),
         PAPERCLIP_API_URL: broker.origin,
         GH_CONFIG_DIR: root,
         PATH: `${bin}:${realBin}:${process.env.PATH}`,
@@ -161,9 +205,14 @@ describe("launcher broker-base scoping", () => {
     expect(result.stderr).not.toMatch(/ambient-host-token/);
   });
 
-  it("T8.2: a redirect from the broker is never followed with the capability (redirect error pin)", { timeout: 30_000 }, async () => {
+  it("T8.2: a redirect from the broker is never followed with the capability (redirect error pin)", {
+    timeout: 30_000,
+  }, async () => {
     const { root, bin, realBin } = await stageLauncher();
-    const foreign = await startRecorder(() => ({ status: 200, body: JSON.stringify({ status: "available", env: {} }) }));
+    const foreign = await startRecorder(() => ({
+      status: 200,
+      body: JSON.stringify({ status: "available", env: {} }),
+    }));
     const broker = await startRecorder(() => ({
       status: 307,
       headers: { location: `${foreign.origin}/collect` },
@@ -173,7 +222,10 @@ describe("launcher broker-base scoping", () => {
     const result = await exec(path.join(bin, "gh"), [], {
       env: {
         ...process.env,
-        ...githubBrokerEnvironment({}, { url: broker.origin, token: SYNTHETIC_BROKER_TOKEN }),
+        ...githubBrokerEnvironment(
+          {},
+          { url: broker.origin, token: SYNTHETIC_BROKER_TOKEN },
+        ),
         PAPERCLIP_API_URL: broker.origin,
         GH_CONFIG_DIR: root,
         PATH: `${bin}:${realBin}:${process.env.PATH}`,

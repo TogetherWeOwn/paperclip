@@ -21,20 +21,40 @@ import { buildLocalProcessSandboxSpawnTarget } from "./local-process-sandbox.js"
 const cleanup: string[] = [];
 
 afterEach(async () => {
-  await Promise.all(cleanup.splice(0).map((candidate) => fs.rm(candidate, { recursive: true, force: true })));
+  await Promise.all(
+    cleanup
+      .splice(0)
+      .map((candidate) => fs.rm(candidate, { recursive: true, force: true })),
+  );
 });
 
 describe("sandbox egress allowlist proxy", () => {
-  async function startStub(text: string): Promise<{ port: number; close: () => Promise<void> }> {
-    const server = http.createServer((_request, response) => response.end(text));
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  async function startStub(
+    text: string,
+  ): Promise<{ port: number; close: () => Promise<void> }> {
+    const server = http.createServer((_request, response) =>
+      response.end(text),
+    );
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
     const address = server.address();
-    if (!address || typeof address === "string") throw new Error("Expected TCP test server address.");
-    return { port: address.port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    if (!address || typeof address === "string")
+      throw new Error("Expected TCP test server address.");
+    return {
+      port: address.port,
+      close: () =>
+        new Promise<void>((resolve) => server.close(() => resolve())),
+    };
   }
 
-  async function startProxy(input: { allowlist: string[]; trustedUrls?: string[] }) {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-egress-scoping-"));
+  async function startProxy(input: {
+    allowlist: string[];
+    trustedUrls?: string[];
+  }) {
+    const workspace = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-egress-scoping-"),
+    );
     cleanup.push(workspace);
     const target = await buildLocalProcessSandboxSpawnTarget({
       executable: process.execPath,
@@ -53,21 +73,32 @@ describe("sandbox egress allowlist proxy", () => {
     return { target, socketPath };
   }
 
-  function requestOverSocket(socketPath: string, url: string): Promise<{ status: number; body: string }> {
+  function requestOverSocket(
+    socketPath: string,
+    url: string,
+  ): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
-      const outgoing = http.request({ socketPath, path: url, headers: { host: new URL(url).host } }, (response) => {
-        let body = "";
-        response.on("data", (chunk) => {
-          body += chunk;
-        });
-        response.on("end", () => resolve({ status: response.statusCode ?? 0, body }));
-      });
+      const outgoing = http.request(
+        { socketPath, path: url, headers: { host: new URL(url).host } },
+        (response) => {
+          let body = "";
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () =>
+            resolve({ status: response.statusCode ?? 0, body }),
+          );
+        },
+      );
       outgoing.on("error", reject);
       outgoing.end();
     });
   }
 
-  function connectOverSocket(socketPath: string, target: string): Promise<string> {
+  function connectOverSocket(
+    socketPath: string,
+    target: string,
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(socketPath, () => {
         socket.end(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
@@ -82,107 +113,150 @@ describe("sandbox egress allowlist proxy", () => {
     });
   }
 
-  it.runIf(process.platform === "linux")("T7.1: allowed-host HTTP egress works through the proxy", async () => {
-    const stub = await startStub("allowed-response");
-    const { target, socketPath } = await startProxy({ allowlist: [`127.0.0.1:${stub.port}`] });
-    try {
-      const response = await requestOverSocket(socketPath, `http://127.0.0.1:${stub.port}/canary`);
-      expect(response.status).toBe(200);
-      expect(response.body).toBe("allowed-response");
-    } finally {
-      await target.cleanup?.();
-      await stub.close();
-    }
-  });
-
-  it.runIf(process.platform === "linux")("T7.2: denied hosts get 403 network_target_denied", async () => {
-    const stub = await startStub("allowed-response");
-    const { target, socketPath } = await startProxy({ allowlist: [`127.0.0.1:${stub.port}`] });
-    try {
-      const response = await requestOverSocket(socketPath, "http://example.com/");
-      expect(response.status).toBe(403);
-      expect(response.body).toBe(
-        '{"error":{"code":"network_target_denied","message":"Network target denied by Paperclip sandbox policy."}}\n',
-      );
-    } finally {
-      await target.cleanup?.();
-      await stub.close();
-    }
-  });
-
-  it.runIf(process.platform === "linux")("T7.3: CONNECT to a non-allowlisted host is denied", async () => {
-    const stub = await startStub("allowed-response");
-    const { target, socketPath } = await startProxy({ allowlist: [`127.0.0.1:${stub.port}`] });
-    try {
-      const response = await connectOverSocket(socketPath, "example.com:443");
-      expect(response).toContain("HTTP/1.1 403 Forbidden\r\n");
-      expect(response).toContain('"code":"network_target_denied"');
-    } finally {
-      await target.cleanup?.();
-      await stub.close();
-    }
-  });
-
-  it.runIf(process.platform === "linux")("T7.4: CONNECT to an allowlisted host tunnels bytes opaquely", async () => {
-    const stub = await startStub("tunneled-response");
-    const { target, socketPath } = await startProxy({ allowlist: [`127.0.0.1:${stub.port}`] });
-    try {
-      const tunneled = await new Promise<string>((resolve, reject) => {
-        const socket = net.createConnection(socketPath, () => {
-          socket.write(`CONNECT 127.0.0.1:${stub.port} HTTP/1.1\r\nHost: 127.0.0.1:${stub.port}\r\n\r\n`);
-        });
-        let buffered = "";
-        let established = false;
-        socket.setEncoding("utf8");
-        socket.on("data", (chunk) => {
-          buffered += chunk;
-          if (!established && buffered.includes("\r\n\r\n")) {
-            established = true;
-            buffered = "";
-            socket.write(`GET /ping HTTP/1.1\r\nHost: 127.0.0.1:${stub.port}\r\nConnection: close\r\n\r\n`);
-          }
-        });
-        socket.on("end", () => resolve(buffered));
-        socket.on("error", reject);
+  it.runIf(process.platform === "linux")(
+    "T7.1: allowed-host HTTP egress works through the proxy",
+    async () => {
+      const stub = await startStub("allowed-response");
+      const { target, socketPath } = await startProxy({
+        allowlist: [`127.0.0.1:${stub.port}`],
       });
-      expect(tunneled).toContain("200");
-      expect(tunneled).toContain("tunneled-response");
-    } finally {
-      await target.cleanup?.();
-      await stub.close();
-    }
-  });
+      try {
+        const response = await requestOverSocket(
+          socketPath,
+          `http://127.0.0.1:${stub.port}/canary`,
+        );
+        expect(response.status).toBe(200);
+        expect(response.body).toBe("allowed-response");
+      } finally {
+        await target.cleanup?.();
+        await stub.close();
+      }
+    },
+  );
 
-  it.runIf(process.platform === "linux")("T7.6: absolute-URL HTTPS without CONNECT is rejected, not forwarded", async () => {
-    const stub = await startStub("allowed-response");
-    const { target, socketPath } = await startProxy({ allowlist: [`127.0.0.1:${stub.port}`] });
-    try {
-      const response = await requestOverSocket(socketPath, `https://127.0.0.1:${stub.port}/canary`);
-      expect(response.status).toBe(400);
-      expect(response.body).toContain('"code":"https_requires_connect"');
-    } finally {
-      await target.cleanup?.();
-      await stub.close();
-    }
-  });
+  it.runIf(process.platform === "linux")(
+    "T7.2: denied hosts get 403 network_target_denied",
+    async () => {
+      const stub = await startStub("allowed-response");
+      const { target, socketPath } = await startProxy({
+        allowlist: [`127.0.0.1:${stub.port}`],
+      });
+      try {
+        const response = await requestOverSocket(
+          socketPath,
+          "http://example.com/",
+        );
+        expect(response.status).toBe(403);
+        expect(response.body).toBe(
+          '{"error":{"code":"network_target_denied","message":"Network target denied by Paperclip sandbox policy."}}\n',
+        );
+      } finally {
+        await target.cleanup?.();
+        await stub.close();
+      }
+    },
+  );
 
-  it.runIf(process.platform === "linux")("T7-deny: networkScope deny removes network without proxy env, never open network", async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-egress-deny-"));
-    cleanup.push(workspace);
-    const target = await buildLocalProcessSandboxSpawnTarget({
-      executable: process.execPath,
-      args: ["-e", "process.exit(0)"],
-      cwd: workspace,
-      options: { workspaceDir: workspace, networkScope: "deny" },
-    });
-    try {
-      expect(target.args).toContain("--unshare-net");
-      expect(target.env?.HTTP_PROXY).toBeUndefined();
-      expect(target.env?.HTTPS_PROXY).toBeUndefined();
-      expect(target.env?.http_proxy).toBeUndefined();
-      expect(target.env?.https_proxy).toBeUndefined();
-    } finally {
-      await target.cleanup?.();
-    }
-  });
+  it.runIf(process.platform === "linux")(
+    "T7.3: CONNECT to a non-allowlisted host is denied",
+    async () => {
+      const stub = await startStub("allowed-response");
+      const { target, socketPath } = await startProxy({
+        allowlist: [`127.0.0.1:${stub.port}`],
+      });
+      try {
+        const response = await connectOverSocket(socketPath, "example.com:443");
+        expect(response).toContain("HTTP/1.1 403 Forbidden\r\n");
+        expect(response).toContain('"code":"network_target_denied"');
+      } finally {
+        await target.cleanup?.();
+        await stub.close();
+      }
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "T7.4: CONNECT to an allowlisted host tunnels bytes opaquely",
+    async () => {
+      const stub = await startStub("tunneled-response");
+      const { target, socketPath } = await startProxy({
+        allowlist: [`127.0.0.1:${stub.port}`],
+      });
+      try {
+        const tunneled = await new Promise<string>((resolve, reject) => {
+          const socket = net.createConnection(socketPath, () => {
+            socket.write(
+              `CONNECT 127.0.0.1:${stub.port} HTTP/1.1\r\nHost: 127.0.0.1:${stub.port}\r\n\r\n`,
+            );
+          });
+          let buffered = "";
+          let established = false;
+          socket.setEncoding("utf8");
+          socket.on("data", (chunk) => {
+            buffered += chunk;
+            if (!established && buffered.includes("\r\n\r\n")) {
+              established = true;
+              buffered = "";
+              socket.write(
+                `GET /ping HTTP/1.1\r\nHost: 127.0.0.1:${stub.port}\r\nConnection: close\r\n\r\n`,
+              );
+            }
+          });
+          socket.on("end", () => resolve(buffered));
+          socket.on("error", reject);
+        });
+        expect(tunneled).toContain("200");
+        expect(tunneled).toContain("tunneled-response");
+      } finally {
+        await target.cleanup?.();
+        await stub.close();
+      }
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "T7.6: absolute-URL HTTPS without CONNECT is rejected, not forwarded",
+    async () => {
+      const stub = await startStub("allowed-response");
+      const { target, socketPath } = await startProxy({
+        allowlist: [`127.0.0.1:${stub.port}`],
+      });
+      try {
+        const response = await requestOverSocket(
+          socketPath,
+          `https://127.0.0.1:${stub.port}/canary`,
+        );
+        expect(response.status).toBe(400);
+        expect(response.body).toContain('"code":"https_requires_connect"');
+      } finally {
+        await target.cleanup?.();
+        await stub.close();
+      }
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "T7-deny: networkScope deny removes network without proxy env, never open network",
+    async () => {
+      const workspace = await fs.mkdtemp(
+        path.join(os.tmpdir(), "paperclip-egress-deny-"),
+      );
+      cleanup.push(workspace);
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: workspace,
+        options: { workspaceDir: workspace, networkScope: "deny" },
+      });
+      try {
+        expect(target.args).toContain("--unshare-net");
+        expect(target.env?.HTTP_PROXY).toBeUndefined();
+        expect(target.env?.HTTPS_PROXY).toBeUndefined();
+        expect(target.env?.http_proxy).toBeUndefined();
+        expect(target.env?.https_proxy).toBeUndefined();
+      } finally {
+        await target.cleanup?.();
+      }
+    },
+  );
 });

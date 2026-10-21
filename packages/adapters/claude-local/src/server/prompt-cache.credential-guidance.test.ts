@@ -14,7 +14,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 
-const REPO_SKILL_MD = new URL("../../../../../skills/paperclip/SKILL.md", import.meta.url);
+const REPO_SKILL_MD = new URL(
+  "../../../../../skills/paperclip/SKILL.md",
+  import.meta.url,
+);
 
 describe("prompt-bundle credential guidance", () => {
   const cleanupDirs: string[] = [];
@@ -33,7 +36,9 @@ describe("prompt-bundle credential guidance", () => {
     const authStart = skill.indexOf("## Authentication");
     expect(authStart).toBeGreaterThanOrEqual(0);
     const nextSection = skill.indexOf("\n## ", authStart + 1);
-    return nextSection === -1 ? skill.slice(authStart) : skill.slice(authStart, nextSection);
+    return nextSection === -1
+      ? skill.slice(authStart)
+      : skill.slice(authStart, nextSection);
   }
 
   it("T6.1: the Paperclip skill forbids substituting a Paperclip credential for GitHub auth", async () => {
@@ -45,8 +50,12 @@ describe("prompt-bundle credential guidance", () => {
 
   it("T6.2: the Paperclip skill forbids forwarding credentials to unapproved origins", async () => {
     const authentication = await readSkillAuthentication();
-    expect(authentication).toMatch(/must not[^.\n]*forward[^.\n]*(credential|token|key|secret|authorization)/i);
-    expect(authentication).toMatch(/(unapproved|untrusted|non-paperclip|foreign|allowlist)/i);
+    expect(authentication).toMatch(
+      /must not[^.\n]*forward[^.\n]*(credential|token|key|secret|authorization)/i,
+    );
+    expect(authentication).toMatch(
+      /(unapproved|untrusted|non-paperclip|foreign|allowlist)/i,
+    );
   });
 
   it("T6.3: a bundle whose skill source is missing fails closed instead of launching unguided", async () => {
@@ -57,7 +66,10 @@ describe("prompt-bundle credential guidance", () => {
           {
             key: "paperclipai/paperclip/paperclip",
             runtimeName: "paperclip",
-            source: path.join(os.tmpdir(), "paperclip-scoping-missing-skill-source"),
+            source: path.join(
+              os.tmpdir(),
+              "paperclip-scoping-missing-skill-source",
+            ),
             sourceStatus: "missing",
           },
         ],
@@ -68,7 +80,9 @@ describe("prompt-bundle credential guidance", () => {
   });
 
   it("T6.4: the bundle mounts the skill and content-addresses SKILL.md into the bundle key", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-bundle-guidance-"));
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "paperclip-bundle-guidance-"),
+    );
     cleanupDirs.push(root);
     const skillDir = path.join(root, "paperclip");
     await mkdir(skillDir, { recursive: true });
@@ -78,7 +92,11 @@ describe("prompt-bundle credential guidance", () => {
       source: skillDir,
     };
 
-    await writeFile(path.join(skillDir, "SKILL.md"), "# Paperclip Skill\n\n## Authentication\n\nRule set A.\n", "utf8");
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "# Paperclip Skill\n\n## Authentication\n\nRule set A.\n",
+      "utf8",
+    );
     const first = await prepareClaudePromptBundle({
       companyId: "company-scoping-test",
       skills: [entry],
@@ -92,7 +110,11 @@ describe("prompt-bundle credential guidance", () => {
     );
     expect(mountedSkill).toContain("Rule set A.");
 
-    await writeFile(path.join(skillDir, "SKILL.md"), "# Paperclip Skill\n\n## Authentication\n\nRule set B.\n", "utf8");
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "# Paperclip Skill\n\n## Authentication\n\nRule set B.\n",
+      "utf8",
+    );
     const second = await prepareClaudePromptBundle({
       companyId: "company-scoping-test",
       skills: [entry],
