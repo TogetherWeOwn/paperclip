@@ -1342,6 +1342,7 @@ export const PLUGIN_CAPABILITIES = [
   "approvals.read",
   "issue.documents.read",
   "agents.read",
+  "agents.queued_counts.read",
   "goals.read",
   "goals.create",
   "goals.update",
