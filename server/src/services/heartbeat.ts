@@ -26416,6 +26416,10 @@ export function heartbeatService(
                 : "failed";
 
         const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
+        // mirror the per-run PID accounting into the usage metrics
+        // whenever a usage row is persisted (resultJson always carries it).
+        const pidStatsForUsage =
+          parseObject(adapterResult.resultJson).pidStats ?? null;
         const usageJson =
           normalizedUsage ||
           adapterResult.costUsd != null ||
@@ -26471,6 +26475,7 @@ export function heartbeatService(
                 billingType: normalizeLedgerBillingType(
                   adapterResult.billingType,
                 ),
+                ...(pidStatsForUsage ? { pidStats: pidStatsForUsage } : {}),
               } as Record<string, unknown>)
             : null;
 

@@ -1,0 +1,166 @@
+import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  countProcessesInGroup,
+  RUN_PID_LIMIT_ENV_KEY,
+} from "./run-pids-guard.js";
+import { RUN_PID_LIMIT_EXCEEDED, runChildProcess } from "./server-utils.js";
+
+const isLinux = process.platform === "linux";
+// Unique fixture marker: no other test binary uses this sleep duration.
+const FORK_MARKER = "29731";
+const FORK_CHILDREN = 48;
+
+function procCmdlinesContain(marker: string): number[] {
+  const hits: number[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return hits;
+  }
+  for (const entry of entries) {
+    if (!/^[0-9]+$/.test(entry)) continue;
+    try {
+      const cmdline = readFileSync(path.join("/proc", entry, "cmdline"), "utf8");
+      if (cmdline.includes(marker)) hits.push(Number(entry));
+    } catch {
+      continue;
+    }
+  }
+  return hits;
+}
+
+async function killFixtureLeftovers(): Promise<void> {
+  if (!isLinux) return;
+  for (const pid of procCmdlinesContain(FORK_MARKER)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+describe("runChildProcess per-run PID limit", () => {
+  const savedEnv = {
+    limit: process.env[RUN_PID_LIMIT_ENV_KEY],
+    interval: process.env.PAPERCLIP_RUN_PID_GUARD_INTERVAL_MS,
+    cgroup: process.env.PAPERCLIP_RUN_CGROUP_PARENT,
+  };
+  beforeEach(() => {
+    delete process.env[RUN_PID_LIMIT_ENV_KEY];
+    delete process.env.PAPERCLIP_RUN_PID_GUARD_INTERVAL_MS;
+    delete process.env.PAPERCLIP_RUN_CGROUP_PARENT;
+  });
+  afterEach(async () => {
+    if (savedEnv.limit === undefined) delete process.env[RUN_PID_LIMIT_ENV_KEY];
+    else process.env[RUN_PID_LIMIT_ENV_KEY] = savedEnv.limit;
+    if (savedEnv.interval === undefined) {
+      delete process.env.PAPERCLIP_RUN_PID_GUARD_INTERVAL_MS;
+    } else {
+      process.env.PAPERCLIP_RUN_PID_GUARD_INTERVAL_MS = savedEnv.interval;
+    }
+    if (savedEnv.cgroup === undefined) {
+      delete process.env.PAPERCLIP_RUN_CGROUP_PARENT;
+    } else {
+      process.env.PAPERCLIP_RUN_CGROUP_PARENT = savedEnv.cgroup;
+    }
+    await killFixtureLeftovers();
+  });
+
+  it("records the default budget on a normal run", async () => {
+    const result = await runChildProcess(randomUUID(), "echo", ["hi"], {
+      cwd: process.cwd(),
+      env: {},
+      timeoutSec: 30,
+      graceSec: 1,
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.pidStats?.limit).toBe(512);
+    expect(result.pidStats?.exceeded).toBe(false);
+    expect(result.pidStats?.peak).toBeGreaterThanOrEqual(isLinux ? 1 : 0);
+  });
+
+  it.runIf(isLinux)(
+    "fails only the runaway run with run_pid_limit_exceeded",
+    async () => {
+      // Bounded fork fixture: exactly FORK_CHILDREN short sleeps, no
+      // recursion, unique marker for the afterEach backstop.
+      const forkScript = [
+        "const { spawn } = require('node:child_process');",
+        `for (let i = 0; i < ${FORK_CHILDREN}; i += 1) {`,
+        `  const c = spawn('sleep', ['${FORK_MARKER}'], { stdio: 'ignore' });`,
+        "  c.unref();",
+        "}",
+        "setTimeout(() => {}, 60000);",
+      ].join("\n");
+      let forkPgid: number | null = null;
+      const forkRun = runChildProcess(randomUUID(), process.execPath, ["-e", forkScript], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 30,
+        graceSec: 1,
+        pidLimit: 32,
+        pidGuardIntervalMs: 50,
+        onLog: async () => {},
+        onSpawn: async (meta) => {
+          forkPgid = meta.processGroupId;
+        },
+      });
+      // A normal run alongside the runaway must be unaffected.
+      const normalRun = runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "setTimeout(() => console.log('alongside-ok'), 1200);"],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 30,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+      const [forkResult, normalResult] = await Promise.all([forkRun, normalRun]);
+
+      expect(forkResult.errorCode).toBe(RUN_PID_LIMIT_EXCEEDED);
+      expect(RUN_PID_LIMIT_EXCEEDED).toBe("run_pid_limit_exceeded");
+      expect(forkResult.stderr).toContain("run PID limit exceeded");
+      expect(forkResult.stderr).toContain(RUN_PID_LIMIT_EXCEEDED);
+      expect(forkResult.pidStats?.limit).toBe(32);
+      expect(forkResult.pidStats?.exceeded).toBe(true);
+      expect(forkResult.pidStats?.peak).toBeGreaterThan(32);
+      expect(forkResult.pidStats?.enforced).toBe("poll");
+
+      expect(normalResult.exitCode).toBe(0);
+      expect(normalResult.errorCode ?? null).toBeNull();
+      expect(normalResult.stdout).toContain("alongside-ok");
+      expect(normalResult.pidStats?.exceeded).toBe(false);
+
+      // The runaway tree is fully reaped: its process group is empty and no
+      // fixture sleep survives anywhere on the box.
+      if (forkPgid === null) throw new Error("fork fixture never spawned");
+      expect(countProcessesInGroup(forkPgid)).toBe(0);
+      expect(procCmdlinesContain(FORK_MARKER)).toEqual([]);
+    },
+    30_000,
+  );
+
+  it.runIf(isLinux)("honors an explicit per-agent limit", async () => {
+    const result = await runChildProcess(randomUUID(), "echo", ["hi"], {
+      cwd: process.cwd(),
+      env: {},
+      timeoutSec: 30,
+      graceSec: 1,
+      pidLimit: 128,
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.pidStats?.limit).toBe(128);
+    expect(result.pidStats?.exceeded).toBe(false);
+  });
+});

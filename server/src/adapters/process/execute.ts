@@ -13,6 +13,7 @@ import {
   resolveCommandForLogs,
   runChildProcess,
 } from "../utils.js";
+import { resolveRunPidLimit } from "@paperclipai/adapter-utils/server-utils";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta, authToken } = ctx;
@@ -51,6 +52,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 15);
+  const runPidLimit = resolveRunPidLimit(config.runPidLimit);
 
   if (onMeta) {
     await onMeta({
@@ -67,6 +69,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env,
     timeoutSec,
     graceSec,
+    pidLimit: runPidLimit,
     onLog,
     onSpawn: ctx.onSpawn,
   });
@@ -86,9 +89,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: false,
       errorMessage: `Process exited with code ${proc.exitCode ?? -1}`,
+      errorCode: proc.errorCode ?? null,
       resultJson: {
         stdout: proc.stdout,
         stderr: proc.stderr,
+        ...(proc.pidStats ? { pidStats: proc.pidStats } : {}),
       },
     };
   }
@@ -100,6 +105,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     resultJson: {
       stdout: proc.stdout,
       stderr: proc.stderr,
+      ...(proc.pidStats ? { pidStats: proc.pidStats } : {}),
     },
   };
 }
