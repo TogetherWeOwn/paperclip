@@ -160,6 +160,12 @@ export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingCon
 // same write that sets the flag, and every clear removes both keys together.
 export const EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY = "reopenPendingConsumptionSince";
 
+// The blocker text the close-readiness preflight and the archive route both
+// report for a reopen-pending workspace. One constant keeps the preflight
+// consistent with the authoritative under-lock archive guard by construction.
+export const EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON =
+  "Execution workspace was reopened and cannot be archived right now";
+
 export function metadataHasReopenPendingConsumption(
   metadata: Record<string, unknown> | null | undefined,
 ): boolean {
@@ -2627,6 +2633,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const blockingReasons: string[] = [];
       if (!statusInspectionSucceeded) {
         blockingReasons.push("Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
+      }
+      if (metadataHasReopenPendingConsumption(workspace.metadata as Record<string, unknown> | null)) {
+        // A reopen published this row as active while its source issue is still
+        // terminal. The under-lock archive guard refuses this row with 409, so the
+        // preflight reports the same blocker: callers check readiness before they
+        // preserve and archive, and a stale "ready" would waste a preservation
+        // upload on a refusal. Unmerged-work warnings stay separate below, and the
+        // archive guard stays authoritative for a reopen that lands after this read.
+        blockingReasons.push(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
       }
       const isSharedWorkspace = executionWorkspace.mode === "shared_workspace";
       const workspacePath = readNullableString(executionWorkspace.providerRef) ?? readNullableString(executionWorkspace.cwd);
