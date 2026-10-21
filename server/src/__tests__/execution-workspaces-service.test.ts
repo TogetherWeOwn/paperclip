@@ -29,14 +29,17 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
+  EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
+  clearMetadataReopenPendingConsumption,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
   readMetadataReopenPendingConsumptionSince,
+  setMetadataReopenPendingConsumption,
 } from "../services/execution-workspaces.ts";
 import { issueService } from "../services/issues.ts";
 import {
@@ -1642,6 +1645,111 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       (workspace?.metadata as Record<string, unknown> | null)?.[EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY],
     ).toBe(4);
     // The rebuilt worktree is intact.
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("reports a reopen-pending workspace as blocked and keeps unmerged-work warnings separate", async () => {
+    // The close-readiness preflight omitted the reopen-pending blocker while the
+    // under-lock archive guard refused the same row with 409, so callers paid for
+    // a preservation upload before learning the archive was refused. The
+    // preflight reports the same blocker as the authoritative guard, in the same
+    // words, and keeps the unmerged-work warnings alongside it.
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({
+        metadata: setMetadataReopenPendingConsumption(
+          {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+          },
+          new Date("2026-10-18T03:30:36.158Z"),
+        ),
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.state).toBe("blocked");
+    expect(readiness?.blockingReasons).toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(readiness?.isDestructiveCloseAllowed).toBe(false);
+    expect(readiness?.deliveryState).toBe("unmerged");
+    expect(readiness?.warnings).toContain(
+      "This workspace is 1 commit ahead of main and is not merged.",
+    );
+  });
+
+  it("treats consumed and unset reopen metadata as non-blocking", async () => {
+    // Only a set reopen-pending flag blocks the preflight. A workspace that never
+    // carried the flag, and one whose consumer already cleared it, both stay
+    // archivable through the preflight.
+    const seeded = await seedTerminalWorkspace();
+
+    const unsetReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(unsetReadiness?.blockingReasons).not.toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(unsetReadiness?.blockingReasons).toEqual([]);
+    expect(unsetReadiness?.isDestructiveCloseAllowed).toBe(true);
+
+    const pendingMetadata = setMetadataReopenPendingConsumption(
+      {
+        createdByRuntime: true,
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+      },
+      new Date("2026-10-19T21:45:12.927Z"),
+    );
+    await db
+      .update(executionWorkspaces)
+      .set({ metadata: clearMetadataReopenPendingConsumption(pendingMetadata) })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const consumedReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(consumedReadiness?.blockingReasons).not.toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(consumedReadiness?.blockingReasons).toEqual([]);
+    expect(consumedReadiness?.isDestructiveCloseAllowed).toBe(true);
+  });
+
+  it("still refuses the archive when a reopen lands after a ready preflight", async () => {
+    // The preflight is a point-in-time read: a reopen can publish the
+    // reopen-pending flag after the readiness check and before the archive
+    // write. The under-lock guard stays authoritative for that race and refuses
+    // the stale ready preflight, so the rebuilt worktree survives.
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+
+    const staleReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(staleReadiness?.blockingReasons).toEqual([]);
+    expect(staleReadiness?.isDestructiveCloseAllowed).toBe(true);
+
+    // A concurrent reopen publishes the row active with the pending flag.
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "active",
+        metadata: setMetadataReopenPendingConsumption(
+          {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+          },
+          new Date(),
+        ),
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+    expect(result).toEqual({ outcome: "reopen_pending" });
+
+    const [workspace] = await db
+      .select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("active");
+    expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
