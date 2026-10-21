@@ -95,7 +95,9 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/documents.js", () => ({
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => ({
+      remapOpenThreadsForDocument: async () => [],
+    }),
     documentService: () => mockDocumentsService,
   }));
 
@@ -128,7 +130,9 @@ function registerModuleMocks() {
     companySkillService: () => ({
       completeTestRunForIssue: vi.fn(async () => null),
     }),
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentAnnotationService: () => ({
+      remapOpenThreadsForDocument: async () => [],
+    }),
     documentService: () => mockDocumentsService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({}),
@@ -173,16 +177,20 @@ async function createApp(
   db: unknown = {},
 ) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    vi.importActual<typeof import("../routes/issues.js")>(
+      "../routes/issues.js",
+    ),
+    vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    ),
   ]);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = actor;
+    (req as unknown as { actor: Express.Request["actor"] }).actor = actor;
     next();
   });
-  app.use("/api", issueRoutes(db as any, {} as any));
+  app.use("/api", issueRoutes(db as never, {} as never));
   app.use(errorHandler);
   return app;
 }
@@ -249,7 +257,9 @@ describe("issue document byte-fidelity routes", () => {
       },
     });
     mockInstanceSettingsService.getExperimental.mockResolvedValue({});
-    mockInstanceSettingsService.getGeneral.mockResolvedValue({ feedbackDataSharingPreference: "prompt" });
+    mockInstanceSettingsService.getGeneral.mockResolvedValue({
+      feedbackDataSharingPreference: "prompt",
+    });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue([companyId]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
@@ -257,10 +267,12 @@ describe("issue document byte-fidelity routes", () => {
 
   it("creates a new document with byte-identical body and hash", async () => {
     const fixture = buildByteFixture("create");
-    mockDocumentsService.upsertIssueDocument.mockImplementation(async (input: { body: string }) => ({
-      created: true,
-      document: storedDocument(input.body),
-    }));
+    mockDocumentsService.upsertIssueDocument.mockImplementation(
+      async (input: { body: string }) => ({
+        created: true,
+        document: storedDocument(input.body),
+      }),
+    );
 
     const res = await request(await createApp())
       .put(`/api/issues/${issueId}/documents/spec`)
@@ -270,7 +282,9 @@ describe("issue document byte-fidelity routes", () => {
     expect(mockDocumentsService.upsertIssueDocument).toHaveBeenCalledTimes(1);
     const received = mockDocumentsService.upsertIssueDocument.mock.calls[0][0];
     expect(received.body).toBe(fixture);
-    expect(Buffer.byteLength(received.body, "utf8")).toBe(Buffer.byteLength(fixture, "utf8"));
+    expect(Buffer.byteLength(received.body, "utf8")).toBe(
+      Buffer.byteLength(fixture, "utf8"),
+    );
     expect(sha256(received.body)).toBe(sha256(fixture));
     expect(res.body.body).toBe(fixture);
     expect(sha256(res.body.body)).toBe(sha256(fixture));
@@ -279,23 +293,32 @@ describe("issue document byte-fidelity routes", () => {
   it("updates a document revision-safely with byte-identical body and hash", async () => {
     const fixture = buildByteFixture("update");
     const baseRevisionId = "33333333-3333-4333-8333-333333333333";
-    mockDocumentsService.upsertIssueDocument.mockImplementation(async (input: { body: string }) => ({
-      created: false,
-      document: storedDocument(input.body, {
-        latestRevisionId: "revision-2",
-        latestRevisionNumber: 2,
+    mockDocumentsService.upsertIssueDocument.mockImplementation(
+      async (input: { body: string }) => ({
+        created: false,
+        document: storedDocument(input.body, {
+          latestRevisionId: "revision-2",
+          latestRevisionNumber: 2,
+        }),
       }),
-    }));
+    );
 
     const res = await request(await createApp())
       .put(`/api/issues/${issueId}/documents/spec`)
-      .send({ format: "markdown", title: "Spec", body: fixture, baseRevisionId });
+      .send({
+        format: "markdown",
+        title: "Spec",
+        body: fixture,
+        baseRevisionId,
+      });
 
     expect(res.status).toBe(200);
     const received = mockDocumentsService.upsertIssueDocument.mock.calls[0][0];
     expect(received.baseRevisionId).toBe(baseRevisionId);
     expect(received.body).toBe(fixture);
-    expect(Buffer.byteLength(received.body, "utf8")).toBe(Buffer.byteLength(fixture, "utf8"));
+    expect(Buffer.byteLength(received.body, "utf8")).toBe(
+      Buffer.byteLength(fixture, "utf8"),
+    );
     expect(sha256(received.body)).toBe(sha256(fixture));
     expect(res.body.body).toBe(fixture);
   });
@@ -303,7 +326,8 @@ describe("issue document byte-fidelity routes", () => {
   it("keeps the stale-revision conflict without mangling the attempted body", async () => {
     const fixture = buildByteFixture("stale");
     const currentRevisionId = "44444444-4444-4434-8444-444444444444";
-    const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    const { conflict } =
+      await vi.importActual<typeof import("../errors.js")>("../errors.js");
     mockDocumentsService.upsertIssueDocument.mockRejectedValue(
       conflict("Document was updated by someone else", { currentRevisionId }),
     );
