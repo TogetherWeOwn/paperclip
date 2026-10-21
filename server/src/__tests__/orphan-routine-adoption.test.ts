@@ -52,6 +52,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner orphaned routine firi
   async function seed(params: {
     siblingStatus?: "in_progress" | "done";
     orphanFingerprint?: string;
+    orphanStaleCheckout?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -84,6 +85,19 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner orphaned routine firi
       invocationSource: "manual",
       startedAt: new Date(),
     });
+    let staleCheckoutRunId: string | null = null;
+    if (params.orphanStaleCheckout) {
+      staleCheckoutRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: staleCheckoutRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+    }
     const siblingStatus = params.siblingStatus ?? "in_progress";
     await db.insert(issues).values({
       id: currentIssueId,
@@ -109,10 +123,10 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner orphaned routine firi
       originKind: "routine_execution",
       originId: ROUTINE_ID,
       originFingerprint: params.orphanFingerprint ?? FINGERPRINT,
-      checkoutRunId: null,
+      checkoutRunId: staleCheckoutRunId,
       executionRunId: null,
     });
-    return { agentId, currentRunId, currentIssueId, orphanIssueId };
+    return { agentId, currentRunId, currentIssueId, orphanIssueId, staleCheckoutRunId };
   }
 
   it("rejects adoption of an orphaned firing with a 409 while a sibling firing holds the execution slot", async () => {
@@ -120,13 +134,38 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner orphaned routine firi
 
     await expect(
       svc.assertCheckoutOwner(seeded.orphanIssueId, seeded.agentId, seeded.currentRunId),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "routine_execution_slot_held" },
+    });
 
     const row = await db
       .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
       .from(issues)
       .where(eq(issues.id, seeded.orphanIssueId))
       .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("clears a terminal checkout, then rejects adoption with a 409 while a sibling firing holds the execution slot", async () => {
+    const seeded = await seed({ orphanStaleCheckout: true });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.orphanIssueId, seeded.agentId, seeded.currentRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "routine_execution_slot_held" },
+    });
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.orphanIssueId))
+      .then((rows) => rows[0]);
+    // clearCheckoutRunIfTerminal commits before adoption runs, so a terminal
+    // checkout always collides through the unowned branch and the row is left
+    // fully released. The stale-adoption wrap only serves the live→terminal
+    // race window between the clear and the adopt transaction.
     expect(row).toEqual({ checkoutRunId: null, executionRunId: null });
   });
 
