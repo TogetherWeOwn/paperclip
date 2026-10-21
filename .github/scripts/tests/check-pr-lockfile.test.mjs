@@ -32,6 +32,16 @@ test('fails when lockfile changed by regular user', () => {
   assert.ok(result.failures[0].includes('pnpm-lock.yaml'));
 });
 
+test('fails when lockfile changed by regular user on refresh head', () => {
+  const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'chore/refresh-lockfile');
+  assert.equal(result.passed, false);
+});
+
+test('fails when lockfile changed by regular user on deploy head', () => {
+  const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'chore/refresh-lockfile-deploy-tog6');
+  assert.equal(result.passed, false);
+});
+
 test('fails when lockfile changed by bot on wrong branch', () => {
   const result = checkLockfile(
     makeFiles(['pnpm-lock.yaml']),

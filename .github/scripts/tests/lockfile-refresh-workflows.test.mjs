@@ -39,10 +39,12 @@ test('lockfile refresh covers each base branch with its own head', async () => {
 
   // The trusted policy exempts both bot heads from the manual-edit block, and
   // only for same-repo heads: a fork can reuse the branch name, so the head
-  // repository must match.
+  // repository must match. The || joining the repo guard to the head-name
+  // check is pinned too: flipping it to && would silently reintroduce the
+  // fork bypass (and skip the step for every same-repo PR).
   assert.match(trusted, /github\.head_ref != 'chore\/refresh-lockfile' &&/);
   assert.match(trusted, /github\.head_ref != 'chore\/refresh-lockfile-deploy-tog6'/);
-  assert.match(trusted, /github\.event\.pull_request\.head\.repo\.full_name != github\.repository/);
+  assert.match(trusted, /github\.event\.pull_request\.head\.repo\.full_name != github\.repository \|\|/);
 });
 
 test('lockfile repair workflows resolve dependencies instead of updating metadata only', async () => {
