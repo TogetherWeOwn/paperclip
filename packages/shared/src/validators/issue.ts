@@ -2133,7 +2133,10 @@ export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);
 export const upsertIssueDocumentSchema = z.object({
   title: z.string().trim().max(200).nullable().optional(),
   format: issueDocumentFormatSchema,
-  body: multilineTextSchema.pipe(z.string().max(524288)),
+  // Documents preserve exact bytes: no multilineTextSchema normalization.
+  // Escape-shaped source sequences (e.g. Python "\n", regex "\d") must
+  // round-trip untouched; normalizing them silently corrupts stored code.
+  body: z.string().max(524288),
   changeSummary: z.string().trim().max(500).nullable().optional(),
   baseRevisionId: z.string().guid().nullable().optional(),
 });
