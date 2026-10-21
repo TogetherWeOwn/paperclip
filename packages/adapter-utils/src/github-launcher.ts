@@ -1,6 +1,6 @@
 /**
  * SHA-256 digests of every earlier managed launcher that shipped (`git log -- github-launcher.ts`):
- * 1cc45086d, 297d8741f, 82f662656, ffb01ff3d, ab832bc02 (= d2ecec335), 5442f2d86, b721d24ca, 7d7871b58.
+ * 1cc45086d, 297d8741f, 82f662656, ffb01ff3d, ab832bc02 (= d2ecec335), 5442f2d86, b721d24ca, 7d7871b58, e3afc6b86.
  * Production before this fix ran 5442f2d86. Interim heads of the recursion fix were only ever staged in
  * unbuilt pin candidates and are deliberately absent.
  * A directory is skipped on `PATH` only when every `git`/`gh` in it is byte-identical to the running launcher
