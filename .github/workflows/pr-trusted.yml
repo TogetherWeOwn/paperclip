@@ -258,6 +258,7 @@ jobs:
           base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_ref" --jq '.object.sha')"
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::current base branch has no valid commit SHA"; exit 1; }
           git cat-file -e "$base_sha^{commit}" 2>/dev/null || git fetch --no-tags origin "$base_sha"
+          echo "ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "::notice title=PR base::checking against $base_ref at $base_sha (event base $EVENT_BASE_SHA)"
 
@@ -304,7 +305,7 @@ jobs:
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
           github.event.pull_request.user.login != 'dependabot[bot]' &&
-          !startsWith(github.base_ref, 'deploy/')
+          !startsWith(steps.base.outputs.ref, 'deploy/')
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
