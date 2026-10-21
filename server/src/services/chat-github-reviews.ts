@@ -45,6 +45,7 @@ import {
 import { HttpError, conflict, forbidden, notFound } from "../errors.js";
 import {
   evictGithubBotRepositoryToken,
+  githubBotRepositoryRequest,
   githubBotRepositoryToken,
   githubBotRequest,
 } from "./chat-github-client.js";
@@ -740,8 +741,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         }, async path => {
           // This closure is invoked ONLY after the snapshot reader validates an
           // exact commit-addressed object. No general live client exists here.
-          const token = await githubBotRepositoryToken(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, fetchImpl, "read");
-          return githubBotRequest(fetchImpl, token, `/repos/${source.repository}${path}`);
+          // Through the shared wrapper so a revoked cached token evicts and
+          // retries once instead of failing until expiry.
+          return githubBotRepositoryRequest(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, `/repos/${source.repository}${path}`, {}, fetchImpl, "read");
         }, source.previousAssessment?.headSha)
       : await client(source);
     const pull = await api.request<Pull>(`/pulls/${source.number}`);
