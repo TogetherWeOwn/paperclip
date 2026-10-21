@@ -1,7 +1,7 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { chatDeliveries, chatGitHubReviews, type Db } from "@paperclipai/db";
 import type { GitHubReviewEventContext } from "@paperclipai/shared";
-import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
+import { evictGithubBotRepositoryToken, githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 
 /** Paperclip's own check never gates the request for it. */
 const OWN_CHECK = "Paperclip Review";
@@ -101,7 +101,10 @@ export async function githubGreenReviewContext(input: {
   | { ready: true; context: GitHubReviewEventContext }
   | { ready: false; outcome: GitHubGreenRequestOutcome }
 > {
-  const token = await githubBotRepositoryToken(
+  // One token for the whole green check, reused across its GitHub calls; a
+  // 401 evicts the cached entry and retries once with a fresh token, mirroring
+  // the review/check clients.
+  let token = await githubBotRepositoryToken(
     input.db,
     input.companyId,
     input.endpointId,
@@ -110,8 +113,30 @@ export async function githubGreenReviewContext(input: {
     "read",
   );
   const prefix = `/repos/${input.repository.split("/").map(encodeURIComponent).join("/")}`;
-  const get = <T>(path: string) =>
-    githubBotRequest<T>(input.fetchImpl, token, `${prefix}${path}`);
+  const get = async <T>(path: string): Promise<T> => {
+    try {
+      return await githubBotRequest<T>(input.fetchImpl, token, `${prefix}${path}`);
+    } catch (error) {
+      const providerStatus = (
+        error as { details?: { providerStatus?: unknown } }
+      )?.details?.providerStatus;
+      if (providerStatus !== 401) throw error;
+      evictGithubBotRepositoryToken({
+        companyId: input.companyId,
+        endpointId: input.endpointId,
+        repositoryId: input.repositoryId,
+      });
+      token = await githubBotRepositoryToken(
+        input.db,
+        input.companyId,
+        input.endpointId,
+        input.repositoryId,
+        input.fetchImpl,
+        "read",
+      );
+      return githubBotRequest<T>(input.fetchImpl, token, `${prefix}${path}`);
+    }
+  };
   const pr = await get<PullRequestPayload>(`/pulls/${input.pullNumber}`);
   const headSha = pr.head.sha.toLowerCase();
   if (pr.state !== "open") return { ready: false, outcome: { status: "closed", headSha } };

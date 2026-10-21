@@ -12,7 +12,7 @@ import {
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 import { withGitHubPrimaryBlindingAdmission } from "./chat-github-primary-blinding-state.js";
-import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
+import { githubBotRepositoryRequest, githubBotRepositoryToken } from "./chat-github-client.js";
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust } from "./chat-github-task-trust.js";
@@ -132,12 +132,16 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     // never finish json()/text(), or ignore the signal altogether.
     return await Promise.race([cancelled, (async () => {
     captureDeadline.throwIfAborted();
-    const token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
-    const pr = await githubBotRequest<{
+    // Every capture GitHub read routes through the shared helper, which reuses
+    // the cached installation token and retries once with a fresh token after
+    // a 401. One retry implementation, pinned by the helper's own tests.
+    const request = async <T>(path: string): Promise<T> =>
+      githubBotRepositoryRequest<T>(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, `/repos/${input.repository}${path}`, {}, boundedFetch, "read");
+    const pr = await request<{
       title: string; body: string | null; draft: boolean;
       head: { sha: string }; base: { sha: string; ref: string };
       user: { id: number; login: string; type?: string }; labels?: Array<{ name: string }>;
-    }>(boundedFetch, token, `/repos/${input.repository}/pulls/${match[2]}`);
+    }>(`/pulls/${match[2]}`);
     event ??= {
       ...unavailableEvent,
       headSha: githubCommitSchema.parse(pr.head.sha), baseSha: githubCommitSchema.parse(pr.base.sha),
@@ -160,10 +164,13 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     // its own window, into the admission manifest; candidate dispatch waits for
     // it (bounded) and otherwise runs with workspace equivalence unverified.
     const producer = githubRepositoryArtifactProducer();
+    // Resolve from cache after the PR read, so a 401 retry above leaves the
+    // fresh token for the artifact: it never starts with a rejected token.
+    const artifactToken = producer ? await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read") : "";
     if (producer) void startGitHubRepositoryArtifact({ repository: input.repository, pullNumber: event.pullNumber,
-      headSha: event.headSha, baseSha: event.baseSha, baseBranch: event.baseBranch, token, fetchImpl,
+      headSha: event.headSha, baseSha: event.baseSha, baseBranch: event.baseBranch, token: artifactToken, fetchImpl,
       signal: artifactAbort.signal }, { producer });
-    const snapshot = await captureGitHubReviewSnapshot({ request: path => githubBotRequest(boundedFetch, token, `/repos/${input.repository}${path}`) }, event,
+    const snapshot = await captureGitHubReviewSnapshot({ request: (path: string) => request(path) }, event,
       { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, producer ? undefined : "repository_artifact_disabled");
     return { event, snapshot };
     })()]);

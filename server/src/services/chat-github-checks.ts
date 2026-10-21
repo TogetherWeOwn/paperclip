@@ -23,7 +23,7 @@ import {
   type GitHubReviewCheckResponse,
 } from "./chat-github-check-reconciliation.js";
 import {
-  githubBotRepositoryToken,
+  githubBotRepositoryRequest,
   githubBotRequest,
 } from "./chat-github-client.js";
 import { githubShadowLabel } from "./chat-github-review-policy.js";
@@ -286,23 +286,23 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   : state === "running"
                     ? "Agent is reviewing this commit"
                     : "Waiting for the assigned agent";
-          const token = await githubBotRepositoryToken(
-            db,
-            action.companyId,
-            action.endpointId,
-            event.repositoryId,
-            lease.fetch,
-          );
           const prefix = `/repos/${event.repository.split("/").map(encodeURIComponent).join("/")}`;
-          const request = <T>(
+          // Every check-run GitHub call routes through the shared helper, which
+          // reuses the cached installation token and retries once with a fresh
+          // token after a 401. One retry implementation, pinned by the helper's
+          // own tests.
+          const request = async <T>(
             path: string,
             options?: Parameters<typeof githubBotRequest>[3],
-          ) =>
-            githubBotRequest<T>(
-              lease.fetch,
-              token,
+          ): Promise<T> =>
+            githubBotRepositoryRequest<T>(
+              db,
+              action.companyId,
+              action.endpointId,
+              event.repositoryId,
               `${prefix}${path}`,
-              options,
+              options ?? {},
+              lease.fetch,
             );
           const current = await request<{ head: { sha: string } }>(
             `/pulls/${event.pullNumber}`,
