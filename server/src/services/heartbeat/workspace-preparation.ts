@@ -16,6 +16,8 @@ import {
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { tmpdir } from "node:os";
+import { ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { and, asc, eq } from "drizzle-orm";
 import { type ExecutionWorkspace } from "@paperclipai/shared";
 import { heartbeatRuns, projectWorkspaces } from "@paperclipai/db";
@@ -141,6 +143,8 @@ export interface HeartbeatWorkspacePreparationInput {
   };
   controllerLease: Pick<ReturnType<typeof watchLegacyControllerLease>, "assertOwned">;
   nativeRunnerPreparationSpans: NativeRunHistoricalSpan[];
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -149,6 +153,8 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspacePreparationInput) {
   const { run, agent, controllerLease, nativeRunnerPreparationSpans } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
+  let candidateWorkspaceDir: string | null = null;
   const {
     issueRef,
     issueId,
@@ -222,6 +228,15 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
       return preflightEnvironment.driver;
     },
     resolveWorkspace: async () => {
+      if (candidateRuntime) {
+        // Never synchronize an agent home, prior worktree, or cached answer.
+        // Repository reads remain the sealed, commit-addressed gateway tools.
+        candidateWorkspaceDir = await fs.mkdtemp(path.join(tmpdir(), "paperclip-shadow-workspace-"));
+        return { cwd: candidateWorkspaceDir, source: "task_session" as const,
+          projectId: null, workspaceId: null, repoUrl: null, repoRef: null,
+          workspaceHints: [], warnings: [], baseCwdFallback: false,
+          materializationFailures: [], additionalWorkspaces: [], referencedProjectFailures: [] };
+      }
       if (isDotRun) {
         // This is private controller storage, never a provider filesystem.
         // v6 projects workspace.access=none and cwd=null to Dot.
@@ -324,7 +339,11 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
         : workspace;
     },
   });
-  const hostExecutionWorkspaceConfig = isDotRun ? {} :
+  // The candidate reviews the sealed snapshot through tools, not a host
+  // checkout. Never execute host provisioning or restore a previous tree.
+  const hostExecutionWorkspaceConfig = candidateRuntime
+    ? { workspaceStrategy: { type: "project_primary" } }
+    : isDotRun ? {} :
     stripHostWorkspaceProvisionForLowTrustSandbox({
       config: mergedConfig,
       trustPreset,
@@ -1129,7 +1148,23 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   // and lease scope instead of silently creating a per-run replacement.
   await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
   const workspaceRealization = realizationResult.workspaceRealization;
-  const executionTarget = realizationResult.executionTarget;
+  const realizedTarget = realizationResult.executionTarget;
+  if (candidateRuntime && (realizedTarget?.kind !== "remote" || realizedTarget.transport !== "ssh"
+    || realizedTarget.environmentId !== candidateRuntime.target.environmentId
+    || realizedTarget.spec.host !== candidateRuntime.target.spec.host
+    || realizedTarget.spec.username !== candidateRuntime.target.spec.username)) {
+    throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: SSH realization changed", {
+      configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+    });
+  }
+  const executionTarget = candidateRuntime ? { ...candidateRuntime.target, leaseId: realizedTarget?.leaseId } : realizedTarget;
+  if (candidateRuntime) {
+    if (executionWorkspace.cwd !== candidateWorkspaceDir) {
+      throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: workspace changed", {
+        configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+      });
+    }
+  }
   // Preserve the host-owned source before adapter context can share lease
   // metadata. A later copy-back failure must not adopt a rebound source.
   const workspaceRestoreSource = structuredClone(realizationResult.lease);
@@ -1152,5 +1187,6 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     workspaceRealization,
     executionTarget,
     workspaceRestoreSource,
+    candidateWorkspaceDir,
   };
 }

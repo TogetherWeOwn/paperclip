@@ -55,6 +55,8 @@ export interface HeartbeatEnvironmentSelectionInput {
     config: Record<string, unknown>;
     issueAssigneeOverrides: { adapterConfig: Record<string, unknown> | null } | null;
   };
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
   services: {
     executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "getById">;
     environmentsSvc: Pick<ReturnType<typeof environmentService>,
@@ -70,6 +72,7 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnvironmentSelectionInput) {
   const { run, agent } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
   const { issueRef, issueContext, issueId, context, executionProjectId, projectContext } = input.task;
   const {
     trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled,
@@ -114,9 +117,9 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
         existingExecutionWorkspace?.status ?? null,
     });
   const requestedShouldReuseExisting =
-    workspaceReuseRequest.requestedShouldReuseExisting;
+    !candidateRuntime && workspaceReuseRequest.requestedShouldReuseExisting;
   const reusableExistingExecutionWorkspace =
-    workspaceReuseRequest.existingExecutionWorkspaceAvailable
+    !candidateRuntime && workspaceReuseRequest.existingExecutionWorkspaceAvailable
       ? existingExecutionWorkspace
       : null;
   const requestedReusableExecutionWorkspaceConfig =
@@ -235,6 +238,11 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       : selectedEnvironmentId
         ? await environmentsSvc.getById(selectedEnvironmentId)
         : null;
+  if (candidateRuntime && selectedEnvironmentForConfig?.id !== candidateRuntime.target.environmentId) {
+    throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: selected environment changed", {
+      configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+    });
+  }
   const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
     adapterType: agent.adapterType,
     environmentDriver: selectedEnvironmentForConfig?.driver ?? null,

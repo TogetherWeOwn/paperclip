@@ -41,6 +41,7 @@ import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@pap
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
+import { ConfigurationIncompleteFailure } from "./run-preparation.js";
 import {
   buildNativeProviderEnvironment,
   executePaperclipNativeSession,
@@ -105,6 +106,8 @@ export interface HeartbeatRuntimeExecutionInput {
     nativeSessionBackendFactory?: (execution: NativeExecutionInput) => NativeSessionBackend;
     pluginWorkerManager?: PluginWorkerManager;
   };
+  /** Paired shadow-review candidate runtime, or null for ordinary runs. */
+  candidateRuntime?: Awaited<ReturnType<typeof import("../chat-github-runtime-isolation.js").prepareGitHubCandidateRuntime>> | null;
   task: Pick<Selection["task"], "issueContext" | "context" | "executionContinuation"> & {
     issueRef: (NonNullable<Selection["task"]["issueRef"]> & { projectId: string | null }) | null;
     issueId: string | null;
@@ -222,6 +225,7 @@ function readNonEmptyString(value: unknown): string | null {
 
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
   const { run, agent, options } = input;
+  const candidateRuntime = input.candidateRuntime ?? null;
   const { issueRef, issueContext, context, issueId, taskKey, executionContinuation } = input.task;
   const { nativeRuntimeResolution, nativeExecution, nativeRunnerInstanceId, adapter, runtimeForAdapter, getNativeFreshSessionHandoff, getFreshSessionHandoff, runOptions } = input.runtime;
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
@@ -743,7 +747,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const isolatedRuntime =
         agent.adapterType === "codex_local" &&
         parseObject(runtimeConfig).isolateRuntime === true;
-      const runtimeTools = isolatedRuntime
+      // Connection-intent brokers and generic managed MCP credentials are
+      // not snapshot review tools. Candidates get only the run-bound API
+      // credential and gateways whose discovery/dispatch enforce I4.
+      const runtimeTools = isolatedRuntime || candidateRuntime
         ? undefined
         : createAdapterRuntimeToolAccess({
             agentId: agent.id,
@@ -751,7 +758,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             runId: run.id,
             responsibleUserId: run.responsibleUserId,
           });
-      if (!runtimeTools && !isolatedRuntime) {
+      if (candidateRuntime && !authToken) {
+        throw new ConfigurationIncompleteFailure("github_candidate_isolation_unavailable: scoped tools unavailable", {
+          configurationIncomplete: { reason: "github_candidate_isolation_unavailable" },
+        });
+      }
+      if (!runtimeTools && !isolatedRuntime && !candidateRuntime) {
         logger.warn(
           {
             companyId: agent.companyId,
@@ -767,6 +779,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             db,
             agent,
             runId: run.id,
+            apiBaseUrl: candidateRuntime ? "http://127.0.0.1:3100" : undefined,
           });
       const runtimeToolDelivery =
         adapter.runtimeToolDelivery ?? "invocation_context";
@@ -778,7 +791,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           connectionId: "paperclip-runtime-tools",
         });
       }
-      if (!isolatedRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+      if (!isolatedRuntime && !candidateRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
       }
@@ -786,7 +799,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {
         adapterContext.paperclipRuntimeTools = runtimeTools;
       }
-      const managedMcpConfig = isolatedRuntime
+      const managedMcpConfig = isolatedRuntime || candidateRuntime
         ? null
         : await createManagedMcpRunConfig({
             db,

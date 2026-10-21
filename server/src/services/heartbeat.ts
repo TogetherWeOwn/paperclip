@@ -1,3 +1,5 @@
+import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
+import { createGitHubRunEvidenceCollector, githubWorkspaceState, GITHUB_REVIEW_RUN_EVIDENCE } from "./chat-github-run-evidence.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
@@ -2109,6 +2111,7 @@ export function heartbeatService(
     executionControl.phases.enter("host_execution");
     const executionPhaseContext = { onExecutionPhase: executionControl.phases.enter };
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    let candidateRuntime: Awaited<ReturnType<typeof prepareGitHubCandidateRuntime>> = null;
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -2157,6 +2160,10 @@ export function heartbeatService(
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
       }
+
+      // Before session restoration, workspace setup, plugins or model work.
+      // Only a server-certified SSH environment with fresh per-run proof enters.
+      candidateRuntime = await prepareGitHubCandidateRuntime(db, { run, agent });
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -3096,6 +3103,7 @@ export function heartbeatService(
         useIsolatedTaskDirectory,
       } = await selectHeartbeatEnvironment(db, {
         run, agent,
+        candidateRuntime,
         task: { issueRef, issueContext, issueId, context, executionProjectId, projectContext },
         policy: {
           trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled,
@@ -3160,7 +3168,7 @@ export function heartbeatService(
         },
       );
       const useHostGitHub =
-        !githubSelection.configured &&
+        !candidateRuntime && !githubSelection.configured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -3408,7 +3416,7 @@ export function heartbeatService(
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
       });
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        Boolean(candidateRuntime) || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
@@ -3416,7 +3424,7 @@ export function heartbeatService(
         db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
         throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
       }) : undefined;
-      const previousSessionParams =
+      const previousSessionParams = candidateRuntime ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
           agent.adapterType,
@@ -3457,8 +3465,10 @@ export function heartbeatService(
         workspaceRealization,
         executionTarget,
         workspaceRestoreSource,
+        candidateWorkspaceDir,
       } = await prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans,
+        candidateRuntime,
         task: {
           issueRef,
           issueId,
@@ -3511,6 +3521,9 @@ export function heartbeatService(
           appendRunEvent,
         },
       });
+      if (candidateRuntime) {
+        runtimeConfig = githubCandidateAdapterConfig(candidateRuntime, runtimeConfig, executionWorkspace.cwd);
+      }
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
       let instructionSave: Record<string, unknown> | null = null;
       const instructionPreparationKey = createHash("sha256").update(JSON.stringify({
@@ -3558,7 +3571,7 @@ export function heartbeatService(
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
-      const remoteExecution = realizationResult.remoteExecution;
+      const remoteExecution = candidateRuntime ? candidateRuntime.target.spec : realizationResult.remoteExecution;
       if (
         nativeChatWorkspaceScope &&
         (executionTarget?.kind === "remote" ||
@@ -3612,6 +3625,7 @@ export function heartbeatService(
           (!isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
+          if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
@@ -3623,6 +3637,7 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
+        if (candidateRuntime) await assertGitHubCandidateDispatch(db, candidateRuntime, executionTarget);
         const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
           runId: run.id,
           companyId: run.companyId,
@@ -3708,7 +3723,9 @@ export function heartbeatService(
       } else {
         delete context.paperclipScratch;
       }
-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
+      const gitExecutionEnv = candidateRuntime ? Object.fromEntries(
+        Object.entries(parseObject(runtimeConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ) : await prepareGitHubExecutionEnvironment({
         target: executionTarget,
         cwd: executionWorkspace.cwd,
         env: Object.fromEntries(
@@ -3726,7 +3743,7 @@ export function heartbeatService(
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
-      if (!useHostGitHub) {
+      if (!useHostGitHub && !candidateRuntime) {
         const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
           githubConfigured: githubSelection.configured,
@@ -3967,6 +3984,14 @@ export function heartbeatService(
           delete executionContinuation?.resumeDelta;
         }
       }
+      if (candidateRuntime) {
+        runtimeSessionIdForAdapter = null;
+        runtimeSessionParamsForAdapter = null;
+        previousSessionDisplayId = null;
+        delete executionContinuation?.resumeDelta;
+        delete context.paperclipSessionHandoffMarkdown;
+        delete context.paperclipPreviousSessionId;
+      }
       const runtimeForAdapter = {
         sessionId: runtimeSessionIdForAdapter,
         sessionParams: runtimeSessionParamsForAdapter,
@@ -4159,7 +4184,24 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
+        // Observe both arms before their first tool read. Default-off runs do no
+        // parsing, Git I/O, or evidence writes. A missing/error observation never
+        // fails a primary run; comparison eligibility remains fail-closed.
+        const collectGitHubEvidence = resolvedInstanceSettings.experimental.githubReviewShadowEnabled === true
+          && agent.adapterType === "claude_local" && typeof context.wakeCommentId === "string"
+          ? createGitHubRunEvidenceCollector({
+            expectedCwd: executionTarget?.kind === "remote" ? executionTarget.remoteCwd : executionWorkspace.cwd,
+            workspaceHead: () => runtimeConfig.isolateRuntime === true ? Promise.resolve(null)
+              : githubWorkspaceState({ runId: run.id, target: executionTarget, cwd: executionWorkspace.cwd, env: gitExecutionEnv }),
+            // Isolated primaries have neither a checkout nor recorded network git.
+            ...(runtimeConfig.isolateRuntime === true ? {} : { role: candidateRuntime ? "candidate" as const : "primary" as const }),
+            record: async evidence => { await appendRunEvent(currentRun, { eventType: GITHUB_REVIEW_RUN_EVIDENCE,
+              stream: "system", payload: { ...evidence } }); },
+          }) : null;
         const appendIdentityRedactedLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          if (collectGitHubEvidence) await collectGitHubEvidence(stream, chunk).catch(error => {
+            logger.warn({ err: error, runId: run.id }, "GitHub review runtime evidence unavailable");
+          });
           const sanitizedChunk = compactRunLogChunk(
             redactCurrentUserText(chunk, currentUserRedactionOptions),
           );
@@ -4398,7 +4440,9 @@ export function heartbeatService(
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
           : !["claude_managed_agents_api", "aws_agentcore_harness_api", "openai_dot_mcp"].includes(nativeRuntimeResolution.profile.backend);
-        if (hasInstructionFilesystem) {
+        // Preserve the same instruction text, but do not restore an agent-home
+        // directory (which may include primary memory or previous answers).
+        if (hasInstructionFilesystem && !candidateRuntime) {
           try {
             // Missing contract fields on a restored session mean the deployed
             // legacy format. New sessions opt into whole-directory persistence.
@@ -4565,6 +4609,7 @@ export function heartbeatService(
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
         const execution = await executeHeartbeatRuntime(db, {
           run, agent, options,
+          candidateRuntime,
           task: {
             issueRef,
             issueContext,
@@ -4950,6 +4995,8 @@ export function heartbeatService(
         });
       }
     } finally {
+      if (candidateRuntime) await cleanupGitHubCandidateRuntime(candidateRuntime).catch(error =>
+        logger.warn({ runId: run.id, err: error }, "Candidate isolated home cleanup failed; later sibling probes will fail closed"));
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
@@ -5195,6 +5242,7 @@ export function heartbeatService(
           inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
 
       } finally {
+        if (candidateWorkspaceDir) await fs.rm(candidateWorkspaceDir, { recursive: true, force: true }).catch(() => {});
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,

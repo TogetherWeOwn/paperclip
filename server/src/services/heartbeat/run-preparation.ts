@@ -925,6 +925,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
   expectedAssignmentDigest?: string | null;
+  /** Host-selected endpoint for a certified SSH principal; never agent config. */
+  apiBaseUrl?: string;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const access = toolAccessService(input.db);
   const effective = await access.getEffectiveProfilesForAgent(
@@ -1238,7 +1240,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   return [
     {
       name: ASSIGNED_MCP_SERVER_NAME,
-      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
+      url: `${input.apiBaseUrl ?? paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
     },
