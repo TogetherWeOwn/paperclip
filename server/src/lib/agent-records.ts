@@ -400,11 +400,27 @@ export function agentRecordQueries(db: Db) {
       .where(eq(agents.id, id))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
-    const [companyRows, hydrated] = await Promise.all([
-      listCompanyAgentRows(row.companyId),
-      hydrateAgentSpend([row]).then((rows) => rows[0]!),
-    ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    // orgChainHealth only walks the reportsTo ancestor chain, so resolve
+    // just self + ancestors instead of all company rows (172 on prod).
+    // Ancestors are fetched by id without a company filter, then treated as
+    // missing when the company mismatches — same semantics as the old map.
+    const ancestorRows: (typeof agents.$inferSelect)[] = [row];
+    const seen = new Set<string>([row.id]);
+    let cursor: string | null = row.reportsTo;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const parent = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, cursor))
+        .then((rows) => rows[0] ?? null);
+      if (!parent) break;
+      ancestorRows.push(parent);
+      cursor = parent.reportsTo;
+      if (ancestorRows.length > 100) break;
+    }
+    const [hydrated] = await hydrateAgentSpend([row]);
+    return normalizeAgentRow(hydrated, ancestorRows);
   }
 
   async function ensureManager(companyId: string, managerId: string) {

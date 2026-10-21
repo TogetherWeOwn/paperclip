@@ -35,6 +35,7 @@ import express from "express";
 import request from "supertest";
 import { aiConnectionRoutes, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest } from "../routes/ai-connections.js";
 import { validateAiApiKey } from "../routes/ai-connections.js";
+import { hasAssignedModelLane } from "../services/run-model-decision.js";
 vi.mock("../services/local-ai-browser-login.js", () => ({
   startLocalBrowserLogin: () => ({ authorizationUrl: "https://auth.openai.com/codex/device", code: "ABCD-EFGHJ", abort: () => {} }),
 }));
@@ -49,6 +50,13 @@ let service: ReturnType<typeof aiConnectionService>;
 const binding = { provider: "anthropic", method: "api_key", mode: "responsible_user" } as const;
 const input = { companyId, agentId, adapterType: "claude_local", binding };
 const create = (userId: string, name: string, ownership: "personal" | "shared" = "personal") => service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership, name, apiKey: "fixture", agentIds: [], allAgents: true }, `fixture-${name}`);
+// Recorded run model decisions. Model routing is separate from credential
+// selection: a run with a decided or kept model lane still executes with the
+// responsible user's selected AI account, so the recorded decision must never
+// change how that account's authentication failure is repaired.
+const decidedLane = { decisionId: "fixture-decision", pluginKey: "fixture.model-router", model: "fixture-model-a", source: "router", latencyMs: 7, outcome: "decided" } as const;
+const keptLane = { decisionId: null, pluginKey: "fixture.model-router", model: null, source: null, latencyMs: 7, outcome: "kept" } as const;
+const advisoryOnly = { decisionId: null, pluginKey: "fixture.model-router", model: null, source: null, latencyMs: 7, outcome: "timeout", reason: "requireRunModelDecision disabled", advisory: { outcome: "decided", decisionId: "fixture-advice", model: "fixture-model-a", source: "router" } } as const;
 
 beforeAll(async () => {
   home = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-tests-")));
@@ -1105,6 +1113,67 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       expect(runtime.attribution.grantId).toBe(account.grantId);
     } finally { await runtime.cleanup(); }
   }, 30000);
+
+  // The recorded model decision is independent of the account the run used, so
+  // every row is repaired through the same reconnect card. No decision and an
+  // advisory suggestion are controls; decided and kept are assigned lanes.
+  it.each([
+    ["no model decision", null, false],
+    ["advisory suggestion only", advisoryOnly, false],
+    ["decided lane", decidedLane, true],
+    ["kept lane", keptLane, true],
+  ] as const)("flags the failed account, opens one reconnect card and resumes once repaired: %s", async (_label, modelDecision, assignedLane) => {
+    // The fixture must really be (or not be) an assigned lane, or the row proves nothing.
+    if (modelDecision) expect(hasAssignedModelLane(modelDecision)).toBe(assignedLane);
+    const userId = `auth-lane-${randomUUID()}`;
+    const id = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const selectedBinding = { provider: "anthropic", method: "api_key", mode: "responsible_user" } as const;
+    const prepare = () => prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Lane agent", adapterType: "claude_local", runtimeConfig: { aiConnection: selectedBinding } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Lane failure", status: "in_progress", assigneeAgentId: id });
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Lane account", apiKey: "fixture", agentIds: [id], allAgents: false }, "fixture-lane-key");
+    const runtime = await prepare();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId,
+      contextSnapshot: { issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity }, ...(modelDecision ? { modelDecision } : {}) },
+    });
+    await runtime.cleanup();
+    const intents = connectionIntentService(db);
+    const card = await intents.requestForRunAuthFailure(runId);
+    const [failed] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    // One observation, so a regression reports every symptom at once.
+    expect({ state: card?.state, service: card?.service, grant: failed.status }).toEqual({ state: "needs_user_action", service: "anthropic", grant: "needs_reauthorization" });
+    expect((await intents.requestForRunAuthFailure(runId))?.interactionId).toBe(card!.interactionId);
+    const cards = (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).filter((row) => row.kind === "connection_intent");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ id: card!.interactionId, status: "pending", sourceRunId: runId, addresseeUserId: userId, payload: { purpose: "ai", serviceSlug: "anthropic", requestingAgentId: id } });
+    expect((await intents.setupOptions(card!.interactionId!)).aiRepair).toMatchObject({ canReconnect: true, connection: { id: account.connectionId, status: "needs_attention" } });
+    // Unusable until repaired, both for the next run and for the card itself.
+    await expect(prepare()).rejects.toMatchObject({ status: 422, details: { code: "ai_connection_unavailable" } });
+    await expect(intents.complete(card!.interactionId!, account.connectionId, userId)).rejects.toThrow();
+    await service.save(companyId, userId, { provider: "anthropic", method: "api_key", ownership: "personal", name: "Lane account", connectionId: account.connectionId, apiKey: "fixture", agentIds: [id], allAgents: false }, "fixture-lane-repaired-key");
+    await intents.complete(card!.interactionId!, account.connectionId, userId);
+    const repaired = await prepare();
+    try {
+      expect(repaired.attribution).toMatchObject({ grantId: account.grantId });
+      expect((repaired.config.env as Record<string, string>).ANTHROPIC_API_KEY).toBe("fixture-lane-repaired-key");
+    } finally { await repaired.cleanup(); }
+    const wakeup = vi.fn(async (_agentId, opts) => {
+      await db.insert(agentWakeupRequests).values({ companyId, agentId: id, source: "automation", status: "queued", idempotencyKey: opts.idempotencyKey });
+      return null;
+    });
+    const delivery = connectionIntentDeliveryService(db, { wakeup } as never);
+    await delivery.deliver(card!.interactionId!);
+    await delivery.deliver(card!.interactionId!);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(id, expect.objectContaining({ contextSnapshot: expect.objectContaining({ forceFreshSession: true }) }));
+    // Reprocessing the old failure cannot invalidate the repaired account.
+    await intents.requestForRunAuthFailure(runId);
+    expect((await service.select({ companyId, agentId: id, userId, adapterType: "claude_local", binding: selectedBinding })).grant.status).toBe("active");
+  });
   it.each([
     ["anthropic", "claude_local", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
     ["openai", "codex_local", "CODEX_HOME", "OPENAI_API_KEY"],
@@ -1205,6 +1274,16 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       execute.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", signal: null, timedOut: false } as Awaited<ReturnType<typeof executionTarget.runAdapterExecutionTargetProcess>>);
       await expect(assertManagedAiProjectAuth({}, "openai", target)).resolves.toBeUndefined();
       await expect(assertManagedAiProjectAuth({ args: ["--api-key=override"] }, "xai", target)).rejects.toThrow("overrides");
+    } finally { execute.mockRestore(); }
+  });
+  it("launches the remote project-auth probe under the run's native SSH executor", async () => {
+    const execute = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess");
+    const target = { kind: "remote", transport: "ssh", remoteCwd: "/srv/project" } as Parameters<typeof assertManagedAiProjectAuth>[2];
+    const hostExecutor = { kind: "native_ssh" as const, authorizeLaunch: vi.fn() };
+    try {
+      execute.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", signal: null, timedOut: false } as Awaited<ReturnType<typeof executionTarget.runAdapterExecutionTargetProcess>>);
+      await expect(assertManagedAiProjectAuth({}, "openai", target, hostExecutor)).resolves.toBeUndefined();
+      expect(execute.mock.calls[0][4]).toMatchObject({ hostExecutor });
     } finally { execute.mockRestore(); }
   });
   it("keeps personal defaults separate and does not replace the first default", async () => {
@@ -1879,6 +1958,44 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     }
   });
 
+  it("refuses runner account adoption on SSH while native SSH authority is required", async () => {
+    // Adoption validation probes the agent's environment outside any run, so
+    // the managed-environment probe guard refuses it with 422 before any
+    // adapter probe or provider key check. The SSH test context resolves its
+    // target without a lease, so only the target resolver is stubbed.
+    const { agentRoutes } = await import("../routes/agents.js");
+    const targetModule = await import("../services/environment-execution-target.js");
+    const { requireServerAdapter } = await import("../adapters/index.js");
+    const [environment] = await db.insert(environments).values({ name: "Adoption SSH", driver: "ssh", config: { host: "ssh.example.test" } }).returning();
+    const id = randomUUID();
+    await db.insert(agents).values({ id, companyId, name: "SSH adoption", adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.6-sol" }, defaultEnvironmentId: environment.id });
+    const account = await service.save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "SSH adoption account", apiKey: "fixture-adoption-key", agentIds: [id], allAgents: false }, "fixture-adoption-key");
+    await service.setDefault(companyId, "alice", account.grantId);
+    const sshTarget = { kind: "remote", transport: "ssh", remoteCwd: "/srv/paperclip/run", spec: { host: "ssh.example.test" } };
+    const resolveTarget = vi.spyOn(targetModule, "resolveEnvironmentExecutionTarget").mockResolvedValue(sshTarget as never);
+    const probe = vi.spyOn(requireServerAdapter("paperclip_runner"), "testEnvironment").mockImplementation(async () => ({ adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [] }));
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: "alice", companyIds: [companyId] }; next(); });
+    app.use("/api", agentRoutes(db));
+    app.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => { res.status(error.status ?? 500).json({ error: error.message }); });
+    const selected = { provider: "openai", method: "api_key", mode: "responsible_user" } as const;
+    const providerRequest = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(null, { status: 200 }));
+    const previousSwitch = process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY;
+    process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY = "required";
+    try {
+      const res = await request(app).patch(`/api/agents/${id}`).send({ runtimeConfig: { aiConnection: selected } });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(probe).not.toHaveBeenCalled();
+      expect(providerRequest).not.toHaveBeenCalled();
+      expect((await db.select().from(agents).where(eq(agents.id, id)))[0].runtimeConfig.aiConnection).toBeUndefined();
+    } finally {
+      if (previousSwitch === undefined) delete process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY;
+      else process.env.PAPERCLIP_NATIVE_SSH_AUTHORITY = previousSwitch;
+      providerRequest.mockRestore(); probe.mockRestore(); resolveTarget.mockRestore();
+    }
+  });
+
   it("creates and hires agents with an authorized restricted shared connection", async () => {
     const { agentRoutes } = await import("../routes/agents.js");
     await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, companyId));
@@ -1922,10 +2039,14 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
 
 
 describe("AI connection recovery delivery", () => {
-  it.each(["ai_connection_unavailable", "secret_binding_missing"].flatMap(reason =>
-    ["restored", "newer failure", "different blocker", "revoked again", "closed task"].map(scenario => [reason, scenario]),
+  // Whether or not the failed run was assigned a model lane, the completed card
+  // restores exactly its own source failure, once, for either failure reason.
+  it.each((["ai_connection_unavailable", "secret_binding_missing"] as const).flatMap((reason) =>
+    ([["no lane", null], ["decided lane", decidedLane], ["kept lane", keptLane]] as const).flatMap(([lane, modelDecision]) =>
+      (["restored", "newer failure", "different blocker", "revoked again", "closed task"] as const).map((scenario) => [reason, lane, scenario, modelDecision] as const),
+    ),
   ))(
-    "continues only the repaired %s source failure: %s", async (reason, scenario) => {
+    "continues only the repaired %s source failure (%s): %s", async (reason, _lane, scenario, modelDecision) => {
       const userId = `recovery-${randomUUID()}`;
       const recoveringAgentId = randomUUID();
       const issueId = randomUUID();
@@ -1933,7 +2054,7 @@ describe("AI connection recovery delivery", () => {
       await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
       await db.insert(agents).values({ id: recoveringAgentId, companyId, name: "Recovery agent", status: "active", adapterType: "claude_local", runtimeConfig: { aiConnection: binding } });
       await db.insert(issues).values({ id: issueId, companyId, title: "Restore selected account", status: "in_progress", assigneeAgentId: recoveringAgentId });
-      await db.insert(heartbeatRuns).values({ id: failedRunId, companyId, agentId: recoveringAgentId, status: "running", responsibleUserId: userId, contextSnapshot: { issueId } });
+      await db.insert(heartbeatRuns).values({ id: failedRunId, companyId, agentId: recoveringAgentId, status: "running", responsibleUserId: userId, contextSnapshot: { issueId, ...(modelDecision ? { modelDecision } : {}) } });
       const intents = connectionIntentService(db);
       const pending = await intents.request({ sub: recoveringAgentId, company_id: companyId, run_id: failedRunId, responsible_user_id: userId }, "anthropic", { purpose: "ai" });
       const account = await create(userId, `Recovered ${scenario}`);

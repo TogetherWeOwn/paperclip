@@ -322,7 +322,16 @@ async function pushRemoteOnlyBranch(
   return sha;
 }
 
-function realizeWorktreeForTest(repoRoot: string, repoRef: string | null, resolveGitAuth?: Parameters<typeof realizeExecutionWorkspace>[0]["resolveGitAuth"]) {
+function realizeWorktreeForTest(
+  repoRoot: string,
+  repoRef: string | null,
+  resolveOrOverrides:
+    | Parameters<typeof realizeExecutionWorkspace>[0]["resolveGitAuth"]
+    | { identifier?: string; recorder?: WorkspaceOperationRecorder } = {},
+) {
+  const overrides: { identifier?: string; recorder?: WorkspaceOperationRecorder } =
+    typeof resolveOrOverrides === "function" || !resolveOrOverrides ? {} : resolveOrOverrides;
+  const resolveGitAuth = typeof resolveOrOverrides === "function" ? resolveOrOverrides : undefined;
   return realizeExecutionWorkspace({
     resolveGitAuth,
     base: {
@@ -341,7 +350,7 @@ function realizeWorktreeForTest(repoRoot: string, repoRef: string | null, resolv
     },
     issue: {
       id: "issue-1",
-      identifier: "PAP-447",
+      identifier: overrides.identifier ?? "PAP-447",
       title: "Add Worktree Support",
     },
     agent: {
@@ -349,6 +358,7 @@ function realizeWorktreeForTest(repoRoot: string, repoRef: string | null, resolv
       name: "Codex Coder",
       companyId: "company-1",
     },
+    recorder: overrides.recorder,
   });
 }
 
@@ -1017,6 +1027,41 @@ describe("realizeExecutionWorkspace", () => {
     expect(second.branchCreatedByRuntime).toBe(true);
     expect(second.cwd).toBe(first.cwd);
     expect(second.branchName).toBe(first.branchName);
+  });
+
+  it("serializes concurrent worktree creation for the same repository", async () => {
+    const repoRoot = await createTempRepo();
+    let activeAdds = 0;
+    let maxActiveAdds = 0;
+    const recorder: WorkspaceOperationRecorder = {
+      attachExecutionWorkspaceId: async () => {},
+      recordOperation: async ({ command, run }) => {
+        const isWorktreeAdd = command?.startsWith("git worktree add") ?? false;
+        if (isWorktreeAdd) {
+          activeAdds += 1;
+          maxActiveAdds = Math.max(maxActiveAdds, activeAdds);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        try {
+          await run(async () => {});
+          return {} as never;
+        } finally {
+          if (isWorktreeAdd) activeAdds -= 1;
+        }
+      },
+    };
+
+    const [first, second] = await Promise.all([
+      realizeWorktreeForTest(repoRoot, "HEAD", { identifier: "PAP-901", recorder }),
+      realizeWorktreeForTest(repoRoot, "HEAD", { identifier: "PAP-902", recorder }),
+    ]);
+
+    expect(maxActiveAdds).toBe(1);
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(true);
+    expect(first.cwd).not.toBe(second.cwd);
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).toContain(first.cwd);
+    expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).toContain(second.cwd);
   });
 
   it("retains the project provision command when an issue overrides its base branch", async () => {

@@ -37,6 +37,14 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Environment (driver `sandbox`) that runs the trust preset
+   * `low_trust_review` whenever its environment selection would otherwise land
+   * on local. Trusted runs never read it. Absent/`null` = no designation: a
+   * low-trust run that lands on local fails closed
+   * (`low_trust_requires_sandbox_environment`).
+   */
+  lowTrustSandboxEnvironmentId?: string | null;
 }
 
 export interface InstanceExperimentalSettings {
@@ -77,6 +85,8 @@ export interface InstanceExperimentalSettings {
   enablePublicMcp: boolean;
   /** Enable the standalone Dot choice and dedicated agent MCP connection independently of the general Runner rollout. */
   enableOpenAiDot: boolean;
+  /** Global paired-review admission switch. Default OFF; never changes primary review or capture-only fences. */
+  githubReviewShadowEnabled: boolean;
   /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
   enableMcpAggregators: boolean;
   /** Show experimental memory connection setup. Existing connections remain usable. */
@@ -140,6 +150,13 @@ export interface InstanceExperimentalSettings {
    * enableNativeRunner and this value has no runtime effect.
    */
   enableRunnerPreviewIngress: boolean;
+  /**
+   * Issue runs ask the `run.model.resolve` plugin holder which model to use
+   * before the adapter config merge. On: no decision parks the run on a
+   * bounded retry and never falls back to the default. Off: advisory only,
+   * the run starts on the default and records `outcome: "timeout"`.
+   */
+  requireRunModelDecision: boolean;
   /**
    * Worktree preview instances (`PAPERCLIP_IN_WORKTREE=true`) suppress the
    * heartbeat run engine by default so previews never self-execute tasks. When

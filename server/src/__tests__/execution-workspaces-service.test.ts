@@ -390,7 +390,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     pullRequestDetailsByKey.set(`${companyId}:10624`, {
       state: "merged",
       headRef: "unrelated-delivery",
-      headSha,
+      // A different branch carries a different commit. Delivery matches by
+      // head SHA (same repo), so this must not equal the workspace HEAD —
+      // otherwise it would (correctly) count as delivery. Card-free publish
+      // refs reuse the workspace HEAD and are covered separately.
+      headSha: "0000000000000000000000000000000000000000",
     });
     pullRequestDetailsByKey.set(`${companyId}:10625`, {
       state: "merged",
@@ -479,6 +483,49 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep.archived).toBe(1);
     expect(archived).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
+  }, 20_000);
+
+  it("reports a card-free publish ref delivery as merged_via_pr", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-cardfree-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+    await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
+    await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
+    await runGit(worktreePath, ["add", "delivered.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
+
+    const seeded = await seedTerminalWorkspace();
+    // Card-free publish: the agent keeps commits on the workspace branch but
+    // opens the PR from a different ref carrying the same HEAD commit.
+    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, {
+      state: "merged",
+      headRef: "fix/short-slug",
+      headSha: await readGit(worktreePath, ["rev-parse", "HEAD"]),
+    });
+    await db.update(executionWorkspaces).set({
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      providerType: "git_worktree",
+      baseRef: "main",
+      repoUrl: "https://github.com/paperclipai/paperclip.git",
+      branchName: "PAP-16015-delivery",
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId: seeded.sourceIssueId,
+      type: "pull_request",
+      provider: "github",
+      title: "Card-free delivery",
+      url: "https://github.com/paperclipai/paperclip/pull/10623",
+      status: "merged",
+    });
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("merged_via_pr");
+    expect(readiness?.git?.isMergedIntoBase).toBe(false);
   }, 20_000);
 
   async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date } = {}) {
@@ -939,6 +986,85 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
   });
 
+  it("waits for the last workspace-linked issue and archives at the 24-hour boundary", async () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+    const cooldownService = (cooldownDays: number) => executionWorkspaceService(db, {
+      resolvePullRequestDetails: async (companyId, reference) =>
+        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+        ?? { state: "unknown", headRef: null, headSha: null },
+      now: () => new Date(nowMs),
+      workspaceReaperCooldownDays: cooldownDays,
+    });
+    const statusOf = async (executionWorkspaceId: string) => {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    };
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(issues)
+      .set({ completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    const linkedIssueId = randomUUID();
+    const issuePrefix = seeded.identifier.split("-")[0];
+    const linkedIdentifier = `${issuePrefix}-2`;
+    const linkedChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: linkedIssueId,
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        identifier: linkedIdentifier,
+        title: "Independent card using the isolated workspace",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 2,
+      },
+      {
+        id: linkedChildId,
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        parentId: linkedIssueId,
+        identifier: `${issuePrefix}-3`,
+        title: "Follow-up child of the independent workspace card",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 3,
+      },
+    ]);
+    await db
+      .update(executionWorkspaces)
+      .set({ updatedAt: new Date(nowMs - 2 * DAY_MS) })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const blockedSweep = await cooldownService(1).sweepTerminalWorkspaces();
+    expect(blockedSweep).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, linkedIssueId));
+    const childBlockedSweep = await cooldownService(1).sweepTerminalWorkspaces();
+
+    expect(childBlockedSweep).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    expect(childBlockedSweep.skippedRace).toBe(0);
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, linkedChildId));
+    const eligibleSweep = await cooldownService(1).sweepTerminalWorkspaces();
+
+    expect(eligibleSweep).toMatchObject({ archived: 1, skippedCooldown: 0 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+  }, 20_000);
+
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
     const unrelatedIssueId = randomUUID();
@@ -989,7 +1115,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   });
 
-  it("does not trust directly linked merged products for a different repository or branch", async () => {
+  it("does not trust directly linked merged products for a different repository or a different head commit", async () => {
     const seeded = await seedTerminalWorkspace();
     await db.insert(issueWorkProducts).values([
       {

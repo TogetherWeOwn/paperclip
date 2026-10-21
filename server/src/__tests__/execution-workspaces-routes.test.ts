@@ -44,6 +44,12 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
+const mockSweepWorkspaceValidationRecoveries = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/workspace-validation-sweep.js", () => ({
+  sweepWorkspaceValidationRecoveries: mockSweepWorkspaceValidationRecoveries,
+}));
+
 const mockEnvironmentRuntimeService = vi.hoisted(() => ({
   destroyReusableSandboxLeases: vi.fn(async () => undefined),
 }));
@@ -582,5 +588,36 @@ describe("execution workspace routes", () => {
     expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).toHaveBeenCalledTimes(1);
     // The reopen keeps its reusable leases because the fence skipped the destroy.
     expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
+  });
+
+  it("runs the branch-incoherence sweep as a dry run scoped to the company", async () => {
+    mockSweepWorkspaceValidationRecoveries.mockResolvedValue({
+      enabled: true,
+      dryRun: true,
+      scanned: 0,
+      deferred: 0,
+      restored: 0,
+      wouldRestore: 0,
+      refused: 0,
+      skipped: {},
+      items: [],
+    });
+
+    const res = await request(createApp())
+      .post("/api/companies/company-1/execution-workspaces/sweep-branch-incoherence?dryRun=true");
+
+    expect(res.status).toBe(200);
+    expect(mockSweepWorkspaceValidationRecoveries).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({ companyId: "company-1", dryRun: true }),
+    );
+  });
+
+  it("refuses the branch-incoherence sweep without dryRun=true", async () => {
+    const res = await request(createApp())
+      .post("/api/companies/company-1/execution-workspaces/sweep-branch-incoherence");
+
+    expect(res.status).toBe(400);
+    expect(mockSweepWorkspaceValidationRecoveries).not.toHaveBeenCalled();
   });
 });

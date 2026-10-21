@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork } from "../chat-work-notifications.js";
+import { insertChatActions } from "../chat-publication-authority.js";
 import { authorizeSlackDocument } from "./slack-document.js";
 import { slackMessage } from "./slack-message.js";
 import { createHash } from "node:crypto";
@@ -101,31 +102,24 @@ export async function executeSlackWrite(
     .update(JSON.stringify({ name, args }))
     .digest("hex");
   const key = `slack-tool:${binding.issueId}:${args.idempotencyKey}`;
-  const [created] = await db.transaction(async (tx) => {
-    await notifyChatPublicationWork(tx);
-    return tx
-      .insert(chatActions)
-      .values({
-        companyId: binding.companyId,
-        endpointId: authority.endpoint.id,
-        conversationId: authority.conversation?.id ?? null,
-        principalId: authority.principalId,
-        kind: "slack_tool_write",
-        providerActionId: key,
-        status: "received",
-        payload: {
-          name,
-          args,
-          hash,
-          binding,
-          userId: authority.userId,
-          revision: authority.revision,
-          invocationId,
-        },
-      })
-      .onConflictDoNothing()
-      .returning();
-  });
+  const [created] = await insertChatActions(db, {
+      companyId: binding.companyId,
+      endpointId: authority.endpoint.id,
+      conversationId: authority.conversation?.id ?? null,
+      principalId: authority.principalId,
+      kind: "slack_tool_write",
+      providerActionId: key,
+      status: "received",
+      payload: {
+        name,
+        args,
+        hash,
+        binding,
+        userId: authority.userId,
+        revision: authority.revision,
+        invocationId,
+      },
+    }, { onConflictDoNothing: true });
   const action =
     created ??
     (

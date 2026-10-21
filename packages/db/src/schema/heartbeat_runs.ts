@@ -140,6 +140,13 @@ export const heartbeatRuns = pgTable(
       table.id,
       table.completionContractId,
     ),
+    companyAgentVisibilityIdx: index("heartbeat_runs_company_agent_visibility_idx").on(table.companyId, table.agentId, table.id),
+    companyLegacyIssueVisibilityIdx: index("heartbeat_runs_company_legacy_issue_visibility_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} ->> 'issueId')`, table.id)
+      .where(sql`${table.nativeIssueId} is null`),
+    companyLegacyTaskVisibilityIdx: index("heartbeat_runs_company_legacy_task_visibility_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} ->> 'taskId')`, table.id)
+      .where(sql`${table.nativeIssueId} is null and ${table.contextSnapshot}->>'issueId' is null`),
     companyAgentStartedIdx: index("heartbeat_runs_company_agent_started_idx").on(
       table.companyId,
       table.agentId,
@@ -173,6 +180,14 @@ export const heartbeatRuns = pgTable(
     companyCreatedAtDescIdx: index("heartbeat_runs_company_created_at_desc_idx").on(
       table.companyId,
       table.createdAt.desc(),
+    ),
+    // Milestone sweep recovery bound: enqueueChatRunMilestones scans runs
+    // updated in the trailing window ordered by (updatedAt, id) for cursor
+    // pagination. Without this the 24h window seq-scans the table back to
+    // back (~122 s/exec on prod, 1 pool slot held continuously).
+    updatedAtIdIdx: index("heartbeat_runs_updated_at_id_idx").on(
+      table.updatedAt,
+      table.id,
     ),
     companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(
       table.companyId,

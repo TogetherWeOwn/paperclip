@@ -7,11 +7,22 @@ import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubOperationLaunchers,
   adapterExecutionTargetUsesManagedHome,
+  adapterExecutionTargetUsesPaperclipBridge,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
 } from "./execution-target.js";
+
+describe("certified shadow SSH transport", () => {
+  it("uses the certified loopback API instead of opening an unrestricted reverse tunnel", () => {
+    const target = { kind: "remote" as const, transport: "ssh" as const, remoteCwd: "/home/paperclip-shadow/work",
+      spec: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/work",
+        remoteCwd: "/home/paperclip-shadow/work", privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true } };
+    expect(adapterExecutionTargetUsesPaperclipBridge(target)).toBe(true);
+    expect(adapterExecutionTargetUsesPaperclipBridge({ ...target, githubCandidateIsolation: { namespace: "run", home: "/home/paperclip-shadow/run" } })).toBe(false);
+  });
+});
 
 describe("runAdapterExecutionTargetShellCommand", () => {
   afterEach(() => {

@@ -189,6 +189,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "id":id,"ok":true,"result":{"resolved":true}
                 }),
             )?;
+            // A command acknowledgement does not synchronize the following event.
+            // Keep the roundtrip fixture asynchronous even on a fast test host.
+            std::thread::sleep(Duration::from_millis(25));
             if params.get("error").is_some_and(|value| !value.is_null()) {
                 write_turn_event(
                     &mut stdout,

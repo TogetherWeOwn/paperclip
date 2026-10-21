@@ -1,3 +1,4 @@
+import { insertChatActions } from "./chat-publication-authority.js";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import {
@@ -192,7 +193,7 @@ export async function reconcileStoredDiscordCommandRegistration(
           .onConflictDoNothing()
           .returning();
         if (inserted.length) {
-          await tx.insert(chatActions).values({
+          await insertChatActions(tx, {
             id: actionId,
             companyId: scope.companyId,
             endpointId: scope.endpointId,

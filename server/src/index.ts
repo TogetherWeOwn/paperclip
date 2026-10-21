@@ -20,6 +20,7 @@ import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
+import { sweepWorkspaceValidationRecoveries } from "./services/workspace-validation-sweep.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
@@ -52,8 +53,11 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import { initializeGitHubPrimaryBlinding } from "./services/chat-github-primary-blinding-state.js";
+import { initializeGitHubPrimaryReviewers } from "./services/chat-github-primary-reviewers.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { installUncaughtExceptionPolicy } from "./fatal-exception-policy.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -77,6 +81,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
   decisionService,
+  createDecisionRetentionSweep,
   decisionRetentionService,
   externalObjectService,
   executionWorkspaceService,
@@ -902,6 +907,18 @@ async function startServerWithDatabaseTeardown(
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  // Both states start fail-closed (blind every agent, query the candidate boundary)
+  // until bootstrap succeeds, so a bootstrap error must not stop startup.
+  const bootstrapGitHubReviewVisibility = async (): Promise<void> => {
+    try {
+      await initializeGitHubPrimaryBlinding(db);
+      await initializeGitHubPrimaryReviewers(db);
+    } catch (err) {
+      logger.warn({ err }, "GitHub review visibility bootstrap failed; blinding stays fail-closed, retrying in 30s");
+      setTimeout(() => void bootstrapGitHubReviewVisibility(), 30_000).unref?.();
+    }
+  };
+  await bootstrapGitHubReviewVisibility();
   const app = await createApp(db as any, {
     prepareIdleDatabaseBackup: idleDatabaseBackupEnabled
       ? async () => (await runServerDatabaseBackup("idle")) !== null
@@ -1405,6 +1422,40 @@ async function startServerWithDatabaseTeardown(
         }));
     };
 
+    let workspaceValidationSweepInFlight = false;
+    let lastWorkspaceValidationSkipLogAt = 0;
+    const scheduleWorkspaceValidationRecoverySweep = () => {
+      if (heartbeatSchedulerStopped || workspaceValidationSweepInFlight) return;
+      workspaceValidationSweepInFlight = true;
+      trackHeartbeatSchedulerWork(sweepWorkspaceValidationRecoveries(db, {
+        limit: 5,
+        wakeup: heartbeat.wakeup,
+      })
+        .then((result) => {
+          if (result.restored > 0 || result.refused > 0) {
+            logger.info(
+              { restored: result.restored, refused: result.refused, skipped: result.skipped },
+              "workspace validation recovery sweep changed workspace state",
+            );
+          }
+          const skipped = Object.values(result.skipped).reduce((total, count) => total + count, 0);
+          const nowMs = Date.now();
+          if (skipped > 0 && nowMs - lastWorkspaceValidationSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
+            lastWorkspaceValidationSkipLogAt = nowMs;
+            logger.info(
+              { skipped: result.skipped, deferred: result.deferred },
+              "workspace validation recovery sweep skipped candidates",
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "workspace validation recovery sweep failed");
+        })
+        .finally(() => {
+          workspaceValidationSweepInFlight = false;
+        }));
+    };
+
     // The restart-safe cleanup backstop for adapter login sessions. The
     // in-process five-minute timer stays the primary control. This reaper runs
     // on startup and on the scheduler interval. It deletes the login sandbox for
@@ -1628,7 +1679,9 @@ async function startServerWithDatabaseTeardown(
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
-    await decisionExecutor.sweepExpired();
+    await decisionExecutor.sweepExpired().catch((err: unknown) => {
+      logger.error({ err }, "startup decision recovery failed; continuing startup");
+    });
 
     // Run the adapter login reaper once at startup, so a login sandbox that
     // outlived a server restart is deleted before timer ticks start.
@@ -1652,23 +1705,26 @@ async function startServerWithDatabaseTeardown(
     // restart, so a leaked sandbox does not stay allocated across the restart.
     await runEnvironmentLeaseCleanupSweep(0);
 
-    const runRetentionSweep = async () => {
-      const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
-      let archived = 0;
-      for (const company of activeCompanies) {
-        // Cursor pagination rebuilds the whole feed for every page; one
-        // unscoped all-items build keeps this sweep at a single feed build
-        // per company per tick.
-        const page = await attentionService(db as any).list(company.id, {
-          includeDismissed: true,
-          all: true,
-          allowUnscopedAll: true,
-        });
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
-      }
-      const notifications = await retentionExecutor.deliverNotifications();
-      return { archived, ...notifications };
-    };
+    const retentionSweep = createDecisionRetentionSweep({
+      archiveIdleItems: async () => {
+        const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+        let archived = 0;
+        for (const company of activeCompanies) {
+          // Cursor pagination rebuilds the whole feed for every page; one
+          // unscoped all-items build keeps this sweep at a single feed build
+          // per company per sweep.
+          const page = await attentionService(db as any).list(company.id, {
+            includeDismissed: true,
+            all: true,
+            allowUnscopedAll: true,
+          });
+          archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
+        }
+        return archived;
+      },
+      deliverNotifications: () => retentionExecutor.deliverNotifications(),
+    });
+    const runRetentionSweep = () => retentionSweep.run() ?? Promise.resolve(null);
     await runRetentionSweep();
 
     startHeartbeatSchedulerInterval(() => {
@@ -1691,7 +1747,8 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
-        if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+        const schedulingSuppressed = (await heartbeat.resolveSchedulingSuppression()).suppressed;
+        if (!schedulingSuppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {
@@ -1712,6 +1769,7 @@ async function startServerWithDatabaseTeardown(
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
+        if (!schedulingSuppressed) scheduleWorkspaceValidationRecoverySweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
@@ -2122,6 +2180,21 @@ function isMainModule(metaUrl: string): boolean {
 }
 
 if (isMainModule(import.meta.url)) {
+  // Replaces Node's default print-and-exit. Tests import this module, so the
+  // handler is installed only for the real server process.
+  installUncaughtExceptionPolicy(
+    process,
+    (message, error) => {
+      logger.fatal({ err: error }, message);
+    },
+    async (error) => {
+      // Capture after the client exists. captureException is a no-op until
+      // bootstrap finishes, and a synchronous exit would drop the flush.
+      await sentryReady;
+      captureException(error);
+      await shutdownSentry();
+    },
+  );
   void startServer().catch(async (err) => {
     logger.error({ err }, "Paperclip server failed to start");
     // Supervised-transient refusals in managed-cloud deployments are an

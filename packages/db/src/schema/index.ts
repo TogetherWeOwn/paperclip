@@ -1,4 +1,6 @@
 export { chatSlackRegistrations } from "./chat_slack_registrations.js";
+export { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } from "./chat_github_shadow.js";
+export type { GitHubReviewEnrollmentEnvelope, GitHubReviewInputSnapshot, GitHubReviewRepositoryArtifact, GitHubCandidateWorkspaceReceipt } from "./chat_github_shadow.js";
 export { companies } from "./companies.js";
 export { companyLogos } from "./company_logos.js";
 export { companyTransferRuns } from "./company_transfer_runs.js";
@@ -212,7 +214,7 @@ export { chatTeamsFileTransfers } from "./chat_teams_file_transfers.js";
 export { chatDiscordCommandOwners } from "./chat_discord_command_owners.js";
 export { chatTelegramDraftIds } from "./chat_telegram_draft_ids.js";
 export { chatVoiceSessions, chatVoiceToolCalls, chatVoiceReplies } from "./chat_voice_sessions.js";
-export { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews } from "./chat_github.js";
+export { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews, chatGitHubReviewArms } from "./chat_github.js";
 
 export { aiConnectionDefaults } from "./ai_connection_defaults.js";
 export { aiProviderDefaults } from "./ai_provider_defaults.js";

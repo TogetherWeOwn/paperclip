@@ -83,6 +83,63 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+The terminal workspace sweep retries `cleanup_failed` rows on later scans. Each
+retry rechecks terminal issues and descendants, merged delivery, cooldown,
+active runs, and clean Git state. It keeps the original close timestamp and uses
+the same lifecycle lock, generation fence, and non-forced worktree removal as
+initial cleanup. A failed retry stays `cleanup_failed`; it does not force removal
+or run cleanup hooks.
+
+### SSH workspace synchronization
+
+SSH execution for task workspaces excludes workspace-root `.paperclip-runtime/`,
+`.claude/worktrees/`, `.paperclip/worktrees/`, `.worktrees/`, `node_modules/`, and
+`target/` from export, baseline capture, size measurement, and sync-back. It also
+excludes nested linked Git worktrees at other paths: their `.git` file points to
+Git metadata with a `commondir` file. CRLF gitfiles and symlinks to regular
+gitfiles are recognized too. Discovery runs on the creating host before
+archiving, so worktrees created remotely are excluded too. It does not follow
+symlink directories. The workspace root itself, independent nested repositories,
+submodules, and separate-git-dir repositories remain in scope.
+
+These directories contain local runtime state, nested agent checkouts, and build
+outputs. Restore preserves the local copies. The remote run must install
+dependencies or rebuild outputs.
+Nested source such as `src/commands/target/` still transfers. Do not use a root
+`target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
+tracks it. Plain persistent directories (agent instruction directories and
+`workspaceFileMode: "all"` syncs) are exempt: they transfer and restore every file
+except workspace-root `.paperclip-runtime/`.
+
+The archive creator selects root-relative exclude syntax from its own `tar
+--version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server
+and remote can use different implementations. Unknown implementations fail the
+transfer rather than risk deleting nested source.
+
+`PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES` sets the sync-back cap in bytes on the server.
+The default is 2 GiB. Missing, invalid, and non-positive values use the default.
+Sync-back measures the excluded archive before download and checks the extracted
+staging directory before replacing workspace contents. A cap refusal leaves the
+workspace untouched. Normal success and failure paths remove staging directories;
+a hard process kill can still leave one behind.
+
+To verify GNU/BSD compatibility, install both tar implementations and run the
+focused suite for all four local/remote pairs. Set `GNU_TAR` and `BSD_TAR` to their
+absolute executable paths (`gtar` and `bsdtar` are common names):
+
+```sh
+for LOCAL_TAR in "$GNU_TAR" "$BSD_TAR"; do
+  for REMOTE_TAR in "$GNU_TAR" "$BSD_TAR"; do
+    PAPERCLIP_TEST_LOCAL_TAR="$LOCAL_TAR" PAPERCLIP_TEST_REMOTE_TAR="$REMOTE_TAR" \
+      pnpm exec vitest run packages/adapter-utils/src/ssh-sync-back-guard.test.ts \
+      packages/adapter-utils/src/remote-managed-runtime.test.ts || exit "$?"
+  done
+done
+```
+
+These tests run real archive creation and extraction through a fake SSH transport.
+They do not require an SSH host or a database.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.
@@ -936,6 +993,12 @@ Sandbox staging, including Daytona, transfers each repository's Git history and 
 
 Staging preserves relative symlink targets in secondary repositories, including skill links such as `.claude/skills/demo -> ../../skills/demo`. It does not rewrite them to host temporary paths or copy their target contents in place of the link. Daytona still rejects outbound archives with absolute or escaping link targets before extraction.
 
+If a managed secondary checkout loses its `.git` directory but keeps its files, snapshotting skips that checkout with a warning. Its files stay host-local and restore does not delete them. Diagnostics contain at most 32 warnings; when more checkouts are skipped, the last warning summarizes the remaining count. Every skipped path stays protected regardless of the diagnostic limit. Errors while reading a confirmed Git repository still fail closed.
+
+On the next setup, Paperclip provisions a clean checkout at the original path and preserves the non-Git directory under `.paperclip-runtime/detached-repositories/`. The preserved files are not replayed into the clean checkout. Existing Git directories and usable linked-worktree Git files are adopted, not quarantined. Dangling or malformed Git files fail setup explicitly without moving the checkout's files. A canonical-anchor queue serializes setup calls in the server process, including callers using a workspace alias. Cloning, ref checkout and local-source seeding run outside the anchor directory-merge lock, in excluded `.paperclip-runtime/repository-clones/` staging. Setup takes that lock only for root initialization, initial adoption validation, fresh destination validation/publication, final set-wide validation and inactive-checkout retention. Publication recreates a missing repositories parent and validates its confinement. It adopts a valid checkout that appeared during cloning or preserves the latest non-Git files before moving the new checkout into place. A final locked barrier revalidates all active checkouts, including those adopted before a later clone. If a restore stripped their metadata, setup releases the lock to stage repairs. Two repair passes are allowed; continuous changes fail setup rather than return stale checkout hints. A failed clone leaves the existing damaged directory untouched. The lock timeout stays fail-closed. This does not serialize child-only restores or guarantee exclusion of independent server or remote writers. Secondary checkout hints retain the caller's anchor alias.
+
+Restore refuses a file or symlink replacement of an ancestor of a literal excluded path before Git integration or file writes. A skipped directory's files must not be committed in the anchor's Git history: ignored paths cannot remove committed content from the staged Git clone. Snapshotting rejects that unsupported layout rather than transferring the supposedly skipped files. Recovery never rewrites the anchor's Git history.
+
 If a repository is detached or its source configuration changes, its previous task copy is retained under `.paperclip-runtime/detached-repositories/` and excluded from future sandbox transfers. Referenced projects continue to use the separate read-only multi-project workspace behavior.
 
 ## Config Freshness
@@ -947,6 +1010,14 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 An explicit `reuse_existing` Git workspace keeps its recorded source repository, including after its project-workspace row is deleted or the project primary changes. The server verifies the original company, project, repository origin, and worktree registration before reuse. It does not attach a deleted association to the new primary. A conflicting explicit project-workspace selection, missing source identity, or an unverified legacy local checkout blocks the run. Restore the original source. Before intentionally clearing the existing-workspace binding to choose a new repository, review and preserve its retained work. Missing worktrees may be reconstructed only from the verified original source; current project defaults are not a fallback.
 
 ## Workspace Git Scan Protection
+
+Worktree registration checks require a complete `git worktree list --porcelain`
+result. That list has a dedicated 16 MiB capture bound; other parsed Git output
+keeps the default 256 KiB bound. Truncated parsed output fails closed. An
+unreadable worktree list reports `worktree_list_unavailable`, not
+`not_registered`. Git mutations keep bounded diagnostic tails and use the exit
+status to determine success, with or without an operation recorder. A truncated
+commit summary does not turn an already-successful rescue commit into a failure.
 
 Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical buffered scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Streaming snapshot scans have caller-owned sinks, so they use separate jobs in the same queue and are never cached or coalesced. Correctness-sensitive runtime guards bypass the result cache.
 
@@ -1249,6 +1320,7 @@ An issue can pin its isolated worktree to an exact pre-existing branch instead o
 
 When a run reuses an isolated worktree, Paperclip checks that HEAD is on the branch recorded for the workspace and repairs the drift it can prove safe. A clean worktree whose checked-out branch is forward of the recorded branch adopts that branch (`enableWorkspaceBranchReconcileForward`). A clean worktree that is detached, behind, or diverged gets the recorded branch checked out again (`enableWorkspaceDirtyQuarantineRepair`). A detached commit that no ref reaches is first pinned on `paperclip/rescue/<issue>/detached-<time>`, and a displaced named branch keeps its own ref. A dirty worktree is committed to a rescue branch before the restore. The restore is refused while another run is running in the same worktree, while a runtime service of the workspace is running, or while an interrupted git operation (rebase, merge, bisect) is in progress. Before a run starts, a branch that an operator owns only ever gets this plain checkout. Every repair writes an `execution_workspace.*` activity entry. Anything else fails closed with `workspace_validation_failed`.
 
+A background sweep applies the same plain checkout to parked issues. It selects active `workspace_validation` recoveries whose evidence reason is `git_worktree_branch_incoherence`, never-tried cards first and then the least recently tried, and processes at most five per scheduler tick. It acts only when the recovery belongs to the workspace's source issue, the source issue is still `blocked` with no unresolved blocker or pending interaction, the worktree is clean and registered, the recorded branch exists, a recovery action still matches the worktree state, and no run or runtime service is active. It does not run while heartbeat scheduling is suppressed, and it skips companies that are not active. A repaired issue returns to `todo` and its assignee is woken. Each skip is counted by reason, and it is gated by `enableWorkspaceDirtyQuarantineRepair`. `POST /api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence?dryRun=true` reports the decision for each candidate without changing anything.
 Heavier setup that is only needed by a managed runtime service can use `workspaceStrategy.runtimeProvisionCommand`. Paperclip runs this command lazily before spawning the first service in a start batch, serializes concurrent provisioning for the same workspace, and records the attempt as `workspace_runtime_provision`. The command receives the same workspace environment as `provisionCommand` and should be idempotent because later service-start batches invoke it again.
 
 Managed runtime control actions (`start`, `stop`, `restart`, and job `run`) are mutually exclusive per execution workspace. An overlapping control is rejected with `409 workspace_runtime_control_in_progress` instead of racing the active operation, and authorization is still checked first, so the conflict never widens who may control a workspace.
@@ -1849,11 +1921,12 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_ALERT_FILE=/path/to/failure-marker` lets external cron
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
-  terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
-  the work inside this window. The default is `7`. A value of `0` disables the
-  cooldown and restores immediate reaping. A negative or non-numeric value falls
-  back to the default.
+  terminal-workspace reaper waits after every card referencing an execution
+  workspace is terminal before it archives the workspace and deletes the worktree.
+  A person can reopen the work inside this window. The default is `1` day. A value
+  of `0` disables the cooldown and restores immediate reaping. A negative or
+  non-numeric value falls back to the default. Dirty, untracked, or undelivered
+  work is not deleted.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

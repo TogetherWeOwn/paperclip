@@ -779,6 +779,12 @@ export interface IssueExecutionState {
   changesRequestedCount?: number;
 }
 
+export interface RestoreCompletedReviewResult {
+  outcome: "restore" | "already_restored";
+  issue: Issue;
+  completionActivityId: string;
+}
+
 export interface IssueExecutionDecision {
   id: string;
   companyId: string;

@@ -173,6 +173,8 @@ export type {
   PluginExternalObjectResolveResult,
   RefreshExternalObjectsParams,
   RefreshExternalObjectsResult,
+  ResolveRunModelParams,
+  ResolveRunModelResult,
   PluginEnvironmentDiagnostic,
   PluginEnvironmentDriverBaseParams,
   PluginEnvironmentValidateConfigParams,

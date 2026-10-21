@@ -7,6 +7,7 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { githubLauncherSource } from "./github-launcher.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
+import type { NativeSshHostExecutorTarget } from "./host-executor.js";
 import {
   prepareCommandManagedRuntime,
   type CommandManagedDuplexChannel,
@@ -136,6 +137,10 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 }
 
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+  /** Host-only per-run isolation attestation. Never parsed from agent config.
+   * The certified principal reaches the loopback API directly; an SSH reverse
+   * tunnel would bypass its owner-match egress rules. */
+  githubCandidateIsolation?: { namespace: string; home: string };
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;
@@ -307,6 +312,10 @@ export interface AdapterExecutionTargetProcessOptions {
    */
   settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
+  /** Server-created native SSH authority issuer; only used for SSH targets. */
+  hostExecutor?: NativeSshHostExecutorTarget | null;
+  /** Local target only. False starts the child from an empty env; see `runChildProcess`. */
+  inheritServerEnv?: boolean;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -546,7 +555,7 @@ export function resolveAdapterExecutionTargetCwd(
 export function adapterExecutionTargetUsesPaperclipBridge(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
-  return target?.kind === "remote";
+  return target?.kind === "remote" && !(target.transport === "ssh" && target.githubCandidateIsolation);
 }
 
 export function describeAdapterExecutionTarget(
@@ -929,6 +938,9 @@ export async function runAdapterExecutionTargetProcess(
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+    hostExecutor:
+      target?.kind === "remote" && target.transport === "ssh" ? (options.hostExecutor ?? null) : null,
+    inheritServerEnv: options.inheritServerEnv,
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote
   // provider exited. SSH status 255 is transport failure, never a stop receipt.

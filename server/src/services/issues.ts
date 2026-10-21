@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -111,7 +112,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -147,7 +148,10 @@ import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import {
+  instanceSettingsService,
+  type InstanceSettingsWriteDb,
+} from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -7240,8 +7244,16 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(
+    companyId: string,
+    userId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    // Keep this read on the caller's transaction connection. The chat ingress
+    // task-mutation transaction calls create/update while holding the endpoint
+    // row lock; re-entering the outer pool here can deadlock when concurrent
+    // transactions fill the pool while waiting on the same endpoint row.
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -7698,6 +7710,10 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      // Match checkout cleanup and run finalization: lock the issue before its run.
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`,
+      );
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
@@ -9940,8 +9956,12 @@ export function issueService(db: Db) {
       // A prompt prefix is not a task identity: distinct requests can share it.
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
+      // All reads below stay on the caller's connection. Create is called
+      // from the chat ingress task-mutation transaction while it holds the
+      // endpoint row lock; acquiring a second pooled connection here can
+      // exhaust the pool under concurrent ingress and freeze the API.
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9952,12 +9972,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -10913,8 +10933,12 @@ export function issueService(db: Db) {
           );
         }
       }
+      // Keep this read on the caller's connection: update runs inside the
+      // chat ingress task-mutation transaction while it holds the endpoint
+      // row lock, so a pooled read here can exhaust the pool under ingress
+      // fanout and freeze the API (see create above).
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
@@ -11053,6 +11077,7 @@ export function issueService(db: Db) {
         await assertAssignableUser(
           existing.companyId,
           issueData.assigneeUserId,
+          dbOrTx,
         );
       }
       let nextProjectId =
@@ -12033,11 +12058,29 @@ export function issueService(db: Db) {
           return { ownership: sameRunOwnership, latest: null };
 
         if (canAdoptUnownedCheckout(candidate)) {
-          const adopted = await adoptUnownedCheckoutRun({
-            issueId: id,
-            actorAgentId,
-            actorRunId: actorRunId!,
-          });
+          let adopted: Awaited<ReturnType<typeof adoptUnownedCheckoutRun>>;
+          try {
+            adopted = await adoptUnownedCheckoutRun({
+              issueId: id,
+              actorAgentId,
+              actorRunId: actorRunId!,
+            });
+          } catch (error) {
+            if (
+              isUniqueViolation(error, "issues_open_routine_execution_uq")
+            ) {
+              throw conflict(
+                "Another execution for this routine is already in progress",
+                {
+                  code: "routine_execution_slot_held",
+                  issueId: id,
+                  actorAgentId,
+                  actorRunId,
+                },
+              );
+            }
+            throw error;
+          }
 
           if (adopted) {
             return {
@@ -12058,12 +12101,30 @@ export function issueService(db: Db) {
           candidate.checkoutRunId !== actorRunId
         ) {
           const previousCheckoutRunId = candidate.checkoutRunId;
-          const staleAdoption = await adoptStaleCheckoutRun({
-            issueId: id,
-            actorAgentId,
-            actorRunId,
-            expectedCheckoutRunId: previousCheckoutRunId,
-          });
+          let staleAdoption: Awaited<ReturnType<typeof adoptStaleCheckoutRun>>;
+          try {
+            staleAdoption = await adoptStaleCheckoutRun({
+              issueId: id,
+              actorAgentId,
+              actorRunId,
+              expectedCheckoutRunId: previousCheckoutRunId,
+            });
+          } catch (error) {
+            if (
+              isUniqueViolation(error, "issues_open_routine_execution_uq")
+            ) {
+              throw conflict(
+                "Another execution for this routine is already in progress",
+                {
+                  code: "routine_execution_slot_held",
+                  issueId: id,
+                  actorAgentId,
+                  actorRunId,
+                },
+              );
+            }
+            throw error;
+          }
 
           if (staleAdoption.adopted) {
             return {
@@ -13048,55 +13109,43 @@ export function issueService(db: Db) {
               );
         const publicationCreatedAt = new Date();
         for (const binding of bindings) {
-          await dbOrTx.transaction(async (tx: DbTransaction) => {
-            await notifyChatPublicationWork(tx);
-            return tx
-              .insert(chatPublications)
-              .values({
-                companyId: binding.companyId,
-                endpointId: binding.endpointId,
-                conversationId: binding.conversationId,
-                issueId,
-                commentId: comment.id,
-                idempotencyKey: `comment:${comment.id}:${binding.endpointId}`,
-                payload: projectSafeChatPublication({
-                  classification: "external",
-                  source: "agent_comment",
-                  text: redactedBody,
-                }),
-                state: "pending",
-                createdAt: publicationCreatedAt,
-                updatedAt: publicationCreatedAt,
-              })
-              .onConflictDoNothing();
-          });
+          await insertChatPublications(dbOrTx, {
+              companyId: binding.companyId,
+              endpointId: binding.endpointId,
+              conversationId: binding.conversationId,
+              issueId,
+              commentId: comment.id,
+              idempotencyKey: `comment:${comment.id}:${binding.endpointId}`,
+              payload: projectSafeChatPublication({
+                classification: "external",
+                source: "agent_comment",
+                text: redactedBody,
+              }),
+              state: "pending",
+              createdAt: publicationCreatedAt,
+              updatedAt: publicationCreatedAt,
+            }, { onConflictDoNothing: true });
           for (const [index, attachment] of boundAttachments.entries()) {
             const attachmentCreatedAt = new Date(
               publicationCreatedAt.getTime() + index + 1,
             );
-            await dbOrTx.transaction(async (tx: DbTransaction) => {
-              await notifyChatPublicationWork(tx);
-              return tx
-                .insert(chatPublications)
-                .values({
-                  companyId: binding.companyId,
-                  endpointId: binding.endpointId,
-                  conversationId: binding.conversationId,
-                  issueId,
-                  commentId: attachment.commentId,
-                  idempotencyKey: `attachment:${attachment.id}:${binding.endpointId}`,
-                  payload: projectSafeChatPublication({
-                    classification: "external",
-                    source: "agent_comment",
-                    text: `Shared ${attachment.originalFilename ?? "a file"}.`,
-                    attachmentIds: [attachment.id],
-                  }),
-                  state: "pending",
-                  createdAt: attachmentCreatedAt,
-                  updatedAt: attachmentCreatedAt,
-                })
-                .onConflictDoNothing();
-            });
+            await insertChatPublications(dbOrTx, {
+                companyId: binding.companyId,
+                endpointId: binding.endpointId,
+                conversationId: binding.conversationId,
+                issueId,
+                commentId: attachment.commentId,
+                idempotencyKey: `attachment:${attachment.id}:${binding.endpointId}`,
+                payload: projectSafeChatPublication({
+                  classification: "external",
+                  source: "agent_comment",
+                  text: `Shared ${attachment.originalFilename ?? "a file"}.`,
+                  attachmentIds: [attachment.id],
+                }),
+                state: "pending",
+                createdAt: attachmentCreatedAt,
+                updatedAt: attachmentCreatedAt,
+              }, { onConflictDoNothing: true });
           }
         }
       }
@@ -13340,10 +13389,7 @@ export function issueService(db: Db) {
             registeredRunId,
           );
           for (const binding of bindings) {
-            await notifyChatPublicationWork(tx);
-            await tx
-              .insert(chatPublications)
-              .values({
+            await insertChatPublications(tx, {
                 companyId: issue.companyId,
                 endpointId: binding.endpointId,
                 conversationId: binding.conversationId,
@@ -13357,8 +13403,7 @@ export function issueService(db: Db) {
                   attachmentIds: [attachment.id],
                 }),
                 state: "pending",
-              })
-              .onConflictDoNothing();
+              }, { onConflictDoNothing: true });
           }
         }
 

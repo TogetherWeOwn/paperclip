@@ -1,5 +1,7 @@
 import { githubRunReplyState } from "./chat-run-publications.js";
 import { stageReceiptReactionRemovals } from "./chat-receipt-reactions.js";
+import { insertChatActions } from "./chat-publication-authority.js";
+import { githubShadowLabel } from "./chat-github-review-policy.js";
 import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
@@ -15,6 +17,9 @@ import {
 } from "./chat-github-review-template.js";
 import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
+import { primaryGitHubReview } from "./chat-github-primary.js";
+import { githubRunCapability, sealGitHubPrimaryReviewInputs } from "./chat-github-shadow.js";
+import { githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
 import { createHash } from "node:crypto";
 import { githubResponseCommentService, writeGitHubResponseComment } from "./chat-github-response-comments.js";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
@@ -120,6 +125,8 @@ const readSchema = z
       "files",
       "comments",
       "reviews",
+      "inline_comments",
+      "checks",
       "changes_since_review",
     ]),
     page: z.number().int().min(1).max(100).default(1),
@@ -165,6 +172,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       (publishing && !["running", "succeeded"].includes(run.status))
     )
       throw forbidden("This task run is no longer authorized");
+    const capability = await githubRunCapability(db, session);
+    if (!capability) throw forbidden("This run has no exact GitHub admission capability");
     const commentId = run.contextSnapshot?.wakeCommentId;
     const [source] =
       typeof commentId === "string"
@@ -202,7 +211,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 eq(chatMessageLinks.companyId, session.companyId),
                 eq(chatMessageLinks.commentId, commentId),
                 eq(chatConversations.issueId, session.issueId),
-                eq(chatEndpoints.assignedAgentId, session.agentId),
+                eq(chatEndpoints.id, capability.endpoint.id),
                 eq(chatEndpoints.provider, "github"),
               ),
             )
@@ -358,11 +367,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       number: Number(match[3]),
       isIssue: !!match[2],
       replyId: match[4] ?? null,
-      policy: effectiveGitHubReviewPolicy(
+      enrollment: capability.enrollment,
+      candidate: capability.candidate,
+      previousAssessment: capability.enrollment?.envelope.previousAssessments?.[capability.candidate?.armId ?? "primary"] ?? null,
+      policy: capability.enrollment?.envelope.policy ?? effectiveGitHubReviewPolicy(
         source.config.configuration,
         repositoryId,
       ),
-      shadowLabel: githubShadowLabel(source.config.configuration),
+      shadowLabel: source.conversation.githubShadowLabel
+        ?? source.delivery.githubShadowLabel
+        ?? githubShadowLabel(source.config.configuration),
     };
   }
   /** The shadow label pinned on this task's newest review row, if any. A
@@ -452,6 +466,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           `Workflow review trigger is not reviewable: ${decision.reason}`,
         );
     }
+    const inputSource = source.enrollment?.envelope.snapshot ? "snapshot" as const : "live" as const;
     const [prior] = await db
       .select()
       .from(chatGitHubReviews)
@@ -461,6 +476,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           eq(chatGitHubReviews.endpointId, source.endpoint.id),
           eq(chatGitHubReviews.issueId, source.issue.id),
           eq(chatGitHubReviews.headSha, pull.head.sha),
+          source.enrollment ? eq(chatGitHubReviews.deliveryId, source.delivery.id) : undefined,
         ),
       )
       .orderBy(desc(chatGitHubReviews.createdAt))
@@ -469,7 +485,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     if (prior && !prior.runId && prior.deliveryId === source.delivery.id) {
       const [claimed] = await db
         .update(chatGitHubReviews)
-        .set({ runId: source.run.id, state: "running", updatedAt: new Date() })
+        .set({ runId: source.run.id, state: "running", event: { ...prior.event, inputSource }, updatedAt: new Date() })
         .where(
           and(
             eq(chatGitHubReviews.id, prior.id),
@@ -496,7 +512,6 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       | undefined;
     const context: GitHubReviewEventContext = {
       event: manual?.event ?? "mention",
-      deliveryId: source.delivery.id,
       repositoryId: source.repositoryId,
       repository: source.repository,
       pullNumber: source.number,
@@ -522,6 +537,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         ),
       },
       labels: pull.labels.map((l) => l.name),
+      deliveryId: source.delivery.id,
       ...(automatic ? automatic.context : {}),
     };
     const [review] = await db
@@ -535,11 +551,12 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         repository: source.repository,
         pullNumber: source.number,
         headSha: pull.head.sha,
-        deliveryId: `run:${source.run.id}:${pull.head.sha}`,
+        deliveryId: source.candidate ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
+        admissionDeliveryId: source.delivery.id,
         configurationRevision:
-          manual?.revision ?? automatic?.revision ?? source.config.revision,
-        policySnapshot: manual?.policy ?? automatic?.policy ?? source.policy,
-        event: context,
+          source.enrollment?.configurationRevision ?? manual?.revision ?? automatic?.revision ?? source.config.revision,
+        policySnapshot: source.enrollment?.envelope.policy ?? manual?.policy ?? automatic?.policy ?? source.policy,
+        event: { ...context, inputSource },
         state: "running",
         shadowLabel: source.shadowLabel,
       })
@@ -553,6 +570,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           context,
           true,
           "authorized_manual_request",
+          source.delivery.id,
         );
       return review;
     }
@@ -564,7 +582,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           eq(chatGitHubReviews.endpointId, source.endpoint.id),
           eq(
             chatGitHubReviews.deliveryId,
-            `run:${source.run.id}:${pull.head.sha}`,
+            source.candidate ? source.delivery.id : `run:${source.run.id}:${pull.head.sha}`,
           ),
         ),
       );
@@ -608,11 +626,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       },
       status: "received",
     };
-    const [action] = await writer
-      .insert(chatActions)
-      .values(values)
-      .onConflictDoNothing()
-      .returning();
+    const [action] = await insertChatActions(writer, values, { onConflictDoNothing: true });
     if (!action) {
       const [existing] = await writer
         .select()
@@ -652,8 +666,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     input: unknown,
     invocationId?: string,
   ) {
-    const source = await scope(session);
-    const api = await client(source);
+    let source = await scope(session);
     if (name === "comment" || name === "update_comment") {
       const parsed = commentSchema.parse(input);
       const shadowLabel =
@@ -681,6 +694,38 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This task is bound to a GitHub issue. Pull request review tools require a PR conversation.",
       );
+    // Every remaining review tool reads PR inputs (including begin_review and
+    // read_file). Select once before constructing either reader. Candidate
+    // capture failure is optional work and must never fail the primary tool.
+    if (!source.candidate && source.conversation.executionScope === "primary") {
+      const enrollment = await sealGitHubPrimaryReviewInputs(db, source.run, source.delivery, fetchImpl).catch(() => null);
+      source = { ...source, enrollment,
+        previousAssessment: enrollment?.envelope.previousAssessments?.primary ?? null,
+        policy: enrollment?.envelope.policy ?? source.policy };
+    }
+    // A legacy capture label proves publication denial, not blinded inputs.
+    // No admission snapshot exists for these tasks. Refuse source reads before
+    // constructing any live client (also after configuration is switched off).
+    if ((name === "read_pull_request" || name === "read_file")
+      && (source.shadowLabel ?? await pinnedShadowLabel(session, source))
+      && !source.enrollment?.envelope.snapshot) {
+      throw conflict("Capture-only review reads require a sealed admission snapshot", { code: "github_review_snapshot_required" });
+    }
+    if (source.candidate && (source.enrollment?.envelope.snapshot?.version !== 2
+      || !source.enrollment.envelope.snapshot.redactions)) {
+      throw conflict("Candidate snapshot predates bot-answer blinding; live reads are forbidden");
+    }
+    const useSnapshot = !!source.candidate || !!source.enrollment?.envelope.snapshot;
+    const api: GitHubReviewReader = useSnapshot
+      ? githubSnapshotReader(source.enrollment?.envelope.snapshot, {
+          headSha: source.enrollment!.headSha, baseSha: source.enrollment!.baseSha, pullNumber: source.number,
+        }, async path => {
+          // This closure is invoked ONLY after the snapshot reader validates an
+          // exact commit-addressed object. No general live client exists here.
+          const token = await githubBotRepositoryToken(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, fetchImpl, "read");
+          return githubBotRequest(fetchImpl, token, `/repos/${source.repository}${path}`);
+        }, source.previousAssessment?.headSha)
+      : await client(source);
     const pull = await api.request<Pull>(`/pulls/${source.number}`);
     const automatic = source.delivery.normalizedEvent.githubAutomatic as
       { context: GitHubReviewEventContext } | undefined;
@@ -718,7 +763,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         const configuration = (source.delivery.normalizedEvent.githubManual ??
           source.delivery.normalizedEvent.githubAutomatic) as
           { policy: GitHubReviewPolicy; revision: number } | undefined;
-        const previous = await githubPreviousAssessment(
+        const previous = source.enrollment ? source.previousAssessment : await githubPreviousAssessment(
           db,
           source.endpoint,
           source.repositoryId,
@@ -728,9 +773,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           untrusted: true,
           pull,
           diffBaseSha: await diffBaseSha(api, pull.base.sha, pull.head.sha),
-          reviewPolicy: configuration?.policy ?? source.policy,
+          reviewPolicy: source.enrollment?.envelope.policy ?? configuration?.policy ?? source.policy,
           configurationRevision:
-            configuration?.revision ?? source.config.revision,
+            source.enrollment?.configurationRevision ?? configuration?.revision ?? source.config.revision,
           previousAssessment: previous
             ? {
                 reviewedCommit: previous.headSha,
@@ -742,7 +787,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         };
       }
       if (parsed.section === "changes_since_review") {
-        const previous = await githubPreviousAssessment(
+        const previous = source.enrollment ? source.previousAssessment : await githubPreviousAssessment(
           db,
           source.endpoint,
           source.repositoryId,
@@ -782,10 +827,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             "GitHub limits comparison files to 300. This delta is supporting context; read all current PR files before claiming complete coverage. Force pushes can change ancestry.",
         };
       }
+      if (parsed.section === "checks") {
+        const checks = await api.request<{ check_runs: unknown[] }>(`/commits/${pull.head.sha}/check-runs?per_page=100&page=${parsed.page}`);
+        const statuses = await api.request<unknown[]>(`/commits/${pull.head.sha}/statuses?per_page=100&page=${parsed.page}`);
+        return { untrusted: true, items: checks.check_runs, statuses,
+          hasMore: checks.check_runs.length === 100 || statuses.length === 100, page: parsed.page, reviewedCommit: pull.head.sha };
+      }
       const route =
         parsed.section === "comments"
           ? `/issues/${source.number}/comments`
-          : `/pulls/${source.number}/${parsed.section}`;
+          : `/pulls/${source.number}/${parsed.section === "inline_comments" ? "comments" : parsed.section}`;
       const rows = await api.request<Array<Record<string, unknown>>>(
         `${route}?per_page=100&page=${parsed.page}`,
       );
@@ -1283,6 +1334,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                   eq(chatGitHubReviews.endpointId, source.endpoint.id),
                   eq(chatGitHubReviews.repositoryId, source.repositoryId),
                   eq(chatGitHubReviews.pullNumber, source.number),
+                  eq(chatGitHubReviews.companyId, session.companyId),
+                  primaryGitHubReview(),
                   gt(chatGitHubReviews.createdAt, source.run.createdAt),
                   sql`${chatGitHubReviews.runId} is distinct from ${source.run.id}`,
                   sql`${chatGitHubReviews.assessment} is not null`,

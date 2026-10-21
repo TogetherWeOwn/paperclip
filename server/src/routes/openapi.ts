@@ -65,6 +65,7 @@ import {
   setIssueTitleSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
+  restoreCompletedReviewSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
@@ -149,7 +150,9 @@ import {
   announcementSchema,
   dismissAnnouncementSchema,
   // Execution workspaces
+  allocateSourceBoundWorkspaceSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -1423,6 +1426,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/remote-agent-profiles",
   "POST /api/companies/{companyId}/remote-agent-profiles",
   "POST /api/execution-workspaces/{id}/reconcile-branch",
+  "POST /api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence",
   "POST /api/execution-workspaces/{id}/login-handoff",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
@@ -1469,6 +1473,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "POST /api/issues/{id}/source-bound-workspace-allocation",
+  "POST /api/issues/{id}/source-bound-workspace-allocation/rollback",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -4268,6 +4274,28 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/issues/{id}/completed-review/restore",
+  tags: ["issues"],
+  summary: "Restore an evidenced completed typed review",
+  description:
+    "Accepts persisted completion and promoted-wake locators only, never client state or replacement approvals. Rechecks issue writes, current review policy and original-target assignment in the locked transaction. Agents require the current assignee's persisted active exact-issue run; skill-test and task-bridge keys cannot use this repair. Missing legacy receipts, conflicting runs, holds, changed policy or delivery, newer work, intentional resumes and ambiguous evidence refuse restoration. Same-evidence unchanged replay is idempotent.",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(restoreCompletedReviewSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/issues/{id}/stalled-review-decision",
   tags: ["issues"],
   summary: "Resolve a stalled issue review",
@@ -4282,6 +4310,76 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/transport-validation",
+  tags: ["issues"],
+  summary: "Validate source-bound transport only",
+  description:
+    "Validates the authenticated agent principal against server-resolved source issue assignee, unresolved blockers, low-trust preflight and selected workspace transport, plus deployed-image digest pinning for the running build from the trusted deployment record. Terminates under a transport-only boundary: no wake, checkout, workspace realization or runtime start. Returns a validation receipt, which grants no execution authority.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z.object({
+        workspaceId: z.string().uuid(),
+        transport: z.string().min(1),
+        requestedToolClass: z.string().nullable().optional(),
+      }),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation",
+  tags: ["issues"],
+  summary: "Allocate a source-bound unrealized execution workspace",
+  description:
+    "Board principal with runtime:manage only (agent keys are denied). Allocates — or idempotently returns — an unrealized execution-workspace record bound to the issue, with every field derived server-side from the issue's stored isolated_workspace + git_worktree selection. No wake, run, checkout, branch/worktree creation, or runtime start; no issue status, assignee, blocker, or monitor change. Allocation alone never passes transport validation (workspace_not_realized) until a later heartbeat run realizes into the same record.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(allocateSourceBoundWorkspaceSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: { description: "Allocation created" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/source-bound-workspace-allocation/rollback",
+  tags: ["issues"],
+  summary: "Roll back a source-bound workspace allocation",
+  description:
+    "Board principal with runtime:manage only. Archives the allocated unrealized record and restores the issue's exact prior executionWorkspaceId recorded at allocation, refusing if the binding changed in between. Realized workspaces cannot be rolled back through this path. Audited as a separate attributed activity entry.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(rollbackSourceBoundWorkspaceAllocationSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -8637,6 +8735,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence",
+  tags: ["execution-workspaces"],
+  summary: "Dry-run the workspace validation recovery sweep for a company",
+  description:
+    "Board only. Reports, per parked branch-incoherence recovery, whether the scheduled sweep " +
+    "would restore the recorded branch or skip it and why. Requires dryRun=true and makes no changes.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ dryRun: z.literal("true") }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/execution-workspaces/{id}",
   tags: ["execution-workspaces"],
@@ -9187,6 +9300,7 @@ registry.registerPath({
           runId: z.string(),
           companyId: z.string(),
           projectId: z.string(),
+          budgetSpentFraction: z.number().optional(),
         }),
       }),
     ),

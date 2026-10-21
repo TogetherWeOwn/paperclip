@@ -11,6 +11,8 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
+  issueThreadInteractions,
   issueWorkProducts,
   issues,
   projects,
@@ -44,7 +46,7 @@ import {
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
-import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { logActivity } from "./activity-log.js";
 import {
   createPullRequestMergeDetailsResolver,
@@ -235,9 +237,9 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
-  // The terminal-workspace reaper waits this many days after an issue tree
-  // becomes terminal before it archives the workspace. A value of 0 disables
-  // the cooldown. The default is 7 days.
+  // The terminal-workspace reaper waits this many days after every issue
+  // referencing the workspace becomes terminal before it archives the workspace.
+  // A value of 0 disables the cooldown. The default is 1 day.
   workspaceReaperCooldownDays?: number;
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
@@ -276,7 +278,25 @@ export function deriveExecutionWorkspaceDeliveryState(input: {
   return "unknown";
 }
 
-export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore";
+export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore" | "restore";
+
+export type RecordedBranchRestoreSkipReason =
+  | "workspace_missing"
+  | "source_issue_mismatch"
+  | "source_issue_closed"
+  | "inspection_failed"
+  | "no_active_recovery"
+  | "dirty"
+  | "busy"
+  | "branch_missing"
+  | "not_registered"
+  | "source_issue_not_blocked"
+  | "source_issue_has_open_blockers"
+  | "source_issue_has_pending_interaction";
+
+export type RecordedBranchRestoreClassification =
+  | { eligible: true; inspection: ExecutionWorkspaceBranchReconcileInspection }
+  | { eligible: false; reason: RecordedBranchRestoreSkipReason; message: string };
 
 export type ExecutionWorkspaceBranchReconcileActor = {
   actorType: "agent" | "user" | "system";
@@ -738,6 +758,169 @@ function assertLockedBranchReconcileWorkspaceStillMatchesInspection(input: {
   }
 }
 
+// Restore only the blocked state parking leaves; anything else was moved since then.
+async function recordedBranchRestoreSourceIssueSkip(input: {
+  db: Db;
+  companyId: string;
+  sourceIssueId: string;
+}): Promise<{ reason: RecordedBranchRestoreSkipReason; message: string } | null> {
+  const [sourceIssue] = await input.db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.id, input.sourceIssueId), eq(issues.companyId, input.companyId)))
+    .limit(1);
+  if (sourceIssue?.status !== "blocked") {
+    return {
+      reason: "source_issue_not_blocked",
+      message: `Source issue is ${sourceIssue?.status ?? "missing"}, not blocked`,
+    };
+  }
+  const { issueService } = await import("./issues.js");
+  const readiness = await issueService(input.db).getDependencyReadiness(input.sourceIssueId, input.db);
+  if (readiness.unresolvedBlockerCount > 0) {
+    return {
+      reason: "source_issue_has_open_blockers",
+      message: "Source issue still has an unresolved blocker",
+    };
+  }
+  const [pendingInteraction] = await input.db
+    .select({ id: issueThreadInteractions.id })
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, input.sourceIssueId),
+      eq(issueThreadInteractions.status, "pending"),
+    ))
+    .limit(1);
+  if (pendingInteraction) {
+    return {
+      reason: "source_issue_has_pending_interaction",
+      message: "Source issue is waiting on a pending interaction",
+    };
+  }
+  return null;
+}
+
+async function recordedBranchRestoreSkip(input: {
+  db: Db;
+  row: ExecutionWorkspaceRow;
+  sourceIssueId: string;
+  recoveryFingerprints: string[];
+  inspection: ExecutionWorkspaceBranchReconcileInspection;
+  heartbeatRunId: string | null;
+}): Promise<{ reason: RecordedBranchRestoreSkipReason; message: string } | null> {
+  const sourceIssueSkip = await recordedBranchRestoreSourceIssueSkip({
+    db: input.db,
+    companyId: input.row.companyId,
+    sourceIssueId: input.sourceIssueId,
+  });
+  if (sourceIssueSkip) return sourceIssueSkip;
+  const { inspection } = input;
+  if (inspection.cleanliness === "unknown") {
+    return { reason: "inspection_failed", message: "Recorded branch restore could not read the worktree status" };
+  }
+  if (inspection.cleanliness === "dirty") {
+    return { reason: "dirty", message: "Recorded branch restore requires a clean worktree" };
+  }
+  if (inspection.fromBranchRefStatus !== "resolved") {
+    return { reason: "branch_missing", message: `Recorded branch "${inspection.fromBranch}" does not exist` };
+  }
+  const [activeRecovery] = await input.db
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .where(and(
+      eq(issueRecoveryActions.companyId, input.row.companyId),
+      eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+      eq(issueRecoveryActions.kind, "workspace_validation"),
+      eq(issueRecoveryActions.cause, WORKSPACE_VALIDATION_RECOVERY_CAUSE),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      inArray(issueRecoveryActions.fingerprint, input.recoveryFingerprints),
+    ))
+    .limit(1);
+  if (!activeRecovery) {
+    return { reason: "no_active_recovery", message: "No active workspace validation recovery action matches this worktree state" };
+  }
+  const { findRegisteredGitWorktreeByPath } = await import("./workspace-runtime.js");
+  if (!(await findRegisteredGitWorktreeByPath(inspection.repoRoot, inspection.worktreePath))) {
+    return { reason: "not_registered", message: `"${inspection.worktreePath}" is not a registered git worktree` };
+  }
+  const busyRun = await executionWorkspaceService(input.db).findRunningRunInWorktree({
+    companyId: input.row.companyId,
+    worktreePath: inspection.worktreePath,
+    executionWorkspaceId: input.row.id,
+    excludingRunId: input.heartbeatRunId,
+  });
+  if (busyRun) {
+    return { reason: "busy", message: `Run ${busyRun.id} is running in this worktree` };
+  }
+  const runtimeServices = ((await loadEffectiveRuntimeServicesByExecutionWorkspace(input.db, input.row.companyId, [input.row]))
+    .get(input.row.id) ?? []).map(toRuntimeService);
+  if (runtimeServices.some((service) => service.status !== "stopped")) {
+    return { reason: "busy", message: "A runtime service of this workspace is still running" };
+  }
+  return null;
+}
+
+async function restoreRecordedBranchInCleanWorktree(input: {
+  db: Db;
+  workspaceId: string;
+  sourceIssueId: string;
+  inspection: ExecutionWorkspaceBranchReconcileInspection;
+  actor: ExecutionWorkspaceBranchReconcileActor;
+}): Promise<void> {
+  const sourceIssue = await input.db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      workMode: issues.workMode,
+    })
+    .from(issues)
+    .where(eq(issues.id, input.sourceIssueId))
+    .then((rows) => rows[0] ?? null);
+  if (!sourceIssue) throw notFound("Source issue not found");
+
+  const { ensureGitWorktreeBranchCoherent } = await import("./workspace-runtime.js");
+  try {
+    await ensureGitWorktreeBranchCoherent({
+      db: input.db,
+      repoRoot: input.inspection.repoRoot,
+      worktreePath: input.inspection.worktreePath,
+      expectedBranchName: input.inspection.fromBranch,
+      actualBranchName: input.inspection.toBranch,
+      sourceIssue,
+      executionWorkspaceId: input.workspaceId,
+      heartbeatRunId: input.actor.runId,
+      restoreOnly: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+      enableWorkspaceCleanRestore: true,
+      persistForwardReconcile: false,
+      reconcileOperationPhase: "worktree_prepare",
+      recorder: null,
+    });
+  } catch (error) {
+    if (isWorkspaceRuntimeValidationFailure(error)) {
+      throw unprocessable(error.message, {
+        code: error.code,
+        ...error.resultJson,
+      });
+    }
+    throw error;
+  }
+
+  // The restore helper returns quietly when its own gate refuses, so HEAD is
+  // the only proof that the recorded branch is checked out now.
+  const headBranch = await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], input.inspection.worktreePath)
+    .catch(() => null);
+  if (headBranch !== input.inspection.fromBranch) {
+    throw unprocessable(`Recorded branch "${input.inspection.fromBranch}" is not checked out after restore`, {
+      inspection: input.inspection,
+      headBranch,
+    });
+  }
+}
+
 async function quarantineRestoreDirtyWorkspaceBranch(input: {
   db: Db;
   workspace: Pick<ExecutionWorkspace, "id" | "sourceIssueId">;
@@ -807,6 +990,12 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   statusInspectionSucceeded: boolean;
 }> {
   const warnings: string[] = [];
+  // An unrealized source-bound allocation has no worktree, branch, or
+  // local path by construction: there is nothing to inspect and close
+  // must never plan worktree/branch deletion for it.
+  if (workspace.status === "unrealized") {
+    return { git: null, warnings, statusInspectionSucceeded: true };
+  }
   const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
   const createdByRuntime = workspace.providerType === "git_worktree"
     ? isRuntimeOwnedGitBranch(workspace.metadata)
@@ -1291,13 +1480,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const resolvePullRequestDetails = opts.resolvePullRequestDetails ?? createPullRequestMergeDetailsResolver(db);
   const now = opts.now ?? (() => new Date());
-  // The reaper waits this long after an issue tree becomes terminal before it
-  // archives the workspace. A value of 0 disables the cooldown, so the reaper
-  // archives a terminal workspace on the same sweep. A negative value also
-  // disables the cooldown.
+  // The reaper waits this long after every issue referencing a workspace
+  // becomes terminal before it archives the workspace. A value of 0 disables
+  // the cooldown, so the reaper archives a terminal workspace on the same sweep.
   const workspaceReaperCooldownMs = Math.max(
     0,
-    (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
+    (opts.workspaceReaperCooldownDays ?? 1) * 24 * 60 * 60 * 1000,
   );
   const pullRequestStateCache = new Map<
     string,
@@ -1331,7 +1519,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
 
-  async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
+  async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
     return db
       .select({
@@ -1347,10 +1535,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         sql<boolean>`
           ${issues.id} IN (
             WITH RECURSIVE issue_tree(id) AS (
-              SELECT ${issues.id}
-              FROM ${issues}
-              WHERE ${issues.companyId} = ${workspace.companyId}
-                AND ${issues.id} = ${workspace.sourceIssueId}
+              SELECT root.id
+              FROM ${issues} root
+              WHERE root.company_id = ${workspace.companyId}
+                AND (
+                  root.id = ${workspace.sourceIssueId}
+                  OR root.execution_workspace_id = ${workspace.id}
+                )
               UNION ALL
               SELECT child.id
               FROM ${issues} child
@@ -1440,11 +1631,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               { details, checkedAtMs: now().getTime() },
             );
           }
+          // A merged PR delivers the workspace when its head commit is the
+          // workspace HEAD. The head ref may differ: on public repos agents
+          // push HEAD to a card-free ref so the published branch never
+          // carries a tracker id.
           if (
             details.state === "merged"
-            && details.headRef === workspace.branchName
-            && details.headSha === workspaceHeadSha
+            && details.headSha !== null
             && workspaceHeadSha !== null
+            && details.headSha === workspaceHeadSha
           ) {
             mergedPullRequest = true;
             break;
@@ -2663,9 +2858,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       terminalSweepInProgress = true;
       try {
+      // Failed cleanup closes the row but leaves its worktree behind. Retry it
+      // through the same delivery, terminality, run and Git safety checks.
+      const cleanupCandidateFilter = or(
+        and(
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+        ),
+        eq(executionWorkspaces.status, "cleanup_failed"),
+      );
       const baseCandidateFilter = and(
-        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-        isNull(executionWorkspaces.closedAt),
+        cleanupCandidateFilter,
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
       // Continue the scan after the previous sweep's last row. The keyset
@@ -2854,11 +3057,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          const fresh = await tx.select().from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspace.id)).then((rows) => rows[0] ?? null);
+          if (
+            !fresh || fresh.status !== workspace.status
+            || readExecutionWorkspaceLifecycleGeneration(fresh.metadata) !== readExecutionWorkspaceLifecycleGeneration(workspace.metadata)
+          ) return null;
           return tx
             .update(executionWorkspaces)
             .set({
               status: "archived",
-              closedAt,
+              closedAt: workspace.closedAt ?? closedAt,
               cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
               cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
               metadata: archivedMetadata,
@@ -2867,8 +3076,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .where(and(
               eq(executionWorkspaces.id, workspace.id),
               eq(executionWorkspaces.companyId, workspace.companyId),
-              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-              isNull(executionWorkspaces.closedAt),
+              cleanupCandidateFilter,
               sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
               sql<boolean>`EXISTS (
                 SELECT 1
@@ -2897,6 +3105,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
+                  UNION
+                  SELECT linked.id, linked.status
+                  FROM ${issues} linked
+                  WHERE linked.company_id = ${workspace.companyId}
+                    AND linked.execution_workspace_id = ${workspace.id}
+                    AND linked.id <> ${workspace.sourceIssueId}
                   UNION ALL
                   SELECT child.id, child.status
                   FROM ${issues} child
@@ -2917,6 +3131,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
+                  UNION
+                  SELECT linked.id, linked.status, linked.completed_at, linked.cancelled_at, linked.updated_at
+                  FROM ${issues} linked
+                  WHERE linked.company_id = ${workspace.companyId}
+                    AND linked.execution_workspace_id = ${workspace.id}
+                    AND linked.id <> ${workspace.sourceIssueId}
                   UNION ALL
                   SELECT child.id, child.status, child.completed_at, child.cancelled_at, child.updated_at
                   FROM ${issues} child
@@ -3540,6 +3760,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
 
       const reason = readNullableString(input.reason);
+      if (input.mode === "restore") {
+        const skip = await recordedBranchRestoreSkip({
+          db,
+          row: existingRow,
+          sourceIssueId: existing.sourceIssueId,
+          recoveryFingerprints: [
+            inspection.fingerprint,
+            ...(input.alternateRecoveryFingerprints ?? []).filter((value): value is string => Boolean(value)),
+          ],
+          inspection,
+          heartbeatRunId: input.actor.runId,
+        });
+        if (skip) throw unprocessable(skip.message, { reason: skip.reason, inspection });
+        await restoreRecordedBranchInCleanWorktree({
+          db,
+          workspaceId: existing.id,
+          sourceIssueId: existing.sourceIssueId,
+          inspection,
+          actor: input.actor,
+        });
+      }
       const rescueRef = input.mode === "quarantine_restore"
         ? await (async () => {
             const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(
@@ -3563,6 +3804,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             });
           })()
         : null;
+      const resolutionNote = input.mode === "quarantine_restore" && rescueRef
+        ? `Execution workspace dirty worktree quarantined on "${rescueRef.branchName}" and restored recorded branch "${inspection.fromBranch}".`
+        : input.mode === "restore"
+          ? `Execution workspace checked out recorded branch "${inspection.fromBranch}" in its clean worktree.`
+          : `Execution workspace branch record reconciled from "${inspection.fromBranch}" to "${inspection.toBranch}".`;
       const now = new Date();
       const allowActiveWorkspace =
         input.mode === "forward" &&
@@ -3634,7 +3880,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
 
         let updatedRow: ExecutionWorkspaceRow = lockedRow;
-        if (input.mode !== "quarantine_restore") {
+        if (input.mode !== "quarantine_restore" && input.mode !== "restore") {
           assertBranchReconcileWorkspaceIsSafe({
             workspaceStatus: lockedWorkspace.status,
             inspection,
@@ -3699,9 +3945,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             fingerprint: inspection.fingerprint,
             status: "resolved",
             outcome: "restored",
-            resolutionNote: input.mode === "quarantine_restore" && rescueRef
-              ? `Execution workspace dirty worktree quarantined on "${rescueRef.branchName}" and restored recorded branch "${inspection.fromBranch}".`
-              : `Execution workspace branch record reconciled from "${inspection.fromBranch}" to "${inspection.toBranch}".`,
+            resolutionNote,
           },
           tx,
         );
@@ -3717,9 +3961,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                 fingerprint: alternateFingerprint,
                 status: "resolved",
                 outcome: "restored",
-                resolutionNote: input.mode === "quarantine_restore" && rescueRef
-                  ? `Execution workspace dirty worktree quarantined on "${rescueRef.branchName}" and restored recorded branch "${inspection.fromBranch}".`
-                  : `Execution workspace branch record reconciled from "${inspection.fromBranch}" to "${inspection.toBranch}".`,
+                resolutionNote,
               },
               tx,
             );
@@ -3727,9 +3969,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
         }
 
+        if (input.mode === "restore" && !recoveryAction) {
+          throw unprocessable(
+            "Recorded branch restore resolved no active recovery action; the source issue was left unchanged",
+            { inspection },
+          );
+        }
+
         let restoredSourceIssue: ExecutionWorkspaceBranchReconcileResult["restoredSourceIssue"] = null;
         let sourceIssueStatusChanged = false;
-        if (input.mode === "quarantine_restore") {
+        if (input.mode === "quarantine_restore" || input.mode === "restore") {
           const [sourceBefore] = await tx
             .select({
               id: issues.id,
@@ -3750,6 +3999,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .where(eq(issues.id, lockedWorkspace.sourceIssueId))
             .for("update");
           if (!sourceBefore) throw notFound("Source issue not found");
+          if (input.mode === "restore") {
+            const sourceIssueSkip = await recordedBranchRestoreSourceIssueSkip({
+              db: txDb,
+              companyId: lockedWorkspace.companyId,
+              sourceIssueId: lockedWorkspace.sourceIssueId,
+            });
+            if (sourceIssueSkip) {
+              throw unprocessable(sourceIssueSkip.message, { reason: sourceIssueSkip.reason, inspection });
+            }
+          }
 
           const requestedStatus = quarantineRestoreRequestedSourceStatus(sourceBefore);
           const policy = normalizeIssueExecutionPolicy(sourceBefore.executionPolicy ?? null);
@@ -3822,6 +4081,58 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           sourceIssueStatusChanged,
         };
       });
+    },
+
+    classifyRecordedBranchRestore: async (
+      id: string,
+      expected: { companyId: string; sourceIssueId: string; recoveryFingerprint: string },
+    ): Promise<RecordedBranchRestoreClassification> => {
+      const row = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!row?.sourceIssueId) {
+        return { eligible: false, reason: "workspace_missing", message: "Execution workspace not found or has no source issue" };
+      }
+      if (row.companyId !== expected.companyId || row.sourceIssueId !== expected.sourceIssueId) {
+        return {
+          eligible: false,
+          reason: "source_issue_mismatch",
+          message: "The recovery action belongs to a different issue than the workspace's source issue",
+        };
+      }
+      const sourceStatus = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, row.sourceIssueId))
+        .then((rows) => rows[0]?.status ?? null);
+      if (sourceStatus === null) {
+        return { eligible: false, reason: "workspace_missing", message: "Source issue not found" };
+      }
+      if (TERMINAL_ISSUE_STATUSES.has(sourceStatus)) {
+        return { eligible: false, reason: "source_issue_closed", message: `Source issue is ${sourceStatus}` };
+      }
+
+      let inspection: ExecutionWorkspaceBranchReconcileInspection;
+      try {
+        inspection = await inspectExecutionWorkspaceBranchForReconcile(toExecutionWorkspace(row));
+      } catch (error) {
+        return {
+          eligible: false,
+          reason: "inspection_failed",
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      const skip = await recordedBranchRestoreSkip({
+        db,
+        row,
+        sourceIssueId: row.sourceIssueId,
+        recoveryFingerprints: [expected.recoveryFingerprint],
+        inspection,
+        heartbeatRunId: null,
+      });
+      return skip ? { eligible: false, ...skip } : { eligible: true, inspection };
     },
 
     clearEnvironmentSelection: async (companyId: string, environmentId: string) => {

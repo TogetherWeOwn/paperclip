@@ -608,10 +608,15 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
-  it("waits for onSpawn before sending stdin to the child", async () => {
-    const spawnDelayMs = 150;
+  it("sends stdin immediately without waiting for onSpawn metadata persistence", async () => {
+    // stdin delivery must not gate on onSpawn (which persists run
+    // process metadata to the DB). Under host pressure that persist can exceed
+    // the CLI's 3-second stdin deadline, so the prompt must already be in
+    // flight while persistence runs concurrently.
+    const spawnDelayMs = 500;
     const startedAt = Date.now();
     let onSpawnCompletedAt = 0;
+    let onSpawnCalled = false;
 
     const result = await runChildProcess(
       randomUUID(),
@@ -628,6 +633,7 @@ describe("runChildProcess", () => {
         graceSec: 1,
         onLog: async () => {},
         onSpawn: async () => {
+          onSpawnCalled = true;
           await new Promise((resolve) => setTimeout(resolve, spawnDelayMs));
           onSpawnCompletedAt = Date.now();
         },
@@ -637,8 +643,61 @@ describe("runChildProcess", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("hello from stdin");
-    expect(onSpawnCompletedAt).toBeGreaterThanOrEqual(startedAt + spawnDelayMs);
-    expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
+    expect(onSpawnCalled).toBe(true);
+    // The run completes on stdin delivery, well before the slow metadata
+    // persist finishes. The old gated code took >= spawnDelayMs here.
+    expect(finishedAt - startedAt).toBeLessThan(spawnDelayMs);
+    // The background persist still runs to completion (fire-and-forget with
+    // error logging); give it a beat to land, then assert it ran.
+    await new Promise((resolve) => setTimeout(resolve, spawnDelayMs + 200));
+    expect(onSpawnCompletedAt).toBeGreaterThan(0);
+  });
+
+  it("delivers the prompt before a synthetic CLI stdin deadline even when onSpawn is slow", async () => {
+    // Synthetic delayed-start fixture for failed review runs that exited with
+    // exit 1, "no stdin data received in 3s ... Input must be provided
+    // either through stdin or as a prompt argument when using --print".
+    // The fake CLI enforces a short stdin deadline like the real CLI's 3s
+    // timer; onSpawn simulates a slow DB metadata persist under host load.
+    // Prompt transport stays piped stdin in both lanes — never argv/logs.
+    const stdinDeadlineMs = 300;
+    const spawnDelayMs = 1_500;
+    const fakeCliScript = [
+      `const deadlineMs=${stdinDeadlineMs};`,
+      "let gotData=false;",
+      "const timer=setTimeout(()=>{",
+      "if(!gotData){",
+      `process.stderr.write('Warning: no stdin data received in ${stdinDeadlineMs}ms, proceeding without it.\\n');`,
+      "process.stderr.write('Error: Input must be provided either through stdin or as a prompt argument when using --print.\\n');",
+      "process.exit(1);",
+      "}",
+      "},deadlineMs);",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',()=>{gotData=true;});",
+      "process.stdin.on('end',()=>{clearTimeout(timer);if(gotData){process.stdout.write('prompt-received');process.exit(0);}});",
+    ].join("");
+
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", fakeCliScript],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "confidential review prompt bytes",
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, spawnDelayMs));
+        },
+      },
+    );
+
+    expect(result.stderr).not.toContain("no stdin data received");
+    expect(result.stderr).not.toContain("Input must be provided either through stdin");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("prompt-received");
   });
 
   it.skipIf(process.platform === "win32")(
@@ -859,6 +918,49 @@ describe("runChildProcess", () => {
   );
 
   it.skipIf(process.platform === "win32")(
+    "reports exit 143 with terminal-result evidence when the child exits 143 on cleanup SIGTERM",
+    async () => {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
+            "process.on('SIGTERM', () => process.exit(143));",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async () => {},
+          terminalResultCleanup: {
+            graceMs: 100,
+            hasTerminalResult: ({ stdout }) =>
+              stdout.includes('"type":"result"'),
+          },
+        },
+      );
+
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(143);
+      expect(result.terminalResultCleanup).toMatchObject({
+        kind: "terminal_result_cleanup",
+        stopped: true,
+        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+        terminalResultSeen: true,
+        signal: "SIGTERM",
+        forceKilled: false,
+      });
+      expect(result.stdout).toContain('"type":"result"');
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "does not clean up noisy runs that have no terminal output",
     async () => {
       const runId = randomUUID();
@@ -932,6 +1034,117 @@ describe("runChildProcess", () => {
       }
     },
   );
+});
+
+// Regression coverage for TOG-12050: the controller crashed twice on
+// 2026-10-02 when deferred stdin payloads hit a child pipe the child had
+// already closed. The write-side EPIPE surfaces asynchronously as an 'error'
+// event on the parent's stdin stream; with no listener it is an uncaught
+// exception and the whole controller process dies with it. These tests drive
+// the real runChildProcess spawn path -- including the slow onSpawn persist
+// that defers the write -- so a missing listener fails loudly here instead
+// of in production.
+describe("runChildProcess deferred stdin pipe failures", () => {
+  it("settles normally when the child reads its stdin and exits", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "let data='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>data+=chunk);process.stdin.on('end',()=>{process.stdout.write(data);process.exit(0);});",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "normal-input",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("normal-input");
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives the child exiting before a slow onSpawn persist settles", async () => {
+    // The child fails immediately, while the onSpawn persist below stays
+    // slow: the deferred write then lands on a pipe whose reader is gone.
+    // Before the fix this emitted an unhandled error on the stdin stream
+    // and crashed the host process; now the run settles with the child's
+    // real exit code and the failure is contained to this run.
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.exit(3);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "deferred payload nobody reads",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(3);
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives an asynchronous EPIPE from a live child that closed its stdin", async () => {
+    // The child destroys its own stdin read end and stays alive past the
+    // write. The pipe buffer fills, so the kernel delivers EPIPE as an
+    // async 'error' event on the parent's stdin stream -- neither the
+    // child.killed nor the stdin.destroyed guard filters this case. The
+    // host process must stay alive and the run must settle on child exit.
+    const payload = "x".repeat(1024 * 1024);
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdin.destroy();setTimeout(()=>process.exit(0),500);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: payload,
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("survives a slow onSpawn persist against a live child with closed stdin", async () => {
+    // The exact incident shape: a readerless child plus the deferred write
+    // racing the slow onSpawn persist, so the parent-side guards read clean
+    // at write time and the failure arrives async instead.
+    const payload = "x".repeat(1024 * 1024);
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdin.destroy();setTimeout(()=>process.exit(0),1500);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: payload,
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+  });
 });
 
 describe("renderPaperclipWakePrompt", () => {
@@ -2041,7 +2254,8 @@ describe("renderPaperclipWakePrompt", () => {
 
     const firstPrompt = renderPaperclipWakePrompt(payload);
     expect(firstPrompt).toContain(
-      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch; keep all commits on it.",
+      // paperclip:allow-git-push: assertion mirrors the prompt prose above; no push behavior under test.
+      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch; keep all commits on it. On a public repository never publish a branch name that carries a tracker id: push HEAD to a card-free ref (`git push origin HEAD:refs/heads/<type>/<short-slug>`) and open the PR from that ref.",
     );
 
     const resumedPrompt = renderPaperclipWakePrompt(payload, {
@@ -3564,6 +3778,55 @@ describe("shapePaperclipWorkspaceEnvForExecution", () => {
       workspaceWorktreePath: "/tmp/worktree",
       workspaceHints,
     });
+  });
+});
+
+describe("runChildProcess inheritServerEnv", () => {
+  const PRINT_KEYS = "process.stdout.write(JSON.stringify(Object.keys(process.env).sort()))";
+
+  async function childEnvKeys(input: { env: Record<string, string>; inheritServerEnv?: boolean }) {
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", PRINT_KEYS], {
+      cwd: process.cwd(),
+      env: input.env,
+      timeoutSec: 0,
+      graceSec: 1,
+      onLog: async () => {},
+      ...(input.inheritServerEnv === undefined ? {} : { inheritServerEnv: input.inheritServerEnv }),
+    });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as string[];
+  }
+
+  it("inherits the server env by default", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "visible";
+    try {
+      const keys = await childEnvKeys({ env: { EXPLICIT_ONE: "1" } });
+      expect(keys).toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
+  });
+
+  it("starts from an empty env when inheritServerEnv is false", async () => {
+    const saved = process.env.TOG16050_SERVER_ONLY;
+    process.env.TOG16050_SERVER_ONLY = "hidden";
+    try {
+      const keys = await childEnvKeys({
+        env: { EXPLICIT_ONE: "1", PATH: process.env.PATH ?? "" },
+        inheritServerEnv: false,
+      });
+      expect(keys).not.toContain("TOG16050_SERVER_ONLY");
+      expect(keys).toContain("EXPLICIT_ONE");
+      // Nothing from the server survives by name: only what was passed (the
+      // runtime may add a few of its own, such as locale or cwd hints).
+      expect(keys.filter((key) => !["EXPLICIT_ONE", "PATH", "PWD", "SHLVL", "_", "LC_CTYPE", "OLDPWD"].includes(key))).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.TOG16050_SERVER_ONLY;
+      else process.env.TOG16050_SERVER_ONLY = saved;
+    }
   });
 });
 

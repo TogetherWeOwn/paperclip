@@ -66,12 +66,20 @@ export interface GitHubReviewEnrollmentEnvelope {
   unavailableEvent?: Pick<GitHubReviewEventContext, "event" | "deliveryId" | "repositoryId" | "repository" | "pullNumber" | "sender">;
   /** Missing certification on older rows is also ineligible, never implicit approval. */
   comparisonEligibility?: { certifiedClean: boolean; reasons: string[] };
-  /** Admission-time protocol, including explicit deviations and their provenance. */
+  /** Admission-time protocol, including explicit deviations and their provenance.
+   * Pre-#193 rows carry only the `webTools` key; newer rows carry every
+   * candidate-only denial in GITHUB_SHADOW_CANDIDATE_DENIALS. */
   protocol?: {
     version: number; primaryBlindingVersion: number; eligibilitySource: string;
-    deviations: { webTools: { deniedTools: readonly string[]; reason: string; primaryChanged: boolean;
-      evidence: { successfulRuns: number; lookbackDays: number; webSearchRequests: number; webFetchRequests: number;
-        source: string; observedOn: string; verification: string } } };
+    deviations: Record<string, {
+      reason: string; primaryChanged: boolean; bias: string;
+      deniedTools?: readonly string[];
+      deniedMcpServers?: readonly string[];
+      deniedToolPrefixes?: readonly string[];
+      deniedToolPattern?: string;
+      evidence?: { successfulRuns: number; lookbackDays: number; webSearchRequests: number; webFetchRequests: number;
+        source: string; observedOn: string; verification: string };
+    }>;
   };
   /** Admission-time policy evidence, not a claim about ambient CLI/MCP tools. */
   primaryToolPolicy?: { adapterType: string; engine: string | null; configDigest: string; effectiveToolsVerified: false };

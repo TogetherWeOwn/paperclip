@@ -326,6 +326,11 @@ There is no separate messaging or chat system. Tasks are the communication chann
 Experimental external chat and voice connections are transports into this task
 system. They preserve the selected agent, task context, current caller authority,
 and governed-action checks; a voice session is not a separate authority or inbox.
+A deferred comment already covered by a completed typed review must not erase
+that review. Intentional resumes remain new work. Any supported repair derives
+completion from authentic persisted evidence, preserves access and policy gates,
+and records original decision references. See [the implementation contract](SPEC-implementation.md#93-permission-matrix-v1) and [the restoration release gates](completed-review-restoration.md).
+
 Experimental Agent Chat presents one persistent task per person and agent as a simplified conversation. Chat has a searchable secondary sidebar with agent avatars that lists every eligible agent, conversations first; adding an agent starts or reopens their single conversation. It retains the task composer, transcript, tools, attachments, documents, and existing Subtasks panel, with ordinary company visibility. New execution tasks are ordinary project tasks, not children of the conversation. Idle conversations wait for a message without entering execution-task work queues. Agents clarify goals here and create assigned tasks for substantial execution. `/new` resets provider context at an ordered session boundary within the same task while preserving visible history. `enableAgentChat` is disabled by default; the V1 lifecycle and rollout contract is specified in `SPEC-implementation.md`.
 
 ### Question recipients

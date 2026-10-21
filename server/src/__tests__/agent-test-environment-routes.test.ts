@@ -391,6 +391,59 @@ describe("agent test-environment route", () => {
     expect(testEnvironmentSpy).not.toHaveBeenCalled();
   });
 
+  it("refuses an SSH probe with 422 while native SSH authority is required", async () => {
+    // A probe outside a run has no run, issue or decided model to bind an
+    // authority to, so the route refuses before the adapter is entered.
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "required");
+    try {
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip/run",
+        spec: { host: "ssh.example.test" },
+      });
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/external_test/test-environment")
+        .send({
+          adapterConfig: {},
+          environmentId: "11111111-1111-4111-8111-111111111111",
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details.code).toBe("native_ssh_authority_required");
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("refuses a managed SSH probe with the same 422 while native SSH authority is required", async () => {
+    mockManagedRuntime("api_key");
+    vi.stubEnv("PAPERCLIP_NATIVE_SSH_AUTHORITY", "required");
+    try {
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/srv/paperclip/run",
+        spec: { host: "ssh.example.test" },
+      });
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/adapters/external_test/test-environment")
+        .send({
+          adapterConfig: { cwd: "/" },
+          environmentId: "11111111-1111-4111-8111-111111111111",
+          aiConnection: { provider: "anthropic", method: "api_key", mode: "responsible_user" },
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details.code).toBe("native_ssh_authority_required");
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
+      expect(mockValidateAiApiKey).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("tests a prospective adapter switch before saving the agent", async () => {
     mockAgentService.getById.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1",

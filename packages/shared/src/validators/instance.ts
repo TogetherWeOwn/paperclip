@@ -31,6 +31,11 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Environment (driver `sandbox`) that runs the trust preset `low_trust_review`
+  // whenever its environment selection would otherwise land on local. Trusted
+  // runs never read it. Absent/null = no designation: a low-trust run that
+  // lands on local fails closed (`low_trust_requires_sandbox_environment`).
+  lowTrustSandboxEnvironmentId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z
@@ -55,6 +60,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableOpenAiDot: z.boolean().default(false),
   enableChatConnectors: z.boolean().default(false),
   enableGitHubReviewBots: z.boolean().default(false),
+  // Global admission/wake kill switch for paired reviews, independent of the
+  // primary endpoint and permanent capture-only fences. Preparation is inert.
+  githubReviewShadowEnabled: z.boolean().default(false),
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),
   enableMemoryConnectors: z.boolean().default(false),
@@ -90,6 +98,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   // Deprecated compatibility key. Runner ingress follows enableNativeRunner;
   // this remains accepted so older stored rows and managed configs keep loading.
   enableRunnerPreviewIngress: z.boolean().default(false),
+  // TOG-11792: issue runs wait for the run.model.resolve holder's decision and
+  // never start on the default. Off = advisory (run on the default).
+  requireRunModelDecision: z.boolean().default(false),
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),

@@ -17,6 +17,7 @@ import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { githubReadOperationsService } from "../services/github-read-operations.js";
 
 function bearer(req: Request) {
   const value = req.header("authorization") ?? "";
@@ -39,10 +40,13 @@ function resultContent(value: unknown) {
 export { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../services/connection-tool-definitions.js";
 import { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../services/connection-tool-definitions.js";
 
+const GITHUB_CREDENTIAL_CACHE_MAX_TTL_MS = 10 * 60 * 1000;
+
 /** Public, token-authenticated routes mounted before the general actor middleware. */
 export function runtimeConnectionIntentRoutes(db: Db) {
   const router = Router();
   const service = connectionIntentService(db);
+  const githubReads = githubReadOperationsService(db);
 
   router.post("/runtime-tools/github/credentials", async (req, res) => {
     // This capability is never accepted as board/session authentication.
@@ -52,9 +56,14 @@ export function runtimeConnectionIntentRoutes(db: Db) {
       ? req.headers["x-paperclip-github-capability"] : bearer(req), "github_credentials");
     if (!claims) throw unauthorized("Invalid GitHub runtime capability");
     res.setHeader("Cache-Control", "no-store");
-    res.json(await resolveGitHubOperationCredentials(db, {
+    const credentials = await resolveGitHubOperationCredentials(db, {
       companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
-    }));
+    });
+    // This capability names exactly one run, so the launcher may reuse the
+    // capture for operations under the same capability, never past its expiry.
+    // Session-lifetime brokers that rebind runs must not send this field.
+    const cacheTtlMs = Math.max(0, Math.min(GITHUB_CREDENTIAL_CACHE_MAX_TTL_MS, claims.exp * 1000 - Date.now() - 60_000));
+    res.json({ ...credentials, cacheTtlMs });
   });
 
   router.get("/mcp/runtime-tools", async (req, res) => {
@@ -64,6 +73,7 @@ export function runtimeConnectionIntentRoutes(db: Db) {
 
   router.post("/mcp/runtime-tools", async (req, res) => {
     const claims = runtimeClaims(req);
+    res.setHeader("Cache-Control", "no-store");
     // Streamable HTTP lifecycle calls are token uses too. Revalidate the bound
     // run before initialize/list as well as before an actual tool call so an
     // ended heartbeat cannot keep probing the endpoint with a once-valid token.
@@ -110,6 +120,16 @@ export function runtimeConnectionIntentRoutes(db: Db) {
       if (name === "connection_request") {
         const input = connectionRequestInputSchema.parse(params.arguments ?? {});
         const result = await service.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService, connectionId: input.connectionId, toolNames: input.toolNames });
+        res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
+        return;
+      }
+      if (name === "github_actions_job_logs") {
+        const result = await githubReads.actionsJobLogs(claims, params.arguments ?? {});
+        res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
+        return;
+      }
+      if (name === "github_repository_webhooks") {
+        const result = await githubReads.repositoryWebhooks(claims, params.arguments ?? {});
         res.json({ jsonrpc: "2.0", id, result: resultContent(result) });
         return;
       }

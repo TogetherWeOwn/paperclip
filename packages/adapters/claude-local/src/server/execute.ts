@@ -101,6 +101,7 @@ import {
   createClaudeAcpExecutor,
   resolveClaudeExecutionEngineForRun,
 } from "./acp.js";
+import { isIsolatedRuntime, isolatedRuntimeEnv } from "./isolated-runtime.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeClaudeAcp = createClaudeAcpExecutor();
@@ -311,8 +312,14 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  const certifiedCandidate = executionTarget?.kind === "remote" && executionTarget.transport === "ssh"
+    && executionTarget.githubCandidateIsolation;
+  if (certifiedCandidate) env.PAPERCLIP_API_URL = "http://127.0.0.1:3100";
+  // Ordinary SSH inherits host compatibility variables. A certified candidate
+  // must never send controller credentials to the isolated account, even in
+  // command-resolution/bootstrap probes before the actual CLI launch.
   const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv(certifiedCandidate ? { ...env } : { ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -427,6 +434,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
+  const isolateRuntime = isIsolatedRuntime(config);
+  if (isolateRuntime && executionTargetIsRemote) {
+    // The sandbox and SSH lanes add their own bridge and credential env after
+    // this point; isolation cannot vouch for what they carry.
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_isolation_unsupported",
+      errorMessage:
+        "adapterConfig.isolateRuntime is only supported for local execution targets; refusing to start a remote run without it.",
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -494,9 +517,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
-  const model = resolveClaudeModel(config.model, modelEnv);
-  const billingType = resolveClaudeBillingType(effectiveEnv);
+  // Mutable: under isolateRuntime these are re-decided from the narrowed env
+  // below, so a server-held key never bills `api` for a child that never
+  // receives it.
+  let modelEnv = executionTargetIsRemote ? env : effectiveEnv;
+  let model = resolveClaudeModel(config.model, modelEnv);
+  let billingType = resolveClaudeBillingType(effectiveEnv);
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // Keep per-run working-copy paths out of the content-addressed system prompt.
@@ -624,6 +650,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterKey: "claude",
           timeoutSec,
           workspaceLocalDir: cwd,
+          // A certified GitHub candidate's checkout is materialised from the
+          // sealed artifact on the isolated host. Never replace or sync it back.
+          ...(executionTarget?.kind === "remote" && executionTarget.transport === "ssh" && executionTarget.githubCandidateIsolation
+            ? { syncWorkspace: false } : {}),
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,
           onProgress: (line) => onLog("stdout", line),
@@ -746,6 +776,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         loggedEnv.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
       }
     }
+  }
+  if (isolateRuntime) {
+    // The child is spawned with `inheritServerEnv: false`, so this is its whole
+    // environment. Replace in place: `env` is also what `adapter.invoke` logs,
+    // so the narrowed key set is the E1 evidence. The harness-minted run token
+    // stays exactly as today, and managed MCP wiring is untouched.
+    const kept = isolatedRuntimeEnv(env);
+    for (const key of Object.keys(env)) delete env[key];
+    Object.assign(env, kept);
+    // Decide model and billing from what the child actually receives: a
+    // server-held key must not select `--model` or bill `api` for a child
+    // that never gets it.
+    modelEnv = env;
+    model = resolveClaudeModel(config.model, env);
+    billingType = resolveClaudeBillingType(env);
+    loggedEnv = buildInvocationEnvForLogs(env, {
+      runtimeEnv: ensurePathInEnv({ ...env }),
+      includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
+      resolvedCommand,
+    });
+    await onLog(
+      "stdout",
+      `[paperclip] isolateRuntime: Claude environment limited to ${Object.keys(env).length} variable(s); run token kept in process env only (this change writes no credential files; the pre-existing per-run MCP config file is unchanged).\n`,
+    );
   }
   let effectiveEffort = effort;
   if (executionTargetIsSandbox && effort) {
@@ -990,6 +1044,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
+      inheritServerEnv: !isolateRuntime,
     });
     await accountingLog.flush();
 
@@ -1278,7 +1333,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
-      biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+      biller: isBedrockAuth(isolateRuntime ? env : effectiveEnv) ? "aws_bedrock" : "anthropic",
       model: Object.keys(parseObject(parsed.modelUsage)).length > 1 ? "mixed" : parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd,
@@ -1326,7 +1381,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
           errorCode: "claude_cli_version_incompatible",
           provider: "anthropic",
-          biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+          biller: isBedrockAuth(isolateRuntime ? env : effectiveEnv) ? "aws_bedrock" : "anthropic",
           model,
           billingType,
           resultJson: {

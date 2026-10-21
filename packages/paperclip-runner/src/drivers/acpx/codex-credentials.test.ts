@@ -839,7 +839,10 @@ describe("managed Codex credentials", () => {
           const pathname = String(path);
           if (retainedHomes.has(pathname)) {
             directoryOpenAttempts += 1;
-            if (directoryOpenAttempts === 4) observeFourOpens();
+            if (directoryOpenAttempts === 4) {
+              // Let the caller install its timeout before advancing fake time.
+              void Promise.resolve().then(observeFourOpens);
+            }
             return await new Promise<FileHandle>(() => undefined);
           }
           if (pathname === fixtures[4].home) fifthHomeOpenAttempts += 1;
@@ -923,7 +926,8 @@ describe("managed Codex credentials", () => {
           if (String(path) === fixture.home) {
             directoryOpenAttempts += 1;
             if (directoryOpenAttempts === 1) {
-              observeFirstOpen();
+              // Let the caller install its timeout before advancing fake time.
+              void Promise.resolve().then(observeFirstOpen);
               return await retainedOpen;
             }
           }

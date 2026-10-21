@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Select GitHub PR review execution trust from API repository and author identities, not the trigger sender. Same-repository PRs by linked members or explicitly trusted bot user IDs can use normal trust. Forks and outside authors remain low trust. Trusted follow-ups can remove audited connector-generated restrictions without clearing operator policy. Review wakes retain their admitted containment, and paired reviews use the originating delivery's decision. This change targets the deployment branch; restore removed bot guests in a new configuration revision only after deployment.
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
 ## 0.3.1

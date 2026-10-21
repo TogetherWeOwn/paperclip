@@ -7415,6 +7415,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it("does not admit disposition repair while a cancelled prerequisite remains unresolved", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const blockerId = randomUUID();
+    const [sourceIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    if (!sourceIssue) throw new Error("Expected stranded source issue");
+
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Cancelled prerequisite",
+      status: "cancelled",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: `${sourceIssue.identifier?.split("-")[0]}-2`,
+      cancelledAt: new Date("2026-03-18T00:00:00.000Z"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const sourceState = await collectDispositionRepairSourceState(db, {
+      issue: sourceIssue,
+    });
+    expect(sourceState).toMatchObject({
+      dependencyIssueIds: [blockerId],
+      hasDurableWaitingPath: true,
+      durablePathReason: "blocker",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    const repairRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = 'issue_disposition_repair'`,
+        ),
+      );
+    expect(actions).toHaveLength(0);
+    expect(repairRuns).toHaveLength(0);
+  });
+
   it("folds a persisted disposition-repair action when a current typed wait appears", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -13391,6 +13460,74 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     },
   );
+
+  it("dispatches while a same-agent claim transaction holds the agents row", async () => {
+    // Dispatch takes issue/wake/run locks only; restoring the agents-row
+    // lock makes dispatch spin the retry budget (51 attempts at 100ms) and
+    // fail with ChatControlRecoveryUnresolvedError while a claim holds it.
+    const source = await seedCommittedChatControlStop();
+    await db.update(chatPublications).set({ state: "pending" })
+      .where(eq(chatPublications.id, source.publicationId));
+    const child = await seedChatAutomaticChild(source);
+    await db.update(agentWakeupRequests).set({
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      reason: "issue_commented",
+    }).where(eq(agentWakeupRequests.id, child.wakeupRequestId));
+    await db.update(heartbeatRuns).set({ retryOfRunId: null })
+      .where(eq(heartbeatRuns.id, child.runId));
+    let release!: () => void;
+    let locked: Promise<unknown> | undefined;
+    let dispatchChecked = false;
+    let adapterEntered = false;
+    mockAdapterExecute.mockImplementation(async () => {
+      adapterEntered = true;
+      // Dispatch cleared the gate against the held agents row. Release the
+      // hold now: post-dispatch finalization updates the agents row, which
+      // must not wedge behind this test's own lock.
+      release();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, source.issueId));
+      return { exitCode: 0, summary: "Recorded completion", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db, {
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "dispatch" || dispatchChecked) return;
+        dispatchChecked = true;
+        let ready!: () => void;
+        const acquired = new Promise<void>((resolve) => { ready = resolve; });
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        // Same shape as a concurrent claim's agents-row hold: FOR NO KEY
+        // UPDATE in an open transaction, held across the dispatch gate.
+        locked = db.transaction(async (tx) => {
+          await tx.execute(
+            sql`select id from agents where id = ${source.agentId} and company_id = ${source.companyId} for no key update`,
+          );
+          ready();
+          await held;
+        });
+        await acquired;
+      },
+    });
+    const startedAt = Date.now();
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+    } finally {
+      release?.();
+      await locked;
+      await heartbeat.drainActiveRunExecutions();
+    }
+    expect(dispatchChecked).toBe(true);
+    expect(locked).toBeDefined();
+    expect(adapterEntered).toBe(true);
+    // With the agents lock restored, the gate burns the ~5s retry budget
+    // before failing; without it, dispatch clears in milliseconds.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    const settled = await heartbeat.getRun(child.runId);
+    expect(settled?.errorCode).not.toBe(CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(settled?.status).toBe("succeeded");
+    expect(readChatControlRecoveryAdmission(settled!)).toBe("admitted");
+  });
 
   it("defers unresolved automatic ancestry at claim and records a distinct nonretrying failure after claim", async () => {
     const source = await seedCommittedChatControlStop();

@@ -2343,6 +2343,90 @@ describe("agent issue mutation checkout ownership", () => {
       },
     );
 
+    it("retries legacy stranded evidence that stores only latestRunId", async () => {
+      // Producer/consumer mismatch: stranded actions created before the
+      // canonical evidence.runId stored the failed run as latestRunId with
+      // sourceRunId null. The route must resolve that single-source fallback
+      // server-side and let prepareFailedChatRunRetry prove chat provenance.
+      const { db } = setupChatRecovery({
+        evidence: { latestRunId: ownerRunId, sourceRunId: null },
+      });
+      const res = await request(
+        await createApp(boardActor(), db, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+      )
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(retryRequest);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(
+        mockChatRunRetries.prepareFailedChatRunRetry,
+      ).toHaveBeenCalledExactlyOnceWith(db, {
+        companyId,
+        issueId,
+        agentId: ownerAgentId,
+        failedRunId: ownerRunId,
+        initiatedByUserId: "board-user",
+      });
+    });
+
+    it("prefers canonical evidence.runId over legacy latestRunId", async () => {
+      const { db } = setupChatRecovery({
+        evidence: {
+          runId: ownerRunId,
+          latestRunId: peerAgentId,
+          sourceRunId: peerAgentId,
+        },
+      });
+      const res = await request(
+        await createApp(boardActor(), db, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+      )
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(retryRequest);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(
+        mockChatRunRetries.prepareFailedChatRunRetry,
+      ).toHaveBeenCalledExactlyOnceWith(db, {
+        companyId,
+        issueId,
+        agentId: ownerAgentId,
+        failedRunId: ownerRunId,
+        initiatedByUserId: "board-user",
+      });
+    });
+
+    it.each([
+      { latestRunId: ownerRunId, sourceRunId: peerAgentId },
+      { latestRunId: "not-a-run-id", sourceRunId: null },
+      { latestRunId: null, sourceRunId: null },
+    ])(
+      "rejects ambiguous or invalid legacy recovery evidence without staging: %j",
+      async (evidence) => {
+        const { db } = setupChatRecovery({ evidence });
+        const res = await request(
+          await createApp(boardActor(), db, {
+            chatRunRetries: mockChatRunRetries,
+          }),
+        )
+          .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+          .send(retryRequest);
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.details?.code).toBe(
+          "chat_recovery_requires_authorized_context",
+        );
+        expect(
+          mockChatRunRetries.prepareFailedChatRunRetry,
+        ).not.toHaveBeenCalled();
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(
+          mockIssueRecoveryActionService.resolveActiveForIssue,
+        ).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      },
+    );
+
     it.each([
       { failedRunId: peerAgentId },
       {
@@ -3059,6 +3143,93 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("issue PATCH redacted env restore", () => {
+    const REDACTED = "***REDACTED***";
+    const storedPathBinding = { type: "plain", value: "/usr/bin:/bin" };
+
+    it("restores a redacted PATH from the stored override on GET-then-PATCH round trip", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: { adapterConfig: { env: { PATH: storedPathBinding } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: REDACTED } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: storedPathBinding } },
+          },
+        }),
+      );
+    });
+
+    it("falls back to the assignee agent stored env when the override has no stored value", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: null,
+      }));
+      mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, {
+        adapterConfig: { env: { PATH: { type: "plain", value: "/agent/bin" } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: REDACTED } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/agent/bin" } } },
+          },
+        }),
+      );
+    });
+
+    it("passes genuine new env values through untouched", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: { adapterConfig: { env: { PATH: storedPathBinding } } },
+      }));
+      const app = await createApp(boardActor());
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/new/bin" } } },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAdapterOverrides: {
+            adapterConfig: { env: { PATH: { type: "plain", value: "/new/bin" } } },
+          },
+        }),
+      );
+      expect(mockAgentService.getById).not.toHaveBeenCalled();
     });
   });
 });

@@ -7,7 +7,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden } from "../errors.js";
+import { conflict, forbidden, unprocessable } from "../errors.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -225,6 +225,29 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
         () => svc.getGeneral(),
         (field) => hidden.has(`instance.general.${field}`),
       );
+      // The low-trust sandbox designation places untrusted-code runs, so only a
+      // real, active sandbox-driver environment may be designated. null clears it.
+      if (Object.prototype.hasOwnProperty.call(req.body, "lowTrustSandboxEnvironmentId")) {
+        await assertEnvironmentSelectionForCompany(
+          environments,
+          "instance",
+          typeof req.body.lowTrustSandboxEnvironmentId === "string"
+            ? req.body.lowTrustSandboxEnvironmentId
+            : null,
+          { allowedDrivers: ["sandbox"] },
+        );
+        // A retained VM would carry one untrusted run's content into the next.
+        const designated =
+          typeof req.body.lowTrustSandboxEnvironmentId === "string"
+            ? await environments.getById(req.body.lowTrustSandboxEnvironmentId)
+            : null;
+        if (designated?.config?.reuseLease === true) {
+          throw unprocessable(
+            "A low-trust sandbox environment must not reuse leases (reuseLease must be off).",
+            { code: "low_trust_sandbox_reuses_lease" },
+          );
+        }
+      }
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

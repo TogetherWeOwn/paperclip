@@ -1,3 +1,4 @@
+import { insertChatActions } from "./chat-publication-authority.js";
 import { sql } from "drizzle-orm";
 import { chatActions, type Db } from "@paperclipai/db";
 
@@ -49,10 +50,7 @@ export async function stageSlackSessionSync(
     runtimeGeneration: input.runtimeGeneration,
     credentialFingerprint: input.credentialFingerprint,
   };
-  await notifyChatActionWork(database, "slack_session_sync");
-  await database
-    .insert(chatActions)
-    .values({
+  await insertChatActions(database, {
       companyId: input.companyId,
       endpointId: input.endpointId,
       conversationId: input.conversationId,
@@ -61,8 +59,7 @@ export async function stageSlackSessionSync(
       payload,
       status: "received",
       updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
+    }, { onConflictDoUpdate: {
       target: [chatActions.endpointId, chatActions.providerActionId],
       set: {
         payload: sql`${JSON.stringify(payload)}::jsonb || jsonb_build_object('revision', coalesce((${chatActions.payload}->>'revision')::bigint, 0) + 1)`,
@@ -70,5 +67,5 @@ export async function stageSlackSessionSync(
         result: null,
         updatedAt: new Date(),
       },
-    });
+    } });
 }

@@ -622,12 +622,13 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }
@@ -932,6 +933,13 @@ export const stalledReviewDecisionSchema = z
   });
 
 export type StalledReviewDecision = z.infer<typeof stalledReviewDecisionSchema>;
+
+export const restoreCompletedReviewSchema = z.object({
+  completionActivityId: z.string().guid(),
+  wakeupRequestId: z.string().guid(),
+}).strict();
+
+export type RestoreCompletedReview = z.infer<typeof restoreCompletedReviewSchema>;
 
 export const checkoutIssueSchema = z.object({
   agentId: z.string().guid(),

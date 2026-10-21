@@ -1,3 +1,4 @@
+import { insertChatActions } from "../chat-publication-authority.js";
 import { and, eq, sql } from "drizzle-orm";
 import { chatActions, chatEndpointResources, type Db } from "@paperclipai/db";
 import { HttpError, forbidden, unprocessable } from "../../errors.js";
@@ -166,9 +167,7 @@ export async function recordSlackReadBoundary(
     throw forbidden(
       "Ask for cross-channel private research in a DM with the bot",
     );
-  await db
-    .insert(chatActions)
-    .values({
+  await insertChatActions(db, {
       companyId: authority.endpoint.companyId,
       endpointId: authority.endpoint.id,
       conversationId: authority.conversation?.id ?? null,
@@ -184,8 +183,7 @@ export async function recordSlackReadBoundary(
           ? authority.conversation.externalConversationId.replace(/^slack:/, "")
           : null,
       },
-    })
-    .onConflictDoNothing();
+    }, { onConflictDoNothing: true });
 }
 export async function slackPublicationAllowed(
   db: Pick<Db, "select">,

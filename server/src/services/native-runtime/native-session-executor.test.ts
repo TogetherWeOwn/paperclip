@@ -9103,6 +9103,31 @@ describe("native session bounded recovery", () => {
     });
   });
 
+  it("fails an SSH-bound Paperclip Runner launch terminally on the first attempt", () => {
+    const code = nativeSessionFailureSourceCode(
+      new Error(
+        "runner_transport_ineligible: Paperclip Runner launches over SSH are refused without an executor-issued launch authority",
+      ),
+    );
+    expect(code).toBe("runner_transport_ineligible");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure",
+      failureCode: "runner_transport_ineligible",
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionRecoveryProjection({
+        phase: "terminal_failure",
+        failureCode: code,
+        agentId: "agent",
+      }),
+    ).toMatchObject({
+      issueStatus: "blocked",
+      recoveryOwner: { kind: "board" },
+      recoveryActionCause: "runner_transport_ineligible",
+    });
+  });
+
   it("preserves stable provider and runner failure causes", () => {
     expect(
       nativeSessionFailureSourceCode(
@@ -9182,6 +9207,13 @@ describe("native session bounded recovery", () => {
         ),
       ),
     ).toBe("runner_remote_provider_artifact_incompatible");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "runner_transport_ineligible: Paperclip Runner launches over SSH are refused",
+        ),
+      ),
+    ).toBe("runner_transport_ineligible");
     expect(
       nativeSessionFailureSourceCode(
         new Error("native_current_wake_comments_unread"),
@@ -9581,6 +9613,48 @@ describe("runnerd provider runtime wiring", () => {
     await rm(isolatedStateDirectory, { recursive: true, force: true });
   });
 
+  // Paperclip Runner launches over SSH are refused without an
+  // executor-issued launch authority, so remote runnerd wiring regressions
+  // run against the supported sandbox transport. The mock answers the
+  // runnerd/codex staging probes with compatible results for the paths
+  // these tests exercise through the mocked runner transport.
+  function sandboxCodexRunner() {
+    return {
+      execute: vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") {
+          return {
+            exitCode: 0, timedOut: false, signal: null, stderr: "",
+            stdout: JSON.stringify({
+              schema: "paperclip-runner/runnerd-build-metadata/v1",
+              binaryName: "paperclip-runnerd",
+              packageName: "@paperclipai/paperclip-runner",
+              binaryContractVersion: 2,
+              durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"],
+              prpTransportModes: ["dial_wss", "listen_ws"],
+            }),
+          };
+        }
+        if (command.args?.[0] === "--version") {
+          return {
+            exitCode: 0, timedOut: false, signal: null, stderr: "",
+            stdout: "codex-cli 0.156.0",
+          };
+        }
+        if (command.args?.[1] === "uname -s; uname -m") {
+          return {
+            exitCode: 0, timedOut: false, signal: null, stderr: "",
+            stdout: `${process.platform === "darwin" ? "Darwin" : "Linux"}\n${process.arch === "arm64" ? "arm64" : "x86_64"}\n`,
+          };
+        }
+        if (command.args?.[1]?.includes("base64")) {
+          return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, timedOut: false, signal: null, stdout: "", stderr: "" };
+      }),
+      syncIn: vi.fn(async () => undefined),
+    };
+  }
+
   it.each([
     ["open", "before-close"],
     ["open", "during-close"],
@@ -9971,19 +10045,11 @@ describe("runnerd provider runtime wiring", () => {
         useRunnerd: true,
         runnerExecutionTarget: {
           kind: "remote",
-          transport: "ssh",
+          transport: "sandbox",
+          providerKey: "daytona",
           remoteCwd,
-          spec: {
-            host: "runner.internal",
-            port: 22,
-            username: "runner",
-            remoteWorkspacePath: remoteCwd,
-            remoteCwd,
-            privateKey: null,
-            knownHosts: null,
-            strictHostKeyChecking: true,
-          },
-        },
+          runner: sandboxCodexRunner(),
+        } as never,
       });
       expect(state.createBackend).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -12478,19 +12544,11 @@ describe("runnerd provider runtime wiring", () => {
       useRunnerd: true,
       runnerExecutionTarget: {
         kind: "remote",
-        transport: "ssh",
+        transport: "sandbox",
+        providerKey: "daytona",
         remoteCwd,
-        spec: {
-          host: "runner.internal",
-          port: 22,
-          username: "runner",
-          remoteWorkspacePath: remoteCwd,
-          remoteCwd,
-          privateKey: null,
-          knownHosts: null,
-          strictHostKeyChecking: true,
-        },
-      },
+        runner: sandboxCodexRunner(),
+      } as never,
       runnerPublicUrl: "wss://paperclip.example.test",
     });
 
@@ -12520,12 +12578,12 @@ describe("runnerd provider runtime wiring", () => {
         }),
       }),
     );
-    const sshTransportOptions = state.createTransport.mock.calls[0]![0] as {
+    const transportOptions = state.createTransport.mock.calls[0]![0] as {
       environment: NodeJS.ProcessEnv;
     };
     expect(
-      sshTransportOptions.environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX,
-    ).toBeUndefined();
+      transportOptions.environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX,
+    ).toBe("1");
     expect(state.createTransport.mock.calls[0]![0].runnerBinary).not.toBe(
       `${remoteCwd}/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd`,
     );
@@ -12941,6 +12999,42 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  it("refuses Paperclip Runner launches on SSH targets before any remote contact", async () => {
+    const remoteCwd = "/home/daytona/paperclip-workspace";
+    const sshExecution = {
+      ...execution,
+      binding: { ...execution.binding, runId: "run-remote-ssh-refused" },
+    } as NativeExecutionInputV1;
+    const sshTarget = {
+      kind: "remote" as const,
+      transport: "ssh" as const,
+      remoteCwd,
+      spec: {
+        host: "runner.internal",
+        port: 22,
+        username: "runner",
+        remoteWorkspacePath: remoteCwd,
+        remoteCwd,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    };
+    state.createBackend.mockClear();
+    state.createTransport.mockClear();
+
+    await expect(
+      createRunnerdBackend({
+        db: leaseDb(sshExecution),
+        execution: sshExecution,
+        runnerInstanceId: "runner",
+        runnerExecutionTarget: sshTarget,
+      }),
+    ).rejects.toThrow("runner_transport_ineligible");
+    expect(state.createBackend).not.toHaveBeenCalled();
+    expect(state.createTransport).not.toHaveBeenCalled();
+  });
+
   it("binds a remote launch to the configured controller-owned runner artifact", async () => {
     const remoteCwd = "/home/daytona/paperclip-workspace";
     const controllerArtifact = "/controller/artifacts/paperclip-runnerd";
@@ -12956,19 +13050,12 @@ describe("runnerd provider runtime wiring", () => {
       runnerInstanceId: "runner",
       runnerExecutionTarget: {
         kind: "remote",
-        transport: "ssh",
+        transport: "sandbox",
+        providerKey: "daytona",
+        leaseId: "lease-remote-runner-artifact",
         remoteCwd,
-        spec: {
-          host: "runner.internal",
-          port: 22,
-          username: "runner",
-          remoteWorkspacePath: remoteCwd,
-          remoteCwd,
-          privateKey: null,
-          knownHosts: null,
-          strictHostKeyChecking: true,
-        },
-      },
+        runner: sandboxCodexRunner(),
+      } as never,
       runnerRemoteBinaryPath: controllerArtifact,
     });
 
@@ -13009,19 +13096,12 @@ describe("runnerd provider runtime wiring", () => {
           runnerInstanceId: "runner",
           runnerExecutionTarget: {
             kind: "remote",
-            transport: "ssh",
+            transport: "sandbox",
+            providerKey: "daytona",
+            leaseId: `lease-remote-${providerKind}-rejected`,
             remoteCwd,
-            spec: {
-              host: "runner.internal",
-              port: 22,
-              username: "runner",
-              remoteWorkspacePath: remoteCwd,
-              remoteCwd,
-              privateKey: null,
-              knownHosts: null,
-              strictHostKeyChecking: true,
-            },
-          },
+            runner: sandboxCodexRunner(),
+          } as never,
         }),
       ).rejects.toThrow(providerKind === "opencode"
         ? "runner_remote_provider_artifact_incompatible: provider-pack.json is unreadable"

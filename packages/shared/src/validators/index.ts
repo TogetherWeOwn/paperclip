@@ -434,6 +434,7 @@ export {
   issueBlockedInboxStateSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
+  restoreCompletedReviewSchema,
   issueExecutionPolicySchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionStateSchema,
@@ -509,6 +510,7 @@ export {
   type CreateIssueLabel,
   type UpdateIssue,
   type StalledReviewDecision,
+  type RestoreCompletedReview,
   type IssueExecutionWorkspaceSettings,
   type IssueRecoveryActionReadModel,
   type ResolveIssueRecoveryAction,
@@ -588,7 +590,9 @@ export {
 
 export {
   executionWorkspaceConfigSchema,
+  allocateSourceBoundWorkspaceSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  rollbackSourceBoundWorkspaceAllocationSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   executionWorkspaceDeliveryStateSchema,

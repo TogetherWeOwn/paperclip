@@ -6202,6 +6202,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "native_provider_approval_required" ||
     sourceFailureCode === "native_event_replay_conflict" ||
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
+    sourceFailureCode === "runner_transport_ineligible" ||
     sourceFailureCode === "native_provider_terminal_failed" ||
     sourceFailureCode === "native_current_wake_comments_unread" ||
     sourceFailureCode === "native_current_wake_comments_changed_after_read" ||
@@ -6258,6 +6259,7 @@ export function nativeSessionFailureSourceCode(
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
   | "runner_remote_provider_artifact_incompatible"
+  | "runner_transport_ineligible"
   | "provider_process_exited"
   | "provider_stdout_closed"
   | "provider_process_output_closed"
@@ -6300,6 +6302,9 @@ export function nativeSessionFailureSourceCode(
   }
   if (/runner_remote_provider_artifact_incompatible/i.test(message)) {
     return "runner_remote_provider_artifact_incompatible";
+  }
+  if (/runner_transport_ineligible/i.test(message)) {
+    return "runner_transport_ineligible";
   }
   if (/provider_process_exited/i.test(message)) {
     return "provider_process_exited";
@@ -6425,6 +6430,7 @@ export async function nativeProviderRecoveryEvidence(input: {
     ReturnType<typeof nativeSessionFailureSourceCode>
   >([
     "runner_remote_provider_artifact_incompatible",
+    "runner_transport_ineligible",
     "provider_process_exited",
     "provider_stdout_closed",
     "provider_process_output_closed",
@@ -11179,6 +11185,23 @@ export async function createRunnerdBackend(input: {
     },
   ) => Promise<unknown>;
 }): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
+  // The Paperclip Runner has no signed launch authority on SSH transports:
+  // its start command runs through the server-owned SSH command runner, which
+  // the native-SSH dispatch mediation does not gate. Refuse before the factory
+  // creates any backend or transport, so no staging command, provider, or
+  // remote contact follows. In the production run path the state-root
+  // migration, the coordinator claim, and heartbeat environment realization
+  // already ran before this factory is called; the failure classifier treats
+  // this refusal as terminal on the first attempt (see
+  // nativeSessionFailureDisposition), so the run fails fast with this code.
+  if (
+    input.runnerExecutionTarget?.kind === "remote" &&
+    input.runnerExecutionTarget.transport === "ssh"
+  ) {
+    throw new Error(
+      "runner_transport_ineligible: Paperclip Runner launches over SSH are refused without an executor-issued launch authority",
+    );
+  }
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {

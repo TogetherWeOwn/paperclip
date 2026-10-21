@@ -4,9 +4,11 @@ const {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   executeClaudeAcp,
+  prepareAdapterExecutionTargetRuntime,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
 } = vi.hoisted(() => ({
+  prepareAdapterExecutionTargetRuntime: vi.fn(async (_input: Record<string, unknown>): Promise<never> => { throw new Error("STOP_AT_REMOTE_STAGING"); }),
   ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => undefined),
   ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => undefined),
   executeClaudeAcp: vi.fn(async () => {
@@ -55,6 +57,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     ...actual,
     ensureAdapterExecutionTargetCommandResolvable,
     ensureAdapterExecutionTargetRuntimeCommandInstalled,
+    prepareAdapterExecutionTargetRuntime,
     resolveAdapterExecutionTargetCommandForLogs,
     runAdapterExecutionTargetProcess,
   };
@@ -120,6 +123,44 @@ describe("claude_local ACP startup fallback", () => {
         }),
       }),
     );
+  });
+
+  it("does not forward ambient controller credentials to certified SSH probes", async () => {
+    vi.stubEnv("GH_TOKEN", "PRIMARY_GITHUB_SECRET");
+    vi.stubEnv("DATABASE_URL", "PRIMARY_DATABASE_SECRET");
+    vi.stubEnv("ANTHROPIC_API_KEY", "PRIMARY_MODEL_SECRET");
+    vi.stubEnv("PAPERCLIP_API_URL", "https://controller.example.test");
+    const ctx = {
+      ...buildContext({ engine: "cli", env: { HOME: "/home/paperclip-shadow/run", CLAUDE_CONFIG_DIR: "/home/paperclip-shadow/run/.claude",
+        ANTHROPIC_AUTH_TOKEN: "explicit-shadow-token" } }),
+      executionTarget: { kind: "remote", transport: "ssh", remoteCwd: "/home/paperclip-shadow/run/workspace",
+        githubCandidateIsolation: { namespace: "run", home: "/home/paperclip-shadow/run" },
+        spec: { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/run/workspace",
+          remoteCwd: "/home/paperclip-shadow/run/workspace", privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true } },
+    };
+    ensureAdapterExecutionTargetCommandResolvable.mockImplementationOnce(async (...args: unknown[]) => {
+      const env = args[3];
+      expect(JSON.stringify(env)).not.toContain("PRIMARY_");
+      expect(env).toMatchObject({ HOME: "/home/paperclip-shadow/run", ANTHROPIC_AUTH_TOKEN: "explicit-shadow-token", PAPERCLIP_API_URL: "http://127.0.0.1:3100" });
+      throw new Error("STOP_BEFORE_REMOTE_STAGING");
+    });
+    await expect(execute(ctx as never)).rejects.toThrow("STOP_BEFORE_REMOTE_STAGING");
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+  });
+
+  it("never syncs or restores over a certified candidate's materialised checkout", async () => {
+    const spec = { host: "127.0.0.1", port: 22, username: "paperclip-shadow", remoteWorkspacePath: "/home/paperclip-shadow/run/workspace",
+      remoteCwd: "/home/paperclip-shadow/run/workspace", privateKey: null, knownHosts: "fixture", strictHostKeyChecking: true };
+    const base = buildContext({ engine: "cli", env: { HOME: "/home/paperclip-shadow/run", CLAUDE_CONFIG_DIR: "/home/paperclip-shadow/run/.claude",
+      ANTHROPIC_AUTH_TOKEN: "explicit-shadow-token" } });
+    for (const candidate of [true, false]) {
+      prepareAdapterExecutionTargetRuntime.mockClear();
+      await expect(execute({ ...base, executionTarget: { kind: "remote", transport: "ssh", remoteCwd: spec.remoteCwd, environmentId: "env",
+        ...(candidate ? { githubCandidateIsolation: { namespace: "run", home: "/home/paperclip-shadow/run" } } : {}), spec } } as never))
+        .rejects.toThrow("STOP_AT_REMOTE_STAGING");
+      expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledOnce();
+      expect(prepareAdapterExecutionTargetRuntime.mock.calls[0]![0].syncWorkspace).toBe(candidate ? false : undefined);
+    }
   });
 
   it("keeps explicit ACP strict when startup fails", async () => {

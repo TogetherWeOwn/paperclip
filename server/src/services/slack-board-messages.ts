@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork, notifyChatActionWork } from "./chat-work-notifications.js";
+import { insertChatActions, insertChatPublications } from "./chat-publication-authority.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   assets,
@@ -19,7 +20,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { slackBoardAuthor } from "./slack-board-authority.js";
 import { forbidden } from "../errors.js";
 
-type Executor = Pick<Db, "select" | "insert">;
+type Executor = Pick<Db, "select" | "insert" | "execute" | "transaction">;
 
 /** Called only for an authenticated Board comment, in its insert transaction.
  * Provider ingress and agent-authored comments never enter this path. */
@@ -102,10 +103,7 @@ export async function mirrorSlackBoardComment(
     if (!principal) {
       throw forbidden("Link your Slack account to this connection before sending a message to its Slack thread");
     }
-    if (options.wakeAgent) await notifyChatActionWork(db, "slack_board_message");
-    const [receipt] = await db
-      .insert(chatActions)
-      .values({
+    const [receipt] = await insertChatActions(db, {
         companyId: comment.companyId,
         endpointId: endpoint.id,
         conversationId: conversation.id,
@@ -119,14 +117,9 @@ export async function mirrorSlackBoardComment(
           principalId: principal.id,
           agentId: endpoint.assignedAgentId,
         },
-      })
-      .onConflictDoNothing()
-      .returning();
+      }, { onConflictDoNothing: true });
     if (!receipt) continue;
-    await notifyChatPublicationWork(db);
-    const [publication] = await db
-      .insert(chatPublications)
-      .values({
+    const [publication] = await insertChatPublications(db, {
         companyId: comment.companyId,
         endpointId: endpoint.id,
         conversationId: conversation.id,
@@ -141,9 +134,7 @@ export async function mirrorSlackBoardComment(
           text: `**${author} (via Paperclip)**\n\n${comment.body}`,
         }),
         state: "pending",
-      })
-      .onConflictDoNothing()
-      .returning();
+      }, { onConflictDoNothing: true });
     if (!publication)
       throw new Error("Slack Board publication identity already exists");
     const files = await db
@@ -164,10 +155,8 @@ export async function mirrorSlackBoardComment(
           byId.has(id) ? [byId.get(id)!] : [],
         )
       : files;
-    for (const [index, file] of orderedFiles.entries()) {
-      await db
-        .insert(chatPublications)
-        .values({
+    for (const [index, file] of orderedFiles.entries())
+      await insertChatPublications(db, {
           companyId: comment.companyId,
           endpointId: endpoint.id,
           conversationId: conversation.id,
@@ -182,9 +171,7 @@ export async function mirrorSlackBoardComment(
           }),
           state: "pending",
           createdAt: new Date(Date.now() + index + 1),
-        })
-        .onConflictDoNothing();
-    }
+        }, { onConflictDoNothing: true });
     await logActivity(db as Db, {
       companyId: comment.companyId,
       actorType: "user",

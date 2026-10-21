@@ -137,7 +137,10 @@ DATABASE_IDLE_TIMEOUT_SECONDS=60     # close idle pooled connections; default: 6
 DATABASE_CONNECT_TIMEOUT_SECONDS=10  # default: 30
 DATABASE_MAX_LIFETIME_SECONDS=1800   # recycle a pooled connection after this long; default: 30-60 min (random)
 DATABASE_APPLICATION_NAME=paperclip  # application_name in pg_stat_activity; default: paperclip
+DATABASE_MAX_PENDING_QUERIES=10000   # waiting queries past this fail with QUERY_QUEUE_FULL; default: 10000
 ```
+
+Queries that cannot get a pooled connection wait, up to `DATABASE_MAX_PENDING_QUERIES`. The next one fails with `QUERY_QUEUE_FULL` instead of growing the driver queue until the process crashes. The vendored driver default stops a client opened without `max_queue` at 10000. `DATABASE_MAX_PENDING_QUERIES` applies to the server pool and to short-lived utility clients used for migrations and probes. Other direct `postgres()` calls keep the driver default unless they pass `max_queue`.
 
 ### Push the schema
 
@@ -211,6 +214,37 @@ identity state, not parent keys. The lock still serializes identity writers and
 blocks concurrent task or run updates. It allows audit inserts to retain their
 foreign-key `KEY SHARE` locks without waiting on identity acquisition. The audit
 foreign keys and their deletion behavior remain enforced.
+
+## Wake transactions and connection-pool regression
+
+A wake transaction must pass its `tx` handle to every database read it calls.
+Using the outer `db` can exhaust the pool: each transaction holds a connection
+while waiting for a second one. Session-workspace and responsible-user helpers
+accept a read handle so that the wake transaction can reuse its connection.
+Calls outside a transaction continue to use the normal pool.
+
+The nested-pool regression runs four concurrent isolated-workspace wakes with
+two connections. It also rejects outer-pool reads inside a transaction, so a
+regression fails promptly instead of hanging teardown. It uses a manual wake:
+an assignment wake resets the prior session and skips the affected session read.
+
+Create an empty, exclusively owned database named `paperclip_nested_pool_*` on
+`agent-testdb`, then run:
+
+```sh
+PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/paperclip_nested_pool_regression \
+  pnpm --filter @paperclipai/server exec vitest run src/__tests__/heartbeat-wake-nested-pool.test.ts
+```
+
+The test applies migrations and deletes its test rows during cleanup. Never
+point it at a shared application database. It accepts `agent-testdb`, or a
+PostgreSQL CI service at `localhost`, `127.0.0.1`, or `postgres` when `CI=true`.
+The suite reads only `PAPERCLIP_NESTED_POOL_TEST_DATABASE_URL`, not the shared
+`PAPERCLIP_TEST_DATABASE_URL` that other integration suites use. Without it,
+including when only the shared URL is set, the suite reports a skip. If it is
+set to anything other than a `paperclip_nested_pool_*` database on an allowed
+host, collection fails. The suite does not fall back to `DATABASE_URL` or start
+embedded PostgreSQL.
 
 ## Switching between modes
 

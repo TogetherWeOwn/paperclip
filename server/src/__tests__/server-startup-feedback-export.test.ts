@@ -21,6 +21,7 @@ const {
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
+  decisionServiceMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
@@ -40,6 +41,7 @@ const {
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
+  sweepWorkspaceValidationRecoveriesMock,
 } = vi.hoisted(() => {
   const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
@@ -64,6 +66,9 @@ const {
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
+  const decisionServiceMock = {
+    sweepExpired: vi.fn(async () => ({ expired: 0 })),
+  };
   const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
@@ -155,12 +160,24 @@ const {
     close: vi.fn((callback?: (error?: Error) => void) => callback?.()),
   };
   const loadConfigMock = vi.fn();
+  const sweepWorkspaceValidationRecoveriesMock = vi.fn(async () => ({
+    enabled: false,
+    dryRun: false,
+    scanned: 0,
+    deferred: 0,
+    restored: 0,
+    wouldRestore: 0,
+    refused: 0,
+    skipped: {},
+    items: [],
+  }));
 
   return {
     completionSweepMock,
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
+    decisionServiceMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
@@ -180,6 +197,7 @@ const {
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
+    sweepWorkspaceValidationRecoveriesMock,
   };
 });
 
@@ -232,7 +250,10 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
+// Keep schema exports available to startup's transitive imports while all
+// database connections and migration operations remain mocked.
+vi.mock("@paperclipai/db", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@paperclipai/db")>(),
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
@@ -259,6 +280,11 @@ vi.mock("../services/native-runtime/native-session-executor.js", () => ({
 // exercised by the dedicated DB-backed recovery suites.
 vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
   reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
+}));
+
+// Sweep decisions are exercised by the DB-backed workspace validation sweep suite.
+vi.mock("../services/workspace-validation-sweep.js", () => ({
+  sweepWorkspaceValidationRecoveries: sweepWorkspaceValidationRecoveriesMock,
 }));
 
 vi.mock("../config.js", () => ({
@@ -297,8 +323,16 @@ vi.mock("../services/index.js", () => ({
   attentionService: vi.fn(() => ({
     list: vi.fn(async () => ({ items: [], nextCursor: null })),
   })),
-  decisionService: vi.fn(() => ({
-    sweepExpired: vi.fn(async () => ({ expired: 0 })),
+  decisionService: vi.fn(() => decisionServiceMock),
+  createDecisionRetentionSweep: vi.fn((input: {
+    archiveIdleItems: () => Promise<number>;
+    deliverNotifications: () => Promise<unknown>;
+  }) => ({
+    run: vi.fn(async () => {
+      await input.archiveIdleItems();
+      await input.deliverNotifications();
+      return null;
+    }),
   })),
   decisionRetentionService: vi.fn(() => ({
     autoArchive: vi.fn(async () => 0),
@@ -701,6 +735,17 @@ describe("startServer feedback export wiring", () => {
     expect(completionSweepMock).not.toHaveBeenCalled();
   });
 
+  it.each(["Agent is not invokable", "decision query failed"])("continues startup when decision recovery rejects with %s", async (message) => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    decisionServiceMock.sweepExpired.mockRejectedValueOnce(new Error(message));
+
+    const started = await startServer();
+
+    expect(started.server).toBe(fakeServer);
+    expect(decisionServiceMock.sweepExpired).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).not.toHaveBeenCalled();
+  });
+
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -792,6 +837,39 @@ describe("startServer feedback export wiring", () => {
       expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+      expect(sweepWorkspaceValidationRecoveriesMock).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("runs the workspace validation recovery sweep on the tick when heartbeat scheduling is not suppressed", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: false,
+      reason: null,
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(sweepWorkspaceValidationRecoveriesMock).not.toHaveBeenCalled();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sweepWorkspaceValidationRecoveriesMock).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }

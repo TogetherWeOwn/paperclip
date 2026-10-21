@@ -10,8 +10,23 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url)
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
+/**
+ * Short-lived clients (migrations and probes) use one connection, but they
+ * still wait on `reserve()` when that connection is busy. Give them the same
+ * pending-query cap as the server pool. `max` stays 1 even when
+ * `DATABASE_POOL_MAX` is set.
+ */
+export function utilitySqlDriverOptions(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+  const { maxPendingQueries } = resolveDatabaseClientOptions(databaseClientOptionsFromEnv(env));
+  return {
+    max: 1,
+    onnotice: () => {},
+    ...postgresJsOptions({ maxPendingQueries }),
+  };
+}
+
 function createUtilitySql(url: string) {
-  return postgres(url, { max: 1, onnotice: () => {} });
+  return postgres(url, utilitySqlDriverOptions());
 }
 
 type RegisteredPostgresClient = ReturnType<typeof postgres>;
@@ -155,6 +170,13 @@ export interface DatabaseClientOptions {
    * `postgres.js`).
    */
   applicationName?: string;
+  /**
+   * postgres.js `max_queue`. Queries waiting for a pooled connection fail
+   * with `QUERY_QUEUE_FULL` once this many are already waiting. Without a
+   * bound, a saturated pool appends forever and the driver can crash the
+   * process. Driver default (vendored patch): 10000.
+   */
+  maxPendingQueries?: number;
 }
 
 /**
@@ -167,6 +189,13 @@ export interface DatabaseClientOptions {
 export const DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS = 60;
 /** `application_name` reported to PostgreSQL unless `DATABASE_APPLICATION_NAME` overrides it. */
 export const DEFAULT_DATABASE_APPLICATION_NAME = "paperclip";
+/**
+ * Pending queries allowed to wait for a pooled connection. Further queries
+ * fail with `QUERY_QUEUE_FULL` instead of growing the driver queue until
+ * `Array.push` throws and kills the process. `DATABASE_MAX_PENDING_QUERIES`
+ * overrides this.
+ */
+export const DEFAULT_DATABASE_MAX_PENDING_QUERIES = 10000;
 
 function envBoolean(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
   const value = env[name]?.trim().toLowerCase();
@@ -223,14 +252,17 @@ export function databaseClientOptionsFromEnv(env: NodeJS.ProcessEnv = process.en
   if (maxLifetimeSeconds !== undefined) options.maxLifetimeSeconds = maxLifetimeSeconds;
   const applicationName = envNonEmptyString(env, "DATABASE_APPLICATION_NAME");
   if (applicationName !== undefined) options.applicationName = applicationName;
+  const maxPendingQueries = envPositiveInteger(env, "DATABASE_MAX_PENDING_QUERIES");
+  if (maxPendingQueries !== undefined) options.maxPendingQueries = maxPendingQueries;
   return options;
 }
 
 /**
  * Fills in Paperclip's defaults for the options the caller left unset: idle
  * connections are reaped after `DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS`, and the
- * pool identifies itself as `DEFAULT_DATABASE_APPLICATION_NAME`. Everything
- * else stays at the driver default. An explicit value (including
+ * pool identifies itself as `DEFAULT_DATABASE_APPLICATION_NAME`, and at most
+ * `DEFAULT_DATABASE_MAX_PENDING_QUERIES` queries wait for a connection.
+ * Everything else stays at the driver default. An explicit value (including
  * `idleTimeoutSeconds: 0`) always wins over the default.
  */
 export function resolveDatabaseClientOptions(options: DatabaseClientOptions): DatabaseClientOptions {
@@ -238,6 +270,7 @@ export function resolveDatabaseClientOptions(options: DatabaseClientOptions): Da
     ...options,
     idleTimeoutSeconds: options.idleTimeoutSeconds ?? DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
     applicationName: options.applicationName ?? DEFAULT_DATABASE_APPLICATION_NAME,
+    maxPendingQueries: options.maxPendingQueries ?? DEFAULT_DATABASE_MAX_PENDING_QUERIES,
   };
 }
 
@@ -251,6 +284,7 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   if (options.applicationName !== undefined) {
     driverOptions.connection = { application_name: options.applicationName };
   }
+  if (options.maxPendingQueries !== undefined) driverOptions.max_queue = options.maxPendingQueries;
   return driverOptions;
 }
 

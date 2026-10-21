@@ -21,6 +21,7 @@ describe("createDecisionWakeOriginAgent", () => {
     expect(wakeup).toHaveBeenCalledWith("agent-1", {
       source: "automation",
       triggerDetail: "system",
+      requestedByActorType: "system",
       reason: "decision_decided",
       payload: { issueId: "issue-1", decisionId: "decision-1", outcome: "decided" },
     });

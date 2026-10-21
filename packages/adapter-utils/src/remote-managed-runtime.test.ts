@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -32,7 +34,7 @@ import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 describe("remote managed runtime", () => {
   const cleanupDirs: string[] = [];
 
-  it("stages all files over SSH without Git or cache exclusions and restores the same baseline", async () => {
+  it("keeps agent-local paths in the plain-directory baseline", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-plain-"));
     cleanupDirs.push(root);
     await mkdir(path.join(root, "node_modules"));
@@ -53,6 +55,7 @@ describe("remote managed runtime", () => {
         exclude: [".paperclip-runtime", "explicitly-excluded"],
         entries: expect.any(Map),
       }),
+      excludeAgentLocalScratch: false,
     }));
     const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
     expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(true);
@@ -120,6 +123,73 @@ describe("remote managed runtime", () => {
       { maxBuffer: 1024 * 1024 },
     );
     expect(restoredAuth).toBe('{"token":"remote"}\n');
+  });
+
+  it.each([
+    { gitBacked: false, label: "plain" },
+    { gitBacked: true, label: "git-backed" },
+  ])("captures the $label workspace baseline without the SSH agent-local scratch", async ({ gitBacked }) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-baseline-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(path.join(workspaceDir, ".claude", "worktrees", "wt"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "target", "debug"), { recursive: true });
+    await mkdir(path.join(workspaceDir, "src", "commands", "target"), { recursive: true });
+    await writeFile(path.join(workspaceDir, ".claude", "worktrees", "wt", "work.txt"), "uncommitted\n");
+    await writeFile(path.join(workspaceDir, "node_modules", "dep", "index.js"), "module.exports = {};\n");
+    await writeFile(path.join(workspaceDir, "target", "debug", "binary"), "built\n");
+    await writeFile(path.join(workspaceDir, "src", "commands", "target", "index.ts"), "export {};\n");
+    await writeFile(path.join(workspaceDir, "keep.txt"), "keep\n");
+    // A discovered linked checkout outside every fixed scratch root. Keep its
+    // real admin dir outside the workspace and require the literal path in the
+    // baseline even when its name contains glob metacharacters.
+    const mainRepo = path.join(rootDir, "main");
+    const nestedName = "nested [linked]";
+    const nestedDir = path.join(workspaceDir, nestedName);
+    const git = async (cwd: string, ...args: string[]) => await promisify(execFile)("git", [
+      "-c", "user.name=Test", "-c", "user.email=test@example.invalid", ...args,
+    ], { cwd });
+    await mkdir(mainRepo);
+    await git(mainRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(mainRepo, "README.md"), "main\n");
+    await git(mainRepo, "add", "README.md");
+    await git(mainRepo, "commit", "-q", "-m", "initial");
+    await git(mainRepo, "worktree", "add", nestedDir, "-b", "baseline-linked");
+    expect((await git(nestedDir, "rev-parse", "--show-toplevel")).stdout.trim()).toBe(nestedDir);
+    await writeFile(path.join(nestedDir, "marker.txt"), "local linked work\n");
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteWorkspacePath: "/remote",
+        remoteCwd: "/remote",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "KNOWN HOSTS",
+        strictHostKeyChecking: true,
+      },
+      runId: "run-baseline",
+      adapterKey: "codex",
+      workspaceLocalDir: workspaceDir,
+    });
+    await prepared.restoreWorkspace();
+
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
+      baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> };
+    };
+    const { exclude, entries } = restoreInput.baselineSnapshot;
+    expect(exclude).toEqual(expect.arrayContaining([".paperclip-runtime", ".claude/worktrees", "node_modules", "target"]));
+    expect(exclude).toContain(nestedName);
+    expect(entries.has(`${nestedName}/marker.txt`)).toBe(false);
+    expect([...entries.keys()].filter((key) => key === nestedName || key.startsWith(`${nestedName}/`))).toEqual([]);
+    // Root scratch is out of the baseline; nested source named like it stays in.
+    expect([...entries.keys()].filter((key) => /^(\.claude\/worktrees|node_modules|target)(\/|$)/.test(key))).toEqual([]);
+    expect(entries.has("src/commands/target/index.ts")).toBe(true);
+    expect(entries.has("keep.txt")).toBe(true);
   });
 
   it("stages each additional project into its own isolated SSH dir, isolating one failure", async () => {

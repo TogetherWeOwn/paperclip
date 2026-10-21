@@ -142,6 +142,13 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  githubReviewShadowEnabled: {
+    title: "Paired GitHub shadow reviews",
+    description: "Global switch for experimental paired review admission. Route configuration alone does not start work or grant tools. Does not disable primary reviews or permanent capture-only fences.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableMemoryConnectors: {
     title: "Memory connectors",
     description: "Show experimental Mem0, Zep, Supermemory, Cognee, and Honcho setup. Existing connections keep running when hidden.",
@@ -331,7 +338,7 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
   enableWorkspaceDirtyQuarantineRepair: {
     title: "Workspace Dirty Quarantine Repair",
     description:
-      "Let workspace runtime recovery quarantine and repair dirty execution workspaces before runs, and check the recorded branch back out in clean workspaces whose HEAD drifted off it.",
+      "Let workspace runtime recovery quarantine and repair dirty execution workspaces before runs, check the recorded branch back out in clean workspaces whose HEAD drifted off it, and run a background sweep that restores parked issues blocked by that drift.",
     tier: "managed",
     cloudDefault: true,
     selfHostedDefault: true,
@@ -356,6 +363,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     title: "Runner Preview Ingress (Deprecated)",
     description:
       "Compatibility-only key retained for older managed configs. Runner ingress follows the Paperclip Runner setting.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  requireRunModelDecision: {
+    title: "Require Run Model Decision",
+    description:
+      "Issue runs wait for the model routing plugin to decide their model and never start on the agent default. Off keeps the decision advisory.",
     tier: "managed",
     cloudDefault: false,
     selfHostedDefault: false,

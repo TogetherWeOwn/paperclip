@@ -2,18 +2,23 @@ import { describe, expect, it } from "vitest";
 import {
   adapterSupportsRemoteManagedEnvironments,
   getEnvironmentCapabilities,
+  isEnvironmentDriverSupportedForAdapter,
   isSandboxProviderSupportedForAdapter,
   supportedEnvironmentDriversForAdapter,
 } from "./environment-support.js";
 
 describe("isSandboxProviderSupportedForAdapter", () => {
-  it("treats Paperclip Runner as a remote-managed adapter", () => {
+  it("treats Paperclip Runner as a remote-managed adapter without SSH", () => {
     expect(adapterSupportsRemoteManagedEnvironments("paperclip_runner")).toBe(true);
+    // The runner backend refuses SSH transports without an executor-issued
+    // launch authority, so the matrix must not advertise SSH for it.
     expect(supportedEnvironmentDriversForAdapter("paperclip_runner")).toEqual([
       "local",
-      "ssh",
       "sandbox",
     ]);
+    expect(
+      isEnvironmentDriverSupportedForAdapter("paperclip_runner", "ssh"),
+    ).toBe(false);
   });
 
   it("accepts additional sandbox providers for remote-managed adapters", () => {

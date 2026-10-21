@@ -1,8 +1,5 @@
 import { z } from "zod";
-import {
-  DEFAULT_GITHUB_REVIEW_PROMPTS,
-  GITHUB_REVIEW_EVENTS,
-} from "../types/chat-github.js";
+import { GITHUB_REVIEW_EVENTS } from "../types/chat-github.js";
 
 export const githubIdSchema = z.string().regex(/^[1-9][0-9]{0,19}$/);
 export const githubCommitSchema = z
@@ -18,11 +15,6 @@ const prompts = z
     ready_for_review: z.string().max(12000),
     mention: z.string().max(12000),
     comment: z.string().max(12000),
-    // Defaulted so configurations saved before this event existed stay valid.
-    checks_green: z
-      .string()
-      .max(12000)
-      .default(DEFAULT_GITHUB_REVIEW_PROMPTS.checks_green),
   })
   .strict();
 export const githubReviewPolicySchema = z
@@ -79,6 +71,17 @@ export const githubAllowedPersonSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
 ]);
+const githubReviewShadowRouteSchema = z.object({
+  label: z.string().trim().min(1).max(64)
+    .regex(/^[a-z0-9][a-z0-9._-]*$/, "Shadow route label must be a lowercase slug"),
+  agentId: z.string().uuid().transform((value) => value.toLowerCase()),
+  enabled: z.boolean().default(false),
+  sampleRate: z.number().finite().min(0).max(1).default(1),
+  repos: z.array(z.string().trim().regex(/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/)
+    .transform(value => value.toLowerCase())).max(500)
+    .refine(repos => new Set(repos).size === repos.length, "Shadow route repositories must be unique").optional(),
+}).strict();
+
 export const githubChatConfigurationSchema = z
   .object({
     version: z.literal(1),
@@ -86,10 +89,14 @@ export const githubChatConfigurationSchema = z
     responsibleUserId: z.string().min(1),
     memberAccess: z.enum(["all_linked", "selected"]),
     people: z.array(githubAllowedPersonSchema).max(500),
+    trustedBotAuthorIds: z.array(githubIdSchema).max(100)
+      .refine(ids => new Set(ids).size === ids.length, "Trusted bot author IDs must be unique")
+      .optional(),
     defaults: githubReviewPolicySchema,
     repositories: z
       .record(githubIdSchema, githubReviewPolicySchema.partial())
       .refine((value) => Object.keys(value).length <= 500),
+    shadowRoutes: z.array(githubReviewShadowRouteSchema).max(8).default([]),
     // Optional so configurations saved before shadow mode existed stay valid.
     shadow: z
       .object({
@@ -106,6 +113,14 @@ export const githubChatConfigurationSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    for (const field of ["label", "agentId"] as const) {
+      if (new Set(value.shadowRoutes.map((route) => route[field])).size !== value.shadowRoutes.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["shadowRoutes"], message: `Shadow route ${field} must be unique.` });
+      }
+    }
+    if (value.shadow?.enabled && value.shadowRoutes.some((route) => route.enabled)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["shadowRoutes"], message: "A shadow-only endpoint cannot enable paired shadow routes." });
+    }
     if (
       new Set(value.people.map((person) => person.githubUserId)).size !==
       value.people.length
@@ -122,57 +137,7 @@ export const updateGitHubChatConfigurationSchema = z
     configuration: githubChatConfigurationSchema,
   })
   .strict();
-
-function validateGitHubReviewAssessmentShape(
-  value: {
-    complete: boolean;
-    coverage: { reviewedPaths: string[] };
-    findings: Array<{
-      key: string;
-      path: string;
-      side: "LEFT" | "RIGHT";
-      line: number;
-      basePath?: string;
-    }>;
-  },
-  ctx: z.RefinementCtx,
-  validateNewBasePath: boolean,
-) {
-  if (value.complete && value.coverage.reviewedPaths.length === 0)
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["coverage"],
-      message: "A complete assessment must identify reviewed files.",
-    });
-  const keys = value.findings.map(
-    (f) => `${f.key}:${f.path}:${f.side}:${f.line}`,
-  );
-  if (new Set(keys).size !== keys.length)
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["findings"],
-      message: "Duplicate findings are not allowed.",
-    });
-  value.findings.forEach((finding, index) => {
-    if (!validateNewBasePath || finding.side !== "LEFT") return;
-    if (!finding.basePath) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["findings", index, "basePath"],
-        message: "LEFT-side findings must include their base filename.",
-      });
-      return;
-    }
-    if (!value.coverage.reviewedPaths.includes(finding.basePath))
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["findings", index, "basePath"],
-        message: "LEFT-side basePath must be listed in reviewedPaths.",
-      });
-  });
-}
-
-const githubReviewAssessmentObjectSchema = z
+export const githubReviewAssessmentSchema = z
   .object({
     reviewedCommit: githubCommitSchema,
     score: z.union([
@@ -184,7 +149,7 @@ const githubReviewAssessmentObjectSchema = z
       z.literal(5),
     ]),
     complete: z.boolean(),
-    summary: z.string().trim().min(1).max(2000),
+    summary: z.string().trim().min(1).max(24000),
     rationale: z.string().trim().min(1).max(12000),
     coverage: z
       .object({
@@ -203,64 +168,27 @@ const githubReviewAssessmentObjectSchema = z
             side: z.enum(["LEFT", "RIGHT"]),
             severity: z.enum(["info", "warning", "error"]),
             category: z.string().min(1).max(80),
-            basePath: z
-              .string()
-              .trim()
-              .min(1)
-              .max(500)
-              .regex(/^[^\r\n]+$/, "Base path must be a single line")
-              .optional(),
-            title: z
-              .string()
-              .trim()
-              .min(1)
-              .max(120)
-              // Titles render inside a GFM table cell, where `|` opens a
-              // column and a newline splits the row; the renderer escapes
-              // both as a second layer of defence.
-              .regex(/^[^|\r\n]*$/, "Title must be a single line without '|'"),
             body: z.string().trim().min(1).max(12000),
-            evidence: z.string().trim().min(1).max(500).optional(),
-            suggestion: z.string().min(1).max(4000).optional(),
           })
           .strict(),
       )
       .max(300),
   })
-  .strict();
-export const githubReviewAssessmentSchema =
-  githubReviewAssessmentObjectSchema.superRefine((value, ctx) =>
-    validateGitHubReviewAssessmentShape(value, ctx, true),
-  );
-
-const persistedReviewAssessmentObjectSchema =
-  githubReviewAssessmentObjectSchema;
-const persistedReviewFindingSchema =
-  persistedReviewAssessmentObjectSchema.shape.findings.element.extend({
-    title:
-      persistedReviewAssessmentObjectSchema.shape.findings.element.shape.title.optional(),
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.complete && value.coverage.reviewedPaths.length === 0)
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["coverage"],
+        message: "A complete assessment must identify reviewed files.",
+      });
+    const keys = value.findings.map(
+      (f) => `${f.key}:${f.path}:${f.side}:${f.line}`,
+    );
+    if (new Set(keys).size !== keys.length)
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["findings"],
+        message: "Duplicate findings are not allowed.",
+      });
   });
-
-/**
- * Stored assessments are revalidated during publication and retries. Accept the
- * previous 24,000-character summary bound and findings without a title or base
- * filename. Normalize missing titles. A legacy LEFT finding without basePath is
- * rendered without a file link rather than guessing a path at the base commit.
- */
-export const githubPersistedReviewAssessmentSchema =
-  persistedReviewAssessmentObjectSchema
-    .extend({
-      summary: z.string().trim().min(1).max(24000),
-      findings: z.array(persistedReviewFindingSchema).max(300),
-    })
-    .strict()
-    .superRefine((value, ctx) =>
-      validateGitHubReviewAssessmentShape(value, ctx, false),
-    )
-    .transform((value) => ({
-      ...value,
-      findings: value.findings.map((finding) => ({
-        ...finding,
-        title: finding.title ?? finding.category,
-      })),
-    }));
