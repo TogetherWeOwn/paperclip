@@ -1050,6 +1050,38 @@ describe("ssh seed mirror", () => {
   );
 
   it(
+    "seeded workspaces without an origin drop the mirror remote",
+    async () => {
+      const { repoDir } = await initSeedTestRepo();
+      // No workspace origin: the seed must not leave `origin` pointing at
+      // the shared mirror — an agent `git push origin` would write into the
+      // deletable cache, and the remote breaks once the mirror is deleted.
+      await git(repoDir, ["remote", "remove", "origin"]);
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const remoteDir = `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`;
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({ spec, localDir: repoDir, remoteDir }),
+      );
+      expect(prepared.seedMode).toBe("shared-mirror");
+      expect(await git(localRemoteDir, ["remote"])).toBe("");
+
+      // The mirror stays a deletable cache: history works without it and no
+      // remote points at it.
+      await rm(mirrorRoot, { recursive: true, force: true });
+      await expect(git(localRemoteDir, ["log", "--oneline"])).resolves.toMatch(
+        "initial",
+      );
+      await git(localRemoteDir, ["fsck"]);
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
     "falls back to the full copy for workspaces with submodules",
     async () => {
       const submoduleSrc = await createTempDir("paperclip-ssh-submodule-src-");

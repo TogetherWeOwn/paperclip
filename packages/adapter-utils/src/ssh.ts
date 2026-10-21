@@ -2192,9 +2192,18 @@ async function seedGitWorkspaceToSshViaMirror(input: {
     // Dissociate from the mirror: the mirror is a deletable object cache, so
     // the seeded repo must not borrow from it past this script. `repack -a`
     // copies every reachable object (including alternates') into a local pack
-    // before the alternates file is dropped.
+    // before the alternates file is dropped. Without a workspace origin URL,
+    // `origin` still names the mirror path after `clone --shared`, so drop it
+    // (same as the bundle import's alternates branch): a push there would
+    // write into the shared cache, and the remote breaks when the mirror is
+    // deleted. Best-effort under `set -e`.
     `git -C ${shellQuote(input.remoteDir)} repack -a -d >/dev/null`,
     `rm -f ${shellQuote(path.posix.join(input.remoteDir, ".git", "objects", "info", "alternates"))}`,
+    ...(originUrl
+      ? []
+      : [
+        `git -C ${shellQuote(input.remoteDir)} remote remove origin >/dev/null 2>&1 || true`,
+      ]),
   ].join("\n");
 
   // No history bytes cross the wire, but keep the phase's completion line so
