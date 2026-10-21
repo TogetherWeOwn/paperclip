@@ -2485,7 +2485,11 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      input.existingExecutionWorkspaceStatus !== "archived" &&
+      // An unrealized source-bound allocation has no worktree to restore:
+      // presence of the binding is not proof of realization. Dispatch
+      // realizes fresh and adopts the record at persistence instead.
+      input.existingExecutionWorkspaceStatus !== "unrealized",
   };
 }
 
