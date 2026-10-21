@@ -99,7 +99,7 @@
     "test:lifecycle-baseline:typecheck": "tsc -p tests/lifecycle-baseline/tsconfig.json"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.15",
+    "@biomejs/biome": "2.5.15",
     "@playwright/test": "^1.62.1",
     "@vitest/coverage-v8": "^4.1.11",
     "agentmail": "^0.5.14",
