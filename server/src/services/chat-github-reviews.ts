@@ -44,7 +44,7 @@ import {
 } from "@paperclipai/shared";
 import { HttpError, conflict, forbidden, notFound } from "../errors.js";
 import {
-  githubBotRepositoryToken,
+  githubBotRepositoryRequest,
   githubBotRequest,
 } from "./chat-github-client.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
@@ -400,22 +400,27 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     source: Awaited<ReturnType<typeof scope>>,
     requestFetch = fetchImpl,
   ) {
-    const token = await githubBotRepositoryToken(
-      db,
-      source.endpoint.companyId,
-      source.endpoint.id,
-      source.repositoryId,
-      requestFetch,
-    );
     const prefix = `/repos/${source.repository.split("/").map(encodeURIComponent).join("/")}`;
-    return {
-      prefix,
-      request: <T>(
-        path: string,
-        options?: Parameters<typeof githubBotRequest>[3],
-      ) =>
-        githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options),
-    };
+    // Every review GitHub call routes through the shared helper, which reuses
+    // the cached installation token and retries once with a fresh token after
+    // a 401. One retry implementation, pinned by the helper's own tests.
+    const companyId = source.endpoint.companyId;
+    const endpointId = source.endpoint.id;
+    const repositoryId = source.repositoryId;
+    const request = async <T>(
+      path: string,
+      options?: Parameters<typeof githubBotRequest>[3],
+    ): Promise<T> =>
+      githubBotRepositoryRequest<T>(
+        db,
+        companyId,
+        endpointId,
+        repositoryId,
+        `${prefix}${path}`,
+        options ?? {},
+        requestFetch,
+      );
+    return { prefix, request };
   }
   async function diffBaseSha(
     api: GitHubReviewReader,
@@ -712,8 +717,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         }, async path => {
           // This closure is invoked ONLY after the snapshot reader validates an
           // exact commit-addressed object. No general live client exists here.
-          const token = await githubBotRepositoryToken(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, fetchImpl, "read");
-          return githubBotRequest(fetchImpl, token, `/repos/${source.repository}${path}`);
+          // Through the shared wrapper so a revoked cached token evicts and
+          // retries once instead of failing until expiry.
+          return githubBotRepositoryRequest(db, source.endpoint.companyId, source.endpoint.id, source.repositoryId, `/repos/${source.repository}${path}`, {}, fetchImpl, "read");
         }, source.previousAssessment?.headSha)
       : await client(source);
     const pull = await api.request<Pull>(`/pulls/${source.number}`);

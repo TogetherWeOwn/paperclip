@@ -5,7 +5,7 @@ import {
   companyMemberships, type Db,
 } from "@paperclipai/db";
 import { githubCommitSchema, githubIdSchema } from "@paperclipai/shared";
-import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
+import { githubBotRepositoryRequest } from "./chat-github-client.js";
 
 type Store = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 const providerId = z.union([githubIdSchema, z.number().int().positive().safe().transform(String)]);
@@ -62,8 +62,10 @@ export async function readGitHubReviewProvenance(db: Db, input: {
   if (!match || match[1]!.toLowerCase() !== input.repository.toLowerCase() ||
       !githubIdSchema.safeParse(input.repositoryId).success || !Number.isSafeInteger(Number(match[2]))) return null;
   try {
-    const token = await githubBotRepositoryToken(db, input.companyId, input.endpointId, input.repositoryId, fetchImpl, "read");
-    const raw = await githubBotRequest<unknown>(fetchImpl, token, `/repos/${input.repository}/pulls/${match[2]}`);
+    // Single request through the shared wrapper: a 401 evicts the cached
+    // token and retries once with a fresh one; a persistent failure still
+    // returns null below, never a credential-bearing error.
+    const raw = await githubBotRepositoryRequest<unknown>(db, input.companyId, input.endpointId, input.repositoryId, `/repos/${input.repository}/pulls/${match[2]}`, {}, fetchImpl, "read");
     const parsed = pullProvenanceSchema.safeParse(raw);
     if (!parsed.success || parsed.data.number !== Number(match[2])) return null;
     const pr = parsed.data;

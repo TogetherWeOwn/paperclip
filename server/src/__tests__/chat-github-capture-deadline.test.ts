@@ -5,10 +5,20 @@ import { GITHUB_PRIMARY_SEAL_WAIT_MS, prepareGitHubPairEvent } from "../services
 vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({ getExperimental: async () => ({ githubReviewShadowEnabled: true }) }),
 }));
-vi.mock("../services/chat-github-client.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../services/chat-github-client.js")>(),
-  githubBotRepositoryToken: async () => "fixture-token",
-}));
+vi.mock("../services/chat-github-client.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/chat-github-client.js")>();
+  return {
+    ...original,
+    githubBotRepositoryToken: async () => "fixture-token",
+    // Shadow capture routes through the shared helper; keep the fixture token
+    // so these timing tests never touch credential resolution.
+    githubBotRepositoryRequest: async <T>(
+      _db: unknown, _companyId: string, _endpointId: string, _repositoryId: string,
+      path: string, options: Parameters<typeof original.githubBotRequest>[3] = {},
+      fetchImpl: typeof fetch = fetch,
+    ): Promise<T> => original.githubBotRequest<T>(fetchImpl, "fixture-token", path, options),
+  };
+});
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 

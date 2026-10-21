@@ -3,6 +3,7 @@ import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../servi
 import { githubChatManagementService } from "../services/chat-github-management.js";
 import { githubChatReviewService } from "../services/chat-github-reviews.js";
 import { githubReviewCheckService } from "../services/chat-github-checks.js";
+import { __clearGithubBotTokenCacheForTests } from "../services/chat-github-client.js";
 import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession } from "../services/chat-github-tools.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
@@ -8435,6 +8436,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .where(eq(chatActions.id, staged.id));
       recorder.mutations.length = 0;
       armed = true;
+      // The installation token cache is module-level: without a clear, the
+      // retry reuses the token minted before the hook armed, no POST to
+      // /access_tokens fires, and the mid-flight flip never lands.
+      __clearGithubBotTokenCacheForTests();
       await service.processPending();
       // The flip landed after the dispatch scoped with shadow off, so the
       // pre-write head re-check is what must stop the publication.
