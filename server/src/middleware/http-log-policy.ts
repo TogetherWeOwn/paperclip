@@ -1,3 +1,5 @@
+import { stripSecretBearingUrlParts } from "./redact-sensitive.js";
+
 const SILENCED_SUCCESS_METHODS = new Set(["GET", "HEAD"]);
 
 const SILENCED_SUCCESS_API_PATHS = [
@@ -81,6 +83,36 @@ export function isSecretSensitiveHttpRequest(
   if (!SECRET_SENSITIVE_HTTP_METHODS.has(method.toUpperCase())) return false;
   const pathname = normalizePath(url);
   return SECRET_SENSITIVE_HTTP_PATHS.some((pattern) => pattern.test(pathname));
+}
+
+function privateWebhookLogUrl(url: unknown) {
+  return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
+    ? "/api/routine-triggers/public/:publicId/fire"
+    : "/api/chat-webhooks/:publicId/:provider";
+}
+
+/**
+ * The single URL form every HTTP log line uses: provider webhooks collapse
+ * to a content-free route template, everything else keeps its path with
+ * secret-bearing parts (credentials, query) stripped. Shared by the
+ * pino-http messages and the retained access log so both stay greppable
+ * with the same patterns.
+ */
+export function requestLogUrl(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}): string {
+  const url =
+    typeof req.originalUrl === "string"
+      ? req.originalUrl
+      : typeof req.url === "string"
+        ? req.url
+        : undefined;
+  if (isPrivateWebhookHttpRequest(req.method, url)) {
+    return privateWebhookLogUrl(url);
+  }
+  return stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
 }
 
 export function shouldSilenceHttpSuccessLog(

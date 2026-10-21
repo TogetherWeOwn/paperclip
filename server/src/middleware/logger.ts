@@ -1,16 +1,18 @@
 import pino from "pino";
-import type { Logger } from "pino";
+import type { DestinationStream, Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  requestLogUrl,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
   redactSensitive,
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
+import { getFileLogging } from "./file-logging.js";
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -19,26 +21,72 @@ const sharedOpts = {
 };
 
 const isProduction = process.env.NODE_ENV === "production";
+
+// Retained copy of every pino line under the instance logs dir (see
+// file-logging.ts). Stdout keeps working exactly as before; when the file
+// sink is unavailable the logger below is built without it.
+const fileLogStream = (() => {
+  try {
+    const sink = getFileLogging().serverSink;
+    return sink ? { write: (chunk: string) => sink.write(chunk) } : null;
+  } catch {
+    return null;
+  }
+})();
+
+function withFileCopy(stream: DestinationStream): DestinationStream {
+  if (!fileLogStream) return stream;
+  // Each leg gets the same serialized JSON chunk; the pretty transport
+  // formats its copy for stdout while the file keeps greppable JSON.
+  return pino.multistream([{ stream }, { stream: fileLogStream }]);
+}
+
 export const logger = isProduction
-  ? pino({
-      level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
-      redact: [...HTTP_LOG_REDACT_PATHS],
-    })
+  ? fileLogStream
+    ? pino(
+        {
+          level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
+          redact: [...HTTP_LOG_REDACT_PATHS],
+        },
+        withFileCopy(process.stdout),
+      )
+    : pino({
+        level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
+        redact: [...HTTP_LOG_REDACT_PATHS],
+      })
   : pino(
       {
         level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug",
         redact: [...HTTP_LOG_REDACT_PATHS],
       },
-      pino.transport({
-        target: "pino-pretty",
-        options: {
-          ...sharedOpts,
-          ignore: "pid,hostname,req,res,responseTime",
-          colorize: true,
-          destination: 1,
-        },
-      }),
+      withFileCopy(
+        pino.transport({
+          target: "pino-pretty",
+          options: {
+            ...sharedOpts,
+            ignore: "pid,hostname,req,res,responseTime",
+            colorize: true,
+            destination: 1,
+          },
+        }),
+      ),
     );
+
+if (fileLogStream) {
+  try {
+    const { config, serverSink, accessSink } = getFileLogging();
+    logger.info(
+      {
+        logDir: config.dir,
+        serverLog: serverSink?.path,
+        accessLog: accessSink?.path ?? null,
+      },
+      "retained file logging enabled",
+    );
+  } catch {
+    // The startup line is informational; never fail boot for it.
+  }
+}
 
 function requestClassificationUrl(req: {
   originalUrl?: unknown;
@@ -62,22 +110,6 @@ function isPrivateWebhook(req: {
   );
 }
 
-function privateWebhookLogUrl(url: unknown) {
-  return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
-    ? "/api/routine-triggers/public/:publicId/fire"
-    : "/api/chat-webhooks/:publicId/:provider";
-}
-
-function requestLogUrl(req: {
-  method?: string;
-  originalUrl?: unknown;
-  url?: unknown;
-}) {
-  return isPrivateWebhook(req)
-    ? privateWebhookLogUrl(requestClassificationUrl(req))
-    : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
-}
-
 export function createHttpLogger(baseLogger: Logger) {
   return pinoHttp({
     logger: baseLogger,
@@ -95,7 +127,10 @@ export function createHttpLogger(baseLogger: Logger) {
           return {
             id: req.id,
             method: req.method,
-            url: privateWebhookLogUrl(req.url),
+            url: requestLogUrl({
+              method: typeof req.method === "string" ? req.method : undefined,
+              url: req.url,
+            }),
           };
         }
         return {

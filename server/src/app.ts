@@ -24,7 +24,7 @@ import {
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
+import { accessLogger, httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
@@ -584,6 +584,9 @@ export async function createApp(
   );
   app.use("/api", apiCompression());
   app.use(httpLogger);
+  // Retained one-line-per-request log (access.log). Mounted right after
+  // httpLogger so the logged request id matches the pino-http lines.
+  app.use(accessLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
