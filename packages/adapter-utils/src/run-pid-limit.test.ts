@@ -185,12 +185,21 @@ describe("runChildProcess per-run PID limit", () => {
       // group holds only the wrapper while the tree runs in a new session.
       // The trap reaps the session synchronously so no straggler outlives
       // the kill list snapshot.
+      // Self-bound at 10s: the escaped session is unreachable by
+      // timeoutSec's group kill, so if fork pressure ever leaves a partial
+      // tree the guard stays quiet and the fixture would hang past the
+      // test timeout. The killer reaps the session from within (kill 0 is
+      // the fixture's own group) so that mode fails fast and diagnosably
+      // instead of hanging; healthy runs finish in ~1s and never reach it.
+      // Newline-joined: a ";" join would emit "&;" after the backgrounded
+      // killer, which is a sh syntax error.
       const script = [
         "trap 'kill 0; exit 0' TERM",
+        "(sleep 10; kill 0) &",
         "i=0",
         `while [ $i -lt ${FORK_CHILDREN} ]; do sleep ${SETSID_MARKER} & i=$((i+1)); done`,
         "wait",
-      ].join("; ");
+      ].join("\n");
       const result = await runChildProcess(
         randomUUID(),
         "setsid",

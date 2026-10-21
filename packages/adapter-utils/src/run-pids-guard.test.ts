@@ -435,9 +435,17 @@ describe("readCgroupPidsMaxEvents", () => {
 
 describe("shared scanner", () => {
   it.runIf(isLinux)("fans one scan out to every live guard", async () => {
-    const child = spawn("sh", ["-c", "sleep 30 & sleep 30 & sleep 30 & wait"], {
+    // Deterministic growth: the leader shell starts with a quiet tree (one
+    // task, under the limit), so both guards' immediate first samples are
+    // quiet by construction. The tree only exceeds the limit after the
+    // stdin-driven growth below, which means both guards MUST fire off
+    // shared ticks — the immediate samples are already in the past.
+    // (Spawning the full tree up front raced the immediate samples: on a
+    // fast box both guards fired synchronously at start and no shared tick
+    // ever ran, failing the scansPerformed assertion.)
+    const child = spawn("sh", [], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["pipe", "ignore", "ignore"],
     });
     const pgid = child.pid as number;
     const scansBefore = getRunPidsSharedScannerStats().scansPerformed;
@@ -468,6 +476,14 @@ describe("shared scanner", () => {
       expect(
         getRunPidsSharedScannerStats().activeGuards,
       ).toBeGreaterThanOrEqual(2);
+      // The immediate samples ran synchronously inside startRunPidsGuard
+      // while the tree held only the leader: both must still be quiet,
+      // and no shared tick can interleave this synchronous stretch.
+      expect(seenA).toEqual([]);
+      expect(seenB).toEqual([]);
+      // Grow the leader's group past the limit: the background sleeps join
+      // the leader's process group, no timing luck involved.
+      child.stdin?.write("sleep 30 & sleep 30 & sleep 30 &\n");
       for (
         let i = 0;
         i < 120 && (seenA.length === 0 || seenB.length === 0);
@@ -477,17 +493,25 @@ describe("shared scanner", () => {
       }
       expect(seenA.length).toBe(1);
       expect(seenB.length).toBe(1);
-      // Both guards fired off shared ticks: at least one shared scan ran
-      // while both were registered (immediate first samples don't count).
+      // Both guards fired off shared ticks: firing requires a post-growth
+      // evaluation, evaluations only happen on shared ticks, and every tick
+      // increments the counter — so at least one shared scan ran while both
+      // were registered (immediate first samples don't count).
       expect(
         getRunPidsSharedScannerStats().scansPerformed,
       ).toBeGreaterThan(scansBefore);
-      // The tree pids fed to the kill path cover the whole fixture.
+      // The tree pids fed to the kill path cover the fixture (the leader
+      // plus at least the sleeps that pushed it over the limit).
       expect(guardA.getTreePids().length).toBeGreaterThanOrEqual(3);
     } finally {
       guardA.stop();
       guardB.stop();
       expect(guardA.getTreePids()).toEqual([]);
+      try {
+        child.stdin?.destroy();
+      } catch {
+        // Already gone.
+      }
       try {
         process.kill(-pgid, "SIGKILL");
       } catch {
