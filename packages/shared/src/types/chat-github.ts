@@ -176,6 +176,9 @@ export interface GitHubTaskReview {
   conclusion: GitHubReviewConclusion | null;
   checkUrl: string | null;
   summaryUrl: string | null;
+  /** Non-null only for shadow reviews: the endpoint config's shadow label,
+   * pinned when the review row was created. Shadow reviews never publish. */
+  shadowLabel: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -168,6 +168,7 @@ export function review(
     conclusion: "success",
     checkUrl: "https://github.com/acme/web/pull/24/checks",
     summaryUrl: "https://github.com/acme/web/pull/24#issuecomment-123",
+    shadowLabel: null,
     createdAt,
     updatedAt: createdAt,
   };
