@@ -206,6 +206,31 @@ describe("local loopback bridge (local_v1)", () => {
     expect(hostRequests).toEqual([]);
   });
 
+  it("rejects browser-indicated requests with 403 even with a valid token, and never forwards them", { timeout: 30_000 }, async () => {
+    const hostRequests: RecordedRequest[] = [];
+    const host = await startStubServer(
+      () => ({ status: 200, body: JSON.stringify({ ok: true }) }),
+      hostRequests,
+    );
+    closers.push(host.close);
+
+    const bridge = await startLocalBridge({ hostApiUrl: host.origin });
+    const token = bridge!.env.PAPERCLIP_API_KEY;
+    const browserHeaders: Record<string, string>[] = [
+      { origin: "https://browser.test" },
+      { "sec-fetch-site": "cross-site" },
+      { origin: "https://browser.test", "sec-fetch-site": "same-origin" },
+    ];
+    for (const extra of browserHeaders) {
+      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
+        headers: { authorization: `Bearer ${token}`, ...extra },
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: expect.stringContaining("Browser-originated") });
+    }
+    expect(hostRequests).toEqual([]);
+  });
+
   it.each([307, 308])(
     "a %i from the stub host to a foreign origin is refused with 502 and never followed",
     { timeout: 30_000 },

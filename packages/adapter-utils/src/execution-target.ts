@@ -4423,7 +4423,14 @@ async function forwardLocalBridgeRequest(input: {
   }
   const commentMarker = postedIssueCommentLogMarker(method, input.path, response.status, responseBody);
   if (commentMarker) await input.onLog("stdout", commentMarker);
-  return { status: response.status, headers: buildBridgeResponseHeaders(response), body: responseBody };
+  const responseHeaders = buildBridgeResponseHeaders(response);
+  // Preserve the host's caching directive on the child-visible response: the
+  // broker marks credential responses `no-store`, and the bridge must not
+  // silently drop that. The shared response allowlist stays minimal; only
+  // this one standard directive passes, here, on the local leg.
+  const cacheControl = response.headers.get("cache-control");
+  if (cacheControl && cacheControl.trim().length > 0) responseHeaders["cache-control"] = cacheControl.trim();
+  return { status: response.status, headers: responseHeaders, body: responseBody };
 }
 
 function writeLocalBridgeJson(res: http.ServerResponse, status: number, value: unknown): void {
@@ -4479,6 +4486,17 @@ async function startLocalAdapterExecutionTargetPaperclipBridge(input: {
       const presented = readLocalBridgeBearerToken(req.headers.authorization);
       if (!presented || !compareBridgeTokensConstantTime(bridgeToken, presented)) {
         writeLocalBridgeJson(res, 401, { error: "Invalid bridge token." });
+        return;
+      }
+
+      // Browser-indicator rejection: the loopback bridge must not honor
+      // browser-originated requests even with a valid token. `sec-fetch-site`
+      // cannot be suppressed by page script; `origin` covers older browsers.
+      // Cookie-bearing requests are NOT rejected: frozen T3.1 requires they
+      // forward with the cookie stripped, and a real browser request always
+      // carries sec-fetch-site.
+      if (req.headers.origin || req.headers["sec-fetch-site"]) {
+        writeLocalBridgeJson(res, 403, { error: "Browser-originated bridge requests are forbidden." });
         return;
       }
 
