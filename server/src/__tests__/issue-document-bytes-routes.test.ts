@@ -235,7 +235,7 @@ describe("issue document byte-fidelity routes", () => {
     mockIssueService.getById.mockResolvedValue({
       id: issueId,
       companyId,
-      identifier: "PAP-881",
+      identifier: "DOC-BYTES",
       title: "Byte fidelity",
       status: "in_progress",
     });
