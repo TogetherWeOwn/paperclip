@@ -52,6 +52,17 @@ const vault = vi.hoisted(() => ({
   resolveSecretValue: vi.fn(async () => "test-dedicated-token"),
 }));
 vi.mock("../services/secrets.js", () => ({ secretService: () => vault }));
+const toolAccessMock = vi.hoisted(() => ({
+  refreshOAuthGrantCredentials: vi.fn(),
+}));
+vi.mock("../services/tool-access.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../services/tool-access.js")>();
+  const factory = (...args: Parameters<typeof original.toolAccessService>) => ({
+    ...original.toolAccessService(...args),
+    refreshOAuthGrantCredentials: toolAccessMock.refreshOAuthGrantCredentials,
+  });
+  return { ...original, toolAccessService: factory };
+});
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)(
   "operation-time GitHub credential resolution",
@@ -358,6 +369,31 @@ const support = await getEmbeddedPostgresTestSupport();
       ).rejects.toThrow();
       expect(operation).not.toHaveBeenCalled();
       expect(vault.resolveUserSecretValue).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not refresh an expiring grant for diagnostics while the operation path still refreshes", async () => {
+      const input = await seed();
+      const row = await grant(input, "A");
+      const [stored] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, row.id));
+      const expiringTenant = {
+        ...(stored!.providerTenant as Record<string, unknown>),
+        oauth: {
+          accessTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+          refreshedAt: new Date().toISOString(),
+        },
+      };
+      await db.update(connectionGrants).set({ providerTenant: expiringTenant }).where(eq(connectionGrants.id, row.id));
+      const [expiring] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, row.id));
+      toolAccessMock.refreshOAuthGrantCredentials.mockReset().mockResolvedValue(expiring);
+
+      const operation = vi.fn(async (credential: { token: string }) => credential.token);
+      await expect(withGitHubOperationCredential(db, input, operation)).resolves.toBe("test-token-A");
+      expect(operation).toHaveBeenCalledTimes(1);
+      expect(toolAccessMock.refreshOAuthGrantCredentials).not.toHaveBeenCalled();
+
+      toolAccessMock.refreshOAuthGrantCredentials.mockClear();
+      await expect(resolveGitHubOperationCredentials(db, input)).resolves.toMatchObject({ status: "available" });
+      expect(toolAccessMock.refreshOAuthGrantCredentials).toHaveBeenCalledTimes(1);
     });
 
     it("uses one stable grant when the same person connects the same GitHub account twice", async () => {

@@ -5,10 +5,12 @@ import {
   sanitizeGitHubDiagnosticText,
   type GitHubReadRunClaims,
 } from "./github-read-operations.js";
+import { redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
 const mocks = vi.hoisted(() => ({
   validate: vi.fn(),
   withCredential: vi.fn(),
+  redactForRun: vi.fn(async (_companyId: string, _runId: string, value: unknown) => value),
 }));
 
 vi.mock("./connection-intents.js", () => ({
@@ -22,7 +24,7 @@ vi.mock("./github-operation-credentials.js", () => ({
 vi.mock("./run-secret-redaction.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./run-secret-redaction.js")>()),
   createRunSecretRedactionRegistry: () => ({
-    redactForRun: async (_companyId: string, _runId: string, value: unknown) => value,
+    redactForRun: mocks.redactForRun,
   }),
 }));
 
@@ -100,6 +102,9 @@ describe("githubReadOperationsService", () => {
     mocks.withCredential
       .mockReset()
       .mockImplementation(async (_db, _input, operation) => operation({ token: TOKEN }));
+    mocks.redactForRun
+      .mockReset()
+      .mockImplementation(async (_companyId: string, _runId: string, value: unknown) => value);
   });
 
   it("sends only GET requests and strips authorization from the log download", async () => {
@@ -119,6 +124,68 @@ describe("githubReadOperationsService", () => {
     expect(new Headers(calls[0]!.init.headers).get("authorization")).toBe(`Bearer ${TOKEN}`);
     expect(new Headers(calls[1]!.init.headers).get("authorization")).toBeNull();
     expect(JSON.stringify(result)).not.toContain(TOKEN);
+  });
+
+  it("passes a 15s timeout signal on every GitHub fetch", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    try {
+      const logCalls: Array<{ init: RequestInit }> = [];
+      const logFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        logCalls.push({ init: init ?? {} });
+        return logCalls.length === 1 ? redirect(SAFE_DOWNLOAD) : new Response("ok", { status: 200 });
+      }) as unknown as typeof fetch;
+      await service(logFetch).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+      expect(logCalls).toHaveLength(2);
+      expect(timeoutSpy).toHaveBeenCalledTimes(2);
+      for (const call of logCalls) {
+        expect(call.init.signal).toBeInstanceOf(AbortSignal);
+        expect((call.init.signal as AbortSignal).aborted).toBe(false);
+      }
+      for (const call of timeoutSpy.mock.calls) expect(call[0]).toBe(15_000);
+
+      timeoutSpy.mockClear();
+      const webhookFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        expect((init?.signal as AbortSignal).aborted).toBe(false);
+        return new Response("[]", { status: 200 });
+      }) as unknown as typeof fetch;
+      await service(webhookFetch).repositoryWebhooks(claims, { repositoryId: REPO_ID });
+      expect(webhookFetch).toHaveBeenCalledTimes(1);
+      expect(timeoutSpy).toHaveBeenCalledTimes(1);
+      expect(timeoutSpy.mock.calls[0]![0]).toBe(15_000);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("redacts run-registered secrets with no pattern shape from both tools", async () => {
+    const opaque = "qzxw-7741-brilliant-harbor-giraffe";
+    expect(sanitizeGitHubDiagnosticText(`echo ${opaque}`, [])).toContain(opaque);
+    mocks.redactForRun.mockImplementation(
+      async (companyId: string, runId: string, value: unknown) =>
+        redactRegisteredSecretValues(value, [opaque]),
+    );
+
+    let calls = 0;
+    const logFetch = vi.fn(async () => {
+      calls += 1;
+      return calls === 1 ? redirect(SAFE_DOWNLOAD) : bodyStream(`build output ${opaque} done`);
+    }) as unknown as typeof fetch;
+    const logs = await service(logFetch).actionsJobLogs(claims, { repositoryId: REPO_ID, jobId: "42" });
+    expect(logs.logs).not.toContain(opaque);
+    expect(logs.logs).toContain("***REDACTED***");
+
+    const webhookFetch = vi.fn(
+      async () => new Response(JSON.stringify([{ id: 1, name: opaque, type: "Repository", active: true, events: ["push"], config: { content_type: "json", insecure_ssl: "0" } }]), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const webhooks = await service(webhookFetch).repositoryWebhooks(claims, { repositoryId: REPO_ID });
+    expect(JSON.stringify(webhooks)).not.toContain(opaque);
+
+    expect(mocks.redactForRun).toHaveBeenCalledTimes(2);
+    for (const call of mocks.redactForRun.mock.calls) {
+      expect(call[0]).toBe(claims.company_id);
+      expect(call[1]).toBe(claims.run_id);
+    }
   });
 
   it.each([
@@ -355,6 +422,7 @@ describe("sanitizeGitHubDiagnosticText", () => {
     ["basic header", "Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA"],
     ["jwt", "id eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.c2lnbmF0dXJl end", "eyJhbGci"],
     ["add-mask", "::add-mask::supersecretvalue", "supersecretvalue"],
+    ["add-mask multi-word", "::add-mask::correct horse battery staple", "horse battery staple"],
     ["provider key", "key sk-ABCDEFGHIJKLMNOPQRSTUV and AKIAABCDEFGHIJKLMNOP", "sk-ABCDEF"],
     ["pem block", `before\n${KEY}\nafter`, "MIIEowIBAAKC"],
     ["truncated pem", "before\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq", "MIIEvQIBAD"],
@@ -456,6 +524,9 @@ describe("sanitizeGitHubDiagnosticText", () => {
     ["Authorization: Digest username=admin, response=abcdef0123", "abcdef0123"],
     ["{'password': 'py-secret'}", "py-secret"],
     ["curl -u admin:s3cr3tpass https://example.test", "s3cr3tpass"],
+    ["curl -uadmin:s3cr3tpass https://example.test/", "s3cr3tpass"],
+    ["curl --user admin:s3cr3tpass https://example.test/", "s3cr3tpass"],
+    ["curl --user=admin:s3cr3tpass https://example.test/", "s3cr3tpass"],
   ])("redacts %s", (input, secret) => {
     expect(sanitizeGitHubDiagnosticText(input, [])).not.toContain(secret);
   });
