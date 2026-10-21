@@ -1342,9 +1342,6 @@ export const PLUGIN_CAPABILITIES = [
   "approvals.read",
   "issue.documents.read",
   "agents.read",
-  // Queued heartbeat-run depth per agent (`agents.getQueuedRunCounts`). Deliberately
-  // separate from `agents.read`: queue depth is a `heartbeat_runs` aggregate, not
-  // agent-table rows, so bundling would silently expand existing grants.
   "agents.queued_counts.read",
   "goals.read",
   "goals.create",
