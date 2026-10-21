@@ -64,6 +64,14 @@ describe("readConfigFile", () => {
     );
   });
 
+  it("throws when the config file contains the JSON literal null", () => {
+    writeConfig(configPath, null);
+
+    expect(() => readConfigFile()).toThrow(
+      new RegExp(`Invalid Paperclip config at ${escapeRegExp(configPath)}`),
+    );
+  });
+
   it("throws a field-specific error when the config file fails schema validation", () => {
     const config = minimalConfig();
     if (typeof config === "object" && config !== null) {

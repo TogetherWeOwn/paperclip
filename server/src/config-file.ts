@@ -18,18 +18,34 @@ function formatConfigValidationError(error: ZodError): string {
     .join("; ");
 }
 
-export function readConfigFile(): PaperclipConfig | null {
-  const configPath = resolvePaperclipConfigPath();
-
+function readConfigJson(configPath: string): unknown {
   if (!fs.existsSync(configPath)) return null;
 
-  let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Invalid Paperclip config at ${configPath}: failed to read or parse JSON: ${reason}`);
   }
+}
+
+/**
+ * Pre-validation config for presence checks that zod defaults would mask
+ * (e.g. logging.logDir). Returns null when no config file exists; throws on
+ * unreadable/invalid JSON exactly like readConfigFile.
+ */
+export function readRawConfigFile(): unknown {
+  return readConfigJson(resolvePaperclipConfigPath());
+}
+
+export function readConfigFile(): PaperclipConfig | null {
+  const configPath = resolvePaperclipConfigPath();
+  if (!fs.existsSync(configPath)) return null;
+  const raw = readConfigJson(configPath);
+
+  // A parsed null (file literally contains `null`) must NOT be treated as a
+  // missing file: it falls through to schema validation below, which throws
+  // Invalid Paperclip config like any other non-object JSON value.
 
   try {
     const config = paperclipConfigSchema.parse(raw);

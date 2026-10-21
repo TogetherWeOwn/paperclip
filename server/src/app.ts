@@ -50,7 +50,7 @@ import {
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
+import { accessLogger, httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
@@ -605,6 +605,16 @@ export async function createApp(
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
 
+  // Request logging sits before the body parsers on purpose: a parser
+  // rejection (malformed JSON, oversized bodies) calls next(err),
+  // which skips all downstream non-error middleware, so anything mounted
+  // after the parsers never sees exactly the abusive traffic the access log
+  // exists to count. Both loggers only read the outcome at finish time, so
+  // running their entry step earlier changes nothing else.
+  app.use(httpLogger);
+  // Retained one-line-per-request log (access.log). Mounted right after
+  // httpLogger so the logged request id matches the pino-http lines.
+  app.use(accessLogger);
   app.use(
     COMPANY_IMPORT_API_PATH,
     express.json({
@@ -624,7 +634,6 @@ export async function createApp(
   // File tickets authenticate before parsing bytes; JSON attachments must remain bytes too.
   app.use((req, res, next) => req.path === "/mcp/files/upload" ? next() : jsonBodyParser(req, res, next));
   app.use("/api", apiCompression());
-  app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,

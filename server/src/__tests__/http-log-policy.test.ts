@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  requestLogUrl,
   shouldSilenceHttpSuccessLog,
 } from "../middleware/http-log-policy.js";
 
@@ -186,5 +187,94 @@ describe("shouldSilenceHttpSuccessLog", () => {
         404,
       ),
     ).toBe(false);
+  });
+});
+
+describe("requestLogUrl", () => {
+  it("collapses bearer tokens in invite and board-claim paths, keeping sub-paths", () => {
+    const cases: Array<[string, string]> = [
+      ["/api/invites/pcp_invite_SECRETTOKEN123", "/api/invites/:token"],
+      [
+        "/api/invites/pcp_invite_SECRETTOKEN123/accept",
+        "/api/invites/:token/accept",
+      ],
+      [
+        "/api/invites/pcp_invite_SECRETTOKEN123/skills/paperclip",
+        "/api/invites/:token/skills/paperclip",
+      ],
+      ["/api/board-claim/rawtoken456", "/api/board-claim/:token"],
+      ["/api/board-claim/rawtoken456/claim", "/api/board-claim/:token/claim"],
+    ];
+    for (const [input, expected] of cases) {
+      for (const method of ["GET", "POST"]) {
+        const logged = requestLogUrl({ method, url: input });
+        expect(logged).toBe(expected);
+        expect(logged).not.toContain("SECRETTOKEN123");
+        expect(logged).not.toContain("rawtoken456");
+      }
+    }
+  });
+
+  it("strips query strings and userinfo while collapsing tokens", () => {
+    expect(
+      requestLogUrl({
+        method: "GET",
+        url: "/api/invites/pcp_invite_SECRETTOKEN123/accept?next=/board#frag",
+      }),
+    ).toBe("/api/invites/:token/accept");
+    expect(
+      requestLogUrl({ method: "GET", url: "/api/issues?token=secret" }),
+    ).toBe("/api/issues");
+  });
+
+  it("leaves adjacent non-token routes untouched", () => {
+    for (const path of [
+      "/api/invites",
+      "/api/invites-extra/abc",
+      "/api/board-claim",
+      "/api/companies/acme/issues",
+      "/api/tool-gateway/gateway-tokens/token-id-1/revoke",
+    ]) {
+      expect(requestLogUrl({ method: "GET", url: path })).toBe(path);
+    }
+  });
+
+  it("still collapses webhook ids to route templates", () => {
+    expect(
+      requestLogUrl({
+        method: "POST",
+        originalUrl: "/api/chat-webhooks/endpoint-9/slack",
+        url: "/api/chat-webhooks/endpoint-9/slack",
+      }),
+    ).toBe("/api/chat-webhooks/:publicId/:provider");
+  });
+
+  it("prefers originalUrl over mount-stripped req.url for token collapse", () => {
+    // Regression: at response-finish time Express has stripped the /api
+    // mount prefix from req.url, so collapsing req.url left the raw bearer
+    // token in the pino msg field of server.log and stdout.
+    expect(
+      requestLogUrl({
+        method: "GET",
+        originalUrl: "/api/invites/pcp_invite_SECRETTOKEN123",
+        url: "/invites/pcp_invite_SECRETTOKEN123",
+      }),
+    ).toBe("/api/invites/:token");
+    expect(
+      requestLogUrl({
+        method: "POST",
+        originalUrl: "/api/board-claim/rawtoken456/claim",
+        url: "/board-claim/rawtoken456/claim",
+      }),
+    ).toBe("/api/board-claim/:token/claim");
+  });
+
+  it("collapses mount-relative token paths when originalUrl is unavailable", () => {
+    expect(
+      requestLogUrl({ method: "GET", url: "/invites/pcp_invite_SECRETTOKEN123" }),
+    ).toBe("/invites/:token");
+    expect(
+      requestLogUrl({ method: "POST", url: "/board-claim/rawtoken456/claim" }),
+    ).toBe("/board-claim/:token/claim");
   });
 });
