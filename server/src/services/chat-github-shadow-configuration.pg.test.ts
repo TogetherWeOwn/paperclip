@@ -14,7 +14,7 @@ import { normalizeExperimentalSettings, applyExperimentalSettingsPatch, instance
 // Always disposable, never a shared application DB. Do not turn unsupported
 // hosts into passing acceptance evidence.
 const support = await getEmbeddedPostgresTestSupport();
-const suite = support.supported ? describe.sequential : describe.skip;
+const suite = support.supported ? describe : describe.skip;
 
 suite("GitHub shadow route persistence (A11, real PostgreSQL)", () => {
   let db: ReturnType<typeof createDb>;

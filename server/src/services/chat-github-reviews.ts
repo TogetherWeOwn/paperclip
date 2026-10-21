@@ -1,7 +1,6 @@
 import { githubRunReplyState } from "./chat-run-publications.js";
 import { stageReceiptReactionRemovals } from "./chat-receipt-reactions.js";
 import { insertChatActions } from "./chat-publication-authority.js";
-import { githubShadowLabel } from "./chat-github-review-policy.js";
 import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
@@ -428,7 +427,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     return { prefix, request };
   }
   async function diffBaseSha(
-    api: Awaited<ReturnType<typeof client>>,
+    api: GitHubReviewReader,
     baseSha: string,
     headSha: string,
   ) {

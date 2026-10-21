@@ -42,7 +42,7 @@ const external = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const support = external
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
-const suite = SEEDED && support.supported ? describe.sequential : describe.skip;
+const suite = SEEDED && support.supported ? describe : describe.skip;
 
 // Production-scale seed volumes (host incident 2026-10-18).
 const SEED_ISSUES = 50_000;

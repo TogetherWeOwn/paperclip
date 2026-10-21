@@ -2128,6 +2128,7 @@ export function heartbeatService(
     const executionPhaseContext = { onExecutionPhase: executionControl.phases.enter };
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let candidateRuntime: Awaited<ReturnType<typeof prepareGitHubCandidateRuntime>> = null;
+    let candidateWorkspaceDir: string | null = null;
     let runScratch: HeartbeatRunScratch | null = null;
     let unregisterToolResultSpillWriter: (() => void) | null = null;
     let githubLauncherLocation:
@@ -3482,7 +3483,7 @@ export function heartbeatService(
         workspaceRealization,
         executionTarget,
         workspaceRestoreSource,
-        candidateWorkspaceDir,
+        candidateWorkspaceDir: preparedCandidateWorkspaceDir,
       } = await prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans,
         candidateRuntime,
@@ -3538,6 +3539,7 @@ export function heartbeatService(
           appendRunEvent,
         },
       });
+      candidateWorkspaceDir = preparedCandidateWorkspaceDir;
       if (candidateRuntime) {
         runtimeConfig = githubCandidateAdapterConfig(candidateRuntime, runtimeConfig, executionWorkspace.cwd);
       }

@@ -31,7 +31,10 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { projectSafeChatPublication } from "./chat-publication-projection.js";
+import {
+  GITHUB_PUBLIC_ACTOR_NAME,
+  projectSafeChatPublication,
+} from "./chat-publication-projection.js";
 import { safeChatTaskUrl } from "./chat-task-url.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summary.js";
@@ -212,6 +215,7 @@ type ChatRunMilestoneCandidate = {
   endpointId: string;
   conversationId: string;
   agentName: string;
+  provider: string;
 };
 
 type SafeNativeChatProgressCandidate = {
@@ -226,6 +230,7 @@ type SafeNativeChatProgressCandidate = {
   endpointId: string;
   conversationId: string;
   agentName: string;
+  provider: string;
 };
 
 const SAFE_NATIVE_CHAT_PROGRESS_CADENCE_MS = 20_000;
@@ -252,27 +257,31 @@ export function safeMilestoneText(input: {
   errorCode?: string | null;
   milestone: SafeRunMilestone;
   issueId: string;
+  provider?: string | null;
   publicBaseUrl?: string | null;
 }): string {
-  if (input.milestone === "queued") return `${input.agentName} is queued.`;
-  if (input.milestone === "working") return `${input.agentName} is working…`;
+  const github = input.provider === "github";
+  const agentName = github ? GITHUB_PUBLIC_ACTOR_NAME : input.agentName;
+  if (input.milestone === "queued") return `${agentName} is queued.`;
+  if (input.milestone === "working") return `${agentName} is working…`;
   if (input.milestone === "completed")
-    return `${input.agentName} completed this turn.`;
+    return `${agentName} completed this turn.`;
   if (input.errorCode === "slack_session_stopped")
-    return `${input.agentName} stopped at your request.`;
-  const taskUrl = safeChatTaskUrl(input.publicBaseUrl, input.issueId);
+    return `${agentName} stopped at your request.`;
   const recovery =
     input.milestone === "waiting_for_input"
-      ? `${input.agentName} needs a Paperclip admin to safely recover this turn before more work can start.`
+      ? `${agentName} needs a Paperclip admin to safely recover this turn before more work can start.`
       : input.errorCode === "low_trust_isolation_unavailable"
-        ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
+        ? `${agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
         : input.errorCode === "native_provider_usage_limit"
-          ? `${input.agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
+          ? `${agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
           : input.errorCode === "native_event_replay_conflict"
-            ? `${input.agentName} couldn't safely continue this turn. A Paperclip admin needs to review the run before it can be retried.`
+            ? `${agentName} couldn't safely continue this turn. A Paperclip admin needs to review the run before it can be retried.`
             : input.errorCode === "native_session_cleanup_quarantined"
-              ? `${input.agentName} couldn't start this turn because an earlier session needs recovery. Your request is saved. Ask a Paperclip admin to recover that session before retrying; sending the request again won't repair it.`
-              : `${input.agentName} stopped before completing this turn.`;
+              ? `${agentName} couldn't start this turn because an earlier session needs recovery. Your request is saved. Ask a Paperclip admin to recover that session before retrying; sending the request again won't repair it.`
+              : `${agentName} stopped before completing this turn.`;
+  if (github) return recovery;
+  const taskUrl = safeChatTaskUrl(input.publicBaseUrl, input.issueId);
   return `${recovery}${
     taskUrl
       ? ` Open the task in Paperclip: ${taskUrl}`
@@ -314,6 +323,7 @@ async function enqueueSafeNativeChatProgress(
         eventSeq: heartbeatRunEvents.seq,
         eventType: heartbeatRunEvents.eventType,
         eventCreatedAt: heartbeatRunEvents.createdAt,
+        provider: chatEndpoints.provider,
         runId: heartbeatRuns.id,
         agentId: heartbeatRuns.agentId,
         issueId: chatConversations.issueId,
@@ -515,7 +525,7 @@ async function enqueueSafeNativeChatProgress(
         }
         const progress = safeNativeChatProgressForEvent(
           currentEvent.eventType,
-          row.agentName,
+          row.provider === "github" ? GITHUB_PUBLIC_ACTOR_NAME : row.agentName,
         );
         if (!progress) return 0;
 
@@ -765,6 +775,7 @@ export async function enqueueChatRunMilestones(
         endpointId: chatConversations.endpointId,
         conversationId: chatConversations.id,
         agentName: agents.name,
+        provider: chatEndpoints.provider,
       })
       .from(heartbeatRuns)
       .innerJoin(

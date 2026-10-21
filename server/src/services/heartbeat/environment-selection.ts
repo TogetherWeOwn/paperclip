@@ -61,7 +61,7 @@ export interface HeartbeatEnvironmentSelectionInput {
   services: {
     executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "getById">;
     environmentsSvc: Pick<ReturnType<typeof environmentService>,
-      "ensureLocalEnvironment" | "findManagedSandboxEnvironment" | "findKubernetesEnvironment" | "ensureKubernetesEnvironment" | "getById">;
+      "ensureLocalEnvironment" | "findManagedSandboxEnvironment" | "findKubernetesEnvironment" | "ensureKubernetesEnvironment" | "getById" | "listBoundCompanyIds">;
     instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "get" | "getExperimental">;
     findSharedWorkspaceHolder: ReturnType<typeof createHeartbeatRetries>["findSharedWorkspaceHolder"];
   };

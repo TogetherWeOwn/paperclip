@@ -285,7 +285,6 @@ describeEmbeddedPostgres("gateway connector invocation telemetry", () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    track.mockClear();
     failLogActivityForAction.current = null;
     await db.delete(activityLog);
     await db.delete(toolCallEvents);

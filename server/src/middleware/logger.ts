@@ -9,7 +9,10 @@ import {
   requestLogUrl,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
-import { redactSensitive } from "./redact-sensitive.js";
+import {
+  redactSensitive,
+  stripSecretBearingUrlParts,
+} from "./redact-sensitive.js";
 import { getFileLogging } from "./file-logging.js";
 
 const sharedOpts = {

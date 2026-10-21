@@ -26,7 +26,7 @@ const external = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const support = external
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
-const suite = support.supported ? describe.sequential : describe.skip;
+const suite = support.supported ? describe : describe.skip;
 
 const OLD = "a".repeat(40);
 const NEW = "b".repeat(40);

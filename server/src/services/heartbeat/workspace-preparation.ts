@@ -134,7 +134,7 @@ export interface HeartbeatWorkspacePreparationInput {
   };
   services: {
     envOrchestrator: Pick<ReturnType<typeof environmentRunOrchestrator>, "resolveEnvironment" | "acquireForRun" | "realizeForRun">;
-    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update">;
+    executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "create" | "update" | "getById">;
     workspaceOperationsSvc: Pick<ReturnType<typeof workspaceOperationService>, "createRecorder">;
     issuesSvc: Pick<ReturnType<typeof issueService>, "update">;
     resolveWorkspaceForRun: WorkspaceResolver["resolveWorkspaceForRun"];

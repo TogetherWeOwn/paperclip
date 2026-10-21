@@ -230,6 +230,33 @@ export async function policyBlocks(db: Db, policy: PolicyRow) {
   return observedBlocks(policy, await computeObservedSpend(db, policy));
 }
 
+async function computeObservedAmount(
+  db: Db,
+  policy: Pick<PolicyRow, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">,
+) {
+  if (policy.metric !== "billed_cents") return 0;
+
+  const conditions = [eq(costEvents.companyId, policy.companyId)];
+  if (policy.scopeType === "agent") conditions.push(eq(costEvents.agentId, policy.scopeId));
+  if (policy.scopeType === "project") conditions.push(eq(costEvents.projectId, policy.scopeId));
+  const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
+  if (policy.windowKind === "calendar_month_utc") {
+    conditions.push(gte(costEvents.occurredAt, start));
+    conditions.push(lt(costEvents.occurredAt, end));
+  }
+
+  const [row] = await db
+    .select({
+      total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+    })
+    .from(costEvents)
+    .where(and(...conditions));
+
+  return Number(row?.total ?? 0);
+}
+
+/**
+
 /**
  * Host-computed fraction of the run's budget envelope spent (TOG-7967, D1).
  *

@@ -23,7 +23,6 @@ import type {
   ToolGatewaySession,
 } from "./tool-gateway.js";
 import { runContextSnapshotString } from "./tool-access-policy.js";
-import { githubRunCapability } from "./chat-github-shadow.js";
 
 const objectSchema = (
   properties: Record<string, unknown>,
@@ -306,8 +305,6 @@ export async function githubBotToolsForSession(
     }).onConflictDoNothing().returning();
     if (entry) rows.push({ ...row, entry });
   }
-  // Only the clone exception needs an exact delivery/comment/run capability.
-  const capability = await githubRunCapability(db, session);
   return rows
     .filter(
       (row) =>
