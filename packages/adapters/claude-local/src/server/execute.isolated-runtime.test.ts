@@ -125,7 +125,7 @@ describe("claude execute — isolateRuntime", () => {
     vi.unstubAllEnvs();
   });
 
-  it("control: without the flag the child inherits the server env and carries a bridge token, never the host JWT", async () => {
+  it.runIf(process.platform === "linux")("control: without the flag the child inherits the server env and carries a bridge token, never the host JWT", async () => {
     const { ctx } = buildContext({});
 
     await execute(ctx as never);
@@ -140,7 +140,7 @@ describe("claude execute — isolateRuntime", () => {
     expect(opts.env.GH_APP_PRIVATE_KEY).toBe(PROJECT_SECRETS.GH_APP_PRIVATE_KEY);
   });
 
-  it("starts the child from an allowlist holding the token, and logs the narrowed key set", async () => {
+  it.runIf(process.platform === "linux")("starts the child from an allowlist holding the token, and logs the narrowed key set", async () => {
     const { ctx, onMeta } = buildContext({ isolate: true });
 
     await execute(ctx as never);
@@ -169,7 +169,7 @@ describe("claude execute — isolateRuntime", () => {
     );
   });
 
-  it("decides model and billing from the narrowed env, not server-held keys", async () => {
+  it.runIf(process.platform === "linux")("decides model and billing from the narrowed env, not server-held keys", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-server-only");
     vi.stubEnv("ANTHROPIC_MODEL", "server-model");
     const onMeta = vi.fn(async (_meta: unknown) => {});

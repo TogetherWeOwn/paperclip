@@ -16,6 +16,7 @@ export const LEGACY_GITHUB_LAUNCHER_SHA256 = [
   "b63aaf0b636af06c9bb2fdd84917721de67e020b12db1f9ef13b8e78a9c92fe0",
   "deb6e64cf0d529d29e4aab3054be3212fd809d544ec6a760da2634eeb4735806",
   "c8c3de47810be11c441f704357fe44e95b9bec78d162984cc7df86c412905463",
+  "fe1cb92400861f2a9f7b86381df4dbe0712435e783993fd4a8539398d65dd431",
 ] as const;
 
 /**
@@ -130,8 +131,8 @@ async function main() {
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
         origin = parsed.origin;
       } catch { return null; }
-      if (!(brokerVar && brokerVar.trim())) return origin + '/runtime-tools/github/credentials';
       if (expectedBrokerOrigin) return origin === expectedBrokerOrigin ? origin + '/runtime-tools/github/credentials' : null;
+      if (!(brokerVar && brokerVar.trim())) return origin + '/runtime-tools/github/credentials';
       try {
         return new URL(env.PAPERCLIP_API_URL).origin === origin ? origin + '/runtime-tools/github/credentials' : null;
       } catch { return null; }

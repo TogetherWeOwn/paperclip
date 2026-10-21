@@ -1,8 +1,9 @@
 /**
  * B1 pins for the real local/legacy loopback bridge (`local_v1`): env shape,
- * token separation, 401/403 denials, redirect refusal, and debug-log
- * sanitization — all against local stub HTTP servers with synthetic
- * credentials. Nothing here leaves loopback.
+ * token separation, 401/403 denials, redirect refusal, forward-failure
+ * classification by method safety, and debug-log sanitization — all against
+ * local stub HTTP servers with synthetic credentials. Nothing here leaves
+ * loopback.
  *
  * The execute-level wiring is pinned (mocked bridge) in
  * execute.credential-scoping.test.ts T1.1–T1.3; these pins cover the real
@@ -416,5 +417,62 @@ describe("local loopback bridge (local_v1)", () => {
         headers: { authorization: `Bearer ${bridge.env.PAPERCLIP_API_KEY}` },
       }),
     ).rejects.toThrow();
+  });
+
+  it("a dead host classifies an unsafe-method forward failure as indeterminate 504", {
+    timeout: 30_000,
+  }, async () => {
+    const hostRequests: RecordedRequest[] = [];
+    const host = await startStubServer(
+      () => ({ status: 200, body: JSON.stringify({ ok: true }) }),
+      hostRequests,
+    );
+    const bridge = await startLocalBridge({ hostApiUrl: host.origin });
+    await host.close();
+
+    const response = await fetch(
+      `${bridge.env.PAPERCLIP_API_URL}/api/issues/issue-1/comments`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridge.env.PAPERCLIP_API_KEY}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ body: "note" }),
+      },
+    );
+    // The mutation may have committed before the abort; never invite a retry.
+    expect(response.status).toBe(504);
+    expect(response.headers.get("x-paperclip-bridge-outcome")).toBe(
+      "indeterminate",
+    );
+    expect(await response.json()).toEqual({
+      error: "bridge forward failed",
+      outcome: "indeterminate",
+      retryable: false,
+    });
+  });
+
+  it("a dead host keeps a safe-method forward failure a retryable 502", {
+    timeout: 30_000,
+  }, async () => {
+    const hostRequests: RecordedRequest[] = [];
+    const host = await startStubServer(
+      () => ({ status: 200, body: JSON.stringify({ ok: true }) }),
+      hostRequests,
+    );
+    const bridge = await startLocalBridge({ hostApiUrl: host.origin });
+    await host.close();
+
+    const response = await fetch(
+      `${bridge.env.PAPERCLIP_API_URL}/api/agents/me`,
+      {
+        headers: { authorization: `Bearer ${bridge.env.PAPERCLIP_API_KEY}` },
+      },
+    );
+    // A safe method never committed host state, so a retry cannot double-apply.
+    expect(response.status).toBe(502);
+    expect(response.headers.get("x-paperclip-bridge-outcome")).toBeNull();
+    expect(await response.json()).toEqual({ error: "bridge forward failed" });
   });
 });

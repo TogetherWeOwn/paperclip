@@ -29,7 +29,7 @@ describe("managed GitHub launchers", () => {
     // Other copies of this launcher are only recognised below 16 KiB.
     expect(Buffer.byteLength(githubLauncherSource())).toBeLessThan(16384);
     // When this digest changes, append the previous value to LEGACY_GITHUB_LAUNCHER_SHA256 first.
-    expect(sha256(githubLauncherSource())).toBe("fe1cb92400861f2a9f7b86381df4dbe0712435e783993fd4a8539398d65dd431");
+    expect(sha256(githubLauncherSource())).toBe("8d1270ed5d7c65561a67cb7e2a755c473d6294410a3f4916c8ac4743ebadaadf");
   });
 
   it("passes the shim-free PATH to wrappers and reaches the next Git executable once", async () => {
@@ -409,6 +409,26 @@ describe("baked broker-origin approval", () => {
       },
     });
     expect(evil.urls).toEqual([]);
+    expect(result.stderr).toContain("broker_base_rejected");
+    expect(JSON.parse(result.stdout)).toEqual({ token: null });
+  });
+
+  it("enforces the baked origin before the empty-broker-var fallback", async () => {
+    const { root, bin, realBin } = await stageBaked("https://broker.example.test");
+    const evil = await startRecorder();
+    const result = await exec(path.join(bin, "gh"), [], {
+      env: {
+        ...process.env,
+        ...githubBrokerEnvironment({}, { url: "", token: "run-capability" }),
+        PAPERCLIP_API_URL: evil.origin,
+        GH_CONFIG_DIR: root,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      },
+    });
+    // A tampered PAPERCLIP_API_URL must not steer the capability away from
+    // the baked broker origin via the empty-var fallback.
+    expect(evil.urls).toEqual([]);
+    expect(evil.capabilities).toEqual([]);
     expect(result.stderr).toContain("broker_base_rejected");
     expect(JSON.parse(result.stdout)).toEqual({ token: null });
   });

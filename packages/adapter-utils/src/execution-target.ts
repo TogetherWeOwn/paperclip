@@ -4359,10 +4359,21 @@ async function forwardLocalBridgeRequest(input: {
     // The host is unreachable or the forward budget elapsed. Fail closed with
     // a generic error: the host URL and the failure detail stay out of the
     // child-visible response.
+    if (isSafeBridgeMethod(method)) {
+      return {
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "bridge forward failed" }), "utf8"),
+      };
+    }
+    // An unsafe method may have committed before the abort; never invite a retry.
     return {
-      status: 502,
-      headers: { "content-type": "application/json" },
-      body: Buffer.from(JSON.stringify({ error: "bridge forward failed" }), "utf8"),
+      status: 504,
+      headers: { "content-type": "application/json", "x-paperclip-bridge-outcome": "indeterminate" },
+      body: Buffer.from(
+        JSON.stringify({ error: "bridge forward failed", outcome: "indeterminate", retryable: false }),
+        "utf8",
+      ),
     };
   }
   // `manual` surfaces a redirect as an opaqueredirect response instead of

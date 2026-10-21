@@ -33,7 +33,7 @@ You must not substitute a Paperclip run credential for GitHub authentication: Gi
 
 You must not forward credentials, tokens, or `Authorization` material to unapproved origins: send Paperclip credentials only to the injected `PAPERCLIP_API_URL` origin and the documented broker origin, and never attach them to requests bound for other hosts.
 
-These rules are advisory launch guidance for the agent, not shell confinement: they do not and cannot constrain shell networking on their own. Enforcement lives in the runtime (bridge token separation and the egress allowlist), not in this text.
+These rules are advisory launch guidance for the agent, not shell confinement: they do not and cannot constrain shell networking on their own. Enforcement lives in the runtime for sandboxed local CLI runs (bridge token separation and the egress allowlist); ACP and remote-target runs never take the local-process sandbox, so the rules stay advisory there, not enforced by this text.
 
 ## Conversation tasks
 
