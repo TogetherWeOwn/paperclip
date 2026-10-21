@@ -27,6 +27,7 @@ import { isConnectorTool, executeConnectorTool, type ConnectorAssignment } from 
 import { resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { RUNTIME_CONNECTION_TOOL_DEFINITIONS } from "../connection-tool-definitions.js";
+import { githubReadOperationsService } from "../github-read-operations.js";
 import { connectionsSearchInputSchema, connectionRequestInputSchema, CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { createHash, randomUUID } from "node:crypto";
 import { paperclipChatFilePreparationDelivery } from "@paperclipai/adapter-utils/chat-file-delivery";
@@ -381,6 +382,13 @@ export class PaperclipRunnerToolAuthority {
         const input = connectionsSearchInputSchema.parse(call.arguments);
         return connections.search(claims, input.query, { retryProviderChoice: input.retryProviderChoice });
       }
+      if (call.tool === "github_actions_job_logs") {
+        return githubReadOperationsService(this.db).actionsJobLogs(claims, call.arguments);
+      }
+      if (call.tool === "github_repository_webhooks") {
+        return githubReadOperationsService(this.db).repositoryWebhooks(claims, call.arguments);
+      }
+      if (call.tool !== "connection_request") throw new Error("paperclip_runner_tool_not_advertised");
       const input = connectionRequestInputSchema.parse(call.arguments);
       const result = await connections.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService, connectionId: input.connectionId, toolNames: input.toolNames });
       if (result.state === "ready" && this.binding.pinnedMcpDigest && this.binding.enqueueWakeup) {
