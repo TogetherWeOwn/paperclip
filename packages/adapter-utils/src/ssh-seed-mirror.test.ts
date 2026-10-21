@@ -93,7 +93,9 @@ eval "sh -c $rewritten"
 `;
 
 async function installDecoyStubSsh(): Promise<void> {
-  const binDir = await createFixtureRootDir("paperclip-seed-decoy-stub-ssh-bin-");
+  const binDir = await createFixtureRootDir(
+    "paperclip-seed-decoy-stub-ssh-bin-",
+  );
   await writeFile(path.join(binDir, "ssh"), STUB_DECOY_SOURCE, { mode: 0o755 });
   process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? originalPath}`;
 }
@@ -795,7 +797,9 @@ describe("ssh seed mirror", () => {
         path.join(repoDir, ".claude", "worktrees", "wt", "work.txt"),
         "uncommitted\n",
       );
-      await mkdir(path.join(repoDir, ".paperclip-runtime"), { recursive: true });
+      await mkdir(path.join(repoDir, ".paperclip-runtime"), {
+        recursive: true,
+      });
       await writeFile(
         path.join(repoDir, ".paperclip-runtime", "state.json"),
         "{}\n",
@@ -835,7 +839,10 @@ describe("ssh seed mirror", () => {
       }
       // ... while nested source merely named like scratch still transfers.
       await expect(
-        readFile(path.join(localRemoteDir, "src", "nested", "keep.txt"), "utf8"),
+        readFile(
+          path.join(localRemoteDir, "src", "nested", "keep.txt"),
+          "utf8",
+        ),
       ).resolves.toBe("nested source\n");
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
@@ -992,7 +999,13 @@ describe("ssh seed mirror", () => {
       // throws after cloning.
       const fakeMirror = await createTempDir("paperclip-ssh-fake-mirror-");
       const fakeMirrorRepo = path.join(fakeMirror, "mirror.git");
-      await git(repoDir, ["clone", "--bare", "--quiet", repoDir, fakeMirrorRepo]);
+      await git(repoDir, [
+        "clone",
+        "--bare",
+        "--quiet",
+        repoDir,
+        fakeMirrorRepo,
+      ]);
       await mkdir(path.dirname(localRemoteDir), { recursive: true });
       await git(path.dirname(localRemoteDir), [
         "clone",
@@ -1041,7 +1054,11 @@ describe("ssh seed mirror", () => {
     async () => {
       const submoduleSrc = await createTempDir("paperclip-ssh-submodule-src-");
       await git(submoduleSrc, ["init", "-b", "main"]);
-      await git(submoduleSrc, ["config", "user.email", "seed-test@example.com"]);
+      await git(submoduleSrc, [
+        "config",
+        "user.email",
+        "seed-test@example.com",
+      ]);
       await git(submoduleSrc, ["config", "user.name", "Seed Test"]);
       await writeFile(
         path.join(submoduleSrc, "lib.txt"),
@@ -1094,8 +1111,16 @@ describe("ssh seed mirror", () => {
       // git-crypt class): working bytes differ from the blob while diff
       // reports clean, so a HEAD checkout plus diff overlay would seed the
       // wrong bytes.
-      await git(repoDir, ["config", "filter.paperclip-test.smudge", "tr a-z A-Z"]);
-      await git(repoDir, ["config", "filter.paperclip-test.clean", "tr A-Z a-z"]);
+      await git(repoDir, [
+        "config",
+        "filter.paperclip-test.smudge",
+        "tr a-z A-Z",
+      ]);
+      await git(repoDir, [
+        "config",
+        "filter.paperclip-test.clean",
+        "tr A-Z a-z",
+      ]);
       await writeFile(
         path.join(repoDir, ".gitattributes"),
         "data.bin filter=paperclip-test\n",
