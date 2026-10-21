@@ -91,6 +91,12 @@ export function createGitHubCommitDiffDetailsResolver(
 
   return async (companyId, reference) => {
     try {
+      // The host is pinned to github.com by the GitHubCommitReference type and by
+      // extractGitHubCommitReference, but this resolver attaches a Bearer token, so
+      // re-check at runtime: a hand-built reference must never steer auth to an
+      // attacker-influenced host.
+      const host: string = reference.host;
+      if (host !== "github.com") return null;
       const token = (typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider)?.trim() || null;
       const headers: Record<string, string> = {
         accept: "application/vnd.github+json",

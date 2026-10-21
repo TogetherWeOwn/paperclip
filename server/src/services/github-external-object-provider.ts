@@ -375,6 +375,18 @@ export function createGitHubExternalObjectProvider(
             retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
           };
         }
+        // Both parsers pin the host to github.com, but this resolver attaches a
+        // Bearer token, so re-check at runtime before resolving credentials or
+        // fetching: the destination must never drift to an attacker-influenced host.
+        if (identity.host !== "github.com") {
+          return {
+            ok: false,
+            liveness: "unreachable",
+            errorCode: "github_invalid_identity",
+            errorMessage: "GitHub object identity is invalid.",
+            retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
+          };
+        }
 
         let token: string | null = null;
         try {

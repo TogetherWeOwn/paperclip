@@ -73,7 +73,12 @@ import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/serv
 import { findServerAdapter } from "../adapters/index.js";
 import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
-import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import {
+  assertAllowedGitHubHost,
+  ghFetch,
+  gitHubApiBase,
+  resolveRawGitHubUrl,
+} from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
 import { accessService } from "./access.js";
 import { agentService } from "./agents.js";
@@ -3506,6 +3511,9 @@ export function parseGitHubSourceUrl(rawUrl: string) {
   }
   const owner = parts[0]!;
   const repo = parts[1]!.replace(/\.git$/i, "");
+  // The import source URL is operator-supplied, so pin its host to github.com
+  // or an operator-configured GitHub Enterprise host before anything is fetched.
+  assertAllowedGitHubHost(hostname);
   const queryRef = url.searchParams.get("ref")?.trim();
   const queryPath = normalizeGitHubSourcePath(url.searchParams.get("path"));
   const queryCompanyPath = normalizeGitHubSourcePath(url.searchParams.get("companyPath"));

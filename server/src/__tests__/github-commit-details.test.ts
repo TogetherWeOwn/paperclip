@@ -52,6 +52,25 @@ describe("GitHub commit details", () => {
     }));
   });
 
+  it("refuses to attach the token to a non-github.com host", async () => {
+    const fetch = vi.fn(
+      async () => new Response(JSON.stringify({}), { status: 200 }),
+    );
+    const resolve = createGitHubCommitDiffDetailsResolver({} as any, {
+      fetch,
+      tokenProvider: async () => "secret-token",
+    });
+    await expect(
+      resolve("company-1", {
+        host: "evil.example.com",
+        owner: "acme",
+        repo: "app",
+        sha: "abc1234",
+      } as any),
+    ).resolves.toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("returns null for unavailable or malformed commit details", async () => {
     const resolve = createGitHubCommitDiffDetailsResolver({} as any, {
       fetch: async () => new Response(JSON.stringify({ files: [] }), { status: 200 }),
