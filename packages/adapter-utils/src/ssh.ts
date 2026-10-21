@@ -603,6 +603,12 @@ async function removeLocalEntry(entryPath: string, signal?: AbortSignal | null):
     throwIfWorkspaceRestoreAborted(signal);
     return;
   }
+  // Unlinking a child needs write permission on its parent directory, and the
+  // copy half of this restore preserves read-only source modes (e.g. 0555).
+  // Without this, a second restore of the same tree fails the clear with
+  // EACCES after partially deleting the checkout. The directory itself is
+  // removed below either way.
+  await fs.chmod(entryPath, stat.mode | 0o200);
   for (const entry of await fs.readdir(entryPath)) {
     await removeLocalEntry(path.join(entryPath, entry), signal);
   }
@@ -1621,7 +1627,7 @@ export async function syncDirectoryFromSsh(input: {
   preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
-  /** Cancellation is checked after transfer and before applying staged files. */
+  /** Cancellation interrupts the transfer and is checked again before applying staged files. */
   signal?: AbortSignal | null;
 }): Promise<void> {
   await throwIfWorkspaceRestoreAbortedWithProgress(input.signal, input.onProgress);
@@ -1667,6 +1673,8 @@ export async function syncDirectoryFromSsh(input: {
       let sshStderr = "";
       let tarStderr = "";
       let settled = false;
+      let onAbort = () => {};
+      const cleanupAbort = () => input.signal?.removeEventListener("abort", onAbort);
       let sshExited = false;
       let tarExited = false;
       let sshExitCode: number | null = null;
@@ -1675,6 +1683,7 @@ export async function syncDirectoryFromSsh(input: {
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
+        cleanupAbort();
         if ((sshExitCode ?? 0) !== 0) {
           reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
           return;
@@ -1689,10 +1698,20 @@ export async function syncDirectoryFromSsh(input: {
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
+        cleanupAbort();
         ssh.kill("SIGTERM");
         tar.kill("SIGTERM");
         reject(error);
       };
+      // Abort the transfer itself, not just the apply after it: without this
+      // a Stop mid-download waits for the whole multi-GB stream, the same
+      // unbounded window streamSshToLocalFile was made interruptible for.
+      onAbort = () => fail(workspaceRestoreCancelledError());
+      input.signal?.addEventListener("abort", onAbort, { once: true });
+      if (input.signal?.aborted) {
+        onAbort();
+        return;
+      }
 
       if (progress) {
         progress.counter.on("error", fail);
