@@ -12,7 +12,7 @@ import {
 import { githubCommitSchema, type GitHubReviewEventContext, type GitHubReviewPolicy } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 import { withGitHubPrimaryBlindingAdmission } from "./chat-github-primary-blinding-state.js";
-import { evictGithubBotRepositoryToken, githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
+import { githubBotRepositoryRequest, githubBotRepositoryToken } from "./chat-github-client.js";
 import { issueService } from "./issues.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { initializeGitHubReviewTaskTrust, githubReviewDeliveryTrust } from "./chat-github-task-trust.js";
@@ -132,28 +132,11 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     // never finish json()/text(), or ignore the signal altogether.
     return await Promise.race([cancelled, (async () => {
     captureDeadline.throwIfAborted();
-    // One token for the whole capture, reused across the PR read and the
-    // snapshot sweeps; a 401 evicts the cached entry and retries once with a
-    // fresh token, mirroring the review/check clients. `token` stays current
-    // so the repository artifact below never starts with a rejected token.
-    let token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
-    const request = async <T>(path: string): Promise<T> => {
-      try {
-        return await githubBotRequest<T>(boundedFetch, token, `/repos/${input.repository}${path}`);
-      } catch (error) {
-        const providerStatus = (
-          error as { details?: { providerStatus?: unknown } }
-        )?.details?.providerStatus;
-        if (providerStatus !== 401) throw error;
-        evictGithubBotRepositoryToken({
-          companyId: input.endpoint.companyId,
-          endpointId: input.endpoint.id,
-          repositoryId: input.repositoryId,
-        });
-        token = await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read");
-        return githubBotRequest<T>(boundedFetch, token, `/repos/${input.repository}${path}`);
-      }
-    };
+    // Every capture GitHub read routes through the shared helper, which reuses
+    // the cached installation token and retries once with a fresh token after
+    // a 401. One retry implementation, pinned by the helper's own tests.
+    const request = async <T>(path: string): Promise<T> =>
+      githubBotRepositoryRequest<T>(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, `/repos/${input.repository}${path}`, {}, boundedFetch, "read");
     const pr = await request<{
       title: string; body: string | null; draft: boolean;
       head: { sha: string }; base: { sha: string; ref: string };
@@ -181,8 +164,11 @@ export async function prepareGitHubPairEvent(db: Db, input: {
     // its own window, into the admission manifest; candidate dispatch waits for
     // it (bounded) and otherwise runs with workspace equivalence unverified.
     const producer = githubRepositoryArtifactProducer();
+    // Resolve from cache after the PR read, so a 401 retry above leaves the
+    // fresh token for the artifact: it never starts with a rejected token.
+    const artifactToken = producer ? await githubBotRepositoryToken(db, input.endpoint.companyId, input.endpoint.id, input.repositoryId, boundedFetch, "read") : "";
     if (producer) void startGitHubRepositoryArtifact({ repository: input.repository, pullNumber: event.pullNumber,
-      headSha: event.headSha, baseSha: event.baseSha, baseBranch: event.baseBranch, token, fetchImpl,
+      headSha: event.headSha, baseSha: event.baseSha, baseBranch: event.baseBranch, token: artifactToken, fetchImpl,
       signal: artifactAbort.signal }, { producer });
     const snapshot = await captureGitHubReviewSnapshot({ request: (path: string) => request(path) }, event,
       { login: input.endpoint.botUsername, appId: input.endpoint.botExternalId }, producer ? undefined : "repository_artifact_disabled");

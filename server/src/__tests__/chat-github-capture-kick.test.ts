@@ -11,10 +11,20 @@ import { captureGitHubReviewSnapshot, type GitHubReviewReader } from "../service
 vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({ getExperimental: async () => ({ githubReviewShadowEnabled: true }) }),
 }));
-vi.mock("../services/chat-github-client.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../services/chat-github-client.js")>(),
-  githubBotRepositoryToken: async () => "fixture-token",
-}));
+vi.mock("../services/chat-github-client.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/chat-github-client.js")>();
+  return {
+    ...original,
+    githubBotRepositoryToken: async () => "fixture-token",
+    // Shadow capture routes through the shared helper; keep the fixture token
+    // so these timing tests never touch credential resolution.
+    githubBotRepositoryRequest: async <T>(
+      _db: unknown, _companyId: string, _endpointId: string, _repositoryId: string,
+      path: string, options: Parameters<typeof original.githubBotRequest>[3] = {},
+      fetchImpl: typeof fetch = fetch,
+    ): Promise<T> => original.githubBotRequest<T>(fetchImpl, "fixture-token", path, options),
+  };
+});
 
 const ENV = ["PAPERCLIP_GITHUB_SHADOW_CAPTURE_WINDOW_MS", "PAPERCLIP_GITHUB_SHADOW_SNAPSHOT_BUDGET_MS"] as const;
 const saved = Object.fromEntries(ENV.map(name => [name, process.env[name]]));
