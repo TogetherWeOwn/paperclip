@@ -40,9 +40,12 @@ export function readRawConfigFile(): unknown {
 
 export function readConfigFile(): PaperclipConfig | null {
   const configPath = resolvePaperclipConfigPath();
+  if (!fs.existsSync(configPath)) return null;
   const raw = readConfigJson(configPath);
 
-  if (raw === null) return null;
+  // A parsed null (file literally contains `null`) must NOT be treated as a
+  // missing file: it falls through to schema validation below, which throws
+  // Invalid Paperclip config like any other non-object JSON value.
 
   try {
     const config = paperclipConfigSchema.parse(raw);
