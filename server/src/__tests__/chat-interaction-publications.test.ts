@@ -333,10 +333,20 @@ describeEmbeddedPostgres(
         select: db.select.bind(db),
         update: db.update.bind(db),
         insert: failTokens(db.insert.bind(db)),
-        transaction: callback => db.transaction(async tx => {
-          tx.insert = failTokens(tx.insert.bind(tx));
-          return callback(tx);
-        }),
+        transaction: (callback: (tx: any) => unknown) =>
+          db.transaction(async (tx: any) => {
+            tx.insert = failTokens(tx.insert.bind(tx));
+            // The guarded writers open a nested (savepoint) transaction of
+            // their own; propagate the failure into it so the token insert
+            // under test actually throws.
+            const nestedTransaction = tx.transaction.bind(tx);
+            tx.transaction = (nestedCallback: (savepoint: any) => unknown) =>
+              nestedTransaction(async (savepoint: any) => {
+                savepoint.insert = failTokens(savepoint.insert.bind(savepoint));
+                return nestedCallback(savepoint);
+              });
+            return callback(tx);
+          }),
       };
       await expect(enqueueIssueInteractionChatPublications(failingDb, interaction))
         .rejects.toThrow("Token write failed");
