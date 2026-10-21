@@ -527,6 +527,15 @@ describe("sanitizeGitHubDiagnosticText", () => {
     ["curl -uadmin:s3cr3tpass https://example.test/", "s3cr3tpass"],
     ["curl --user admin:s3cr3tpass https://example.test/", "s3cr3tpass"],
     ["curl --user=admin:s3cr3tpass https://example.test/", "s3cr3tpass"],
+    ["curl -su admin:S3cret! https://example.test/", "S3cret!"],
+    ["curl -sSuadmin:S3cret! https://example.test/", "S3cret!"],
+    ["curl -fsSLu admin:S3cret! https://example.test/", "S3cret!"],
+    ['["curl","-uadmin:S3cret!","https://example.test/"]', "S3cret!"],
+    ["curl '-uadmin:S3cret!' https://example.test/", "S3cret!"],
+    ["-uadmin:S3cret! https://example.test/", "S3cret!"],
+    ['curl -u "admin:my pass phrase" https://example.test/', "pass phrase"],
+    ["+ curl -fsSu svc:thirdPartyPw https://internal.example/", "thirdPartyPw"],
+    ["+ curl '-uadmin:my pass' https://internal.example/", "my pass"],
   ])("redacts %s", (input, secret) => {
     expect(sanitizeGitHubDiagnosticText(input, [])).not.toContain(secret);
   });

@@ -74,7 +74,8 @@ const ADD_MASK_PATTERN = /(::add-mask::)[^\r\n]*/gi;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi;
 const AUTHORIZATION_PATTERN = /\b(authorization\s*[:=]\s*)[^\r\n]+/gi;
 const URL_CREDENTIAL_PATTERN = /\b([a-z][a-z0-9+.-]{0,20}:\/\/)[^\s/@:]{1,200}:[^\s/@]{1,200}@/gi;
-const BASIC_AUTH_OPTION_PATTERN = /(\s(?:-u\s*|--user(?:=|\s+)))[^\s:]{1,200}:\S{1,200}/g;
+const BASIC_AUTH_QUOTED_FLAG_PATTERN = /(["'])(-[A-Za-z]{0,8}u\s*|--user=\s*)[^\s"':]{1,200}:[^"'\r\n]{1,200}\1/g;
+const BASIC_AUTH_OPTION_PATTERN = /(^|[^\w-])(-[A-Za-z]{0,8}u\s*|--user(?:=|\s+))(?:\"[^\r\n:\"]{1,200}:[^\r\n\"]{1,200}\"|'[^\r\n:']{1,200}:[^\r\n']{1,200}'|[^\s:\"']{1,200}:[^\s\"']{1,200})/g;
 const JSON_SECRET_FIELD_PATTERN = new RegExp(String.raw`(["']${SECRET_NAME}["']\s*:\s*)(["'])(?:\\.|(?!\2)[^\\\r\n])*\2?`, "gi");
 const CLI_SECRET_OPTION_PATTERN = new RegExp(String.raw`((?<![A-Za-z0-9_-])--?${SECRET_NAME}(?:=|\s+))(?:"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s"']+)`, "gi");
 const SECRET_ASSIGNMENT_PATTERN = new RegExp(String.raw`(${NAME_START}${SECRET_NAME}\s*[:=]\s*)(?:"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s,;"']+)`, "gi");
@@ -265,7 +266,8 @@ export function sanitizeGitHubDiagnosticText(
     .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
     .replace(AUTHORIZATION_PATTERN, `$1${REDACTED}`)
     .replace(URL_CREDENTIAL_PATTERN, `$1${REDACTED}@`)
-    .replace(BASIC_AUTH_OPTION_PATTERN, `$1${REDACTED}`)
+    .replace(BASIC_AUTH_QUOTED_FLAG_PATTERN, `$1$2${REDACTED}$1`)
+    .replace(BASIC_AUTH_OPTION_PATTERN, `$1$2${REDACTED}`)
     .replace(JSON_SECRET_FIELD_PATTERN, `$1$2${REDACTED}$2`)
     .replace(CLI_SECRET_OPTION_PATTERN, `$1${REDACTED}`)
     .replace(SECRET_ASSIGNMENT_PATTERN, `$1${REDACTED}`)
