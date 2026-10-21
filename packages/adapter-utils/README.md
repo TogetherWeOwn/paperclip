@@ -20,7 +20,11 @@ helpers in [`src/ssh.ts`](./src/ssh.ts):
 - `prepareWorkspaceForSshExecution({ spec, localDir, remoteDir })` — bundles
   the local cwd (tracked files, dirty edits, untracked additions, and the git
   history needed to reconstruct it) to `remoteDir` before the run starts. Runs
-  with no `git remote` configured.
+  with no `git remote` configured. Same-host targets instead seed from a
+  local shared mirror (`git clone --shared`, zero history bytes over the
+  wire) plus an overlay of only the files that differ from HEAD;
+  git-ignored files never transfer on that path.
+  `PAPERCLIP_SSH_INCREMENTAL_SYNC=0` forces the legacy full copy.
 - `restoreWorkspaceFromSshExecution({ spec, localDir, remoteDir, ... })` —
   syncs the remote cwd back into `localDir` after the run, including any new
   commits the agent created. Also runs with no `git remote` configured.

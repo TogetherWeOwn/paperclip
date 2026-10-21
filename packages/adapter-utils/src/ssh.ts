@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
@@ -17,6 +17,7 @@ import { shouldExcludePath } from "./exclude-patterns.js";
 import {
   SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
   SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES,
+  escapeTarExcludeLiteral,
   resolveSshTarFlavor,
   toSshTarExcludes,
   translateSshTarExcludes,
@@ -1794,13 +1795,410 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
+/** How a git-backed SSH workspace seed moved its bytes. */
+export type SshSeedMode =
+  /** Same-host fast path: history via `git clone --shared` from a local bare
+   * mirror (zero history bytes over the wire) plus an overlay tar of only the
+   * files that differ from HEAD. Git-ignored files never transfer. */
+  | "shared-mirror"
+  /** Legacy path: a full-history bundle plus a full-tree tar. */
+  | "full-copy";
+
+/**
+ * Kill switch for every incremental SSH sync optimization. Set
+ * `PAPERCLIP_SSH_INCREMENTAL_SYNC=0` to force the legacy full-copy behavior in
+ * both directions. Any other value (including unset) enables the fast paths.
+ */
+export function isSshIncrementalSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PAPERCLIP_SSH_INCREMENTAL_SYNC?.trim() !== "0";
+}
+
+/**
+ * Root directory for the local shared seed mirrors. A mirror is a bare
+ * object cache, safe to delete at any time: a missing mirror is rebuilt from
+ * the workspace on the next seed. Override with `PAPERCLIP_SSH_MIRROR_ROOT`
+ * (tests point it at a temp directory).
+ */
+export function resolveSshSeedMirrorRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.PAPERCLIP_SSH_MIRROR_ROOT?.trim();
+  if (raw) return raw;
+  return path.join(os.homedir(), ".cache", "paperclip", "ssh-seed-mirrors");
+}
+
+interface SshSeedMirrorInput {
+  mirrorPath: string;
+  /** Physical path of the workspace's shared object store (fetch source). */
+  commonDir: string;
+}
+
+/**
+ * Resolve the shared mirror for `localDir`, keyed by the physical path of its
+ * git common dir so sibling worktrees of one repo share one mirror. Returns
+ * null when the workspace is not a git checkout or the mirror would land
+ * inside the workspace itself (a misconfigured `PAPERCLIP_SSH_MIRROR_ROOT`
+ * must disable the fast path, not seed a repo into itself).
+ */
+async function readSshSeedMirrorInput(
+  localDir: string,
+  mirrorRoot: string = resolveSshSeedMirrorRoot(),
+): Promise<SshSeedMirrorInput | null> {
+  try {
+    const result = await runLocalGit(localDir, ["rev-parse", "--git-common-dir"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    const raw = result.stdout.trim();
+    if (!raw) return null;
+    const absolute = path.isAbsolute(raw) ? raw : path.resolve(localDir, raw);
+    const commonDir = await fs.realpath(absolute).catch(() => absolute);
+    const key = createHash("sha256").update(commonDir).digest("hex").slice(0, 32);
+    const mirrorPath = path.join(mirrorRoot, `${key}.git`);
+    const workspacePhysical = await fs.realpath(localDir).catch(() => path.resolve(localDir));
+    if (mirrorPath === workspacePhysical || mirrorPath.startsWith(`${workspacePhysical}${path.sep}`)) {
+      return null;
+    }
+    return { mirrorPath, commonDir };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create the shared mirror on first use and fetch the workspace's branches
+ * plus `headCommit` into it. Local disk only, incremental after the first
+ * fetch; concurrent runs may fetch together (git ref updates are atomic and
+ * last-writer-wins on mirror refs is harmless — the seed checks out an
+ * explicit SHA, never a mirror branch).
+ *
+ * The mirror is append-only by construction: `gc.auto` is disabled at init so
+ * fetched objects are never pruned, which keeps every `--shared` clone's
+ * alternates valid for the life of its run, even across branch force-pushes.
+ */
+async function ensureSshSeedMirror(input: SshSeedMirrorInput & { headCommit: string }): Promise<void> {
+  const initialized = await fs.stat(path.join(input.mirrorPath, "HEAD")).then(() => true, () => false);
+  if (!initialized) {
+    await execFileText("git", ["init", "--bare", "--quiet", input.mirrorPath], {
+      timeout: 30_000,
+      maxBuffer: 64 * 1024,
+    });
+    await execFileText("git", ["--git-dir", input.mirrorPath, "config", "gc.auto", "0"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+  } else {
+    // Idempotent: mirrors predating the gc.auto guard get it now.
+    await execFileText("git", ["--git-dir", input.mirrorPath, "config", "gc.auto", "0"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+  }
+  // A local-path fetch: only objects missing from the mirror are copied, and a
+  // bare SHA fetches detached-HEAD commits that no branch advertises.
+  await execFileText(
+    "git",
+    [
+      "--git-dir", input.mirrorPath,
+      "fetch", "--no-tags", "--quiet", "--force",
+      input.commonDir,
+      "+refs/heads/*:refs/heads/*",
+      input.headCommit,
+    ],
+    {
+      // First fetch copies the whole object store over local disk; generous.
+      timeout: 300_000,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+}
+
+/**
+ * Prove the SSH remote sees the same filesystem as this host: write a random
+ * secret to a nonce file under the workspace's runtime dir, read it back
+ * through the remote shell, and compare. Any failure — a different host, an
+ * unreadable path, a timeout — returns false and the caller falls back to the
+ * full copy. The nonce file is always removed locally.
+ *
+ * A path-exists check alone would be wrong: two different hosts can share a
+ * path string (e.g. `/home/user/paperclip`). Only the secret round-trip
+ * proves the remote `cat` read THIS host's bytes.
+ */
+async function verifySshSameFilesystem(
+  spec: SshConnectionConfig,
+  localDir: string,
+): Promise<boolean> {
+  const token = randomUUID();
+  const secret = randomUUID();
+  const filePath = path.join(localDir, ".paperclip-runtime", `ssh-same-host-${token}`);
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, secret, { mode: 0o600 });
+  } catch {
+    return false;
+  }
+  try {
+    const result = await runSshCommand(spec, `cat ${shellQuote(filePath)}`, {
+      timeoutMs: 15_000,
+      maxBuffer: 16 * 1024,
+    });
+    return result.stdout.trim() === secret;
+  } catch {
+    return false;
+  } finally {
+    await fs.rm(filePath, { force: true }).catch(() => undefined);
+  }
+}
+
+/** File selection for a mirror seed: the working-tree delta over HEAD. */
+interface SshSeedGitSnapshot {
+  headCommit: string;
+  branchName: string | null;
+  /** Tracked modifications plus untracked-but-not-ignored files. */
+  overlayPaths: string[];
+  deletedPaths: string[];
+  /** Git-ignored paths (`--directory`-collapsed), workspace-relative. */
+  ignoredPaths: string[];
+}
+
+function isSafeSeedRelativePath(value: string): boolean {
+  return Boolean(value) && !value.includes("\0") && !path.posix.isAbsolute(value) && !path.win32.isAbsolute(value) &&
+    !value.split(/[\\/]/).some((part) => part === ".." || part === ".");
+}
+
+function parseNulPathList(stdout: string): string[] {
+  return stdout.split("\0").map((entry) => entry.trim()).filter(Boolean).filter(isSafeSeedRelativePath);
+}
+
+/**
+ * Read the working-tree delta directly from git. Returns null for non-git
+ * directories, non-toplevel workspaces (a subdir of a checkout — overlay
+ * paths are toplevel-relative, so only a toplevel seed can stage them), and
+ * any git failure; every null falls back to the legacy full copy.
+ *
+ * Note: tracked files force-added under an ignored directory are listed by
+ * the overlay scan when modified (so the seed carries them) but hidden from
+ * the restore baseline by the ignored entry (so remote edits to them do not
+ * merge back). The same trade-off as the sandbox lane's ignore handling.
+ */
+async function readSshSeedGitSnapshot(localDir: string): Promise<SshSeedGitSnapshot | null> {
+  try {
+    const insideWorkTree = await runLocalGit(localDir, ["rev-parse", "--is-inside-work-tree"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    if (insideWorkTree.stdout.trim() !== "true") return null;
+    const toplevel = await runLocalGit(localDir, ["rev-parse", "--show-toplevel"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    const [workspacePhysical, toplevelPhysical] = await Promise.all([
+      fs.realpath(localDir).catch(() => path.resolve(localDir)),
+      fs.realpath(toplevel.stdout.trim()).catch(() => ""),
+    ]);
+    if (!toplevelPhysical || workspacePhysical !== toplevelPhysical) return null;
+
+    const [headResult, branchResult, overlayDiff, untracked, deleted, ignored] = await Promise.all([
+      runLocalGit(localDir, ["rev-parse", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
+      runLocalGit(localDir, ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 }),
+      runLocalGit(localDir, ["diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "HEAD", "--"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+      runLocalGit(localDir, ["ls-files", "--others", "--exclude-standard", "-z"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+      runLocalGit(localDir, ["diff", "--name-only", "-z", "--diff-filter=D", "HEAD", "--"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+      runLocalGit(localDir, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+    ]);
+    const headCommit = headResult.stdout.trim();
+    if (!headCommit) return null;
+    const branchName = branchResult.stdout.trim();
+    return {
+      headCommit,
+      branchName: branchName && branchName !== "HEAD" ? branchName : null,
+      overlayPaths: [
+        ...parseNulPathList(overlayDiff.stdout),
+        ...parseNulPathList(untracked.stdout),
+      ],
+      deletedPaths: parseNulPathList(deleted.stdout),
+      ignoredPaths: parseNulPathList(ignored.stdout).map((entry) => entry.replace(/\/+$/, "")).filter(Boolean),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Copy exactly `overlay` (workspace-relative paths from a seed snapshot) out
+ * of `sourceRoot` into an empty `targetDir`, creating parent directories.
+ * Files that vanish mid-copy are skipped — the remote checkout already holds
+ * the HEAD version, so the worst case is a briefly stale file, the same class
+ * of race as the legacy full-tree tar. Returns the staged file count.
+ */
+async function stageSshOverlayPaths(
+  sourceRoot: string,
+  overlay: readonly string[],
+  targetDir: string,
+): Promise<number> {
+  let count = 0;
+  for (const relative of overlay) {
+    if (!isSafeSeedRelativePath(relative)) continue;
+    const source = path.join(sourceRoot, relative);
+    const target = path.join(targetDir, relative);
+    const stats = await fs.lstat(source).catch(() => null);
+    if (!stats) continue;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.cp(source, target, {
+      recursive: stats.isDirectory() && !stats.isSymbolicLink(),
+      force: true,
+      preserveTimestamps: true,
+    });
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Seed a git workspace through the shared mirror. History arrives via a remote
+ * `git clone --shared` of the mirror (same filesystem, verified by the
+ * caller), so no history bytes cross the wire; the working tree is the HEAD
+ * checkout plus an overlay tar of exactly the snapshot's overlay paths.
+ * Returns the git-ignored paths so the caller can keep the restore baseline
+ * blind to the files this seed deliberately omits.
+ */
+async function seedGitWorkspaceToSshViaMirror(input: {
+  spec: SshRemoteExecutionSpec;
+  localDir: string;
+  remoteDir: string;
+  snapshot: SshSeedGitSnapshot;
+  mirror: SshSeedMirrorInput;
+  onProgress?: RuntimeProgressSink;
+}): Promise<string[]> {
+  await ensureSshSeedMirror({ ...input.mirror, headCommit: input.snapshot.headCommit });
+  const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
+
+  const remoteSetupScript = [
+    "set -e",
+    // Clone needs an absent or empty target: fresh per-run dirs satisfy this,
+    // and a retry over an existing checkout fails into the legacy import,
+    // which heals partial state. `git clone` creates the leaf but not its
+    // parents, hence the mkdir.
+    `mkdir -p ${shellQuote(input.remoteDir)}`,
+    `git clone --shared --no-checkout --quiet ${shellQuote(input.mirror.mirrorPath)} ${shellQuote(input.remoteDir)}`,
+    // Same origin/branch/reset/clean semantics as the bundle import below: the
+    // fast path changes the transport, not the resulting checkout.
+    ...(originUrl
+      ? [
+        `{ git -C ${shellQuote(input.remoteDir)} remote set-url origin ${shellQuote(originUrl)} >/dev/null 2>&1 || git -C ${shellQuote(input.remoteDir)} remote add origin ${shellQuote(originUrl)} >/dev/null 2>&1; } || true`,
+      ]
+      : []),
+    input.snapshot.branchName
+      ? `git -C ${shellQuote(input.remoteDir)} checkout --force -B ${shellQuote(input.snapshot.branchName)} ${shellQuote(input.snapshot.headCommit)} >/dev/null`
+      : `git -C ${shellQuote(input.remoteDir)} -c advice.detachedHead=false checkout --force --detach ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+    `git -C ${shellQuote(input.remoteDir)} reset --hard ${shellQuote(input.snapshot.headCommit)} >/dev/null`,
+    `git -C ${shellQuote(input.remoteDir)} clean -fdx -e .paperclip-runtime >/dev/null`,
+  ].join("\n");
+
+  // No history bytes cross the wire, but keep the phase's completion line so
+  // logs still show where the history came from (0 B = mirror, not bundle).
+  const historyProgress = input.onProgress
+    ? createTransferProgress({
+      onProgress: input.onProgress,
+      phase: "Importing git history",
+      direction: "to",
+      totalBytes: 0,
+      estimated: false,
+    })
+    : null;
+  try {
+    await runSshCommand(input.spec, remoteSetupScript, {
+      timeoutMs: 300_000,
+      maxBuffer: 256 * 1024,
+    });
+    await historyProgress?.finish();
+  } catch (error) {
+    await historyProgress?.fail();
+    throw error;
+  }
+
+  const overlayDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-overlay-"));
+  try {
+    const staged = await stageSshOverlayPaths(input.localDir, input.snapshot.overlayPaths, overlayDir);
+    if (staged > 0) {
+      await syncDirectoryToSsh({
+        spec: input.spec,
+        localDir: overlayDir,
+        remoteDir: input.remoteDir,
+        onProgress: input.onProgress,
+        progressLabel: "workspace",
+      });
+    }
+  } finally {
+    await fs.rm(overlayDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  await removeDeletedPathsOnSsh({
+    spec: input.spec,
+    remoteDir: input.remoteDir,
+    deletedPaths: input.snapshot.deletedPaths,
+  });
+
+  return input.snapshot.ignoredPaths;
+}
+
+/**
+ * Attempt the mirror seed. Returns the ignored paths on success, or null when
+ * the fast path is unavailable (cross-host remote, non-toplevel workspace, or
+ * an unreadable checkout) so the caller runs the legacy full copy instead. A
+ * throw means the fast path started and failed partway — the caller still
+ * falls back, since the legacy import heals any partial remote state
+ * (init-if-missing, forced checkout, hard reset, clean).
+ */
+async function trySeedGitWorkspaceViaMirror(input: {
+  spec: SshRemoteExecutionSpec;
+  localDir: string;
+  remoteDir: string;
+  onProgress?: RuntimeProgressSink;
+}): Promise<string[] | null> {
+  if (!(await verifySshSameFilesystem(input.spec, input.localDir))) return null;
+  const mirror = await readSshSeedMirrorInput(input.localDir);
+  if (!mirror) return null;
+  const snapshot = await readSshSeedGitSnapshot(input.localDir);
+  if (!snapshot) return null;
+  return await seedGitWorkspaceToSshViaMirror({ ...input, snapshot, mirror });
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
   remoteDir?: string;
   onProgress?: RuntimeProgressSink;
-}): Promise<{ gitBacked: boolean }> {
+}): Promise<{ gitBacked: boolean; seedMode: SshSeedMode; ignoredPaths?: string[] }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
+  if (isSshIncrementalSyncEnabled()) {
+    try {
+      const ignoredPaths = await trySeedGitWorkspaceViaMirror({
+        spec: input.spec,
+        localDir: input.localDir,
+        remoteDir,
+        onProgress: input.onProgress,
+      });
+      if (ignoredPaths) {
+        return { gitBacked: true, seedMode: "shared-mirror", ignoredPaths };
+      }
+    } catch (error) {
+      console.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "[paperclip] SSH mirror seed failed; falling back to full copy",
+      );
+    }
+  }
   const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
@@ -1824,7 +2222,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       remoteDir,
       deletedPaths: gitSnapshot.deletedPaths,
     });
-    return { gitBacked: true };
+    return { gitBacked: true, seedMode: "full-copy" };
   }
 
   await clearRemoteDirectory({
@@ -1840,7 +2238,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
-  return { gitBacked: false };
+  return { gitBacked: false, seedMode: "full-copy" };
 }
 
 export async function restoreWorkspaceFromSshExecution(input: {
@@ -1849,6 +2247,16 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  /**
+   * Git-ignored paths the seed deliberately omitted (from
+   * `prepareWorkspaceForSshExecution`). The caller also lists them in the
+   * baseline exclude so the merge stays blind to them; this copy lets the
+   * inner transfer prune them with root-anchored, glob-escaped patterns
+   * instead of the unanchored passthrough `toSshTarExcludes` gives
+   * non-scratch entries (an unanchored `nested` would also prune a tracked
+   * `src/nested/` from the sync-back).
+   */
+  ignoredPaths?: string[];
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -1856,6 +2264,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
     // The sync-back never carries the agent-local scratch, so the merge must
     // not read its absence as a remote deletion of the local copies.
     const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
+    const ignored = new Set(input.ignoredPaths ?? []);
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -1879,8 +2288,14 @@ export async function restoreWorkspaceFromSshExecution(input: {
         // agent-local scratch; `baseline` has it merged in, and tar needs the
         // scratch anchored to the root so this inner transfer (staging
         // directory into staging directory) carries neither nested worktrees
-        // nor build outputs, yet keeps nested source named like them.
-        exclude: toSshTarExcludes(baseline.exclude),
+        // nor build outputs, yet keeps nested source named like them. Omitted
+        // git-ignored entries get the same root anchoring (plus glob
+        // escaping, since they are repository-controlled names) for the same
+        // reason: an unanchored `nested` would also prune tracked
+        // `src/nested/` from the sync-back.
+        exclude: toSshTarExcludes(
+          baseline.exclude.map((entry) => ignored.has(entry) ? `./${escapeTarExcludeLiteral(entry)}` : entry),
+        ),
         onProgress: input.onProgress,
         progressLabel: "workspace",
       });
