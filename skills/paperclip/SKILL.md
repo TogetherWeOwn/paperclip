@@ -556,9 +556,11 @@ Exact response fields are documented in `skills/paperclip/references/api-referen
 scratch="${PAPERCLIP_RUN_SCRATCH_DIR:-$(mktemp -d)}"
 payload="$scratch/comment.json"
 jq -n --arg body "$comment" '{body: $body}' > "$payload"
-curl -sS -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+response=$(curl -sS -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
   -H 'X-Paperclip-Run-Id: '"$PAPERCLIP_RUN_ID" \
-  --data @"$payload" "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/comments"
+  -H 'Content-Type: application/json' \
+  --data-binary @"$payload" "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/comments")
+echo "$response" | jq -e --arg body "$comment" '.body == $body' > /dev/null
 ```
 
 ## Critical Rules

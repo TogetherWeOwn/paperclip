@@ -142,6 +142,49 @@ export function buildHeartbeatRunScratchEnv(
   return { env, tempKeysApplied };
 }
 
+export type HeartbeatRunScratchLocation = "local" | "remote";
+
+export interface HeartbeatRunScratchProvisionInput {
+  companyId: string;
+  agentId: string;
+  runId: string;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+  now?: Date;
+}
+
+export interface ProvisionedHeartbeatRunScratch {
+  scratch: HeartbeatRunScratch;
+  env: Record<string, string>;
+  tempKeysApplied: string[];
+  location: HeartbeatRunScratchLocation;
+}
+
+/**
+ * Dispatch-time wiring for per-run scratch: provision the run-unique directory
+ * for the execution target's location and build the env to merge into the
+ * adapter runtime env. Remote targets provision through the execution-target
+ * shell channel; local targets use the host filesystem. Throws on any
+ * provisioning failure — heartbeat dispatch catches that and continues without
+ * scratch env, for both locations.
+ */
+export async function provisionHeartbeatRunScratch(
+  location: HeartbeatRunScratchLocation,
+  input: HeartbeatRunScratchProvisionInput,
+  existingEnv: Record<string, unknown>,
+  deps: { exec: RemoteHeartbeatRunScratchExec },
+): Promise<ProvisionedHeartbeatRunScratch> {
+  const scratch =
+    location === "remote"
+      ? await prepareRemoteHeartbeatRunScratch(input, deps)
+      : await prepareHeartbeatRunScratch(input);
+  const { env, tempKeysApplied } = buildHeartbeatRunScratchEnv(
+    existingEnv,
+    scratch,
+  );
+  return { scratch, env, tempKeysApplied, location };
+}
+
 export async function cleanupHeartbeatRunScratch(input: {
   scratch: HeartbeatRunScratch;
   processGroupId?: number | null;

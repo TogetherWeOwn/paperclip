@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   buildHeartbeatRunScratchEnv,
   cleanupRemoteHeartbeatRunScratch,
   HEARTBEAT_RUN_SCRATCH_MARKER,
   type HeartbeatRunScratch,
   prepareRemoteHeartbeatRunScratch,
+  provisionHeartbeatRunScratch,
   type RemoteHeartbeatRunScratchExec,
   type RemoteHeartbeatRunScratchShellResult,
 } from "./run-scratch.js";
@@ -333,5 +336,109 @@ describe("remote heartbeat run scratch", () => {
     ).rejects.toThrow(
       /Could not remove the remote heartbeat run scratch directory/,
     );
+  });
+});
+
+describe("provisionHeartbeatRunScratch dispatch wiring", () => {
+  const localDirs = new Set<string>();
+
+  afterEach(async () => {
+    await Promise.all(
+      Array.from(localDirs, (dir) =>
+        fs.rm(dir, { recursive: true, force: true }).catch(() => undefined),
+      ),
+    );
+    localDirs.clear();
+  });
+
+  it("provisions remote scratch through the shell channel with the full run env", async () => {
+    const shell = new FakeRemoteShell();
+
+    const first = await provisionHeartbeatRunScratch(
+      "remote",
+      provisionInput({ runId: "run-aaa" }),
+      {},
+      { exec: shell.exec },
+    );
+    const second = await provisionHeartbeatRunScratch(
+      "remote",
+      provisionInput({ runId: "run-bbb" }),
+      {},
+      { exec: shell.exec },
+    );
+
+    expect(first.location).toBe("remote");
+    expect(first.scratch.dir).not.toBe(second.scratch.dir);
+    expect(first.env.PAPERCLIP_RUN_SCRATCH_DIR).toBe(first.scratch.dir);
+    expect(first.env.PAPERCLIP_TASK_SCRATCH_DIR).toBe(first.scratch.dir);
+    expect(first.env.PAPERCLIP_SCRATCH_DIR).toBe(first.scratch.dir);
+    expect(first.env.PAPERCLIP_TMPDIR).toBe(first.scratch.dir);
+    expect(first.env.TMPDIR).toBe(first.scratch.dir);
+    expect(first.tempKeysApplied).toEqual(["TMPDIR", "TEMP", "TMP"]);
+    expect(
+      shell.commands.filter((command) => command.startsWith("mktemp -d")),
+    ).toHaveLength(2);
+  });
+
+  it("throws on remote provisioning failure so dispatch continues without scratch env", async () => {
+    const shell = new FakeRemoteShell();
+    shell.failNext = {
+      prefix: "mktemp -d",
+      exitCode: 1,
+      stderr: "mktemp: failed",
+    };
+
+    await expect(
+      provisionHeartbeatRunScratch(
+        "remote",
+        provisionInput(),
+        {},
+        { exec: shell.exec },
+      ),
+    ).rejects.toThrow(
+      /Could not create the remote heartbeat run scratch directory/,
+    );
+  });
+
+  it("provisions local scratch on the host filesystem with the full run env", async () => {
+    const shell = new FakeRemoteShell();
+
+    const provisioned = await provisionHeartbeatRunScratch(
+      "local",
+      provisionInput(),
+      {},
+      { exec: shell.exec },
+    );
+    localDirs.add(provisioned.scratch.dir);
+
+    expect(provisioned.location).toBe("local");
+    expect(provisioned.scratch.dir.startsWith(`${os.tmpdir()}/`)).toBe(true);
+    expect(provisioned.env.PAPERCLIP_RUN_SCRATCH_DIR).toBe(
+      provisioned.scratch.dir,
+    );
+    expect(provisioned.env.PAPERCLIP_TMPDIR).toBe(provisioned.scratch.dir);
+    await expect(
+      fs.stat(provisioned.scratch.markerPath),
+    ).resolves.toMatchObject({
+      isDirectory: expect.any(Function),
+    });
+    // Local provisioning never touches the remote shell channel.
+    expect(shell.commands).toEqual([]);
+  });
+
+  it("preserves pre-set temp keys instead of overriding them", async () => {
+    const shell = new FakeRemoteShell();
+
+    const provisioned = await provisionHeartbeatRunScratch(
+      "remote",
+      provisionInput(),
+      { TMPDIR: "/custom-tmp", TEMP: "", TMP: "   " },
+      { exec: shell.exec },
+    );
+
+    expect(provisioned.env.TMPDIR).toBeUndefined();
+    expect(provisioned.env.TEMP).toBe(provisioned.scratch.dir);
+    expect(provisioned.env.TMP).toBe(provisioned.scratch.dir);
+    expect(provisioned.tempKeysApplied).toEqual(["TEMP", "TMP"]);
   });
 });
