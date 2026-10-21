@@ -258,6 +258,7 @@ jobs:
           base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_ref" --jq '.object.sha')"
           [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::current base branch has no valid commit SHA"; exit 1; }
           git cat-file -e "$base_sha^{commit}" 2>/dev/null || git fetch --no-tags origin "$base_sha"
+          echo "ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "::notice title=PR base::checking against $base_ref at $base_sha (event base $EVENT_BASE_SHA)"
 
@@ -301,9 +302,13 @@ jobs:
       # other same-repo PR can productively use one. A fork can reuse the same
       # branch name, so the exemption below also requires the PR head to live
       # in this repository.
+      # Deploy release lines must keep a frozen-installable lockfile
+      # (Dockerfile deps stage). Allow reviewed lockfile-only repair PRs on
+      # deploy/* bases so a stale hash on a release line can be fixed lawfully.
       - name: Block manual lockfile edits
         if: >-
           github.event.pull_request.user.login != 'dependabot[bot]' &&
+          !startsWith(steps.base.outputs.ref, 'deploy/') &&
           (
             github.event.pull_request.head.repo.full_name != github.repository ||
             (
