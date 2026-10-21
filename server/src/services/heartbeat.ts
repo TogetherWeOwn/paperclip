@@ -390,6 +390,20 @@ import {
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
 import {
+  CHILD_STOP_RELAY_ACTOR_ID,
+  CHILD_STOP_RELAY_WAKE_SOURCE,
+  COMMENT_WAKE_SUPPRESSED_WAKE_REASON,
+  NON_COMMENT_NEW_INPUT_ACTIVITY_ACTIONS,
+  evaluateAutomationCommentSkip,
+  evaluateCommentWakeDebounce,
+  evaluateRecentRunGuard,
+  findActionableCommentMarkers,
+  isAutomationCommentAuthor,
+  isCommentWakeSuppressionCandidate,
+  readCommentWakeSuppressionConfig,
+} from "./comment-wake-suppression.js";
+import { recordWakeSuppressedBestEffort } from "./wake-suppression-metrics.js";
+import {
   logActivity,
   publishPluginDomainEvent,
   type LogActivityInput,
@@ -29465,6 +29479,221 @@ export function heartbeatService(
             }
             // admission.kind === "proceed": no active run absorbed this wake,
             // so fall through to the ordinary queue path below.
+          }
+
+          // Comment-wake suppression: no live run holds the lock, so this
+          // wake would start a fresh adapter session. Bot/automation comment
+          // bursts (PR-controller notes, age alerts, receipts) are the top
+          // no-op wake source; skip them before the event-free throttle
+          // below. Human comments, reopens, resumes, review-path recovery,
+          // liveness continuations, child stop-relay notifications, and
+          // interaction continuations always pass through.
+          const suppressionConfig = readCommentWakeSuppressionConfig(runtimeEnv);
+          const suppressionPayload = (payload ?? {}) as Record<string, unknown>;
+          if (
+            suppressionConfig.enabled &&
+            isCommentWakeSuppressionCandidate({
+              reason,
+              mutation: suppressionPayload.mutation,
+              wakeCommentId: wakeCommentId ?? null,
+              allowRunCoalescing: opts.allowRunCoalescing,
+              forceFreshSession:
+                enrichedContextSnapshot.forceFreshSession === true,
+              hasResumeIntent:
+                suppressionPayload.resumeIntent === true ||
+                enrichedContextSnapshot.resumeIntent === true,
+              hasExplicitResume: Boolean(explicitResumeSession),
+              hasReviewPathLost: suppressionPayload.reviewPathLost === true,
+              hasReopenedFrom: suppressionPayload.reopenedFrom !== undefined &&
+                suppressionPayload.reopenedFrom !== null,
+              hasInterruptedRunId:
+                suppressionPayload.interruptedRunId !== undefined &&
+                suppressionPayload.interruptedRunId !== null,
+              // A liveness continuation is deliberate recovery (e.g. the
+              // quarantined low-trust handoff), never chatter.
+              hasLivenessContinuation:
+                (typeof enrichedContextSnapshot.livenessContinuationState === "string" &&
+                  enrichedContextSnapshot.livenessContinuationState.length > 0) ||
+                typeof enrichedContextSnapshot.livenessContinuationAttempt === "number",
+              // The child stop-relay comment matches no actionable marker;
+              // key the bypass on its first-party provenance instead.
+              hasStopRelay:
+                opts.requestedByActorId === CHILD_STOP_RELAY_ACTOR_ID ||
+                enrichedContextSnapshot.source === CHILD_STOP_RELAY_WAKE_SOURCE,
+            }) &&
+            wakeCommentId
+          ) {
+            const triggerCommentRows = await tx
+              .select({
+                id: issueComments.id,
+                authorType: issueComments.authorType,
+                authorAgentId: issueComments.authorAgentId,
+                createdByRunId: issueComments.createdByRunId,
+                body: issueComments.body,
+                deletedAt: issueComments.deletedAt,
+              })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.companyId, issue.companyId),
+                  eq(issueComments.issueId, issue.id),
+                  eq(issueComments.id, wakeCommentId),
+                ),
+              )
+              .limit(1);
+            // A missing or deleted triggering comment fails open: wake. So
+            // does a comment that does not belong to the wake's issue.
+            const triggerComment = triggerCommentRows[0] ?? null;
+            if (triggerComment && !triggerComment.deletedAt) {
+              const suppressionMarkers = findActionableCommentMarkers(
+                triggerComment.body,
+              );
+              const triggerIsAutomationAuthor = isAutomationCommentAuthor({
+                authorType: triggerComment.authorType,
+                authorAgentId: triggerComment.authorAgentId,
+                createdByRunId: triggerComment.createdByRunId,
+              });
+              const suppressionRequestedByActorType =
+                opts.requestedByActorType ?? null;
+              let suppressionDecision = evaluateAutomationCommentSkip({
+                isAutomationAuthor: triggerIsAutomationAuthor,
+                requestedByActorType: suppressionRequestedByActorType,
+                markers: suppressionMarkers,
+              });
+              // Rules 2 and 3 need the last finished run; rule 1 (markerless
+              // automation) short-circuits without further reads. Human and
+              // user-requested wakes skip the reads: the evaluators admit
+              // them unconditionally, even when the comment carries markers.
+              if (
+                !suppressionDecision.suppress &&
+                suppressionMarkers.length > 0 &&
+                triggerIsAutomationAuthor &&
+                suppressionRequestedByActorType !== "user"
+              ) {
+                const suppressionNowMs = Date.now();
+                const lastRunRows = await tx
+                  .select({
+                    id: heartbeatRuns.id,
+                    status: heartbeatRuns.status,
+                    finishedAt: heartbeatRuns.finishedAt,
+                  })
+                  .from(heartbeatRuns)
+                  .where(
+                    and(
+                      eq(heartbeatRuns.companyId, agent.companyId),
+                      eq(heartbeatRuns.agentId, agentId),
+                      sql`${heartbeatRuns.finishedAt} is not null`,
+                      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                    ),
+                  )
+                  .orderBy(desc(heartbeatRuns.finishedAt))
+                  .limit(1);
+                const lastRun = lastRunRows[0] ?? null;
+                const lastRunFinishedAt = lastRun?.finishedAt ?? null;
+                if (lastRunFinishedAt) {
+                  const humanCommentSinceRows = await tx
+                    .select({ id: issueComments.id })
+                    .from(issueComments)
+                    .where(
+                      and(
+                        eq(issueComments.companyId, issue.companyId),
+                        eq(issueComments.issueId, issue.id),
+                        gt(issueComments.createdAt, lastRunFinishedAt),
+                        ne(issueComments.id, wakeCommentId),
+                        isNull(issueComments.deletedAt),
+                        or(
+                          eq(issueComments.authorType, "user"),
+                          and(
+                            isNull(issueComments.authorType),
+                            isNull(issueComments.authorAgentId),
+                            isNull(issueComments.createdByRunId),
+                          ),
+                        ),
+                      ),
+                    )
+                    .limit(1);
+                  const hasHumanCommentSinceLastFinish =
+                    humanCommentSinceRows.length > 0;
+                  const lastRunSucceeded = lastRun?.status === "succeeded";
+                  suppressionDecision = evaluateCommentWakeDebounce({
+                    nowMs: suppressionNowMs,
+                    isAutomationAuthor: triggerIsAutomationAuthor,
+                    requestedByActorType: suppressionRequestedByActorType,
+                    lastRunFinishedAtMs: lastRunFinishedAt.getTime(),
+                    lastRunSucceeded,
+                    debounceMs: suppressionConfig.debounceMs,
+                    hasHumanCommentSinceLastFinish,
+                  });
+                  if (!suppressionDecision.suppress) {
+                    const nonCommentInputRows = lastRunSucceeded
+                      ? await tx
+                        .select({ id: activityLog.id })
+                        .from(activityLog)
+                        .where(
+                          and(
+                            eq(activityLog.companyId, agent.companyId),
+                            eq(activityLog.entityType, "issue"),
+                            eq(activityLog.entityId, issue.id),
+                            gt(activityLog.createdAt, lastRunFinishedAt),
+                            inArray(activityLog.action, [
+                              ...NON_COMMENT_NEW_INPUT_ACTIVITY_ACTIONS,
+                            ]),
+                          ),
+                        )
+                        .limit(1)
+                      : [];
+                    suppressionDecision = evaluateRecentRunGuard({
+                      nowMs: suppressionNowMs,
+                      isAutomationAuthor: triggerIsAutomationAuthor,
+                      requestedByActorType: suppressionRequestedByActorType,
+                      lastRunFinishedAtMs: lastRunFinishedAt.getTime(),
+                      lastRunSucceeded,
+                      guardMs: suppressionConfig.recentRunGuardMs,
+                      hasChangesSinceLastFinish:
+                        hasHumanCommentSinceLastFinish ||
+                        nonCommentInputRows.length > 0,
+                    });
+                  }
+                }
+              }
+              if (suppressionDecision.suppress) {
+                const suppressionNow = new Date();
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: COMMENT_WAKE_SUPPRESSED_WAKE_REASON,
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId,
+                    wakeSuppression: {
+                      reason: suppressionDecision.reason,
+                      requestedReason: reason,
+                      wakeCommentId,
+                      authorType: triggerComment.authorType ?? null,
+                      markers: suppressionMarkers,
+                      ...suppressionDecision.detail,
+                      suppressedAt: suppressionNow.toISOString(),
+                    },
+                  },
+                  status: "skipped",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                  finishedAt: suppressionNow,
+                });
+                // Best-effort counter (`wakes_suppressed_total{reason}`): never
+                // await the metric on the wake path and never fail the wake.
+                void recordWakeSuppressedBestEffort(db, {
+                  companyId: agent.companyId,
+                  reason: suppressionDecision.reason,
+                  at: suppressionNow,
+                });
+                return { kind: "skipped" as const };
+              }
+            }
           }
 
           // PAP-13775: no live run holds the lock, so this wake would start a
