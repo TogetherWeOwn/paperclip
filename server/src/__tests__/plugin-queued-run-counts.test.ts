@@ -1,16 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents,
-  companies,
-  createDb,
-  heartbeatRuns,
-} from "@paperclipai/db";
-import { buildHostServices } from "../services/plugin-host-services.js";
-import { pluginCapabilityValidator } from "../services/plugin-capability-validator.js";
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { createHostClientHandlers } from "../../../packages/plugins/sdk/src/host-client-factory.js";
 import { PLUGIN_RPC_ERROR_CODES } from "../../../packages/plugins/sdk/src/protocol.js";
+import { pluginCapabilityValidator } from "../services/plugin-capability-validator.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -35,13 +38,19 @@ describe("agents.getQueuedRunCounts capability gating", () => {
   const validator = pluginCapabilityValidator();
 
   it("denies the operation without agents.queued_counts.read (standard 403)", () => {
-    const result = validator.checkOperation(manifestWithCapabilities([]), "agents.getQueuedRunCounts");
+    const result = validator.checkOperation(
+      manifestWithCapabilities([]),
+      "agents.getQueuedRunCounts",
+    );
     expect(result.allowed).toBe(false);
     expect(result.missing).toEqual(["agents.queued_counts.read"]);
 
     const err = (() => {
       try {
-        validator.assertOperation(manifestWithCapabilities([]), "agents.getQueuedRunCounts");
+        validator.assertOperation(
+          manifestWithCapabilities([]),
+          "agents.getQueuedRunCounts",
+        );
       } catch (e) {
         return e;
       }
@@ -51,24 +60,39 @@ describe("agents.getQueuedRunCounts capability gating", () => {
   });
 
   it("is NOT satisfied by agents.read alone (no bundling)", () => {
-    const manifest = manifestWithCapabilities(["agents.read", "issues.read", "events.subscribe"]);
-    const result = validator.checkOperation(manifest, "agents.getQueuedRunCounts");
+    const manifest = manifestWithCapabilities([
+      "agents.read",
+      "issues.read",
+      "events.subscribe",
+    ]);
+    const result = validator.checkOperation(
+      manifest,
+      "agents.getQueuedRunCounts",
+    );
     expect(result.allowed).toBe(false);
     expect(result.missing).toEqual(["agents.queued_counts.read"]);
-    expect(() => validator.assertOperation(manifest, "agents.getQueuedRunCounts")).toThrowError(
-      expect.objectContaining({ status: 403 }),
-    );
+    expect(() =>
+      validator.assertOperation(manifest, "agents.getQueuedRunCounts"),
+    ).toThrowError(expect.objectContaining({ status: 403 }));
   });
 
   it("allows the operation with agents.queued_counts.read", () => {
-    const manifest = manifestWithCapabilities(["agents.read", "agents.queued_counts.read"]);
-    const result = validator.checkOperation(manifest, "agents.getQueuedRunCounts");
-    expect(result.allowed).toBe(true);
-    expect(result.missing).toEqual([]);
-    expect(() => validator.assertOperation(manifest, "agents.getQueuedRunCounts")).not.toThrow();
-    expect(validator.getRequiredCapabilities("agents.getQueuedRunCounts")).toEqual([
+    const manifest = manifestWithCapabilities([
+      "agents.read",
       "agents.queued_counts.read",
     ]);
+    const result = validator.checkOperation(
+      manifest,
+      "agents.getQueuedRunCounts",
+    );
+    expect(result.allowed).toBe(true);
+    expect(result.missing).toEqual([]);
+    expect(() =>
+      validator.assertOperation(manifest, "agents.getQueuedRunCounts"),
+    ).not.toThrow();
+    expect(
+      validator.getRequiredCapabilities("agents.getQueuedRunCounts"),
+    ).toEqual(["agents.queued_counts.read"]);
   });
 
   it("rejects bridge calls without the capability and never reaches the service", async () => {
@@ -89,7 +113,9 @@ describe("agents.getQueuedRunCounts capability gating", () => {
   });
 
   it("routes bridge calls to the service with the capability declared", async () => {
-    const getQueuedRunCounts = vi.fn().mockResolvedValue([{ agentId: "agent-1", queued: 2 }]);
+    const getQueuedRunCounts = vi
+      .fn()
+      .mockResolvedValue([{ agentId: "agent-1", queued: 2 }]);
     const handlers = createHostClientHandlers({
       pluginId: "queued-counts-plugin",
       capabilities: ["agents.queued_counts.read"],
@@ -123,7 +149,9 @@ function issuePrefix(id: string) {
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported
+  ? describe
+  : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -133,10 +161,14 @@ if (!embeddedPostgresSupport.supported) {
 
 describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
   let db!: ReturnType<typeof createDb>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let tempDb: Awaited<
+    ReturnType<typeof startEmbeddedPostgresTestDatabase>
+  > | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-queued-counts-");
+    tempDb = await startEmbeddedPostgresTestDatabase(
+      "paperclip-plugin-queued-counts-",
+    );
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
@@ -186,7 +218,12 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
   }
 
   function services() {
-    return buildHostServices(db, "plugin-record-id", "paperclip.queued-counts-test", createEventBusStub());
+    return buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.queued-counts-test",
+      createEventBusStub(),
+    );
   }
 
   function byAgentId(rows: Array<{ agentId: string; queued: number }>) {
@@ -241,9 +278,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
 
     const svc = services();
     try {
-      await expect(svc.agents.getQueuedRunCounts({ companyId })).resolves.toEqual([
-        { agentId, queued: 2 },
-      ]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId }),
+      ).resolves.toEqual([{ agentId, queued: 2 }]);
     } finally {
       svc.dispose();
     }
@@ -262,12 +299,12 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
 
     const svc = services();
     try {
-      await expect(svc.agents.getQueuedRunCounts({ companyId: companyA })).resolves.toEqual([
-        { agentId: agentA, queued: 2 },
-      ]);
-      await expect(svc.agents.getQueuedRunCounts({ companyId: companyB })).resolves.toEqual([
-        { agentId: agentB, queued: 3 },
-      ]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId: companyA }),
+      ).resolves.toEqual([{ agentId: agentA, queued: 2 }]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId: companyB }),
+      ).resolves.toEqual([{ agentId: agentB, queued: 3 }]);
     } finally {
       svc.dispose();
     }
@@ -284,9 +321,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
 
     const svc = services();
     try {
-      await expect(svc.agents.getQueuedRunCounts({ companyId: companyA })).resolves.toEqual([
-        { agentId: agentA, queued: 1 },
-      ]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId: companyA }),
+      ).resolves.toEqual([{ agentId: agentA, queued: 1 }]);
     } finally {
       svc.dispose();
     }
@@ -299,9 +336,13 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
 
     const svc = services();
     try {
-      await expect(svc.agents.getQueuedRunCounts({ companyId: randomUUID() })).resolves.toEqual([]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId: randomUUID() }),
+      ).resolves.toEqual([]);
       const emptyCompany = await seedCompany("Empty");
-      await expect(svc.agents.getQueuedRunCounts({ companyId: emptyCompany })).resolves.toEqual([]);
+      await expect(
+        svc.agents.getQueuedRunCounts({ companyId: emptyCompany }),
+      ).resolves.toEqual([]);
     } finally {
       svc.dispose();
     }
@@ -314,7 +355,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
       const svc = services();
       try {
         await expect(
-          svc.agents.getQueuedRunCounts({ companyId: companyId as unknown as string }),
+          svc.agents.getQueuedRunCounts({
+            companyId: companyId as unknown as string,
+          }),
         ).rejects.toThrow("companyId is required for this operation");
         expect(selectSpy).not.toHaveBeenCalled();
       } finally {
@@ -356,7 +399,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
     try {
       const rows = await svc.agents.getQueuedRunCounts({ companyId });
       expect(rows).toHaveLength(121);
-      expect(new Set(rows.map((row) => row.agentId))).toEqual(new Set(agentIds));
+      expect(new Set(rows.map((row) => row.agentId))).toEqual(
+        new Set(agentIds),
+      );
       for (const row of rows) {
         expect(row).toEqual({ agentId: row.agentId, queued: 1 });
       }
@@ -376,7 +421,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
         );
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toBe("Failed to read queued run counts");
-      expect((err as Error).message).not.toMatch(/uuid|syntax|postgres|pg-|22P02/i);
+      expect((err as Error).message).not.toMatch(
+        /uuid|syntax|postgres|pg-|22P02/i,
+      );
     } finally {
       svc.dispose();
     }
@@ -394,7 +441,9 @@ describeEmbeddedPostgres("agents.getQueuedRunCounts host aggregate", () => {
 
     const svc = services();
     try {
-      const rowsA = await svc.agents.getQueuedRunCounts({ companyId: companyA });
+      const rowsA = await svc.agents.getQueuedRunCounts({
+        companyId: companyA,
+      });
       expect(rowsA).toEqual([{ agentId: agentA, queued: 1 }]);
       expect(rowsA[0]?.agentId).not.toBe(agentB);
     } finally {
