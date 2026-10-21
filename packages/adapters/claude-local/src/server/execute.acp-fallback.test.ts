@@ -100,7 +100,7 @@ describe("claude_local ACP startup fallback", () => {
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
 
-  it("trusts the Paperclip API URL when network access is allowlisted", async () => {
+  it.runIf(process.platform === "linux")("confines the child through the allowlist proxy when network access is allowlisted", async () => {
     const paperclipApiUrl = "http://127.0.0.1:4310";
     vi.stubEnv("PAPERCLIP_API_URL", paperclipApiUrl);
     const ctx = buildContext({ engine: "cli", networkScope: "allowlist" });
@@ -108,18 +108,30 @@ describe("claude_local ACP startup fallback", () => {
     await execute(ctx as never);
 
     expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
-    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledWith(
-      expect.any(String),
-      null,
-      expect.any(String),
-      expect.any(Array),
-      expect.objectContaining({
-        localProcessSandbox: expect.objectContaining({
-          networkScope: "allowlist",
-          networkTrustedUrls: [paperclipApiUrl],
-        }),
-      }),
-    );
+    const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [
+      string,
+      unknown,
+      string,
+      string[],
+      { localProcessSandbox: unknown; env: Record<string, string> },
+    ];
+    const command = call[2];
+    const args = call[3];
+    const opts = call[4];
+    // The sandbox resolves before the spawn boundary: argv already carries
+    // bwrap --unshare-net, and no second wrap is requested downstream.
+    expect(command).toBe("bwrap");
+    expect(args).toContain("--unshare-net");
+    expect(opts.localProcessSandbox).toBeNull();
+    expect(opts.env.HTTP_PROXY).toBe("http://127.0.0.1:31337");
+    expect(opts.env.HTTPS_PROXY).toBe("http://127.0.0.1:31337");
+    // Trusted-URL behavior (the API URL is proxied, others denied) is pinned
+    // at the builder level by T7.1/T7.2; the spawn here only carries the shape.
+  });
+
+  it.runIf(process.platform !== "linux")("refuses allowlisted local runs where Bubblewrap is unavailable", async () => {
+    const ctx = buildContext({ engine: "cli", networkScope: "allowlist" });
+    await expect(execute(ctx as never)).rejects.toThrow("supported only on Linux");
   });
 
   it("keeps explicit ACP strict when startup fails", async () => {

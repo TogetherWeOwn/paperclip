@@ -55,6 +55,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
+  buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
@@ -163,6 +164,50 @@ function isBedrockAuth(env: Record<string, string>): boolean {
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     hasNonEmptyEnvValue(env, "ANTHROPIC_BEDROCK_BASE_URL")
   );
+}
+
+// Default egress bound for legacy/local CLI runs without an
+// explicit networkScope: the CLI's default model provider plus narrow GitHub
+// origins for agent git/gh work. PAPERCLIP_API_URL and managed MCP origins
+// travel via networkTrustedUrls. These entries apply ONLY to the new unset
+// default — an explicit networkScope="allowlist" keeps exact current semantics
+// (operator entries + trusted URLs), so approved policies never widen silently.
+const DEFAULT_LEGACY_NETWORK_ALLOWLIST_ENTRIES = [
+  "api.anthropic.com",
+  "github.com",
+  "api.github.com",
+] as const;
+
+function resolveProviderOriginAllowlistEntry(rawBaseUrl: string, envKey: string): string {
+  try {
+    const parsed = new URL(rawBaseUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("protocol");
+    if (!parsed.hostname) throw new Error("hostname");
+    return parsed.origin;
+  } catch {
+    throw new Error(
+      `${envKey} must be an absolute HTTP(S) URL so the default egress allowlist can trust the provider origin.`,
+    );
+  }
+}
+
+function resolveDefaultLegacyNetworkAllowlistEntries(env: Record<string, string>): string[] {
+  const entries: string[] = [...DEFAULT_LEGACY_NETWORK_ALLOWLIST_ENTRIES];
+  const anthropicBaseUrl = env.ANTHROPIC_BASE_URL?.trim();
+  if (anthropicBaseUrl) {
+    entries.push(resolveProviderOriginAllowlistEntry(anthropicBaseUrl, "ANTHROPIC_BASE_URL"));
+  }
+  const bedrockBaseUrl = env.ANTHROPIC_BEDROCK_BASE_URL?.trim();
+  if (bedrockBaseUrl) {
+    entries.push(resolveProviderOriginAllowlistEntry(bedrockBaseUrl, "ANTHROPIC_BEDROCK_BASE_URL"));
+  } else if (isBedrockAuth(env)) {
+    // Bedrock without an explicit base URL uses the region-scoped runtime
+    // endpoint; trust it so default runs keep working. Vertex-default and
+    // other implicit endpoints stay operator-configured via networkAllowlist.
+    const region = (env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? "").trim();
+    if (region) entries.push(`bedrock-runtime.${region}.amazonaws.com`);
+  }
+  return entries;
 }
 
 function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
@@ -592,7 +637,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
-  const networkScope = parseLocalProcessNetworkScope(config.networkScope);
+  const explicitNetworkScope = parseLocalProcessNetworkScope(config.networkScope);
+  // Legacy/local CLI runs default to the required egress
+  // allowlist instead of open networking. Explicit "deny"/"allowlist" keeps
+  // exact current semantics; only the unset default changes. Remote targets
+  // never take the local-process sandbox (see the execution-target gate below).
+  const networkScope = explicitNetworkScope ?? (!executionTargetIsRemote ? "allowlist" : null);
+  const networkScopeIsDefault = networkScope !== null && explicitNetworkScope === null;
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
   const localProcessSandbox: LocalProcessSandboxOptions | null =
     (filesystemScope || networkScope) && !executionTargetIsRemote
@@ -608,7 +659,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
           networkScope,
-          networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
+          networkAllowlist: [
+            ...parseLocalProcessNetworkAllowlist(config.networkAllowlist),
+            ...(networkScopeIsDefault ? resolveDefaultLegacyNetworkAllowlistEntries(env) : []),
+          ],
           networkTrustedUrls: [
             env.PAPERCLIP_API_URL,
             ...runtimeMcpServers.map((server) => server.url),
@@ -623,7 +677,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       .join(" and ");
     await onLog(
       "stdout",
-      `[paperclip] Confining Claude with ${scopes} scope.\n`,
+      `[paperclip] Confining Claude with ${scopes} scope${networkScopeIsDefault ? " (networkScope defaulted to allowlist)" : ""}.\n`,
     );
   }
   const useManagedRemoteClaudeConfig =
@@ -1038,24 +1092,65 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-      cwd,
-      env,
-      stdin: prompt,
-      timeoutSec,
-      graceSec,
-      onSpawn,
-      onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
-      runLogTail: paperclipBridge?.runLogTail,
-      settleRunDisposition: paperclipBridge?.settleRunDisposition,
-      terminalResultCleanup: {
-        graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
-      },
-      localProcessSandbox,
-      inheritServerEnv: !isolateRuntime,
-    });
+    // Resolve the sandbox spawn target BEFORE the spawn
+    // boundary so the confined argv (bwrap --unshare-net ...) is structural:
+    // every local attempt observes it, including the T7.5 acceptance pin which
+    // intercepts runChildProcess. Resolution here is intentionally lenient
+    // about PATH lookup (no bwrap/claude availability check): availability is
+    // enforced at real-spawn time by resolveSpawnTarget/spawn ENOENT, while
+    // mocked/CI environments without bwrap still observe the confined shape.
+    // The pre-resolved lane passes localProcessSandbox: null onward so the
+    // child is never wrapped twice. Cleanup runs per attempt in the finally
+    // below, matching the lifecycle runChildProcess gives sandbox options.
+    const sandboxResolution = localProcessSandbox
+      ? await buildLocalProcessSandboxSpawnTarget({
+          executable: command,
+          args,
+          cwd,
+          options: localProcessSandbox,
+        })
+      : null;
+    // sandboxResolution.env carries `undefined` for proxy keys the sandbox
+    // removes (networkScope="deny"). Pass them through untouched:
+    // runChildProcess deletes undefined-valued keys AFTER merging the server
+    // env, so a server-set HTTP_PROXY cannot leak into a deny-scoped child.
+    // The cast is safe for exactly that reason.
+    const attemptEnv = sandboxResolution
+      ? ({
+          ...env,
+          ...(localProcessSandbox?.homeDir ? { HOME: localProcessSandbox.homeDir } : null),
+          ...sandboxResolution.env,
+        } as Record<string, string>)
+      : env;
+    let proc: Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+    try {
+      proc = await runAdapterExecutionTargetProcess(
+        runId,
+        runtimeExecutionTarget,
+        sandboxResolution?.command ?? command,
+        sandboxResolution?.args ?? args,
+        {
+          cwd: sandboxResolution?.cwd ?? cwd,
+          env: attemptEnv,
+          stdin: prompt,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog,
+          runLogTail: paperclipBridge?.runLogTail,
+          settleRunDisposition: paperclipBridge?.settleRunDisposition,
+          terminalResultCleanup: {
+            graceMs: terminalResultCleanupGraceMs,
+            hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+          },
+          localProcessSandbox: null,
+          inheritServerEnv: !isolateRuntime,
+        },
+      );
+    } finally {
+      await sandboxResolution?.cleanup?.();
+    }
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
