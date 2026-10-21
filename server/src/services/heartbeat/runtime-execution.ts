@@ -736,13 +736,20 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             }
           : {}),
       };
-      const runtimeTools = createAdapterRuntimeToolAccess({
-        agentId: agent.id,
-        companyId: agent.companyId,
-        runId: run.id,
-        responsibleUserId: run.responsibleUserId,
-      });
-      if (!runtimeTools) {
+      // An isolated codex run (adapterConfig.isolateRuntime) is handed no MCP
+      // gateway and no run token, so none is minted for it.
+      const isolatedRuntime =
+        agent.adapterType === "codex_local" &&
+        parseObject(runtimeConfig).isolateRuntime === true;
+      const runtimeTools = isolatedRuntime
+        ? undefined
+        : createAdapterRuntimeToolAccess({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            runId: run.id,
+            responsibleUserId: run.responsibleUserId,
+          });
+      if (!runtimeTools && !isolatedRuntime) {
         logger.warn(
           {
             companyId: agent.companyId,
@@ -752,11 +759,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           "runtime connection tools could not be delivered",
         );
       }
-      const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
-        db,
-        agent,
-        runId: run.id,
-      });
+      const runtimeMcpServers = isolatedRuntime
+        ? []
+        : await buildPaperclipRuntimeMcpServers({
+            db,
+            agent,
+            runId: run.id,
+          });
       const runtimeToolDelivery =
         adapter.runtimeToolDelivery ?? "invocation_context";
       if (runtimeTools && runtimeToolDelivery === "native_mcp") {
@@ -767,7 +776,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           connectionId: "paperclip-runtime-tools",
         });
       }
-      if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+      if (!isolatedRuntime && authToken && configuredPaperclipApiBaseUrl() && issueRef) {
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
       }
@@ -775,14 +784,16 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {
         adapterContext.paperclipRuntimeTools = runtimeTools;
       }
-      const managedMcpConfig = await createManagedMcpRunConfig({
-        db,
-        agent,
-        runId: run.id,
-        config: runtimeConfig,
-        projectId: issueRef?.projectId ?? null,
-        issueId: issueRef?.id ?? null,
-      });
+      const managedMcpConfig = isolatedRuntime
+        ? null
+        : await createManagedMcpRunConfig({
+            db,
+            agent,
+            runId: run.id,
+            config: runtimeConfig,
+            projectId: issueRef?.projectId ?? null,
+            issueId: issueRef?.id ?? null,
+          });
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
@@ -867,7 +878,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   startedAt: meta.startedAt,
                 });
               },
-              authToken: authToken ?? undefined,
+              authToken: isolatedRuntime ? undefined : authToken ?? undefined,
             }));
           },
         );

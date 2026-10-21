@@ -107,3 +107,16 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+it("permits model-decision waits only with explicit evidence that provider work never started", () => {
+  const waiting = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "model_decision_pending", scheduledRetryAttempt: 3,
+    resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } },
+  };
+  expect(legacyExecutionNeedsReconciliation(waiting)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {
+    executionRecovery: { kind: "model_decision_pending", providerWorkStarted: true },
+  } })).toBe(true);
+});

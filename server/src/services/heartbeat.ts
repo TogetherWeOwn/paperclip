@@ -495,11 +495,20 @@ import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
+  mergeIssueAdapterConfigOverrides,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceMode,
   selectEnvironmentExecutionWorkspaceSettings,
 } from "./execution-workspace-policy.js";
+import { pluginRegistryService } from "./plugin-registry.js";
+import { toBoundedReapReceipt } from "./budget-receipt.js";
+import {
+  applyRunModelDecisionToAdapterConfig,
+  isRunModelDecisionDeferral,
+  RunModelDecisionDeferral,
+  type RunModelDecideAnswer,
+} from "./run-model-decision.js";
 import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
@@ -932,6 +941,15 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export {
+  derivePresentationWakeProvenance,
+  isMonitorOnlyIssueUpdateDetails,
+  PRESENTATION_MONITOR_HOUSEKEEPING_ACTIONS,
+  PRESENTATION_MONITOR_ONLY_UPDATE_KEYS,
+  readPresentationRunMadeIssueProgress,
+  type PresentationProgressInput,
+  type PresentationWakeProvenance,
+} from "./heartbeat/presentation-progress.js";
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -1929,6 +1947,7 @@ export function heartbeatService(
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+    pluginWorkerManager: options.pluginWorkerManager,
   });
 
   async function executeRun(
@@ -2377,6 +2396,36 @@ export function heartbeatService(
           : null;
       const experimentalInstanceSettings =
         await instanceSettings.getExperimental();
+      // TOG-11792: the model router decides this run's model before the
+      // adapter config merge and before any workspace or provider work. With
+      // `requireRunModelDecision` off the answer is only recorded (advisory).
+      const modelDecision = await runCompletion.resolveModelDecisionForRun({
+        run,
+        agent,
+        context,
+        issueId,
+        issueContext,
+        issueOverrideModel: readNonEmptyString(
+          issueAssigneeOverrides?.adapterConfig?.model,
+        ),
+        requireDecision: experimentalInstanceSettings.requireRunModelDecision,
+      });
+      context.modelDecision = modelDecision.record;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ modelDecision: modelDecision.record })}::jsonb`,
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+      if (modelDecision.action === "park") {
+        throw new RunModelDecisionDeferral({
+          retryAfterMs: modelDecision.retryAfterMs,
+          reason: modelDecision.reason,
+          record: modelDecision.record,
+        });
+      }
+      const decidedModel: RunModelDecideAnswer | null =
+        modelDecision.answer?.kind === "decide" ? modelDecision.answer : null;
       const isolatedWorkspacesEnabled =
         experimentalInstanceSettings.enableIsolatedWorkspaces;
       // Inert on its own: the operator default only reaches the resolver when
@@ -3058,9 +3107,21 @@ export function heartbeatService(
         legacyUseProjectWorkspace:
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
+      // TOG-11791: merge override `env` per key so a pin that sets one key
+      // keeps the base credentials it omits. All other keys keep shallow
+      // replace semantics. Router-managed keys are stripped from the override
+      // first (upstream router mode), then the remainder merges per-key.
+      const overrideMergedConfig = mergeIssueAdapterConfigOverrides(
+        workspaceManagedConfig,
+        Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
+      );
+      // TOG-11792: the router's decision is run-scoped and lands before secret
+      // resolution; its env keys were validated against the manifest
+      // allowlist and the base config's secret bindings.
       const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
+        ...(decidedModel
+          ? applyRunModelDecisionToAdapterConfig(overrideMergedConfig, decidedModel)
+          : overrideMergedConfig),
         ...(requestedAiBinding?.mode === "router" ? parseObject(parseObject(context.aiRouterSelection).runtimeConfig) : {}),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
@@ -4430,6 +4491,7 @@ export function heartbeatService(
           run,
           agent,
           nativeRuntimeResolution,
+          decidedModel,
           task: {
             issueRef,
             issueContext,
@@ -4486,6 +4548,15 @@ export function heartbeatService(
         });
         if (!runtimeSelection.selected) return;
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
+        // isolateRuntime is applied by the legacy codex adapter. The native runner
+        // would run the agent without it, so refuse rather than silently widen.
+        if (
+          nativeRuntimeResolution.kind === "native" &&
+          agent.adapterType === "codex_local" &&
+          parseObject(agent.adapterConfig).isolateRuntime === true
+        ) {
+          throw new Error("isolate_runtime_unsupported_on_native_runtime");
+        }
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
         const execution = await executeHeartbeatRuntime(db, {
           run, agent, options,
@@ -4857,6 +4928,17 @@ export function heartbeatService(
             );
           },
         );
+      } else if (isRunModelDecisionDeferral(outerErr)) {
+        // TOG-11792: no model decision yet. The run never starts on the
+        // default; park it as a bounded `model_decision_pending` retry.
+        await runCompletion.finalizeRunModelDecisionDeferral(run, outerErr).catch(
+          (deferralErr) => {
+            logger.error(
+              { err: deferralErr, runId },
+              "failed to finalize model-decision deferral",
+            );
+          },
+        );
       } else {
         await runCompletion.failRunSetup({
           run, runId, outerErr, identityRedactor, readFailureReportSecrets,
@@ -4969,6 +5051,61 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // Run-end reap of router async invocations. Never throws: lookup
+          // and call failures are logged, orphans linger to TTL. Company
+          // scope is mandatory (worker throws without it). Success emits a
+          // bounded receipt (counts only); no result payload passthrough.
+          try {
+            const manager = options.pluginWorkerManager;
+            if (manager && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+              const routerRow = await pluginRegistryService(db)
+                .getByKey("togetherweown.paperclip-model-router")
+                .catch(() => null);
+              if (routerRow) {
+                await manager
+                  .call(
+                    routerRow.id,
+                    "performAction",
+                    {
+                      key: "cancel-run-invocations",
+                      params: { runId: run.id },
+                      actorContext: {
+                        type: "system",
+                        userId: null,
+                        agentId: null,
+                        runId: run.id,
+                        companyId: run.companyId,
+                      },
+                    },
+                    10_000,
+                  )
+                  .then((reapResult) => {
+                    const receipt = toBoundedReapReceipt(reapResult);
+                    logger.info(
+                      {
+                        runId: run.id,
+                        cancelled: receipt.cancelled,
+                        alreadyTerminal: receipt.alreadyTerminal,
+                        failed: receipt.failed,
+                        unshaped: receipt.unshaped,
+                      },
+                      "router run-end reap completed",
+                    );
+                  })
+                  .catch((reapErr) => {
+                    logger.warn(
+                      { err: reapErr, runId: run.id },
+                      "router run-end reap failed; orphans linger to TTL",
+                    );
+                  });
+              }
+            }
+          } catch (reapLookupErr) {
+            logger.warn(
+              { err: reapLookupErr, runId: run.id },
+              "router run-end reap lookup failed; orphans linger to TTL",
+            );
+          }
         }
         if (
           runScratch &&

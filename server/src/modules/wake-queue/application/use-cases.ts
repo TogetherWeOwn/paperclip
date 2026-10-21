@@ -328,6 +328,28 @@ async function promoteDeferredWake(
   input: ReleaseIssueExecutionInput,
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
+  // A queued reopen reason describes the task when the comment was posted,
+  // not authority to discard a review completed since then. Explicit resumes
+  // and independent interaction continuations still retain their authority.
+  if (
+    currentIssue.status === "done" &&
+    !workingCandidate.authorizedFailedChatRetry &&
+    !workingCandidate.preservesIndependentContinuation &&
+    workingCandidate.deferredContextSeed.resumeIntent !== true &&
+    await ports.transaction.isCommentWakeCoveredByCompletedReview({
+      companyId: run.companyId,
+      issueId: currentIssue.id,
+      commentIds: [...new Set([...workingCandidate.deferredCommentIds, ...workingCandidate.queuedCommentIds])],
+    })
+  ) {
+    await ports.transaction.cancelDeferredWake({
+      companyId: run.companyId,
+      wakeId: workingCandidate.id,
+      reason: "Deferred comment already covered by completed native review",
+      now: input.now,
+    });
+    return null;
+  }
   let shouldReopen = false;
   if (
     !workingCandidate.authorizedFailedChatRetry &&

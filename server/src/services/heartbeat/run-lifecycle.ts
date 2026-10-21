@@ -1301,6 +1301,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
+      modelDecision: parseObject(run.contextSnapshot).modelDecision ?? null,
     });
   }
 
@@ -1316,6 +1317,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     issueId: string | null;
     startedAt: Date | null;
     finishedAt: Date | null;
+    /**
+     * TOG-11792 `contextSnapshot.modelDecision`. `agent.run.started` fires at
+     * claim, before the hook runs, so only later lifecycle events carry it.
+     */
+    modelDecision?: unknown;
   }) {
     const eventType =
       run.status === "running"
@@ -1350,6 +1356,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         finishedAt: run.finishedAt
           ? new Date(run.finishedAt).toISOString()
           : null,
+        ...(run.modelDecision ? { modelDecision: run.modelDecision } : {}),
       },
     });
   }

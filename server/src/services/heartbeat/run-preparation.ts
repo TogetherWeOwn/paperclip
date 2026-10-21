@@ -2574,6 +2574,12 @@ export async function buildPaperclipWakePayload(input: {
     issueDescriptionTruncated ||
     planReviewContext?.truncated === true ||
     documentReviewContext?.truncated === true;
+  const continuationEnvelope = parseObject(
+    input.contextSnapshot.executionContinuation,
+  );
+  const continuationTruncated =
+    continuationEnvelope.truncated === true ||
+    continuationEnvelope.fallbackFetchNeeded === true;
   const recoveryActionId = readNonEmptyString(
     input.contextSnapshot.recoveryActionId,
   );
@@ -2800,8 +2806,11 @@ export async function buildPaperclipWakePayload(input: {
       includedCount: comments.length,
       missingCount: missingCommentCount,
     },
-    truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    truncated: payloadTruncated || continuationTruncated,
+    fallbackFetchNeeded:
+      payloadTruncated ||
+      continuationTruncated ||
+      missingCommentCount > 0,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -2814,6 +2823,19 @@ export async function buildPaperclipWakePayload(input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export function isManualUserRun(input: {
+  contextSnapshot: Record<string, unknown>;
+  requestedByActorType?: "user" | "agent" | "system" | null;
+  source?: WakeupOptions["source"] | null;
+  triggerDetail?: WakeupOptions["triggerDetail"] | null;
+}) {
+  if (input.requestedByActorType !== "user") return false;
+  const wakeReason = readNonEmptyString(input.contextSnapshot.wakeReason);
+  if (wakeReason && ISSUE_RESPONSIBLE_USER_WAKE_REASONS.has(wakeReason))
+    return false;
+  return input.source === "on_demand" || input.triggerDetail === "manual";
 }
 
 /** Issue context and responsible-user resolution bound to one service database. */
@@ -2861,8 +2883,15 @@ export function createHeartbeatRunPreparation(db: Db) {
     return byCompany;
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(
+    companyId: string,
+    issueId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    return queryDb
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
@@ -2889,6 +2918,7 @@ export function createHeartbeatRunPreparation(db: Db) {
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
@@ -2975,6 +3005,10 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (
       !issueContext ||
@@ -2985,7 +3019,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await queryDb
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -3002,7 +3036,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await queryDb
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -3031,7 +3065,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       }
     }
 
-    const routine = await db
+    const routine = await queryDb
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -3052,8 +3086,14 @@ export function createHeartbeatRunPreparation(db: Db) {
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(
+    companyId: string,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the reads reuse the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
+  ) {
+    const company = await queryDb
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -3063,7 +3103,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -3079,7 +3119,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await queryDb
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -3098,9 +3138,13 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    // TOG-9736: callers inside the wake issue-lock transaction pass `tx` so
+    // the read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    queryDb: Pick<Db, "select"> = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await queryDb
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -3109,19 +3153,6 @@ export function createHeartbeatRunPreparation(db: Db) {
       .where(and(eq(issues.companyId, companyId), eq(issues.id, parentId)))
       .then((rows) => rows[0] ?? null);
     return parent?.responsibleUserId ?? null;
-  }
-
-  function isManualUserRun(input: {
-    contextSnapshot: Record<string, unknown>;
-    requestedByActorType?: "user" | "agent" | "system" | null;
-    source?: WakeupOptions["source"] | null;
-    triggerDetail?: WakeupOptions["triggerDetail"] | null;
-  }) {
-    if (input.requestedByActorType !== "user") return false;
-    const wakeReason = readNonEmptyString(input.contextSnapshot.wakeReason);
-    if (wakeReason && ISSUE_RESPONSIBLE_USER_WAKE_REASONS.has(wakeReason))
-      return false;
-    return input.source === "on_demand" || input.triggerDetail === "manual";
   }
 
   async function resolveResponsibleUserIdForRunSeed(input: {
@@ -3136,7 +3167,12 @@ export function createHeartbeatRunPreparation(db: Db) {
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
+    // TOG-9736: the wake issue-lock transaction passes `tx` so the reads
+    // reuse the transaction's connection instead of acquiring a second pooled
+    // connection (pool deadlock at saturation).
+    queryDb?: Pick<Db, "select">;
   }) {
+    const queryDb = input.queryDb ?? db;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -3156,7 +3192,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await queryDb
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -3181,7 +3217,7 @@ export function createHeartbeatRunPreparation(db: Db) {
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await queryDb
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -3203,11 +3239,12 @@ export function createHeartbeatRunPreparation(db: Db) {
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      queryDb,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, queryDb);
   }
 
   async function resolveResponsibleUserIdForRun(input: {

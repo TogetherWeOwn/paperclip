@@ -2410,7 +2410,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // session read reuses the transaction's connection instead of acquiring a
+    // second pooled connection (pool deadlock at saturation).
+    const resolveHasResolvablePriorSessionWorkspace = async (
+      queryDb?: Pick<Db, "select">,
+    ) => {
       if (hasResolvablePriorSessionWorkspace !== null)
         return hasResolvablePriorSessionWorkspace;
       hasResolvablePriorSessionWorkspace = issueId
@@ -2419,6 +2424,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             contextSnapshot: enrichedContextSnapshot,
             taskKey: effectiveTaskKey,
             explicitResumeSession,
+            queryDb,
           })
         : false;
       return hasResolvablePriorSessionWorkspace;
@@ -2487,15 +2493,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    // TOG-9736: the wake issue-lock transaction calls this with `tx` so the
+    // responsible-user reads reuse the transaction's connection instead of
+    // acquiring a second pooled connection (pool deadlock at saturation). The
+    // pre-lock call sites pass nothing and keep the pooled `db` behavior.
+    const resolveQueuedResponsibleUserId = (queryDb?: Pick<Db, "select">) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, queryDb)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          queryDb,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
@@ -2507,6 +2518,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             requestedByActorId: opts.requestedByActorId ?? null,
             source,
             triggerDetail,
+            queryDb,
           });
         if (!queuedResponsibleUserId) {
           throw new HttpError(
@@ -3549,8 +3561,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 issue.executionWorkspacePreference,
               existingExecutionWorkspaceStatus,
             });
+            // TOG-9736: pass tx so the inner task-session read reuses the
+            // transaction's connection (nested-pool deadlock at saturation).
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await resolveHasResolvablePriorSessionWorkspace(tx);
 
             if (
               isUnrunnableWorktreeCombo({
@@ -4032,7 +4046,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              // TOG-9736: pass tx so the responsible-user reads reuse the
+              // transaction's connection (nested-pool deadlock at saturation).
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -4306,7 +4322,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           invocationSource: source,
           triggerDetail,
           status: "queued",
-          responsibleUserId: await resolveQueuedResponsibleUserId(),
+          // TOG-9736: pass tx so the responsible-user reads reuse the
+          // transaction's connection (nested-pool deadlock at saturation).
+          responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
