@@ -10,6 +10,7 @@ import {
   provisionHeartbeatRunScratch,
   type RemoteHeartbeatRunScratchExec,
   type RemoteHeartbeatRunScratchShellResult,
+  resolveHeartbeatRunScratchLocation,
 } from "./run-scratch.js";
 
 /**
@@ -339,7 +340,7 @@ describe("remote heartbeat run scratch", () => {
   });
 });
 
-describe("provisionHeartbeatRunScratch dispatch wiring", () => {
+describe("provisionHeartbeatRunScratch target-kind dispatch", () => {
   const localDirs = new Set<string>();
 
   afterEach(async () => {
@@ -440,5 +441,32 @@ describe("provisionHeartbeatRunScratch dispatch wiring", () => {
     expect(provisioned.env.TEMP).toBe(provisioned.scratch.dir);
     expect(provisioned.env.TMP).toBe(provisioned.scratch.dir);
     expect(provisioned.tempKeysApplied).toEqual(["TEMP", "TMP"]);
+  });
+
+  it("provisions local scratch when no execution target is set", async () => {
+    const shell = new FakeRemoteShell();
+
+    const provisioned = await provisionHeartbeatRunScratch(
+      null,
+      provisionInput(),
+      {},
+      { exec: shell.exec },
+    );
+    localDirs.add(provisioned.scratch.dir);
+
+    expect(provisioned.location).toBe("local");
+    expect(provisioned.scratch.dir.startsWith(`${os.tmpdir()}/`)).toBe(true);
+    expect(provisioned.env.PAPERCLIP_RUN_SCRATCH_DIR).toBe(
+      provisioned.scratch.dir,
+    );
+    // A missing target never touches the remote shell channel.
+    expect(shell.commands).toEqual([]);
+  });
+
+  it("derives the scratch location from the target kind alone", () => {
+    expect(resolveHeartbeatRunScratchLocation(null)).toBe("local");
+    expect(resolveHeartbeatRunScratchLocation(undefined)).toBe("local");
+    expect(resolveHeartbeatRunScratchLocation("local")).toBe("local");
+    expect(resolveHeartbeatRunScratchLocation("remote")).toBe("remote");
   });
 });

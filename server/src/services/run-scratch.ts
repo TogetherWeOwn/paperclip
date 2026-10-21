@@ -161,19 +161,36 @@ export interface ProvisionedHeartbeatRunScratch {
 }
 
 /**
- * Dispatch-time wiring for per-run scratch: provision the run-unique directory
- * for the execution target's location and build the env to merge into the
- * adapter runtime env. Remote targets provision through the execution-target
- * shell channel; local targets use the host filesystem. Throws on any
- * provisioning failure — heartbeat dispatch catches that and continues without
- * scratch env, for both locations.
+ * Derive the scratch location from an execution target's kind. A missing
+ * target (and an explicitly local one) provisions on the Paperclip host
+ * filesystem; a remote target (SSH/sandbox) provisions on the target itself
+ * through the execution-target shell channel. This is the single tested
+ * decision point for location: dispatch passes the target kind through and
+ * uses this same resolver for its failure logging, so no untested glue
+ * condition in the caller can invert or hardcode the location.
+ */
+export function resolveHeartbeatRunScratchLocation(
+  targetKind: "local" | "remote" | null | undefined,
+): HeartbeatRunScratchLocation {
+  return targetKind === "remote" ? "remote" : "local";
+}
+
+/**
+ * Dispatch-time wiring for per-run scratch: derive the location from the
+ * execution target's kind, provision the run-unique directory there, and
+ * build the env to merge into the adapter runtime env. Remote targets
+ * provision through the execution-target shell channel; local targets use
+ * the host filesystem. Throws on any provisioning failure — heartbeat
+ * dispatch catches that and continues without scratch env, for both
+ * locations.
  */
 export async function provisionHeartbeatRunScratch(
-  location: HeartbeatRunScratchLocation,
+  targetKind: "local" | "remote" | null | undefined,
   input: HeartbeatRunScratchProvisionInput,
   existingEnv: Record<string, unknown>,
   deps: { exec: RemoteHeartbeatRunScratchExec },
 ): Promise<ProvisionedHeartbeatRunScratch> {
+  const location = resolveHeartbeatRunScratchLocation(targetKind);
   const scratch =
     location === "remote"
       ? await prepareRemoteHeartbeatRunScratch(input, deps)

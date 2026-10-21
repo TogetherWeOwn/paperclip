@@ -11,10 +11,13 @@ import { describe, expect, it } from "vitest";
 // executed unit tests against a fake remote shell
 // (server/src/services/run-scratch-remote.test.ts); this source-contract
 // test pins the heartbeat call sites the same way
-// heartbeat-router-run-end-reap.test.ts does: dispatch provisions scratch
-// through the extracted unit with a location derived from the target kind,
-// terminal cleanup runs for remote targets above the native-session guard,
-// and cleanup precedes the environment lease release.
+// heartbeat-router-run-end-reap.test.ts does: dispatch passes the execution
+// target kind straight through to the extracted unit (which owns the
+// kind-to-location decision — covered by executed unit tests, so no glue
+// condition here can invert or hardcode the location), reuses the same
+// resolver for its failure log line, terminal cleanup runs for remote
+// targets above the native-session guard, and cleanup precedes the
+// environment lease release.
 const here = dirname(fileURLToPath(import.meta.url));
 const heartbeatSrc = readFileSync(
   join(here, "../services/heartbeat.ts"),
@@ -23,6 +26,14 @@ const heartbeatSrc = readFileSync(
 
 const REMOTE_CLEANUP_CALL = "cleanupRemoteHeartbeatRunScratch(";
 const REMOTE_KIND_CHECK = 'runScratchTarget?.kind === "remote"';
+const SCRATCH_KIND_PASSTHROUGH =
+  "const scratchTargetKind = executionTarget?.kind ?? null;";
+const SCRATCH_LOG_LOCATION =
+  "resolveHeartbeatRunScratchLocation(scratchTargetKind)";
+const PROVISION_FIRST_ARG = [
+  "const provisionedScratch = await provisionHeartbeatRunScratch(",
+  "          scratchTargetKind,",
+].join("\n");
 const MAIN_NATIVE_GUARD = [
   "if (",
   "          !nativeSessionResumeScheduled &&",
@@ -40,9 +51,13 @@ function teardownRegion(): string {
 }
 
 describe("heartbeat remote run scratch wiring", () => {
-  it("dispatches scratch provisioning through the extracted unit with a location derived from the target kind", () => {
-    expect(heartbeatSrc).toContain("provisionHeartbeatRunScratch(");
-    expect(heartbeatSrc).toContain('? "local" : "remote"');
+  it("passes the execution target kind straight through to the provision unit", () => {
+    // The kind-to-location decision lives in the tested unit: these pins
+    // fail if dispatch hardcodes the kind, re-derives the location inline,
+    // or stops merging the provisioned env.
+    expect(heartbeatSrc).toContain(SCRATCH_KIND_PASSTHROUGH);
+    expect(heartbeatSrc).toContain(SCRATCH_LOG_LOCATION);
+    expect(heartbeatSrc).toContain(PROVISION_FIRST_ARG);
     expect(heartbeatSrc).toContain("provisionedScratch.env");
     expect(heartbeatSrc).toContain(
       "Remote scratch provisioning requires a remote execution target.",

@@ -457,6 +457,7 @@ import {
   cleanupHeartbeatRunScratch,
   cleanupRemoteHeartbeatRunScratch,
   provisionHeartbeatRunScratch,
+  resolveHeartbeatRunScratchLocation,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
@@ -23387,12 +23388,15 @@ export function heartbeatService(
       // execution-target shell channel, local targets use the host
       // filesystem. Without the remote dir, agents fall back to fixed /tmp
       // payload paths on hosts whose /tmp is shared across runs and days.
-      const scratchLocation =
-        !executionTarget || executionTarget.kind === "local" ? "local" : "remote";
+      // The kind passes straight through to the provision unit, which owns
+      // the kind-to-location decision (tested there); this site only reuses
+      // the same resolver for its failure log line.
+      const scratchTargetKind = executionTarget?.kind ?? null;
+      const scratchLocation = resolveHeartbeatRunScratchLocation(scratchTargetKind);
       try {
         const existingRuntimeEnv = parseObject(runtimeConfig.env);
         const provisionedScratch = await provisionHeartbeatRunScratch(
-          scratchLocation,
+          scratchTargetKind,
           {
             companyId: agent.companyId,
             agentId: agent.id,
