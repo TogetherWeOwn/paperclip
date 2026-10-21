@@ -123,6 +123,38 @@ describe("parseFileLoggingConfig", () => {
     ).toBe("/tmp/explicit-logs");
   });
 
+  it("ignores the schema-default logDir when the config omits logging.logDir", () => {
+    // Regression: readConfigFile returns the zod-parsed config, whose logDir
+    // always carries the schema default (~/.paperclip/instances/default/logs
+    // under the OS home), so an omitted logDir overrode the
+    // PAPERCLIP_HOME/instance-aware default and landed logs off the retained
+    // volume (shared across instances when homes coincide).
+    const dir = tempDir();
+    const home = path.join(dir, "paperclip-home");
+    const configPath = path.join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        $meta: {
+          version: 1,
+          updatedAt: new Date().toISOString(),
+          source: "onboard",
+        },
+        database: {},
+        logging: { mode: "file" },
+        server: {},
+        telemetry: {},
+      }),
+    );
+    vi.stubEnv("PAPERCLIP_CONFIG", configPath);
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "prod2");
+    expect(parseFileLoggingConfig({}).dir).toBe(resolveDefaultLogsDir());
+    expect(parseFileLoggingConfig({}).dir).toBe(
+      path.join(home, "instances", "prod2", "logs"),
+    );
+  });
+
   it("ignores an unreadable config file instead of breaking logging setup", () => {
     const dir = tempDir();
     const badPath = path.join(dir, "config.json");

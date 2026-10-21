@@ -16,7 +16,7 @@
 // behavior the server relies on). Anything that fails during setup degrades
 // to stdout-only logging; logging must never break request serving.
 
-import { readConfigFile } from "../config-file.js";
+import { readRawConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { RotatingFileSink } from "./rotating-file-sink.js";
 
@@ -76,19 +76,31 @@ function parsePositiveInt(
 }
 
 /**
- * The operator's configured log dir (onboarding "Log directory" prompt,
- * stored as `logging.logDir`), or null when there is no config file, the
- * file is unreadable, or no dir is configured. Never throws and never warns:
- * the server's own config load stays authoritative for validity errors, and
- * logging setup must never break serving.
+ * The operator's explicitly configured log dir (onboarding "Log directory"
+ * prompt, stored as `logging.logDir`), or null when there is no config file,
+ * the file is unreadable, or no dir was explicitly configured. Reads the raw
+ * (pre-validation) config: the zod schema fills a hardcoded default-instance
+ * logDir, which must not override the PAPERCLIP_HOME/instance-aware default.
+ * logging.logDir is a plain string in the schema, so an explicitly set value
+ * needs no further validation. Never throws and never warns: the server's
+ * own config load stays authoritative for validity errors, and logging setup
+ * must never break serving.
  */
 function configFileLogDir(): string | null {
-  let logDir: unknown;
+  let raw: unknown;
   try {
-    logDir = readConfigFile()?.logging.logDir;
+    raw = readRawConfigFile();
   } catch {
     return null;
   }
+  const logging =
+    typeof raw === "object" && raw !== null
+      ? (raw as Record<string, unknown>).logging
+      : undefined;
+  const logDir =
+    typeof logging === "object" && logging !== null
+      ? (logging as Record<string, unknown>).logDir
+      : undefined;
   if (typeof logDir !== "string" || logDir.trim() === "") return null;
   try {
     return resolveHomeAwarePath(logDir.trim());

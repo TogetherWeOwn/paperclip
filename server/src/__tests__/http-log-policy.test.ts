@@ -240,4 +240,33 @@ describe("requestLogUrl", () => {
       }),
     ).toBe("/api/chat-webhooks/:publicId/:provider");
   });
+
+  it("prefers originalUrl over mount-stripped req.url for token collapse", () => {
+    // Regression: at response-finish time Express has stripped the /api
+    // mount prefix from req.url, so collapsing req.url left the raw bearer
+    // token in the pino msg field of server.log and stdout.
+    expect(
+      requestLogUrl({
+        method: "GET",
+        originalUrl: "/api/invites/pcp_invite_SECRETTOKEN123",
+        url: "/invites/pcp_invite_SECRETTOKEN123",
+      }),
+    ).toBe("/api/invites/:token");
+    expect(
+      requestLogUrl({
+        method: "POST",
+        originalUrl: "/api/board-claim/rawtoken456/claim",
+        url: "/board-claim/rawtoken456/claim",
+      }),
+    ).toBe("/api/board-claim/:token/claim");
+  });
+
+  it("collapses mount-relative token paths when originalUrl is unavailable", () => {
+    expect(
+      requestLogUrl({ method: "GET", url: "/invites/pcp_invite_SECRETTOKEN123" }),
+    ).toBe("/invites/:token");
+    expect(
+      requestLogUrl({ method: "POST", url: "/board-claim/rawtoken456/claim" }),
+    ).toBe("/board-claim/:token/claim");
+  });
 });

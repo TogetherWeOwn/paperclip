@@ -20,9 +20,10 @@ rotation, file layout, or the already-redacted lines do not.
 ## Files
 
 Both live in one directory, resolved in this order: `PAPERCLIP_LOG_DIR`
-when set, else the operator's configured `logging.logDir` from the instance
-config file (when the server runs under one), else the default instance logs
-dir (`$PAPERCLIP_HOME/instances/<id>/logs`). In container deployments that
+when set, else the operator's explicitly configured `logging.logDir` from
+the instance config file (an omitted `logDir` falls through to the default
+even when the server runs under a config file), else the default instance
+logs dir (`$PAPERCLIP_HOME/instances/<id>/logs`). In container deployments that
 dir is on the retained `/paperclip` volume, so recreating the container does
 not delete them; the new process appends to the existing files.
 
@@ -64,7 +65,7 @@ not delete them; the new process appends to the existing files.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PAPERCLIP_FILE_LOGGING` | `true` | `false`/`0`/`no`/`off` disables both files (stdout-only) |
-| `PAPERCLIP_LOG_DIR` | config `logging.logDir`, else instance logs dir | Directory for both files (explicit env wins) |
+| `PAPERCLIP_LOG_DIR` | explicit config `logging.logDir`, else instance logs dir | Directory for both files (explicit env wins) |
 | `PAPERCLIP_SERVER_LOG_MAX_BYTES` | `10485760` | Rotation size for `server.log` |
 | `PAPERCLIP_SERVER_LOG_MAX_FILES` | `5` | Generations kept for `server.log` |
 | `PAPERCLIP_ACCESS_LOG_MAX_BYTES` | `10485760` | Rotation size for `access.log` |
