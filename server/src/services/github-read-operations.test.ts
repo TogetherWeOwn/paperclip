@@ -553,6 +553,9 @@ describe("sanitizeGitHubDiagnosticText", () => {
     ["curl --user TokUser7x: https://api.example.test/", "TokUser7x"],
     ["curl -u :OnlyPw6x https://example.test/", "OnlyPw6x"],
     ['curl -u ":OnlyPw5x" https://example.test/', "OnlyPw5x"],
+    ['curl -u "TokDqOnly9:" https://example.test/', "TokDqOnly9"],
+    ["curl -u 'TokSqOnly9:' https://example.test/", "TokSqOnly9"],
+    ["curl -u ':OnlySqPw9' https://example.test/", "OnlySqPw9"],
     ['curl "-uTokQuoted4x:" https://example.test/', "TokQuoted4x"],
     ["curl '-uTokXtrace3x:' https://example.test/", "TokXtrace3x"],
   ])("redacts %s", (input, secret) => {
