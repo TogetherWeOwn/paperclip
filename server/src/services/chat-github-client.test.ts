@@ -1,7 +1,10 @@
 import { generateKeyPairSync } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { githubBotRepositoryToken } from "./chat-github-client.js";
+import {
+  __clearGithubBotTokenCacheForTests,
+  githubBotRepositoryToken,
+} from "./chat-github-client.js";
 import { githubGreenReviewContext } from "./chat-github-green-gate.js";
 
 const mocks = vi.hoisted(() => ({ resolveSecretValue: vi.fn() }));
@@ -73,6 +76,10 @@ function fixture(reviewRows: unknown[] = [], deliveryRows: unknown[] = []) {
 beforeEach(() => {
   mocks.resolveSecretValue.mockReset();
   mocks.resolveSecretValue.mockImplementation(async (_company, key: string) => credentials[key]);
+  // The installation token cache is module-level: clear it so each test's
+  // fetch-count assertions observe a fresh issuance instead of a hit cached
+  // by an earlier test in this file.
+  __clearGithubBotTokenCacheForTests();
 });
 
 describe("repository App token permissions", () => {
