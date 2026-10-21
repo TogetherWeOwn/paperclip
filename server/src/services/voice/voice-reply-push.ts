@@ -4,6 +4,7 @@ import { chatActions, chatEndpoints, chatPublications, chatVoiceReplies, chatVoi
 import { instanceSettingsService } from "../instance-settings.js";
 import { HttpError } from "../../errors.js";
 import { createSpekoProvider, SpekoProviderError } from "./speko-provider.js";
+import { insertChatActions } from "../chat-publication-authority.js";
 import type { voiceSessionStore } from "./voice-session-store.js";
 
 import { logger } from "../../middleware/logger.js";
@@ -79,8 +80,8 @@ export async function pushVoiceReplies(db: Db, options: {
           const values = {status: "dispatching", result: null, updatedAt: new Date()};
           const action = prior
             ? (await tx.update(chatActions).set(values).where(eq(chatActions.id, prior.id)).returning())[0]!
-            : (await tx.insert(chatActions).values({companyId: session.companyId, endpointId: session.endpointId, conversationId: session.conversationId, kind, providerActionId: identity,
-              payload: {sessionId: session.id, replyId: row.reply.id, publicationId: row.reply.publicationId, generation: session.generation, providerSessionId: session.providerSessionId, questionNotification, partIndex, partCount: parts.length, textDigest}, ...values}).returning())[0]!;
+            : (await insertChatActions(tx, {companyId: session.companyId, endpointId: session.endpointId, conversationId: session.conversationId, kind, providerActionId: identity,
+              payload: {sessionId: session.id, replyId: row.reply.id, publicationId: row.reply.publicationId, generation: session.generation, providerSessionId: session.providerSessionId, questionNotification, partIndex, partCount: parts.length, textDigest}, ...values}))[0]!;
           return {...context, reply: row.reply, questionNotification, text: parts[partIndex]!, partIndex, partCount: parts.length, action};
         }
         return null;

@@ -11,6 +11,7 @@ import { githubChatPrincipalAccess } from "./chat-github-access.js";
 import { githubAutomaticAdmission } from "./chat-github-events.js";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 import { withGitHubPublicationLease } from "./chat-github-publication-lease.js";
+import { insertChatActions } from "./chat-publication-authority.js";
 import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
 import type { GitHubAutomaticEventContext } from "@paperclipai/shared";
 import { githubRunReplyState } from "./chat-run-publications.js";
@@ -46,14 +47,14 @@ async function findResponseComment(source: Source, api: Api): Promise<Comment | 
 /** One durable, App-owned comment per accepted request. Callers hold the same
  * repository publication lease used by agent replies and review summaries. */
 async function stageResponse(db: Db, source: Source) {
-  const [inserted] = await db.insert(chatActions).values({
+  const [inserted] = await insertChatActions(db, {
     companyId: source.endpoint.companyId, endpointId: source.endpoint.id,
     conversationId: source.conversation.id, deliveryId: source.delivery.id,
     principalId: source.delivery.principalId, kind: "github_response_comment",
     providerActionId: actionKey(source.delivery.id),
     payload: { runtimeGeneration: generation(source.endpoint), agentId: source.endpoint.assignedAgentId },
     status: "received",
-  }).onConflictDoNothing().returning();
+  }, { onConflictDoNothing: true });
   const response = inserted ?? (await db.select().from(chatActions).where(and(
     eq(chatActions.companyId, source.endpoint.companyId), eq(chatActions.endpointId, source.endpoint.id),
     eq(chatActions.providerActionId, actionKey(source.delivery.id)),

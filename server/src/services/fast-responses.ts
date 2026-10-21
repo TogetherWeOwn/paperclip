@@ -50,6 +50,7 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionService } from "./ai-connections.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { insertChatPublications } from "./chat-publication-authority.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import { accessService } from "./access.js";
 import type { AuthorizationActor } from "./authorization.js";
@@ -1036,7 +1037,7 @@ export function fastResponseService(
               safe.text,
             ))
           )
-            await tx.insert(chatPublications).values({
+            await insertChatPublications(tx, {
               companyId: request.companyId,
               issueId: request.issueId!,
               endpointId: request.endpointId,

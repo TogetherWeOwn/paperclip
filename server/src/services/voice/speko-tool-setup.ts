@@ -4,6 +4,7 @@ import { chatActions, type Db } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
 import { spekoToolDefinitions } from "./speko-protocol.js";
 import { createSpekoProvider, SpekoProviderError } from "./speko-provider.js";
+import { insertChatActions } from "../chat-publication-authority.js";
 
 /** Called while the existing connection credential lease is held. */
 export async function configureSpekoSessionTools(db: Db, input: {
@@ -55,7 +56,7 @@ export async function configureSpekoSessionTools(db: Db, input: {
     let [action] = await db.select().from(chatActions).where(and(eq(chatActions.companyId, input.companyId), eq(chatActions.endpointId, input.endpointId), eq(chatActions.providerActionId, actionId)));
     if (action && action.status !== "failed" && !existing) throw conflict("A previous Speko tool setup has an uncertain outcome. Inspect the voice agent's tools before reconnecting.");
     if (!action) {
-      [action] = await db.insert(chatActions).values({ companyId: input.companyId, endpointId: input.endpointId, kind: "speko_tool_setup", providerActionId: actionId, status: "processing", payload: { name: definition.name, fingerprint, ownershipAgentId: input.agentId, ownershipDefinitionHash: createHash("sha256").update(JSON.stringify(definition)).digest("hex") } }).returning();
+      [action] = await insertChatActions(db, { companyId: input.companyId, endpointId: input.endpointId, kind: "speko_tool_setup", providerActionId: actionId, status: "processing", payload: { name: definition.name, fingerprint, ownershipAgentId: input.agentId, ownershipDefinitionHash: createHash("sha256").update(JSON.stringify(definition)).digest("hex") } });
     }
     // A recovered matching tool is repaired with an idempotent PATCH. GET does
     // not expose the secret, so presence alone cannot verify the signing key.
@@ -104,7 +105,7 @@ export async function configureSpekoSessionTools(db: Db, input: {
   const actionId = `speko_lifecycle:${fingerprint}`;
   const [previous] = await db.select().from(chatActions).where(and(eq(chatActions.companyId, input.companyId), eq(chatActions.endpointId, input.endpointId), eq(chatActions.providerActionId, actionId)));
   if (previous && previous.status !== "failed" && !matching.length) throw conflict("Speko webhook setup has an uncertain outcome. Inspect Webhooks in Speko before reconnecting.");
-  const action = previous ?? (await db.insert(chatActions).values({companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}).returning())[0]!;
+  const action = previous ?? (await insertChatActions(db, {companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}))[0]!;
   await input.assertOwned();
   try {
     const receipt = await input.client.configureWebhook(input.agentId, callback.href, input.signingSecret, matching[0]?.id);

@@ -6,6 +6,7 @@ import { chatEndpointResources, chatConversations, chatActions, chatEndpoints, c
 import { LOW_TRUST_REVIEW_PRESET, LOW_TRUST_REVIEW_PRESET_VERSION, LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION } from "@paperclipai/shared";
 import { buildChatCommunicationGuidance } from "../chat-communication-guidance.js";
 import { environmentService } from "../environments.js";
+import { insertChatActions } from "../chat-publication-authority.js";
 import { assertEnvironmentSelectionForCompany } from "../../routes/environment-selection.js";
 import { issueService } from "../issues.js";
 import type { VoiceInboundCall, VoicePhoneConfiguration, VoiceSession } from "@paperclipai/shared";
@@ -142,7 +143,7 @@ export function voiceInboundService(db: Db, options: {
       await tx.execute(sql`set local statement_timeout = '2000ms'`);
       // Approval and guest tools lock admission before session; keep that order.
       if (admission) await tx.select({id: chatVoiceInboundCalls.id}).from(chatVoiceInboundCalls).where(eq(chatVoiceInboundCalls.id, admission.id)).for("update");
-      const [receipt] = await tx.insert(chatActions).values({companyId: row.companyId, endpointId: row.id, kind: "speko_lifecycle_receipt", providerActionId: `speko_event:${webhookId}`, status: "completed", payload: {type: event.type, sessionId: session?.id ?? null, fingerprint: eventFingerprint}, result: {accepted: true}}).onConflictDoNothing().returning({id: chatActions.id});
+      const [receipt] = await insertChatActions(tx, {companyId: row.companyId, endpointId: row.id, kind: "speko_lifecycle_receipt", providerActionId: `speko_event:${webhookId}`, status: "completed", payload: {type: event.type, sessionId: session?.id ?? null, fingerprint: eventFingerprint}, result: {accepted: true}}, { onConflictDoNothing: true });
       if (!receipt) {
         const [prior] = await tx.select().from(chatActions).where(and(eq(chatActions.companyId, row.companyId), eq(chatActions.endpointId, row.id), eq(chatActions.providerActionId, `speko_event:${webhookId}`)));
         if (prior?.payload.fingerprint !== eventFingerprint) throw conflict("Voice callback identity was reused for different content");
