@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -33,6 +34,8 @@ export type {
   SandboxAdditionalSource,
 } from "./sandbox-managed-runtime.js";
 import {
+  authorizeSandboxCallbackBridgeRequestWithRoutes,
+  compareBridgeTokensConstantTime,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
@@ -41,6 +44,7 @@ import {
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
   sandboxCallbackBridgeDirectories,
+  sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
   syncRemoteTextFileWithHashSkip,
@@ -545,6 +549,25 @@ export function adapterExecutionTargetUsesPaperclipBridge(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
   return target?.kind === "remote";
+}
+
+/**
+ * Bridge mode for the in-process legacy/local loopback bridge (B1). Distinct
+ * from the remote `queue_v1` / `http2_v1` modes; informational only, no
+ * consumer branches on it.
+ */
+export const ADAPTER_EXECUTION_TARGET_LOCAL_BRIDGE_MODE = "local_v1";
+
+/**
+ * Local/legacy launches (an explicit `{ kind: "local" }` target or no target
+ * at all) get the in-process loopback bridge. Any other target kind returns
+ * false, so an unknown future kind keeps legacy passthrough instead of
+ * silently gaining a bridge.
+ */
+export function adapterExecutionTargetUsesLocalPaperclipBridge(
+  target: AdapterExecutionTarget | null | undefined,
+): boolean {
+  return !target || target.kind === "local";
 }
 
 export function describeAdapterExecutionTarget(
@@ -4226,6 +4249,327 @@ async function closeDuplexChannelWithinBudget(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Local/legacy loopback bridge (`local_v1`, B1).
+//
+// Legacy/local launches run the child on the host, so the bridge is an
+// in-process HTTP listener on 127.0.0.1 with an ephemeral port — no queue
+// dir, no synced asset, no runner. The child env swaps the host JWT + host
+// URL for a host-worthless bridge token + the loopback bridge URL (M1, the
+// Paperclip credential control); the bridge re-applies the real host token on
+// the forward leg toward the pinned host origin.
+//
+// The forward below is intentionally self-contained instead of sharing the
+// remote `forwardBridgeRequest` closure: this keeps the B1 change additive
+// (B4's redirect/log fix lands on the remote path independently) while the
+// local path is redirect-safe and log-sanitized from day one. Both paths
+// share the route/header/token helpers and the response-header/body readers.
+// ---------------------------------------------------------------------------
+
+function resolveBridgeMaxBodyBytes(override: number | null | undefined): number {
+  const configuredAttachmentBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
+  // A larger upload limit needs multipart headroom. A smaller attachment limit
+  // remains enforced by the API and must not shrink unrelated JSON responses.
+  const defaultBodyBytes = Number.isSafeInteger(configuredAttachmentBytes) && configuredAttachmentBytes > 0
+    ? Math.max(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES, configuredAttachmentBytes + 64 * 1024)
+    : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES;
+  return typeof override === "number" && Number.isFinite(override) && override > 0
+    ? Math.trunc(override)
+    : defaultBodyBytes;
+}
+
+function readLocalBridgeBearerToken(authorization: string | string[] | undefined): string | null {
+  const value = Array.isArray(authorization) ? authorization[0] : authorization;
+  if (typeof value !== "string") return null;
+  const match = /^Bearer (.+)$/.exec(value.trim());
+  const token = match?.[1]?.trim() ?? "";
+  return token.length > 0 ? token : null;
+}
+
+async function readLocalBridgeRequestBody(req: http.IncomingMessage, maxBodyBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    totalBytes += buf.byteLength;
+    if (totalBytes > maxBodyBytes) {
+      req.destroy();
+      throw new Error(`Bridge request body exceeded the configured size limit of ${maxBodyBytes} bytes.`);
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
+}
+
+interface LocalBridgeForwardOutcome {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+async function forwardLocalBridgeRequest(input: {
+  method: string;
+  path: string;
+  query: string;
+  headers: Record<string, string>;
+  body: Buffer | undefined;
+  hostApiUrl: string;
+  hostApiToken: string;
+  runId: string;
+  maxBodyBytes: number;
+  forwardTimeoutMs: number;
+  debugOrigin: string;
+  bridgeDebugEnabled: boolean;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<LocalBridgeForwardOutcome> {
+  const method = input.method;
+  if (input.bridgeDebugEnabled) {
+    await input.onLog("stdout", `[paperclip] Local bridge proxy ${method} ${input.debugOrigin}${input.path}\n`);
+  }
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(input.headers)) {
+    if (value.trim().length === 0) continue;
+    headers.set(key, value);
+  }
+  headers.set("authorization", `Bearer ${input.hostApiToken}`);
+  headers.set("x-paperclip-run-id", input.runId);
+  const forwardInit: RequestInit = {
+    method,
+    headers,
+    signal: AbortSignal.timeout(input.forwardTimeoutMs),
+    // Never follow redirects: a 3xx from the pinned host to a foreign origin
+    // would otherwise re-send the host Authorization header and the request
+    // body there. Redirects are refused below with a 502.
+    redirect: "manual",
+  };
+  if (method !== "GET" && method !== "HEAD" && input.body !== undefined) {
+    forwardInit.body = input.body as BodyInit;
+  }
+  let response: Response;
+  try {
+    response = await fetch(buildBridgeForwardUrl(input.hostApiUrl, input), forwardInit);
+  } catch {
+    // The host is unreachable or the forward budget elapsed. Fail closed with
+    // a generic error: the host URL and the failure detail stay out of the
+    // child-visible response.
+    return {
+      status: 502,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({ error: "bridge forward failed" }), "utf8"),
+    };
+  }
+  // `manual` surfaces a redirect as an opaqueredirect response instead of
+  // following it. Refuse it here: passing the foreign Location back to the
+  // local caller would launder the redirect (and a re-issued body) to an
+  // origin the bridge never approved.
+  const redirectLocation = response.headers.get("location");
+  const isRedirectResponse =
+    response.type === "opaqueredirect" ||
+    ([301, 302, 303, 307, 308].includes(response.status) && redirectLocation !== null);
+  if (isRedirectResponse) {
+    await response.arrayBuffer().catch(() => undefined);
+    if (input.bridgeDebugEnabled) {
+      await input.onLog(
+        "stdout",
+        `[paperclip] Local bridge refused to follow redirect for ${method} ${input.debugOrigin}${input.path}\n`,
+      );
+    }
+    return {
+      status: 502,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({ error: "bridge refused to follow redirect" }), "utf8"),
+    };
+  }
+  if (input.bridgeDebugEnabled) {
+    await input.onLog(
+      "stdout",
+      `[paperclip] Local bridge proxy response ${response.status} for ${method} ${input.debugOrigin}${input.path}\n`,
+    );
+  }
+  let responseBody: Buffer;
+  try {
+    // No broker reservation on the local path: like the queue transport, the
+    // local bridge enforces only the one request's own ceiling.
+    responseBody = await readBridgeForwardResponseBody(response, input.maxBodyBytes);
+  } catch (error) {
+    // Same method-safety classification as the remote forward: a safe method
+    // never committed host state, so a retry cannot double-apply a mutation.
+    if (isSafeBridgeMethod(method)) {
+      return {
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), "utf8"),
+      };
+    }
+    return {
+      status: 504,
+      headers: { "content-type": "application/json", "x-paperclip-bridge-outcome": "indeterminate" },
+      body: Buffer.from(
+        JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          outcome: "indeterminate",
+          retryable: false,
+        }),
+        "utf8",
+      ),
+    };
+  }
+  const commentMarker = postedIssueCommentLogMarker(method, input.path, response.status, responseBody);
+  if (commentMarker) await input.onLog("stdout", commentMarker);
+  return { status: response.status, headers: buildBridgeResponseHeaders(response), body: responseBody };
+}
+
+function writeLocalBridgeJson(res: http.ServerResponse, status: number, value: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(value));
+}
+
+/**
+ * Start the in-process loopback bridge for a local/legacy launch. Returns
+ * null when there is no host token — with no host credential there is nothing
+ * to scope, so the launch keeps legacy passthrough instead of being refused.
+ * A failure to bind the loopback listener throws: the launch must not proceed
+ * without the credential control it was promised.
+ */
+async function startLocalAdapterExecutionTargetPaperclipBridge(input: {
+  runId: string;
+  hostApiToken: string | null | undefined;
+  hostApiUrl?: string | null;
+  maxBodyBytes?: number | null;
+  forwardTimeoutMs?: number | null;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
+  const hostApiToken = input.hostApiToken?.trim() ?? "";
+  if (hostApiToken.length === 0) return null;
+  const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
+  const maxBodyBytes = resolveBridgeMaxBodyBytes(input.maxBodyBytes);
+  const forwardTimeoutMs = input.forwardTimeoutMs ?? DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
+  const onLog = input.onLog ?? (async () => {});
+  const bridgeDebugEnabled = isBridgeDebugEnabled(process.env);
+  const debugOrigin = (() => {
+    try {
+      return new URL(hostApiUrl).origin;
+    } catch {
+      return "unparseable-bridge-origin";
+    }
+  })();
+  const bridgeToken = createSandboxCallbackBridgeToken();
+
+  const openSockets = new Set<net.Socket>();
+  const server = http.createServer((req, res) => {
+    void (async () => {
+      // Split the raw target without URL normalization: dot-segment or
+      // absolute-form tricks must reach the route authorizer verbatim, where
+      // the anchored patterns reject them.
+      const rawTarget = req.url ?? "/";
+      const queryIndex = rawTarget.indexOf("?");
+      const path = queryIndex >= 0 ? rawTarget.slice(0, queryIndex) : rawTarget;
+      const query = queryIndex >= 0 ? rawTarget.slice(queryIndex + 1) : "";
+      const method = req.method?.trim().toUpperCase() || "GET";
+
+      // Authenticate first: a wrong or missing bridge token never reaches the
+      // route check, the body read, or the host.
+      const presented = readLocalBridgeBearerToken(req.headers.authorization);
+      if (!presented || !compareBridgeTokensConstantTime(bridgeToken, presented)) {
+        writeLocalBridgeJson(res, 401, { error: "Invalid bridge token." });
+        return;
+      }
+
+      const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path });
+      if (denialReason) {
+        writeLocalBridgeJson(res, 403, { error: denialReason });
+        return;
+      }
+
+      const flattened: Record<string, string> = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value === undefined) continue;
+        flattened[key] = Array.isArray(value) ? value.join(", ") : String(value);
+      }
+      const headers = sanitizeSandboxCallbackBridgeHeaders(flattened);
+
+      let body: Buffer | undefined;
+      if (method !== "GET" && method !== "HEAD") {
+        try {
+          body = await readLocalBridgeRequestBody(req, maxBodyBytes);
+        } catch {
+          writeLocalBridgeJson(res, 413, { error: "Bridge request body too large." });
+          return;
+        }
+      }
+
+      const outcome = await forwardLocalBridgeRequest({
+        method,
+        path,
+        query,
+        headers,
+        body,
+        hostApiUrl,
+        hostApiToken,
+        runId: input.runId,
+        maxBodyBytes,
+        forwardTimeoutMs,
+        debugOrigin,
+        bridgeDebugEnabled,
+        onLog,
+      });
+      res.writeHead(outcome.status, outcome.headers);
+      res.end(outcome.body);
+    })().catch((error: unknown) => {
+      // Fail closed on unexpected handler faults; the child-visible error
+      // carries no internals.
+      void error;
+      if (!res.headersSent) {
+        writeLocalBridgeJson(res, 502, { error: "bridge request failed" });
+      } else {
+        res.destroy();
+      }
+    });
+  });
+  server.on("connection", (socket) => {
+    openSockets.add(socket);
+    socket.once("close", () => {
+      openSockets.delete(socket);
+    });
+  });
+
+  // A listen failure rejects: the caller refuses the launch (no spawn without
+  // the credential control). The once-listener stays attached, so a later
+  // accept-path failure is a no-op reject on the settled promise rather than
+  // an unhandled 'error' throw.
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("Local Paperclip bridge did not bind a loopback TCP port.");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  await onLog("stdout", `[paperclip] Started local callback bridge on ${baseUrl}.\n`);
+
+  return {
+    env: {
+      PAPERCLIP_API_URL: baseUrl,
+      PAPERCLIP_API_KEY: bridgeToken,
+      PAPERCLIP_API_BRIDGE_MODE: ADAPTER_EXECUTION_TARGET_LOCAL_BRIDGE_MODE,
+    },
+    stop: async () => {
+      // Destroy tracked sockets first so keep-alive connections cannot hold
+      // `close()` open; stop runs after all attempts settle, so no forward is
+      // in flight here.
+      for (const socket of openSockets) socket.destroy();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    },
+  };
+}
+
 export async function startAdapterExecutionTargetPaperclipBridge(input: {
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
@@ -4269,10 +4613,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // a real recorder.
   duplexObservabilityRecorder?: DuplexObservabilityRecorder | null;
 }): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
-  if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
-    return null;
-  }
   if (!input.target || input.target.kind !== "remote") {
+    // Local/legacy launches get the in-process loopback bridge (`local_v1`
+    // mode). Null (no host token) keeps legacy passthrough; a throw refuses
+    // the launch.
+    return startLocalAdapterExecutionTargetPaperclipBridge(input);
+  }
+  if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
     return null;
   }
 
@@ -4295,16 +4642,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
   const bridgeToken = createSandboxCallbackBridgeToken();
-  const configuredAttachmentBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
-  // A larger upload limit needs multipart headroom. A smaller attachment limit
-  // remains enforced by the API and must not shrink unrelated JSON responses.
-  const defaultBodyBytes = Number.isSafeInteger(configuredAttachmentBytes) && configuredAttachmentBytes > 0
-    ? Math.max(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES, configuredAttachmentBytes + 64 * 1024)
-    : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES;
-  const maxBodyBytes =
-    typeof input.maxBodyBytes === "number" && Number.isFinite(input.maxBodyBytes) && input.maxBodyBytes > 0
-      ? Math.trunc(input.maxBodyBytes)
-      : defaultBodyBytes;
+  const maxBodyBytes = resolveBridgeMaxBodyBytes(input.maxBodyBytes);
   // The bridge worker runs inside the same process that serves the Paperclip
   // API, so forwarded sandbox calls must target the LOCAL listen origin. The
   // PAPERCLIP_RUNTIME_API_URL / PAPERCLIP_API_URL exports now prefer a

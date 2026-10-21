@@ -10,6 +10,7 @@ import {
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
   adapterExecutionTargetUsesManagedHome,
+  adapterExecutionTargetUsesLocalPaperclipBridge,
   adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
@@ -733,7 +734,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
-  if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
+  // B1: legacy/local launches get the in-process loopback bridge (`local_v1`)
+  // with token separation — the child env swaps the host JWT + host URL for a
+  // host-worthless bridge token + loopback URL (T1.1–T1.3). Remote behavior is
+  // unchanged (T1.4). The ACP lane delegates out before this block and is
+  // untouched.
+  const useLocalPaperclipBridge =
+    !executionTargetIsRemote && adapterExecutionTargetUsesLocalPaperclipBridge(runtimeExecutionTarget);
+  if (
+    (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) ||
+    useLocalPaperclipBridge
+  ) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
       runId,
       target: runtimeExecutionTarget,
@@ -755,6 +766,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       if (remoteClaudeConfigDir) {
         loggedEnv.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
+      }
+      // B1: post-swap bridge-origin allowlist append (B2 contract §1). Sandbox
+      // options are built before the bridge starts, so append here — after the
+      // swap, before attempts spawn. The pre-swap host URL stays in the
+      // trusted set; the bridge origin is appended, never replacing it.
+      const bridgeOrigin = paperclipBridge.env.PAPERCLIP_API_URL;
+      if (
+        !executionTargetIsRemote &&
+        localProcessSandbox &&
+        typeof bridgeOrigin === "string" &&
+        bridgeOrigin.length > 0 &&
+        !(localProcessSandbox.networkAllowlist ?? []).includes(bridgeOrigin)
+      ) {
+        localProcessSandbox.networkAllowlist = [...(localProcessSandbox.networkAllowlist ?? []), bridgeOrigin];
       }
     }
   }
