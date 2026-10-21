@@ -10,8 +10,9 @@ const LOCKFILE_STEP = "Block manual lockfile edits";
 // to (but excluding) the next step's `- name:` line. Steps sit at the same
 // indent, so a sibling step is the next `- name:` at equal-or-lower indent.
 function stepBlock(lines, stepName) {
+  const escaped = stepName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const start = lines.findIndex((line) =>
-    new RegExp(`^\\s*-\\s*name:\\s*${stepName}\\s*$`).test(line),
+    new RegExp(`^\\s*-\\s*name:\\s*${escaped}\\s*$`).test(line),
   );
   assert.ok(
     start !== -1,
@@ -31,7 +32,10 @@ function stepBlock(lines, stepName) {
 
 // Collect the folded `if:` condition lines of a step block into one string.
 function stepCondition(blockLines) {
-  const ifIndex = blockLines.findIndex((line) => /^\s*if:\s*(>-|[|>])?\s*$/.test(line) || /^\s*if:\s*\S/.test(line));
+  const ifIndex = blockLines.findIndex(
+    (line) =>
+      /^\s*if:\s*(>-|[|>])?\s*$/.test(line) || /^\s*if:\s*\S/.test(line),
+  );
   assert.ok(ifIndex !== -1, `"${LOCKFILE_STEP}" must declare an if: condition`);
   const ifIndent = blockLines[ifIndex].match(/^\s*/)[0].length;
   const inline = blockLines[ifIndex].match(/^\s*if:\s*(?![|>]-?\s*$)(\S.*)$/);
