@@ -879,6 +879,9 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     });
     const paths = new Map(repositories.map((repo) => [repo.workspaceId, repo.cwd]));
     projectRepositoryPaths.push(...repositories.map((repo) => path.relative(executionWorkspace.cwd, repo.cwd)));
+    for (const repo of repositories) {
+      if (repo.warnings?.length) resolvedWorkspace.warnings.push(...repo.warnings);
+    }
     if (resolvedWorkspace.workspaceId) paths.set(resolvedWorkspace.workspaceId, executionWorkspace.cwd);
     resolvedWorkspace.workspaceHints = resolvedWorkspace.workspaceHints.map((hint) => ({
       ...hint, cwd: paths.get(hint.workspaceId) ?? hint.cwd,
