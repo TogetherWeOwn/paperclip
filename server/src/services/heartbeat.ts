@@ -503,6 +503,7 @@ import {
   prepareHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
+import { createToolResultSpillWriter, registerToolResultSpillWriter } from "./tool-result-delivery.js";
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
@@ -2128,6 +2129,7 @@ export function heartbeatService(
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let candidateRuntime: Awaited<ReturnType<typeof prepareGitHubCandidateRuntime>> = null;
     let runScratch: HeartbeatRunScratch | null = null;
+    let unregisterToolResultSpillWriter: (() => void) | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
@@ -3755,6 +3757,16 @@ export function heartbeatService(
       } else {
         delete context.paperclipScratch;
       }
+      // Bind spill writes to the exact realized target, including sandbox/SSH
+      // filesystems. A gateway caller never supplies a destination or runner.
+      const toolResultScope = { companyId: run.companyId, agentId: run.agentId, runId: run.id };
+      unregisterToolResultSpillWriter = registerToolResultSpillWriter(toolResultScope, createToolResultSpillWriter({
+        scope: toolResultScope,
+        target: executionTarget,
+        cwd: executionWorkspace.cwd,
+        scratchDir: runScratch?.dir ?? null,
+        hostExecutor: nativeSshHostExecutor,
+      }));
       const gitExecutionEnv = candidateRuntime ? Object.fromEntries(
         Object.entries(parseObject(runtimeConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
       ) : await prepareGitHubExecutionEnvironment({
@@ -5028,6 +5040,7 @@ export function heartbeatService(
         });
       }
     } finally {
+      unregisterToolResultSpillWriter?.();
       if (candidateRuntime) await cleanupGitHubCandidateRuntime(candidateRuntime).catch(error =>
         logger.warn({ runId: run.id, err: error }, "Candidate isolated home cleanup failed; later sibling probes will fail closed"));
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
