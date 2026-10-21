@@ -4,12 +4,20 @@ import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
 } from "./chat-github-publication-lease.js";
-import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
-import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
+import {
+  projectSafeChatPublicationText,
+  scrubInternalReferences,
+} from "./chat-publication-projection.js";
+import {
+  githubPullPermalink,
+  renderInlineFinding,
+  renderReviewSummary,
+} from "./chat-github-review-template.js";
+import { githubEgressReferenceScope } from "./chat-task-url.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import { createHash } from "node:crypto";
 import { githubResponseCommentService, writeGitHubResponseComment } from "./chat-github-response-comments.js";
-import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   toolInvocations,
@@ -22,7 +30,7 @@ import {
   chatGitHubConfigurations,
   chatGitHubReviews,
   chatMessageLinks,
-  companies,
+  companyMemberships,
   heartbeatRuns,
   issues,
   projects,
@@ -36,7 +44,7 @@ import {
 } from "@paperclipai/shared";
 import { HttpError, conflict, forbidden, notFound } from "../errors.js";
 import {
-  githubBotRepositoryToken,
+  githubBotRepositoryRequest,
   githubBotRequest,
 } from "./chat-github-client.js";
 import { githubChatPrincipalAccess } from "./chat-github-access.js";
@@ -45,7 +53,12 @@ import {
   githubReviewConclusion,
   githubReviewPathIsExcluded,
   githubReviewLineIsInPatch,
+  githubShadowLabel,
+  githubWorkflowTriggerPersonAllowed,
+  githubWorkflowTriggerReviewDecision,
   validateGitHubReviewAssessment,
+  validatePersistedGitHubReviewAssessment,
+  type GitHubWorkflowTriggerMarker,
 } from "./chat-github-review-policy.js";
 import {
   isIssueWithinLowTrustBoundary,
@@ -220,6 +233,50 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         ?.allowed
     )
       throw forbidden("Automatic GitHub task authority is no longer available");
+    const workflowTrigger = source.delivery.normalizedEvent
+      .githubWorkflowTrigger as GitHubWorkflowTriggerMarker | undefined;
+    if (workflowTrigger) {
+      const [saved] = await db
+        .select()
+        .from(chatGitHubConfigurations)
+        .where(eq(chatGitHubConfigurations.endpointId, source.endpoint.id));
+      const person = saved?.configuration.people.find(
+        (candidate) =>
+          candidate.githubUserId === workflowTrigger.senderGithubUserId,
+      );
+      let sponsor:
+        | { status?: string | null; membershipRole?: string | null }
+        | undefined;
+      if (person?.kind === "guest") {
+        const [row] = await db
+          .select({
+            status: companyMemberships.status,
+            membershipRole: companyMemberships.membershipRole,
+          })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, source.endpoint.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, person.sponsorUserId),
+            ),
+          );
+        sponsor = row;
+      }
+      if (
+        !githubWorkflowTriggerPersonAllowed({
+          provider: source.endpoint.provider,
+          isMe: false,
+          isSystem: false,
+          isBot: true,
+          triggerHeadSha: workflowTrigger.headSha,
+          allowUnlinkedPeople: source.endpoint.allowUnlinkedPeople,
+          person,
+          sponsor,
+        })
+      )
+        throw forbidden("Workflow review-trigger authority is no longer available");
+    }
     const repositoryId = String(
       source.resource.metadata?.providerRepositoryId ?? "",
     );
@@ -305,33 +362,96 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         source.config.configuration,
         repositoryId,
       ),
+      shadowLabel: githubShadowLabel(source.config.configuration),
     };
+  }
+  /** The shadow label pinned on this task's newest review row, if any. A
+   * labelled review must never publish, even if shadow mode is later
+   * disabled in config, so write tools consult the row as well as config. */
+  async function pinnedShadowLabel(
+    session: Session,
+    source: Awaited<ReturnType<typeof scope>>,
+  ): Promise<string | null> {
+    const [row] = await db
+      .select({ shadowLabel: chatGitHubReviews.shadowLabel })
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.companyId, session.companyId),
+          eq(chatGitHubReviews.endpointId, source.endpoint.id),
+          eq(chatGitHubReviews.issueId, source.issue.id),
+          isNotNull(chatGitHubReviews.shadowLabel),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(1);
+    return row?.shadowLabel ?? null;
   }
   async function client(
     source: Awaited<ReturnType<typeof scope>>,
     requestFetch = fetchImpl,
   ) {
-    const token = await githubBotRepositoryToken(
-      db,
-      source.endpoint.companyId,
-      source.endpoint.id,
-      source.repositoryId,
-      requestFetch,
-    );
     const prefix = `/repos/${source.repository.split("/").map(encodeURIComponent).join("/")}`;
-    return {
-      prefix,
-      request: <T>(
-        path: string,
-        options?: Parameters<typeof githubBotRequest>[3],
-      ) =>
-        githubBotRequest<T>(requestFetch, token, `${prefix}${path}`, options),
-    };
+    // Every review GitHub call routes through the shared helper, which reuses
+    // the cached installation token and retries once with a fresh token after
+    // a 401. One retry implementation, pinned by the helper's own tests.
+    const companyId = source.endpoint.companyId;
+    const endpointId = source.endpoint.id;
+    const repositoryId = source.repositoryId;
+    const request = async <T>(
+      path: string,
+      options?: Parameters<typeof githubBotRequest>[3],
+    ): Promise<T> =>
+      githubBotRepositoryRequest<T>(
+        db,
+        companyId,
+        endpointId,
+        repositoryId,
+        `${prefix}${path}`,
+        options ?? {},
+        requestFetch,
+      );
+    return { prefix, request };
+  }
+  async function diffBaseSha(
+    api: Awaited<ReturnType<typeof client>>,
+    baseSha: string,
+    headSha: string,
+  ) {
+    const comparison = await api.request<{ merge_base_commit: { sha: string } }>(
+      `/compare/${githubCommitSchema.parse(baseSha)}...${githubCommitSchema.parse(headSha)}?per_page=1&page=1`,
+    );
+    return githubCommitSchema.parse(comparison.merge_base_commit.sha);
   }
   async function reviewForHead(
     source: Awaited<ReturnType<typeof scope>>,
     pull: Pull,
   ) {
+    const trigger = source.delivery.normalizedEvent.githubWorkflowTrigger as
+      | GitHubWorkflowTriggerMarker
+      | undefined;
+    if (trigger) {
+      const decision = githubWorkflowTriggerReviewDecision({
+        policy: source.policy,
+        triggerHeadSha: trigger.headSha,
+        pull: {
+          headSha: pull.head.sha,
+          draft: pull.draft,
+          labels: pull.labels.map((l) => l.name),
+          baseBranch: pull.base.ref,
+          authorLogin: pull.user.login,
+          authorIsBot: pull.user.type === "Bot",
+        },
+      });
+      if (!decision.allowed && decision.reason === "stale_head")
+        throw conflict(
+          "This workflow review trigger was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
+        );
+      if (!decision.allowed)
+        throw forbidden(
+          `Workflow review trigger is not reviewable: ${decision.reason}`,
+        );
+    }
     const [prior] = await db
       .select()
       .from(chatGitHubReviews)
@@ -421,16 +541,19 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         policySnapshot: manual?.policy ?? automatic?.policy ?? source.policy,
         event: context,
         state: "running",
+        shadowLabel: source.shadowLabel,
       })
       .onConflictDoNothing()
       .returning();
     if (review) {
-      await githubReviewCheckService(db, fetchImpl).enqueue(
-        source.endpoint,
-        context,
-        true,
-        "authorized_manual_request",
-      );
+      // Shadow reviews never create a check run (enqueue also guards).
+      if (!source.shadowLabel)
+        await githubReviewCheckService(db, fetchImpl).enqueue(
+          source.endpoint,
+          context,
+          true,
+          "authorized_manual_request",
+        );
       return review;
     }
     const [existing] = await db
@@ -533,6 +656,15 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     const api = await client(source);
     if (name === "comment" || name === "update_comment") {
       const parsed = commentSchema.parse(input);
+      const shadowLabel =
+        source.shadowLabel ?? (await pinnedShadowLabel(session, source));
+      if (shadowLabel)
+        return {
+          actionId: null,
+          status: "shadow_stored",
+          receipt: null,
+          shadowLabel,
+        };
       const actionId = await stage(
         source,
         name,
@@ -556,6 +688,30 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This automatic review was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
       );
+    const workflowTrigger = source.delivery.normalizedEvent
+      .githubWorkflowTrigger as GitHubWorkflowTriggerMarker | undefined;
+    if (workflowTrigger) {
+      const decision = githubWorkflowTriggerReviewDecision({
+        policy: source.policy,
+        triggerHeadSha: workflowTrigger.headSha,
+        pull: {
+          headSha: pull.head.sha,
+          draft: pull.draft,
+          labels: pull.labels.map((l) => l.name),
+          baseBranch: pull.base.ref,
+          authorLogin: pull.user.login,
+          authorIsBot: pull.user.type === "Bot",
+        },
+      });
+      if (!decision.allowed && decision.reason === "stale_head")
+        throw conflict(
+          "This workflow review trigger was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
+        );
+      if (!decision.allowed)
+        throw forbidden(
+          `Workflow review trigger is not reviewable: ${decision.reason}`,
+        );
+    }
     if (name === "read_pull_request") {
       const parsed = readSchema.parse(input);
       if (parsed.section === "metadata") {
@@ -571,6 +727,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         return {
           untrusted: true,
           pull,
+          diffBaseSha: await diffBaseSha(api, pull.base.sha, pull.head.sha),
           reviewPolicy: configuration?.policy ?? source.policy,
           configurationRevision:
             configuration?.revision ?? source.config.revision,
@@ -668,8 +825,11 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         githubReviewPathIsExcluded(parsed.path, source.policy)
       )
         throw forbidden("This path is excluded from the review");
+      const revision = parsed.revision === "head"
+        ? pull.head.sha
+        : await diffBaseSha(api, pull.base.sha, pull.head.sha);
       const result = await api.request<Record<string, unknown>>(
-        `/contents/${parsed.path.split("/").map(encodeURIComponent).join("/")}?ref=${parsed.revision === "head" ? pull.head.sha : pull.base.sha}`,
+        `/contents/${parsed.path.split("/").map(encodeURIComponent).join("/")}?ref=${revision}`,
       );
       // Provider URLs can contain credentials or direct download capabilities.
       return {
@@ -708,6 +868,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           ...source.policy.ignoredPaths,
         ],
       });
+      const reviewedDiffBase = await diffBaseSha(api, pull.base.sha, pull.head.sha);
       const files: File[] = [];
       for (let page = 1; page <= 30; page++) {
         const batch = await api.request<File[]>(
@@ -728,10 +889,21 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             source.policy,
           ),
       );
-      const paths = new Set(permittedFiles.map((f) => f.filename));
+      const paths = new Set(
+        permittedFiles.flatMap((file) =>
+          file.previous_filename
+            ? [file.filename, file.previous_filename]
+            : [file.filename],
+        ),
+      );
       const byPath = new Map(
         permittedFiles.map((file) => [file.filename, file]),
       );
+      if (assessment.findings.some((finding) =>
+        finding.side === "LEFT" && finding.basePath !==
+          (byPath.get(finding.path)?.previous_filename ?? finding.path)
+      ))
+        throw conflict("LEFT-side basePath must match GitHub's base filename for the changed file.");
       if (
         assessment.findings.some(
           (finding) =>
@@ -763,8 +935,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         throw conflict(
           "A complete assessment must cover every non-excluded changed file",
         );
+      // Shadow if the label was pinned at review creation or shadow mode is
+      // enabled in the current config; either direction suppresses, so
+      // toggling config mid-review can never leak a shadow assessment.
+      const shadowLabel = review.shadowLabel ?? source.shadowLabel;
       // Commit the immutable assessment and its publication together. A restart
       // must never leave a stored result with no durable publication intent.
+      // Shadow reviews are the one exception: the stored assessment is the
+      // whole result, and no publication intent is ever staged.
       const actionId = await db.transaction(async (tx) => {
         const [current] = await tx
           .select()
@@ -782,11 +960,15 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           .update(chatGitHubReviews)
           .set({
             assessment,
+            event: current.assessment
+              ? current.event
+              : { ...current.event, diffBaseSha: reviewedDiffBase },
             conclusion: githubReviewConclusion(
               assessment,
               review.policySnapshot.ratingThreshold,
             ),
             state: assessment.complete ? "completed" : "incomplete",
+            shadowLabel: current.shadowLabel ?? shadowLabel,
             updatedAt: new Date(),
           })
           .where(
@@ -795,6 +977,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               eq(chatGitHubReviews.companyId, session.companyId),
             ),
           );
+        if (shadowLabel) return null;
         return stage(
           source,
           "assessment",
@@ -806,21 +989,36 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           tx,
         );
       });
+      const conclusion = githubReviewConclusion(
+        assessment,
+        review.policySnapshot.ratingThreshold,
+      );
+      if (!actionId)
+        return {
+          reviewId: review.id,
+          actionId: null,
+          status: "shadow_stored",
+          receipt: null,
+          score: assessment.score,
+          conclusion,
+          shadowLabel,
+        };
       await processPublication(actionId);
       return {
         reviewId: review.id,
         ...(await receipt(actionId)),
         score: assessment.score,
-        conclusion: githubReviewConclusion(
-          assessment,
-          review.policySnapshot.ratingThreshold,
-        ),
+        conclusion,
       };
     }
     if (name === "formal_review") {
       const parsed = formalSchema.parse(input);
       if (parsed.reviewedCommit !== pull.head.sha)
         throw conflict("The PR head changed. Review the new commits first.");
+      if (source.shadowLabel)
+        throw forbidden(
+          "Shadow review endpoints never publish formal GitHub reviews",
+        );
       assertFormalPermission(source.policy, parsed.event);
       const [assessed] = await db
         .select()
@@ -836,6 +1034,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         );
       if (!assessed?.assessment?.complete)
         throw conflict("Submit a complete assessment before a formal review");
+      if (assessed.shadowLabel)
+        throw forbidden(
+          "Shadow review endpoints never publish formal GitHub reviews",
+        );
       const actionId = await stage(
         source,
         "formal_review",
@@ -1001,12 +1203,27 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           throw forbidden("Invalid GitHub publication binding");
         try {
           const source = await scope(session, true);
+          const egressScope = await githubEgressReferenceScope(
+            db,
+            source.endpoint.companyId,
+            null,
+          );
+          const publicReviewText = (text: string) =>
+            scrubInternalReferences(
+              projectSafeChatPublicationText(text),
+              egressScope,
+            );
           if (
             source.endpoint.id !== action.endpointId ||
             source.conversation.id !== action.conversationId ||
             source.delivery.id !== action.deliveryId
           )
             throw forbidden("GitHub publication context changed");
+          // Defense in depth for intents staged before shadow mode was
+          // enabled: a 403 settles the action as cancelled, never retried,
+          // and no provider write has happened yet at this point.
+          if (source.shadowLabel)
+            throw forbidden("Shadow review endpoints do not publish to GitHub");
           await assertPublicationAuthority(source, action);
           const providerApi = await client(source, lease.fetch);
           const api: typeof providerApi = { ...providerApi, request: async (path, options) => {
@@ -1048,6 +1265,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           };
           const currentHead = async (expected: string) => {
             const currentSource = await scope(session, true);
+            // Called immediately before each write group, so this also stops
+            // a dispatch whose endpoint entered shadow mode mid-flight.
+            if (currentSource.shadowLabel)
+              throw forbidden("Shadow reviews are never published to GitHub");
             await assertPublicationAuthority(currentSource, action);
             if (action.payload.operation === "formal_review")
               assertFormalPermission(
@@ -1077,8 +1298,13 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           const operation = action.payload.operation;
           let receipt: Record<string, unknown>;
           if (operation === "comment" || operation === "update_comment") {
+            const fresh = await scope(session, true);
+            // Re-check before the write: shadow enabled, or a label pinned,
+            // while this dispatch was in flight still suppresses the write.
+            if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
+              throw forbidden("Shadow reviews are never published to GitHub");
             receipt = await writeGitHubResponseComment(db, source, api, lease, {
-              body: String(action.payload.body), final: operation === "comment", versionAt: action.createdAt,
+              body: publicReviewText(String(action.payload.body)), final: operation === "comment", versionAt: action.createdAt,
             }, async () => assertPublicationAuthority(await scope(session, true), action));
             if (operation === "comment") await githubResponseCommentService(db, fetchImpl).finishRun({ companyId: session.companyId, issueId: source.issue.id, runId: source.run.id, endpointId: source.endpoint.id }, source,
               receipt as { id: string; url: string }, api, lease, async () => assertPublicationAuthority(await scope(session, true), action));
@@ -1095,6 +1321,9 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               `/pulls/${source.number}/reviews`,
               publicationMarker,
             );
+            const fresh = await scope(session, true);
+            if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
+              throw forbidden("Shadow reviews are never published to GitHub");
             const posted =
               prior ??
               (await api.request<{ id: number; html_url: string }>(
@@ -1104,7 +1333,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                   body: {
                     commit_id: parsed.reviewedCommit,
                     event: parsed.event,
-                    body: `${projectSafeChatPublicationText(parsed.body)}\n\n${publicationMarker}`,
+                    body: `${publicReviewText(parsed.body)}\n\n${publicationMarker}`,
                   },
                 },
               ));
@@ -1124,8 +1353,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               .limit(1);
             if (!review?.assessment)
               throw conflict("Review assessment is unavailable");
+            if (review.shadowLabel)
+              throw forbidden("Shadow reviews are never published to GitHub");
             await currentHead(review.headSha);
-            const assessment = validateGitHubReviewAssessment(
+            const assessment = validatePersistedGitHubReviewAssessment(
               review.assessment,
               review.headSha,
               {
@@ -1140,26 +1371,24 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               assessment,
               review.policySnapshot.ratingThreshold,
             );
-            const origin = runtimePublicOrigin();
-            const [company] = await db
-              .select({ prefix: companies.issuePrefix })
-              .from(companies)
-              .where(eq(companies.id, source.endpoint.companyId));
-            const board =
-              origin && company
-                ? `${origin}/${encodeURIComponent(company.prefix)}`
-                : null;
-            const taskLink = board
-              ? `[${source.issue.identifier}](${board}/issues/${source.issue.id})`
-              : source.issue.identifier;
-            const runLink = board
-              ? `[Run](${board}/agents/${source.agent.id}/runs/${source.run.id})`
-              : `Run: ${source.run.id}`;
-            const historyLink = board
-              ? ` · [Review history](${board}/apps/chat/${source.endpoint.id}/reviews)`
-              : "";
-            const summary = projectSafeChatPublicationText(
-              `## Paperclip Review — ${assessment.complete ? `${assessment.score}/5` : "Incomplete"}\n\n${assessment.summary}\n\n${assessment.rationale}\n\nReviewed commit: \`${review.headSha}\`\n\nCoverage: ${assessment.coverage.reviewedPaths.length} files.\n${assessment.coverage.limitations.join("\n")}\n\nTask: ${taskLink} · ${runLink}${historyLink}`,
+            // LEFT coordinates are relative to the diff merge base, not the
+            // target branch tip. Resolve old rows by their pinned commit pair.
+            const evidenceBase = review.event.diffBaseSha ?? (
+              assessment.findings.some((finding) => finding.side === "LEFT" && finding.basePath)
+                ? await diffBaseSha(api, review.event.baseSha, review.headSha)
+                : review.event.baseSha
+            );
+            // Internal Task/Run/history links are omitted; check runs use the
+            // public PR permalink as their Details URL.
+            const summary = publicReviewText(
+              renderReviewSummary({
+                assessment,
+                repository: source.repository,
+                pullNumber: source.number,
+                headSha: review.headSha,
+                baseSha: evidenceBase,
+                scope: egressScope,
+              }),
             );
             const summaryMarker = marker(
               "review",
@@ -1227,7 +1456,17 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                     {
                       method: "POST",
                       body: {
-                        body: `**${finding.severity} · ${finding.category}**\n\n${projectSafeChatPublicationText(finding.body)}\n\n${findingMarker}`,
+                        body: `${publicReviewText(
+                          renderInlineFinding({
+                            finding,
+                            score: assessment.score,
+                            complete: assessment.complete,
+                            repository: source.repository,
+                            headSha: review.headSha,
+                            baseSha: evidenceBase,
+                            scope: egressScope,
+                          }),
+                        )}\n\n${findingMarker}`,
                         commit_id: review.headSha,
                         path: finding.path,
                         line: finding.line,
@@ -1299,7 +1538,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 name: "Paperclip Review",
                 head_sha: review.headSha,
                 external_id: `${source.endpoint.id}:${source.number}:${review.headSha}`,
-                ...(board ? { details_url: `${board}/issues/${source.issue.id}` } : {}),
+                details_url: githubPullPermalink(source.repository, source.number),
                 status: "completed",
                 conclusion,
                 output: {

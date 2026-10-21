@@ -32,10 +32,92 @@ import { rememberVerifiedSlackSearchEvent, slackSearchActionToken } from "./conn
 import { slackAuthorizationRevision } from "./connectors/slack-revision.js";
 import { slackPublicationAllowed } from "./connectors/slack-access.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { stageGitHubPair, recoverGitHubReviewCandidates, githubCandidateBinding, githubCandidateMayWake, kickGitHubPairCapture } from "./chat-github-shadow.js";
 import { registerSlackTaskAuthority, slackRunOrigin } from "./connectors/slack-authority.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
 function githubPolicyRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+
+// Secret-bearing model-provider credential env keys whose agent-scoped secret
+// bindings a low-trust GitHub review may use. A low-trust review runs the
+// assigned review agent with no Paperclip user principal, so the heartbeat
+// refuses every agent secret binding by default — including the reviewer's
+// own model credential, which means the reviewer can never start. Allowing
+// exactly these bindings lets the reviewer start while every other secret
+// (GitHub tokens, unrelated env, other agents' bindings) stays refused.
+// Paths and base URLs stay out: they are configuration, not credentials.
+export const LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "CODEX_API_KEY",
+  "OPENROUTER_API_KEY",
+  "XAI_API_KEY",
+  "GROK_API_KEY",
+] as const;
+
+export function lowTrustModelCredentialConfigPaths(): string[] {
+  return LOW_TRUST_MODEL_CREDENTIAL_ENV_KEYS.map((key) => `env.${key}`);
+}
+
+type LowTrustSecretBindingRow = {
+  id: string;
+  targetType: string;
+  targetId: string;
+  configPath: string;
+};
+
+export function filterLowTrustModelBindingIds(
+  bindings: readonly LowTrustSecretBindingRow[],
+  agentId: string,
+): string[] {
+  if (!agentId) return [];
+  const allowedPaths = new Set(lowTrustModelCredentialConfigPaths());
+  const ids = new Set<string>();
+  for (const binding of bindings) {
+    if (binding.targetType !== "agent") continue;
+    if (binding.targetId !== agentId) continue;
+    if (!allowedPaths.has(binding.configPath)) continue;
+    if (!binding.id) continue;
+    ids.add(binding.id);
+  }
+  return [...ids].sort();
+}
+
+async function resolveLowTrustModelBindingIds(
+  tx: DbOrTransaction,
+  input: { companyId: string; agentId: string },
+): Promise<string[]> {
+  if (!input.agentId) return [];
+  const rows = await tx
+    .select({
+      id: companySecretBindings.id,
+      targetType: companySecretBindings.targetType,
+      targetId: companySecretBindings.targetId,
+      configPath: companySecretBindings.configPath,
+    })
+    .from(companySecretBindings)
+    .where(
+      and(
+        eq(companySecretBindings.companyId, input.companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, input.agentId),
+        inArray(
+          companySecretBindings.configPath,
+          lowTrustModelCredentialConfigPaths(),
+        ),
+      ),
+    );
+  return filterLowTrustModelBindingIds(rows, input.agentId);
+}
+
+function readLowTrustAllowedBindingIds(value: unknown): string[] {
+  const record = githubPolicyRecord(value);
+  const ids = (record as { allowedSecretBindingIds?: unknown }).allowedSecretBindingIds;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
 import { githubChatManagementService } from "./chat-github-management.js";
 import { githubReviewCheckService } from "./chat-github-checks.js";
 import {
@@ -43,13 +125,25 @@ import {
   githubAutomaticIssueEvent,
   githubAutomaticAdmission,
   githubPreviousAssessment,
+  githubPullThreadKey,
+  reuseOpenGitHubPullConversation,
   githubBodyMentionsBot,
   githubExplicitMentionEvent,
   githubMessageAddressesAnotherBot,
 } from "./chat-github-events.js";
-import { githubReviewPrompt, githubManualMessagePrompt, GITHUB_CONFIGURED_SKILL_GUIDANCE } from "./chat-github-review-policy.js";
-import { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews } from "@paperclipai/db";
+import {
+  GITHUB_WORKFLOW_REVIEWER_HANDLE,
+  githubReviewPrompt,
+  githubManualMessagePrompt,
+  githubShadowLabel,
+  githubWorkflowReviewTriggerHeadSha,
+  githubWorkflowTriggerPersonAllowed,
+  type GitHubWorkflowTriggerMarker,
+  GITHUB_CONFIGURED_SKILL_GUIDANCE,
+} from "./chat-github-review-policy.js";
+import { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews, chatGitHubReviewArms } from "@paperclipai/db";
 import type { GitHubReviewEventContext, GitHubIssueEventContext, GitHubAutomaticEventContext, GitHubReviewPolicy } from "@paperclipai/shared";
+import { githubGreenReviewContext, githubHeadTransition, supersedeQueuedGitHubReviews, type GitHubGreenRequestOutcome } from "./chat-github-green-gate.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { githubResponseCommentService } from "./chat-github-response-comments.js";
 import { githubChatWizardService } from "./chat-github-wizard.js";
@@ -295,8 +389,15 @@ import {
   NativeChatReviewPresentationContentionError,
 } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
-import { projectSafeChatPublication } from "./chat-publication-projection.js";
-import { safeChatTaskUrl } from "./chat-task-url.js";
+import {
+  projectSafeChatPublication,
+  scrubExternalChatCard,
+  scrubInternalReferences,
+} from "./chat-publication-projection.js";
+import {
+  githubEgressReferenceScope,
+  safeChatTaskUrl,
+} from "./chat-task-url.js";
 import {
   resyncGitHubAppWebhook,
   listGitHubAppWebhookDeliveries,
@@ -2979,8 +3080,9 @@ export async function hydrateOutboundAttachment(input: {
 export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const runtime = options.runtime ?? createChatRuntime();
   const githubManualMessages = new WeakMap<object, { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" }>();
-  const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy }>();
+  const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy; shadowLabel?: string | null }>();
   const githubIssueMessages = new WeakMap<object, { context: GitHubIssueEventContext; revision: number; policy: GitHubReviewPolicy }>();
+  const githubWorkflowTriggerMessages = new WeakMap<object, GitHubWorkflowTriggerMarker>();
   const runtimeVersions = new Map<string, string>();
   const runtimeLocalEpochs = new Map<string, number>();
   // One bounded publication lane per endpoint; credential/reconnect fencing
@@ -3453,6 +3555,98 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  /** Shadow GitHub endpoints store review assessments but must never create
+   * GitHub objects. Every generic-egress seam consults this before staging
+   * or dispatching a provider write. Returns the shadow label, else null. */
+  async function githubEndpointShadowLabel(
+    endpointId: string,
+  ): Promise<string | null> {
+    const [config] = await db
+      .select({ configuration: chatGitHubConfigurations.configuration })
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpointId));
+    return config ? githubShadowLabel(config.configuration) : null;
+  }
+
+  /** The shadow label pinned on a review row for this task, if any. A pinned
+   * shadow review must never publish generic chat output either, even after
+   * shadow mode is disabled in config; mirrors the review tools' lookup. */
+  async function githubPinnedShadowLabel(input: {
+    companyId: string;
+    endpointId: string;
+    issueId: string;
+  }): Promise<string | null> {
+    const [row] = await db
+      .select({ shadowLabel: chatGitHubReviews.shadowLabel })
+      .from(chatGitHubReviews)
+      .where(
+        and(
+          eq(chatGitHubReviews.companyId, input.companyId),
+          eq(chatGitHubReviews.endpointId, input.endpointId),
+          eq(chatGitHubReviews.issueId, input.issueId),
+          isNotNull(chatGitHubReviews.shadowLabel),
+        ),
+      )
+      .orderBy(desc(chatGitHubReviews.createdAt))
+      .limit(1);
+    return row?.shadowLabel ?? null;
+  }
+
+  /** The pinned shadow label for the task a receipt-reaction action belongs
+   * to, resolved through its delivery's conversation (or the conversation
+   * recorded on the action itself for terminal removals). */
+  async function githubPinnedShadowLabelForReceiptAction(action: {
+    companyId: string;
+    endpointId: string;
+    deliveryId: string | null;
+    conversationId: string | null;
+  }): Promise<string | null> {
+    let issueId: string | null = null;
+    if (action.deliveryId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatDeliveries)
+        .innerJoin(
+          chatConversations,
+          and(
+            eq(chatConversations.id, chatDeliveries.conversationId),
+            eq(chatConversations.companyId, chatDeliveries.companyId),
+            eq(chatConversations.endpointId, chatDeliveries.endpointId),
+          ),
+        )
+        .where(
+          and(
+            eq(chatDeliveries.id, action.deliveryId),
+            eq(chatDeliveries.companyId, action.companyId),
+            eq(chatDeliveries.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    if (!issueId && action.conversationId) {
+      const [row] = await db
+        .select({ issueId: chatConversations.issueId })
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.id, action.conversationId),
+            eq(chatConversations.companyId, action.companyId),
+            eq(chatConversations.endpointId, action.endpointId),
+          ),
+        )
+        .limit(1);
+      issueId = row?.issueId ?? null;
+    }
+    return issueId
+      ? githubPinnedShadowLabel({
+          companyId: action.companyId,
+          endpointId: action.endpointId,
+          issueId,
+        })
+      : null;
+  }
+
   async function addReceiptReaction(input: {
     deliveryId: string;
     endpoint: EndpointRow;
@@ -3777,6 +3971,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               result: {
                 attempts: attempt,
                 code: "receipt_reaction_runtime_superseded",
+              },
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatActions.id, action!.id),
+                eq(chatActions.status, "processing"),
+                sql`(${chatActions.result}->>'attempts')::int = ${attempt}`,
+              ),
+            );
+          await credentialLease.assertOwned(tx);
+        });
+        return;
+      }
+      if (
+        record.endpoint.provider === "github" &&
+        ((await githubEndpointShadowLabel(record.endpoint.id)) ||
+          (await githubPinnedShadowLabelForReceiptAction(action)))
+      ) {
+        await db.transaction(async (tx) => {
+          await credentialLease.assertOwned(tx);
+          await tx
+            .update(chatActions)
+            .set({
+              status: "cancelled",
+              result: {
+                attempts: attempt,
+                code: "receipt_reaction_shadow_mode",
               },
               updatedAt: new Date(),
             })
@@ -13552,6 +13774,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ? "queued"
               : "not_started";
           await notifyChatPublicationWork(tx);
+          const [endpoint] = await tx
+            .select({ provider: chatEndpoints.provider })
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, source.endpointId));
           return (
             await tx
               .insert(chatPublications)
@@ -13573,7 +13799,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   text:
                     state === "queued"
                       ? "Your retry is queued."
-                      : "This retry was not started. Open the task in Paperclip for details.",
+                      : endpoint?.provider === "github"
+                        ? "This retry was not started."
+                        : "This retry was not started. Open the task in Paperclip for details.",
                   progressState: state === "queued" ? "queued" : "failed",
                 }),
                 state: "pending",
@@ -13997,6 +14225,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           if (prior && !(await inboundQueueNoticeStillVisible(tx, prior)))
             return 0;
           await notifyChatPublicationWork(tx);
+          const [noticeEndpoint] = await tx
+            .select({ provider: chatEndpoints.provider })
+            .from(chatEndpoints)
+            .where(
+              and(
+                eq(chatEndpoints.companyId, action.companyId),
+                eq(chatEndpoints.id, action.endpointId),
+              ),
+            )
+            .limit(1);
           const rows = await tx
             .insert(chatPublications)
             .values({
@@ -14014,7 +14252,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               payload: projectSafeChatPublication({
                 classification: "external",
                 source: "safe_milestone",
-                text: inboundWakePublicationText(context.state),
+                text: inboundWakePublicationText(
+                  context.state,
+                  noticeEndpoint?.provider ?? "",
+                ),
                 progressState: context.state === "queued" ? "queued" : "failed",
               }),
             })
@@ -14320,7 +14561,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const receiptDeclined = (row: typeof agentWakeupRequests.$inferSelect) =>
       ["skipped", "cancelled", "failed"].includes(row.status);
     const settle = async (status: string, result: Record<string, unknown>) => {
-      const changed = await db.transaction(async (tx) => {
+      const settled = await db.transaction(async (tx) => {
         await notifyChatDeliveryWork(tx);
         const changed = await tx
           .update(chatActions)
@@ -14355,13 +14596,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
       // A durable scheduler receipt must accept the work before GitHub shows
       // it as working. This also covers acceptance after a maintenance retry.
-      if (changed && status === "processed") {
+      if (settled && status === "processed") {
         const [endpoint] = await db.select({ provider: chatEndpoints.provider })
           .from(chatEndpoints).where(and(eq(chatEndpoints.id, claimed.endpointId),
             eq(chatEndpoints.companyId, claimed.companyId)));
         if (endpoint?.provider === "github")
           await githubResponseCommentService(db, fetchImpl).tryAcknowledge(deliveryId);
       }
+      // The primary wake is now durably recorded: the exact condition the
+      // deferred sweep waits for. Start paired capture for this delivery now
+      // (fire-and-forget, never awaited); the sweep stays the fallback.
+      if (
+        settled &&
+        status === "processed" &&
+        (result.code === "inbound_wakeup_durable" ||
+          result.code === "inbound_wakeup_already_durable")
+      )
+        kickGitHubPairCapture(db, deliveryId, fetchImpl);
     };
     let request: ReturnType<typeof createDurableChatWakeupRequest> | null =
       null;
@@ -14498,6 +14749,139 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
+  /**
+   * Workflow review-trigger admission.
+   *
+   * Bot-authored `issue_comment.created` callbacks never reach delivery
+   * admission through the ordinary path below. The single exception is a
+   * `@togetherweown-reviewer review <40-hex head>` comment whose author is an
+   * allow-listed workflow identity: a sponsored guest with
+   * `automaticReviews:true` and a currently active non-viewer sponsor. The
+   * mention is matched against this endpoint's GitHub App identity, never
+   * against a handle taken from comment text; endpoints without a discovered
+   * bot username keep the default reviewer handle. Own-bot (`isMe`) and
+   * system messages are never admitted.
+   *
+   * Ingress admission only opens the delivery. The returned marker pins the
+   * parsed head SHA and sender to the delivery; draft/head/allow-list policy
+   * is re-enforced at review time against the live PR (see
+   * githubWorkflowTriggerReviewDecision and the review-service recheck), so
+   * comment-then-label ordering keeps working while a stale or revoked
+   * trigger cannot create a review.
+   */
+  async function githubWorkflowReviewTriggerAdmitted(
+    endpoint: EndpointRow,
+    message: Message,
+  ): Promise<GitHubWorkflowTriggerMarker | null> {
+    if (endpoint.provider !== "github") return null;
+    const reviewerHandle =
+      endpoint.botUsername?.replace(/\[bot\]$/i, "") ||
+      GITHUB_WORKFLOW_REVIEWER_HANDLE;
+    const triggerHeadSha = githubWorkflowReviewTriggerHeadSha(
+      message.text,
+      reviewerHandle,
+    );
+    if (!endpoint.allowUnlinkedPeople) return null;
+    const [saved] = await db
+      .select()
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
+    if (!saved) return null;
+    const person = saved.configuration.people.find(
+      (candidate) => candidate.githubUserId === message.author.userId,
+    );
+    let sponsor:
+      | { status?: string | null; membershipRole?: string | null }
+      | undefined;
+    if (person?.kind === "guest") {
+      const [row] = await db
+        .select({
+          status: companyMemberships.status,
+          membershipRole: companyMemberships.membershipRole,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, endpoint.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, person.sponsorUserId),
+          ),
+        );
+      sponsor = row;
+    }
+    if (
+      !githubWorkflowTriggerPersonAllowed({
+        provider: endpoint.provider,
+        isMe: message.author.isMe,
+        isSystem: message.author.isSystem === true,
+        isBot: message.author.isBot === true,
+        triggerHeadSha,
+        allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+        person,
+        sponsor,
+      })
+    )
+      return null;
+    return {
+      headSha: triggerHeadSha as string,
+      senderGithubUserId: message.author.userId,
+    };
+  }
+
+  /**
+   * Live allow-list recheck for a persisted workflow-trigger marker.
+   *
+   * The drain rebuilds the author with `isBot:false`, so the ingress gate is
+   * not re-entered there. Task mutation and the review service call this
+   * instead: the marker proves the delivery was admitted as a trigger, and
+   * the current configuration decides whether that sender is still allowed.
+   * Revocation (automaticReviews off, sponsor inactive/viewer/missing, or
+   * unlinked people disabled) fails closed.
+   */
+  async function githubWorkflowTriggerStillAllowed(
+    tx: Db | Parameters<Parameters<Db["transaction"]>[0]>[0],
+    endpoint: EndpointRow,
+    marker: GitHubWorkflowTriggerMarker,
+  ): Promise<boolean> {
+    const [saved] = await tx
+      .select()
+      .from(chatGitHubConfigurations)
+      .where(eq(chatGitHubConfigurations.endpointId, endpoint.id));
+    if (!saved) return false;
+    const person = saved.configuration.people.find(
+      (candidate) => candidate.githubUserId === marker.senderGithubUserId,
+    );
+    let sponsor:
+      | { status?: string | null; membershipRole?: string | null }
+      | undefined;
+    if (person?.kind === "guest") {
+      const [row] = await tx
+        .select({
+          status: companyMemberships.status,
+          membershipRole: companyMemberships.membershipRole,
+        })
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, endpoint.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, person.sponsorUserId),
+          ),
+        );
+      sponsor = row;
+    }
+    return githubWorkflowTriggerPersonAllowed({
+      provider: endpoint.provider,
+      isMe: false,
+      isSystem: false,
+      isBot: true,
+      triggerHeadSha: marker.headSha,
+      allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
+      person,
+      sponsor,
+    });
+  }
+
   async function processMessage(
     endpoint: EndpointRow,
     thread: Thread,
@@ -14536,12 +14920,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         isTelegramMigrationRaw(message.raw))
     )
       return;
+    let githubWorkflowTrigger: GitHubWorkflowTriggerMarker | null = endpoint.provider === "github"
+      ? (githubWorkflowTriggerMessages.get(message) ?? null)
+      : null;
     if (
       message.author.isMe ||
       message.author.isBot === true ||
       message.author.isSystem
-    )
-      return;
+    ) {
+      githubWorkflowTrigger = await githubWorkflowReviewTriggerAdmitted(
+        endpoint,
+        message,
+      );
+      if (!githubWorkflowTrigger) return;
+      githubWorkflowTriggerMessages.set(message, githubWorkflowTrigger);
+    }
     // One provider message can match both a mention handler and the catch-all
     // new-message handler. The trigger is policy metadata, not provider event
     // identity, so it must not defeat durable deduplication.
@@ -14711,6 +15104,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ...(githubAutomatic ? { githubAutomatic } : {}),
       ...(githubIssue ? { githubIssue } : {}),
       ...(githubManual ? { githubManual } : {}),
+      ...(githubWorkflowTrigger ? { githubWorkflowTrigger } : {}),
       principal: {
         // Bot/system authors have already been rejected at this intake boundary.
         isBot: false,
@@ -15645,6 +16039,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               )
               .then((rows) => rows[0] ?? null)
           : null;
+      if (!existingConversation && endpoint.provider === "github") {
+        // One live card per repo:PR. PR-level thread ids vary in repository
+        // casing across webhook paths (`Acme/app` vs
+        // `acme/app`), so the exact lookup above misses a still-open
+        // card bound under the other casing. Reuse that card so this event
+        // lands on it as a comment/wake instead of spawning a duplicate.
+        const fallback = await reuseOpenGitHubPullConversation(db, {
+          companyId: endpoint.companyId,
+          endpointId: endpoint.id,
+          threadId: thread.id,
+        });
+        if (fallback) {
+          existingConversation = fallback.conversation;
+          existingIssue = fallback.issue;
+        }
+      }
       if (
         isLinear &&
         existingConversation &&
@@ -16093,6 +16503,29 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ) => {
         let conversation = existingConversation;
         if (!conversation) {
+          const pullKey =
+            taskEndpoint.provider === "github"
+              ? githubPullThreadKey(thread.id)
+              : null;
+          if (pullKey) {
+            // Serialize concurrent first-events for one PR (e.g. a push and a
+            // mention arriving together under different thread casings). The
+            // loser reuses the winner's card instead of spawning a duplicate.
+            await taskTx.execute(
+              sql`select pg_advisory_xact_lock(hashtextextended(${`github-pull:${taskEndpoint.companyId}:${taskEndpoint.id}:${pullKey}`}, 0))`,
+            );
+            const raced = await reuseOpenGitHubPullConversation(taskTx, {
+              companyId: taskEndpoint.companyId,
+              endpointId: taskEndpoint.id,
+              threadId: thread.id,
+            });
+            if (raced) {
+              conversation = raced.conversation;
+              existingIssue = raced.issue;
+            }
+          }
+        }
+        if (!conversation) {
           const sessionGeneration = isLinear
             ? (latestConversation?.sessionGeneration ?? 0) + 1
             : 1;
@@ -16168,6 +16601,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!issue) throw notFound("Bound task not found");
           const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
         if (!taskUserId || ((githubAutomatic || githubIssue) && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
+            // Low-trust reviews run with no user principal, so the heartbeat
+            // refuses every agent secret binding by default. Allow exactly
+            // the assigned review agent's own model-provider credential
+            // binding(s) so the reviewer can start; every other secret stays
+            // refused. The lookup is scoped to this endpoint's assigned
+            // agent by construction, and any operator-set allowlist entries
+            // already on the issue boundary are preserved.
+            const lowTrustReviewAgentId =
+              taskEndpoint.assignedAgentId ?? endpoint.assignedAgentId;
+            const lowTrustModelBindingIds = await resolveLowTrustModelBindingIds(
+              taskTx,
+              {
+                companyId: endpoint.companyId,
+                agentId: lowTrustReviewAgentId,
+              },
+            );
+            const lowTrustAllowedSecretBindingIds = [
+              ...new Set([
+                ...readLowTrustAllowedBindingIds(
+                  githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary,
+                ),
+                ...lowTrustModelBindingIds,
+              ]),
+            ].sort();
             const reviewPreset = {
               id: LOW_TRUST_REVIEW_PRESET,
               version: LOW_TRUST_REVIEW_PRESET_VERSION,
@@ -16203,6 +16660,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                         "tests.local",
                       ],
                       ...githubPolicyRecord(githubPolicyRecord(issue.executionPolicy?.authorizationPolicy)?.trustBoundary),
+                      allowedSecretBindingIds: lowTrustAllowedSecretBindingIds,
                     },
                   },
                 },
@@ -16385,6 +16843,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             pullNumber: githubAutomatic.context.pullNumber, headSha: githubAutomatic.context.headSha,
             deliveryId: activeDelivery.id, configurationRevision: githubAutomatic.revision,
             policySnapshot: githubAutomatic.policy, event: githubAutomatic.context, state: "queued",
+            shadowLabel: githubAutomatic.shadowLabel ?? null,
           }).onConflictDoNothing();
         }
         await stageInboundWakeup(taskTx, {
@@ -16455,6 +16914,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const automaticAdmission = automaticContext ? await githubAutomaticAdmission(tx, currentEndpoint, automaticContext) : null;
         if (automaticContext && !automaticAdmission?.allowed) currentPrincipalAuthorization.allowed = false;
         if (automaticAdmission?.allowed) currentPrincipalAuthorization.userId = automaticAdmission.responsibleUserId ?? null;
+        if (githubWorkflowTrigger) {
+          const stillAllowed = await githubWorkflowTriggerStillAllowed(
+            tx,
+            currentEndpoint,
+            githubWorkflowTrigger,
+          );
+          if (!stillAllowed) currentPrincipalAuthorization.allowed = false;
+        }
         const endpointStillAllowed =
           currentEndpoint.status === "verifying" ||
           currentEndpoint.status === "active";
@@ -17294,11 +17761,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (endpointRuntime.provider === "github" && githubManual && typeof githubManual === "object") githubManualMessages.set(message, githubManual as { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" });
     const githubAutomatic = delivery.normalizedEvent.githubAutomatic;
     if (endpointRuntime.provider === "github" && githubAutomatic && typeof githubAutomatic === "object") {
-      githubAutomaticMessages.set(message, githubAutomatic as { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy });
+      githubAutomaticMessages.set(message, githubAutomatic as { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy; shadowLabel?: string | null });
     }
     const githubIssue = delivery.normalizedEvent.githubIssue;
     if (endpointRuntime.provider === "github" && githubIssue && typeof githubIssue === "object") {
       githubIssueMessages.set(message, githubIssue as { context: GitHubIssueEventContext; revision: number; policy: GitHubReviewPolicy });
+    }
+    const githubWorkflowTrigger = delivery.normalizedEvent.githubWorkflowTrigger;
+    if (endpointRuntime.provider === "github" && githubWorkflowTrigger && typeof githubWorkflowTrigger === "object") {
+      githubWorkflowTriggerMessages.set(message, githubWorkflowTrigger as GitHubWorkflowTriggerMarker);
     }
     if (
       endpointRuntime.provider === "github" ||
@@ -27463,7 +27934,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return new Response("accepted", { status: 202 });
     }
     if (provider === "github" && request.headers.get("x-github-event") === "pull_request") {
-      const event = githubAutomaticReviewEvent(await request.clone().json(), request.headers.get("x-github-delivery") ?? "");
+      const pullRequestPayload: unknown = await request.clone().json();
+      const transition = githubHeadTransition(pullRequestPayload);
+      if (transition) {
+        try {
+          await supersedeQueuedGitHubReviews(db, { companyId: endpoint.companyId, endpointId: endpoint.id, ...transition });
+        } catch (error) {
+          logger.warn({ endpointId: endpoint.id, error: redactError(error) }, "Superseding queued GitHub reviews failed");
+        }
+      }
+      const event = githubAutomaticReviewEvent(pullRequestPayload, request.headers.get("x-github-delivery") ?? "");
       if (!event) return new Response("ignored", { status: 200 });
       const admission = await githubAutomaticAdmission(db, endpoint, event);
       if (admission) await githubReviewCheckService(db, fetchImpl).enqueue(endpoint, event, admission.allowed, admission.reason);
@@ -27480,7 +27960,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         author: { userId: event.author.id, userName: event.author.login, fullName: event.author.login, isBot: false, isMe: false, isSystem: false },
         metadata: { dateSent: new Date(), edited: false }, attachments: [], links: [], isMention: true,
       } as unknown as Message;
-      githubAutomaticMessages.set(message, { context: event, revision: admission.revision, policy: admission.policy });
+      githubAutomaticMessages.set(message, { context: event, revision: admission.revision, policy: admission.policy, shadowLabel: admission.shadowLabel });
       await processMessage(endpoint, thread, message, "mention", true, `https://github.com/${event.repository}/pull/${event.pullNumber}`, { ...runtimeContext, endpointRuntime }, undefined, null, false);
       return new Response("accepted", { status: 202 });
     }
@@ -29434,6 +29914,121 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ? Buffer.from(JSON.stringify([last.createdAt, last.id])).toString("base64url")
         : null,
     };
+  }
+
+  /**
+   * Request one automatic review for a pull request head whose required checks
+   * are all green. GitHub data (author, head, checks) is read with the
+   * endpoint's own App token; authority is the PR author's, exactly as for a
+   * pull_request webhook, and the policy must list the checks_green event.
+   * Idempotent per head: a queued/running/completed review is never repeated.
+   */
+  async function requestGitHubReviewOnGreen(
+    endpointId: string,
+    repository: string,
+    pullNumber: number,
+  ): Promise<GitHubGreenRequestOutcome> {
+    const record = await endpointRecord(endpointId);
+    if (!record || record.endpoint.provider !== "github")
+      throw notFound("GitHub bot not found");
+    const endpoint = record.endpoint;
+    const [resource] = await db
+      .select()
+      .from(chatEndpointResources)
+      .where(
+        and(
+          eq(chatEndpointResources.companyId, endpoint.companyId),
+          eq(chatEndpointResources.endpointId, endpoint.id),
+          eq(chatEndpointResources.providerResourceId, repository.toLowerCase()),
+        ),
+      );
+    const repositoryId = String(resource?.metadata?.providerRepositoryId ?? "");
+    if (
+      !resource?.enabled ||
+      resource.availability !== "available" ||
+      !/^[1-9][0-9]*$/.test(repositoryId)
+    )
+      throw conflict("The repository is not enabled for this GitHub bot");
+    const prepared = await githubGreenReviewContext({
+      db,
+      fetchImpl,
+      companyId: endpoint.companyId,
+      endpointId: endpoint.id,
+      repositoryId,
+      repository: resource.providerResourceId,
+      pullNumber,
+    });
+    if (!prepared.ready) return prepared.outcome;
+    const event = prepared.context;
+    const admission = await githubAutomaticAdmission(db, endpoint, event);
+    if (admission)
+      await githubReviewCheckService(db, fetchImpl).enqueue(
+        endpoint,
+        event,
+        admission.allowed,
+        admission.reason,
+      );
+    if (!admission?.allowed)
+      return {
+        status: "not_admitted",
+        headSha: event.headSha,
+        reason: admission?.reason ?? "not_configured",
+      };
+    const previousAssessment = await githubPreviousAssessment(
+      db,
+      endpoint,
+      event.repositoryId,
+      event.pullNumber,
+    );
+    if (previousAssessment)
+      event.priorReviewedHeadSha = previousAssessment.headSha;
+    const endpointRuntime = await runtimeFor(endpoint);
+    const runtimeContext = runtimeContexts.get(endpointRuntime as object);
+    if (!runtimeContext)
+      throw conflict("Chat endpoint runtime is not current", {
+        code: "chat_endpoint_runtime_superseded",
+      });
+    const thread = endpointRuntime.thread(
+      `github:${event.repository}:${event.pullNumber}`,
+    );
+    const message = {
+      id: `pr-event:${event.deliveryId}`,
+      threadId: thread.id,
+      text: githubReviewPrompt(event, admission.policy, admission.revision),
+      formatted: { type: "root", children: [] },
+      raw: {},
+      author: {
+        userId: event.author.id,
+        userName: event.author.login,
+        fullName: event.author.login,
+        isBot: false,
+        isMe: false,
+        isSystem: false,
+      },
+      metadata: { dateSent: new Date(), edited: false },
+      attachments: [],
+      links: [],
+      isMention: true,
+    } as unknown as Message;
+    githubAutomaticMessages.set(message, {
+      context: event,
+      revision: admission.revision,
+      policy: admission.policy,
+      shadowLabel: admission.shadowLabel,
+    });
+    await processMessage(
+      endpoint,
+      thread,
+      message,
+      "mention",
+      true,
+      `https://github.com/${event.repository}/pull/${event.pullNumber}`,
+      { ...runtimeContext, endpointRuntime },
+      undefined,
+      null,
+      false,
+    );
+    return { status: "requested", headSha: event.headSha, reason: admission.reason };
   }
 
   async function replayDelivery(endpointId: string, deliveryId: string) {
@@ -33591,7 +34186,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     };
   }
 
-  async function postSafePublication(input: {
+  async function scrubGitHubPublication(
+    payload: SafeChatPublicationPayload,
+    companyId: string,
+  ): Promise<SafeChatPublicationPayload> {
+    const scope = await githubEgressReferenceScope(
+      db,
+      companyId,
+      getTaskBaseUrl(),
+    );
+    return {
+      ...payload,
+      text: scrubInternalReferences(payload.text, scope),
+      ...(payload.card
+        ? { card: scrubExternalChatCard(payload.card, scope) }
+        : {}),
+    };
+  }
+
+  async function postSafePublication(request: {
     endpoint: EndpointRow;
     conversation: ConversationRow;
     publication: typeof chatPublications.$inferSelect;
@@ -33603,6 +34216,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       receipt: SlackFileUploadAcceptedReceipt,
     ) => Promise<void>;
   }) {
+    const input =
+      request.endpoint.provider === "github"
+        ? {
+            ...request,
+            payload: await scrubGitHubPublication(
+              request.payload,
+              request.publication.companyId,
+            ),
+          }
+        : request;
     if (input.endpoint.provider === "speko") {
       const receipt = await voiceStore.enqueuePublication(input.endpoint.companyId, input.publication.id);
       scheduleMessageProcessing(() => voice.pushReplies(25, input.endpoint.companyId, input.endpoint.id).then(() => undefined));
@@ -33665,10 +34288,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           files = uploads;
         }
       } else if (files.length === 0) {
-        const taskUrl = safeChatTaskUrl(
-          getTaskBaseUrl(),
-          input.publication.issueId,
-        );
+        const taskUrl =
+          input.endpoint.provider === "github"
+            ? null
+            : safeChatTaskUrl(getTaskBaseUrl(), input.publication.issueId);
         if (
           input.endpoint.provider === "github" ||
           input.endpoint.provider === "microsoft-teams"
@@ -34074,169 +34697,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
-  /** Add navigation only from the exact accepted native input batch. The
-   * omission text/model response is not authority, nor is an older task file. */
-  async function githubCurrentOmissionPreparedText(
-    tx: DbOrTransaction,
-    publication: typeof chatPublications.$inferSelect,
-    endpoint: EndpointRow,
-  ): Promise<string | null | false> {
-    if (endpoint.provider !== "github") return null;
-    const preparationKey = `github-omission-navigation:${publication.id}`;
-    const [prepared] = await tx
-      .select()
-      .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.companyId, publication.companyId),
-          eq(chatActions.endpointId, publication.endpointId),
-          eq(chatActions.conversationId, publication.conversationId),
-          eq(chatActions.providerActionId, preparationKey),
-        ),
-      )
-      .limit(1);
-    // A prepared final cannot become a different kind of publication while
-    // retaining the decorated body. Check its receipt before these exclusions.
-    if (
-      !publication.commentId ||
-      publication.payload.progressState !== undefined ||
-      publication.payload.interactionId ||
-      publication.payload.card ||
-      publication.payload.attachmentIds?.length ||
-      publication.payload.transportPart ||
-      publication.idempotencyKey.startsWith("control:") ||
-      isExplicitOperatorPublication(publication)
-    )
-      return prepared ? false : null;
-    const taskUrl = prepared
-      ? typeof prepared.payload.taskUrl === "string"
-        ? safeChatTaskUrl(prepared.payload.taskUrl, publication.issueId)
-        : null
-      : safeChatTaskUrl(getTaskBaseUrl(), publication.issueId);
-    if (
-      prepared &&
-      (prepared.kind !== "github_omission_navigation" ||
-        prepared.status !== "processed" ||
-        prepared.payload.version !== 1 ||
-        prepared.payload.publicationId !== publication.id ||
-        taskUrl !== prepared.payload.taskUrl ||
-        prepared.payload.preparedTextSha256 !==
-          createHash("sha256").update(publication.payload.text).digest("hex"))
-    )
-      return false;
-    if (!taskUrl) return prepared ? false : null;
-    const [origin] = await tx
-      .select({ run: heartbeatRuns, resultId: nativeRunFinalizations.resultId })
-      .from(issueComments)
-      .innerJoin(
-        heartbeatRuns,
-        and(
-          eq(heartbeatRuns.id, issueComments.createdByRunId),
-          eq(heartbeatRuns.companyId, publication.companyId),
-          eq(heartbeatRuns.nativeIssueId, publication.issueId),
-          eq(heartbeatRuns.agentId, endpoint.assignedAgentId),
-          eq(heartbeatRuns.runtimeMode, "native"),
-          eq(heartbeatRuns.status, "succeeded"),
-          isNotNull(heartbeatRuns.finishedAt),
-        ),
-      )
-      .innerJoin(
-        nativeRunFinalizations,
-        and(
-          eq(nativeRunFinalizations.companyId, publication.companyId),
-          eq(nativeRunFinalizations.issueId, publication.issueId),
-          eq(nativeRunFinalizations.runId, heartbeatRuns.id),
-          eq(nativeRunFinalizations.phase, "committed"),
-        ),
-      )
-      .where(
-        and(
-          eq(issueComments.id, publication.commentId),
-          eq(issueComments.companyId, publication.companyId),
-          eq(issueComments.issueId, publication.issueId),
-          eq(issueComments.authorAgentId, endpoint.assignedAgentId),
-          isNull(issueComments.deletedAt),
-        ),
-      )
-      .limit(1);
-    const presentation = origin?.run.resultJson?.presentationDecision as
-      Record<string, unknown> | undefined;
-    if (!origin?.resultId || presentation?.commentId !== publication.commentId)
-      return prepared ? false : null;
-    if (
-      prepared &&
-      (prepared.payload.runId !== origin.run.id ||
-        prepared.payload.resultId !== origin.resultId)
-    )
-      return false;
-    try {
-      // This existing publication proof includes the accepted response_wake
-      // result, immutable owner/coalesced receipts, every current source,
-      // runtime/generation, source edits/deletes and current principal access.
-      const source = await failedChatRetrySource(tx, {
-        companyId: publication.companyId,
-        issueId: publication.issueId,
-        agentId: origin.run.agentId,
-        failedRunId: origin.run.id,
-        publication: true,
-        committedResponse: { resultId: origin.resultId },
-      });
-      if (
-        source.endpointId !== endpoint.id ||
-        source.conversationId !== publication.conversationId
-      )
-        return prepared ? false : null;
-      const omitted = source.sources.some((entry) => {
-        const count = (
-          entry.omissionReasons as Record<string, unknown> | undefined
-        )?.download_unavailable;
-        return (
-          typeof count === "number" && Number.isSafeInteger(count) && count > 0
-        );
-      });
-      if (!omitted) return prepared ? false : null;
-      if (prepared) return publication.payload.text;
-      const text = publication.payload.text.includes(taskUrl)
-        ? publication.payload.text
-        : `${publication.payload.text}\n\n[Open this Paperclip task](${taskUrl})`;
-      await tx.insert(chatActions).values({
-        companyId: publication.companyId,
-        endpointId: publication.endpointId,
-        conversationId: publication.conversationId,
-        kind: "github_omission_navigation",
-        providerActionId: preparationKey,
-        status: "processed",
-        payload: {
-          version: 1,
-          publicationId: publication.id,
-          runId: origin.run.id,
-          resultId: origin.resultId,
-          taskUrl,
-          preparedTextSha256: createHash("sha256").update(text).digest("hex"),
-        },
-      });
-      return text;
-    } catch (error) {
-      if (
-        isExternalChatWaitAuthorizationContention(error) ||
-        error instanceof NativeChatReviewPresentationContentionError
-      )
-        throw new NativeChatReviewPresentationContentionError();
-      if (
-        isExternalActionAuthorizationChange(error) ||
-        (error &&
-          typeof error === "object" &&
-          "details" in error &&
-          error.details &&
-          typeof error.details === "object" &&
-          "code" in error.details &&
-          error.details.code === "chat_failed_run_retry_not_authorized")
-      )
-        return prepared ? false : null;
-      throw new FailedChatRetryPublicationReadError();
-    }
-  }
-
   async function claimPublicationTransportAuthorization(input: {
     credentialLease: CredentialMutationLeaseGuard;
     endpoint: EndpointRow;
@@ -34246,7 +34706,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     authorizationActionId: string | null;
     conversation: ConversationRow;
     endpoint: EndpointRow;
-    preparedText: string | null;
   } | null> {
     return db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
@@ -34462,12 +34921,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           }
         }
       }
-      const preparedText = await githubCurrentOmissionPreparedText(
-        tx,
-        input.publication,
-        endpoint,
-      );
-      if (preparedText === false) return null;
       if (authorizationAction?.principalId) {
         const authorization = await lockCurrentPrincipalAuthorization(
           tx,
@@ -34497,17 +34950,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         if (!claimedAuthorization) return null;
         authorizationActionId = claimedAuthorization.id;
       }
-      if (preparedText !== null) {
-        // Persist the exact provider text before I/O. A retry must reuse this
-        // body, not accumulate links or regenerate it from changed settings.
-        await notifyChatPublicationWork(tx);
-        await tx
-          .update(chatPublications)
-          .set({
-            payload: { ...input.publication.payload, text: preparedText },
-          })
-          .where(eq(chatPublications.id, input.publication.id));
-      }
       await input.credentialLease.assertOwned(tx);
       // The publication's streaming row plus the optional authorization action
       // are the durable transport claim. Their database locks are released
@@ -34518,7 +34960,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         authorizationActionId,
         conversation,
         endpoint,
-        preparedText,
       };
     });
   }
@@ -37587,6 +38028,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ]);
         if (!endpoint || !conversation)
           throw new Error("Chat publication binding is unavailable");
+        if (
+          endpoint.provider === "github" &&
+          ((await githubEndpointShadowLabel(endpoint.id)) ||
+            (await githubPinnedShadowLabel({
+              companyId: publication.companyId,
+              endpointId: endpoint.id,
+              issueId: publication.issueId,
+            })))
+        ) {
+          // Shadow review endpoints never create GitHub objects: agent
+          // replies, milestones and interaction prompts stay in Paperclip.
+          // The pinned row label keeps suppressing this review task's
+          // output even after shadow mode is disabled in config.
+          await publicationLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({
+              state: "cancelled",
+              redactedError: "Shadow review endpoint does not publish to GitHub",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, publication.id),
+                eq(chatPublications.state, "streaming"),
+                eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+            );
+          return;
+        }
         const providerVisibleCompletion =
           conversation.state === "completed" &&
           !isExplicitOperatorPublication(publication) &&
@@ -37782,7 +38253,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // not when the command was admitted. If an already-streaming final
         // publication won the race, this reply reflects Paperclip's latest
         // authoritative task state after that earlier send commits.
-        let payload = await currentTaskControlPayload(publication);
+        const payload = await currentTaskControlPayload(publication);
         await withCredentialMutationLease(
           recordForLease.endpoint,
           async (credentialGuard) => {
@@ -37874,8 +38345,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               // point. Provider I/O runs without a database transaction or
               // row lock. The renewable lease preserves credential/runtime
               // identity until conditional settlement.
-              if (authorizationClaim.preparedText !== null)
-                payload = { ...payload, text: authorizationClaim.preparedText };
               const telegramDraft =
                 authorizationClaim.endpoint.provider === "telegram" &&
                 authorizationClaim.conversation.isDirectMessage &&
@@ -39059,6 +39528,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     listActivity,
     listActivityPage,
     replayDelivery,
+    requestGitHubReviewOnGreen,
     replayPublication,
     resolveAction,
     resolvePublication,
