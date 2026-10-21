@@ -734,14 +734,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
-        // TOG-28460: agents row first (FOR NO KEY UPDATE, NOWAIT) so this
-        // gate matches the claim transactions' agents-then-issue order.
-        // Reverse order deadlocks (40P01) with concurrent claims that hold
-        // the agents row and wait on the issue row. NOWAIT preserves the
-        // gate's non-blocking contract: contention defers to the queue.
-        await tx.execute(
-          sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update nowait`,
-        );
+        // TOG-28460: claim takes the agents row first (FOR NO KEY UPDATE,
+        // NOWAIT) so this gate matches the claim transactions'
+        // agents-then-issue order. Reverse order deadlocks (40P01) with
+        // concurrent claims that hold the agents row and wait on the issue
+        // row. NOWAIT preserves the gate's non-blocking contract:
+        // contention defers to the queue. Dispatch never claims, so it
+        // skips the agents lock and contends only on issue/wake/run rows.
+        if (stage === "claim") {
+          await tx.execute(
+            sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for no key update nowait`,
+          );
+        }
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
