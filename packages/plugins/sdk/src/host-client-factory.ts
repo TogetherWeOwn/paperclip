@@ -268,10 +268,11 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["issues.documents.delete"][0]): Promise<WorkerToHostMethods["issues.documents.delete"][1]>;
   };
 
-  /** Provides `agents.list`, `agents.get`, `agents.pause`, `agents.resume`, `agents.invoke`. */
+  /** Provides `agents.list`, `agents.get`, `agents.getQueuedRunCounts`, `agents.pause`, `agents.resume`, `agents.invoke`. */
   agents: {
     list(params: WorkerToHostMethods["agents.list"][0]): Promise<WorkerToHostMethods["agents.list"][1]>;
     get(params: WorkerToHostMethods["agents.get"][0]): Promise<WorkerToHostMethods["agents.get"][1]>;
+    getQueuedRunCounts(params: WorkerToHostMethods["agents.getQueuedRunCounts"][0]): Promise<WorkerToHostMethods["agents.getQueuedRunCounts"][1]>;
     pause(params: WorkerToHostMethods["agents.pause"][0]): Promise<WorkerToHostMethods["agents.pause"][1]>;
     resume(params: WorkerToHostMethods["agents.resume"][0]): Promise<WorkerToHostMethods["agents.resume"][1]>;
     invoke(params: WorkerToHostMethods["agents.invoke"][0]): Promise<WorkerToHostMethods["agents.invoke"][1]>;
@@ -487,6 +488,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Agents
   "agents.list": "agents.read",
   "agents.get": "agents.read",
+  "agents.getQueuedRunCounts": "agents.queued_counts.read",
   "agents.pause": "agents.pause",
   "agents.resume": "agents.resume",
   "agents.invoke": "agents.invoke",
@@ -975,6 +977,9 @@ export function createHostClientHandlers(
     }),
     "agents.get": gated("agents.get", async (params) => {
       return services.agents.get(params);
+    }),
+    "agents.getQueuedRunCounts": gated("agents.getQueuedRunCounts", async (params) => {
+      return services.agents.getQueuedRunCounts(params);
     }),
     "agents.pause": gated("agents.pause", async (params) => {
       return services.agents.pause(params);
