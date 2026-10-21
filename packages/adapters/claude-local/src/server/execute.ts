@@ -33,6 +33,7 @@ import {
   applyPaperclipWorkspaceEnv,
   buildPaperclipEnv,
   isPaperclipSkillSourceMissing,
+  PAPERCLIP_OPERATIONAL_SKILL_KEY,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   joinPromptSections,
@@ -551,10 +552,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Missing-source entries must never reach the bundle: their path does not
   // exist, so the bundle hasher would throw and fail the whole run over one
   // broken skill. Log each one instead so the cause lands in the run output.
+  // Exception: the required operational skill carries the credential rules, so
+  // a desired-but-missing operational skill refuses the launch instead of
+  // running unguided.
   const desiredSkillEntries = claudeSkillEntries.filter((entry) => desiredSkillNames.has(entry.key));
   const mountableSkillEntries = desiredSkillEntries.filter((entry) => !isPaperclipSkillSourceMissing(entry));
   for (const entry of desiredSkillEntries) {
     if (!isPaperclipSkillSourceMissing(entry)) continue;
+    if (entry.key.trim().toLowerCase() === PAPERCLIP_OPERATIONAL_SKILL_KEY) {
+      throw new Error(
+        `[paperclip] Refusing to launch: required skill "${entry.key}" is enabled but its files are unavailable${entry.missingDetail ? `: ${entry.missingDetail}` : ""}; launching without the operational credential rules is not allowed.`,
+      );
+    }
     await onLog(
       "stderr",
       `[paperclip] Warning: skill "${entry.key}" is enabled for this agent but its files are unavailable and it was not mounted${entry.missingDetail ? `: ${entry.missingDetail}` : "."}\n`,
