@@ -56,6 +56,7 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  prepareNoCodeExecutionTarget,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
   type AdapterExecutionTarget,
@@ -21615,7 +21616,7 @@ export function heartbeatService(
         agent.adapterType,
         sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
       );
-      const explicitResumeSessionDisplayId = truncateDisplayId(
+      const explicitResumeSessionDisplayId = noCodeWorkspace ? null : truncateDisplayId(
         readNonEmptyString(context.resumeSessionDisplayId) ??
           (sessionCodec.getDisplayId
             ? sessionCodec.getDisplayId(explicitResumeSessionParams)
@@ -21915,8 +21916,29 @@ export function heartbeatService(
           : null;
       const persistedNativeExecutionWorkspaceId =
         persistedNativeExecutionInput?.binding.executionWorkspaceId ?? null;
-      if (noCodeWorkspace && persistedNativeExecutionWorkspaceId) {
-        throw new Error("No-code workspace selection conflicts with the immutable native recovery workspace binding");
+      if (noCodeWorkspace && persistedNativeExecutionInput) {
+        const binding = persistedNativeExecutionInput.binding;
+        const workspace = persistedNativeExecutionInput.workspace;
+        const home = await fs.realpath(resolveDefaultAgentWorkspaceDir(agent.id));
+        if (
+          binding.executionWorkspaceId !== run.id ||
+          binding.runId !== run.id || binding.companyId !== agent.companyId ||
+          binding.agentId !== agent.id || binding.issueId !== issueRef?.id ||
+          workspace.cwd !== path.join(home, "no-code", issueRef.id) ||
+          workspace.repoUrl !== null || workspace.repoRef !== null || workspace.branchName !== null
+        ) {
+          throw new Error("No-code workspace selection conflicts with the immutable native recovery workspace binding");
+        }
+        if (persistedRunnerProfile.sessionCheckpoint != null) {
+          const identity = parseObject(parseObject(persistedRunnerProfile.sessionCheckpoint).identity);
+          if (
+            identity.runId !== run.id || identity.companyId !== agent.companyId ||
+            identity.agentId !== agent.id || identity.issueId !== issueRef.id ||
+            identity.sessionId !== persistedNativeExecutionInput.session.normalizedSessionId
+          ) {
+            throw new Error("No-code recovery cannot adopt an earlier provider session checkpoint");
+          }
+        }
       }
       const requestedExecutionWorkspaceId =
         persistedNativeExecutionWorkspaceId ??
@@ -22478,7 +22500,7 @@ export function heartbeatService(
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
-      const taskSessionForRun = resetTaskSession ? null : taskSession;
+      const taskSessionForRun = resetTaskSession || noCodeWorkspace ? null : taskSession;
       const previousSessionParams = noCodeWorkspace ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
@@ -23353,7 +23375,9 @@ export function heartbeatService(
       // and lease scope instead of silently creating a per-run replacement.
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
-      const executionTarget = realizationResult.executionTarget;
+      const executionTarget = noCodeWorkspace
+        ? await prepareNoCodeExecutionTarget({ runId: run.id, target: realizationResult.executionTarget }) ?? null
+        : realizationResult.executionTarget;
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -23694,7 +23718,7 @@ export function heartbeatService(
         context.projectId = executionWorkspace.projectId;
       }
       const runtimeSessionFallback =
-        taskKey || resetTaskSession
+        taskKey || resetTaskSession || noCodeWorkspace
           ? null
           : isCanonicalSessionIdForAdapter(agent.adapterType, runtime.sessionId)
             ? runtime.sessionId
@@ -24302,7 +24326,7 @@ export function heartbeatService(
                     return requests.length > 0 ? requests : undefined;
                   })(),
                 });
-          const taskNativeSessionId = !taskSessionCredentialCompatible ? null : readNonEmptyString(
+          const taskNativeSessionId = noCodeWorkspace || !taskSessionCredentialCompatible ? null : readNonEmptyString(
             taskSessionDecodedParams?.sessionId,
           );
           // Compatibility for native retry rows created before same-run restart
@@ -24358,7 +24382,7 @@ export function heartbeatService(
                   .then((rows) => rows.length > 0)
               : false;
           const compatibleLegacyRetrySource =
-            !managedAiRuntime && !isConversation(issueContext) && context.forceFreshSession !== true && isUnusedLegacyNativeRetryReplacement({
+            !noCodeWorkspace && !managedAiRuntime && !isConversation(issueContext) && context.forceFreshSession !== true && isUnusedLegacyNativeRetryReplacement({
               replacement: run,
               source: legacyRetrySource,
               hasProviderEvents: nativeBootstrapHasProviderEvidence,
@@ -24383,7 +24407,7 @@ export function heartbeatService(
           // Rows that already acquired provider authority are progress barriers,
           // even when they do not contain a usable checkpoint.
           const previousNativeRun =
-            requestedNativeSessionId &&
+            !noCodeWorkspace && requestedNativeSessionId &&
             isUnusedNativeSessionBootstrap(
               run,
               nativeBootstrapHasProviderEvidence,
@@ -24890,7 +24914,7 @@ export function heartbeatService(
           });
           if (!nativeSelected) return;
           controllerLease.stop();
-          nativeWorkspaceSync = await prepareNativeWorkspaceSync({
+          nativeWorkspaceSync = noCodeWorkspace ? null : await prepareNativeWorkspaceSync({
             db,
             runId: run.id,
             companyId: agent.companyId,

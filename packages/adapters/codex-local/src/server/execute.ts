@@ -850,6 +850,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               targetWorkspaceRealization?.mode === "in_place"
                 ? targetWorkspaceRealization.authoritativeRoot
                 : undefined,
+            noCodeWorkspace: workspaceContext.mode === "no_code",
             syncWorkspace: workspaceContext.mode !== "no_code" && targetWorkspaceRealization?.mode !== "in_place",
             installCommand: SANDBOX_INSTALL_COMMAND,
             detectCommand: command,

@@ -1438,6 +1438,51 @@ export function readAdapterExecutionTarget(input: {
   );
 }
 
+export async function prepareNoCodeExecutionTarget(input: {
+  runId: string;
+  target: AdapterExecutionTarget | null | undefined;
+}): Promise<AdapterExecutionTarget | null | undefined> {
+  const target = input.target;
+  if (!target || target.kind === "local") return target;
+  if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) {
+    throw new Error("Invalid no-code execution run ID");
+  }
+  const root = target.workspaceRealization?.authoritativeRoot ??
+    (target.transport === "ssh" ? target.spec.remoteWorkspacePath : target.remoteCwd);
+  if (!root || !path.posix.isAbsolute(root) || path.posix.normalize(root) !== root || root === "/") {
+    throw new Error("No-code execution requires an authorized ordinary environment root");
+  }
+  const cwd = path.posix.join(root, ".paperclip-runtime", "no-code", input.runId);
+  // Refuse directory/Git substitutions without removing or transferring data.
+  // Even the authorized root must not place this directory inside a repository.
+  const command = [
+    "set -eu",
+    `root=${shellQuote(root)}`,
+    '[ -d "$root" ] && [ ! -L "$root" ]',
+    '[ "$(cd "$root" && pwd -P)" = "$root" ]',
+    'parent="$root"',
+    'while :; do if [ -e "$parent/.git" ] || [ -L "$parent/.git" ]; then exit 1; fi; [ "$parent" != / ] || break; parent=$(dirname "$parent"); done',
+    'current="$root"',
+    `for segment in .paperclip-runtime no-code ${shellQuote(input.runId)}; do`,
+    '  current="$current/$segment"',
+    '  [ ! -L "$current" ]',
+    '  if [ ! -e "$current" ]; then mkdir "$current"; fi',
+    '  if [ ! -d "$current" ] || [ -e "$current/.git" ] || [ -L "$current/.git" ]; then exit 1; fi',
+    "done",
+  ].join("\n");
+  if (target.transport === "ssh") {
+    await runSshCommand(target.spec, command);
+  } else {
+    const result = await requireSandboxRunner(target).execute({
+      command: "sh", args: ["-c", command], timeoutMs: 30_000,
+    });
+    if (result.exitCode !== 0 || result.timedOut || result.signal) {
+      throw new Error("No-code execution directory is not an ordinary non-repository directory inside the authorized environment root");
+    }
+  }
+  return overrideAdapterExecutionTargetRemoteCwd(target, cwd);
+}
+
 export async function prepareAdapterExecutionTargetRuntime(input: {
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
@@ -1446,6 +1491,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   timeoutSec?: number;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
+  noCodeWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceBaseline?: DirectorySnapshot;
@@ -1470,7 +1516,17 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   // SSH and local lanes ignore it. The default is a no-op.
   runtimeSpan?: RuntimeSpanRunner;
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
-  const target = input.target ?? { kind: "local" as const };
+  const target = (input.noCodeWorkspace
+    ? await prepareNoCodeExecutionTarget(input)
+    : input.target) ?? { kind: "local" as const };
+  if (input.noCodeWorkspace) {
+    input = {
+      ...input,
+      workspaceRemoteDir: target.kind === "remote" ? target.remoteCwd : undefined,
+      syncWorkspace: false,
+      additionalSources: [],
+    };
+  }
   if (target.kind === "local") {
     return {
       target,

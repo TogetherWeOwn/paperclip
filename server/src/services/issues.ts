@@ -482,7 +482,8 @@ function buildPreRealizationExecutionWorkspaceSettings(
   const mode =
     settings.mode &&
     settings.mode !== "inherit" &&
-    settings.mode !== "reuse_existing"
+    settings.mode !== "reuse_existing" &&
+    settings.mode !== "no_code"
       ? settings.mode
       : null;
   const next: Record<string, unknown> = {};
@@ -10675,7 +10676,17 @@ export function issueService(db: Db) {
         assigneeAdapterOverrides: existing.assigneeAdapterOverrides,
         ...issueData,
       };
-      const noCodeConflict = noCodeWorkspaceSelectionConflict(effectiveNoCodeSelection);
+      const workspaceSelectionChanged =
+        issueData.executionWorkspaceSettings !== undefined ||
+        issueData.projectWorkspaceId !== undefined ||
+        issueData.executionWorkspaceId !== undefined ||
+        issueData.executionWorkspacePreference !== undefined ||
+        issueData.assigneeAdapterOverrides !== undefined;
+      // Legacy conflicting rows must still permit status/disposition recovery.
+      // Dispatch validates the full row before any workspace or provider work.
+      const noCodeConflict = workspaceSelectionChanged
+        ? noCodeWorkspaceSelectionConflict(effectiveNoCodeSelection)
+        : null;
       if (noCodeConflict) throw unprocessable(noCodeConflict);
       const noCodeWorkspaceRequested = parseObject(effectiveNoCodeSelection.executionWorkspaceSettings).mode === "no_code";
       if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace && !noCodeWorkspaceRequested) {

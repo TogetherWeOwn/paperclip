@@ -699,6 +699,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterKey: "claude",
           timeoutSec,
           workspaceLocalDir: cwd,
+          noCodeWorkspace: workspaceContext.mode === "no_code",
           syncWorkspace: workspaceContext.mode !== "no_code",
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,

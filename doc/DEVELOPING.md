@@ -811,6 +811,17 @@ provisioning and working-tree seed/restore. The task keeps its project identity
 and all company, environment, sandbox, credential and authorization checks.
 Runtime instructions, skills and authentication assets may still transfer.
 
+Remote no-code execution uses a separate run directory below the authorized
+execution root. It does not use a configured repository cwd or a child of that
+repository. A symlink substitution or Git metadata in the selected directory or
+its ancestors fails preparation without deleting files. An environment whose
+authorized root is itself a repository must use an ordinary authorized root for
+no-code work; this setting never grants access outside the configured root.
+Native queued recovery can reuse its own immutable transient no-code input, but
+cannot adopt a code-workspace binding or a checkpoint from an earlier run.
+Unrelated status, title and comment recovery writes remain possible on a legacy
+conflicting row; dispatch still rejects that row before repository work.
+
 A conflicting execution-workspace binding or preference, project-workspace choice,
 or task-level workspace strategy, runtime or cwd override must be explicitly
 removed first. The API rejects conflicts rather than discarding either choice.
