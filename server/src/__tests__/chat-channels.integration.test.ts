@@ -68029,17 +68029,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).resolves.toEqual([
         { conversationId: conversation!.id, state: "processed" },
       ]);
-      await expect(
-        db
-          .select({ body: issueComments.body })
-          .from(issueComments)
-          .where(eq(issueComments.issueId, conversation!.issueId)),
-      ).resolves.toEqual([
-        { body: "@maya original mixed-case request" },
-        {
-          body: "An external message was edited:\n\n@maya corrected mixed-case request",
-        },
-      ]);
+      const commentRows = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation!.issueId));
+      // Row order is plan-dependent without ORDER BY (flaked red in CI);
+      // both comments landing on the conversation thread is the assertion.
+      expect(commentRows.map((row) => row.body).sort()).toEqual(
+        [
+          "@maya original mixed-case request",
+          "An external message was edited:\n\n@maya corrected mixed-case request",
+        ].sort(),
+      );
     } finally {
       await service.shutdown();
     }
