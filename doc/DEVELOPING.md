@@ -810,6 +810,11 @@ No-code preparation skips project and referenced repository checkout, repository
 provisioning and working-tree seed/restore. The task keeps its project identity
 and all company, environment, sandbox, credential and authorization checks.
 Runtime instructions, skills and authentication assets may still transfer.
+Company imports retain the explicit opt-in and its restrictions under either
+feature-flag state, reject conflicting explicit choices atomically, and do not
+attach an implicit project workspace. Referenced projects must belong to the
+target company. Local preparation checks every ancestor before creating children;
+a symlinked configured home is rejected, not adopted through its canonical path.
 
 Remote no-code execution uses a separate run directory below the authorized
 execution root. It does not use a configured repository cwd or a child of that

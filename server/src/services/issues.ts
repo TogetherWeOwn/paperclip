@@ -10295,8 +10295,9 @@ export function issueService(db: Db) {
               ),
             )
             .then((r) => r[0] ?? null);
+          if (!projectRow) throw unprocessable("Imported project must belong to the target company");
           const policy = parseProjectExecutionWorkspacePolicy(
-            projectRow?.executionWorkspacePolicy,
+            projectRow.executionWorkspacePolicy,
           );
           let defaultProjectWorkspaceId =
             policy?.defaultProjectWorkspaceId ?? null;
@@ -10366,16 +10367,19 @@ export function issueService(db: Db) {
 
           const projectId = row.projectId ?? null;
           let projectWorkspaceId = row.projectWorkspaceId ?? null;
-          // Isolated-workspace fields are gated the same way create() gates them:
-          // when the experiment is off the imported settings are dropped.
-          let executionWorkspaceSettings = isolatedWorkspacesEnabled
+          const noCodeWorkspaceRequested = parseObject(row.executionWorkspaceSettings).mode === "no_code";
+          const noCodeConflict = noCodeWorkspaceSelectionConflict(row);
+          if (noCodeConflict) throw unprocessable(noCodeConflict);
+          // Match create(): task-local no-code survives the experiment gate and
+          // never acquires an implicit project code-workspace binding.
+          let executionWorkspaceSettings = isolatedWorkspacesEnabled || noCodeWorkspaceRequested
             ? (row.executionWorkspaceSettings ?? null)
             : null;
           let projectGoalId: string | null = null;
           if (projectId) {
             const derived = await loadProjectDerived(projectId);
             projectGoalId = derived.goalId;
-            if (!projectWorkspaceId)
+            if (!noCodeWorkspaceRequested && !projectWorkspaceId)
               projectWorkspaceId = derived.defaultProjectWorkspaceId;
             if (executionWorkspaceSettings == null) {
               executionWorkspaceSettings =

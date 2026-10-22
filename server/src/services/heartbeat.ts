@@ -12950,33 +12950,28 @@ export function heartbeatService(
     },
   ): Promise<ResolvedWorkspaceForRun> {
     if (opts?.noCodeIssueId) {
-      const home = resolveDefaultAgentWorkspaceDir(agent.id);
-      await fs.mkdir(home, { recursive: true });
-      const canonicalHome = await fs.realpath(home);
-      let cwd = canonicalHome;
-      // A separate ordinary task directory cannot adopt an old repository/session.
-      // Refuse symlinks and Git roots instead of deleting or reusing their contents.
-      for (const segment of ["no-code", opts.noCodeIssueId]) {
+      const home = path.resolve(resolveDefaultAgentWorkspaceDir(agent.id));
+      const root = path.parse(home).root;
+      let cwd = root;
+      // Validate from the filesystem root down before creating each child. A
+      // canonical destination is not authority to follow a substituted ancestor.
+      for (const segment of ["", ...home.slice(root.length).split(path.sep), "no-code", opts.noCodeIssueId]) {
+        cwd = path.join(cwd, segment);
+        const stats = await fs.lstat(cwd).catch(async (error) => {
+          if (error.code !== "ENOENT") throw error;
+          await fs.mkdir(cwd).catch((mkdirError) => {
+            if (mkdirError.code !== "EEXIST") throw mkdirError;
+          });
+          return fs.lstat(cwd);
+        });
+        if (!stats.isDirectory() || stats.isSymbolicLink() || await fs.realpath(cwd) !== cwd) {
+          throw new Error("No-code execution directory and its ancestors must be ordinary non-symlink directories inside the agent workspace");
+        }
         if (await fs.lstat(path.join(cwd, ".git")).then(() => true, (error) => {
           if (error.code === "ENOENT") return false;
           throw error;
-        })) throw new Error("No-code execution directory conflicts with an existing Git workspace");
-        cwd = path.join(cwd, segment);
-        await fs.mkdir(cwd).catch((error) => {
-          if (error.code !== "EEXIST") throw error;
-        });
-        const stats = await fs.lstat(cwd);
-        if (!stats.isDirectory() || stats.isSymbolicLink()) {
-          throw new Error("No-code execution directory must be an ordinary directory inside the agent workspace");
-        }
+        })) throw new Error("No-code execution directory conflicts with an existing Git workspace ancestor");
       }
-      if (!(await fs.realpath(cwd)).startsWith(`${canonicalHome}${path.sep}`)) {
-        throw new Error("No-code execution directory escaped the agent workspace");
-      }
-      if (await fs.lstat(path.join(cwd, ".git")).then(() => true, (error) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      })) throw new Error("No-code execution directory conflicts with an existing Git workspace");
       return {
         cwd, source: "agent_home", projectId: readNonEmptyString(context.projectId),
         workspaceId: null, repoUrl: null, repoRef: null, workspaceHints: [], warnings: [],

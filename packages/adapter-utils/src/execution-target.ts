@@ -1471,7 +1471,9 @@ export async function prepareNoCodeExecutionTarget(input: {
     "done",
   ].join("\n");
   if (target.transport === "ssh") {
-    await runSshCommand(target.spec, command);
+    await runSshCommand(target.spec, command).catch((cause) => {
+      throw new Error("No-code execution directory is not an ordinary non-repository directory inside the authorized environment root", { cause });
+    });
   } else {
     const result = await requireSandboxRunner(target).execute({
       command: "sh", args: ["-c", command], timeoutMs: 30_000,
