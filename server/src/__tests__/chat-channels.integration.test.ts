@@ -10189,12 +10189,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
       const admitted = await admitShadowTestPullRequest(f, head);
+      // Settling the admission delivery kicks a background tryAcknowledge
+      // that holds the per-PR lease while posting its working comment; a
+      // check dispatch that loses the lease silently skips, leaving the
+      // intent received instead of cancelled. Wait for the ack to settle
+      // first — its provider calls must also land before the recorder
+      // install below, or they pollute the no-provider-call assertions.
+      // Processed, failed, or cancelled all mean it will never run
+      // again: nothing retries it during this test.
+      await expect.poll(async () => {
+        const [row] = await db.select({ status: chatActions.status }).from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+        return row !== undefined && ["processed", "failed", "cancelled"].includes(row.status);
+      }, { timeout: 10000 }).toBe(true);
       // Model an intent from before the insertion tripwire. Its exact delivery
       // has capture authority, even if no review record survived the old run.
       await db.update(chatDeliveries).set({ githubShadowLabel: "meta-shadow" }).where(eq(chatDeliveries.id, admitted.deliveryId));
       await db.delete(chatGitHubReviews).where(eq(chatGitHubReviews.id, admitted.id));
       const recorder = installShadowRecorder(f, head);
-      await githubReviewCheckService(db, f.providerFetch).processPending();
+      const [staged] = await shadowTestActions(f.endpoint.id, "github_review_check");
+      expect(staged?.status).toBe("received");
+      // Retry until the dispatch lands: a lease loss skips silently, and
+      // only a landed dispatch cancels. Later dispatches are no-ops: the
+      // landed action is cancelled with shadow_mode.
+      await expect.poll(async () => {
+        await githubReviewCheckService(db, f.providerFetch).processPending();
+        const [row] = await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, staged.id));
+        return row?.status ?? null;
+      }, { timeout: 10000 }).toBe("cancelled");
       const [action] = await shadowTestActions(f.endpoint.id, "github_review_check");
       expect(action).toMatchObject({ status: "cancelled", result: { code: "shadow_mode" } });
       expect(recorder.mutations).toHaveLength(0);
