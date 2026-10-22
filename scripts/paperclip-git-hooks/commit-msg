@@ -1,0 +1,47 @@
+#!/bin/sh
+# Paperclip image commit-msg hook.
+#
+# Appends `Paperclip-Agent: <agent-id>` and `Paperclip-Run: <run-id>` trailers
+# to every agent commit, OVERWRITING any pre-existing Paperclip-* trailer lines
+# with the run-env values. The test-guard gate reads the LAST trailer line, so
+# the hook's values always win over a forged earlier line.
+#
+# Contract:
+#   * ids come from PAPERCLIP_AGENT_ID / PAPERCLIP_RUN_ID (platform-set env);
+#   * idempotent when identical (strip-then-append);
+#   * fail-open: any problem -> exit 0 without touching the message;
+#   * NEVER invokes git (runs inside git; the managed git launcher would recurse).
+# Install: root-owned 0755 at /usr/local/share/paperclip-git-hooks/commit-msg
+# (baked into the image; see Dockerfile), referenced by core.hooksPath in each
+# execution checkout (set by workspace provisioning).
+set -u
+
+MSG_FILE="${1:-}"
+AGENT_ID="${PAPERCLIP_AGENT_ID:-}"
+RUN_ID="${PAPERCLIP_RUN_ID:-}"
+
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+[ -n "$AGENT_ID" ] && [ -n "$RUN_ID" ] || exit 0
+
+# Refuse surprising values: ids are uuid-ish tokens only.
+case "$AGENT_ID" in *[!A-Za-z0-9_-]* ) exit 0;; esac
+case "$RUN_ID" in *[!A-Za-z0-9_-]* ) exit 0;; esac
+
+TMP="$(mktemp "${MSG_FILE}.hook.XXXXXX")" || exit 0
+# Strip pre-existing Paperclip trailers (grep exits 1 when nothing remains).
+grep -v -e '^Paperclip-Agent:' -e '^Paperclip-Run:' "$MSG_FILE" > "$TMP"
+rc=$?
+if [ "$rc" -gt 1 ]; then rm -f "$TMP"; exit 0; fi
+
+# Ensure a blank line separates body from trailers (skip when the file is
+# empty or already ends blank, so amends stay idempotent).
+if [ -s "$TMP" ] && [ -n "$(tail -n 1 "$TMP")" ]; then
+  printf '
+' >> "$TMP"
+fi
+printf '%s
+' "Paperclip-Agent: $AGENT_ID" "Paperclip-Run: $RUN_ID" >> "$TMP"
+
+cat "$TMP" > "$MSG_FILE" || { rm -f "$TMP"; exit 0; }
+rm -f "$TMP"
+exit 0

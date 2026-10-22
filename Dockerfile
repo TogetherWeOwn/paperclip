@@ -171,7 +171,15 @@ RUN apt-get update \
   && cc --version >/dev/null && make --version >/dev/null && pkg-config --version >/dev/null
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY scripts/paperclip-git-hooks/commit-msg /usr/local/share/paperclip-git-hooks/commit-msg
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+  && chmod 0755 /usr/local/share/paperclip-git-hooks/commit-msg
+
+# Commit trailer hook: workspace provisioning points each execution checkout's
+# local core.hooksPath at /usr/local/share/paperclip-git-hooks so agent
+# commits carry Paperclip-Agent/Run trailers. Agents run in this image, so a
+# host path would never fire; the hook must ship here. Root-owned 0755 stays
+# executable after the entrypoint drops to the node user.
 
 COPY --chown=node:node --from=build /app /app
 
