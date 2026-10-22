@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { brokerOriginOf, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
 
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -39,7 +39,15 @@ export async function prepareHeartbeatGitHubLaunchers(
   });
   try {
     return {
-      env: await prepareLaunchers({ ...location, cwd: input.cwd, env }),
+      // Bake the host-intended broker origin into the staged launcher so an
+      // explicit broker base is accepted only there (T8.1a). Anonymous runs
+      // stage no broker identity.
+      env: await prepareLaunchers({
+        ...location,
+        cwd: input.cwd,
+        env,
+        expectedBrokerOrigin: anonymous ? "" : brokerOriginOf(input.brokerUrl),
+      }),
       cleanupLocation: anonymous ? null : location,
     };
   } catch (error) {

@@ -27,6 +27,14 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Credential rules — host JWT vs bridge credentials.** The host JWT is a short-lived run credential that is valid against the Paperclip host API; a bridge token is a run-scoped credential that is valid only against the loopback bridge (`PAPERCLIP_API_URL` pointing at `127.0.0.1`/`localhost`) and is worthless against the host API. Treat the two as non-interchangeable: use the injected `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` exactly as given, and never copy a host JWT into a bridge context or a bridge token into a host-API context.
+
+You must not substitute a Paperclip run credential for GitHub authentication: GitHub API calls authenticate only with the managed GitHub credential provided for that operation, never with `PAPERCLIP_API_KEY` or any Paperclip token.
+
+You must not forward credentials, tokens, or `Authorization` material to unapproved origins: send Paperclip credentials only to the injected `PAPERCLIP_API_URL` origin and the documented broker origin, and never attach them to requests bound for other hosts.
+
+These rules are advisory launch guidance for the agent, not shell confinement: they do not and cannot constrain shell networking on their own. Enforcement lives in the runtime for sandboxed local CLI runs (bridge token separation and the egress allowlist); ACP and remote-target runs never take the local-process sandbox, so the rules stay advisory there, not enforced by this text.
+
 ## Conversation tasks
 
 When the task context says **Chat mode** (the issue has `conversationAgentId`),

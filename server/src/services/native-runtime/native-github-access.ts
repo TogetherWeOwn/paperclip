@@ -6,7 +6,7 @@ import {
   prepareGitHubOperationLaunchers,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
-import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { brokerOriginOf, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -115,16 +115,20 @@ export async function createNativeGitHubAccess(input: {
       await new Promise<void>(resolve => server.close(() => resolve()));
       await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
     }
+    // The launcher accepts an explicit broker base only at the baked origin,
+    // so the baked identity and the broker URL env stay one value (T8.1a).
+    const brokerUrl = ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "";
     const env = await prepareGitHubOperationLaunchers({
       ...location, cwd: input.cwd,
       env: {
         ...githubBrokerEnvironment({ PATH: input.env.PATH }, {
-          url: ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "",
+          url: brokerUrl,
           token: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
         }),
         // Never retain an old run's bridge authentication override.
         PAPERCLIP_GITHUB_BRIDGE_TOKEN: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
       },
+      expectedBrokerOrigin: brokerOriginOf(brokerUrl),
     });
     return {
       env,

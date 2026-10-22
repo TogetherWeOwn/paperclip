@@ -75,7 +75,11 @@ export function assertAllowedGitHubHost(
 // (auth-bearing resolvers) before fetching.
 export async function ghFetch(url: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(url, init);
+    // Explicit redirect posture (T8.7): keep following — api.github.com
+    // relies on same-origin redirects — with cross-origin Authorization
+    // stripping provided by undici (pinned by T8.5/T8.6). A caller-supplied
+    // posture wins over this default.
+    return await fetch(url, { ...init, redirect: init?.redirect ?? "follow" });
   } catch {
     throw unprocessable(`Could not connect to ${new URL(url).hostname} — ensure the URL points to a GitHub or GitHub Enterprise instance`);
   }

@@ -78,13 +78,25 @@ it("rejects other scopes, concurrent bindings, browser requests and forged autho
   }
   const release = b.activate(run("a"));
   expect(() => b.activate(run("b"))).toThrow("busy");
-  const rejectedHeaders: Record<string, string>[] = [{ authorization: "Bearer wrong" }, { authorization: "é".repeat(71) },
-    { authorization: `Bearer ${b.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, origin: "https://browser.test" }];
-  for (const headers of rejectedHeaders) {
+  // Local requests now pass the loopback bridge first: bad tokens stop there
+  // with 401 (frozen T1.5–T1.7); browser-indicated requests with a valid
+  // token stop there with 403. The broker server behind it still answers
+  // 403 for its own denials.
+  const rejectedAuth: Record<string, string>[] = [{ authorization: "Bearer wrong" }, { authorization: "é".repeat(71) }];
+  for (const headers of rejectedAuth) {
+    expect((await request(b, { headers })).status).toBe(401);
+  }
+  const rejectedBrowser: Record<string, string>[] = [
+    { authorization: `Bearer ${b.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, origin: "https://browser.test" },
+    { authorization: `Bearer ${b.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, "sec-fetch-site": "cross-site" },
+  ];
+  for (const headers of rejectedBrowser) {
     expect((await request(b, { headers })).status).toBe(403);
   }
-  expect((await request(b, {}, "/api/companies")).status).toBe(404);
-  expect((await request(b, { method: "GET", body: undefined })).status).toBe(404);
+  // Off-allowlist routes stop at the bridge's route allowlist with 403;
+  // they never reach the broker server's 404.
+  expect((await request(b, {}, "/api/companies")).status).toBe(403);
+  expect((await request(b, { method: "GET", body: undefined })).status).toBe(403);
   const response = await request(b, { body: JSON.stringify({ runId: "b", responsibleUserId: "other" }) });
   expect(response.status).toBe(200);
   expect(response.headers.get("cache-control")).toBe("no-store");
