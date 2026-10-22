@@ -8238,6 +8238,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await githubCandidateReviewAssignmentForRun(db, f.companyId, f.replacementAgentId, session.runId)).toBeNull();
     });
     it("paired admission enrolls authenticated automatic PR events with the same guest authority", async () => {
+      // The admission kick races the sweep below for the capture claim; when
+      // the kick wins and fails, its fresh claim blocks the sweep's capture
+      // for the stale window and the candidate never materializes. Capture is
+      // left to the recovery sweep so this enrollment is deterministic. The
+      // kick itself is covered by the K-series tests.
+      await deferPairCaptureToSweep();
       const f = await pairedReviewFixture();
       await db.delete(chatIdentityLinks).where(eq(chatIdentityLinks.principalId, f.principal.id));
       const config = await f.management.configuration(f.endpoint.id, "owner-user");
@@ -10527,7 +10533,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           createdAt: new Date(Date.now() + 1000),
         }).returning();
         const checks = githubReviewCheckService(db, f.providerFetch);
-        await checks.processPending();
+        // The admission ack briefly holds the per-PR lease while posting its
+        // working comment; a check dispatch that loses the lease silently
+        // skips, leaving the intent received with a null result. Once the ack
+        // releases the lease the retry lands the dispatch. Later dispatches
+        // are no-ops: the landed result carries a future retryAt.
+        await expect.poll(async () => {
+          await checks.processPending();
+          const [row] = await shadowTestActions(f.endpoint.id, "github_review_check");
+          return row?.result ?? null;
+        }, { timeout: 10000 }).toMatchObject({ state: "running" });
         const [check] = await shadowTestActions(f.endpoint.id, "github_review_check");
         expect(check.status).toBe("received");
         expect(check.result).toMatchObject({ state: "running" });
@@ -10623,13 +10638,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("cancels an assessment publication staged before shadow mode was enabled without any provider call", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
-      // Fail every matching listing while armed (not one-shot): settling the
-      // admission delivery kicks tryAcknowledge, which lists this same route
-      // and swallows errors into a retryable ack. That ack failure is harmless
-      // here; the publication's own marker-read failure is what must stage
-      // the retryable publication below. Disarmed right after submit so the
-      // shadow retry exercises the real authorization fence, not the injector.
-      let failMarkerRead = false;
+      // Fail every matching listing while armed (not one-shot), starting
+      // BEFORE admission: settling the admission delivery kicks a background
+      // tryAcknowledge that lists this same route. If that ack completes
+      // first, the submit below takes the GET-by-ID ownership re-read path
+      // instead of listing, the injector never fires, and the submit wrongly
+      // succeeds. The ack swallows errors into a retryable ack (never retried
+      // during this test), so failing its list is harmless here; the
+      // publication's own marker-read failure is what must stage the retryable
+      // publication below. Disarmed right after submit so the shadow retry
+      // exercises the real authorization fence, not the injector.
+      let failMarkerRead = true;
       const recorder = installShadowRecorder(f, head, async (url, method) => {
         if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
           return new Response("temporary", { status: 500 });
@@ -10637,12 +10656,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return undefined;
       });
       const admitted = await admitShadowTestPullRequest(f, head);
+      // The background ack must be dead before the submit below: it lists this
+      // same route, and nothing retries it during this test, so
+      // failed-or-cancelled means it will never list (or post) again. The
+      // submit is then the only lister and deterministically trips the
+      // injector above.
+      await expect.poll(async () => {
+        const [row] = await db.select({ status: chatActions.status }).from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+        return row !== undefined && ["failed", "cancelled"].includes(row.status);
+      }, { timeout: 10000 }).toBe(true);
       const session = await shadowTestSession(f, admitted);
       const service = githubChatReviewService(db, f.providerFetch);
       await service.execute(session, "read_pull_request", { section: "metadata" });
       await service.execute(session, "begin_review", { reviewedCommit: head });
       // The marker-read failure leaves the staged publication retryable.
-      failMarkerRead = true;
       expect(await service.execute(
         session,
         "submit_review",
@@ -10697,13 +10725,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("cancels an assessment dispatch when shadow mode is enabled mid-flight", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
-      // Fail every matching listing while armed (not one-shot): settling the
-      // admission delivery kicks tryAcknowledge, which lists this same route
-      // and swallows errors into a retryable ack. That ack failure is harmless
-      // here; the publication's own marker-read failure is what must stage
-      // the retryable publication below. Disarmed right after submit so the
-      // shadow retry exercises the real authorization fence, not the injector.
-      let failMarkerRead = false;
+      // Fail every matching listing while armed (not one-shot), starting
+      // BEFORE admission: settling the admission delivery kicks a background
+      // tryAcknowledge that lists this same route. If that ack completes
+      // first, the submit below takes the GET-by-ID ownership re-read path
+      // instead of listing, the injector never fires, and the submit wrongly
+      // succeeds. The ack swallows errors into a retryable ack (never retried
+      // during this test), so failing its list is harmless here; the
+      // publication's own marker-read failure is what must stage the retryable
+      // publication below. Disarmed right after submit so the shadow retry
+      // exercises the real authorization fence, not the injector.
+      let failMarkerRead = true;
       let armed = false;
       let flipped = false;
       const recorder = installShadowRecorder(f, head, async (url, method) => {
@@ -10717,12 +10749,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return undefined;
       });
       const admitted = await admitShadowTestPullRequest(f, head);
+      // The background ack must be dead before the submit below: it lists this
+      // same route, and nothing retries it during this test, so
+      // failed-or-cancelled means it will never list (or post) again. The
+      // submit is then the only lister and deterministically trips the
+      // injector above.
+      await expect.poll(async () => {
+        const [row] = await db.select({ status: chatActions.status }).from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+        return row !== undefined && ["failed", "cancelled"].includes(row.status);
+      }, { timeout: 10000 }).toBe(true);
       const session = await shadowTestSession(f, admitted);
       const service = githubChatReviewService(db, f.providerFetch);
       await service.execute(session, "read_pull_request", { section: "metadata" });
       await service.execute(session, "begin_review", { reviewedCommit: head });
       // The marker-read failure leaves the staged publication retryable.
-      failMarkerRead = true;
       expect(await service.execute(
         session,
         "submit_review",
@@ -10759,9 +10800,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("cancels a comment dispatch when shadow mode is enabled mid-flight", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
+      // Two phases. Settling the admission delivery kicks a background
+      // acknowledgement that lists this same route: while it runs, fail its
+      // list (never flip) so it dies swallowed-retryable instead of completing
+      // first (which would flip during admission, or set the response receipt
+      // so this dispatch never lists). Only the dispatch below may land the
+      // flip, and only after the ack is provably dead.
+      let failMarkerRead = true;
+      let flipArmed = false;
       let flipped = false;
       const recorder = installShadowRecorder(f, head, async (url, method) => {
-        if (!flipped && method === "GET" && url.includes("/issues/81/comments?")) {
+        if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
+          return new Response("temporary", { status: 500 });
+        }
+        if (flipArmed && !flipped && method === "GET" && url.includes("/issues/81/comments?")) {
           flipped = true;
           await flipShadowModeInDb(f.endpoint.id, true);
         }
@@ -10770,6 +10822,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const admitted = await admitShadowTestPullRequest(f, head);
       const session = await shadowTestSession(f, admitted);
       const service = githubChatReviewService(db, f.providerFetch);
+      // Nothing retries the ack during this test, so failed-or-cancelled here
+      // means it will never list again. The dispatch below is then the only
+      // lister and deterministically lands the mid-flight flip.
+      await expect.poll(async () => {
+        const [row] = await db.select({ status: chatActions.status }).from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+        return row !== undefined && ["failed", "cancelled"].includes(row.status);
+      }, { timeout: 10000 }).toBe(true);
+      failMarkerRead = false;
+      flipArmed = true;
       const receipt = await service.execute(session, "comment", {
         body: "Mid-flight toggle",
         idempotencyKey: "midflight-comment",
