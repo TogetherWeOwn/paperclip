@@ -17,6 +17,10 @@ import { githubReviewCheckService } from "./chat-github-checks.js";
 import { primaryGitHubReview } from "./chat-github-primary.js";
 import { githubRunCapability, sealGitHubPrimaryReviewInputs } from "./chat-github-shadow.js";
 import { githubSnapshotReader, type GitHubReviewReader } from "./chat-github-review-snapshot.js";
+import {
+  findGitHubReviewChecks,
+  type GitHubReviewCheckResponse,
+} from "./chat-github-check-reconciliation.js";
 import { createHash } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -1555,21 +1559,14 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 };
               }
             await currentHead(review.headSha);
-            const checks = await api.request<{
-              check_runs: Array<{
-                id: number;
-                external_id?: string;
-                app?: { id?: number };
-              }>;
-            }>(
-              `/commits/${review.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
+            const externalId = `${source.endpoint.id}:${source.number}:${review.headSha}`;
+            const checks = await findGitHubReviewChecks(
+              (path) => api.request<GitHubReviewCheckResponse>(path),
+              review.headSha,
+              externalId,
+              String(source.endpoint.botExternalId),
             );
-            const check = checks.check_runs.find(
-              (item) =>
-                item.external_id ===
-                  `${source.endpoint.id}:${source.number}:${review.headSha}` &&
-                String(item.app?.id) === source.endpoint.botExternalId,
-            );
+            const check = checks[0];
             await currentHead(review.headSha);
             const postedCheck = await api.request<{
               id: number;
