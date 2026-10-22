@@ -1,3 +1,4 @@
+import { ConfigurationIncompleteFailure } from "../configuration-incomplete-failure.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
@@ -143,16 +144,7 @@ export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
 // run must not be dispatched. Surfaced as a configuration-incomplete blocker
 // routed to a human owner instead of N opaque dispatched-then-failed runs.
-export class ConfigurationIncompleteFailure extends Error {
-  code = CONFIGURATION_INCOMPLETE_FAILURE_CODE;
-  resultJson: Record<string, unknown>;
-
-  constructor(message: string, resultJson: Record<string, unknown>) {
-    super(message);
-    this.name = "ConfigurationIncompleteFailure";
-    this.resultJson = resultJson;
-  }
-}
+export { ConfigurationIncompleteFailure };
 
 const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_assigned",

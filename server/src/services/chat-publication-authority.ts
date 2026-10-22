@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { PgInsertValue } from "drizzle-orm/pg-core";
 import { activityLog, chatActions, chatPublications, type Db } from "@paperclipai/db";
+import { CHAT_ACTION_QUEUES, notifyChatActionWork, notifyChatPublicationWork, type ScheduledChatAction } from "./chat-work-notifications.js";
 
 type Writer = Pick<Db, "insert" | "execute" | "transaction">;
 type Publication = PgInsertValue<typeof chatPublications>;
@@ -85,6 +86,7 @@ export async function insertChatPublications(
       } else allowed.push(value);
     }
     if (allowed.length === 0) return [];
+    await notifyChatPublicationWork(tx);
     const query = publicationQuery(tx, allowed);
     return options.onConflictDoNothing ? query.onConflictDoNothing().returning() : query.returning();
   });
@@ -111,6 +113,11 @@ export async function insertChatActions(
       } else allowed.push(value);
     }
     if (allowed.length === 0) return [];
+    for (const value of allowed) {
+      if (typeof value.kind === "string" && Object.hasOwn(CHAT_ACTION_QUEUES, value.kind)) {
+        await notifyChatActionWork(tx, value.kind as ScheduledChatAction);
+      }
+    }
     const query = actionQuery(tx, allowed);
     if (options.onConflictDoUpdate) return query.onConflictDoUpdate(options.onConflictDoUpdate).returning();
     return options.onConflictDoNothing ? query.onConflictDoNothing().returning() : query.returning();
