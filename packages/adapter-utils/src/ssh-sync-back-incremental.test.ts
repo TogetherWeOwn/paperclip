@@ -258,6 +258,44 @@ describe("parseSshPorcelainStatusV1Z", () => {
     });
   });
 
+  it("treats staged-then-worktree-deleted entries as deleted, not changed", () => {
+    // Deletion is a Y-column fact: `git add f && rm f` stages content for a
+    // file that no longer exists remotely, so asking tar for it would fail
+    // the whole download into a spurious full-copy fallback.
+    const output = `${["MD modified-gone.txt", "AD added-gone.txt", "TD typechanged-gone.txt"].join("\0")}\0`;
+    expect(parseSshPorcelainStatusV1Z(output)).toEqual({
+      changedPaths: [],
+      deletedPaths: [
+        "added-gone.txt",
+        "modified-gone.txt",
+        "typechanged-gone.txt",
+      ],
+      ignoredPaths: [],
+    });
+  });
+
+  it("treats only DD among unmerged codes as deleted", () => {
+    // Every other unmerged entry still holds conflict content in the
+    // worktree and must transfer; only both-deleted is gone.
+    const output = `${["DD both-deleted.txt", "DU deleted-by-us.txt", "UA added-by-them.txt"].join("\0")}\0`;
+    expect(parseSshPorcelainStatusV1Z(output)).toEqual({
+      changedPaths: ["added-by-them.txt", "deleted-by-us.txt"],
+      deletedPaths: ["both-deleted.txt"],
+      ignoredPaths: [],
+    });
+  });
+
+  it("treats a rename whose destination is worktree-deleted as fully deleted", () => {
+    // `git mv old new && rm new` stages the rename but the destination is
+    // gone remotely: both records are deletes, never a transfer.
+    const output = "RD new-gone.txt\0old.txt\0";
+    expect(parseSshPorcelainStatusV1Z(output)).toEqual({
+      changedPaths: [],
+      deletedPaths: ["new-gone.txt", "old.txt"],
+      ignoredPaths: [],
+    });
+  });
+
   it("transfers unmerged entries, whose worktree content still exists", () => {
     const output = `${["UU conflict.txt", "AA both-added.txt", "UD deleted-by-them.txt"].join("\0")}\0`;
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
@@ -468,6 +506,14 @@ describe("buildSshRemoteStatusScript", () => {
     );
     // Ignored creations must be visible or the sync-back silently drops them.
     expect(script).toContain("--ignored");
+    // Submodule ignore configs must not hide dirty gitlinks from the
+    // delta-driven guard.
+    expect(script).toContain("--ignore-submodules=none");
+    // Agent-local scratch never transfers; keep it off the wire. Every
+    // pathspec is negative, so git still implies the whole tree.
+    for (const root of SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES) {
+      expect(script).toContain(`:!${root}`);
+    }
   });
 
   it(
@@ -501,6 +547,84 @@ describe("buildSshRemoteStatusScript", () => {
       expect(
         (await runShell(buildSshRemoteStatusScript(plainDir))).exitCode,
       ).not.toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "omits agent-local scratch roots while still listing the tree",
+    async () => {
+      const repoDir = await createTempDir("paperclip-status-scratch-");
+      await git(repoDir, ["init", "-b", "main"]);
+      await git(repoDir, ["config", "user.email", "status-test@example.com"]);
+      await git(repoDir, ["config", "user.name", "Status Test"]);
+      await writeFile(
+        path.join(repoDir, ".gitignore"),
+        "node_modules/\n*.log\n",
+      );
+      await writeFile(path.join(repoDir, "dirty.txt"), "v1\n");
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "initial"]);
+      await writeFile(path.join(repoDir, "dirty.txt"), "v2\n");
+      await mkdir(path.join(repoDir, "node_modules", "pkg"), {
+        recursive: true,
+      });
+      await writeFile(
+        path.join(repoDir, "node_modules", "pkg", "index.js"),
+        "x\n",
+      );
+      await writeFile(path.join(repoDir, "run.log"), "log\n");
+
+      const result = await runShell(buildSshRemoteStatusScript(repoDir));
+      expect(result.exitCode).toBe(0);
+      const parsed = parseSshPorcelainStatusV1Z(result.stdout);
+      expect(parsed.changedPaths).toEqual(["dirty.txt"]);
+      expect(parsed.ignoredPaths).toEqual(["run.log"]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "names dirty submodules despite submodule ignore configs",
+    async () => {
+      const subSrc = await createTempDir("paperclip-status-submod-src-");
+      await git(subSrc, ["init", "-b", "main"]);
+      await git(subSrc, ["config", "user.email", "status-test@example.com"]);
+      await git(subSrc, ["config", "user.name", "Status Test"]);
+      await writeFile(path.join(subSrc, "subfile.txt"), "v1\n");
+      await git(subSrc, ["add", "-A"]);
+      await git(subSrc, ["commit", "-m", "submodule seed"]);
+      const repoDir = await createTempDir("paperclip-status-submod-");
+      await git(repoDir, ["init", "-b", "main"]);
+      await git(repoDir, ["config", "user.email", "status-test@example.com"]);
+      await git(repoDir, ["config", "user.name", "Status Test"]);
+      await writeFile(path.join(repoDir, "seed.txt"), "seed\n");
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "seed"]);
+      await git(repoDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        subSrc,
+        "sub",
+      ]);
+      await git(repoDir, [
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.sub.ignore",
+        "dirty",
+      ]);
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "add submodule with ignore=dirty"]);
+      await rm(path.join(repoDir, "sub", "subfile.txt"));
+
+      const result = await runShell(buildSshRemoteStatusScript(repoDir));
+      expect(result.exitCode).toBe(0);
+      expect(parseSshPorcelainStatusV1Z(result.stdout).changedPaths).toContain(
+        "sub",
+      );
     },
     TEST_TIMEOUT_MS,
   );
@@ -2588,6 +2712,262 @@ exec "$STUB_REAL_GIT" "$@"
       await expect(
         readFile(path.join(remoteDir, "checkout", "seed.txt"), "utf8"),
       ).resolves.toBe("seed\n");
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back when a submodule ignore config hides an interior change",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const subSrc = await createTempDir("paperclip-wire-ignoresub-src-");
+      await git(subSrc, ["init", "-b", "main"]);
+      await git(subSrc, ["config", "user.email", "wire-test@example.com"]);
+      await git(subSrc, ["config", "user.name", "Wire Test"]);
+      await writeFile(path.join(subSrc, "subfile.txt"), "v1\n");
+      await git(subSrc, ["add", "-A"]);
+      await git(subSrc, ["commit", "-m", "submodule seed"]);
+      await git(localDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        subSrc,
+        "sub",
+      ]);
+      // `ignore = dirty` is the common build-output pattern: without
+      // --ignore-submodules=none the remote status reports a clean tree and
+      // the gitlink guard never fires.
+      await git(localDir, [
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.sub.ignore",
+        "dirty",
+      ]);
+      await git(localDir, ["add", "-A"]);
+      await git(localDir, ["commit", "-m", "add submodule with ignore=dirty"]);
+      const remoteDir = await createTempDir("paperclip-wire-ignoresub-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await git(checkoutDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+      ]);
+      await rm(path.join(checkoutDir, "sub", "subfile.txt"));
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: await cleanTreeSeedState(localDir),
+        }),
+      );
+
+      await expect(
+        readFile(path.join(localDir, "sub", "subfile.txt"), "utf8"),
+      ).rejects.toThrow(/ENOENT/);
+      expect(reasons).toContain("submodule-delta");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back when a committed submodule bump is hidden by ignore=all",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const subSrc = await createTempDir("paperclip-wire-ignoreall-src-");
+      await git(subSrc, ["init", "-b", "main"]);
+      await git(subSrc, ["config", "user.email", "wire-test@example.com"]);
+      await git(subSrc, ["config", "user.name", "Wire Test"]);
+      await writeFile(path.join(subSrc, "subfile.txt"), "v1\n");
+      await git(subSrc, ["add", "-A"]);
+      await git(subSrc, ["commit", "-m", "submodule seed"]);
+      await git(localDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        subSrc,
+        "sub",
+      ]);
+      await git(localDir, [
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.sub.ignore",
+        "all",
+      ]);
+      await git(localDir, ["add", "-A"]);
+      await git(localDir, ["commit", "-m", "add submodule with ignore=all"]);
+      const remoteDir = await createTempDir("paperclip-wire-ignoreall-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await git(checkoutDir, ["config", "user.email", "wire-test@example.com"]);
+      await git(checkoutDir, ["config", "user.name", "Wire Test"]);
+      await git(checkoutDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+      ]);
+      // The run commits an interior change plus the superproject bump: with
+      // ignore=all the committed diff hides the gitlink unless it passes
+      // --ignore-submodules=none, and the tree is committed-clean so the
+      // status names nothing either.
+      const remoteSub = path.join(checkoutDir, "sub");
+      await git(remoteSub, ["config", "user.email", "wire-test@example.com"]);
+      await git(remoteSub, ["config", "user.name", "Wire Test"]);
+      await writeFile(path.join(remoteSub, "subfile.txt"), "v2\n");
+      await git(remoteSub, ["add", "-A"]);
+      await git(remoteSub, ["commit", "-q", "-m", "interior v2"]);
+      await git(checkoutDir, ["add", "sub"]);
+      await git(checkoutDir, ["commit", "-q", "-m", "bump submodule"]);
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: await cleanTreeSeedState(localDir),
+        }),
+      );
+
+      await expect(
+        readFile(path.join(localDir, "sub", "subfile.txt"), "utf8"),
+      ).resolves.toBe("v2\n");
+      expect(reasons).toContain("submodule-delta");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "seeds the overlay with a dirty gitlink despite submodule ignore configs",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const subSrc = await createTempDir("paperclip-wire-seedsub-src-");
+      await git(subSrc, ["init", "-b", "main"]);
+      await git(subSrc, ["config", "user.email", "wire-test@example.com"]);
+      await git(subSrc, ["config", "user.name", "Wire Test"]);
+      await writeFile(path.join(subSrc, "subfile.txt"), "v1\n");
+      await git(subSrc, ["add", "-A"]);
+      await git(subSrc, ["commit", "-m", "submodule seed"]);
+      await git(localDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        subSrc,
+        "sub",
+      ]);
+      await git(localDir, [
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.sub.ignore",
+        "dirty",
+      ]);
+      await git(localDir, ["add", "-A"]);
+      await git(localDir, ["commit", "-m", "add submodule with ignore=dirty"]);
+      await writeFile(path.join(localDir, "sub", "subfile.txt"), "dirty\n");
+      const remoteDir = await createTempDir("paperclip-wire-seedsub-remote-");
+      const spec = buildStubSpec(remoteDir);
+
+      const prepared = await withIncrementalEnv("0", () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        }),
+      );
+
+      expect(prepared.gitBacked).toBe(true);
+      expect(prepared.seedState?.overlayPaths).toContain("sub");
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "carries host-globally ignored files on the seed overlay and heals their remote delete",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      // A repo-local core.excludesFile stands in for host-global ignores
+      // (dotfiles): the overlay scan must not consult it, so the file rides
+      // the overlay instead of vanishing from every delta input.
+      const excludesFile = path.join(
+        await createTempDir("paperclip-wire-excludes-"),
+        "excludes",
+      );
+      await writeFile(excludesFile, "*.tmp\n");
+      await git(localDir, ["config", "core.excludesFile", excludesFile]);
+      await writeFile(path.join(localDir, "g.tmp"), "host-ignored\n");
+      const remoteDir = await createTempDir("paperclip-wire-hostign-remote-");
+      const spec = buildStubSpec(remoteDir);
+
+      const prepared = await withIncrementalEnv("0", () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        }),
+      );
+
+      expect(prepared.gitBacked).toBe(true);
+      expect(prepared.seedState?.overlayPaths).toContain("g.tmp");
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await git(checkoutDir, ["config", "core.excludesFile", excludesFile]);
+      // The run deletes the host-ignored file: absent plus remotely ignored
+      // means no status record, so only the overlay names it — the missing
+      // member rejects the download and the full-copy fallback heals the tree.
+      await rm(path.join(checkoutDir, "g.tmp"), { force: true });
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const { logPath } = await installSshArgvLog();
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: prepared.seedState,
+        }),
+      );
+
+      await expect(
+        readFile(path.join(localDir, "g.tmp"), "utf8"),
+      ).rejects.toThrow(/ENOENT/);
+      expect(reasons).toContain("download");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(2);
     },
     GIT_TIMEOUT_MS,
   );

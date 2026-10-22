@@ -631,13 +631,16 @@ export interface SshPorcelainChangedPaths {
  * Parse `git status --porcelain=v1 -z` output into transfer, delete, and
  * ignored sets. Every entry whose worktree content still exists remotely
  * transfers (modifications, untracked files, unmerged entries, rename
- * destinations); only pure deletions (`D `, ` D`, `DD`) and rename sources
- * land in the delete set. Ignored entries (`!!`, only present with
- * `--ignored`) are collected separately with any directory marker stripped
- * (a trailing slash can only mark a directory record, never a filename).
- * A record without a status prefix transfers defensively rather than
- * silently dropping a remote path. All sets are sorted and deduped so the
- * transfer command is deterministic.
+ * destinations); only worktree deletions (a `D` in the Y column: ` D`,
+ * `MD`, `AD`, `TD`, plus staged `D ` and unmerged `DD`) and rename sources
+ * land in the delete set. A staged-then-worktree-deleted path (`MD`, `AD`)
+ * has index content for a file that no longer exists remotely, so asking
+ * tar for it would fail the whole download — it deletes, never transfers.
+ * Ignored entries (`!!`, only present with `--ignored`) are collected
+ * separately with any directory marker stripped (a trailing slash can only
+ * mark a directory record, never a filename). A record without a status
+ * prefix transfers defensively rather than silently dropping a remote path.
+ * All sets are sorted and deduped so the transfer command is deterministic.
  */
 export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedPaths {
   const changed = new Set<string>();
@@ -656,15 +659,27 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
         continue;
       }
       // Rename/copy entries carry the destination first and the source as a
-      // bare follow-up record (`R  new\0old\0`); the source is a delete.
+      // bare follow-up record (`R  new\0old\0`); the source is a delete, and
+      // so is a destination the worktree deleted (`RD`/`CD`).
       if (status[0] === "R" || status[0] === "C") {
-        if (entryPath) changed.add(entryPath);
+        if (entryPath) {
+          if (status[1] === "D") deleted.add(entryPath);
+          else changed.add(entryPath);
+        }
         const from = records[index + 1] ?? "";
         index += 1;
         if (from) deleted.add(from);
         continue;
       }
-      if (status === "D " || status === " D" || status === "DD") {
+      // Deletion is a worktree (Y-column) fact: anything with `D` in Y is
+      // gone remotely, as is a staged delete (`D `). Only `DD` counts among
+      // unmerged codes — every other unmerged entry still holds conflict
+      // content in the worktree and must transfer.
+      const unmerged = status === "DD" || status === "AA" || status.includes("U");
+      const worktreeGone = unmerged
+        ? status === "DD"
+        : status[1] === "D" || (status[0] === "D" && status[1] === " ");
+      if (worktreeGone) {
         if (entryPath) deleted.add(entryPath);
       } else if (entryPath) {
         changed.add(entryPath);
@@ -686,7 +701,13 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
  * whole tree, parsed by {@link parseSshPorcelainStatusV1Z}. `--ignored` is
  * load-bearing: without it a file the run created under an ignore rule is
  * invisible to the delta and silently lost, while the full copy restores
- * it. Status paths are repo-root-relative, so the script refuses to run
+ * it. `--ignore-submodules=none` is load-bearing too: a tracked
+ * `ignore = dirty|all` would otherwise hide a dirty gitlink and blind the
+ * delta-driven submodule guard. Agent-local scratch roots are excluded via
+ * negative pathspecs (when every pathspec is negative git still implies
+ * the whole tree) because the merge drops them anyway — listing every file
+ * under `node_modules` over SSH only risks the buffer/timeout fallback.
+ * Status paths are repo-root-relative, so the script refuses to run
  * anywhere but a toplevel checkout first: an empty `--show-prefix` proves
  * `remoteDir` is the root, and any other outcome (a subdir, a non-repo, a
  * broken git) exits nonzero so the caller falls back to the full copy
@@ -694,9 +715,10 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
  */
 export function buildSshRemoteStatusScript(remoteDir: string): string {
   const gitDir = `git -C ${shellQuote(remoteDir)}`;
+  const excludes = SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((root) => shellQuote(`:!${root}`)).join(" ");
   return (
     `prefix=$(${gitDir} rev-parse --show-prefix) && test -z "$prefix" && ` +
-    `${gitDir} status --porcelain=v1 -z -uall --ignored --`
+    `${gitDir} status --porcelain=v1 -z -uall --ignored --ignore-submodules=none -- ${excludes}`
   );
 }
 
@@ -2420,7 +2442,7 @@ export interface SshSeedIgnoredFingerprint {
 async function readSshSeedOverlayPaths(localDir: string): Promise<string[] | null> {
   try {
     const [overlayDiff, untracked] = await Promise.all([
-      runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", "HEAD", "--"], {
+      runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--ignore-submodules=none", "--diff-filter=ACMTUXB", "HEAD", "--"], {
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
@@ -3019,12 +3041,12 @@ async function readSshSyncBackCommittedPaths(
   const [transferDiff, deleteDiff] = await Promise.all([
     runLocalGit(
       localDir,
-      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", seedHead, importedHead, "--"],
+      ["diff", "--no-renames", "--name-only", "-z", "--ignore-submodules=none", "--diff-filter=ACMTUXB", seedHead, importedHead, "--"],
       { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
     ),
     runLocalGit(
       localDir,
-      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=D", seedHead, importedHead, "--"],
+      ["diff", "--no-renames", "--name-only", "-z", "--ignore-submodules=none", "--diff-filter=D", seedHead, importedHead, "--"],
       { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
     ),
   ]);
@@ -3040,11 +3062,13 @@ async function readSshSyncBackCommittedPaths(
  * local index. The superproject status and committed diff name only the
  * dirty gitlink root, never interior paths, so an interior delete or rename
  * is invisible to the changed-files delta while the full copy applies it —
- * an unknowable delta that must fall back. Additions need no guard: a new
- * submodule transfers as one whole-dir member, exactly what the full copy
- * merges. `:(literal)` keeps glob metacharacters in real filenames from
- * misfiring the pathspec match; trailing slashes are stripped so an
- * untracked-form `sub/` still matches the indexed `sub`.
+ * an unknowable delta that must fall back. Both inputs pass
+ * `--ignore-submodules=none`, so a tracked `ignore = dirty|all` cannot hide
+ * the gitlink from this guard. Additions need no guard: a new submodule
+ * transfers as one whole-dir member, exactly what the full copy merges.
+ * `:(literal)` keeps glob metacharacters in real filenames from misfiring
+ * the pathspec match; trailing slashes are stripped so an untracked-form
+ * `sub/` still matches the indexed `sub`.
  */
 async function sshSyncBackDeltaTouchesGitlink(
   localDir: string,
