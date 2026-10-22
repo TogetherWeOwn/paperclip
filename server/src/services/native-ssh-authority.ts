@@ -2,13 +2,18 @@ import { createHash } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
+  createEd25519NativeSshEnvelopeVerifier,
   createNativeSshHostExecutorTarget,
   isNativeSshAuthorityRequired,
+  NativeSshAuthorityError,
   runWithNativeSshHostExecutor,
   type CreateNativeSshHostExecutorTargetInput,
+  type NativeSshEnvelopeVerifier,
   type NativeSshHostExecutorTarget,
+  type NativeSshSignerTransport,
 } from "@paperclipai/adapter-utils/host-executor";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { createUnixSocketNativeSshSignerTransport } from "@paperclipai/adapter-utils/native-ssh-signer-transport";
 import { unprocessable } from "../errors.js";
 import {
   evaluateRunModelDecisionSeam,
@@ -143,4 +148,74 @@ export function runWithRunNativeSshHostExecutor<T>(
   fn: () => T,
 ): T {
   return executor ? runWithNativeSshHostExecutor(executor, fn) : fn();
+}
+
+export interface NativeSshSignerEndpointInput {
+  /** Explicit transport, for tests and embeds that speak to the signer already. */
+  readonly signer?: NativeSshSignerTransport | null | undefined;
+  /** Explicit signature check paired with `signer`. */
+  readonly verifyEnvelope?: NativeSshEnvelopeVerifier | null | undefined;
+  /** AF_UNIX socket path of the out-of-process signer. Null leaves the seam dormant. */
+  readonly endpoint?: string | null | undefined;
+  /** Ed25519 public key (SPKI PEM) the signer signs with. Null leaves the seam dormant. */
+  readonly publicKeyPem?: string | null | undefined;
+}
+
+export interface ResolvedNativeSshSignerPair {
+  readonly signer: NativeSshSignerTransport | undefined;
+  readonly verifyEnvelope: NativeSshEnvelopeVerifier | undefined;
+}
+
+function readSignerConfigText(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : value;
+}
+
+/**
+ * Resolves the heartbeat's signer pair from explicit pieces or endpoint
+ * config. All unset means dormant: the executor keeps its current fail-closed
+ * behavior. A half-set endpoint or an explicit piece mixed with endpoint
+ * config is operator error and throws here, before any launch, so a typo can
+ * neither silently disable the check nor silently leave enforcement refusing
+ * every SSH run. Explicit pieces pass through untouched.
+ */
+export function resolveNativeSshSignerPair(
+  input: NativeSshSignerEndpointInput,
+): ResolvedNativeSshSignerPair {
+  const endpoint = readSignerConfigText(input.endpoint);
+  const publicKeyPem = readSignerConfigText(input.publicKeyPem);
+  const hasExplicit = input.signer != null || input.verifyEnvelope != null;
+  const hasEndpointConfig = endpoint !== null || publicKeyPem !== null;
+  if (hasExplicit && hasEndpointConfig) {
+    throw new NativeSshAuthorityError(
+      "native_ssh_authority_invalid",
+      "Native SSH signer is configured twice: pass an explicit signer pair or an endpoint, not both",
+    );
+  }
+  if (hasEndpointConfig) {
+    if (endpoint === null || publicKeyPem === null) {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_invalid",
+        "Native SSH signer endpoint needs both a socket path and the signer's public key",
+      );
+    }
+    let verifyEnvelope: NativeSshEnvelopeVerifier;
+    try {
+      verifyEnvelope = createEd25519NativeSshEnvelopeVerifier(publicKeyPem);
+    } catch {
+      throw new NativeSshAuthorityError(
+        "native_ssh_authority_invalid",
+        "Native SSH signer public key is not a usable public key",
+      );
+    }
+    return {
+      signer: createUnixSocketNativeSshSignerTransport(endpoint),
+      verifyEnvelope,
+    };
+  }
+  return {
+    signer: input.signer ?? undefined,
+    verifyEnvelope: input.verifyEnvelope ?? undefined,
+  };
 }

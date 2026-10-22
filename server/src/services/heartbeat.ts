@@ -625,6 +625,7 @@ import {
 import {
   createNativeSshHostExecutorForRun,
   nativeSshAuthorityRunLedger,
+  resolveNativeSshSignerPair,
   runWithRunNativeSshHostExecutor,
 } from "./native-ssh-authority.js";
 import {
@@ -9518,6 +9519,15 @@ export interface HeartbeatServiceOptions {
    */
   nativeSshSigner?: NativeSshSignerTransport;
   nativeSshEnvelopeVerifier?: NativeSshEnvelopeVerifier;
+  /**
+   * Endpoint config the heartbeat builds a signer pair from: the AF_UNIX
+   * socket path of the out-of-process signer and its Ed25519 public key
+   * (SPKI PEM). Both null (the default) leaves the seam dormant; setting
+   * exactly one, or mixing endpoint config with the explicit pair above,
+   * refuses the SSH run before any launch. Never read from the environment.
+   */
+  nativeSshSignerEndpoint?: string | null;
+  nativeSshSignerPublicKeyPem?: string | null;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
@@ -23577,8 +23587,12 @@ export function heartbeatService(
         target: executionTarget,
         holder: modelDecision.holder,
         decision: modelDecision.record,
-        signer: options.nativeSshSigner,
-        verifyEnvelope: options.nativeSshEnvelopeVerifier,
+        ...resolveNativeSshSignerPair({
+          signer: options.nativeSshSigner,
+          verifyEnvelope: options.nativeSshEnvelopeVerifier,
+          endpoint: options.nativeSshSignerEndpoint,
+          publicKeyPem: options.nativeSshSignerPublicKeyPem,
+        }),
         ...nativeSshAuthorityRunLedger(db, run.id, context),
       });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
