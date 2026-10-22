@@ -7,12 +7,24 @@
 // Rotation is size-based: `<name>` plus `<name>.1 .. <name>.(maxFiles-1)`,
 // newest lines always in `<name>`.
 //
+// Security: retained logs have carried credential material (GitHub App
+// installation-token JSON via helper stdio), and the logs dir sits on a
+// shared volume. Every file this sink creates is owner-only (0600), newly
+// created directories are 0700, and pre-existing files with group/other
+// permission bits are tightened on open and as they shift through rotation
+// (best-effort: foreign-owned files are left for the host to fix).
+// Rotation renames within the set, so it never produces a world-readable
+// file. As defence in depth, every chunk passes through the shared text
+// redaction before the retained write; stdout is untouched.
+//
 // The sink never throws into its caller: disk-full, permission, and rotation
 // failures degrade to a throttled stderr diagnostic while stdout logging and
 // request serving continue unchanged.
 
 import fs from "node:fs";
 import path from "node:path";
+
+import { redactSensitiveText } from "../redaction.js";
 
 export interface RotatingFileSinkOptions {
   /** Directory holding the log files. Created (recursively) on open. */
@@ -32,6 +44,42 @@ const ERROR_REPORT_INTERVAL_MS = 60_000;
 // disable the sink for the rest of the process: later writes retry the open,
 // throttled so a persistently broken disk costs one syscall per interval.
 const REOPEN_RETRY_INTERVAL_MS = 5_000;
+// Owner-only log files: retained logs have carried credential material, so
+// group/other must never gain read access through rotation or umask.
+const LOG_FILE_MODE = 0o600;
+const LOG_DIR_MODE = 0o700;
+
+/**
+ * Strip group/other permission bits from an open file. Best-effort and never
+ * throws: a foreign-owned file (EPERM) or a raced-away fd is left untouched
+ * for the host to fix. Owner bits are preserved, never loosened.
+ */
+function tightenOpenFilePermissions(fd: number): void {
+  try {
+    const mode = fs.fstatSync(fd).mode & 0o777;
+    if (mode & 0o077) {
+      fs.fchmodSync(fd, mode & 0o700);
+    }
+  } catch {
+    // Not our file to fix, or it vanished mid-call: leave it alone.
+  }
+}
+
+/**
+ * Strip group/other permission bits from a rotated generation by path. Same
+ * best-effort contract as tightenOpenFilePermissions: rotation touches each
+ * generation rarely, so a stat+chmod pair per generation is affordable.
+ */
+function tightenRotatedFilePermissions(filePath: string): void {
+  try {
+    const mode = fs.statSync(filePath).mode & 0o777;
+    if (mode & 0o077) {
+      fs.chmodSync(filePath, mode & 0o700);
+    }
+  } catch {
+    // Missing generation, foreign-owned, or raced away: leave it alone.
+  }
+}
 
 export class RotatingFileSink {
   private readonly filePath: string;
@@ -52,13 +100,19 @@ export class RotatingFileSink {
     this.onError = opts.onError;
     // Throws when the directory cannot be created (permissions, ENOTDIR):
     // the owner catches that and runs stdout-only instead of half-logging.
-    fs.mkdirSync(opts.dir, { recursive: true });
+    // The mode applies to newly created directories only; a pre-existing
+    // logs dir keeps its permissions (tightening a shared dir could lock
+    // out other legitimate writers — files are the protected unit).
+    fs.mkdirSync(opts.dir, { recursive: true, mode: LOG_DIR_MODE });
     try {
       this.size = fs.statSync(this.filePath).size;
     } catch {
       this.size = 0;
     }
-    this.fd = fs.openSync(this.filePath, "a");
+    // The mode applies when the file is created; tightenOpenFilePermissions
+    // below converges a pre-existing world-readable file to owner-only.
+    this.fd = fs.openSync(this.filePath, "a", LOG_FILE_MODE);
+    tightenOpenFilePermissions(this.fd);
   }
 
   /** Absolute path of the live file. */
@@ -78,10 +132,17 @@ export class RotatingFileSink {
         return;
       }
     }
-    const buf =
-      typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
-    if (buf.length === 0) return;
+    const text =
+      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    if (text.length === 0) return;
     try {
+      // Defence in depth: the retained file must never hold credential
+      // material even if a writer passes it raw (helper stdio has carried
+      // GitHub installation-token JSON). Stdout keeps the original bytes;
+      // only the retained copy is redacted. A redaction failure drops the
+      // retained line (fail closed) via the report below.
+      const buf = Buffer.from(redactSensitiveText(text), "utf8");
+      if (buf.length === 0) return;
       // A single line larger than maxBytes must not rotate an empty file in
       // a loop; it just lands in the live file oversized.
       if (this.size > 0 && this.size + buf.length > this.maxBytes) {
@@ -135,6 +196,12 @@ export class RotatingFileSink {
       } catch {
         // Live file vanished mid-rotation (external cleanup): reopen fresh.
       }
+      // Generations created before owner-only files (or by a foreign
+      // process) shift through here: tighten each so rotation converges
+      // every generation to 0600 instead of preserving world-readable bits.
+      for (let i = 1; i < this.maxFiles; i += 1) {
+        tightenRotatedFilePermissions(`${this.filePath}.${i}`);
+      }
       this.size = 0;
     } finally {
       // An unconditional attempt: rotations are rare by design, and a success
@@ -155,7 +222,8 @@ export class RotatingFileSink {
 
   private openLiveFile(context: string): void {
     try {
-      this.fd = fs.openSync(this.filePath, "a");
+      this.fd = fs.openSync(this.filePath, "a", LOG_FILE_MODE);
+      tightenOpenFilePermissions(this.fd);
       try {
         this.size = fs.statSync(this.filePath).size;
       } catch {

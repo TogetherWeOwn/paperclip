@@ -23,8 +23,13 @@ import { RotatingFileSink } from "./rotating-file-sink.js";
 export const SERVER_LOG_FILENAME = "server.log";
 export const ACCESS_LOG_FILENAME = "access.log";
 
-const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
-const DEFAULT_MAX_FILES = 5;
+// Retention sizing (measured 2026-10-22 on the live host: server.log grows
+// ~10 MiB/h, access.log ~4 MiB/h): 24 MiB x 12 generations = 288 MiB per
+// stream, roughly 24h+ of server.log and several days of access.log.
+// Worst-case disk: 576 MiB across both streams. Re-measure with
+// `ls -l --time-style=full-iso` plus first-line timestamps before resizing.
+const DEFAULT_MAX_BYTES = 24 * 1024 * 1024;
+const DEFAULT_MAX_FILES = 12;
 // A pathological writer (progress bar with no newline) must not grow the tee
 // buffer without bound; flush the backlog as one truncated line instead.
 const MAX_TEE_LINE_BYTES = 64 * 1024;
