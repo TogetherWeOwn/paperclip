@@ -1,4 +1,5 @@
-import { readdir, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +23,54 @@ type SnapshotFile = {
 };
 
 const MAX_SNAPSHOTS = 5;
+const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
+const integrityPath = path.join(metaDir, "_integrity.json");
+
+async function checkContentIntegrity(snapshotFiles: string[]) {
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--write-integrity")) {
+    throw new Error("Usage: check-migration-snapshots.ts [--write-integrity]");
+  }
+  const sqlFiles = (await readdir(migrationsDir))
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+  const files: Record<string, string> = {};
+  for (const file of [
+    ...sqlFiles,
+    "meta/_journal.json",
+    ...snapshotFiles.map((file) => `meta/${file}`),
+  ]) {
+    files[file] = createHash("sha256")
+      .update(await readFile(path.join(migrationsDir, file)))
+      .digest("hex");
+  }
+  if (args[0] === "--write-integrity") {
+    await writeFile(integrityPath, `${JSON.stringify({ version: 1, files }, null, 2)}\n`);
+    console.log(`Wrote migration integrity manifest: ${Object.keys(files).length} file(s).`);
+    return;
+  }
+  const manifest = JSON.parse(await readFile(integrityPath, "utf8")) as {
+    version?: unknown;
+    files?: Record<string, unknown>;
+  };
+  if (
+    manifest.version !== 1 || !manifest.files ||
+    typeof manifest.files !== "object" || Array.isArray(manifest.files)
+  ) {
+    throw new Error("Invalid migration integrity manifest");
+  }
+  const expectedFiles = Object.keys(files).sort();
+  const recordedFiles = Object.keys(manifest.files).sort();
+  if (JSON.stringify(expectedFiles) !== JSON.stringify(recordedFiles)) {
+    throw new Error("Migration integrity file set mismatch; regenerate the manifest after intentional migration changes");
+  }
+  for (const file of expectedFiles) {
+    if (manifest.files[file] !== files[file]) {
+      throw new Error(`Migration content hash mismatch: ${file}`);
+    }
+  }
+  console.log(`Migration content integrity passed: ${expectedFiles.length} SHA-256 hash(es).`);
+}
 
 function migrationNumber(value: string): string | null {
   const match = value.match(/^(\d{4})_/);
@@ -119,6 +168,8 @@ async function main() {
       `Newest migration ${newestTag} has no snapshot: expected meta/${newestSnapshot} (migration-snapshot-drift.test.ts diffs the schema against it)`,
     );
   }
+
+  await checkContentIntegrity(snapshotFiles);
 
   console.log(
     `Migration snapshot check passed: ${snapshotFiles.length} snapshot(s), newest is ${newestSnapshot}.`,

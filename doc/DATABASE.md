@@ -2,6 +2,20 @@
 
 Paperclip uses PostgreSQL via [Drizzle ORM](https://orm.drizzle.team/). There are three ways to run the database, from simplest to most production-ready.
 
+## Migration integrity
+
+`pnpm --filter @paperclipai/db check:migrations` validates migration numbering,
+file/journal order, snapshot linkage, and SHA-256 content hashes for every SQL
+file, the journal, and the retained snapshots. The hashes live in
+`packages/db/src/migrations/meta/_integrity.json`; this manifest detects accidental
+drift, not a substitute for reviewing SQL or proving SQL/schema equivalence.
+
+`pnpm db:generate` refreshes the manifest after generation and snapshot pruning.
+After an intentional handwritten migration or metadata repair, refresh it with
+`pnpm --filter @paperclipai/db exec tsx src/check-migration-snapshots.ts --write-integrity`
+and review the SQL, metadata, and hash diff together. CI only checks hashes and
+never refreshes them. Neither command applies migrations to a database.
+
 ## 1. Embedded PostgreSQL — zero config
 
 If you don't set `DATABASE_URL`, the server automatically starts an embedded PostgreSQL instance and manages a local data directory.
