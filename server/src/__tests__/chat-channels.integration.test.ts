@@ -6866,6 +6866,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ],
       };
     }
+    // Posted response-comment bodies persist like GitHub would. The store lives
+    // on the fixture (not in the install closure) so replacing the handler
+    // with a second install (new head/hook) keeps serving the App-owned
+    // GET-by-ID/marker receipts the response writer re-reads for ownership.
+    const shadowPostedCommentBodies = Symbol("shadowPostedCommentBodies");
     function installShadowRecorder(
       f: Awaited<ReturnType<typeof reviewBotFixture>>,
       head: string,
@@ -6877,7 +6882,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
       // Persist posted comment bodies like GitHub would, so ownership
       // re-reads (GET .../comments/<id>) see what was written.
-      const postedCommentBodies = new Map<number, string>();
+      const holder = f as unknown as Record<symbol, Map<number, string> | undefined>;
+      const postedCommentBodies = holder[shadowPostedCommentBodies] ??= new Map<number, string>();
       const readPostedBody = (raw: unknown): string | undefined => {
         try {
           const body = (JSON.parse(String(raw ?? "{}")) as { body?: unknown }).body;
@@ -7585,6 +7591,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           return undefined;
         });
         await f.service.processPendingDeliveries();
+        if (scenario === "primary-published" || scenario === "published-during-capture") {
+          // Race premise: the primary's comment actually reached confirmed
+          // provider publication. A silent denial (cancelled/failed) would
+          // invalidate the post-admission evidence this case exercises.
+          if (scenario === "published-during-capture") expect(published).toBe(true);
+          const publications = await db.select().from(chatActions).where(and(
+            eq(chatActions.endpointId, f.endpoint.id),
+            eq(chatActions.kind, "github_review_publication"),
+          ));
+          const raced = publications.find(p => (p.payload as { operation?: unknown }).operation === "comment");
+          expect(raced?.status).toBe("processed");
+          expect(raced?.result).toMatchObject({ id: expect.any(String), url: expect.any(String) });
+        }
         const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
         expect(enrollment).toBeDefined();
         expect(enrollment!.envelope.snapshot).toBeUndefined();
