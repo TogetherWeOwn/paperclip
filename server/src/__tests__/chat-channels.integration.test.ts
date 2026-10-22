@@ -2745,6 +2745,121 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         runId: run.id,
       }, "read_pull_request", { section: "metadata" })).rejects.toThrow("older pull request head");
     });
+    it("resolves an automatic PR event and a mixed-case mention to one thread", async () => {
+      const f = await reviewBotFixture();
+      const current = await f.service.get(f.endpoint.id);
+      const providerRuntime = f.runtime.endpoints.get(f.endpoint.id);
+      if (!providerRuntime || !current.botUsername)
+        throw new Error("Expected configured GitHub runtime identity");
+      attachFakeGitHubIssueCommentWebhook({
+        botUsername: current.botUsername,
+        callbacks: f.callbacks,
+        endpointId: f.endpoint.id,
+        runtime: providerRuntime,
+      });
+      // GitHub delivers the canonical org casing. The automatic path already
+      // lowercases it; the comment path must mint the same lowercase thread.
+      const repository = {
+        id: 97531,
+        full_name: "PaperclipAI/Paperclip",
+        name: "Paperclip",
+        owner: { id: 1357, login: "PaperclipAI" },
+      };
+      const createdAt = "2026-10-09T19:30:00Z";
+      const automatic = await f.service.handleWebhook(
+        f.endpoint.publicId,
+        "github",
+        signedGitHubWebhookRequest({
+          event: "pull_request",
+          delivery: randomUUID(),
+          payload: {
+            action: "opened",
+            installation: { id: 2468 },
+            repository,
+            sender: { id: 77, login: "maintainer" },
+            pull_request: {
+              number: 84,
+              title: "Mixed-case thread check",
+              body: "",
+              draft: false,
+              base: { sha: "a".repeat(40), ref: "master" },
+              head: { sha: "b".repeat(40) },
+              user: { id: 42, login: "octocat", type: "User" },
+              labels: [],
+            },
+          },
+          webhookSecret: f.webhookSecret,
+        }),
+      );
+      expect(automatic.status).toBeLessThan(300);
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select()
+                .from(chatGitHubReviews)
+                .where(eq(chatGitHubReviews.endpointId, f.endpoint.id))
+            ).length,
+          { timeout: 10000 },
+        )
+        .toBe(1);
+      const mention = await f.service.handleWebhook(
+        f.endpoint.publicId,
+        "github",
+        signedGitHubWebhookRequest({
+          event: "issue_comment",
+          delivery: randomUUID(),
+          payload: {
+            action: "created",
+            installation: { id: 2468 },
+            repository,
+            issue: {
+              number: 84,
+              pull_request: {
+                url: "https://api.github.com/repos/PaperclipAI/Paperclip/pulls/84",
+              },
+            },
+            comment: {
+              id: 84001,
+              body: `@${current.botUsername} please re-review`,
+              created_at: createdAt,
+              updated_at: createdAt,
+              user: { id: 42, login: "octocat", type: "User" },
+            },
+            sender: { id: 42, login: "octocat", type: "User" },
+          },
+          webhookSecret: f.webhookSecret,
+        }),
+      );
+      expect(mention.status).toBeLessThan(300);
+      const mentionEventId = "github:paperclipai/paperclip:84:84001";
+      await expect
+        .poll(
+          async () =>
+            (
+              await db
+                .select({ state: chatDeliveries.state })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.endpointId, f.endpoint.id),
+                    eq(chatDeliveries.providerEventId, mentionEventId),
+                  ),
+                )
+            )[0]?.state,
+          { timeout: 10000 },
+        )
+        .toBe("processed");
+      const conversations = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, f.endpoint.id));
+      expect(conversations).toHaveLength(1);
+      expect(conversations[0]!.externalThreadId).toBe(
+        "github:paperclipai/paperclip:84",
+      );
+    });
     it("admits an allow-listed workflow review-trigger bot comment and persists the marker", async () => {
       const f = await reviewBotFixture();
       const initial = await f.management.configuration(
@@ -3867,7 +3982,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         await githubBotToolsForSession(db, { ...session, issueId: randomUUID() }),
       ).toHaveLength(0);
-      const mutations: Array<{ url: string; body: Record<string, unknown> }> = [];
+      const mutations: Array<{
+        url: string;
+        method: "POST" | "PATCH";
+        body: Record<string, unknown>;
+      }> = [];
       const comments = new Map<
         number,
         {
@@ -3893,6 +4012,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         id: 98,
         details_url: "https://github.com/paperclipai/paperclip/pull/91",
       };
+      let exposeReviewPublicationCheckRows = false;
+      const newerCheckFromOtherPull = {
+        id: 102,
+        external_id: `${f.endpoint.id}:92:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://github.com/paperclipai/paperclip/pull/92",
+      };
+      const olderMatchingCheck = {
+        id: 103,
+        external_id: `${f.endpoint.id}:91:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://internal.example/reviews",
+      };
       const pull = () => ({
         number: 91,
         title: "Test PR",
@@ -3909,7 +4041,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
         if (init?.method === "POST" || init?.method === "PATCH") {
           const body = JSON.parse(String(init.body));
-          mutations.push({ url, body });
+          mutations.push({ url, method: init.method, body });
           const id =
             init.method === "PATCH"
               ? Number(url.split("/").at(-1))
@@ -3975,13 +4107,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               deletions: 1,
             },
           ]);
-        if (url.includes("/check-runs?"))
+        if (url.includes("/check-runs?")) {
+          if (exposeReviewPublicationCheckRows) {
+            const filter = new URL(url).searchParams.get("filter");
+            return Response.json({
+              check_runs:
+                filter === "all"
+                  ? [newerCheckFromOtherPull, olderMatchingCheck]
+                  : [newerCheckFromOtherPull],
+            });
+          }
           return Response.json({
             check_runs:
               check.details_url === "https://current-vanity.example/reviews"
                 ? [duplicateCheck, check]
                 : [check],
           });
+        }
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
@@ -4081,6 +4223,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ...assessment,
         findings: [{ ...assessment.findings[1], basePath: "src/math.ts" }],
       })).rejects.toThrow("basePath must match GitHub's base filename");
+      const checkMutationCountBeforePublication = mutations.filter((mutation) =>
+        mutation.url.includes("/check-runs"),
+      ).length;
+      const readCountBeforePublication = reads.length;
+      exposeReviewPublicationCheckRows = true;
       const result = await service.execute(
         session,
         "submit_review",
@@ -4088,6 +4235,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "first-invocation",
       );
       expect(result).toMatchObject({ score: 2, conclusion: "failure" });
+      const reviewCheckMutations = mutations
+        .filter((mutation) => mutation.url.includes("/check-runs"))
+        .slice(checkMutationCountBeforePublication);
+      expect(reviewCheckMutations).toHaveLength(1);
+      expect(reviewCheckMutations[0]).toMatchObject({
+        method: "PATCH",
+        url: `https://api.github.com/repos/paperclipai/paperclip/check-runs/${olderMatchingCheck.id}`,
+        body: {
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
+        },
+      });
+      const reviewCheckRequests = reads
+        .slice(readCountBeforePublication)
+        .filter((url) => url.includes("/check-runs?"));
+      expect(reviewCheckRequests).toHaveLength(1);
+      expect(
+        new URL(reviewCheckRequests[0]!).searchParams.get("filter"),
+      ).toBe("all");
+      exposeReviewPublicationCheckRows = false;
       const [publication] = await db
         .select()
         .from(chatActions)
@@ -9106,11 +9272,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           "i",
         ).test(text),
       );
+      // Mirror the adapter's lowercase thread canonicalization: GitHub
+      // owner/repo names are case-insensitive, so deliveries mint the same
+      // thread id regardless of payload casing. The display name keeps the
+      // payload's original casing.
+      const canonicalName = fullName.toLowerCase();
       const thread = makeThread({
-        channelId: fullName,
+        channelId: canonicalName,
         id: payload.issue?.pull_request
-          ? `github:${fullName}:${issueNumber}`
-          : `github:${fullName}:issue:${issueNumber}`,
+          ? `github:${canonicalName}:${issueNumber}`
+          : `github:${canonicalName}:issue:${issueNumber}`,
         name: fullName,
       }).thread;
       const message = makeMessage({
@@ -67822,6 +67993,122 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("routes a mixed-case GitHub edit to the lowercase conversation thread", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, webhookSecret } =
+      await configuredGitHubEndpoint(fixture);
+    try {
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:issue:84",
+        name: "paperclipai/paperclip",
+      });
+      // configuredGitHubEndpoint already seeds the paperclipai/paperclip
+      // repository resource; no manual insert needed.
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: makeMessage({
+          id: "84001",
+          text: "@maya original mixed-case request",
+          mentioned: true,
+          userId: "7001",
+        }),
+        trigger: "mention",
+      });
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      expect(conversation!.externalThreadId).toBe(
+        "github:paperclipai/paperclip:issue:84",
+      );
+      // GitHub delivers the canonical org casing. The lifecycle path must
+      // mint the same lowercase thread id as the conversation above.
+      await expect(
+        service.handleWebhook(
+          endpoint.publicId,
+          "github",
+          signedGitHubWebhookRequest({
+            delivery: "mixed-case-lifecycle-edit",
+            event: "issue_comment",
+            webhookSecret,
+            url: `https://paperclip.example/api/chat-webhooks/${endpoint.publicId}/github`,
+            payload: {
+              action: "edited",
+              comment: {
+                id: 84001,
+                body: "@maya corrected mixed-case request",
+                updated_at: "2026-10-09T19:35:00Z",
+              },
+              issue: { number: 84 },
+              repository: {
+                id: 97531,
+                full_name: "PaperclipAI/Paperclip",
+                name: "Paperclip",
+                owner: { id: 1357, login: "PaperclipAI" },
+              },
+              sender: { id: 7001, login: "alex-e2e" },
+            },
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true });
+      const [ingress] = await db
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "github_webhook_ingress"),
+            eq(
+              chatActions.providerActionId,
+              "github_webhook_ingress:mixed-case-lifecycle-edit",
+            ),
+          ),
+        );
+      expect(ingress).toBeDefined();
+      await service.processPendingGitHubWebhookIngress(1, ingress!.id);
+      const [delivery] = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "message_updated"),
+          ),
+        );
+      expect(delivery).toBeDefined();
+      await service.processPendingDeliveries(1, delivery!.id);
+      await expect(
+        db
+          .select({
+            conversationId: chatDeliveries.conversationId,
+            state: chatDeliveries.state,
+          })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, delivery!.id)),
+      ).resolves.toEqual([
+        { conversationId: conversation!.id, state: "processed" },
+      ]);
+      const commentRows = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation!.issueId));
+      // Row order is plan-dependent without ORDER BY (flaked red in CI);
+      // both comments landing on the conversation thread is the assertion.
+      expect(commentRows.map((row) => row.body).sort()).toEqual(
+        [
+          "@maya original mixed-case request",
+          "An external message was edited:\n\n@maya corrected mixed-case request",
+        ].sort(),
+      );
+    } finally {
+      await service.shutdown();
+    }
+  });
+
   it("supplements Chat SDK with verified GitHub comment edit and delete lifecycle events", async () => {
     const fixture = await seedCompany();
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
@@ -69289,17 +69576,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await vi.waitFor(() =>
         expect(dm.post).toHaveBeenCalledWith(visibleFailure),
       );
-      await expect(
-        db
-          .select({ kind: chatActions.kind, status: chatActions.status })
-          .from(chatActions)
-          .where(eq(chatActions.deliveryId, delivery.id)),
-      ).resolves.toEqual(
-        expect.arrayContaining([
-          { kind: "inbound_wakeup", status: "failed" },
-          { kind: "provider_effect", status: "processed" },
-        ]),
-      );
+      // The DM post is observable before its provider_effect row settles,
+      // so under suite load the row can still be mid-settlement when the
+      // mock resolves (drew a processing row in CI on 2026-10-22). Wait
+      // for the bookkeeping, bounded, like the ephemeral-post paths do.
+      await vi.waitFor(async () => {
+        expect(
+          await db
+            .select({ kind: chatActions.kind, status: chatActions.status })
+            .from(chatActions)
+            .where(eq(chatActions.deliveryId, delivery.id)),
+        ).toEqual(
+          expect.arrayContaining([
+            { kind: "inbound_wakeup", status: "failed" },
+            { kind: "provider_effect", status: "processed" },
+          ]),
+        );
+      });
     } finally {
       await retirePublicationFixture(service, endpoint.id);
     }

@@ -85,5 +85,5 @@ export async function findGitHubReviewChecks(
     );
     if (checkRuns.length < CHECK_RUN_PAGE_SIZE) return matches;
   }
-  return matches;
+  throw new Error("GitHub review check history exceeded the pagination limit");
 }

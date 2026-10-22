@@ -89,6 +89,8 @@ export async function runChildProcess(
     graceSec: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    pidLimit?: number | null;
+    pidGuardIntervalMs?: number;
   },
 ): Promise<RunProcessResult> {
   return _runChildProcess(runId, command, args, {

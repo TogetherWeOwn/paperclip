@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { RunPidsStats } from "@paperclipai/adapter-utils/server-utils";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
@@ -45,6 +46,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   renderTemplate,
+  resolveRunPidLimit,
   selectPaperclipPromptSections,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -823,6 +825,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
+    const runPidLimit = resolveRunPidLimit(config.runPidLimit);
     let effectiveExecutionCwd = targetWorkspaceRealization?.mode === "in_place"
       ? targetWorkspaceRealization.authoritativeRoot
       : adapterExecutionTargetRemoteCwd(executionTarget, cwd);
@@ -1365,6 +1368,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdin: prompt,
           timeoutSec,
           graceSec,
+          pidLimit: runPidLimit,
           onSpawn: wrappedOnSpawn,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
@@ -1415,7 +1419,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
+        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null; pidStats?: RunPidsStats | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
         monitor?:
@@ -1447,6 +1451,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           resultJson: {
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
+            ...(attempt.proc.pidStats ? { pidStats: attempt.proc.pidStats } : {}),
             outputInactivityMonitor: {
               kind: "output_inactivity",
               timeoutMs: attempt.monitor.timeoutMs,
@@ -1576,6 +1581,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(attempt.proc.pidStats ? { pidStats: attempt.proc.pidStats } : {}),
           ...(errorFamily ? { errorFamily } : {}),
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),

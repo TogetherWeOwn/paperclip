@@ -312,6 +312,14 @@ export interface AdapterExecutionTargetProcessOptions {
   hostExecutor?: NativeSshHostExecutorTarget | null;
   /** Local target only. False starts the child from an empty env; see `runChildProcess`. */
   inheritServerEnv?: boolean;
+  /**
+   * Per-run process budget for the spawned tree. Local/SSH lanes
+   * only; sandbox runs execute provider-side and ignore it. Absent means the
+   * runChildProcess default (explicit value, PAPERCLIP_RUN_PID_LIMIT env,
+   * then 512). Resolve agent config with resolveRunPidLimit from
+   * @paperclipai/adapter-utils/server-utils.
+   */
+  pidLimit?: number | null;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -939,6 +947,7 @@ export async function runAdapterExecutionTargetProcess(
     hostExecutor:
       target?.kind === "remote" && target.transport === "ssh" ? (options.hostExecutor ?? null) : null,
     inheritServerEnv: options.inheritServerEnv,
+    pidLimit: options.pidLimit,
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote
   // provider exited. SSH status 255 is transport failure, never a stop receipt.

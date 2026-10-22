@@ -44,6 +44,7 @@ import {
   isPaperclipRuntimeEnvKey,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
+  resolveRunPidLimit,
   selectPaperclipPromptSections,
   isPaperclipRecoveryWakePayload,
   rewriteWorkspaceCwdEnvVarsForExecution,
@@ -124,6 +125,7 @@ interface ClaudeRuntimeConfig {
   loggedEnv: Record<string, string>;
   timeoutSec: number;
   graceSec: number;
+  runPidLimit: number;
   extraArgs: string[];
 }
 
@@ -323,6 +325,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     asNumber(config.timeoutSec, 0),
   );
   const graceSec = asNumber(config.graceSec, 20);
+  const runPidLimit = resolveRunPidLimit(config.runPidLimit);
   await ensureAdapterExecutionTargetRuntimeCommandInstalled({
     runId,
     target: executionTarget,
@@ -362,6 +365,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     loggedEnv,
     timeoutSec,
     graceSec,
+    runPidLimit,
     extraArgs,
   };
 }
@@ -388,6 +392,7 @@ export async function runClaudeLogin(input: {
     env: runtime.env,
     timeoutSec: runtime.timeoutSec,
     graceSec: runtime.graceSec,
+    pidLimit: runtime.runPidLimit,
     onLog,
   });
 
@@ -497,6 +502,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     loggedEnv: initialLoggedEnv,
     timeoutSec,
     graceSec,
+    runPidLimit,
     extraArgs,
   } = runtimeConfig;
   Object.assign(env, claudeSandboxPermissionEnv({ dangerouslySkipPermissions, targetIsSandbox: executionTargetIsSandbox }));
@@ -1017,6 +1023,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdin: prompt,
       timeoutSec,
       graceSec,
+      pidLimit: runPidLimit,
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
@@ -1141,6 +1148,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+          ...(proc.pidStats ? { pidStats: proc.pidStats } : {}),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
@@ -1278,6 +1286,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...(proc.pidStats ? { pidStats: proc.pidStats } : {}),
     };
 
     return {

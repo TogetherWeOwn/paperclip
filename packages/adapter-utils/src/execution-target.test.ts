@@ -295,6 +295,48 @@ describe("runAdapterExecutionTargetProcess", () => {
       }),
     );
   });
+
+  it("forwards pidLimit to the child process", async () => {
+    const runChildProcessSpy = vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "hi\n",
+      stderr: "",
+      pid: 4242,
+      startedAt: new Date().toISOString(),
+      pidStats: {
+        limit: 200,
+        peak: 1,
+        lastCount: 1,
+        enforced: "poll",
+        exceeded: false,
+      },
+    });
+
+    const result = await runAdapterExecutionTargetProcess(
+      "run-pid-limit",
+      null,
+      "echo",
+      ["hi"],
+      {
+        cwd: "/tmp/local",
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        pidLimit: 200,
+        onLog: async () => {},
+      },
+    );
+
+    expect(runChildProcessSpy).toHaveBeenCalledWith(
+      "run-pid-limit",
+      "echo",
+      ["hi"],
+      expect.objectContaining({ pidLimit: 200 }),
+    );
+    expect(result.pidStats?.limit).toBe(200);
+  });
 });
 
 describe("ensureAdapterExecutionTargetRuntimeCommandInstalled", () => {
