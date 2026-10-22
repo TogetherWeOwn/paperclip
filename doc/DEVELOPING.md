@@ -172,9 +172,11 @@ repository-owned `.gitignore` rules, including when
 `PAPERCLIP_SSH_INCREMENTAL_SYNC=0` disables incremental sync. Git evaluates negations;
 force-added tracked files still transfer, even inside an ignored directory.
 Host-global excludes and `.git/info/exclude` do not determine these omissions.
-Non-Git folders use a temporary empty Git index outside the source folder to
-apply their `.gitignore` files without creating repository metadata in the source.
-An unreadable ignore scan stops the seed rather than exporting ignored files.
+Full-copy restores independently evaluate the remote repository's rules before
+download, including when seed provenance is unavailable. Plain non-Git folders
+retain their full-copy fallback: a `.gitignore` file alone does not supply index
+authority. An unreadable ignore scan in a known repository stops the transfer
+rather than exporting ignored files.
 
 The seed returns its omitted paths for the restore baseline and plain restore's
 local-preservation list, so local configuration such as an ignored `.env` survives.
@@ -191,7 +193,8 @@ transfer rather than risk deleting nested source.
 `PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES` sets the sync-back cap in bytes on the server.
 The default is 2 GiB. Missing, invalid, and non-positive values use the default.
 Sync-back measures the excluded archive before download and checks the extracted
-staging directory before replacing workspace contents. A cap refusal leaves the
+staging directory before replacing workspace contents. Plain Git restores also
+defer the local worktree reset until both checks pass. A cap refusal leaves the
 workspace untouched. Normal success and failure paths remove staging directories;
 a hard process kill can still leave one behind.
 
