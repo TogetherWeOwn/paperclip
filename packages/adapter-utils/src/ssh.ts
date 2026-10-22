@@ -2142,6 +2142,11 @@ async function stageSshOverlayPaths(
       recursive: stats.isDirectory() && !stats.isSymbolicLink(),
       force: true,
       preserveTimestamps: true,
+      // Without this, fs.cp resolves relative symlink targets against the
+      // source dir: a staged `cur.txt -> two.txt` would tar to the remote as
+      // an absolute link at a local path — silently pointing back at the
+      // local workspace same-host, dangling cross-host.
+      verbatimSymlinks: true,
     });
     count += 1;
   }
