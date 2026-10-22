@@ -50,6 +50,22 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
       contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
       permissions: null,
     }]).then(onFulfilled, onRejected),
+  // The pause-hold gate (issue-tree-control) chains .orderBy(...) after
+  // .where(...). Resolve it (and .limit) to zero rows so a real service
+  // instance behaves like the "no holds" stub instead of throwing TypeError.
+  // (Mirrored in the beforeEach re-implementation below.)
+  orderBy: (..._args: unknown[]) => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(onFulfilled, onRejected),
+    limit: (..._limitArgs: unknown[]) => ({
+      then: (onFulfilled2: (rows: unknown[]) => unknown, onRejected2?: (reason: unknown) => unknown) =>
+        Promise.resolve([]).then(onFulfilled2, onRejected2),
+    }),
+  }),
+  limit: (..._args: unknown[]) => ({
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(onFulfilled, onRejected),
+  }),
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
@@ -76,93 +92,101 @@ const mockRunnerGoalService = vi.hoisted(() => ({
   act: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/completed-review-receipt.js", () => ({
-    collectCompletedReviewReceipt: mockCollectReceipt,
-  }));
-  vi.doMock("../services/queued-interaction-response.js", () => ({
-    hasQueuedInteractionResponse: vi.fn(async () => false),
-  }));
-  vi.doMock("../services/runner-goals.js", () => ({
-    runnerGoalService: () => mockRunnerGoalService,
-    RunnerGoalActionError: class RunnerGoalActionError extends Error {},
-    RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
-  }));
+// Module mocks are registered ONCE via hoisted vi.mock. Do not convert these
+// back to a per-test doUnmock/doMock cycle: doMock/doUnmock resolve through
+// async RPC, so unmocking and re-mocking the same path in one beforeEach
+// settles last-writer-wins and flip-flops the mock per test under load. When
+// the real services/index won that race, the real issueTreeControlService ran
+// against the incomplete mockDb and the receipt tests 500'd with
+// "orderBy is not a function". Hoisted registration persists across
+// vi.resetModules(), so each test's fresh route import still gets these mocks.
+// NOTE: ../services/index.js deliberately omits issueTreeControlService (and
+// taskWatchdogService) so routes fall back to their "no holds" stubs.
+vi.mock("../services/completed-review-receipt.js", () => ({
+  collectCompletedReviewReceipt: mockCollectReceipt,
+}));
+vi.mock("../services/queued-interaction-response.js", () => ({
+  hasQueuedInteractionResponse: vi.fn(async () => false),
+}));
+vi.mock("../services/runner-goals.js", () => ({
+  runnerGoalService: () => mockRunnerGoalService,
+  RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+  RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1" })),
-    }),
-    accessService: () => mockAccessService,
-    agentService: () => ({
-      getById: vi.fn(async (agentId: string) => ({
-        id: agentId,
+vi.mock("../services/index.js", () => ({
+  companyService: () => ({
+    getById: vi.fn(async () => ({ id: "company-1" })),
+  }),
+  accessService: () => mockAccessService,
+  agentService: () => ({
+    getById: vi.fn(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      permissions: null,
+    })),
+    resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
+      ambiguous: false,
+      agent: {
+        id: reference,
         companyId: "company-1",
-        permissions: null,
-      })),
-      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
-        ambiguous: false,
-        agent: {
-          id: reference,
-          companyId: "company-1",
-          status: "idle",
-          orgChainHealth: { status: "healthy" },
-        },
-      })),
+        status: "idle",
+        orgChainHealth: { status: "healthy" },
+      },
+    })),
+  }),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
+  }),
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+  documentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({
+    listIssueVotesForUser: vi.fn(async () => []),
+    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  }),
+  goalService: () => ({}),
+  heartbeatService: () => mockHeartbeatService,
+  environmentService: () => ({
+    getById: vi.fn(async () => null),
+  }),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        feedbackDataSharingPreference: "prompt",
+      },
+    })),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  issueApprovalService: () => mockIssueApprovalService,
+  issueReferenceService: () => ({
+    deleteDocumentSource: async () => undefined,
+    diffIssueReferenceSummary: () => ({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
     }),
-    companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
-    }),
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-    }),
-    goalService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
-    environmentService: () => ({
-      getById: vi.fn(async () => null),
-    }),
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => ["company-1"]),
-    }),
-    issueApprovalService: () => mockIssueApprovalService,
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueService: () => mockIssueService,
-    issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: mockLogActivity,
-    projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
-    workProductService: () => ({}),
-  }));
-}
+    emptySummary: () => ({ outbound: [], inbound: [] }),
+    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+    syncComment: async () => undefined,
+    syncDocument: async () => undefined,
+    syncIssue: async () => undefined,
+  }),
+  issueRecoveryActionService: () => ({
+    getActiveForIssue: vi.fn(async () => null),
+    listActiveForIssues: vi.fn(async () => new Map()),
+  }),
+  issueService: () => mockIssueService,
+  issueThreadInteractionService: () => mockIssueThreadInteractionService,
+  logActivity: mockLogActivity,
+  projectService: () => ({}),
+  routineService: () => ({
+    syncRunStatusForIssue: vi.fn(async () => undefined),
+  }),
+  workProductService: () => ({}),
+}));
 
 type TestActor =
   | {
@@ -207,12 +231,15 @@ async function createApp(actor?: TestActor) {
 
 describe("issue execution policy routes", () => {
   beforeEach(async () => {
+    // Fresh route/middleware instances per test. The hoisted vi.mock
+    // registrations above survive resetModules (see note there); do not add a
+    // per-test doUnmock/doMock cycle here, it raced (last-writer-wins).
     vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
+    // mockReset, not just clearAllMocks: a mockRejected/ResolvedValueOnce entry
+    // queued by a test whose request failed before receipt collection must not
+    // leak into the next test and flip its outcome.
+    mockCollectReceipt.mockReset();
     mockCollectReceipt.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -244,6 +271,20 @@ describe("issue execution policy routes", () => {
           contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
           permissions: null,
         }]).then(onFulfilled, onRejected),
+      // Mirrors the hoisted default above: zero-row orderBy/limit so a real
+      // pause-hold gate behaves like the "no holds" stub instead of throwing.
+      orderBy: (..._args: unknown[]) => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+        limit: (..._limitArgs: unknown[]) => ({
+          then: (onFulfilled2: (rows: unknown[]) => unknown, onRejected2?: (reason: unknown) => unknown) =>
+            Promise.resolve([]).then(onFulfilled2, onRejected2),
+        }),
+      }),
+      limit: (..._args: unknown[]) => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([]).then(onFulfilled, onRejected),
+      }),
     }));
     mockIssueService.createChild.mockResolvedValue({
       issue: {

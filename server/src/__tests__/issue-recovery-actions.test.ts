@@ -8,12 +8,14 @@ import { and, eq, ne, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
-  costEvents,
   agents,
   agentRuntimeState,
+  approvalComments,
+  approvals,
   authUsers,
   agentWakeupRequests,
   activityLog,
+  budgetIncidents,
   budgetPolicies,
   companies,
   costEvents,
@@ -153,6 +155,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    // Wipe order is FK-child-before-parent: incidents/approvals reference
+    // policies/companies, relations reference issues/companies. A missed child
+    // aborts the remaining wipes and leaks rows into later tests.
+    await db.delete(budgetIncidents);
+    await db.delete(approvalComments);
+    await db.delete(approvals);
     await db.delete(costEvents);
     await db.delete(budgetPolicies);
     await db.delete(workspaceOperations);
@@ -166,6 +174,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
     await db.delete(issueInboxArchives);
+    await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
