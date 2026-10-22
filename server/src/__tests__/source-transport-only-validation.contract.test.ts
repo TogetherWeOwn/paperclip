@@ -51,7 +51,7 @@ import type {
   ScheduledRetryFacts,
 } from "../modules/run-dispatch/domain/policy.js";
 import * as dispatchPolicy from "../modules/run-dispatch/domain/policy.js";
-import * as agentPermissions from "../services/agent-permissions.js";
+import * as agentPermissions from "../lib/agent-permissions.js";
 import { classifyEnvironmentCapabilities } from "../services/environment-runtime.js";
 import {
   type ValidateSourceTransportOnlyInput,
