@@ -9,6 +9,7 @@ import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   assertNativeSshLaunchAuthority,
   isNativeSshAuthorityRequired,
+  throwIfLaunchCancelled,
   type NativeSshSignedEnvelope,
 } from "./host-executor.js";
 import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remote-execution-env.js";
@@ -1550,11 +1551,19 @@ export async function buildSshSpawnTarget(input: {
    * nothing behind. Required when the server requires native SSH authority.
    */
   authority?: NativeSshSignedEnvelope | null;
+  /**
+   * Run-cancellation signal. Checked before the authority is spent and before
+   * any key material is staged, so a run cancelled after the signer answered
+   * still refuses without touching keys.
+   */
+  signal?: AbortSignal | null;
 }): Promise<{
   command: string;
   args: string[];
   cleanup: () => Promise<void>;
 }> {
+  // First gate: the proof stays unspent and no key file exists for a dead run.
+  throwIfLaunchCancelled(input.signal, "Native SSH launch");
   const { env: launchEnv, dropped } = sshLaunchEnv(input);
   // The authority covers the environment the remote command actually gets,
   // after the size budget, so it is checked here and not on `input.env`.

@@ -114,7 +114,7 @@ function executor(
   });
 }
 
-function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null) {
+function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null, opts: { signal?: AbortSignal | null } = {}) {
   return runChildProcess(RUN, COMMAND, ARGS, {
     cwd: sandbox,
     env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
@@ -123,6 +123,7 @@ function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null) {
     onLog: async () => {},
     remoteExecution: spec,
     ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
 }
 
@@ -463,6 +464,54 @@ describe("ssh call-site inventory", () => {
       resolveCommandForLogs(COMMAND, sandbox, { PATH: fakeBin }, { remoteExecution: spec }),
     ).resolves.toContain("ssh://fixture-agent@fixture.example.test:22");
     expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+});
+
+describe("run cancellation before spawn", () => {
+  it("refuses and starts nothing when the run is cancelled while the signer answers", async () => {
+    const controller = new AbortController();
+    const hanging = executor(() => {
+      controller.abort();
+      return new Promise<never>(() => {});
+    });
+    await expect(launchWith(hanging, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+      name: "LaunchCancelledError",
+    });
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses before resolving anything when already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    // No executor is forwarded: cancellation wins over enforcement.
+    await expect(launchWith(undefined, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+    });
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses before key staging when the run died after the signer answered", async () => {
+    const proof = await executor(async (recorded) => sign(recorded)).authorizeLaunch(launch);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      buildSshSpawnTarget({
+        spec,
+        command: COMMAND,
+        args: ARGS,
+        env: {},
+        authority: proof,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "launch_cancelled" });
+    expect(await tempArtifacts()).toEqual([]);
+    // The refusal spent nothing: the same proof still authorizes a live launch.
+    const live = await buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env: {}, authority: proof });
+    await live.cleanup();
     expect(await tempArtifacts()).toEqual([]);
   });
 });

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { unlink } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { NativeSshAuthorityError } from "./host-executor.js";
+import { LaunchCancelledError, NativeSshAuthorityError } from "./host-executor.js";
 import {
   createUnixSocketNativeSshSignerTransport,
   encodeNativeSshSignerFrame,
@@ -322,5 +322,48 @@ describe("signer transport self-disable pins", () => {
     vi.stubEnv("PAPERCLIP_NATIVE_SSH_SIGNER_SOCKET", "/nonexistent/rogue.sock");
     const direct = createUnixSocketNativeSshSignerTransport(stub.path);
     await expect(direct.requestEnvelope({ ...REQUEST })).resolves.toEqual({ marker: true });
+  });
+});
+
+describe("signer transport cancellation", () => {
+  it("refuses without connecting when already cancelled", async () => {
+    const stub = await startStub((_body, socket) => {
+      socket.write(frameJson({ ok: true, envelope: {} }));
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const transport = createUnixSocketNativeSshSignerTransport(stub.path);
+    const error = await transport.requestEnvelope({ ...REQUEST }, { signal: controller.signal }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(LaunchCancelledError);
+    expect(error).not.toBeInstanceOf(NativeSshAuthorityError);
+    expect(error).toMatchObject({ code: "launch_cancelled" });
+    expect(stub.connections).toBe(0);
+  });
+
+  it("aborts the response wait and drops the connection when cancelled", async () => {
+    const controller = new AbortController();
+    let peerSocket: Socket | undefined;
+    const stub = await startStub((_body, socket) => {
+      peerSocket = socket;
+      // Never answer; cancel once the request arrived.
+      controller.abort();
+    });
+    const transport = createUnixSocketNativeSshSignerTransport(stub.path);
+    await expect(
+      transport.requestEnvelope({ ...REQUEST }, { signal: controller.signal }),
+    ).rejects.toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+    if (!peerSocket) throw new Error("stub never saw the connection");
+    const seen: Socket = peerSocket;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stub-side socket never closed")), 2000);
+      seen.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    expect(stub.closedByPeer).toBe(1);
   });
 });

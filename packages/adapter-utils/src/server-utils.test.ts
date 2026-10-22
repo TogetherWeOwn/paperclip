@@ -567,6 +567,31 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("refuses without spawning when the run is already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let spawned = false;
+    await expect(
+      runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.exit(0)"],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async () => {
+            spawned = true;
+          },
+          signal: controller.signal,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+    expect(spawned).toBe(false);
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),

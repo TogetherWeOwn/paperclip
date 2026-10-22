@@ -91,6 +91,8 @@ export async function runChildProcess(
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
     pidLimit?: number | null;
     pidGuardIntervalMs?: number;
+    /** Run-cancellation signal; forwarded to the shared spawn path. */
+    signal?: AbortSignal | null;
   },
 ): Promise<RunProcessResult> {
   return _runChildProcess(runId, command, args, {

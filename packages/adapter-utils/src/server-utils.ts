@@ -29,6 +29,7 @@ import {
   getActiveNativeSshHostExecutor,
   isNativeSshAuthorityRequired,
   NativeSshAuthorityError,
+  throwIfLaunchCancelled,
   type NativeSshHostExecutorTarget,
   type NativeSshSignedEnvelope,
 } from "./host-executor.js";
@@ -3783,6 +3784,8 @@ async function resolveSpawnTarget(
     localProcessSandbox?: LocalProcessSandboxOptions | null;
     hostExecutor?: NativeSshHostExecutorTarget | null;
     onNativeSshAuthority?: (envelope: NativeSshSignedEnvelope) => void;
+    /** Run-cancellation signal; aborts the signer wait and refuses before key staging. */
+    signal?: AbortSignal | null;
   } = {},
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
@@ -3804,18 +3807,21 @@ async function resolveSpawnTarget(
       );
     }
     const authority = hostExecutor
-      ? await hostExecutor.authorizeLaunch({
-          command,
-          args,
-          remote: {
-            host: remote.host,
-            port: remote.port,
-            username: remote.username,
-            remoteCwd: remote.remoteCwd,
+      ? await hostExecutor.authorizeLaunch(
+          {
+            command,
+            args,
+            remote: {
+              host: remote.host,
+              port: remote.port,
+              username: remote.username,
+              remoteCwd: remote.remoteCwd,
+            },
+            // What the remote command actually gets after the SSH size budget.
+            env: sshLaunchEnv({ spec: remote, command, args, env: sshEnv }).env,
           },
-          // What the remote command actually gets after the SSH size budget.
-          env: sshLaunchEnv({ spec: remote, command, args, env: sshEnv }).env,
-        })
+          options.signal ? { signal: options.signal } : undefined,
+        )
       : null;
     if (authority) options.onNativeSshAuthority?.(authority);
     const sshResolved = await resolveCommandPath("ssh", process.cwd(), env);
@@ -3828,6 +3834,7 @@ async function resolveSpawnTarget(
       args,
       env: sshEnv,
       authority,
+      signal: options.signal ?? null,
     });
     return {
       command: sshResolved,
@@ -4892,6 +4899,13 @@ export async function runChildProcess(
      */
     hostExecutor?: NativeSshHostExecutorTarget | null;
     /**
+     * Run-cancellation signal. Checked before the spawn target resolves and
+     * again before the child spawns, and threaded into the SSH signer wait:
+     * a cancelled run refuses with `launch_cancelled` instead of starting a
+     * child it no longer owns. Omitted when the caller has no source.
+     */
+    signal?: AbortSignal | null;
+    /**
      * Default true: the child starts from the server's environment minus the
      * server-secret denylist, then `env` is merged over it. Set false to start
      * from an empty environment so the child sees exactly `env` (plus a default
@@ -4915,6 +4929,8 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    // No resolution, no signer round trip, no child for a run that is already dead.
+    throwIfLaunchCancelled(opts.signal, "Child process launch");
     let nativeSshAuthority: RunProcessResult["nativeSshAuthority"] = null;
     const {
       env: prunedRawMerged,
@@ -4969,8 +4985,17 @@ export async function runChildProcess(
           expiresAt: envelope.authority.expiresAt,
         };
       },
+      signal: opts.signal ?? null,
     })
-      .then((target) => {
+      .then(async (target) => {
+        if (opts.signal?.aborted) {
+          // An abort that landed while the target resolved (key staging awaits
+          // file writes): refuse before spawn, and remove any staged key
+          // material through the target's own cleanup. Cleanup failures must
+          // not mask the cancellation.
+          await target.cleanup?.().catch(() => {});
+          throwIfLaunchCancelled(opts.signal, "Child process launch");
+        }
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];

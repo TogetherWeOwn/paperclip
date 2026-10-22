@@ -1,9 +1,12 @@
 import { connect, type Socket } from "node:net";
 
 import {
+  LaunchCancelledError,
   NATIVE_SSH_SIGNER_REQUEST_VERSION,
   NativeSshAuthorityError,
+  throwIfLaunchCancelled,
   type NativeSshSignerRequest,
+  type NativeSshSignerRequestOptions,
   type NativeSshSignerTransport,
 } from "./host-executor.js";
 
@@ -164,30 +167,73 @@ export function readNativeSshSignerFrame(
   });
 }
 
-function connectSocket(socketPath: string, timeoutMs: number): Promise<Socket> {
+function cancelledRequest(): LaunchCancelledError {
+  return new LaunchCancelledError("Native SSH signer request refused: run was cancelled before spawn");
+}
+
+function connectSocket(socketPath: string, timeoutMs: number, signal?: AbortSignal | null): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
     let settled = false;
     const socket = connect(socketPath);
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    };
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      cleanup();
       socket.destroy();
       reject(unavailable(`Native SSH signer did not accept a connection within ${timeoutMs}ms`));
     }, timeoutMs);
+    const onAbort = signal
+      ? () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          socket.destroy();
+          reject(cancelledRequest());
+        }
+      : undefined;
+    if (onAbort) signal?.addEventListener("abort", onAbort, { once: true });
     socket.once("connect", () => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cleanup();
       resolve(socket);
     });
     socket.once("error", (error: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cleanup();
       socket.destroy();
       reject(unavailable(`Native SSH signer connection failed: ${error.message}`));
     });
   });
+}
+
+/**
+ * Response read that ends on run cancellation. Destroying the socket forces
+ * the pending frame read to settle, so no listener or timer outlives the wait.
+ * The race subscribes to both promises, so the loser's late settlement is
+ * handled and never surfaces as an unhandled rejection.
+ */
+function readResponseFrame(socket: Socket, readTimeoutMs: number, signal: AbortSignal): Promise<Buffer> {
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      socket.destroy();
+      reject(cancelledRequest());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return (async () => {
+    try {
+      return await Promise.race([readNativeSshSignerFrame(socket, { timeoutMs: readTimeoutMs }), aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  })();
 }
 
 function writeFrame(socket: Socket, frame: Buffer): Promise<void> {
@@ -258,16 +304,25 @@ export function createUnixSocketNativeSshSignerTransport(
     }
   }
   return {
-    async requestEnvelope(request: NativeSshSignerRequest): Promise<unknown> {
+    async requestEnvelope(
+      request: NativeSshSignerRequest,
+      options?: NativeSshSignerRequestOptions,
+    ): Promise<unknown> {
+      const signal = options?.signal ?? null;
+      // No connection for a dead run: refuse before the socket exists.
+      throwIfLaunchCancelled(signal, "Native SSH signer request");
       const validated = assertSignerRequest(request);
       const payload = Buffer.from(
         JSON.stringify({ version: validated.version, opaqueRequestId: validated.opaqueRequestId }),
         "utf8",
       );
-      const socket = await connectSocket(socketPath, connectTimeoutMs);
+      const socket = await connectSocket(socketPath, connectTimeoutMs, signal);
       try {
+        throwIfLaunchCancelled(signal, "Native SSH signer request");
         await writeFrame(socket, encodeNativeSshSignerFrame(payload));
-        const body = await readNativeSshSignerFrame(socket, { timeoutMs: readTimeoutMs });
+        const body = signal
+          ? await readResponseFrame(socket, readTimeoutMs, signal)
+          : await readNativeSshSignerFrame(socket, { timeoutMs: readTimeoutMs });
         return parseDaemonResponse(body);
       } finally {
         socket.destroy();
