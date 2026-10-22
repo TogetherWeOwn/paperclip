@@ -701,6 +701,27 @@ export function buildSshRemoteStatusScript(remoteDir: string): string {
 }
 
 /**
+ * The remote shell script the changed-files sync-back runs to re-prove the
+ * seed's ignored-file fingerprint: the same `ls-files` selection
+ * {@link readSshSeedIgnoredFingerprint} hashed at seed time, per-file blob
+ * hashes via `xargs -0` (NUL-separated, so hostile filenames cannot split
+ * arguments; `xargs` may hash in several argv batches, whose outputs still
+ * concatenate in input order), folded with `git hash-object --stdin`.
+ * Prints one 40-hex digest line. Any failure rejects and the caller falls
+ * back to the full copy; an emptied set hashes to the empty blob, which
+ * can only match a seed that carried nothing (and those seeds skip this
+ * probe), so mass deletion fails closed too.
+ */
+export function buildSshSeededIgnoredProbeScript(remoteDir: string): string {
+  const excludes = SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((root) => shellQuote(`:!${root}`)).join(" ");
+  return (
+    `cd ${shellQuote(remoteDir)} && ` +
+    `git ls-files --others --ignored --exclude-standard -z -- ${excludes} | ` +
+    `xargs -0 git hash-object | git hash-object --stdin`
+  );
+}
+
+/**
  * Resolve the final sync-back transfer and delete sets from the remote
  * worktree status plus the paths the run's new commits changed (a local
  * `git diff` of the merge-base against the imported head, which shares the
@@ -2300,18 +2321,48 @@ interface SshSeedGitSnapshot {
 
 /**
  * The seed provenance a baseline restore needs to reconcile the
- * changed-files delta exactly: the local HEAD the seed started from, and
- * the working-tree delta over it (dirty tracked files plus
- * untracked-but-not-ignored files, minus agent-local scratch). Without the
- * seed head, a retried restore cannot tell an already-applied delta from an
+ * changed-files delta exactly: the local HEAD the seed started from, the
+ * working-tree delta over it (dirty tracked files plus
+ * untracked-but-not-ignored files, minus agent-local scratch), and the
+ * tracked paths already deleted locally at seed time. Without the seed
+ * head, a retried restore cannot tell an already-applied delta from an
  * interrupted one; without the overlay, a seeded file the run reverted to
  * HEAD (or deleted) is invisible to both the remote status and the
- * committed diff. Returned by `prepareWorkspaceForSshExecution` for every
- * git-backed seed; a restore that omits it takes the full copy.
+ * committed diff; without the deleted list, a seed-time deletion the run
+ * restored remotely stays deleted locally for the same reason.
+ *
+ * `ignoredFingerprint` covers the one set git status cannot diff: the
+ * ignored files a legacy full-copy seed carried. A remotely deleted
+ * ignored file has no status record at all, so the restore re-proves this
+ * fingerprint remotely and falls back to the full copy on any change; a
+ * match proves the set byte-identical and skips ignored reconciliation
+ * entirely. Mirror seeds omit ignored files, so they leave this unset
+ * (their baseline excludes make the records moot), as do legacy seeds
+ * whose scan found no ignored files (remote creations are then plain
+ * `!!` transfers and deletes are impossible). Returned by
+ * `prepareWorkspaceForSshExecution` for every git-backed seed; a restore
+ * that omits it takes the full copy.
  */
 export interface SshSyncBackSeedState {
   headCommit: string;
   overlayPaths: string[];
+  /** Tracked paths deleted in the local worktree at seed time (already filtered against the overlay and scratch). */
+  deletedPaths: string[];
+  /** Fingerprint of the carried ignored files' names and contents; unset when the seed carried none. */
+  ignoredFingerprint?: SshSeedIgnoredFingerprint;
+}
+
+/**
+ * Opaque fingerprint of the git-ignored files a legacy seed carried:
+ * `count` names how many, `digest` is `git hash-object --stdin` over the
+ * per-file blob hashes in `git ls-files` order. Both sides compute it with
+ * git itself, so no hashing semantics can drift; any name or content change
+ * (create, edit, delete) flips the digest and fails the restore closed to
+ * the full copy.
+ */
+export interface SshSeedIgnoredFingerprint {
+  count: number;
+  digest: string;
 }
 
 /**
@@ -2338,6 +2389,58 @@ async function readSshSeedOverlayPaths(localDir: string): Promise<string[] | nul
       ...parseNulPathList(overlayDiff.stdout),
       ...parseNulPathList(untracked.stdout),
     ].filter((entry) => !isSshSeedAgentLocalScratchPath(entry));
+  } catch {
+    return null;
+  }
+}
+
+/** Paths per `git hash-object` argv batch: 1000 average-length paths stay far under ARG_MAX. */
+const SSH_SEED_IGNORED_HASH_BATCH = 1000;
+
+/**
+ * Fingerprint the git-ignored files a legacy (full-copy) seed carries, for
+ * {@link SshSyncBackSeedState.ignoredFingerprint}. The scan mirrors the
+ * remote probe in {@link buildSshSeededIgnoredProbeScript} exactly: same
+ * `ls-files` selection with the same scratch pathspec excludes (the seed
+ * tar drops scratch, so the fingerprint must too), per-file blob hashes in
+ * `ls-files` order, folded with `git hash-object --stdin`. Null on any git
+ * failure or hash/count mismatch — the caller then omits the seed state and
+ * the restore fails closed to the full copy.
+ */
+export async function readSshSeedIgnoredFingerprint(localDir: string): Promise<SshSeedIgnoredFingerprint | null> {
+  try {
+    const scan = await runLocalGit(
+      localDir,
+      [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((root) => `:!${root}`),
+      ],
+      { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+    );
+    const entries = parseNulPathList(scan.stdout);
+    const perFile: string[] = [];
+    for (let index = 0; index < entries.length; index += SSH_SEED_IGNORED_HASH_BATCH) {
+      const batch = await runLocalGit(
+        localDir,
+        ["hash-object", "--", ...entries.slice(index, index + SSH_SEED_IGNORED_HASH_BATCH)],
+        { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+      );
+      perFile.push(...batch.stdout.split("\n").filter(Boolean));
+    }
+    // A short batch (a file vanishing mid-scan) must not mint a fingerprint
+    // the remote can never reproduce: fall closed instead.
+    if (perFile.length !== entries.length) return null;
+    const digest = await runLocalGit(localDir, ["hash-object", "--stdin"], {
+      timeout: 60_000,
+      maxBuffer: 16 * 1024,
+      stdin: perFile.length > 0 ? `${perFile.join("\n")}\n` : "",
+    });
+    return { count: entries.length, digest: digest.stdout.trim() };
   } catch {
     return null;
   }
@@ -2677,7 +2780,13 @@ async function trySeedGitWorkspaceViaMirror(input: {
   const ignoredPaths = await seedGitWorkspaceToSshViaMirror({ ...input, snapshot, mirror });
   return {
     ignoredPaths,
-    seedState: { headCommit: snapshot.headCommit, overlayPaths: snapshot.overlayPaths },
+    // No ignored fingerprint: this seed omits ignored files, and the
+    // baseline excludes above make their status records moot.
+    seedState: {
+      headCommit: snapshot.headCommit,
+      overlayPaths: snapshot.overlayPaths,
+      deletedPaths: snapshot.deletedPaths,
+    },
   };
 }
 
@@ -2720,8 +2829,9 @@ export async function prepareWorkspaceForSshExecution(input: {
 
   if (gitSnapshot) {
     // Read before the transfers below: like the mirror snapshot, the
-    // overlay describes the tree at seed time.
+    // overlay and the ignored fingerprint describe the tree at seed time.
     const overlayPaths = await readSshSeedOverlayPaths(input.localDir);
+    const ignoredFingerprint = await readSshSeedIgnoredFingerprint(input.localDir);
     await importGitWorkspaceToSsh({
       spec: input.spec,
       localDir: input.localDir,
@@ -2742,13 +2852,31 @@ export async function prepareWorkspaceForSshExecution(input: {
       remoteDir,
       deletedPaths: gitSnapshot.deletedPaths,
     });
-    // An unreadable overlay omits the seed state instead of guessing it:
-    // the restore then fails closed to the full copy.
+    // An unreadable overlay or ignored scan omits the seed state instead of
+    // guessing it: the restore then fails closed to the full copy. An empty
+    // ignored set omits just the fingerprint: with nothing carried, remote
+    // creations are plain `!!` transfers and deletes are impossible.
+    const overlaySet = new Set(overlayPaths ?? []);
     return {
       gitBacked: true,
       seedMode: "full-copy",
-      ...(overlayPaths
-        ? { seedState: { headCommit: gitSnapshot.headCommit, overlayPaths } }
+      ...(overlayPaths && ignoredFingerprint
+        ? {
+            seedState: {
+              headCommit: gitSnapshot.headCommit,
+              overlayPaths,
+              // `ls-files --deleted` is unfiltered raw output: apply the
+              // mirror snapshot's guards (a worktree-present path is never
+              // a delete, scratch never reconciles) before trusting it.
+              deletedPaths: gitSnapshot.deletedPaths.filter(
+                (entry) =>
+                  isSafeGitRelativePath(entry) &&
+                  !overlaySet.has(entry) &&
+                  !isSshSeedAgentLocalScratchPath(entry),
+              ),
+              ...(ignoredFingerprint.count > 0 ? { ignoredFingerprint } : {}),
+            },
+          }
         : {}),
     };
   }
@@ -2851,8 +2979,8 @@ async function readSshRemoteSyncBackStatus(
  * partial tree over the workspace with explicit deletes. Returns true when
  * the incremental restore completed, false when the caller must run the
  * full copy instead (fast path disabled, seed state omitted, delta
- * unknowable, path list over the remote command budget, or a listed path
- * missing remotely).
+ * unknowable, path list over the remote command budget, a changed seed
+ * ignored set, or a listed path missing remotely).
  *
  * The fallback window ends at the merge: a failed download leaves nothing
  * the full copy cannot heal (staging is emptied before returning false, so
@@ -2908,6 +3036,35 @@ async function tryRestoreChangedFilesFromSsh(input: {
   } catch (error) {
     return fallBack("remote-status", error);
   }
+  // A legacy seed carries the ignored files, so their seed-time fingerprint
+  // must still match: a remotely deleted ignored file lists no status
+  // record at all (absence is invisible even to `--ignored`), and neither
+  // the committed diff nor the overlay can name it, so the full copy is the
+  // only exact restore. A match proves the whole set byte-identical, and
+  // the ignored records below are then all unchanged files, so they are
+  // dropped instead of transferred.
+  const ignoredFingerprint = seedState.ignoredFingerprint;
+  if (ignoredFingerprint && ignoredFingerprint.count > 0) {
+    let remoteDigest: string;
+    try {
+      const probe = await runSshCommand(input.spec, buildSshSeededIgnoredProbeScript(input.remoteDir), {
+        timeoutMs: 60_000,
+        maxBuffer: 16 * 1024,
+      });
+      remoteDigest = probe.stdout.trim();
+    } catch (error) {
+      return fallBack("ignored-probe", error);
+    }
+    if (remoteDigest !== ignoredFingerprint.digest) {
+      return fallBack(
+        "ignored-set-changed",
+        new Error(
+          `seeded ignored-file fingerprint changed remotely: expected ${ignoredFingerprint.digest}, found ${remoteDigest || "<empty>"}`,
+        ),
+      );
+    }
+    status = { ...status, ignoredPaths: [] };
+  }
   const sets = resolveSshSyncBackTransferSets({ status, committed });
   // Baseline-excluded paths (agent-local scratch, seed-omitted ignored
   // files) would be skipped by the merge anyway; dropping them here keeps
@@ -2929,17 +3086,30 @@ async function tryRestoreChangedFilesFromSsh(input: {
     if (!keep(entry) || deleted.has(entry) || transfer.has(entry)) continue;
     transfer.add(entry);
   }
-  // Remote ignored creations (`!!`): the full copy restores an ignored file
-  // that did not exist at seed time, so the delta must carry it too. Paths
-  // already in the baseline keep their local content on this path — seed-time
-  // ignored files are never re-transferred — but a baseline-present ignored
-  // file the status also reports deleted (staged delete plus an on-disk
-  // ignored copy, the `rm --cached` shape) is still present remotely, so it
-  // must not delete either.
+  // Seed-deletion reconciliation: a tracked file deleted locally at seed
+  // time was removed remotely by the seed, so a run that restores it (e.g.
+  // `git checkout -- delme.txt`) leaves no status record and no committed
+  // diff. The seed's deleted list names it as a transfer candidate. The
+  // still-deleted common case stays on the fast path: the remote status
+  // reports ` D` (or the run committed the deletion, which lands in the
+  // same set), and the guard below keeps it off the transfer list —
+  // asking tar for a missing member would fail the download into a
+  // spurious fallback.
+  for (const entry of seedState.deletedPaths) {
+    if (!keep(entry) || deleted.has(entry) || transfer.has(entry)) continue;
+    transfer.add(entry);
+  }
+  // Remote ignored records (`!!`): the full copy restores an ignored file
+  // that did not exist at seed time, so the delta must carry it too. A
+  // baseline-present record the excludes did not already drop (a tracked
+  // file the run uncached under an ignore rule, whose `D ` the delete below
+  // must not honor) transfers as well: the merge no-ops byte-identical
+  // content, and the seed-time masses never reach this loop — mirror seeds
+  // exclude them from the baseline, and a matching legacy fingerprint
+  // clears the records above.
   for (const entry of status.ignoredPaths) {
     if (!keep(entry) || transfer.has(entry)) continue;
     deleted.delete(entry);
-    if (input.baseline.entries.has(entry)) continue;
     transfer.add(entry);
   }
   const transferPaths = [...transfer].sort();

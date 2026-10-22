@@ -298,6 +298,7 @@ describe("ssh seed mirror", () => {
       expect(prepared.seedState).toEqual({
         headCommit: head.trim(),
         overlayPaths: ["modified.txt", "run-me.sh", "untracked.txt"],
+        deletedPaths: ["deleted.txt"],
       });
       // The history phase still reports, with zero wire bytes from the mirror.
       expect(
@@ -761,11 +762,18 @@ describe("ssh seed mirror", () => {
         expect(prepared.seedMode).toBe("full-copy");
         expect(prepared.ignoredPaths).toBeUndefined();
         // The legacy seed carries the same reconcile state: the bulk-ignored
-        // files are ignored, so the overlay is just the repo's dirt.
-        expect(prepared.seedState).toEqual({
+        // files are ignored, so the overlay is just the repo's dirt — plus
+        // the deleted list and the fingerprint of the carried ignored set
+        // (the 350 bulk files plus app.log, .env, and the nested junk).
+        expect(prepared.seedState).toMatchObject({
           headCommit: head.trim(),
           overlayPaths: ["modified.txt", "run-me.sh", "untracked.txt"],
+          deletedPaths: ["deleted.txt"],
         });
+        expect(prepared.seedState?.ignoredFingerprint?.count).toBe(353);
+        expect(prepared.seedState?.ignoredFingerprint?.digest).toMatch(
+          /^[0-9a-f]{40}$/,
+        );
         expect(await readdir(mirrorRoot)).toHaveLength(0);
         expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
         // Legacy behavior preserved: ignored files transfer with the full tree.

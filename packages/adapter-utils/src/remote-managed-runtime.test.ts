@@ -383,7 +383,7 @@ describe("remote managed runtime", () => {
       gitBacked: true,
       seedMode: "shared-mirror",
       ignoredPaths: [".env"],
-      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"] },
+      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] },
     } as unknown as { gitBacked: boolean });
 
     const prepared = await prepareRemoteManagedRuntime({
@@ -416,7 +416,7 @@ describe("remote managed runtime", () => {
     expect(restoreInput.baselineSnapshot.entries.has(".env")).toBe(false);
     expect(restoreInput.baselineSnapshot.entries.has("keep.txt")).toBe(true);
     expect(restoreInput.ignoredPaths).toEqual([".env"]);
-    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"] });
+    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] });
   });
 
   it("threads mirror-seed ignoredPaths through the asset-failure restore", async () => {
@@ -430,7 +430,7 @@ describe("remote managed runtime", () => {
       gitBacked: true,
       seedMode: "shared-mirror",
       ignoredPaths: [".env"],
-      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"] },
+      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] },
     } as unknown as { gitBacked: boolean });
     syncDirectoryToSsh.mockRejectedValueOnce(new Error("asset transfer failed"));
 
@@ -459,6 +459,6 @@ describe("remote managed runtime", () => {
       seedState?: { headCommit: string; overlayPaths: string[] };
     };
     expect(restoreInput.ignoredPaths).toEqual([".env"]);
-    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"] });
+    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] });
   });
 });
