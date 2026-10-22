@@ -703,21 +703,47 @@ export function buildSshRemoteStatusScript(remoteDir: string): string {
 /**
  * The remote shell script the changed-files sync-back runs to re-prove the
  * seed's ignored-file fingerprint: the same `ls-files` selection
- * {@link readSshSeedIgnoredFingerprint} hashed at seed time, per-file blob
- * hashes via `xargs -0` (NUL-separated, so hostile filenames cannot split
- * arguments; `xargs` may hash in several argv batches, whose outputs still
- * concatenate in input order), folded with `git hash-object --stdin`.
- * Prints one 40-hex digest line. Any failure rejects and the caller falls
- * back to the full copy; an emptied set hashes to the empty blob, which
- * can only match a seed that carried nothing (and those seeds skip this
- * probe), so mass deletion fails closed too.
+ * {@link readSshSeedIgnoredFingerprint} hashed at seed time, re-folded
+ * remotely. Prints `<content-hex> <meta-hex>`: the content fold (per-file
+ * blob hashes of RAW bytes via `--no-filters`, in `ls-files` order) and the
+ * meta fold (one `f <mode> <name>` / `l <target> <name>` line per entry,
+ * same order). Bare blob hashes are blind to exactly what the merge
+ * compares — modes, symlink targets (hashing follows the link), and
+ * clean-filter or autocrlf normalizations — so both folds must match.
+ *
+ * Strictly POSIX `sh` (the transport runs `sh -c`, which may be dash): no
+ * `read -d`, no process substitution, no `pipefail`. NUL-separated
+ * throughout, so hostile filenames cannot split arguments; `xargs` may hash
+ * in several argv batches, whose outputs still concatenate in input order.
+ * The `sh -c` guard keeps the empty set hashing to nothing: bare `xargs -0`
+ * would still run git once with no file arguments, hashing stdin instead.
+ * Any failure rejects and the caller falls back to the full copy; an
+ * emptied set folds to the empty blob twice, which can only match a seed
+ * that carried nothing (and those seeds skip this probe), so mass deletion
+ * fails closed too.
  */
 export function buildSshSeededIgnoredProbeScript(remoteDir: string): string {
   const excludes = SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((root) => shellQuote(`:!${root}`)).join(" ");
+  const selection = `git ls-files --others --ignored --exclude-per-directory=.gitignore -z -- ${excludes}`;
+  const contentFold =
+    `${selection} | xargs -0 sh -c '[ $# -gt 0 ] && exec git hash-object --no-filters -- "$@"' sh | ` +
+    `git hash-object --stdin`;
+  // Modes need `stat`, whose flag differs per platform: GNU `-c %a` first,
+  // BSD `-f %Lp` as fallback. Either renders permission bits octal without
+  // padding, matching the reader; anywhere both fail, the fold mismatches
+  // and the restore falls back to the full copy.
+  const metaFold =
+    `${selection} | xargs -0 sh -c 'for f in "$@"; do ` +
+    `if [ -L "./$f" ]; then t=$(readlink "./$f") || exit 1; printf "l %s %s\\n" "$t" "$f"; ` +
+    `elif [ -f "./$f" ]; then m=$(stat -c %a "./$f" 2>/dev/null || stat -f %Lp "./$f" 2>/dev/null) || exit 1; ` +
+    `printf "f %s %s\\n" "$m" "$f"; ` +
+    `else printf "? %s\\n" "$f"; fi; done' sh | ` +
+    `git hash-object --stdin`;
   return (
     `cd ${shellQuote(remoteDir)} && ` +
-    `git ls-files --others --ignored --exclude-standard -z -- ${excludes} | ` +
-    `xargs -0 git hash-object | git hash-object --stdin`
+    `content=$(${contentFold}) && ` +
+    `meta=$(${metaFold}) && ` +
+    `printf "%s %s\\n" "$content" "$meta"`
   );
 }
 
@@ -953,6 +979,10 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      // Without this, fs.cp resolves relative symlink targets against the
+      // source dir: a restored `cur.log -> two.txt` would come back as an
+      // absolute link into this deleted staging directory.
+      verbatimSymlinks: true,
     });
   }));
 }
@@ -2335,13 +2365,13 @@ interface SshSeedGitSnapshot {
  * ignored files a legacy full-copy seed carried. A remotely deleted
  * ignored file has no status record at all, so the restore re-proves this
  * fingerprint remotely and falls back to the full copy on any change; a
- * match proves the set byte-identical and skips ignored reconciliation
- * entirely. Mirror seeds omit ignored files, so they leave this unset
- * (their baseline excludes make the records moot), as do legacy seeds
- * whose scan found no ignored files (remote creations are then plain
- * `!!` transfers and deletes are impossible). Returned by
- * `prepareWorkspaceForSshExecution` for every git-backed seed; a restore
- * that omits it takes the full copy.
+ * match proves names, kinds, modes, link targets, and raw bytes identical
+ * and skips ignored reconciliation entirely. Mirror seeds omit ignored
+ * files, so they leave this unset (their baseline excludes make the
+ * records moot), as do legacy seeds whose scan found no ignored files
+ * (remote creations are then plain `!!` transfers and deletes are
+ * impossible). Returned by `prepareWorkspaceForSshExecution` for every
+ * git-backed seed; a restore that omits it takes the full copy.
  */
 export interface SshSyncBackSeedState {
   headCommit: string;
@@ -2354,11 +2384,17 @@ export interface SshSyncBackSeedState {
 
 /**
  * Opaque fingerprint of the git-ignored files a legacy seed carried:
- * `count` names how many, `digest` is `git hash-object --stdin` over the
- * per-file blob hashes in `git ls-files` order. Both sides compute it with
- * git itself, so no hashing semantics can drift; any name or content change
- * (create, edit, delete) flips the digest and fails the restore closed to
- * the full copy.
+ * `count` names how many, `digest` is two `git hash-object --stdin`
+ * digests separated by a space — the content fold (per-file blob hashes of
+ * raw bytes via `--no-filters`, in `git ls-files` order) and the meta fold
+ * (one `f <mode> <name>` / `l <target> <name>` line per entry, same
+ * order). Both sides compute it with git itself, so no hashing semantics
+ * can drift; any name, kind, mode, link-target, or raw-content change
+ * flips the digest and fails the restore closed to the full copy. Filtered
+ * hashing would collide (a clean filter or autocrlf normalizes distinct
+ * worktrees identically), bare blob hashes ignore modes and hash through
+ * symlinks onto target bytes, and hashes alone miss renames — the pair
+ * covers every dimension the merge compares.
  */
 export interface SshSeedIgnoredFingerprint {
   count: number;
@@ -2372,6 +2408,14 @@ export interface SshSeedIgnoredFingerprint {
  * closed to the full copy. No toplevel check: a subdir workspace never
  * reaches the overlay read anyway, because the committed-delta reader
  * rejects non-toplevel checkouts first.
+ *
+ * The untracked scan uses the repository-owned `.gitignore` rules only, not
+ * `--exclude-standard`: host-global excludes and `.git/info/exclude` differ
+ * per machine, so a file ignored only locally would otherwise force every
+ * restore into the ignored-set-changed fallback (it can never reproduce
+ * remotely). Files ignored only by host rules ride the overlay instead —
+ * still exact, since a remotely deleted candidate rejects the download
+ * into the full-copy fallback.
  */
 async function readSshSeedOverlayPaths(localDir: string): Promise<string[] | null> {
   try {
@@ -2380,7 +2424,7 @@ async function readSshSeedOverlayPaths(localDir: string): Promise<string[] | nul
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
-      runLocalGit(localDir, ["ls-files", "--others", "--exclude-standard", "-z"], {
+      runLocalGit(localDir, ["ls-files", "--others", "--exclude-per-directory=.gitignore", "-z"], {
         timeout: 60_000,
         maxBuffer: 64 * 1024 * 1024,
       }),
@@ -2402,10 +2446,15 @@ const SSH_SEED_IGNORED_HASH_BATCH = 1000;
  * {@link SshSyncBackSeedState.ignoredFingerprint}. The scan mirrors the
  * remote probe in {@link buildSshSeededIgnoredProbeScript} exactly: same
  * `ls-files` selection with the same scratch pathspec excludes (the seed
- * tar drops scratch, so the fingerprint must too), per-file blob hashes in
- * `ls-files` order, folded with `git hash-object --stdin`. Null on any git
- * failure or hash/count mismatch — the caller then omits the seed state and
- * the restore fails closed to the full copy.
+ * tar drops scratch, so the fingerprint must too), per-file blob hashes of
+ * raw bytes plus one meta line per entry, in `ls-files` order, folded with
+ * `git hash-object --stdin`. Null on any git failure, hash/count mismatch,
+ * or unhashable entry — the caller then omits the seed state and the
+ * restore fails closed to the full copy.
+ *
+ * The selection uses the repository-owned `.gitignore` rules only, matching
+ * the probe and the legacy overlay scan: host-global excludes would select
+ * different sets on each side and fail every restore closed.
  */
 export async function readSshSeedIgnoredFingerprint(localDir: string): Promise<SshSeedIgnoredFingerprint | null> {
   try {
@@ -2415,7 +2464,7 @@ export async function readSshSeedIgnoredFingerprint(localDir: string): Promise<S
         "ls-files",
         "--others",
         "--ignored",
-        "--exclude-standard",
+        "--exclude-per-directory=.gitignore",
         "-z",
         "--",
         ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((root) => `:!${root}`),
@@ -2423,11 +2472,31 @@ export async function readSshSeedIgnoredFingerprint(localDir: string): Promise<S
       { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
     );
     const entries = parseNulPathList(scan.stdout);
+    // Classify before hashing: git cannot hash what the merge distinguishes
+    // (modes, symlink targets), and hash-object would block on a fifo or
+    // fail on anything but a file or link — either way the set is
+    // unprovable, so fail closed instead of minting a partial fingerprint.
+    // The permission-bits mask matches the probe's `stat %a` rendering.
+    const metaLines: string[] = [];
+    for (const entry of entries) {
+      const entryPath = path.join(localDir, entry);
+      const stats = await fs.lstat(entryPath).catch(() => null);
+      if (!stats) return null;
+      if (stats.isSymbolicLink()) {
+        const target = await fs.readlink(entryPath).catch(() => null);
+        if (target === null) return null;
+        metaLines.push(`l ${target} ${entry}\n`);
+      } else if (stats.isFile()) {
+        metaLines.push(`f ${(stats.mode & 0o7777).toString(8)} ${entry}\n`);
+      } else {
+        return null;
+      }
+    }
     const perFile: string[] = [];
     for (let index = 0; index < entries.length; index += SSH_SEED_IGNORED_HASH_BATCH) {
       const batch = await runLocalGit(
         localDir,
-        ["hash-object", "--", ...entries.slice(index, index + SSH_SEED_IGNORED_HASH_BATCH)],
+        ["hash-object", "--no-filters", "--", ...entries.slice(index, index + SSH_SEED_IGNORED_HASH_BATCH)],
         { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
       );
       perFile.push(...batch.stdout.split("\n").filter(Boolean));
@@ -2435,12 +2504,22 @@ export async function readSshSeedIgnoredFingerprint(localDir: string): Promise<S
     // A short batch (a file vanishing mid-scan) must not mint a fingerprint
     // the remote can never reproduce: fall closed instead.
     if (perFile.length !== entries.length) return null;
-    const digest = await runLocalGit(localDir, ["hash-object", "--stdin"], {
-      timeout: 60_000,
-      maxBuffer: 16 * 1024,
-      stdin: perFile.length > 0 ? `${perFile.join("\n")}\n` : "",
-    });
-    return { count: entries.length, digest: digest.stdout.trim() };
+    const [contentFold, metaFold] = await Promise.all([
+      runLocalGit(localDir, ["hash-object", "--stdin"], {
+        timeout: 60_000,
+        maxBuffer: 16 * 1024,
+        stdin: perFile.length > 0 ? `${perFile.join("\n")}\n` : "",
+      }),
+      runLocalGit(localDir, ["hash-object", "--stdin"], {
+        timeout: 60_000,
+        maxBuffer: 16 * 1024,
+        stdin: metaLines.join(""),
+      }),
+    ]);
+    return {
+      count: entries.length,
+      digest: `${contentFold.stdout.trim()} ${metaFold.stdout.trim()}`,
+    };
   } catch {
     return null;
   }
@@ -2957,6 +3036,34 @@ async function readSshSyncBackCommittedPaths(
 }
 
 /**
+ * True when any path in the incremental delta is a submodule gitlink in the
+ * local index. The superproject status and committed diff name only the
+ * dirty gitlink root, never interior paths, so an interior delete or rename
+ * is invisible to the changed-files delta while the full copy applies it —
+ * an unknowable delta that must fall back. Additions need no guard: a new
+ * submodule transfers as one whole-dir member, exactly what the full copy
+ * merges. `:(literal)` keeps glob metacharacters in real filenames from
+ * misfiring the pathspec match; trailing slashes are stripped so an
+ * untracked-form `sub/` still matches the indexed `sub`.
+ */
+async function sshSyncBackDeltaTouchesGitlink(
+  localDir: string,
+  paths: readonly string[],
+): Promise<boolean> {
+  const candidates = paths
+    .map((entry) => entry.replace(/\/+$/, ""))
+    .filter(Boolean)
+    .map((entry) => `:(literal)${entry}`);
+  if (candidates.length === 0) return false;
+  const staged = await runLocalGit(localDir, ["ls-files", "--stage", "-z", "--", ...candidates], {
+    timeout: 60_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  // `--stage` entries are `<mode> <sha> <stage>\t<path>`; 160000 is gitlink.
+  return staged.stdout.split("\0").some((entry) => entry.startsWith("160000 "));
+}
+
+/**
  * List what the run left dirty in the remote worktree, parsed by
  * {@link parseSshPorcelainStatusV1Z}. The status script exits nonzero
  * anywhere but a toplevel checkout, and `runSshCommand` surfaces that as a
@@ -3040,9 +3147,9 @@ async function tryRestoreChangedFilesFromSsh(input: {
   // must still match: a remotely deleted ignored file lists no status
   // record at all (absence is invisible even to `--ignored`), and neither
   // the committed diff nor the overlay can name it, so the full copy is the
-  // only exact restore. A match proves the whole set byte-identical, and
-  // the ignored records below are then all unchanged files, so they are
-  // dropped instead of transferred.
+  // only exact restore. A match proves names, kinds, modes, link targets,
+  // and raw bytes identical, and the ignored records below are then all
+  // unchanged files, so they are dropped instead of transferred.
   const ignoredFingerprint = seedState.ignoredFingerprint;
   if (ignoredFingerprint && ignoredFingerprint.count > 0) {
     let remoteDigest: string;
@@ -3114,6 +3221,22 @@ async function tryRestoreChangedFilesFromSsh(input: {
   }
   const transferPaths = [...transfer].sort();
   const deletedPaths = [...deleted].sort();
+  // Submodule interiors are invisible to the superproject delta: a dirty or
+  // moved gitlink in either set names the root, never the interior path, so
+  // the full copy (which merges the whole tree) is the only exact restore.
+  // Runs before the download so a fallback spends no transfer.
+  let touchesGitlink = false;
+  try {
+    touchesGitlink = await sshSyncBackDeltaTouchesGitlink(input.localDir, [...transferPaths, ...deletedPaths]);
+  } catch (error) {
+    return fallBack("submodule-probe", error);
+  }
+  if (touchesGitlink) {
+    return fallBack(
+      "submodule-delta",
+      new Error("SSH changed-files sync-back delta names a submodule gitlink, whose interior is invisible to the superproject status"),
+    );
+  }
   try {
     await downloadChangedFilesFromSsh({
       spec: input.spec,

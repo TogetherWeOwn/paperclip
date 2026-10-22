@@ -772,7 +772,7 @@ describe("ssh seed mirror", () => {
         });
         expect(prepared.seedState?.ignoredFingerprint?.count).toBe(353);
         expect(prepared.seedState?.ignoredFingerprint?.digest).toMatch(
-          /^[0-9a-f]{40}$/,
+          /^[0-9a-f]{40} [0-9a-f]{40}$/,
         );
         expect(await readdir(mirrorRoot)).toHaveLength(0);
         expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);

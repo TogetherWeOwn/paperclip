@@ -6,12 +6,15 @@ import {
   statSync,
 } from "node:fs";
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -25,6 +28,7 @@ import {
   createSshSyncBackCapTransform,
   downloadChangedFilesFromSsh,
   parseSshPorcelainStatusV1Z,
+  prepareWorkspaceForSshExecution,
   readSshSeedIgnoredFingerprint,
   resolveSshSyncBackTransferSets,
   restoreWorkspaceFromSshExecution,
@@ -140,6 +144,55 @@ async function cleanTreeSeedState(repoDir: string): Promise<{
     overlayPaths: [],
     deletedPaths: [],
   };
+}
+
+// Resolve the REAL git binary for a PATH shim to exec. Inside a
+// Paperclip run, PATH starts with the live managed launcher, so a naive
+// `command -v git` returns the launcher shim — and a logging shim that execs
+// the launcher recurses without bound (the launcher re-resolves `git` to the
+// logging shim). On 2026-10-22 that fork-bombed the shared container to its
+// PID limit and the run was killed by the PID guard. Strip every launcher
+// dir and test bin dir, then fail closed unless the result is an absolute,
+// executable, non-shim path.
+function resolveRealGitPath(): string {
+  const cleanPath = originalPath
+    .split(path.delimiter)
+    .filter(
+      (entry) =>
+        entry.length > 0 &&
+        !entry.includes("paperclip-github-runtime") &&
+        !tempDirs.includes(entry),
+    )
+    .join(path.delimiter);
+  const resolved = execFileSync("sh", ["-c", "command -v git"], {
+    env: { ...process.env, PATH: cleanPath },
+  })
+    .toString()
+    .trim();
+  if (resolved.length === 0 || !path.isAbsolute(resolved)) {
+    throw new Error(
+      `git shim: no absolute real git found (got ${JSON.stringify(resolved)})`,
+    );
+  }
+  if (!statSync(resolved, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`git shim: real git is not a file: ${resolved}`);
+  }
+  try {
+    accessSync(resolved, fsConstants.X_OK);
+  } catch {
+    throw new Error(`git shim: real git is not executable: ${resolved}`);
+  }
+  // Refuse shims even if PATH filtering missed one: our own shims embed
+  // STUB_REAL_GIT, the managed launcher embeds its credential-cache marker.
+  const head = readFileSync(resolved, "utf8").slice(0, 4096);
+  if (
+    head.includes("STUB_REAL_GIT") ||
+    head.includes("paperclip-github-credential-cache") ||
+    head.includes("managedDigests")
+  ) {
+    throw new Error(`git shim: resolved git is a shim, refusing: ${resolved}`);
+  }
+  return resolved;
 }
 
 afterEach(async () => {
@@ -480,7 +533,107 @@ describe("readSshSeedIgnoredFingerprint", () => {
       const second = await readSshSeedIgnoredFingerprint(repoDir);
       expect(first).toEqual(second);
       expect(first?.count).toBe(2);
-      expect(first?.digest).toMatch(/^[0-9a-f]{40}$/);
+      expect(first?.digest).toMatch(/^[0-9a-f]{40} [0-9a-f]{40}$/);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "flips the digest on a mode-only change",
+    async () => {
+      const repoDir = await initIgnoredRepo();
+      await writeFile(path.join(repoDir, "tool.log"), "#!/bin/sh\n", {
+        mode: 0o600,
+      });
+
+      const before = await readSshSeedIgnoredFingerprint(repoDir);
+      await chmod(path.join(repoDir, "tool.log"), 0o700);
+      const after = await readSshSeedIgnoredFingerprint(repoDir);
+      // git hash-object ignores modes, so a bare blob fold would collide
+      // here while the merge (which compares snapshot modes) applies the
+      // change: the fingerprint must see it.
+      expect(before?.digest).not.toBe(after?.digest);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "flips the digest when a symlink repoints at identical content",
+    async () => {
+      const repoDir = await initIgnoredRepo();
+      await writeFile(path.join(repoDir, "one.txt"), "same\n");
+      await writeFile(path.join(repoDir, "two.txt"), "same\n");
+      await symlink("one.txt", path.join(repoDir, "cur.log"));
+
+      const before = await readSshSeedIgnoredFingerprint(repoDir);
+      expect(before?.count).toBe(1);
+      await rm(path.join(repoDir, "cur.log"));
+      await symlink("two.txt", path.join(repoDir, "cur.log"));
+      const after = await readSshSeedIgnoredFingerprint(repoDir);
+      // git hash-object follows the link and hashes target bytes, so a
+      // bare blob fold collides while the merge (which records link
+      // targets) applies the repoint.
+      expect(before?.digest).not.toBe(after?.digest);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "flips the digest on a clean-filter collision",
+    async () => {
+      const repoDir = await initIgnoredRepo();
+      await writeFile(path.join(repoDir, ".gitattributes"), "*.log ident\n");
+      await git(repoDir, ["add", "-A"]);
+      await git(repoDir, ["commit", "-m", "ident"]);
+      await writeFile(path.join(repoDir, "app.log"), "$Id$\n");
+
+      const before = await readSshSeedIgnoredFingerprint(repoDir);
+      await writeFile(path.join(repoDir, "app.log"), "$Id: abc123 $\n");
+      const after = await readSshSeedIgnoredFingerprint(repoDir);
+      // The clean filter normalizes both revisions to `$Id$`, so a
+      // filtered hash collides while the raw bytes (which the merge
+      // compares) differ.
+      expect(before?.digest).not.toBe(after?.digest);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "flips the digest on an order-preserving rename",
+    async () => {
+      const repoDir = await initIgnoredRepo();
+      await writeFile(path.join(repoDir, "m.log"), "ex\n");
+      await writeFile(path.join(repoDir, "z.log"), "why\n");
+
+      const before = await readSshSeedIgnoredFingerprint(repoDir);
+      await writeFile(path.join(repoDir, "n.log"), "ex\n");
+      await rm(path.join(repoDir, "m.log"));
+      const after = await readSshSeedIgnoredFingerprint(repoDir);
+      // The ordered per-file hash list is identical before and after, so
+      // a bare blob fold collides; the digest must cover names too.
+      expect(before?.digest).not.toBe(after?.digest);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "ignores files excluded only by host-global rules",
+    async () => {
+      const repoDir = await initIgnoredRepo();
+      const globalIgnore = path.join(
+        await createTempDir("paperclip-fingerprint-global-"),
+        "ignore",
+      );
+      await writeFile(globalIgnore, "onlyglobal.tmp\n");
+      await git(repoDir, ["config", "core.excludesFile", globalIgnore]);
+      await writeFile(path.join(repoDir, "a.log"), "aaa\n");
+      await writeFile(path.join(repoDir, "onlyglobal.tmp"), "global\n");
+
+      // The remote host has its own global excludes, so a repository-owned
+      // selection (`.gitignore` rules only) keeps both sides identical;
+      // host-specific ignores ride the overlay instead.
+      const fingerprint = await readSshSeedIgnoredFingerprint(repoDir);
+      expect(fingerprint?.count).toBe(1);
     },
     TEST_TIMEOUT_MS,
   );
@@ -512,7 +665,7 @@ describe("readSshSeedIgnoredFingerprint", () => {
       const repoDir = await initIgnoredRepo();
       const fingerprint = await readSshSeedIgnoredFingerprint(repoDir);
       expect(fingerprint?.count).toBe(0);
-      expect(fingerprint?.digest).toMatch(/^[0-9a-f]{40}$/);
+      expect(fingerprint?.digest).toMatch(/^[0-9a-f]{40} [0-9a-f]{40}$/);
     },
     TEST_TIMEOUT_MS,
   );
@@ -528,9 +681,10 @@ describe("buildSshSeededIgnoredProbeScript", () => {
     const script = buildSshSeededIgnoredProbeScript("/remote/ws");
     expect(script).toContain("cd '/remote/ws'");
     expect(script).toContain(
-      "ls-files --others --ignored --exclude-standard -z",
+      "ls-files --others --ignored --exclude-per-directory=.gitignore -z",
     );
-    expect(script).toContain("xargs -0 git hash-object");
+    expect(script).toContain("xargs -0 sh -c");
+    expect(script).toContain("git hash-object --no-filters");
     expect(script).toContain("git hash-object --stdin");
     for (const root of SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES) {
       expect(script).toContain(`:!${root}`);
@@ -548,12 +702,16 @@ describe("buildSshSeededIgnoredProbeScript", () => {
       await git(repoDir, ["add", "-A"]);
       await git(repoDir, ["commit", "-m", "seed"]);
       await writeFile(path.join(repoDir, "a.log"), "aaa\n");
-      await writeFile(path.join(repoDir, "b.log"), "bbb\n");
+      await writeFile(path.join(repoDir, "b.log"), "bbb\n", { mode: 0o755 });
+      await symlink("a.log", path.join(repoDir, "c.log"));
+      await mkdir(path.join(repoDir, "sub"), { recursive: true });
+      await writeFile(path.join(repoDir, "sub", "d.log"), "ddd\n");
 
       const fingerprint = await readSshSeedIgnoredFingerprint(repoDir);
-      expect(fingerprint?.count).toBe(2);
+      expect(fingerprint?.count).toBe(4);
       // The probe script is plain sh over git: run it locally to prove the
-      // two halves hash identically, not just that the strings match.
+      // two halves hash identically, not just that the strings match. The
+      // mode, symlink, and nested entries cover every meta record shape.
       const probe = await runShell(buildSshSeededIgnoredProbeScript(repoDir));
       expect(probe.exitCode).toBe(0);
       expect(probe.stdout.trim()).toBe(fingerprint?.digest);
@@ -844,57 +1002,6 @@ describe("incremental sync-back bundle export", () => {
   const GIT_TIMEOUT_MS = 60_000;
 
   beforeEach(installStubSsh);
-
-  // Resolve the REAL git binary for the argv-log shim to exec. Inside a
-  // Paperclip run, PATH starts with the live managed launcher, so a naive
-  // `command -v git` returns the launcher shim — and a logging shim that execs
-  // the launcher recurses without bound (the launcher re-resolves `git` to the
-  // logging shim). On 2026-10-22 that fork-bombed the shared container to its
-  // PID limit and the run was killed by the PID guard. Strip every launcher
-  // dir and test bin dir, then fail closed unless the result is an absolute,
-  // executable, non-shim path.
-  function resolveRealGitPath(): string {
-    const cleanPath = originalPath
-      .split(path.delimiter)
-      .filter(
-        (entry) =>
-          entry.length > 0 &&
-          !entry.includes("paperclip-github-runtime") &&
-          !tempDirs.includes(entry),
-      )
-      .join(path.delimiter);
-    const resolved = execFileSync("sh", ["-c", "command -v git"], {
-      env: { ...process.env, PATH: cleanPath },
-    })
-      .toString()
-      .trim();
-    if (resolved.length === 0 || !path.isAbsolute(resolved)) {
-      throw new Error(
-        `git-argv-log: no absolute real git found (got ${JSON.stringify(resolved)})`,
-      );
-    }
-    if (!statSync(resolved, { throwIfNoEntry: false })?.isFile()) {
-      throw new Error(`git-argv-log: real git is not a file: ${resolved}`);
-    }
-    try {
-      accessSync(resolved, fsConstants.X_OK);
-    } catch {
-      throw new Error(`git-argv-log: real git is not executable: ${resolved}`);
-    }
-    // Refuse shims even if PATH filtering missed one: our own shim embeds
-    // STUB_REAL_GIT, the managed launcher embeds its credential-cache marker.
-    const head = readFileSync(resolved, "utf8").slice(0, 4096);
-    if (
-      head.includes("STUB_REAL_GIT") ||
-      head.includes("paperclip-github-credential-cache") ||
-      head.includes("managedDigests")
-    ) {
-      throw new Error(
-        `git-argv-log: resolved git is a shim, refusing: ${resolved}`,
-      );
-    }
-    return resolved;
-  }
 
   // Log every git invocation (local and stub-remote alike — both resolve
   // through the test process PATH) so the tests can count `bundle create`
@@ -1249,6 +1356,80 @@ describe("changed-files sync-back wiring", () => {
 
   function baselineExcludes(): string[] {
     return [".git", ".git/*", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES];
+  }
+
+  async function withIncrementalEnv<T>(
+    value: string | null,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const key = "PAPERCLIP_SSH_INCREMENTAL_SYNC";
+    const previous = process.env[key];
+    if (value === null) delete process.env[key];
+    else process.env[key] = value;
+    try {
+      return await fn();
+    } finally {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+  }
+
+  // Capture the fallback reason codes tryRestoreChangedFilesFromSsh logs so a
+  // test can pin WHICH fallback fired, not just that the outcome healed: a
+  // tar count alone cannot tell a pre-download fallback (one full-copy tar)
+  // from an incremental restore (one delta tar).
+  async function captureFallbackReasons<T>(
+    fn: () => Promise<T>,
+  ): Promise<{ result: T; reasons: unknown[] }> {
+    const reasons: unknown[] = [];
+    const originalWarn = console.warn;
+    console.warn = (first: unknown, ...rest: unknown[]) => {
+      const reason = (first as { reason?: unknown } | null)?.reason;
+      if (typeof reason === "string") reasons.push(reason);
+      originalWarn(first, ...rest);
+    };
+    try {
+      const result = await fn();
+      return { result, reasons };
+    } finally {
+      console.warn = originalWarn;
+    }
+  }
+
+  // Fault injection for the seed-state gate: a PATH `git` shim that fails
+  // exactly the ignored-fingerprint `ls-files` scan and delegates everything
+  // else to the real binary. Positional argv matching (never `$*` substring)
+  // so remote `git -C ...` calls and the overlay scan pass through; the same
+  // absolute-path resolution plus depth guard as the argv-log shim, for the
+  // same PID-guard reason.
+  async function installFailingFingerprintGitStub(): Promise<void> {
+    const binDir = await createTempDir("paperclip-git-fp-fail-bin-");
+    await writeFile(
+      path.join(binDir, "git"),
+      `#!/bin/sh
+depth=\${STUB_GIT_FP_FAIL_DEPTH:-0}
+depth=$((depth + 1))
+if [ "$depth" -gt 5 ]; then
+  echo "git-fp-fail: recursion depth $depth exceeds bound; STUB_REAL_GIT=$STUB_REAL_GIT" >&2
+  exit 99
+fi
+export STUB_GIT_FP_FAIL_DEPTH="$depth"
+# runLocalGit prefixes every local call with "-C <dir>"; shift past it so
+# the match below sees the git subcommand. Only the fingerprint scan
+# carries this exact argv (the remote probe rephrases it as shell, and no
+# prepare-time remote call lists ignored files), so nothing else can match.
+a1="$1"; a2="$2"; a3="$3"; a4="$4"
+if [ "$a1" = "-C" ]; then a1="$3"; a2="$4"; a3="$5"; a4="$6"; fi
+if [ "$a1" = "ls-files" ] && [ "$a2" = "--others" ] && [ "$a3" = "--ignored" ] && [ "$a4" = "--exclude-per-directory=.gitignore" ]; then
+  echo "git-fp-fail: failing the ignored fingerprint scan" >&2
+  exit 1
+fi
+exec "$STUB_REAL_GIT" "$@"
+`,
+      { mode: 0o755 },
+    );
+    process.env.STUB_REAL_GIT = resolveRealGitPath();
+    process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
   }
 
   it(
@@ -2153,6 +2334,260 @@ describe("changed-files sync-back wiring", () => {
       ).rejects.toThrow(/ENOENT/);
       expect(await countStatusQueries(logPath)).toBe(1);
       expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "applies a mode-only change to a carried ignored file",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      await writeFile(path.join(localDir, "tool.log"), "#!/bin/sh\n", {
+        mode: 0o600,
+      });
+      const ignoredFingerprint = await readSshSeedIgnoredFingerprint(localDir);
+      if (!ignoredFingerprint) {
+        throw new Error("fixture must fingerprint its ignored file");
+      }
+      const remoteDir = await createTempDir(
+        "paperclip-wire-ignoredmode-remote-",
+      );
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // The legacy seed carried tool.log at 0600; the run chmodded it. Blob
+      // hashes ignore modes, so only the meta half of the fingerprint sees
+      // this and routes the restore to the full copy.
+      await writeFile(path.join(checkoutDir, "tool.log"), "#!/bin/sh\n", {
+        mode: 0o600,
+      });
+      await chmod(path.join(checkoutDir, "tool.log"), 0o700);
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: {
+            ...(await cleanTreeSeedState(localDir)),
+            ignoredFingerprint,
+          },
+        }),
+      );
+
+      expect((await lstat(path.join(localDir, "tool.log"))).mode & 0o777).toBe(
+        0o700,
+      );
+      expect(reasons).toContain("ignored-set-changed");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "applies an ignored symlink repoint at identical content",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "one.txt", "same\n", "seed one");
+      await commitFile(localDir, "two.txt", "same\n", "seed two");
+      await symlink("one.txt", path.join(localDir, "cur.log"));
+      const ignoredFingerprint = await readSshSeedIgnoredFingerprint(localDir);
+      if (!ignoredFingerprint) {
+        throw new Error("fixture must fingerprint its ignored file");
+      }
+      const remoteDir = await createTempDir(
+        "paperclip-wire-ignoredlink-remote-",
+      );
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // The legacy seed carried cur.log -> one.txt; the run repointed it at
+      // two.txt, whose bytes are identical. Hashing through the link
+      // collides, so only the recorded link target flips the fingerprint.
+      await symlink("one.txt", path.join(checkoutDir, "cur.log"));
+      await rm(path.join(checkoutDir, "cur.log"));
+      await symlink("two.txt", path.join(checkoutDir, "cur.log"));
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: {
+            ...(await cleanTreeSeedState(localDir)),
+            ignoredFingerprint,
+          },
+        }),
+      );
+
+      await expect(readlink(path.join(localDir, "cur.log"))).resolves.toBe(
+        "two.txt",
+      );
+      expect(reasons).toContain("ignored-set-changed");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "applies an ignored edit hidden by a clean filter",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await writeFile(path.join(localDir, ".gitattributes"), "*.log ident\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      await writeFile(path.join(localDir, "app.log"), "$Id$\n");
+      const ignoredFingerprint = await readSshSeedIgnoredFingerprint(localDir);
+      if (!ignoredFingerprint) {
+        throw new Error("fixture must fingerprint its ignored file");
+      }
+      const remoteDir = await createTempDir(
+        "paperclip-wire-ignoredident-remote-",
+      );
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // The legacy seed carried `$Id$`; the run expanded the keyword. The
+      // clean filter normalizes both revisions identically, so only an
+      // unfiltered content hash sees the change.
+      await writeFile(path.join(checkoutDir, "app.log"), "$Id$\n");
+      await writeFile(path.join(checkoutDir, "app.log"), "$Id: abc123 $\n");
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: {
+            ...(await cleanTreeSeedState(localDir)),
+            ignoredFingerprint,
+          },
+        }),
+      );
+
+      await expect(
+        readFile(path.join(localDir, "app.log"), "utf8"),
+      ).resolves.toBe("$Id: abc123 $\n");
+      expect(reasons).toContain("ignored-set-changed");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy when the delta touches a submodule",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const subSrc = await createTempDir("paperclip-wire-submodule-src-");
+      await git(subSrc, ["init", "-b", "main"]);
+      await git(subSrc, ["config", "user.email", "wire-test@example.com"]);
+      await git(subSrc, ["config", "user.name", "Wire Test"]);
+      await writeFile(path.join(subSrc, "subfile.txt"), "v1\n");
+      await git(subSrc, ["add", "-A"]);
+      await git(subSrc, ["commit", "-m", "submodule seed"]);
+      await git(localDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        subSrc,
+        "sub",
+      ]);
+      await git(localDir, ["add", "-A"]);
+      await git(localDir, ["commit", "-m", "add submodule"]);
+      const remoteDir = await createTempDir("paperclip-wire-submod-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await git(checkoutDir, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+      ]);
+      // The run deleted a file inside the submodule without committing: the
+      // superproject status names only the dirty gitlink, never the interior
+      // path, so the changed-files delta cannot see the deletion.
+      await rm(path.join(checkoutDir, "sub", "subfile.txt"));
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      const { reasons } = await captureFallbackReasons(async () =>
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+          baselineSnapshot: baseline,
+          restoreGitHistory: true,
+          seedState: await cleanTreeSeedState(localDir),
+        }),
+      );
+
+      await expect(
+        readFile(path.join(localDir, "sub", "subfile.txt"), "utf8"),
+      ).rejects.toThrow(/ENOENT/);
+      expect(reasons).toContain("submodule-delta");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "omits the seed state when the ignored fingerprint scan fails",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      await writeFile(path.join(localDir, "a.log"), "ignored\n");
+      const remoteDir = await createTempDir("paperclip-wire-fpgate-remote-");
+      const spec = buildStubSpec(remoteDir);
+      // The kill switch forces the legacy seed deterministically; the stub
+      // fails only the fingerprint scan, so the seed itself must still land
+      // while the restore-affecting seed state stays omitted.
+      await installFailingFingerprintGitStub();
+      const prepared = await withIncrementalEnv("0", () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        }),
+      );
+
+      expect(prepared.gitBacked).toBe(true);
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(prepared.seedState).toBeUndefined();
+      await expect(
+        readFile(path.join(remoteDir, "checkout", "seed.txt"), "utf8"),
+      ).resolves.toBe("seed\n");
     },
     GIT_TIMEOUT_MS,
   );
