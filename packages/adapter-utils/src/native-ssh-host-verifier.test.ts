@@ -202,12 +202,9 @@ describe("verified script generation", () => {
       "cd '/srv/run'",
       "set +e +u",
       "unset IFS",
-      "paperclip_expected_argv='",
-      "paperclip_expected_env='",
       "paperclip_expected_user='some-user'",
       "paperclip_expected_cwd='/srv/run'",
       "paperclip_expires_at='",
-      `paperclip_opaque_id='${REQUEST_ID}'`,
       "set -- 'claude'",
       "id -un",
       "date +%s",
@@ -215,7 +212,8 @@ describe("verified script generation", () => {
       'for paperclip_item in "$@"',
       "export A_KEY='a'",
       "export B_KEY='b'",
-      'for paperclip_item in "A_KEY=$A_KEY" "B_KEY=$B_KEY"',
+      'set -- "A_KEY=$A_KEY" "B_KEY=$B_KEY"',
+      'for paperclip_item in "$@"',
       'exec "$@"',
     ];
     let at = -1;
@@ -227,6 +225,15 @@ describe("verified script generation", () => {
     expect(script.endsWith('exec "$@"')).toBe(true);
     // Exports follow the same sorted order the digest is computed over.
     expect(script.indexOf("export A_KEY=")).toBeLessThan(script.indexOf("export B_KEY="));
+    // Expected digests and the opaque id are literals, and the hash tool is
+    // resolved per subshell: no clobberable verifier variable survives the
+    // launch-env exports.
+    expect(script).not.toContain("paperclip_expected_argv=");
+    expect(script).not.toContain("paperclip_expected_env=");
+    expect(script).not.toContain("paperclip_opaque_id=");
+    expect(script).toContain(`'${nativeSshHostArgvDigest(COMMAND, ARGS)}'`);
+    expect(script).toContain(`'${nativeSshHostEnvDigest({ B_KEY: "b", A_KEY: "a" })}'`);
+    expect(script).toContain(`launch ${REQUEST_ID} refused on host`);
   });
 
   it("embeds the expiry with the documented clock-skew allowance", () => {
@@ -473,6 +480,63 @@ describe("verified links on a real shell", () => {
     expect(result.stdout).toContain("REACHED");
   });
 
+  // Every verifier scratch name, as launch env keys with hostile values. The
+  // checks must still pass: expected values are literals, the hash tool is
+  // resolved per subshell, and the env words freeze before scratch init.
+  const COLLIDING_ENV = {
+    paperclip_expected_argv: "forged-argv",
+    paperclip_expected_env: "forged-env",
+    paperclip_expected_user: "forged-user",
+    paperclip_expected_cwd: "/forged",
+    paperclip_expires_at: "forged-exp",
+    paperclip_opaque_id: "forged-id",
+    paperclip_sha256: "forged-tool",
+    paperclip_h: "forged-h",
+    paperclip_item: "forged-item",
+    paperclip_e: "forged-e",
+    paperclip_now: "forged-now",
+  };
+
+  it("accepts a launch whose env keys collide with verifier scratch names", () => {
+    const links = linksFor({ launchEnv: COLLIDING_ENV });
+    const result = runScript(
+      [
+        ...links,
+        'echo "ARGS:$1:$2:$3"',
+        'echo "PE=$paperclip_expected_env"',
+        'echo "PH=$paperclip_h"',
+        'echo "REACHED"',
+      ].join(" && "),
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("ARGS:my-cmd:a1:a2");
+    expect(result.stdout).toContain("PE=forged-env");
+    expect(result.stdout).toContain("PH=forged-h");
+    expect(result.stdout).toContain("REACHED");
+  });
+
+  it("still refuses argv tampering when colliding env keys are present", () => {
+    const tampered = linksFor({ launchEnv: COLLIDING_ENV }).map((link) =>
+      link.startsWith("set -- ") ? `${link} 'injected'` : link,
+    );
+    const result = runScript([...tampered, 'echo "REACHED:$1"'].join(" && "));
+    expect(result.status).toBe(NATIVE_SSH_HOST_VERIFY_REFUSAL_EXIT);
+    expect(result.stderr).toContain(REQUEST_ID);
+    expect(result.stderr).not.toContain("forged-id");
+    expect(result.stderr).toContain("command does not match the launch authority");
+    expect(result.stdout).not.toContain("REACHED");
+  });
+
+  it("still refuses env tampering when the tampered key collides", () => {
+    const tampered = linksFor({ launchEnv: COLLIDING_ENV }).map((link) =>
+      link === "export paperclip_h='forged-h'" ? "export paperclip_h='evil'" : link,
+    );
+    const result = runScript([...tampered, 'echo "REACHED:$paperclip_h"'].join(" && "));
+    expect(result.status).toBe(NATIVE_SSH_HOST_VERIFY_REFUSAL_EXIT);
+    expect(result.stderr).toContain("environment does not match the launch authority");
+    expect(result.stdout).not.toContain("REACHED");
+  });
+
   it("is unaffected by hostile shell state left by login profiles", () => {
     const script = [
       "set -e",
@@ -524,8 +588,8 @@ describe("verified launch budgeting", () => {
     const verified = await buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env, authority: proof });
     try {
       const last = String(verified.args.at(-1));
-      expect(last).toContain("paperclip_expected_argv");
-      expect(last).toContain("paperclip_expected_env");
+      expect(last).toContain(nativeSshHostArgvDigest(COMMAND, ARGS));
+      expect(last).toContain(nativeSshHostEnvDigest(kept));
       expect(last).toContain(proof.authority.opaqueRequestId);
       expect(last).toContain('exec "$@"');
       expect(last).not.toContain("exec env ");

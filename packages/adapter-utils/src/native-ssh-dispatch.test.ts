@@ -204,8 +204,10 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
     const result = await launchWith(executor(async (recorded) => sign(recorded)));
     expect(result.exitCode).toBe(0);
     const sent = readFileSync(marker, "utf8");
-    expect(sent).toContain("paperclip_expected_argv");
-    expect(sent).toContain("paperclip_expected_env");
+    expect(sent).toContain("command does not match the launch authority");
+    expect(sent).toContain("environment does not match the launch authority");
+    expect(sent).not.toContain("paperclip_expected_argv=");
+    expect(sent).not.toContain("paperclip_expected_env=");
     expect(sent).toContain(REQUEST_ID);
     expect(sent).toContain('exec "$@"');
     expect(sent).not.toContain("exec env ");

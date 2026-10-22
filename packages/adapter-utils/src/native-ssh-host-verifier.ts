@@ -128,16 +128,20 @@ function assertBinding(binding: NativeSshHostVerifierBinding): {
  *
  * Link order is load-bearing: shell state is reset first (a login profile may
  * have set -e/-u or IFS), expected values are assigned, the about-to-exec argv
- * is captured with `set --`, host-observed facts (user, cwd, clock, expiry,
- * hash tool) are checked, the argv digest is verified, the launch env is
- * exported, the env digest is verified over the live variables, and only then
- * does the caller exec "$@" — the same params that were just verified.
+ * is captured with `set --`, host-observed facts (user, cwd, clock, expiry)
+ * are checked, the argv digest is verified, the launch env is exported, the
+ * env digest is verified over the live variables, and only then does the
+ * caller exec "$@" — the same params that were just verified.
  *
  * Every check fails closed with exit 125 and a stderr line naming the opaque
  * request id. Refusal lines carry digests and the opaque id only, never
- * values. All scratch variables are initialized before use and all reads
- * happen in subshells or after assignment, so a launch env key that happens
- * to share the paperclip_ prefix cannot change a check outcome.
+ * values. No launch env key of any name can change a check outcome or a
+ * refusal line: expected digests and the opaque id are literals, not
+ * variables; each digest subshell resolves its own hash tool in contained
+ * scope; the env subshell freezes its word list with `set --` before any
+ * scratch variable is initialized (subshell positionals never reach the
+ * outer "$@", which stays the verified argv); and every remaining verifier
+ * variable is last read before the launch-env exports.
  */
 export function buildNativeSshHostVerifierLinks(
   input: Omit<BuildNativeSshVerifiedRemoteScriptInput, "profileLines">,
@@ -213,32 +217,44 @@ export function buildNativeSshHostVerifierLinks(
   const normalizedCwd = absoluteCwd ? remoteCwd.replace(/\/+$/, "") || "/" : remoteCwd;
 
   const R = NATIVE_SSH_HOST_VERIFY_REFUSAL_EXIT;
+  // The opaque id is a literal: a launch env key named paperclip_opaque_id
+  // must not relabel a refusal. UUID-validated above, so no quoting risk.
   const refuse = (reason: string): string =>
-    `echo "paperclip: native SSH launch $paperclip_opaque_id refused on host: ${reason}" >&2; exit ${R}`;
+    `echo "paperclip: native SSH launch ${opaqueRequestId} refused on host: ${reason}" >&2; exit ${R}`;
+  // Resolved inside each digest subshell, after the launch-env exports: a
+  // launch env key named paperclip_sha256 must not pick the hash tool.
+  const resolveTool =
+    `paperclip_sha256=''; if command -v sha256sum >/dev/null 2>&1; then paperclip_sha256='sha256sum'; ` +
+    `elif command -v shasum >/dev/null 2>&1; then paperclip_sha256='shasum -a 256'; ` +
+    `else ${refuse("no sha256 tool on host")}; fi;`;
   const hashChain =
     `paperclip_e=$(printf '%s' "$paperclip_item" | $paperclip_sha256 | cut -d' ' -f1) || exit ${R}; ` +
     `paperclip_h="$paperclip_h$paperclip_e"`;
-  const hashFinal = (expectedVar: string, reason: string): string =>
+  // The expected digest is a hex literal: a launch env key named
+  // paperclip_expected_argv or paperclip_expected_env must not move the goal.
+  const hashFinal = (expectedHex: string, reason: string): string =>
     `paperclip_h=$(printf '%s' "$paperclip_h" | $paperclip_sha256 | cut -d' ' -f1) || exit ${R}; ` +
-    `if [ "$paperclip_h" != "$${expectedVar}" ]; then ${refuse(reason)}; fi`;
+    `if [ "$paperclip_h" != '${expectedHex}' ]; then ${refuse(reason)}; fi`;
 
   const argvSubshell =
-    `( paperclip_h=''; paperclip_item=''; for paperclip_item in "$@"; do ${hashChain}; done; ` +
-    `${hashFinal("paperclip_expected_argv", "command does not match the launch authority")} )`;
+    `( ${resolveTool} paperclip_h=''; paperclip_item=''; for paperclip_item in "$@"; do ${hashChain}; done; ` +
+    `${hashFinal(argvDigest, "command does not match the launch authority")} )`;
   const envWords = envKeys.map((key) => `"${key}=$${key}"`).join(" ");
+  // The env words freeze with `set --` before any scratch variable exists in
+  // this subshell: words naming paperclip_h, paperclip_item or paperclip_e
+  // expand against the exported launch values, not the loop locals below.
+  // Subshell positionals never reach the outer "$@" the caller execs.
   const envSubshell =
-    `( paperclip_h=''; paperclip_item=''; for paperclip_item in${envWords ? ` ${envWords}` : ""}; do ` +
-    `${hashChain}; done; ${hashFinal("paperclip_expected_env", "environment does not match the launch authority")} )`;
+    `( set --${envWords ? ` ${envWords}` : ""}; ${resolveTool} paperclip_h=''; paperclip_item=''; ` +
+    `for paperclip_item in "$@"; do ${hashChain}; done; ` +
+    `${hashFinal(envDigest, "environment does not match the launch authority")} )`;
 
   return [
     "set +e +u",
     "unset IFS",
-    `paperclip_expected_argv='${argvDigest}'`,
-    `paperclip_expected_env='${envDigest}'`,
     `paperclip_expected_user=${shellQuote(username)}`,
     ...(absoluteCwd ? [`paperclip_expected_cwd=${shellQuote(normalizedCwd)}`] : []),
     `paperclip_expires_at='${expiresEpoch + NATIVE_SSH_HOST_CLOCK_SKEW_SEC}'`,
-    `paperclip_opaque_id=${shellQuote(opaqueRequestId)}`,
     `set -- ${[command, ...args].map((word) => shellQuote(word)).join(" ")}`,
     `if [ "$(id -un)" != "$paperclip_expected_user" ]; then ${refuse("unexpected remote user")}; fi`,
     ...(absoluteCwd
@@ -249,7 +265,6 @@ export function buildNativeSshHostVerifierLinks(
     "paperclip_now=$(date +%s)",
     `case $paperclip_now in ''|*[!0-9]*) ${refuse("host clock is unreadable")};; esac`,
     `if [ "$paperclip_now" -ge "$paperclip_expires_at" ]; then ${refuse("launch authority expired")}; fi`,
-    `if command -v sha256sum >/dev/null 2>&1; then paperclip_sha256='sha256sum'; elif command -v shasum >/dev/null 2>&1; then paperclip_sha256='shasum -a 256'; else ${refuse("no sha256 tool on host")}; fi`,
     argvSubshell,
     ...envKeys.map((key) => `export ${key}=${shellQuote(launchEnv[key])}`),
     envSubshell,
