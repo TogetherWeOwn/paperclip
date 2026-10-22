@@ -2837,7 +2837,9 @@ exec "$STUB_REAL_GIT" "$@"
       await writeFile(path.join(remoteSub, "subfile.txt"), "v2\n");
       await git(remoteSub, ["add", "-A"]);
       await git(remoteSub, ["commit", "-q", "-m", "interior v2"]);
-      await git(checkoutDir, ["add", "sub"]);
+      // Since git 2.54 `git add <submodule>` honors ignore=all and needs
+      // -f; the flag is a no-op on older gits, where the add never ignored.
+      await git(checkoutDir, ["add", "-f", "sub"]);
       await git(checkoutDir, ["commit", "-q", "-m", "bump submodule"]);
       const baseline = await captureDirectorySnapshot(localDir, {
         exclude: baselineExcludes(),
