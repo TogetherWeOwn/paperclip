@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -49,6 +48,7 @@ import {
 import {
   appendRetainedNativeCleanupEvent,
   createRunnerdBackend,
+  nativeSessionWorkspaceScope,
   retainedNativeCleanupJournalMatches,
 } from "./native-session-executor.js";
 import * as publicationSignals from "../chat-publication-reconciliation.js";
@@ -483,6 +483,57 @@ const recoveryFakeCodex = resolve(
   "../../../../packages/paperclip-runner/test/fixtures/fake-final-burst-codex-app-server.mjs",
 );
 
+// Verbatim mirror of the private canonicalJson in native-session-executor.ts.
+// The damaged-epoch fixture must name the isolated codex home in its explicit
+// provider args before the first backend opens it, so it predicts the scoped
+// state root below. Any production drift fails loudly at the predictedRoot
+// check (wrong directory, never a wrong-binary launch).
+function canonicalScopeJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalScopeJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(
+      ([left], [right]) => left.localeCompare(right),
+    );
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalScopeJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+// Mirror of nativeSessionScopeKey + scopedRunnerdStateRoot for the local
+// codex/opencode provider branch (native-session-executor.ts). Uses the real
+// exported nativeSessionWorkspaceScope; the provider identity and session key
+// replicate the codex branch exactly.
+function predictedRunnerdStateRoot(
+  execution: NativeExecutionInput,
+  stateBase: string,
+): string {
+  if (
+    execution.provider.kind !== "codex" &&
+    execution.provider.kind !== "opencode"
+  ) {
+    throw new Error(
+      "fixture only mirrors the local codex/opencode provider scope",
+    );
+  }
+  const scopeKey = canonicalScopeJson({
+    schema: "paperclip.native-session-scope.v2",
+    companyId: execution.binding.companyId,
+    agentId: execution.binding.agentId,
+    workspace: nativeSessionWorkspaceScope(execution),
+    provider: {
+      driverKind: execution.session.driverKind,
+      identity: { kind: execution.provider.kind },
+    },
+    normalizedSessionId:
+      execution.session.normalizedSessionId ??
+      `session-${execution.binding.runId}`,
+  });
+  return join(
+    stateBase,
+    createHash("sha256").update(scopeKey).digest("hex"),
+  );
+}
+
 (embeddedSupport.supported && existsSync(defaultCapabilityRunnerdBinary())
   ? it
   : it.skip)(
@@ -728,7 +779,6 @@ const recoveryFakeCodex = resolve(
     const db = createDb(database.connectionString);
     const scratch = await mkdtemp(join(tmpdir(), "native-damaged-resume-"));
     const stateBase = join(scratch, "sessions");
-    const bin = join(scratch, "bin");
     const workspace = join(scratch, "workspace");
     const sourceHome = join(scratch, "source-home");
     const previousStateBase = process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -746,19 +796,14 @@ const recoveryFakeCodex = resolve(
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
     try {
       await Promise.all(
-        [bin, workspace, sourceHome].map((path) =>
+        [workspace, sourceHome].map((path) =>
           mkdir(path, { recursive: true }),
         ),
       );
       // Only the provider boundary is synthetic; driver, runnerd, authority
-      // rotation, prior-owner DB checks and archive/replacement are real.
-      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-      const command = join(bin, "codex");
-      await writeFile(
-        command,
-        `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(recoveryFakeCodex)} "$CODEX_HOME/fake-state.json" 16\n`,
-      );
-      await chmod(command, 0o700);
+      // rotation, prior-owner DB checks and archive/replacement are real. The
+      // synthetic provider is injected by explicit command (installed-first
+      // resolution ignores PATH), mirroring the fixture above.
       await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
       const address = server.address();
       if (!address || typeof address === "string")
@@ -792,10 +837,17 @@ const recoveryFakeCodex = resolve(
       expect(() => parseNativeExecutionInput(firstExecution)).not.toThrow();
       const runnerInstanceId = randomUUID();
       const environment = {
-        PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
         HOME: sourceHome,
         CODEX_HOME: sourceHome,
       };
+      // Both executions share company/agent/workspace/provider/session scope,
+      // so one predicted root serves all three backend calls below. The fake
+      // must write the isolated codex home the daemon spawns it with.
+      const predictedRoot = predictedRunnerdStateRoot(firstExecution, stateBase);
+      expect(predictedRunnerdStateRoot(currentExecution, stateBase)).toBe(
+        predictedRoot,
+      );
+      const stateFile = join(predictedRoot, "codex-home", "fake-state.json");
       await db.insert(companies).values({
         id: companyId,
         name: "Damaged recovery",
@@ -863,6 +915,8 @@ const recoveryFakeCodex = resolve(
         execution: firstExecution,
         runnerInstanceId,
         runnerEnvironment: environment,
+        localCodexCommand: process.execPath,
+        localCodexArgs: [recoveryFakeCodex, stateFile, "16"],
         onLog: onRunnerLog,
         onSpawn,
       });
@@ -894,6 +948,7 @@ const recoveryFakeCodex = resolve(
       );
       expect(stateKey).toBeDefined();
       const root = join(stateBase, stateKey!);
+      expect(root).toBe(predictedRoot);
       const runnerPath = join(root, "runner", "runner-state.json");
       const providerPath = join(root, "runner", "codex-provider-state.json");
       const runner = JSON.parse(await readFile(runnerPath, "utf8"));
@@ -968,6 +1023,8 @@ const recoveryFakeCodex = resolve(
           execution: currentExecution,
           runnerInstanceId,
           runnerEnvironment: environment,
+          localCodexCommand: process.execPath,
+          localCodexArgs: [recoveryFakeCodex, stateFile, "16"],
         }),
       ).rejects.toThrow("runner_state_identity_mismatch");
       expect(await readFile(runnerPath, "utf8")).toBe(
@@ -1014,6 +1071,8 @@ const recoveryFakeCodex = resolve(
         execution: currentExecution,
         runnerInstanceId,
         runnerEnvironment: environment,
+        localCodexCommand: process.execPath,
+        localCodexArgs: [recoveryFakeCodex, stateFile, "16"],
         onLog: onRunnerLog,
         onSpawn,
       });
@@ -1168,6 +1227,14 @@ const recoveryFakeCodex = resolve(
           "utf8",
         ),
       );
+      // The persisted first-generation provider seed must show the explicit
+      // synthetic executable + fake args, never installed/live Codex.
+      expect(control.runAttachTemplate).toMatchObject({
+        provider: {
+          command: process.execPath,
+          args: [recoveryFakeCodex, stateFile, "16"],
+        },
+      });
       const rawIdentity = control.committedEvents
         .map(
           (entry: { envelope: { payload: Record<string, unknown> } }) =>
