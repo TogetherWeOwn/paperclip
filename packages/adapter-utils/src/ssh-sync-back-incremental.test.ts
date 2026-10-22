@@ -4,12 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  buildSshChangedFilesDownloadScript,
   createSshSyncBackCapTransform,
+  downloadChangedFilesFromSsh,
   parseSshPorcelainStatusV1Z,
   SshSyncBackSizeLimitExceededError,
   syncDirectoryFromSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
+import { SSH_REMOTE_ARG_MAX_BYTES } from "./remote-execution-env.js";
 
 const tempDirs: string[] = [];
 
@@ -249,5 +252,162 @@ describe("sync-back streaming cap", () => {
     expect(failure).toBeInstanceOf(SshSyncBackSizeLimitExceededError);
     expect(await readdir(localDir)).toEqual([]);
     expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+  }, TEST_TIMEOUT_MS);
+});
+
+describe("buildSshChangedFilesDownloadScript", () => {
+  it("archives exactly the listed paths with root-anchored, quoted targets", () => {
+    const script = buildSshChangedFilesDownloadScript({
+      remoteDir: FAKE_REMOTE_ROOT,
+      paths: ["a.txt", "sub/b.txt", "-dash.txt", "sp ace.txt", "qu'ote.txt"],
+      exclude: ["node_modules"],
+    });
+    expect(script).toContain(`cd '${FAKE_REMOTE_ROOT}'`);
+    expect(script).toContain("tar ");
+    expect(script).toContain("-cf -");
+    for (const target of ["'./a.txt'", "'./sub/b.txt'", "'./-dash.txt'", "'./sp ace.txt'"]) {
+      expect(script).toContain(target);
+    }
+    // Single quotes inside a path are shell-escaped, never breaking quoting.
+    expect(script).toContain(`'./qu'"'"'ote.txt'`);
+    expect(script).toContain("'--exclude'");
+    expect(script).toContain("'node_modules'");
+    expect(script).not.toContain(" -cf - . ");
+  });
+
+  it("selects the tar dialect when excludes are root-relative", () => {
+    const script = buildSshChangedFilesDownloadScript({
+      remoteDir: FAKE_REMOTE_ROOT,
+      paths: ["a.txt"],
+      exclude: ["./node_modules"],
+    });
+    expect(script).toContain('case "$(tar --version)" in');
+    expect(script).toContain("'./a.txt'");
+  });
+});
+
+describe("downloadChangedFilesFromSsh", () => {
+  beforeEach(installStubSsh);
+
+  async function writeTree(root: string, files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      const full = path.join(root, relative);
+      await mkdir(path.dirname(full), { recursive: true });
+      await writeFile(full, content, "utf8");
+    }
+  }
+
+  async function pathExists(target: string): Promise<boolean> {
+    return await lstat(target).then(() => true, () => false);
+  }
+
+  it("transfers only the listed paths and honors excludes", async () => {
+    const remoteDir = await createTempDir("paperclip-changed-remote-");
+    await writeTree(remoteDir, {
+      "listed.txt": "listed\n",
+      "unlisted.txt": "unlisted\n",
+      "sub/listed.txt": "nested listed\n",
+      "node_modules/junk.txt": "excluded\n",
+    });
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-changed-staging-");
+
+    await downloadChangedFilesFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      stagingDir,
+      paths: ["listed.txt", "sub/listed.txt", "node_modules/junk.txt"],
+      exclude: ["node_modules"],
+    });
+
+    await expect(readFile(path.join(stagingDir, "listed.txt"), "utf8")).resolves.toBe("listed\n");
+    await expect(readFile(path.join(stagingDir, "sub/listed.txt"), "utf8")).resolves.toBe("nested listed\n");
+    expect(await pathExists(path.join(stagingDir, "unlisted.txt"))).toBe(false);
+    expect(await pathExists(path.join(stagingDir, "node_modules"))).toBe(false);
+  }, TEST_TIMEOUT_MS);
+
+  it("transfers awkward filenames byte-exact", async () => {
+    const remoteDir = await createTempDir("paperclip-awkward-remote-");
+    const names = ["-dash.txt", "sp ace.txt", "qu'ote.txt", "déjà.txt"];
+    await writeTree(remoteDir, Object.fromEntries(names.map((name) => [name, `${name}\n`])));
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-awkward-staging-");
+
+    await downloadChangedFilesFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      stagingDir,
+      paths: names,
+    });
+
+    for (const name of names) {
+      await expect(readFile(path.join(stagingDir, name), "utf8")).resolves.toBe(`${name}\n`);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  it("resolves without transferring when no paths changed", async () => {
+    const remoteDir = await createTempDir("paperclip-empty-remote-");
+    await writeFile(path.join(remoteDir, "a.txt"), "a\n");
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-empty-staging-");
+
+    await downloadChangedFilesFromSsh({ spec, remoteDir: FAKE_REMOTE_ROOT, stagingDir, paths: [] });
+
+    expect(await readdir(stagingDir)).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it("refuses an over-cap transfer without completing the extraction", async () => {
+    const remoteDir = await createTempDir("paperclip-changed-cap-remote-");
+    await writeFile(path.join(remoteDir, "big.bin"), Buffer.alloc(64 * 1024, 0x41));
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-changed-cap-staging-");
+
+    const failure = await downloadChangedFilesFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      stagingDir,
+      paths: ["big.bin"],
+      capBytes: 1024,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(SshSyncBackSizeLimitExceededError);
+  }, TEST_TIMEOUT_MS);
+
+  it("rejects a path list that exceeds the remote command budget", async () => {
+    const remoteDir = await createTempDir("paperclip-budget-remote-");
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-budget-staging-");
+    // ~45 bytes per path once quoted: 5000 paths blow the ~124 KiB budget.
+    const paths = Array.from({ length: 5000 }, (_, index) => `dir-${index}/file-with-a-long-name-${index}.txt`);
+
+    const script = buildSshChangedFilesDownloadScript({ remoteDir: FAKE_REMOTE_ROOT, paths });
+    expect(Buffer.byteLength(script, "utf8")).toBeGreaterThan(SSH_REMOTE_ARG_MAX_BYTES);
+
+    await expect(
+      downloadChangedFilesFromSsh({ spec, remoteDir: FAKE_REMOTE_ROOT, stagingDir, paths }),
+    ).rejects.toThrow(/budget/);
+    expect(await readdir(stagingDir)).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it("rejects when a listed path is missing remotely so the caller falls back", async () => {
+    const remoteDir = await createTempDir("paperclip-missing-remote-");
+    await writeFile(path.join(remoteDir, "present.txt"), "present\n");
+    const spec = buildStubSpec(remoteDir);
+    const stagingDir = await createTempDir("paperclip-missing-staging-");
+
+    // GNU tar exits nonzero for a missing member; bsdtar too. Either way the
+    // changed-files path must surface the failure instead of silently
+    // delivering a partial tree.
+    await expect(
+      downloadChangedFilesFromSsh({
+        spec,
+        remoteDir: FAKE_REMOTE_ROOT,
+        stagingDir,
+        paths: ["present.txt", "gone.txt"],
+      }),
+    ).rejects.toThrow();
   }, TEST_TIMEOUT_MS);
 });

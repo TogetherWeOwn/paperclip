@@ -6,7 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
-import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remote-execution-env.js";
+import {
+  budgetSshRemoteEnvWithReport,
+  SSH_REMOTE_ARG_MAX_BYTES,
+  sshScriptOuterQuotedBytes,
+} from "./remote-execution-env.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -553,9 +557,9 @@ export function assertSshSyncBackSizeWithinCap(input: {
  * script exactly once; the size cap is enforced on the stream it produces,
  * so no separate probe has to read the remote tree first.
  */
-function buildRemoteWorkspaceDownloadScript(remoteDir: string, exclude?: string[]): string {
+function buildRemoteWorkspaceDownloadScript(remoteDir: string, exclude?: string[], targets: string[] = ["."]): string {
   const tarCommand = (flavor: SshTarFlavor) =>
-    `tar ${[...tarExcludeArgs(exclude, flavor).map(shellQuote), "-cf", "-", "."].join(" ")}`;
+    `tar ${[...tarExcludeArgs(exclude, flavor).map(shellQuote), "-cf", "-", ...targets.map(shellQuote)].join(" ")}`;
   // Probe on the creating host: the server and remote can use different tars.
   const archive = hasRootRelativeTarExcludes(exclude)
     ? `case "$(tar --version)" in ` +
@@ -564,6 +568,25 @@ function buildRemoteWorkspaceDownloadScript(remoteDir: string, exclude?: string[
       `*) printf '%s\\n' 'Unsupported tar for root-relative SSH workspace excludes; use GNU tar or bsdtar' >&2; exit 1 ;; esac`
     : tarCommand("gnu");
   return `cd ${shellQuote(remoteDir)} && ${archive}`;
+}
+
+/**
+ * The remote shell script the changed-files sync-back runs: archive exactly
+ * the listed repository-relative paths to stdout with the caller's excludes.
+ * Targets are `./`-anchored (root-relative, and dash-safe: a file named
+ * `-rf` can never parse as a tar flag) and shell-quoted, so spaces, quotes,
+ * and non-ASCII names survive byte-exact.
+ */
+export function buildSshChangedFilesDownloadScript(input: {
+  remoteDir: string;
+  paths: readonly string[];
+  exclude?: string[];
+}): string {
+  return buildRemoteWorkspaceDownloadScript(
+    input.remoteDir,
+    input.exclude,
+    input.paths.map((entry) => `./${entry}`),
+  );
 }
 
 /**
@@ -1737,53 +1760,35 @@ export async function syncDirectoryToSsh(input: {
   }
 }
 
-export async function syncDirectoryFromSsh(input: {
+/**
+ * Stream one remote tar script into a staging directory: ssh stdout through
+ * the streaming size cap (and the caller's progress counter, if any) into a
+ * local tar extractor. Shared by the full-tree sync-back and the
+ * changed-files sync-back; both fail closed with
+ * {@link SshSyncBackSizeLimitExceededError} on over-cap streams.
+ */
+async function extractRemoteTarStreamToStaging(input: {
   spec: SshRemoteExecutionSpec;
+  remoteScript: string;
+  stagingDir: string;
+  capBytes: number;
   remoteDir: string;
-  localDir: string;
-  exclude?: string[];
-  preserveLocalEntries?: readonly string[];
-  onProgress?: RuntimeProgressSink;
-  progressLabel?: string;
+  progress: TransferProgress | null;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
-  const remoteTarScript = buildRemoteWorkspaceDownloadScript(input.remoteDir, input.exclude);
   const sshArgs = [
     ...auth.args,
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteTarScript)}`,
+    `sh -c ${shellQuote(input.remoteScript)}`,
   ];
-
-  // The remote tar size isn't known locally, so probe the remote directory for
-  // an estimate (clamped to 99%). The probe runs concurrently with the transfer
-  // so its round-trip never delays the restore; when it is unavailable we report
-  // bytes received in MB mode with a terminal completion line.
-  const progress = input.onProgress
-    ? createTransferProgress({
-      onProgress: input.onProgress,
-      phase: "Restoring",
-      direction: "from",
-      label: input.progressLabel,
-      totalBytes: probeRemoteDirSize({ spec: input.spec, remoteDir: input.remoteDir }),
-      estimated: true,
-    })
-    : null;
-
   try {
-    // Fail closed before any byte is copied out of staging: the transfer
-    // stream itself carries a cap that aborts the moment cumulative wire
-    // bytes exceed it, instead of copying until ENOSPC. A refusal still runs
-    // the `finally` below, so no staging directory is left behind.
-    const capBytes = resolveSshSyncBackMaxBytes();
-
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
+      const tar = spawn("tar", ["-xf", "-", "-C", input.stagingDir], {
         stdio: ["pipe", "ignore", "pipe"],
         env: tarSpawnEnv(),
       });
@@ -1820,11 +1825,11 @@ export async function syncDirectoryFromSsh(input: {
 
       // The streaming cap sits first in the pipe so over-cap bytes never
       // reach the extractor; its error kills both processes via `fail`.
-      const cap = createSshSyncBackCapTransform({ capBytes, remoteDir: input.remoteDir });
+      const cap = createSshSyncBackCapTransform({ capBytes: input.capBytes, remoteDir: input.remoteDir });
       cap.on("error", fail);
-      if (progress) {
-        progress.counter.on("error", fail);
-        ssh.stdout?.pipe(cap).pipe(progress.counter).pipe(tar.stdin ?? null);
+      if (input.progress) {
+        input.progress.counter.on("error", fail);
+        ssh.stdout?.pipe(cap).pipe(input.progress.counter).pipe(tar.stdin ?? null);
       } else {
         ssh.stdout?.pipe(cap).pipe(tar.stdin ?? null);
       }
@@ -1848,6 +1853,53 @@ export async function syncDirectoryFromSsh(input: {
         maybeFinish();
       });
     });
+  } finally {
+    await auth.cleanup();
+  }
+}
+
+export async function syncDirectoryFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+  exclude?: string[];
+  preserveLocalEntries?: readonly string[];
+  onProgress?: RuntimeProgressSink;
+  progressLabel?: string;
+}): Promise<void> {
+  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  const remoteTarScript = buildRemoteWorkspaceDownloadScript(input.remoteDir, input.exclude);
+
+  // The remote tar size isn't known locally, so probe the remote directory for
+  // an estimate (clamped to 99%). The probe runs concurrently with the transfer
+  // so its round-trip never delays the restore; when it is unavailable we report
+  // bytes received in MB mode with a terminal completion line.
+  const progress = input.onProgress
+    ? createTransferProgress({
+      onProgress: input.onProgress,
+      phase: "Restoring",
+      direction: "from",
+      label: input.progressLabel,
+      totalBytes: probeRemoteDirSize({ spec: input.spec, remoteDir: input.remoteDir }),
+      estimated: true,
+    })
+    : null;
+
+  try {
+    // Fail closed before any byte is copied out of staging: the transfer
+    // stream itself carries a cap that aborts the moment cumulative wire
+    // bytes exceed it, instead of copying until ENOSPC. A refusal still runs
+    // the `finally` below, so no staging directory is left behind.
+    const capBytes = resolveSshSyncBackMaxBytes();
+
+    await extractRemoteTarStreamToStaging({
+      spec: input.spec,
+      remoteScript: remoteTarScript,
+      stagingDir,
+      capBytes,
+      remoteDir: input.remoteDir,
+      progress,
+    });
     await progress?.finish();
 
     // The streaming cap bounds wire bytes, not extracted bytes: hardlinks
@@ -1864,7 +1916,70 @@ export async function syncDirectoryFromSsh(input: {
     throw error;
   } finally {
     await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
-    await auth.cleanup();
+  }
+}
+
+/**
+ * Download exactly the listed repository-relative paths from the remote
+ * workspace into `stagingDir`. This is the transfer half of the
+ * changed-files sync-back: the caller lists what `git status --porcelain`
+ * reported remotely, then merges the partial tree over the workspace with
+ * `mergeChangedFilesWithBaseline`.
+ *
+ * The transfer shares the full sync-back's guards: the streaming size cap
+ * aborts over-cap streams mid-transfer, and the post-extract staging check
+ * bounds extracted bytes. A path list that would overflow the remote
+ * command budget, or a listed path missing remotely, rejects so the caller
+ * falls back to the full copy — a partial tree is never silently delivered.
+ */
+export async function downloadChangedFilesFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  stagingDir: string;
+  paths: readonly string[];
+  exclude?: string[];
+  capBytes?: number;
+  onProgress?: RuntimeProgressSink;
+  progressLabel?: string;
+}): Promise<void> {
+  if (input.paths.length === 0) return;
+  const remoteScript = buildSshChangedFilesDownloadScript({
+    remoteDir: input.remoteDir,
+    paths: input.paths,
+    exclude: input.exclude,
+  });
+  if (sshScriptOuterQuotedBytes(remoteScript) > SSH_REMOTE_ARG_MAX_BYTES) {
+    throw new Error(
+      `SSH changed-files sync-back from ${input.remoteDir} lists ${input.paths.length} paths, ` +
+        `which exceeds the remote command budget; falling back to the full copy`,
+    );
+  }
+  const capBytes = input.capBytes ?? resolveSshSyncBackMaxBytes();
+  const progress = input.onProgress
+    ? createTransferProgress({
+      onProgress: input.onProgress,
+      phase: "Restoring",
+      direction: "from",
+      label: input.progressLabel,
+      totalBytes: null,
+      estimated: false,
+    })
+    : null;
+  try {
+    await extractRemoteTarStreamToStaging({
+      spec: input.spec,
+      remoteScript,
+      stagingDir: input.stagingDir,
+      capBytes,
+      remoteDir: input.remoteDir,
+      progress,
+    });
+    await progress?.finish();
+    const stagedBytes = await measureDirectoryFileBytes(input.stagingDir);
+    assertSshSyncBackSizeWithinCap({ sourceBytes: stagedBytes, capBytes, remoteDir: input.remoteDir });
+  } catch (error) {
+    await progress?.fail();
+    throw error;
   }
 }
 
