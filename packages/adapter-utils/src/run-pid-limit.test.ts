@@ -14,6 +14,7 @@ const isLinux = process.platform === "linux";
 const FORK_MARKER = "29731";
 const SETSID_MARKER = "29732";
 const TRAP_MARKER = "29733";
+const DOUBLE_FORK_MARKER = "29734";
 const FORK_CHILDREN = 48;
 
 const hasSetsid = (() => {
@@ -47,7 +48,9 @@ function procCmdlinesContain(marker: string): number[] {
 
 async function killFixtureLeftovers(): Promise<void> {
   if (!isLinux) return;
-  for (const marker of [FORK_MARKER, SETSID_MARKER, TRAP_MARKER]) {
+  for (
+    const marker of [FORK_MARKER, SETSID_MARKER, TRAP_MARKER, DOUBLE_FORK_MARKER]
+  ) {
     for (const pid of procCmdlinesContain(marker)) {
       try {
         process.kill(pid, "SIGKILL");
@@ -222,6 +225,54 @@ describe("runChildProcess per-run PID limit", () => {
       // never a clean 0: the typed failure must survive the wrapper.
       expect(result.exitCode).not.toBe(0);
       expect(procCmdlinesContain(SETSID_MARKER)).toEqual([]);
+    },
+    30_000,
+  );
+
+  it.runIf(hasSetsid)(
+    "catches double-fork daemons that reparent to PID 1",
+    async () => {
+      // True double-fork: the setsid intermediate backgrounds the daemon
+      // (a braced group — a bare `&` would only background the last command
+      // and run the rest in the foreground) and exits after 0.5s, so the
+      // daemon reparents to PID 1 outside the run's group. The daemon only
+      // grows its tree at 1.2s — after the intermediate is gone — so only
+      // cumulative attribution (one sample during the 0.5s intact window
+      // keeps the daemon counted) can see it. A per-tick descendant walk
+      // reports peak ~2 here and stays silent. The marker appears in every
+      // fixture cmdline (the -c scripts carry it), so marker-emptiness
+      // proves the kill list covered the daemon subtree too. Self-bound like
+      // the setsid test: the in-group killer ends the leader at 10s if the
+      // guard stays quiet, and the run then resolves at timeoutSec (the
+      // daemon's session is unreachable by the group kill, and the daemon
+      // holds stdio open) instead of hanging; the afterEach marker backstop
+      // reaps the daemon subtree.
+      const script = [
+        "trap 'kill 0; exit 0' TERM",
+        "(sleep 10; kill 0) &",
+        `setsid sh -c '{ sleep 1.2; i=0; while [ $i -lt ${FORK_CHILDREN} ]; do sleep ${DOUBLE_FORK_MARKER} & i=$((i+1)); done; sleep 60; } & sleep 0.5' &`,
+        "wait",
+      ].join("\n");
+      const result = await runChildProcess(
+        randomUUID(),
+        "sh",
+        ["-c", script],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 30,
+          graceSec: 1,
+          pidLimit: 32,
+          pidGuardIntervalMs: 50,
+          onLog: async () => {},
+        },
+      );
+      expect(result.errorCode).toBe(RUN_PID_LIMIT_EXCEEDED);
+      expect(result.stderr).toContain("run PID limit exceeded");
+      expect(result.pidStats?.exceeded).toBe(true);
+      expect(result.pidStats?.peak).toBeGreaterThan(32);
+      expect(result.exitCode).not.toBe(0);
+      expect(procCmdlinesContain(DOUBLE_FORK_MARKER)).toEqual([]);
     },
     30_000,
   );

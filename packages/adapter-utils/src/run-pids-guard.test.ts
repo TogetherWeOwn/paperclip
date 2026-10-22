@@ -16,6 +16,7 @@ import {
   MIN_RUN_PID_LIMIT,
   parseStatFields,
   parseStatProcessGroup,
+  pruneSeenPids,
   readCgroupPidsMaxEvents,
   resolveRunPidGuardIntervalMs,
   resolveRunPidLimit,
@@ -29,13 +30,15 @@ import {
 const isLinux = process.platform === "linux";
 
 // Build a realistic /proc/<pid>/stat line: `pid (comm) state ppid pgrp ...`
-// with num_threads (stat field 20) at post-comm index 17.
+// with num_threads (stat field 20) at post-comm index 17 and starttime
+// (stat field 22) at post-comm index 19.
 function statLine(
   pid: number,
   comm: string,
   ppid: number,
   pgrp: number,
   threads: number,
+  startTime = 0,
 ): string {
   const tail = [
     "S",
@@ -57,7 +60,7 @@ function statLine(
     0,
     threads,
     0,
-    0,
+    startTime,
   ].join(" ");
   return `${pid} (${comm}) ${tail}`;
 }
@@ -329,25 +332,29 @@ describe("startRunPidsGuard", () => {
 });
 
 describe("parseStatFields", () => {
-  it("parses ppid, pgrp and num_threads", () => {
-    expect(parseStatFields(statLine(1234, "node", 1000, 1234, 7))).toEqual({
+  it("parses ppid, pgrp, num_threads and starttime", () => {
+    expect(
+      parseStatFields(statLine(1234, "node", 1000, 1234, 7, 987654)),
+    ).toEqual({
       ppid: 1000,
       pgrp: 1234,
       numThreads: 7,
+      startTime: 987654,
     });
   });
 
   it("anchors on the last paren when comm has spaces and parens", () => {
     expect(
       parseStatFields(statLine(99, "my (weird) proc", 1, 4242, 3)),
-    ).toEqual({ ppid: 1, pgrp: 4242, numThreads: 3 });
+    ).toEqual({ ppid: 1, pgrp: 4242, numThreads: 3, startTime: 0 });
   });
 
-  it("defaults num_threads to 1 on truncated lines", () => {
+  it("defaults num_threads to 1 and starttime to 0 on truncated lines", () => {
     expect(parseStatFields("1234 (node) S 1000 1234 0 0 0")).toEqual({
       ppid: 1000,
       pgrp: 1234,
       numThreads: 1,
+      startTime: 0,
     });
   });
 
@@ -417,6 +424,82 @@ describe("countRunTree", () => {
     expect(() =>
       scanProcessEntries(path.join(os.tmpdir(), "pids-guard-no-such-root"))
     ).toThrow();
+  });
+
+  it("attributes reparented daemons via additionalRoots", () => {
+    // Double-fork aftermath: the intermediate (11) exited, the daemon (12)
+    // reparented to PID 1 outside the run's group, and forked a new child
+    // (14) the per-tick BFS could never reach from the leader.
+    const root = mkdtempSync(path.join(os.tmpdir(), "pids-guard-tree-"));
+    for (
+      const [pid, ppid, pgrp, threads] of [
+        [10, 1, 10, 1],
+        [12, 1, 99, 1],
+        [14, 12, 99, 2],
+        [15, 1, 15, 9],
+      ] as const
+    ) {
+      mkdirSync(path.join(root, String(pid)));
+      writeFileSync(
+        path.join(root, String(pid), "stat"),
+        statLine(pid, `p${pid}`, ppid, pgrp, threads),
+      );
+    }
+    const entries = scanProcessEntries(root);
+    const withoutSeen = countRunTree({
+      entries,
+      processGroupId: 10,
+      rootPid: 10,
+    });
+    expect(withoutSeen.count).toBe(1);
+    expect(new Set(withoutSeen.pids)).toEqual(new Set([10]));
+    // The guard passes its cumulative seen set (which learned pid 12 while
+    // the intermediate lived) as additionalRoots.
+    const withSeen = countRunTree({
+      entries,
+      processGroupId: 10,
+      rootPid: 10,
+      additionalRoots: [12],
+    });
+    expect(withSeen.count).toBe(1 + 1 + 2);
+    expect(new Set(withSeen.pids)).toEqual(new Set([10, 12, 14]));
+  });
+});
+
+describe("pruneSeenPids", () => {
+  function entry(pid: number, startTime: number) {
+    return { pid, ppid: 1, pgrp: pid, threads: 1, startTime };
+  }
+
+  it("keeps live pids with an unchanged starttime", () => {
+    const seen = new Map([
+      [10, 100],
+      [12, 200],
+    ]);
+    pruneSeenPids(seen, [entry(10, 100), entry(12, 200), entry(13, 50)]);
+    expect(seen).toEqual(
+      new Map([
+        [10, 100],
+        [12, 200],
+      ]),
+    );
+  });
+
+  it("drops exits and pid-number reuse", () => {
+    const seen = new Map([
+      [10, 100],
+      [11, 110],
+      [12, 200],
+    ]);
+    // 10 exited, 12's number was reused by a new process (new starttime).
+    pruneSeenPids(seen, [entry(11, 110), entry(12, 999)]);
+    expect(seen).toEqual(new Map([[11, 110]]));
+  });
+
+  it("is a no-op for an empty seen set", () => {
+    const seen = new Map<number, number>();
+    pruneSeenPids(seen, [entry(10, 100)]);
+    expect(seen.size).toBe(0);
   });
 });
 
@@ -520,6 +603,83 @@ describe("shared scanner", () => {
       child.unref();
     }
   });
+
+  it.runIf(isLinux)(
+    "keeps detecting while other guards churn",
+    async () => {
+      // Regression: the shared timer used to be cleared and recreated on
+      // every guard start/stop, so registration churn faster than the tick
+      // deferred every live guard's detection indefinitely (churn peaks
+      // during a PID incident, when runs fail and retry). The tick deadline
+      // must survive churn when the minimum interval is unchanged.
+      const child = spawn("sh", [], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      const pgid = child.pid as number;
+      const stamp = Date.now();
+      const seen: number[] = [];
+      const victim = startRunPidsGuard({
+        runId: `guard-churn-victim-${stamp}`,
+        processGroupId: pgid,
+        rootPid: child.pid,
+        limit: 2,
+        intervalMs: 100,
+        onExceeded: (stats) => {
+          seen.push(stats.lastCount);
+        },
+      });
+      const scansBefore = getRunPidsSharedScannerStats().scansPerformed;
+      let churning = true;
+      const churn = (async () => {
+        let n = 0;
+        while (churning) {
+          // Same cadence as the victim, so the shared minimum never
+          // changes and a correct scheduler never restarts the timer.
+          const dummy = startRunPidsGuard({
+            runId: `guard-churn-dummy-${stamp}-${(n += 1)}`,
+            processGroupId: 4194302,
+            limit: 4096,
+            intervalMs: 100,
+            onExceeded: () => {},
+          });
+          dummy.stop();
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      })();
+      try {
+        expect(seen).toEqual([]);
+        // Grow past the limit while churn is running: only shared ticks
+        // can fire the victim from here.
+        child.stdin?.write("sleep 30 & sleep 30 & sleep 30 &\n");
+        for (let i = 0; i < 100 && seen.length === 0; i += 1) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(seen.length).toBe(1);
+        // Ticks fired throughout the churn (pre-fix: zero scans here and
+        // the victim stayed quiet until churn stopped).
+        expect(
+          getRunPidsSharedScannerStats().scansPerformed,
+        ).toBeGreaterThan(scansBefore);
+      } finally {
+        churning = false;
+        await churn;
+        victim.stop();
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // Already gone.
+        }
+        try {
+          process.kill(-pgid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        child.unref();
+      }
+    },
+    30_000,
+  );
 
   it.runIf(isLinux)("fires on cgroup max events below the poll count", async () => {
     const child = spawn("sleep", ["30"], {

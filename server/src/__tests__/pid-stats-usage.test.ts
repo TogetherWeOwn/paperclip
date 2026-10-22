@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { selectPidStatsForUsageJson } from "../services/pid-stats-usage.js";
 
@@ -21,5 +22,19 @@ describe("selectPidStatsForUsageJson", () => {
     expect(selectPidStatsForUsageJson(undefined)).toEqual({});
     expect(selectPidStatsForUsageJson("not-an-object")).toEqual({});
     expect(selectPidStatsForUsageJson({ pidStats: null })).toEqual({});
+  });
+
+  it("pins the heartbeat usageJson mirror call site", () => {
+    // The helper test above pins the helper, not heartbeat calling it: the
+    // usageJson spread lives inside heartbeatService's run-finalization
+    // closure, which has no narrower behavioral seam. This source pin fails
+    // if the mirror call is ever deleted or detached from resultJson.
+    const heartbeatSource = readFileSync(
+      new URL("../services/heartbeat.ts", import.meta.url),
+      "utf8",
+    );
+    expect(heartbeatSource).toContain(
+      "...selectPidStatsForUsageJson(adapterResult.resultJson)",
+    );
   });
 });

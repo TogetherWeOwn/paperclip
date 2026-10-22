@@ -30,9 +30,15 @@ import path from "node:path";
  * incident filled):
  * - Threads count: the pids cgroup charges tasks, not thread-group leaders,
  *   so each member contributes its stat num_threads.
- * - Descendants count: sandboxed runs (bwrap --new-session) and setsid'd or
- *   reparented children leave the wrapper's process group, so members of the
- *   group plus all descendants of the spawned leader are attributed to the run.
+ * - Descendants count, cumulatively: sandboxed runs (bwrap --new-session)
+ *   and setsid'd children leave the wrapper's process group, so members of
+ *   the group plus all descendants of the spawned leader are attributed to
+ *   the run. Attribution is sticky: once a pid is seen in the run's tree it
+ *   stays attributed while it lives, so double-fork daemons that reparent to
+ *   PID 1 after the intermediate exits are still counted (and still
+ *   stoppable) as long as one sample observed the intact chain. Sticky pids
+ *   are keyed by (pid, start_time) so a reused pid number is never mistaken
+ *   for the remembered process.
  * - One shared scan: every live guard is served by a single /proc pass per
  *   tick (plus its own immediate first sample), so dozens of concurrent runs
  *   cost one scan per interval instead of one scan per run per interval.
@@ -132,21 +138,28 @@ export interface ProcStatFields {
   ppid: number;
   pgrp: number;
   numThreads: number;
+  /**
+   * stat starttime (field 22, clock ticks since boot). Only ever compared
+   * for equality against the same pid's earlier value, to tell pid-number
+   * reuse apart from the remembered process.
+   */
+  startTime: number;
 }
 
 /**
- * Parse the ppid/pgrp/num_threads fields from one /proc/<pid>/stat line. The
- * comm field may contain spaces and parens, so anchor on the LAST ")":
- * everything after is ` state ppid pgrp ... num_threads ...`. num_threads
- * defaults to 1 when the line is truncated (real kernel lines always carry
- * all 52 fields).
+ * Parse the ppid/pgrp/num_threads/starttime fields from one
+ * /proc/<pid>/stat line. The comm field may contain spaces and parens, so
+ * anchor on the LAST ")": everything after is
+ * ` state ppid pgrp ... num_threads ... starttime ...`. num_threads defaults
+ * to 1 and starttime to 0 when the line is truncated (real kernel lines
+ * always carry all 52 fields).
  */
 export function parseStatFields(statLine: string): ProcStatFields | null {
   const close = statLine.lastIndexOf(")");
   if (close === -1) return null;
   const fields = statLine.slice(close + 1).trim().split(/\s+/);
   // fields[0] = state, fields[1] = ppid, fields[2] = pgrp,
-  // fields[17] = num_threads.
+  // fields[17] = num_threads, fields[19] = starttime.
   if (fields.length < 3) return null;
   const ppid = Number.parseInt(fields[1] ?? "", 10);
   const pgrp = Number.parseInt(fields[2] ?? "", 10);
@@ -157,7 +170,13 @@ export function parseStatFields(statLine: string): ProcStatFields | null {
     Number.isInteger(rawThreads) && (rawThreads as number) >= 1
       ? (rawThreads as number)
       : 1;
-  return { ppid, pgrp, numThreads };
+  const rawStart =
+    fields.length > 19 ? Number.parseInt(fields[19] ?? "", 10) : Number.NaN;
+  const startTime =
+    Number.isInteger(rawStart) && (rawStart as number) >= 0
+      ? (rawStart as number)
+      : 0;
+  return { ppid, pgrp, numThreads, startTime };
 }
 
 /**
@@ -174,6 +193,8 @@ export interface ProcEntry {
   pgrp: number;
   /** Thread-group size from stat num_threads (>= 1). */
   threads: number;
+  /** stat starttime; equality-compared to detect pid-number reuse. */
+  startTime: number;
 }
 
 /**
@@ -202,15 +223,38 @@ export function scanProcessEntries(procRoot = "/proc"): ProcEntry[] {
       ppid: fields.ppid,
       pgrp: fields.pgrp,
       threads: fields.numThreads,
+      startTime: fields.startTime,
     });
   }
   return entries;
 }
 
 /**
+ * Prune a guard's cumulative seen-pid set against one fresh scan, in place.
+ * Drops exits (absent from the scan) and pid-number reuse (same pid, new
+ * starttime): without the starttime check a remembered pid reused by an
+ * unrelated process would be counted — and signaled on exceed — as ours.
+ * Pure apart from mutating `seen`: no I/O.
+ */
+export function pruneSeenPids(
+  seen: Map<number, number>,
+  entries: readonly ProcEntry[],
+): void {
+  if (seen.size === 0) return;
+  const live = new Map<number, number>();
+  for (const entry of entries) live.set(entry.pid, entry.startTime);
+  for (const [pid, startTime] of seen) {
+    if (live.get(pid) !== startTime) seen.delete(pid);
+  }
+}
+
+/**
  * Attribute scanned entries to one run: members of its process group plus
  * all descendants of the spawned leader (bwrap --new-session, setsid, and
  * daemon double-forks all leave the wrapper group but stay descendants).
+ * `additionalRoots` seeds the descendant walk with the guard's cumulative
+ * seen-pid set, so double-fork daemons reparented to PID 1 stay attributed
+ * (with their own new children) after the intermediate exits.
  * The count is thread-weighted to match pids-cgroup accounting. Pure: no I/O,
  * so the shared scanner calls it once per live guard per tick.
  */
@@ -218,20 +262,26 @@ export function countRunTree(input: {
   entries: readonly ProcEntry[];
   processGroupId?: number | null;
   rootPid?: number | null;
+  additionalRoots?: readonly number[];
 }): { count: number; pids: number[] } {
   const { entries } = input;
   const pgid = input.processGroupId ?? null;
   const rootPid = input.rootPid ?? null;
+  const seeds: number[] = [];
+  if (typeof rootPid === "number" && rootPid > 0) seeds.push(rootPid);
+  for (const extra of input.additionalRoots ?? []) {
+    if (typeof extra === "number" && extra > 0) seeds.push(extra);
+  }
   const inTree = new Set<number>();
-  if (typeof rootPid === "number" && rootPid > 0) {
+  if (seeds.length > 0) {
     const children = new Map<number, number[]>();
     for (const entry of entries) {
       const list = children.get(entry.ppid);
       if (list) list.push(entry.pid);
       else children.set(entry.ppid, [entry.pid]);
     }
-    const queue = [rootPid];
-    inTree.add(rootPid);
+    const queue = [...seeds];
+    for (const seed of seeds) inTree.add(seed);
     while (queue.length > 0) {
       const current = queue.pop() as number;
       const kids = children.get(current);
@@ -406,10 +456,18 @@ interface GuardRegistration {
   lastSampleAt: number;
   lastTreePids: number[];
   stopped: boolean;
+  /**
+   * Cumulative attribution: every pid ever sampled in this run's tree,
+   * mapped to its stat starttime. Pruned against each fresh scan (exits and
+   * pid reuse drop out); survivors seed the next sample's descendant walk so
+   * double-fork daemons stay attributed after reparenting.
+   */
+  seenPids: Map<number, number>;
 }
 
 const guardRegistrations = new Map<string, GuardRegistration>();
 let sharedScannerTimer: NodeJS.Timeout | null = null;
+let sharedScannerIntervalMs: number | null = null;
 let sharedScannerScans = 0;
 
 /**
@@ -433,11 +491,22 @@ function evaluateGuardWithEntries(
   now: number,
 ): void {
   if (reg.stopped || reg.stats.exceeded) return;
+  // Cumulative attribution: pids seen in an earlier sample keep counting
+  // (and keep their new children counting) even after leaving the group or
+  // reparenting away from the leader — the double-fork daemon case.
+  pruneSeenPids(reg.seenPids, entries);
   const { count, pids } = countRunTree({
     entries,
     processGroupId: reg.processGroupId,
     rootPid: reg.rootPid,
+    additionalRoots: [...reg.seenPids.keys()],
   });
+  const attributed = new Set(pids);
+  for (const entry of entries) {
+    if (attributed.has(entry.pid)) {
+      reg.seenPids.set(entry.pid, entry.startTime);
+    }
+  }
   reg.lastSampleAt = now;
   reg.lastTreePids = pids;
   reg.stats.lastCount = count;
@@ -463,15 +532,26 @@ function evaluateGuardWithEntries(
 }
 
 function rescheduleSharedScanner(): void {
-  if (sharedScannerTimer) {
-    clearInterval(sharedScannerTimer);
-    sharedScannerTimer = null;
+  if (guardRegistrations.size === 0) {
+    if (sharedScannerTimer) {
+      clearInterval(sharedScannerTimer);
+      sharedScannerTimer = null;
+    }
+    sharedScannerIntervalMs = null;
+    return;
   }
-  if (guardRegistrations.size === 0) return;
   let interval = DEFAULT_RUN_PID_GUARD_INTERVAL_MS;
   for (const reg of guardRegistrations.values()) {
     if (reg.intervalMs < interval) interval = reg.intervalMs;
   }
+  // Never restart the tick deadline when the cadence is unchanged: run
+  // start/stop churn (peaking during a PID incident, when runs fail and
+  // retry) would otherwise defer every live guard's detection indefinitely.
+  // A stale-faster timer is harmless — each guard still keeps its own
+  // cadence via the lastSampleAt gate in the tick below.
+  if (sharedScannerTimer && sharedScannerIntervalMs === interval) return;
+  if (sharedScannerTimer) clearInterval(sharedScannerTimer);
+  sharedScannerIntervalMs = interval;
   sharedScannerTimer = setInterval(() => {
     let entries: ProcEntry[];
     try {
@@ -551,6 +631,7 @@ export function startRunPidsGuard(input: StartRunPidsGuardInput): RunPidsGuard {
     lastSampleAt: 0,
     lastTreePids: [],
     stopped: false,
+    seenPids: new Map(),
   };
   // Sample immediately so a run that spawns its whole tree in the first
   // few milliseconds is caught before the first shared tick.
