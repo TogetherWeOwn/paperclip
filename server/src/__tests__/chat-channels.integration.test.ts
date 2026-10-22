@@ -67930,6 +67930,121 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("routes a mixed-case GitHub edit to the lowercase conversation thread", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, webhookSecret } =
+      await configuredGitHubEndpoint(fixture);
+    try {
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:issue:84",
+        name: "paperclipai/paperclip",
+      });
+      // configuredGitHubEndpoint already seeds the paperclipai/paperclip
+      // repository resource; no manual insert needed.
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: makeMessage({
+          id: "84001",
+          text: "@maya original mixed-case request",
+          mentioned: true,
+          userId: "7001",
+        }),
+        trigger: "mention",
+      });
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      expect(conversation!.externalThreadId).toBe(
+        "github:paperclipai/paperclip:issue:84",
+      );
+      // GitHub delivers the canonical org casing. The lifecycle path must
+      // mint the same lowercase thread id as the conversation above.
+      await expect(
+        service.handleWebhook(
+          endpoint.publicId,
+          "github",
+          signedGitHubWebhookRequest({
+            delivery: "mixed-case-lifecycle-edit",
+            event: "issue_comment",
+            webhookSecret,
+            url: `https://paperclip.example/api/chat-webhooks/${endpoint.publicId}/github`,
+            payload: {
+              action: "edited",
+              comment: {
+                id: 84001,
+                body: "@maya corrected mixed-case request",
+                updated_at: "2026-10-09T19:35:00Z",
+              },
+              issue: { number: 84 },
+              repository: {
+                id: 97531,
+                full_name: "PaperclipAI/Paperclip",
+                name: "Paperclip",
+                owner: { id: 1357, login: "PaperclipAI" },
+              },
+              sender: { id: 7001, login: "alex-e2e" },
+            },
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true });
+      const [ingress] = await db
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "github_webhook_ingress"),
+            eq(
+              chatActions.providerActionId,
+              "github_webhook_ingress:mixed-case-lifecycle-edit",
+            ),
+          ),
+        );
+      expect(ingress).toBeDefined();
+      await service.processPendingGitHubWebhookIngress(1, ingress!.id);
+      const [delivery] = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "message_updated"),
+          ),
+        );
+      expect(delivery).toBeDefined();
+      await service.processPendingDeliveries(1, delivery!.id);
+      await expect(
+        db
+          .select({
+            conversationId: chatDeliveries.conversationId,
+            state: chatDeliveries.state,
+          })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, delivery!.id)),
+      ).resolves.toEqual([
+        { conversationId: conversation!.id, state: "processed" },
+      ]);
+      await expect(
+        db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation!.issueId)),
+      ).resolves.toEqual([
+        { body: "@maya original mixed-case request" },
+        {
+          body: "An external message was edited:\n\n@maya corrected mixed-case request",
+        },
+      ]);
+    } finally {
+      await service.shutdown();
+    }
+  });
+
   it("supplements Chat SDK with verified GitHub comment edit and delete lifecycle events", async () => {
     const fixture = await seedCompany();
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
