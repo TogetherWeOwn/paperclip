@@ -503,6 +503,66 @@ export async function mergeDirectoryWithBaseline(input: {
   });
 }
 
+/**
+ * Apply a partial (changed-files-only) sync-back over a target directory with
+ * the same outcome as {@link mergeDirectoryWithBaseline}: staged entries that
+ * differ from the baseline overwrite the target (remote wins), and
+ * `deletedPaths` remove baseline entries the remote deleted — but only where
+ * the target still matches the baseline, so concurrent local edits survive.
+ * Deletion is explicit: unlike the full merge, absence from the partial
+ * source never implies a delete.
+ *
+ * Two deliberate differences from the full merge:
+ * - Empty directories are left in place (no `rmdir` pass). Porcelain status
+ *   cannot distinguish a remotely-deleted directory from a remotely-emptied
+ *   one, and keeping an empty directory can never break a consumer that
+ *   recreates it on demand.
+ * - The target is read per deleted path instead of snapshotted whole, so a
+ *   clean-tree restore costs no full-tree walk.
+ */
+export async function mergeChangedFilesWithBaseline(input: {
+  baseline: DirectorySnapshot;
+  /** Staging directory holding ONLY remotely-changed content (a partial tree). */
+  sourceDir: string;
+  /** Remote-deleted paths, applied only where the target matches the baseline. */
+  deletedPaths: readonly string[];
+  targetDir: string;
+  beforeApply?: () => Promise<void>;
+  afterApply?: () => Promise<void>;
+}): Promise<void> {
+  const source = await captureDirectorySnapshot(input.sourceDir, { exclude: input.baseline.exclude });
+  await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+    // Same guard as the full merge: a literal excluded descendant must
+    // survive replacement of its ancestor. Reject before any file writes.
+    for (const [relative, entry] of source.entries) {
+      if (entry.kind === "dir" || entriesMatch(input.baseline.entries.get(relative), entry)) continue;
+      if (input.baseline.exclude.some((excluded) => excluded.replace(/^\.\//, "").startsWith(`${relative}/`))) {
+        throw Object.assign(new Error("Workspace restore cannot replace an excluded path's ancestor"), {
+          code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE",
+        });
+      }
+    }
+    await input.beforeApply?.();
+    const deletes = [...new Set(input.deletedPaths)].sort((left, right) => right.length - left.length);
+    for (const relative of deletes) {
+      const baselineEntry = input.baseline.entries.get(relative);
+      if (!baselineEntry || baselineEntry.kind === "dir") continue;
+      if (!entriesMatch(await readSnapshotEntry(canonicalTargetDir, relative), baselineEntry)) continue;
+      await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }).catch(() => undefined);
+    }
+
+    const changedSourceEntries = [...source.entries.entries()]
+      .filter(([relative, entry]) => !entriesMatch(input.baseline.entries.get(relative), entry))
+      .sort(([left], [right]) => left.localeCompare(right));
+
+    for (const [relative, entry] of changedSourceEntries) {
+      await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+    }
+
+    await input.afterApply?.();
+  });
+}
+
 export async function directoryEntryMatchesBaseline(
   rootDir: string,
   relative: string,
