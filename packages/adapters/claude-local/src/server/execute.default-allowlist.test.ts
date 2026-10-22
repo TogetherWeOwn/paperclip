@@ -5,6 +5,7 @@ const {
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
+  startAdapterExecutionTargetPaperclipBridge,
   capturedSandboxOptions,
 } = vi.hoisted(() => ({
   ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => undefined),
@@ -43,6 +44,22 @@ const {
     pid: 123,
     startedAt: new Date().toISOString(),
   })),
+  startAdapterExecutionTargetPaperclipBridge: vi.fn(
+    async (input: { hostApiToken?: string | null }) => {
+      // Mirror the real local-bridge gate: no host token keeps legacy
+      // passthrough (null). The fake bridge URL stays in sync with
+      // PINNED_BRIDGE_URL below; the discard port never routes anywhere.
+      if (!input.hostApiToken?.trim()) return null;
+      return {
+        env: {
+          PAPERCLIP_API_URL: "http://127.0.0.1:9",
+          PAPERCLIP_API_KEY: "SYNTHETIC-BRIDGE-TOKEN-PIN",
+          PAPERCLIP_API_BRIDGE_MODE: "local_v1",
+        },
+        stop: async () => {},
+      };
+    },
+  ),
   capturedSandboxOptions: [] as Array<{
     networkScope: unknown;
     networkAllowlist: unknown;
@@ -73,6 +90,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     ensureAdapterExecutionTargetRuntimeCommandInstalled,
     resolveAdapterExecutionTargetCommandForLogs,
     runAdapterExecutionTargetProcess,
+    startAdapterExecutionTargetPaperclipBridge,
   };
 });
 
@@ -96,6 +114,13 @@ vi.mock("@paperclipai/adapter-utils/local-process-sandbox", async () => {
 });
 
 import { execute } from "./execute.js";
+
+// Synthetic credentials. The host JWT is JWT-shaped (three dot segments);
+// nothing here is a real credential and nothing leaves the test process.
+const SYNTHETIC_HOST_JWT =
+  "c3ludGhldGljLWFsbG93bGlzdC1waW4.SU5KRy1IQ09TVC1UT0tFTg.c3ludGhldGljLXNpZ25hdHVyZQ";
+// Keep in sync with the bridge mock above (hoisting keeps it out of reach).
+const PINNED_BRIDGE_URL = "http://127.0.0.1:9";
 
 function buildContext(config: Record<string, unknown> = {}) {
   return {
@@ -130,6 +155,21 @@ function spawnCommand(): string {
       "expected runAdapterExecutionTargetProcess to have been called",
     );
   return call[2];
+}
+
+function spawnEnv(): Record<string, string> {
+  const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [
+    string,
+    unknown,
+    string,
+    unknown,
+    { env: Record<string, string> },
+  ];
+  if (!call)
+    throw new Error(
+      "expected runAdapterExecutionTargetProcess to have been called",
+    );
+  return call[4].env;
 }
 
 describe("claude_local default egress allowlist (B2)", () => {
@@ -228,6 +268,33 @@ describe("claude_local default egress allowlist (B2)", () => {
     async () => {
       await expect(execute(buildContext() as never)).rejects.toThrow(
         "supported only on Linux",
+      );
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "appends the started bridge origin to the sandbox allowlist (B1/B2 contract)",
+    async () => {
+      await execute({
+        ...buildContext(),
+        authToken: SYNTHETIC_HOST_JWT,
+      } as never);
+
+      expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalled();
+      // The child env carries the bridge URL and bridge token, never the host JWT.
+      expect(spawnEnv().PAPERCLIP_API_URL).toBe(PINNED_BRIDGE_URL);
+      expect(spawnEnv().PAPERCLIP_API_KEY).toBe("SYNTHETIC-BRIDGE-TOKEN-PIN");
+      // The sandbox allowlist trusts exactly that bridge origin alongside the
+      // pre-swap defaults, so the egress proxy lets bridge calls through.
+      // Deleting the execute.ts append must fail this test (mutant pin).
+      expect(capturedSandboxOptions).toHaveLength(1);
+      expect(capturedSandboxOptions[0]?.networkAllowlist).toEqual(
+        expect.arrayContaining([
+          "api.anthropic.com",
+          "github.com",
+          "api.github.com",
+          PINNED_BRIDGE_URL,
+        ]),
       );
     },
   );

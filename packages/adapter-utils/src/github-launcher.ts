@@ -21,18 +21,25 @@ export const LEGACY_GITHUB_LAUNCHER_SHA256 = [
 
 /**
  * Normalize a stager-provided broker base to its http(s) origin, or `""`
- * when absent or invalid. Host authority only: never feed caller env here.
+ * when absent. Host authority only: never feed caller env here. A nonempty
+ * value that is not an absolute HTTP(S) URL throws instead of degrading to
+ * `""`: an originless launcher would accept an explicit broker base at any
+ * child-chosen same-origin pair, so a misconfigured host must fail closed
+ * at stage time rather than silently stage the weaker launcher.
  */
 export function brokerOriginOf(value: string | null | undefined): string {
   const trimmed = (value ?? "").trim();
   if (trimmed.length === 0) return "";
+  let parsed: URL;
   try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
-    return parsed.origin;
+    parsed = new URL(trimmed);
   } catch {
-    return "";
+    throw new Error("Invalid broker origin: must be an absolute HTTP(S) URL");
   }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Invalid broker origin: must be an absolute HTTP(S) URL");
+  }
+  return parsed.origin;
 }
 
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */

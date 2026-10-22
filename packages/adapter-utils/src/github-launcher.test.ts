@@ -320,11 +320,18 @@ describe("baked broker-origin approval", () => {
   it("normalizes stager broker bases to origins", () => {
     expect(brokerOriginOf("https://broker.example.test/api/")).toBe("https://broker.example.test");
     expect(brokerOriginOf("http://127.0.0.1:9")).toBe("http://127.0.0.1:9");
+    expect(brokerOriginOf("  https://broker.example.test/api/  ")).toBe("https://broker.example.test");
     expect(brokerOriginOf("")).toBe("");
     expect(brokerOriginOf(null)).toBe("");
     expect(brokerOriginOf(undefined)).toBe("");
-    expect(brokerOriginOf("notaurl")).toBe("");
-    expect(brokerOriginOf("ftp://broker.example.test/")).toBe("");
+  });
+
+  it("fails closed on malformed stager broker bases instead of staging an originless launcher", () => {
+    expect(() => brokerOriginOf("notaurl")).toThrow("Invalid broker origin");
+    expect(() => brokerOriginOf("ftp://broker.example.test/")).toThrow("Invalid broker origin");
+    expect(() => brokerOriginOf("https://")).toThrow("Invalid broker origin");
+    // The rejection propagates through launcher staging (no silent "" fallback).
+    expect(() => githubLauncherSource({ expectedBrokerOrigin: "notaurl" })).toThrow("Invalid broker origin");
   });
 
   async function stageBaked(expectedBrokerOrigin: string) {
