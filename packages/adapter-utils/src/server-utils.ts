@@ -44,6 +44,19 @@ import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
 } from "./types.js";
+import {
+  RUN_PID_LIMIT_EXCEEDED,
+  resolveRunPidGuardIntervalMs,
+  resolveRunPidLimit,
+  startRunPidsGuard,
+  tryAttachRunPidsCgroup,
+  type RunPidsCgroupAttachment,
+  type RunPidsGuard,
+  type RunPidsStats,
+} from "./run-pids-guard.js";
+
+export { RUN_PID_LIMIT_EXCEEDED, resolveRunPidLimit } from "./run-pids-guard.js";
+export type { RunPidsStats } from "./run-pids-guard.js";
 
 export function buildRuntimeToolsEnv(
   access: AdapterRuntimeToolAccess | null | undefined,
@@ -90,6 +103,9 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // Per-run PID budget accounting. Set by runChildProcess for
+  // locally spawned runs; absent from producers that do not spawn locally.
+  pidStats?: RunPidsStats | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -116,6 +132,7 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  pidLimit?: number;
 }
 
 interface SpawnTarget {
@@ -167,6 +184,23 @@ export function signalRunningProcess(
   // `exitCode`/`signalCode` are null until the child actually closes.
   if (running.child.exitCode === null && running.child.signalCode === null) {
     running.child.kill(signal);
+  }
+}
+
+// Best-effort direct signal to individually sampled pids. Used only by the
+// run-PID-limit kill path to reach tree members that escaped the wrapper's
+// process group (bwrap --new-session, setsid). Callers gate on leader
+// liveness to bound the pid-reuse window: a sampled pid is only signaled
+// while the run's leader is still alive, and dead pids fail with ESRCH.
+function signalPidList(pids: readonly number[], signal: NodeJS.Signals) {
+  if (process.platform === "win32") return;
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Dead since the sample, or already reaped by the group signal.
+    }
   }
 }
 
@@ -4865,6 +4899,16 @@ export async function runChildProcess(
      * must not inherit anything by ambient name.
      */
     inheritServerEnv?: boolean;
+    /**
+     * Per-run process budget for this run's process tree.
+     * Resolved via resolveRunPidLimit: explicit value, then the
+     * PAPERCLIP_RUN_PID_LIMIT env override, then the 512 default. Exceeding
+     * it stops only this run's tree and resolves with errorCode
+     * `run_pid_limit_exceeded`.
+     */
+    pidLimit?: number | null;
+    /** PID-guard poll interval in ms (default 1000; tests use a small value). */
+    pidGuardIntervalMs?: number;
   },
 ): Promise<RunProcessResult> {
   const onLogError =
@@ -4955,10 +4999,14 @@ export async function runChildProcess(
             });
         }
 
+        // resolve the per-run PID budget before registering the
+        // process so the live entry carries the effective limit.
+        const pidLimit = resolveRunPidLimit(opts.pidLimit ?? undefined);
         runningProcesses.set(runId, {
           child,
           graceSec: opts.graceSec,
           processGroupId,
+          pidLimit,
         });
 
         let timedOut = false;
@@ -4973,6 +5021,79 @@ export async function runChildProcess(
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+
+        // Per-run PID budget. Polling needs no privileges, so it
+        // guards every lane that spawns locally: plain local runs, the
+        // local ssh-client side of remote runs, and bwrap-sandboxed local
+        // runs (descendant counting covers their --new-session trees).
+        // Only provider-side sandbox-remote runs never reach this path.
+        let pidLimitExceeded = false;
+        let pidsGuard: RunPidsGuard | null = null;
+        let pidsCgroup: RunPidsCgroupAttachment | null = null;
+        const stopPidsGuard = (): RunPidsStats | null => {
+          const stats = pidsGuard?.stop() ?? null;
+          pidsGuard = null;
+          if (pidsCgroup) {
+            try {
+              pidsCgroup.cleanup();
+            } catch {
+              // Best-effort cgroup teardown only.
+            }
+            pidsCgroup = null;
+          }
+          return stats;
+        };
+        if (typeof child.pid === "number" && child.pid > 0) {
+          pidsCgroup = tryAttachRunPidsCgroup(child.pid, pidLimit, { runId });
+          pidsGuard = startRunPidsGuard({
+            runId,
+            processGroupId,
+            rootPid: child.pid,
+            limit: pidLimit,
+            intervalMs: resolveRunPidGuardIntervalMs(opts.pidGuardIntervalMs),
+            cgroupAttached: pidsCgroup !== null,
+            cgroupPath: pidsCgroup?.path ?? null,
+            onExceeded: (exceededStats) => {
+              pidLimitExceeded = true;
+              const marker =
+                `[paperclip] run PID limit exceeded: ${exceededStats.lastCount} processes/threads ` +
+                `over the ${exceededStats.limit} budget; stopping this run only ` +
+                `(code ${RUN_PID_LIMIT_EXCEEDED})\n`;
+              stderr = appendWithCap(stderr, marker);
+              logChain = logChain
+                .then(() => opts.onLog("stderr", marker))
+                .catch((err) =>
+                  onLogError(err, runId, "failed to append pid-limit log chunk"),
+                );
+              onLogError(
+                new Error(marker.trim()),
+                runId,
+                "run PID limit exceeded; run tree stopped",
+              );
+              signalRunningProcess({ child, processGroupId }, "SIGTERM");
+              // The group signal misses members that escaped into a new
+              // session (bwrap --new-session, setsid): signal the sampled
+              // tree union directly. The leader is definitionally alive at
+              // exceed time, which bounds the pid-reuse window.
+              signalPidList(pidsGuard?.getTreePids() ?? [], "SIGTERM");
+              setTimeout(
+                () => {
+                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  // Escalate to direct pids only while the leader is still
+                  // alive; once it exits, sampled pids may be reused by
+                  // unrelated processes.
+                  if (
+                    child.exitCode === null &&
+                    child.signalCode === null
+                  ) {
+                    signalPidList(pidsGuard?.getTreePids() ?? [], "SIGKILL");
+                  }
+                },
+                Math.max(1, opts.graceSec) * 1000,
+              );
+            },
+          });
+        }
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -5132,6 +5253,7 @@ export async function runChildProcess(
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          stopPidsGuard();
           runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
@@ -5139,7 +5261,9 @@ export async function runChildProcess(
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
-              : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
+              : errno === "EAGAIN"
+                ? `Failed to start command "${command}" in "${opts.cwd}": system process/thread limit reached (EAGAIN). A runaway run may be exhausting PIDs; per-run budget kills report as ${RUN_PID_LIMIT_EXCEEDED}.`
+                : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
           reject(new Error(msg));
         });
 
@@ -5152,13 +5276,21 @@ export async function runChildProcess(
           (code: number | null, signal: NodeJS.Signals | null) => {
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
+            const pidStats = stopPidsGuard();
             runningProcesses.delete(runId);
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .finally(() => {
+                  // A child that traps SIGTERM and exits 0 would otherwise
+                  // read as a clean success with the typed code buried in
+                  // pidStats: no downstream outcome keys on errorCode alone.
+                  // Mirror the duplex seam and synthesize a failure shape.
+                  const cleanExitAfterPidKill =
+                    pidLimitExceeded &&
+                    (code === 0 || (code === null && signal === null));
                   resolve({
-                    exitCode: code,
+                    exitCode: cleanExitAfterPidKill ? 1 : code,
                     signal,
                     timedOut,
                     stdout,
@@ -5166,6 +5298,8 @@ export async function runChildProcess(
                     pid: child.pid ?? null,
                     startedAt,
                     nativeSshAuthority,
+                    errorCode: pidLimitExceeded ? RUN_PID_LIMIT_EXCEEDED : undefined,
+                    pidStats,
                     terminalResultCleanup: terminalCleanupStarted
                       ? {
                           kind: "terminal_result_cleanup",

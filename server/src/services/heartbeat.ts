@@ -1,4 +1,5 @@
 import { externalObjectService } from "./external-objects.js";
+import { selectPidStatsForUsageJson } from "./pid-stats-usage.js";
 import { tmpdir } from "node:os";
 import { prepareGitHubCandidateRuntime, assertGitHubCandidateDispatch, githubCandidateAdapterConfig, cleanupGitHubCandidateRuntime } from "./chat-github-runtime-isolation.js";
 import { ConfigurationIncompleteFailure } from "./configuration-incomplete-failure.js";
@@ -26471,6 +26472,9 @@ export function heartbeatService(
                 billingType: normalizeLedgerBillingType(
                   adapterResult.billingType,
                 ),
+                // Mirror the per-run PID accounting into the usage metrics
+                // whenever a usage row is persisted (resultJson carries it).
+                ...selectPidStatsForUsageJson(adapterResult.resultJson),
               } as Record<string, unknown>)
             : null;
 

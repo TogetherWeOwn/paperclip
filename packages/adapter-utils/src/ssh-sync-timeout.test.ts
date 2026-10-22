@@ -52,7 +52,9 @@ describe("syncDirectoryToSsh timeout", () => {
     const deadline = Date.now() + 5_000;
     while (alive(pid) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
     expect(alive(pid)).toBe(false);
-  });
+    // Explicit timeout: the 5s default is tighter than this test's own
+    // worst case (400ms transfer timeout plus the 5s reap poll).
+  }, 30_000);
 
   it("rejects with the ssh failure (no EPIPE crash, no stuck tar) when ssh exits before reading the archive", async () => {
     scratch = await mkdtemp(path.join(os.tmpdir(), "ssh-sync-early-exit-"));
@@ -67,5 +69,9 @@ describe("syncDirectoryToSsh timeout", () => {
     const error = await syncDirectoryToSsh({ spec, localDir: local, remoteDir: "/remote/artifact", timeoutMs: 20_000 }).then(() => null, e => e);
     expect(isSshSyncTimeoutError(error)).toBe(false);
     expect(String(error?.message)).toContain("connection refused");
-  });
+    // Explicit timeout: this spawn+pipe+8MB transfer tripped the 5s default
+    // once under workspaces-b shard load (paperclip#242, head becf6cd). The
+    // settle path is correct — every tar/ssh outcome resolves in ms — so a
+    // 5s stall is executor starvation, not a product hang; give it room.
+  }, 30_000);
 });
