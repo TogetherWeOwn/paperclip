@@ -8744,6 +8744,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const tasks = await pairedTasks(f.endpoint.id);
       const primary = tasks.find(t => t.issue.assigneeAgentId === f.assignedAgentId)!;
       const candidate = tasks.find(t => t.issue.assigneeAgentId === f.replacementAgentId)!;
+      // heartbeat.run.* events require a resolvable runId: live-events-ws drops
+      // run-less payloads before blinding ever runs. Bind one run per review arm
+      // to its real company/issue/agent so run privacy and blinding are exercised.
+      const [primaryRun] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        scopeKind: "issue", issueId: primary.issue.id, invocationSource: "assignment", status: "running", startedAt: new Date() }).returning();
+      const [candidateRun] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.replacementAgentId,
+        scopeKind: "issue", issueId: candidate.issue.id, invocationSource: "assignment", status: "running", startedAt: new Date() }).returning();
       const { agentApiKeys } = await import("@paperclipai/db");
       const { createServer } = await import("node:http");
       const { WebSocket } = await import("ws");
@@ -8772,10 +8779,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const primaryEvent = new Promise<void>(resolve => socket.on("message", data => {
           const text = String(data); seen.push(text); if (text.includes("PRIMARY_VISIBLE")) resolve();
         }));
-        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "CANDIDATE_LIVE_SECRET" } });
-        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "PRIMARY_VISIBLE" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, runId: candidateRun!.id, message: "CANDIDATE_LIVE_SECRET" } });
+        // Run-less and unknown-run heartbeat events are dropped for every socket,
+        // even when the issue itself is readable. Delivery is serialized per
+        // socket, so their absence once PRIMARY_VISIBLE arrives proves the drop.
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "RUNLESS_DROPPED" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, runId: randomUUID(), message: "UNKNOWN_RUN_DROPPED" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, runId: primaryRun!.id, message: "PRIMARY_VISIBLE" } });
         await primaryEvent;
         expect(seen.join("\n")).not.toContain("CANDIDATE_LIVE_SECRET");
+        expect(seen.join("\n")).not.toContain("RUNLESS_DROPPED");
+        expect(seen.join("\n")).not.toContain("UNKNOWN_RUN_DROPPED");
         expect(await builderEvent).toContain("CANDIDATE_LIVE_SECRET");
         // Scope is checked on each event, not frozen when the socket opens.
         const { withGitHubPrimaryReviewerChange } = await import("../services/chat-github-primary-reviewers.js");
@@ -8785,10 +8799,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const promotedEvent = new Promise<void>(resolve => builderSocket.on("message", data => {
           const text = String(data); afterPromotion.push(text); if (text.includes("AFTER_PROMOTION")) resolve();
         }));
-        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, message: "PROMOTED_CANDIDATE_SECRET" } });
-        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "AFTER_PROMOTION" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: candidate.issue.id, runId: candidateRun!.id, message: "PROMOTED_CANDIDATE_SECRET" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, message: "RUNLESS_DROPPED_AFTER" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, runId: randomUUID(), message: "UNKNOWN_RUN_DROPPED_AFTER" } });
+        publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.log", payload: { issueId: primary.issue.id, runId: primaryRun!.id, message: "AFTER_PROMOTION" } });
         await promotedEvent;
         expect(afterPromotion.join("\n")).not.toContain("PROMOTED_CANDIDATE_SECRET");
+        expect(afterPromotion.join("\n")).not.toContain("RUNLESS_DROPPED_AFTER");
+        expect(afterPromotion.join("\n")).not.toContain("UNKNOWN_RUN_DROPPED_AFTER");
         await expect(connect(keys[1]!)).rejects.toThrow("403");
       } finally {
         for (const client of clients) client.terminate();
