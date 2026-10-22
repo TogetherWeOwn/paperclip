@@ -108,6 +108,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableSandboxDuplexBridge: false,
     enableRunnerPreviewIngress: false,
     requireRunModelDecision: false,
+    eventBackedWaitMode: "off",
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
