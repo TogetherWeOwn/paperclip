@@ -25,10 +25,14 @@ const mockPino = vi.hoisted(() => {
     child: vi.fn(),
   }));
   (fn as any).transport = mockTransport;
+  // The logger always builds a multistream (stdout leg + lazily-resolved
+  // retained-file leg), so the mock must provide it.
+  (fn as any).multistream = vi.fn(() => ({ write: vi.fn() }));
   return fn;
 });
 
-// Mock fs so the module-level mkdirSync call is a no-op in tests.
+// Belt-and-braces: importing the logger must never touch the filesystem
+// (no auto-init), so mkdirSync should never fire; keep it a no-op anyway.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, mkdirSync: vi.fn() };
@@ -73,7 +77,11 @@ describe("logger translateTime respects TZ environment variable", () => {
     await import("../middleware/logger.js");
 
     expect(mockTransport).not.toHaveBeenCalled();
-    expect(mockPino).toHaveBeenCalledWith(expect.objectContaining({ level: "info" }));
+    // Second arg is the multistream destination (stdout + lazy file leg).
+    expect(mockPino).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "info" }),
+      expect.anything(),
+    );
   });
 
   it("SYS: prefix produces timezone-sensitive output: UTC epoch formats differently under UTC vs UTC+8", () => {
