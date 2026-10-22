@@ -46,3 +46,16 @@ export function toSshTarExcludes(exclude: readonly string[]): string[] {
 export function translateSshTarExcludes(exclude: readonly string[], flavor: SshTarFlavor): string[] {
   return exclude.map((entry) => flavor === "bsd" && entry.startsWith("./") ? `^${entry.slice(2)}` : entry);
 }
+
+/**
+ * Escape tar `--exclude` glob metacharacters (`*`, `?`, `[`, `\`) in a
+ * literal path, so a repository-controlled path containing one of them is
+ * matched literally instead of as a pattern. Without this, an ignored file
+ * named e.g. `*` would exclude the whole tree from the transfer. GNU tar and
+ * bsdtar both honor a backslash as a `fnmatch` escape character, and both
+ * receive `--exclude` values as argument-vector entries, never through a
+ * shell, so this is not command injection.
+ */
+export function escapeTarExcludeLiteral(entry: string): string {
+  return entry.replace(/\\/g, "\\\\").replace(/([*?[])/g, "\\$1");
+}
