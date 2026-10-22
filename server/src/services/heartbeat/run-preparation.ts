@@ -1021,9 +1021,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
   );
-  const assignedTools = effective.allowedTools.filter((tool) =>
-    assignedConnectionIds.has(tool.connectionId),
-  );
+  const assignedTools = candidateReview
+    ? candidateReview.tools
+    : effective.allowedTools.filter((tool) =>
+        assignedConnectionIds.has(tool.connectionId),
+      );
   const service = createToolGatewayService(input.db);
   if (assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -1065,7 +1067,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
 
   if (!profile) {
     const fullConnectionIds = new Set(
-      effective.entries
+      (candidateReview ? [] : effective.entries)
         .filter(
           (entry) =>
             entry.effect === "include" &&
