@@ -48,6 +48,15 @@ function runServerEntry(main: boolean) {
           fatal({ err }, message) { send("fatal", { log: message, ...describeError(err) }); },
         },
       },
+      "./middleware/file-logging.js": {
+        // Server boot inits retained file logging explicitly (a bare logger
+        // import must not). No sinks exist in the hermetic child, so the
+        // boot path skips its informational line and continues to startup.
+        initServerFileLogging() {
+          send("file-logging-init");
+          return { serverSink: null };
+        },
+      },
       "./startup-recovery-state.js": {
         setStartupRecoveryPhase(phase) { send("startup-phase", { phase }); },
       },
@@ -115,6 +124,7 @@ describe("fatal policy production server entry binding", () => {
     expect(events.find((event) => event.kind === "binding")).toEqual({ kind: "binding", listeners: 1 });
     expect(child.stderr).toBe("");
     expect(events.map((event) => event.kind)).toEqual([
+      "file-logging-init",
       "startup-phase",
       "binding",
       "fatal",
@@ -126,15 +136,16 @@ describe("fatal policy production server entry binding", () => {
       "shutdown-complete",
       "exit",
     ]);
-    expect(events[0]).toEqual({ kind: "startup-phase", phase: "starting" });
-    expect(events[1]).toEqual({ kind: "binding", listeners: 1 });
-    expect(events[2]).toMatchObject({
+    expect(events[0]).toEqual({ kind: "file-logging-init" });
+    expect(events[1]).toEqual({ kind: "startup-phase", phase: "starting" });
+    expect(events[2]).toEqual({ kind: "binding", listeners: 1 });
+    expect(events[3]).toMatchObject({
       name: "RangeError",
       message: "hermetic entry fault",
       log: expect.stringMatching(/fatal uncaught exception/),
     });
-    expect(events[5]).toEqual({ kind: "capture", name: "RangeError", message: "hermetic entry fault" });
-    expect(events[9]).toEqual({ kind: "exit", code: 1 });
+    expect(events[6]).toEqual({ kind: "capture", name: "RangeError", message: "hermetic entry fault" });
+    expect(events[10]).toEqual({ kind: "exit", code: 1 });
   });
 
   it("does not install a process listener or start the server when imported", () => {
