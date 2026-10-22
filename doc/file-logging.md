@@ -58,7 +58,8 @@ not delete them; the new process appends to the existing files.
 - Permissions: every retained file is created owner-only (`0600`), and
   newly created log directories are `0700`. Files with group/other
   permission bits (e.g. generations written before owner-only files)
-  are tightened to owner-only when the sink opens them and as they
+  are tightened to owner-only when the sink opens — every generation
+  on disk, even above a lowered `MAX_FILES` cap — and as generations
   shift through rotation; rotation itself only renames within the set,
   so it never produces a world-readable file. Files owned by another
   user cannot be tightened by the server process — the host must

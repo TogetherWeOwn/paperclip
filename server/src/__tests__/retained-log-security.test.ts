@@ -110,6 +110,32 @@ describe("retained log file permissions", () => {
     expectOwnerOnly(path.join(dir, "server.log.2"));
   });
 
+  it("tightens generations above a lowered cap and leaves non-generations alone", () => {
+    const dir = tempDir();
+    // An operator lowering PAPERCLIP_SERVER_LOG_MAX_FILES from 12 to 2 while
+    // pre-fix 0644 generations exist: rotation never touches .2+, so only
+    // open-time enumeration converges them.
+    for (const name of ["server.log.1", "server.log.2", "server.log.5"]) {
+      writeFileSync(path.join(dir, name), "old\n");
+      chmodSync(path.join(dir, name), 0o644);
+    }
+    // Same-prefix decoys that are not generations must keep their mode.
+    for (const name of ["server.log.bak", "server.log.1.gz", "other.log.1"]) {
+      writeFileSync(path.join(dir, name), "decoy\n");
+      chmodSync(path.join(dir, name), 0o644);
+    }
+    const sink = track(
+      new RotatingFileSink({ dir, filename: "server.log", maxBytes: 65536, maxFiles: 2 }),
+    );
+    sink.write("live\n");
+    expectOwnerOnly(path.join(dir, "server.log.1"));
+    expectOwnerOnly(path.join(dir, "server.log.2"));
+    expectOwnerOnly(path.join(dir, "server.log.5"));
+    for (const name of ["server.log.bak", "server.log.1.gz", "other.log.1"]) {
+      expect(statSync(path.join(dir, name)).mode & 0o777).toBe(0o644);
+    }
+  });
+
   it("keeps every rotation generation owner-only, including legacy files", () => {
     const dir = tempDir();
     const sink = track(
@@ -154,6 +180,21 @@ describe("retained log credential scrubbing", () => {
     expect(content).toContain("***REDACTED***");
     // Non-secret lines pass through byte-identical (no over-redaction).
     expect(content).toContain(control);
+  });
+
+  it("redacts a bare fine-grained PAT with no other keywords or dots", () => {
+    // Pins the `github_pat_` gate hints in both the server and the adapter
+    // redaction: this line passes neither gate without them, so removing
+    // either hint leaves the token verbatim in the retained file.
+    const dir = tempDir();
+    const sink = track(
+      new RotatingFileSink({ dir, filename: "server.log", maxBytes: 65536, maxFiles: 2 }),
+    );
+    sink.write(`${FAKE_FINE_GRAINED_PAT}\n`);
+    const content = readFileSync(path.join(dir, "server.log"), "utf8");
+    expect(content).not.toContain(FAKE_FINE_GRAINED_PAT);
+    expect(content).not.toMatch(/github_pat_/);
+    expect(content).toContain("***REDACTED***");
   });
 
   it("keeps helper token stdout out of the retained file (stdio tee end-to-end)", () => {

@@ -136,9 +136,12 @@ export class RotatingFileSink {
     );
     // Pre-existing generations converge here, not only on the next
     // rotation: a restart must not leave yesterday's world-readable files
-    // in place for hours until traffic triggers a rotate.
-    for (let i = 1; i < this.maxFiles; i += 1) {
-      const generation = `${this.filePath}.${i}`;
+    // in place for hours until traffic triggers a rotate. Every generation
+    // present on disk is tightened, not just the ones inside the current
+    // maxFiles window: an operator lowering the cap must not orphan stale
+    // world-readable files above it (rotation never touches those again,
+    // so open-time convergence is the only path that reaches them).
+    for (const generation of this.listExistingGenerations()) {
       this.reportTightenFailure(
         tightenRotatedFilePermissions(generation),
         generation,
@@ -149,6 +152,33 @@ export class RotatingFileSink {
   /** Absolute path of the live file. */
   get path(): string {
     return this.filePath;
+  }
+
+  /**
+   * Absolute paths of the `<name>.<n>` generations present on disk,
+   * regardless of maxFiles. Falls back to the in-window generations when
+   * the directory cannot be listed, so a listing failure degrades to the
+   * old bounded convergence instead of none.
+   */
+  private listExistingGenerations(): string[] {
+    const dir = path.dirname(this.filePath);
+    const prefix = `${path.basename(this.filePath)}.`;
+    try {
+      return fs
+        .readdirSync(dir)
+        .filter((entry) => {
+          if (!entry.startsWith(prefix)) return false;
+          const suffix = entry.slice(prefix.length);
+          return suffix.length > 0 && /^\d+$/.test(suffix);
+        })
+        .map((entry) => path.resolve(dir, entry));
+    } catch {
+      const generations: string[] = [];
+      for (let i = 1; i < this.maxFiles; i += 1) {
+        generations.push(`${this.filePath}.${i}`);
+      }
+      return generations;
+    }
   }
 
   /** Append bytes. Never throws; failures are counted and reported. */
