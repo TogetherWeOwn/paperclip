@@ -383,6 +383,7 @@ describe("remote managed runtime", () => {
       gitBacked: true,
       seedMode: "shared-mirror",
       ignoredPaths: [".env"],
+      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] },
     } as unknown as { gitBacked: boolean });
 
     const prepared = await prepareRemoteManagedRuntime({
@@ -406,6 +407,7 @@ describe("remote managed runtime", () => {
     const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
       baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> };
       ignoredPaths?: string[];
+      seedState?: { headCommit: string; overlayPaths: string[] };
     };
     // The seed's ignored list lands in the baseline exclude (so the merge
     // stays blind to it) and rides the restore input (so the inner transfer
@@ -414,6 +416,7 @@ describe("remote managed runtime", () => {
     expect(restoreInput.baselineSnapshot.entries.has(".env")).toBe(false);
     expect(restoreInput.baselineSnapshot.entries.has("keep.txt")).toBe(true);
     expect(restoreInput.ignoredPaths).toEqual([".env"]);
+    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] });
   });
 
   it("threads mirror-seed ignoredPaths through the asset-failure restore", async () => {
@@ -427,6 +430,7 @@ describe("remote managed runtime", () => {
       gitBacked: true,
       seedMode: "shared-mirror",
       ignoredPaths: [".env"],
+      seedState: { headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] },
     } as unknown as { gitBacked: boolean });
     syncDirectoryToSsh.mockRejectedValueOnce(new Error("asset transfer failed"));
 
@@ -452,7 +456,9 @@ describe("remote managed runtime", () => {
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     const restoreInput = (restoreWorkspaceFromSshExecution.mock.calls as unknown[][])[0]?.[0] as {
       ignoredPaths?: string[];
+      seedState?: { headCommit: string; overlayPaths: string[] };
     };
     expect(restoreInput.ignoredPaths).toEqual([".env"]);
+    expect(restoreInput.seedState).toEqual({ headCommit: "seed-head", overlayPaths: ["dirty.txt"], deletedPaths: [] });
   });
 });

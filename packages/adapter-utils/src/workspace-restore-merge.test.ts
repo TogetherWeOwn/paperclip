@@ -12,6 +12,7 @@ import {
   directorySnapshotSha256,
   classifyWorkspaceRestoreFailure,
   describeWorkspaceRestoreFailure,
+  mergeChangedFilesWithBaseline,
   mergeDirectoryWithBaseline,
   parseDirectorySnapshot,
   serializeDirectorySnapshot,
@@ -609,5 +610,310 @@ describe("workspace restore merge", () => {
         else process.env.PAPERCLIP_HOME = previousHome;
       }
     });
+  });
+});
+
+describe("mergeChangedFilesWithBaseline", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(async () => {
+    while (cleanupDirs.length > 0) {
+      const dir = cleanupDirs.pop();
+      if (!dir) continue;
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function makeRoot(prefix: string): Promise<string> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
+    cleanupDirs.push(dir);
+    return dir;
+  }
+
+  async function writeTree(root: string, files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      const full = path.join(root, relative);
+      await mkdir(path.dirname(full), { recursive: true });
+      await writeFile(full, content, "utf8");
+    }
+  }
+
+  async function copyDir(source: string, target: string): Promise<void> {
+    await fsPromises.cp(source, target, { recursive: true });
+  }
+
+  type TreeEntry = { kind: "file"; content: string; exec: boolean } | { kind: "symlink"; target: string };
+
+  // Files and symlinks only: empty directories are compared separately
+  // because the changed-files merge deliberately leaves them in place.
+  async function readTree(root: string): Promise<Map<string, TreeEntry>> {
+    const out = new Map<string, TreeEntry>();
+    const walk = async (relative: string): Promise<void> => {
+      const current = relative ? path.join(root, relative) : root;
+      const entries = await readdir(current, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const next = relative ? path.posix.join(relative, entry.name) : entry.name;
+        const full = path.join(root, next);
+        if (entry.isDirectory()) {
+          await walk(next);
+          continue;
+        }
+        if (entry.isSymbolicLink()) {
+          out.set(next, { kind: "symlink", target: await fsPromises.readlink(full) });
+          continue;
+        }
+        if (entry.isFile()) {
+          const stats = await lstat(full);
+          out.set(next, {
+            kind: "file",
+            content: await readFile(full, "utf8"),
+            exec: (stats.mode & 0o111) !== 0,
+          });
+        }
+      }
+    };
+    await walk("");
+    return out;
+  }
+
+  async function listEmptyDirs(root: string): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (relative: string): Promise<void> => {
+      const current = relative ? path.join(root, relative) : root;
+      const entries = await readdir(current, { withFileTypes: true });
+      if (relative && entries.length === 0) out.push(relative);
+      for (const entry of entries) {
+        if (entry.isDirectory()) await walk(relative ? path.posix.join(relative, entry.name) : entry.name);
+      }
+    };
+    await walk("");
+    return out.sort();
+  }
+
+  it("matches the full merge across the file-state matrix, except pruned empty dirs", async () => {
+    const root = await makeRoot("paperclip-changed-merge-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, {
+      "keep.txt": "unchanged\n",
+      "edit-remote.txt": "baseline\n",
+      "edit-both.txt": "baseline\n",
+      "delete-quiescent.txt": "gone remotely\n",
+      "delete-edited.txt": "gone remotely\n",
+      "old-name.txt": "renamed remotely\n",
+      "mode.sh": "echo baseline\n",
+      "sub/nested.txt": "nested\n",
+      "fulldir/file.txt": "dir deleted remotely\n",
+      "emptyme/file.txt": "dir emptied remotely\n",
+      "scratch/skip.txt": "local scratch\n",
+    });
+    await chmod(path.join(seedDir, "mode.sh"), 0o644);
+    await symlink("keep.txt", path.join(seedDir, "link.txt"));
+
+    // The full remote tree: every remote change applied.
+    const remoteDir = path.join(root, "remote");
+    await copyDir(seedDir, remoteDir);
+    await writeFile(path.join(remoteDir, "edit-remote.txt"), "remote\n");
+    await writeFile(path.join(remoteDir, "edit-both.txt"), "remote\n");
+    await rm(path.join(remoteDir, "delete-quiescent.txt"));
+    await rm(path.join(remoteDir, "delete-edited.txt"));
+    await rm(path.join(remoteDir, "old-name.txt"));
+    await writeFile(path.join(remoteDir, "new-name.txt"), "renamed remotely\n");
+    await writeFile(path.join(remoteDir, "added.txt"), "added remotely\n");
+    await writeTree(remoteDir, { "sub2/new.txt": "new nested\n" });
+    await chmod(path.join(remoteDir, "mode.sh"), 0o755);
+    await rm(path.join(remoteDir, "link.txt"));
+    await symlink("edit-remote.txt", path.join(remoteDir, "link.txt"));
+    await writeFile(path.join(remoteDir, "scratch/skip.txt"), "remote scratch\n");
+    await rm(path.join(remoteDir, "fulldir"), { recursive: true });
+    await rm(path.join(remoteDir, "emptyme/file.txt"));
+
+    // The partial staging tree: ONLY the remotely-changed files, as the
+    // changed-files transfer would deliver them (plus their parent dirs).
+    const stagingDir = path.join(root, "staging");
+    await writeTree(stagingDir, {
+      "edit-remote.txt": "remote\n",
+      "edit-both.txt": "remote\n",
+      "new-name.txt": "renamed remotely\n",
+      "added.txt": "added remotely\n",
+      "sub2/new.txt": "new nested\n",
+      "mode.sh": "echo baseline\n",
+    });
+    await chmod(path.join(stagingDir, "mode.sh"), 0o755);
+    await symlink("edit-remote.txt", path.join(stagingDir, "link.txt"));
+    const deletedPaths = [
+      "delete-quiescent.txt",
+      "delete-edited.txt",
+      "old-name.txt",
+      "fulldir/file.txt",
+      "emptyme/file.txt",
+    ];
+
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: ["scratch", ".git"] });
+
+    // The local target both merges start from: seed plus concurrent edits.
+    const targetSeedDir = path.join(root, "target-seed");
+    await copyDir(seedDir, targetSeedDir);
+    await writeFile(path.join(targetSeedDir, "edit-both.txt"), "local\n");
+    await writeFile(path.join(targetSeedDir, "delete-edited.txt"), "local edit\n");
+    await writeFile(path.join(targetSeedDir, "local-only.txt"), "local only\n");
+
+    const fullTarget = path.join(root, "full-target");
+    await copyDir(targetSeedDir, fullTarget);
+    const fullHooks: string[] = [];
+    await mergeDirectoryWithBaseline({
+      baseline,
+      sourceDir: remoteDir,
+      targetDir: fullTarget,
+      beforeApply: async () => void fullHooks.push("before"),
+      afterApply: async () => void fullHooks.push("after"),
+    });
+
+    const changedTarget = path.join(root, "changed-target");
+    await copyDir(targetSeedDir, changedTarget);
+    const changedHooks: string[] = [];
+    let beforeSawBaselineContent = false;
+    await mergeChangedFilesWithBaseline({
+      baseline,
+      sourceDir: stagingDir,
+      deletedPaths,
+      targetDir: changedTarget,
+      beforeApply: async () => {
+        changedHooks.push("before");
+        beforeSawBaselineContent =
+          (await readFile(path.join(changedTarget, "edit-remote.txt"), "utf8")) === "baseline\n";
+      },
+      afterApply: async () => void changedHooks.push("after"),
+    });
+
+    expect(fullHooks).toEqual(["before", "after"]);
+    expect(changedHooks).toEqual(["before", "after"]);
+    expect(beforeSawBaselineContent).toBe(true);
+
+    // Spot-check the matrix outcomes on the changed-files target.
+    await expect(readFile(path.join(changedTarget, "edit-remote.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(changedTarget, "edit-both.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(changedTarget, "delete-edited.txt"), "utf8")).resolves.toBe("local edit\n");
+    await expect(readFile(path.join(changedTarget, "local-only.txt"), "utf8")).resolves.toBe("local only\n");
+    await expect(readFile(path.join(changedTarget, "new-name.txt"), "utf8")).resolves.toBe("renamed remotely\n");
+    await expect(readFile(path.join(changedTarget, "scratch/skip.txt"), "utf8")).resolves.toBe("local scratch\n");
+    expect(await lstat(path.join(changedTarget, "delete-quiescent.txt")).then(() => true, () => false)).toBe(false);
+    expect(await lstat(path.join(changedTarget, "old-name.txt")).then(() => true, () => false)).toBe(false);
+
+    // Full differential equality on files and symlinks.
+    const fullTree = await readTree(fullTarget);
+    const changedTree = await readTree(changedTarget);
+    expect([...changedTree.entries()].sort()).toEqual([...fullTree.entries()].sort());
+
+    // The one documented divergence: the full merge prunes remotely-deleted
+    // directories, while the changed-files merge leaves them as empty dirs
+    // (porcelain cannot distinguish "deleted" from "emptied", and keeping an
+    // empty dir can never break a consumer that recreates it on demand).
+    expect(await listEmptyDirs(fullTarget)).toEqual(["emptyme"]);
+    expect(await listEmptyDirs(changedTarget)).toEqual(["emptyme", "fulldir"]);
+  });
+
+  it("runs hooks but leaves the target untouched when nothing changed", async () => {
+    const root = await makeRoot("paperclip-changed-merge-clean-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, { "keep.txt": "unchanged\n" });
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: [] });
+    const stagingDir = path.join(root, "staging");
+    await mkdir(stagingDir, { recursive: true });
+    const targetDir = path.join(root, "target");
+    await copyDir(seedDir, targetDir);
+    const hooks: string[] = [];
+
+    await mergeChangedFilesWithBaseline({
+      baseline,
+      sourceDir: stagingDir,
+      deletedPaths: [],
+      targetDir,
+      beforeApply: async () => void hooks.push("before"),
+      afterApply: async () => void hooks.push("after"),
+    });
+
+    expect(hooks).toEqual(["before", "after"]);
+    await expect(readFile(path.join(targetDir, "keep.txt"), "utf8")).resolves.toBe("unchanged\n");
+  });
+
+  it("rejects a staged file that would replace an excluded path's ancestor", async () => {
+    const root = await makeRoot("paperclip-changed-merge-unsafe-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, { "nested/keep.txt": "baseline\n" });
+    // The baseline excludes a literal descendant; the remote replaced its
+    // ancestor with a file. The full merge rejects this archive; so must we.
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: ["nested/keep.txt"] });
+    const stagingDir = path.join(root, "staging");
+    await writeTree(stagingDir, { nested: "ancestor replaced by file\n" });
+    const targetDir = path.join(root, "target");
+    await copyDir(seedDir, targetDir);
+
+    await expect(
+      mergeChangedFilesWithBaseline({
+        baseline,
+        sourceDir: stagingDir,
+        deletedPaths: [],
+        targetDir,
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" });
+    await expect(readFile(path.join(targetDir, "nested/keep.txt"), "utf8")).resolves.toBe("baseline\n");
+  });
+
+  it("ignores deletes for paths outside the baseline and type-changed targets", async () => {
+    const root = await makeRoot("paperclip-changed-merge-deletes-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, { "file.txt": "baseline\n", "other.txt": "baseline\n" });
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: [] });
+    const stagingDir = path.join(root, "staging");
+    await mkdir(stagingDir, { recursive: true });
+    const targetDir = path.join(root, "target");
+    await copyDir(seedDir, targetDir);
+    // The target replaced a baseline file with a directory: not a baseline
+    // match, so the remote delete must not remove it.
+    await rm(path.join(targetDir, "other.txt"));
+    await mkdir(path.join(targetDir, "other.txt"), { recursive: true });
+    await writeFile(path.join(targetDir, "other.txt/inner.txt"), "local\n");
+
+    await mergeChangedFilesWithBaseline({
+      baseline,
+      sourceDir: stagingDir,
+      deletedPaths: ["file.txt", "never-in-baseline.txt", "other.txt"],
+      targetDir,
+    });
+
+    expect(await lstat(path.join(targetDir, "file.txt")).then(() => true, () => false)).toBe(false);
+    await expect(readFile(path.join(targetDir, "other.txt/inner.txt"), "utf8")).resolves.toBe("local\n");
+  });
+
+  it("skips an explicit delete whose ancestor became a symlink", async () => {
+    const root = await makeRoot("paperclip-changed-merge-symlink-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, { "d/f.txt": "gone remotely\n", "keep.txt": "keep\n" });
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: [] });
+    const targetDir = path.join(root, "target");
+    await copyDir(seedDir, targetDir);
+    // Between baseline capture and restore, d/ is replaced by a symlink to a
+    // second tree whose f.txt matches the baseline byte-for-byte: reading the
+    // leaf through the link looks like a baseline match, but removing it
+    // would delete a file outside the target. The full merge never descends
+    // through the link, so the partial merge must not delete through it
+    // either: the delete is skipped and the outside file survives.
+    const outsideDir = path.join(root, "outside");
+    await writeTree(outsideDir, { "f.txt": "gone remotely\n" });
+    await rm(path.join(targetDir, "d"), { recursive: true });
+    await symlink(outsideDir, path.join(targetDir, "d"));
+    const stagingDir = path.join(root, "staging");
+    await mkdir(stagingDir, { recursive: true });
+
+    await mergeChangedFilesWithBaseline({
+      baseline,
+      sourceDir: stagingDir,
+      deletedPaths: ["d/f.txt"],
+      targetDir,
+    });
+
+    await expect(readFile(path.join(outsideDir, "f.txt"), "utf8")).resolves.toBe("gone remotely\n");
+    expect((await lstat(path.join(targetDir, "d"))).isSymbolicLink()).toBe(true);
   });
 });

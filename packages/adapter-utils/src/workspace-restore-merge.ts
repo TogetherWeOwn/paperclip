@@ -150,6 +150,26 @@ async function walkDirectory(
   return out;
 }
 
+/**
+ * True when any ancestor of `relative` under `root` is a symlink. The full
+ * merge walks the target, so a directory the baseline captured that is now
+ * a symlink hides its whole subtree from the delete pass (the leaf reads
+ * as absent and no delete fires). The partial merge reads per deleted path
+ * instead, so it must reproduce that blindness explicitly: without this
+ * check the leaf read hashes THROUGH a replaced ancestor link, matches the
+ * baseline, and `fs.rm` deletes a file outside the target.
+ */
+async function hasSymlinkAncestor(root: string, relative: string): Promise<boolean> {
+  const segments = relative.split("/");
+  let current = root;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    current = path.join(current, segments[index] ?? "");
+    const stats = await fs.lstat(current).catch(() => null);
+    if (stats?.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
   const fullPath = path.join(root, relative);
   let stats;
@@ -489,6 +509,69 @@ export async function mergeDirectoryWithBaseline(input: {
 
     for (const [relative] of deletedDirs) {
       await fs.rmdir(path.join(canonicalTargetDir, relative)).catch(() => undefined);
+    }
+
+    const changedSourceEntries = [...source.entries.entries()]
+      .filter(([relative, entry]) => !entriesMatch(input.baseline.entries.get(relative), entry))
+      .sort(([left], [right]) => left.localeCompare(right));
+
+    for (const [relative, entry] of changedSourceEntries) {
+      await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+    }
+
+    await input.afterApply?.();
+  });
+}
+
+/**
+ * Apply a partial (changed-files-only) sync-back over a target directory with
+ * the same outcome as {@link mergeDirectoryWithBaseline}: staged entries that
+ * differ from the baseline overwrite the target (remote wins), and
+ * `deletedPaths` remove baseline entries the remote deleted — but only where
+ * the target still matches the baseline, so concurrent local edits survive,
+ * and never through an ancestor the target replaced with a symlink (the
+ * full merge never descends through such a link, so neither does this
+ * one). Deletion is explicit: unlike the full merge, absence from the
+ * partial source never implies a delete.
+ *
+ * Two deliberate differences from the full merge:
+ * - Empty directories are left in place (no `rmdir` pass). Porcelain status
+ *   cannot distinguish a remotely-deleted directory from a remotely-emptied
+ *   one, and keeping an empty directory can never break a consumer that
+ *   recreates it on demand.
+ * - The target is read per deleted path instead of snapshotted whole, so a
+ *   clean-tree restore costs no full-tree walk.
+ */
+export async function mergeChangedFilesWithBaseline(input: {
+  baseline: DirectorySnapshot;
+  /** Staging directory holding ONLY remotely-changed content (a partial tree). */
+  sourceDir: string;
+  /** Remote-deleted paths, applied only where the target matches the baseline. */
+  deletedPaths: readonly string[];
+  targetDir: string;
+  beforeApply?: () => Promise<void>;
+  afterApply?: () => Promise<void>;
+}): Promise<void> {
+  const source = await captureDirectorySnapshot(input.sourceDir, { exclude: input.baseline.exclude });
+  await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+    // Same guard as the full merge: a literal excluded descendant must
+    // survive replacement of its ancestor. Reject before any file writes.
+    for (const [relative, entry] of source.entries) {
+      if (entry.kind === "dir" || entriesMatch(input.baseline.entries.get(relative), entry)) continue;
+      if (input.baseline.exclude.some((excluded) => excluded.replace(/^\.\//, "").startsWith(`${relative}/`))) {
+        throw Object.assign(new Error("Workspace restore cannot replace an excluded path's ancestor"), {
+          code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE",
+        });
+      }
+    }
+    await input.beforeApply?.();
+    const deletes = [...new Set(input.deletedPaths)].sort((left, right) => right.length - left.length);
+    for (const relative of deletes) {
+      const baselineEntry = input.baseline.entries.get(relative);
+      if (!baselineEntry || baselineEntry.kind === "dir") continue;
+      if (await hasSymlinkAncestor(canonicalTargetDir, relative)) continue;
+      if (!entriesMatch(await readSnapshotEntry(canonicalTargetDir, relative), baselineEntry)) continue;
+      await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }).catch(() => undefined);
     }
 
     const changedSourceEntries = [...source.entries.entries()]
