@@ -295,6 +295,10 @@ describe("ssh seed mirror", () => {
       expect(prepared.ignoredPaths).toEqual(
         expect.arrayContaining(["nested", "app.log", ".env"]),
       );
+      expect(prepared.seedState).toEqual({
+        headCommit: head.trim(),
+        overlayPaths: ["modified.txt", "run-me.sh", "untracked.txt"],
+      });
       // The history phase still reports, with zero wire bytes from the mirror.
       expect(
         progressLines.some((line) => line.includes("Importing git history")),
@@ -611,6 +615,7 @@ describe("ssh seed mirror", () => {
         baselineSnapshot,
         restoreGitHistory: true,
         ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
       });
 
       // Tracked remote edits land; local-only ignored files survive untouched.
@@ -715,6 +720,7 @@ describe("ssh seed mirror", () => {
         baselineSnapshot,
         restoreGitHistory: false,
         ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
       });
       await expect(
         readFile(path.join(repoDir, "tracked.txt"), "utf8"),
@@ -754,6 +760,12 @@ describe("ssh seed mirror", () => {
         );
         expect(prepared.seedMode).toBe("full-copy");
         expect(prepared.ignoredPaths).toBeUndefined();
+        // The legacy seed carries the same reconcile state: the bulk-ignored
+        // files are ignored, so the overlay is just the repo's dirt.
+        expect(prepared.seedState).toEqual({
+          headCommit: head.trim(),
+          overlayPaths: ["modified.txt", "run-me.sh", "untracked.txt"],
+        });
         expect(await readdir(mirrorRoot)).toHaveLength(0);
         expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
         // Legacy behavior preserved: ignored files transfer with the full tree.
@@ -878,6 +890,7 @@ describe("ssh seed mirror", () => {
         localDir: repoDir,
         remoteDir,
         ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
       });
 
       await expect(
@@ -977,6 +990,7 @@ describe("ssh seed mirror", () => {
         baselineSnapshot,
         restoreGitHistory: true,
         ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
       });
       await expect(
         readFile(path.join(repoDir, "tracked.txt"), "utf8"),

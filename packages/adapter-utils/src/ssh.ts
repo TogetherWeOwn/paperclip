@@ -614,29 +614,35 @@ export async function measureDirectoryFileBytes(dir: string): Promise<number> {
 }
 
 /**
- * The two path sets a `git status --porcelain=v1 -z -uall` listing splits
- * into for an incremental sync-back: paths whose remote content must
- * transfer, and paths the remote deleted (applied as baseline-guarded
- * deletes, never inferred from transfer absence).
+ * The three path sets a `git status --porcelain=v1 -z -uall --ignored`
+ * listing splits into for an incremental sync-back: paths whose remote
+ * content must transfer, paths the remote deleted (applied as
+ * baseline-guarded deletes, never inferred from transfer absence), and
+ * ignored paths the run created remotely (reconciled against the baseline
+ * separately, since seed-time ignored files must stay local-only).
  */
 export interface SshPorcelainChangedPaths {
   changedPaths: string[];
   deletedPaths: string[];
+  ignoredPaths: string[];
 }
 
 /**
- * Parse `git status --porcelain=v1 -z` output into transfer and delete sets.
- * Every entry whose worktree content still exists remotely transfers
- * (modifications, untracked files, unmerged entries, rename destinations);
- * only pure deletions (`D `, ` D`, `DD`) and rename sources land in the
- * delete set. Ignored entries (`!!`, only present with `--ignored`) are
- * skipped. A record without a status prefix transfers defensively rather
- * than silently dropping a remote path. Both sets are sorted and deduped so
- * the transfer command is deterministic.
+ * Parse `git status --porcelain=v1 -z` output into transfer, delete, and
+ * ignored sets. Every entry whose worktree content still exists remotely
+ * transfers (modifications, untracked files, unmerged entries, rename
+ * destinations); only pure deletions (`D `, ` D`, `DD`) and rename sources
+ * land in the delete set. Ignored entries (`!!`, only present with
+ * `--ignored`) are collected separately with any directory marker stripped
+ * (a trailing slash can only mark a directory record, never a filename).
+ * A record without a status prefix transfers defensively rather than
+ * silently dropping a remote path. All sets are sorted and deduped so the
+ * transfer command is deterministic.
  */
 export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedPaths {
   const changed = new Set<string>();
   const deleted = new Set<string>();
+  const ignored = new Set<string>();
   const records = output.split("\0");
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index] ?? "";
@@ -644,7 +650,11 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
     if (record.length > 3 && record[2] === " ") {
       const status = record.slice(0, 2);
       const entryPath = record.slice(3);
-      if (status === "!!") continue;
+      if (status === "!!") {
+        const normalized = entryPath.replace(/\/+$/, "");
+        if (normalized) ignored.add(normalized);
+        continue;
+      }
       // Rename/copy entries carry the destination first and the source as a
       // bare follow-up record (`R  new\0old\0`); the source is a delete.
       if (status[0] === "R" || status[0] === "C") {
@@ -666,24 +676,27 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
   return {
     changedPaths: [...changed].sort(),
     deletedPaths: [...deleted].sort(),
+    ignoredPaths: [...ignored].sort(),
   };
 }
 
 /**
  * The remote shell script the changed-files sync-back runs to list what the
- * run left dirty: `git status --porcelain=v1 -z -uall` over the whole tree,
- * parsed by {@link parseSshPorcelainStatusV1Z}. Status paths are
- * repo-root-relative, so the script refuses to run anywhere but a toplevel
- * checkout first: an empty `--show-prefix` proves `remoteDir` is the root,
- * and any other outcome (a subdir, a non-repo, a broken git) exits nonzero
- * so the caller falls back to the full copy instead of mis-resolving every
- * path against the wrong root.
+ * run left dirty: `git status --porcelain=v1 -z -uall --ignored` over the
+ * whole tree, parsed by {@link parseSshPorcelainStatusV1Z}. `--ignored` is
+ * load-bearing: without it a file the run created under an ignore rule is
+ * invisible to the delta and silently lost, while the full copy restores
+ * it. Status paths are repo-root-relative, so the script refuses to run
+ * anywhere but a toplevel checkout first: an empty `--show-prefix` proves
+ * `remoteDir` is the root, and any other outcome (a subdir, a non-repo, a
+ * broken git) exits nonzero so the caller falls back to the full copy
+ * instead of mis-resolving every path against the wrong root.
  */
 export function buildSshRemoteStatusScript(remoteDir: string): string {
   const gitDir = `git -C ${shellQuote(remoteDir)}`;
   return (
     `prefix=$(${gitDir} rev-parse --show-prefix) && test -z "$prefix" && ` +
-    `${gitDir} status --porcelain=v1 -z -uall --`
+    `${gitDir} status --porcelain=v1 -z -uall --ignored --`
   );
 }
 
@@ -695,16 +708,20 @@ export function buildSshRemoteStatusScript(remoteDir: string): string {
  * disagree: a committed delete the run then recreated transfers (the remote
  * has the file), and a committed add the run then deleted is a delete, never
  * a transfer — asking tar for a missing member fails the whole download, so
- * a path the worktree deleted must never reach the transfer list. Both sets
- * are sorted and deduped so the transfer command is deterministic.
+ * a path the worktree deleted must never reach the transfer list. The rule
+ * also holds inside the status itself: `git rm --cached` (or a staged
+ * delete plus a recreate) reports the path as BOTH `D ` and `??`, and the
+ * worktree copy wins — it transfers, never deletes. Both sets are sorted
+ * and deduped so the transfer command is deterministic.
  */
 export function resolveSshSyncBackTransferSets(input: {
   status: SshPorcelainChangedPaths;
   committed: SshPorcelainChangedPaths;
 }): { transferPaths: string[]; deletedPaths: string[] } {
   const statusChanged = new Set(input.status.changedPaths);
-  const statusDeleted = new Set(input.status.deletedPaths);
-  const deleted = new Set<string>(input.status.deletedPaths);
+  const deleted = new Set<string>(
+    input.status.deletedPaths.filter((entry) => !statusChanged.has(entry)),
+  );
   for (const entry of input.committed.deletedPaths) {
     if (!statusChanged.has(entry)) deleted.add(entry);
   }
@@ -2058,9 +2075,11 @@ export async function syncDirectoryFromSsh(input: {
  *
  * The transfer shares the full sync-back's guards: the streaming size cap
  * aborts over-cap streams mid-transfer, and the post-extract staging check
- * bounds extracted bytes. A path list that would overflow the remote
- * command budget, or a listed path missing remotely, rejects so the caller
- * falls back to the full copy — a partial tree is never silently delivered.
+ * bounds extracted bytes. Directory members archive recursively, so an
+ * ignored-directory record transfers whole. A path list that would overflow
+ * the remote command budget, or a listed path missing remotely, rejects so
+ * the caller falls back to the full copy — a partial tree is never
+ * silently delivered.
  */
 export async function downloadChangedFilesFromSsh(input: {
   spec: SshRemoteExecutionSpec;
@@ -2277,6 +2296,51 @@ interface SshSeedGitSnapshot {
   deletedPaths: string[];
   /** Git-ignored paths (`--directory`-collapsed), workspace-relative. */
   ignoredPaths: string[];
+}
+
+/**
+ * The seed provenance a baseline restore needs to reconcile the
+ * changed-files delta exactly: the local HEAD the seed started from, and
+ * the working-tree delta over it (dirty tracked files plus
+ * untracked-but-not-ignored files, minus agent-local scratch). Without the
+ * seed head, a retried restore cannot tell an already-applied delta from an
+ * interrupted one; without the overlay, a seeded file the run reverted to
+ * HEAD (or deleted) is invisible to both the remote status and the
+ * committed diff. Returned by `prepareWorkspaceForSshExecution` for every
+ * git-backed seed; a restore that omits it takes the full copy.
+ */
+export interface SshSyncBackSeedState {
+  headCommit: string;
+  overlayPaths: string[];
+}
+
+/**
+ * Read the working-tree delta over HEAD for a legacy (full-copy) seed: the
+ * same selection the mirror seed calls its overlay. Null on any git
+ * failure — the caller then omits the seed state and the restore fails
+ * closed to the full copy. No toplevel check: a subdir workspace never
+ * reaches the overlay read anyway, because the committed-delta reader
+ * rejects non-toplevel checkouts first.
+ */
+async function readSshSeedOverlayPaths(localDir: string): Promise<string[] | null> {
+  try {
+    const [overlayDiff, untracked] = await Promise.all([
+      runLocalGit(localDir, ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", "HEAD", "--"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+      runLocalGit(localDir, ["ls-files", "--others", "--exclude-standard", "-z"], {
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+    ]);
+    return [
+      ...parseNulPathList(overlayDiff.stdout),
+      ...parseNulPathList(untracked.stdout),
+    ].filter((entry) => !isSshSeedAgentLocalScratchPath(entry));
+  } catch {
+    return null;
+  }
 }
 
 function isSafeGitRelativePath(value: string): boolean {
@@ -2597,7 +2661,7 @@ async function trySeedGitWorkspaceViaMirror(input: {
   localDir: string;
   remoteDir: string;
   onProgress?: RuntimeProgressSink;
-}): Promise<string[] | null> {
+}): Promise<{ ignoredPaths: string[]; seedState: SshSyncBackSeedState } | null> {
   if (!(await verifySshSameFilesystem(input.spec, input.localDir))) return null;
   const mirror = await readSshSeedMirrorInput(input.localDir);
   if (!mirror) return null;
@@ -2610,7 +2674,11 @@ async function trySeedGitWorkspaceViaMirror(input: {
     );
     return null;
   }
-  return await seedGitWorkspaceToSshViaMirror({ ...input, snapshot, mirror });
+  const ignoredPaths = await seedGitWorkspaceToSshViaMirror({ ...input, snapshot, mirror });
+  return {
+    ignoredPaths,
+    seedState: { headCommit: snapshot.headCommit, overlayPaths: snapshot.overlayPaths },
+  };
 }
 
 export async function prepareWorkspaceForSshExecution(input: {
@@ -2618,18 +2686,28 @@ export async function prepareWorkspaceForSshExecution(input: {
   localDir: string;
   remoteDir?: string;
   onProgress?: RuntimeProgressSink;
-}): Promise<{ gitBacked: boolean; seedMode: SshSeedMode; ignoredPaths?: string[] }> {
+}): Promise<{
+  gitBacked: boolean;
+  seedMode: SshSeedMode;
+  ignoredPaths?: string[];
+  seedState?: SshSyncBackSeedState;
+}> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   if (isSshIncrementalSyncEnabled()) {
     try {
-      const ignoredPaths = await trySeedGitWorkspaceViaMirror({
+      const seeded = await trySeedGitWorkspaceViaMirror({
         spec: input.spec,
         localDir: input.localDir,
         remoteDir,
         onProgress: input.onProgress,
       });
-      if (ignoredPaths) {
-        return { gitBacked: true, seedMode: "shared-mirror", ignoredPaths };
+      if (seeded) {
+        return {
+          gitBacked: true,
+          seedMode: "shared-mirror",
+          ignoredPaths: seeded.ignoredPaths,
+          seedState: seeded.seedState,
+        };
       }
     } catch (error) {
       console.warn(
@@ -2641,6 +2719,9 @@ export async function prepareWorkspaceForSshExecution(input: {
   const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
+    // Read before the transfers below: like the mirror snapshot, the
+    // overlay describes the tree at seed time.
+    const overlayPaths = await readSshSeedOverlayPaths(input.localDir);
     await importGitWorkspaceToSsh({
       spec: input.spec,
       localDir: input.localDir,
@@ -2661,7 +2742,15 @@ export async function prepareWorkspaceForSshExecution(input: {
       remoteDir,
       deletedPaths: gitSnapshot.deletedPaths,
     });
-    return { gitBacked: true, seedMode: "full-copy" };
+    // An unreadable overlay omits the seed state instead of guessing it:
+    // the restore then fails closed to the full copy.
+    return {
+      gitBacked: true,
+      seedMode: "full-copy",
+      ...(overlayPaths
+        ? { seedState: { headCommit: gitSnapshot.headCommit, overlayPaths } }
+        : {}),
+    };
   }
 
   await clearRemoteDirectory({
@@ -2682,17 +2771,22 @@ export async function prepareWorkspaceForSshExecution(input: {
 
 /**
  * List the paths the run's new commits changed, as seen from the local
- * checkout that already fetched them: `git diff` of the merge-base against
- * the imported head, split into transfer and delete sets. The merge-base
- * (not the current local head) is the diff root so a concurrent local
- * commit can never shrink the transfer set below what the full copy would
- * apply. Throws when the delta is unknowable — a non-toplevel workspace, an
- * unborn local head, or histories with no common ancestor — and the caller
- * falls back to the full copy.
+ * checkout that already fetched them: `git diff` of the seed head against
+ * the imported head, split into transfer and delete sets. The seed head
+ * (not the current local head, and not their merge-base) is the diff root:
+ * the merge integration moves the local branch to the imported head before
+ * any file is applied, so a retry after an interrupted merge would
+ * merge-base to the imported head itself and report an empty delta while
+ * the worktree still holds pre-run files. Rooting at the seed head names
+ * the run's whole delta on every attempt, and is immune to concurrent
+ * local commits for the same reason. Throws when the delta is unknowable —
+ * a non-toplevel workspace or histories with no common ancestor — and the
+ * caller falls back to the full copy.
  */
 async function readSshSyncBackCommittedPaths(
   localDir: string,
   importedHead: string,
+  seedHead: string,
 ): Promise<SshPorcelainChangedPaths> {
   const prefix = await runLocalGit(localDir, ["rev-parse", "--show-prefix"], {
     timeout: 10_000,
@@ -2701,37 +2795,36 @@ async function readSshSyncBackCommittedPaths(
   if (prefix.stdout.trim() !== "") {
     throw new Error(`SSH changed-files sync-back requires a toplevel local checkout: ${localDir}`);
   }
-  const head = await runLocalGit(localDir, ["rev-parse", "HEAD"], {
+  // Ancestry validation only: the diff itself always roots at the seed
+  // head. Histories with no common ancestor (an unrelated remote, exit 1)
+  // fail here so the caller falls back before spending a status round
+  // trip; every other failure keeps its own error.
+  const mergeBase = await runLocalGit(localDir, ["merge-base", seedHead, importedHead], {
     timeout: 10_000,
     maxBuffer: 16 * 1024,
+  }).catch((error: unknown) => {
+    if ((error as { code?: unknown } | null)?.code !== 1) throw error;
+    return null;
   });
-  const localHead = head.stdout.trim();
-  if (!localHead) {
-    throw new Error("SSH changed-files sync-back requires a local head commit");
-  }
-  const mergeBase = await runLocalGit(localDir, ["merge-base", localHead, importedHead], {
-    timeout: 10_000,
-    maxBuffer: 16 * 1024,
-  });
-  const base = mergeBase.stdout.trim();
-  if (!base) {
+  if (!mergeBase || !mergeBase.stdout.trim()) {
     throw new Error("SSH changed-files sync-back found no common ancestor for the committed delta");
   }
   const [transferDiff, deleteDiff] = await Promise.all([
     runLocalGit(
       localDir,
-      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", base, importedHead, "--"],
+      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", seedHead, importedHead, "--"],
       { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
     ),
     runLocalGit(
       localDir,
-      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=D", base, importedHead, "--"],
+      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=D", seedHead, importedHead, "--"],
       { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
     ),
   ]);
   return {
     changedPaths: parseNulPathList(transferDiff.stdout),
     deletedPaths: parseNulPathList(deleteDiff.stdout),
+    ignoredPaths: [],
   };
 }
 
@@ -2757,8 +2850,9 @@ async function readSshRemoteSyncBackStatus(
  * the remote status paths plus the run's committed paths, then merge the
  * partial tree over the workspace with explicit deletes. Returns true when
  * the incremental restore completed, false when the caller must run the
- * full copy instead (fast path disabled, delta unknowable, path list over
- * the remote command budget, or a listed path missing remotely).
+ * full copy instead (fast path disabled, seed state omitted, delta
+ * unknowable, path list over the remote command budget, or a listed path
+ * missing remotely).
  *
  * The fallback window ends at the merge: a failed download leaves nothing
  * the full copy cannot heal (staging is emptied before returning false, so
@@ -2777,11 +2871,16 @@ async function tryRestoreChangedFilesFromSsh(input: {
   importedHead: string;
   stagingDir: string;
   exclude: string[];
+  seedState: SshSyncBackSeedState | undefined;
   beforeApply?: () => Promise<void>;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<boolean> {
   if (!isSshIncrementalSyncEnabled()) return false;
+  // Fail closed without seed provenance: the committed delta cannot root at
+  // the seed head and seeded-but-reverted paths cannot reconcile, so the
+  // full copy (which needs neither) is the only exact restore.
+  if (!input.seedState) return false;
   const fallBack = async (reason: string, error: unknown): Promise<false> => {
     console.warn(
       { reason, error: error instanceof Error ? error.message : String(error) },
@@ -2796,9 +2895,10 @@ async function tryRestoreChangedFilesFromSsh(input: {
   };
   // Local first: a workspace that cannot even name its committed delta must
   // not spend a remote round trip before falling back.
+  const seedState = input.seedState;
   let committed: SshPorcelainChangedPaths;
   try {
-    committed = await readSshSyncBackCommittedPaths(input.localDir, input.importedHead);
+    committed = await readSshSyncBackCommittedPaths(input.localDir, input.importedHead, seedState.headCommit);
   } catch (error) {
     return fallBack("committed-diff", error);
   }
@@ -2816,8 +2916,34 @@ async function tryRestoreChangedFilesFromSsh(input: {
   // root, but a tar member that did would write outside staging.
   const keep = (entry: string): boolean =>
     isSafeGitRelativePath(entry) && !shouldExcludePath(entry, input.baseline.exclude);
-  const transferPaths = sets.transferPaths.filter(keep);
-  const deletedPaths = sets.deletedPaths.filter(keep);
+  const transfer = new Set(sets.transferPaths.filter(keep));
+  const deleted = new Set(sets.deletedPaths.filter(keep));
+  // Seed-overlay reconciliation: a seeded dirty file the run reverted to
+  // HEAD (or a seeded untracked file the run deleted) is clean in both the
+  // remote status and the committed diff, so neither names it. Overlay
+  // candidates already covered stay deduplicated; an explicit worktree
+  // delete stays authoritative (the file is gone remotely — asking tar for
+  // it would only fail the download). An overlay candidate missing remotely
+  // rejects the download below and the full-copy fallback heals the tree.
+  for (const entry of seedState.overlayPaths) {
+    if (!keep(entry) || deleted.has(entry) || transfer.has(entry)) continue;
+    transfer.add(entry);
+  }
+  // Remote ignored creations (`!!`): the full copy restores an ignored file
+  // that did not exist at seed time, so the delta must carry it too. Paths
+  // already in the baseline keep their local content on this path — seed-time
+  // ignored files are never re-transferred — but a baseline-present ignored
+  // file the status also reports deleted (staged delete plus an on-disk
+  // ignored copy, the `rm --cached` shape) is still present remotely, so it
+  // must not delete either.
+  for (const entry of status.ignoredPaths) {
+    if (!keep(entry) || transfer.has(entry)) continue;
+    deleted.delete(entry);
+    if (input.baseline.entries.has(entry)) continue;
+    transfer.add(entry);
+  }
+  const transferPaths = [...transfer].sort();
+  const deletedPaths = [...deleted].sort();
   try {
     await downloadChangedFilesFromSsh({
       spec: input.spec,
@@ -2861,6 +2987,15 @@ export async function restoreWorkspaceFromSshExecution(input: {
    * files instead of deleting them.
    */
   ignoredPaths?: string[];
+  /**
+   * Seed provenance from `prepareWorkspaceForSshExecution` (the local HEAD
+   * the seed started from plus its working-tree overlay). Required for the
+   * changed-files fast path: without it the committed delta cannot root at
+   * the seed head and seeded-but-reverted paths cannot reconcile, so the
+   * restore takes the full copy. Omit only for restores whose baseline did
+   * not come from a seed.
+   */
+  seedState?: SshSyncBackSeedState;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -2926,6 +3061,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
           importedHead,
           stagingDir,
           exclude: transferExclude,
+          seedState: input.seedState,
           beforeApply,
           onProgress: input.onProgress,
           progressLabel: "workspace",

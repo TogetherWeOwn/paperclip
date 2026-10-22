@@ -187,6 +187,7 @@ export async function prepareRemoteManagedRuntime(input: {
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
         ignoredPaths: preparedWorkspace.ignoredPaths,
+        seedState: preparedWorkspace.seedState,
         onProgress: input.onProgress,
       });
     }
@@ -255,6 +256,7 @@ export async function prepareRemoteManagedRuntime(input: {
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
           ignoredPaths: preparedWorkspace.ignoredPaths,
+          seedState: preparedWorkspace.seedState,
           onProgress,
         });
       }

@@ -885,4 +885,35 @@ describe("mergeChangedFilesWithBaseline", () => {
     expect(await lstat(path.join(targetDir, "file.txt")).then(() => true, () => false)).toBe(false);
     await expect(readFile(path.join(targetDir, "other.txt/inner.txt"), "utf8")).resolves.toBe("local\n");
   });
+
+  it("skips an explicit delete whose ancestor became a symlink", async () => {
+    const root = await makeRoot("paperclip-changed-merge-symlink-");
+    const seedDir = path.join(root, "seed");
+    await writeTree(seedDir, { "d/f.txt": "gone remotely\n", "keep.txt": "keep\n" });
+    const baseline = await captureDirectorySnapshot(seedDir, { exclude: [] });
+    const targetDir = path.join(root, "target");
+    await copyDir(seedDir, targetDir);
+    // Between baseline capture and restore, d/ is replaced by a symlink to a
+    // second tree whose f.txt matches the baseline byte-for-byte: reading the
+    // leaf through the link looks like a baseline match, but removing it
+    // would delete a file outside the target. The full merge never descends
+    // through the link, so the partial merge must not delete through it
+    // either: the delete is skipped and the outside file survives.
+    const outsideDir = path.join(root, "outside");
+    await writeTree(outsideDir, { "f.txt": "gone remotely\n" });
+    await rm(path.join(targetDir, "d"), { recursive: true });
+    await symlink(outsideDir, path.join(targetDir, "d"));
+    const stagingDir = path.join(root, "staging");
+    await mkdir(stagingDir, { recursive: true });
+
+    await mergeChangedFilesWithBaseline({
+      baseline,
+      sourceDir: stagingDir,
+      deletedPaths: ["d/f.txt"],
+      targetDir,
+    });
+
+    await expect(readFile(path.join(outsideDir, "f.txt"), "utf8")).resolves.toBe("gone remotely\n");
+    expect((await lstat(path.join(targetDir, "d"))).isSymbolicLink()).toBe(true);
+  });
 });

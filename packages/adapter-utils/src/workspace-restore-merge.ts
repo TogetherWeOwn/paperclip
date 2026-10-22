@@ -150,6 +150,26 @@ async function walkDirectory(
   return out;
 }
 
+/**
+ * True when any ancestor of `relative` under `root` is a symlink. The full
+ * merge walks the target, so a directory the baseline captured that is now
+ * a symlink hides its whole subtree from the delete pass (the leaf reads
+ * as absent and no delete fires). The partial merge reads per deleted path
+ * instead, so it must reproduce that blindness explicitly: without this
+ * check the leaf read hashes THROUGH a replaced ancestor link, matches the
+ * baseline, and `fs.rm` deletes a file outside the target.
+ */
+async function hasSymlinkAncestor(root: string, relative: string): Promise<boolean> {
+  const segments = relative.split("/");
+  let current = root;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    current = path.join(current, segments[index] ?? "");
+    const stats = await fs.lstat(current).catch(() => null);
+    if (stats?.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
   const fullPath = path.join(root, relative);
   let stats;
@@ -508,9 +528,11 @@ export async function mergeDirectoryWithBaseline(input: {
  * the same outcome as {@link mergeDirectoryWithBaseline}: staged entries that
  * differ from the baseline overwrite the target (remote wins), and
  * `deletedPaths` remove baseline entries the remote deleted — but only where
- * the target still matches the baseline, so concurrent local edits survive.
- * Deletion is explicit: unlike the full merge, absence from the partial
- * source never implies a delete.
+ * the target still matches the baseline, so concurrent local edits survive,
+ * and never through an ancestor the target replaced with a symlink (the
+ * full merge never descends through such a link, so neither does this
+ * one). Deletion is explicit: unlike the full merge, absence from the
+ * partial source never implies a delete.
  *
  * Two deliberate differences from the full merge:
  * - Empty directories are left in place (no `rmdir` pass). Porcelain status
@@ -547,6 +569,7 @@ export async function mergeChangedFilesWithBaseline(input: {
     for (const relative of deletes) {
       const baselineEntry = input.baseline.entries.get(relative);
       if (!baselineEntry || baselineEntry.kind === "dir") continue;
+      if (await hasSymlinkAncestor(canonicalTargetDir, relative)) continue;
       if (!entriesMatch(await readSnapshotEntry(canonicalTargetDir, relative), baselineEntry)) continue;
       await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }).catch(() => undefined);
     }

@@ -123,6 +123,18 @@ function runShell(
   });
 }
 
+async function cleanTreeSeedState(
+  repoDir: string,
+): Promise<{ headCommit: string; overlayPaths: string[] }> {
+  // These fixtures seed from a clean tree (every setup file is committed
+  // before the remote diverges), so the overlay is empty and the current
+  // local head is the seed head: no fixture commits locally after setup.
+  return {
+    headCommit: (await git(repoDir, ["rev-parse", "HEAD"])).trim(),
+    overlayPaths: [],
+  };
+}
+
 afterEach(async () => {
   process.env.PATH = originalPath;
   if (originalTmpdir === undefined) delete process.env.TMPDIR;
@@ -146,6 +158,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z("")).toEqual({
       changedPaths: [],
       deletedPaths: [],
+      ignoredPaths: [],
     });
   });
 
@@ -154,14 +167,25 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ["added.txt", "both.txt", "modified.txt", "staged.txt"],
       deletedPaths: [],
+      ignoredPaths: [],
     });
   });
 
-  it("treats untracked files as changed and skips ignored entries", () => {
+  it("collects ignored entries separately so the caller can reconcile creations", () => {
     const output = `${["?? new.txt", "?? sub/dir/file.txt", "!! ignored.log"].join("\0")}\0`;
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ["new.txt", "sub/dir/file.txt"],
       deletedPaths: [],
+      ignoredPaths: ["ignored.log"],
+    });
+  });
+
+  it("strips the directory marker from ignored directory records", () => {
+    const output = `${["!! logs/", "!! run.log"].join("\0")}\0`;
+    expect(parseSshPorcelainStatusV1Z(output)).toEqual({
+      changedPaths: [],
+      deletedPaths: [],
+      ignoredPaths: ["logs", "run.log"],
     });
   });
 
@@ -170,6 +194,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: [],
       deletedPaths: ["dir/nested-gone.txt", "gone.txt", "staged-gone.txt"],
+      ignoredPaths: [],
     });
   });
 
@@ -178,6 +203,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ["both-added.txt", "conflict.txt", "deleted-by-them.txt"],
       deletedPaths: [],
+      ignoredPaths: [],
     });
   });
 
@@ -202,6 +228,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ["new.txt"],
       deletedPaths: ["old.txt"],
+      ignoredPaths: [],
     });
   });
 
@@ -210,6 +237,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ['a file "quoted".txt', "déjà-vu.txt"],
       deletedPaths: [],
+      ignoredPaths: [],
     });
   });
 
@@ -218,6 +246,7 @@ describe("parseSshPorcelainStatusV1Z", () => {
     expect(parseSshPorcelainStatusV1Z(output)).toEqual({
       changedPaths: ["a.txt", "b.txt"],
       deletedPaths: [],
+      ignoredPaths: [],
     });
   });
 });
@@ -377,6 +406,8 @@ describe("buildSshRemoteStatusScript", () => {
     expect(script).toContain(
       `git -C '${FAKE_REMOTE_ROOT}' status --porcelain=v1 -z -uall`,
     );
+    // Ignored creations must be visible or the sync-back silently drops them.
+    expect(script).toContain("--ignored");
   });
 
   it(
@@ -419,8 +450,16 @@ describe("resolveSshSyncBackTransferSets", () => {
   it("unions disjoint status and committed sets", () => {
     expect(
       resolveSshSyncBackTransferSets({
-        status: { changedPaths: ["dirty.txt"], deletedPaths: ["gone.txt"] },
-        committed: { changedPaths: ["new.txt"], deletedPaths: ["old.txt"] },
+        status: {
+          changedPaths: ["dirty.txt"],
+          deletedPaths: ["gone.txt"],
+          ignoredPaths: [],
+        },
+        committed: {
+          changedPaths: ["new.txt"],
+          deletedPaths: ["old.txt"],
+          ignoredPaths: [],
+        },
       }),
     ).toEqual({
       transferPaths: ["dirty.txt", "new.txt"],
@@ -433,8 +472,12 @@ describe("resolveSshSyncBackTransferSets", () => {
     // remote HAS f, so it transfers and is not deleted.
     expect(
       resolveSshSyncBackTransferSets({
-        status: { changedPaths: ["f.txt"], deletedPaths: [] },
-        committed: { changedPaths: [], deletedPaths: ["f.txt"] },
+        status: { changedPaths: ["f.txt"], deletedPaths: [], ignoredPaths: [] },
+        committed: {
+          changedPaths: [],
+          deletedPaths: ["f.txt"],
+          ignoredPaths: [],
+        },
       }),
     ).toEqual({ transferPaths: ["f.txt"], deletedPaths: [] });
   });
@@ -445,19 +488,43 @@ describe("resolveSshSyncBackTransferSets", () => {
     // whole download) and lands in the delete set instead.
     expect(
       resolveSshSyncBackTransferSets({
-        status: { changedPaths: [], deletedPaths: ["f.txt"] },
-        committed: { changedPaths: ["f.txt"], deletedPaths: [] },
+        status: { changedPaths: [], deletedPaths: ["f.txt"], ignoredPaths: [] },
+        committed: {
+          changedPaths: ["f.txt"],
+          deletedPaths: [],
+          ignoredPaths: [],
+        },
       }),
     ).toEqual({ transferPaths: [], deletedPaths: ["f.txt"] });
+  });
+
+  it("lets worktree presence win when status reports both changed and deleted", () => {
+    // `git rm --cached f` (or a staged delete plus a recreate) emits both
+    // `D  f` and `?? f`: the remote HAS f, so it transfers, never deletes.
+    expect(
+      resolveSshSyncBackTransferSets({
+        status: {
+          changedPaths: ["f.txt"],
+          deletedPaths: ["f.txt"],
+          ignoredPaths: [],
+        },
+        committed: { changedPaths: [], deletedPaths: [], ignoredPaths: [] },
+      }),
+    ).toEqual({ transferPaths: ["f.txt"], deletedPaths: [] });
   });
 
   it("dedupes and sorts both sets deterministically", () => {
     expect(
       resolveSshSyncBackTransferSets({
-        status: { changedPaths: ["b.txt", "a.txt"], deletedPaths: ["z.txt"] },
+        status: {
+          changedPaths: ["b.txt", "a.txt"],
+          deletedPaths: ["z.txt"],
+          ignoredPaths: [],
+        },
         committed: {
           changedPaths: ["a.txt", "c.txt"],
           deletedPaths: ["z.txt", "y.txt"],
+          ignoredPaths: [],
         },
       }),
     ).toEqual({
@@ -811,6 +878,7 @@ exec "$STUB_REAL_GIT" "$@"
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       expect(await bundleCreateArgvs(logPath)).toEqual([]);
@@ -860,6 +928,7 @@ exec "$STUB_REAL_GIT" "$@"
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       const bundles = await bundleCreateArgvs(logPath);
@@ -944,6 +1013,7 @@ exec "$STUB_REAL_GIT" "$@"
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       const bundles = await bundleCreateArgvs(logPath);
@@ -1093,6 +1163,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       await expect(
@@ -1185,6 +1256,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       await expect(
@@ -1251,6 +1323,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       await expect(
@@ -1304,6 +1377,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       await expect(
@@ -1348,6 +1422,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       }).then(
         () => null,
         (error: unknown) => error,
@@ -1392,6 +1467,7 @@ describe("changed-files sync-back wiring", () => {
         remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
         baselineSnapshot: baseline,
         restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
       });
 
       await expect(
@@ -1402,6 +1478,312 @@ describe("changed-files sync-back wiring", () => {
       const graftBody = await git(localDir, ["log", "-1", "--format=%B"]);
       expect(graftBody).toContain("(Paperclip SSH sync graft");
       expect(await git(localDir, ["rev-parse", "HEAD"])).not.toBe(remoteHead);
+      expect(await countStatusQueries(logPath)).toBe(0);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps a remotely rm-cached file instead of deleting the local copy",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(
+        path.join(localDir, "big.bin"),
+        Buffer.alloc(1024 * 1024, 0x41),
+      );
+      await commitFile(localDir, "foo.txt", "v1\n", "seed");
+      const remoteDir = await createTempDir("paperclip-wire-rmcached-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // `git rm --cached` stages a delete while the file stays on disk: real
+      // git reports BOTH `D  foo.txt` and `?? foo.txt`. The worktree has the
+      // file, so it must transfer — never land in the delete set.
+      await git(checkoutDir, ["rm", "--cached", "-q", "foo.txt"]);
+      await writeFile(path.join(checkoutDir, "foo.txt"), "v2remote\n");
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+      process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
+      });
+
+      await expect(
+        readFile(path.join(localDir, "foo.txt"), "utf8"),
+      ).resolves.toBe("v2remote\n");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "heals a seeded dirty file the run reverted to HEAD",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(
+        path.join(localDir, "big.bin"),
+        Buffer.alloc(1024 * 1024, 0x41),
+      );
+      await commitFile(localDir, "dirty.txt", "base\n", "seed");
+      const seedHead = (await git(localDir, ["rev-parse", "HEAD"])).trim();
+      // Seeded dirt: the local tree is dirty when the seed carries it.
+      await writeFile(path.join(localDir, "dirty.txt"), "localEdit\n");
+      const remoteDir = await createTempDir("paperclip-wire-revert-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // The seed overlay lands remotely, then the run reverts it to HEAD:
+      // remote status is clean and the committed diff is empty, so only the
+      // seed overlay names this file as a transfer candidate.
+      await writeFile(path.join(checkoutDir, "dirty.txt"), "localEdit\n");
+      await git(checkoutDir, ["checkout", "--", "dirty.txt"]);
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+      process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: { headCommit: seedHead, overlayPaths: ["dirty.txt"] },
+      });
+
+      await expect(
+        readFile(path.join(localDir, "dirty.txt"), "utf8"),
+      ).resolves.toBe("base\n");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy when the run deleted a seeded untracked file",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const seedHead = (await git(localDir, ["rev-parse", "HEAD"])).trim();
+      await writeFile(
+        path.join(localDir, "untracked.txt"),
+        "seeded untracked\n",
+      );
+      const remoteDir = await createTempDir(
+        "paperclip-wire-seeddelete-remote-",
+      );
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // The seed overlay lands remotely, then the run deletes it: status is
+      // clean, so the overlay candidate is the only trace. It is absent
+      // remotely, so the delta download rejects and the full-copy fallback
+      // heals the local tree (no cap: the fallback must fit).
+      await writeFile(
+        path.join(checkoutDir, "untracked.txt"),
+        "seeded untracked\n",
+      );
+      await rm(path.join(checkoutDir, "untracked.txt"));
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: { headCommit: seedHead, overlayPaths: ["untracked.txt"] },
+      });
+
+      expect(
+        await lstat(path.join(localDir, "untracked.txt")).then(
+          () => true,
+          () => false,
+        ),
+      ).toBe(false);
+      expect(await countStatusQueries(logPath)).toBe(1);
+      // The delta download plus the full-copy fallback.
+      expect(await countTarDownloads(logPath)).toBe(2);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "restores an ignored file the run created when none existed at seed time",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(
+        path.join(localDir, "big.bin"),
+        Buffer.alloc(1024 * 1024, 0x41),
+      );
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      const remoteDir = await createTempDir("paperclip-wire-ignored-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      // No .log file exists locally at seed time, so no ignored entry is
+      // baseline-blind here; the run's creation must come back.
+      await writeFile(path.join(checkoutDir, "run.log"), "remote log\n");
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+      process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
+      });
+
+      await expect(
+        readFile(path.join(localDir, "run.log"), "utf8"),
+      ).resolves.toBe("remote log\n");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "leaves seed-time ignored files in place instead of re-transferring them",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      // A legacy-style baseline: the ignored file is IN the baseline (never
+      // transferred on the incremental path), not in its excludes.
+      const ignoredBytes = Buffer.alloc(256 * 1024, 0x43);
+      await writeFile(path.join(localDir, "big.log"), ignoredBytes);
+      const remoteDir = await createTempDir(
+        "paperclip-wire-ignoredkeep-remote-",
+      );
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await writeFile(path.join(checkoutDir, "big.log"), ignoredBytes);
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+      // Below the ignored file's size: transferring it would refuse.
+      process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: await cleanTreeSeedState(localDir),
+      });
+
+      await expect(readFile(path.join(localDir, "big.log"))).resolves.toEqual(
+        ignoredBytes,
+      );
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(0);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "heals a retry whose first attempt advanced the branch without applying files",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(
+        path.join(localDir, "big.bin"),
+        Buffer.alloc(1024 * 1024, 0x41),
+      );
+      await commitFile(localDir, "f.txt", "v1\n", "seed");
+      const seedHead = (await git(localDir, ["rev-parse", "HEAD"])).trim();
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const remoteDir = await createTempDir("paperclip-wire-retry-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await git(checkoutDir, ["config", "user.email", "wire-test@example.com"]);
+      await git(checkoutDir, ["config", "user.name", "Wire Test"]);
+      await commitFile(checkoutDir, "f.txt", "v2\n", "remote edit");
+      await commitFile(checkoutDir, "new.txt", "new\n", "remote add");
+      const remoteHead = (await git(checkoutDir, ["rev-parse", "HEAD"])).trim();
+      // The interrupted-merge state: beforeApply already moved the local
+      // branch to the imported head, but the worktree still holds pre-run
+      // files. A delta rooted at the local head would be empty here; the
+      // seed head still names the run's work.
+      await git(localDir, ["fetch", checkoutDir, "main"]);
+      await git(localDir, ["update-ref", "refs/heads/main", remoteHead]);
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+      process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+        seedState: { headCommit: seedHead, overlayPaths: [] },
+      });
+
+      await expect(
+        readFile(path.join(localDir, "f.txt"), "utf8"),
+      ).resolves.toBe("v2\n");
+      await expect(
+        readFile(path.join(localDir, "new.txt"), "utf8"),
+      ).resolves.toBe("new\n");
+      expect(await countStatusQueries(logPath)).toBe(1);
+      expect(await countTarDownloads(logPath)).toBe(1);
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "falls back to the full copy without a status round trip when the seed state is omitted",
+    async () => {
+      const localDir = await initRepo();
+      await commitFile(localDir, "tracked.txt", "v1\n", "seed");
+      const remoteDir = await createTempDir("paperclip-wire-noseed-remote-");
+      await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+      const checkoutDir = path.join(remoteDir, "checkout");
+      await writeFile(path.join(checkoutDir, "tracked.txt"), "v2\n");
+      const baseline = await captureDirectorySnapshot(localDir, {
+        exclude: baselineExcludes(),
+      });
+      const spec = buildStubSpec(remoteDir);
+      const { logPath } = await installSshArgvLog();
+
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot: baseline,
+        restoreGitHistory: true,
+      });
+
+      await expect(
+        readFile(path.join(localDir, "tracked.txt"), "utf8"),
+      ).resolves.toBe("v2\n");
       expect(await countStatusQueries(logPath)).toBe(0);
       expect(await countTarDownloads(logPath)).toBe(1);
     },

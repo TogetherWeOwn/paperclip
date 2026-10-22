@@ -29,9 +29,10 @@ helpers in [`src/ssh.ts`](./src/ssh.ts):
   syncs the remote cwd back into `localDir` after the run, including any new
   commits the agent created. Also runs with no `git remote` configured. Git
   baseline restores transfer only the remotely-changed files plus the new
-  commits (the streaming size cap is enforced mid-transfer), falling back to
-  the full copy when the delta is unknowable; `PAPERCLIP_SSH_INCREMENTAL_SYNC=0`
-  forces the full copy here too.
+  commits (the streaming size cap is enforced mid-transfer: an over-cap
+  delta fails the restore instead of retrying as the larger full copy),
+  falling back to the full copy when the delta is unknowable;
+  `PAPERCLIP_SSH_INCREMENTAL_SYNC=0` forces the full copy here too.
 
 `prepareRemoteManagedRuntime` in
 [`src/remote-managed-runtime.ts`](./src/remote-managed-runtime.ts) wraps both

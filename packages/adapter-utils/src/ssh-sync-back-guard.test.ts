@@ -535,6 +535,7 @@ describe("SSH workspace restore never deletes local scratch or nested source", (
       remoteDir: FAKE_REMOTE_ROOT,
       baselineSnapshot: baseline,
       restoreGitHistory: true,
+      seedState: prepared.seedState,
     });
 
     expect((await git(localDir, "status", "--porcelain")).trim()).toBe("");
