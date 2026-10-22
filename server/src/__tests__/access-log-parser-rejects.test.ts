@@ -39,7 +39,22 @@ describe("access log parser rejects", () => {
     vi.stubEnv("PAPERCLIP_CONFIG", path.join(dir, "no-config.json"));
 
     const { createApp } = await import("../app.js");
-    const app = await createApp({} as never, {
+    // Hermetic DB owner for the chat-delivery-work bootstrap: createApp now
+    // subscribes delivery queues through subscribeDatabaseWork, which
+    // correctly requires a createDb-registered owner. This minimal double
+    // carries only the work-signal scope (no queue rows); the malformed/
+    // oversized HTTP assertions below never touch it.
+    const { installDatabaseWorkSignals } = await import(
+      "../../../packages/db/src/work-signals.js"
+    );
+    const execute = async () => [{ xid: "42", status: "committed" }];
+    const db = installDatabaseWorkSignals({
+      execute,
+      async transaction(callback: (tx: any) => Promise<any>) {
+        return callback({ execute });
+      },
+    });
+    const app = await createApp(db as never, {
       uiMode: "none",
       serverPort: 3100,
       storageService: {} as never,
