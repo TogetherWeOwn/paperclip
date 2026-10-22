@@ -47,16 +47,16 @@ function writeConfig(dir: string, logDir: string): string {
 }
 
 describe("parseFileLoggingConfig", () => {
-  it("defaults to enabled with the instance logs dir and 10MB x 5 caps", () => {
+  it("defaults to enabled with the instance logs dir and 24MB x 12 caps", () => {
     // Hermetic: an ambient instance config must not redirect the default dir.
     vi.stubEnv("PAPERCLIP_CONFIG", path.join(tempDir(), "no-config.json"));
     const config = parseFileLoggingConfig({});
     expect(config.enabled).toBe(true);
     expect(config.dir).toBe(resolveDefaultLogsDir());
-    expect(config.serverMaxBytes).toBe(10 * 1024 * 1024);
-    expect(config.serverMaxFiles).toBe(5);
-    expect(config.accessMaxBytes).toBe(10 * 1024 * 1024);
-    expect(config.accessMaxFiles).toBe(5);
+    expect(config.serverMaxBytes).toBe(24 * 1024 * 1024);
+    expect(config.serverMaxFiles).toBe(12);
+    expect(config.accessMaxBytes).toBe(24 * 1024 * 1024);
+    expect(config.accessMaxFiles).toBe(12);
   });
 
   it("honours explicit disable flags and a custom dir", () => {
@@ -75,9 +75,9 @@ describe("parseFileLoggingConfig", () => {
       PAPERCLIP_SERVER_LOG_MAX_FILES: "-2",
       PAPERCLIP_ACCESS_LOG_MAX_BYTES: "0",
     });
-    expect(config.serverMaxBytes).toBe(10 * 1024 * 1024);
-    expect(config.serverMaxFiles).toBe(5);
-    expect(config.accessMaxBytes).toBe(10 * 1024 * 1024);
+    expect(config.serverMaxBytes).toBe(24 * 1024 * 1024);
+    expect(config.serverMaxFiles).toBe(12);
+    expect(config.accessMaxBytes).toBe(24 * 1024 * 1024);
   });
 
   it("rejects suffixed, scientific, and below-floor sizes (no partial parse)", () => {
@@ -88,15 +88,15 @@ describe("parseFileLoggingConfig", () => {
       PAPERCLIP_ACCESS_LOG_MAX_BYTES: "1e9",
       PAPERCLIP_SERVER_LOG_MAX_FILES: "5x",
     });
-    expect(suffixed.serverMaxBytes).toBe(10 * 1024 * 1024);
-    expect(suffixed.accessMaxBytes).toBe(10 * 1024 * 1024);
-    expect(suffixed.serverMaxFiles).toBe(5);
+    expect(suffixed.serverMaxBytes).toBe(24 * 1024 * 1024);
+    expect(suffixed.accessMaxBytes).toBe(24 * 1024 * 1024);
+    expect(suffixed.serverMaxFiles).toBe(12);
     const tiny = parseFileLoggingConfig({
       PAPERCLIP_SERVER_LOG_MAX_BYTES: "100",
       PAPERCLIP_ACCESS_LOG_MAX_BYTES: "65535",
     });
-    expect(tiny.serverMaxBytes).toBe(10 * 1024 * 1024);
-    expect(tiny.accessMaxBytes).toBe(10 * 1024 * 1024);
+    expect(tiny.serverMaxBytes).toBe(24 * 1024 * 1024);
+    expect(tiny.accessMaxBytes).toBe(24 * 1024 * 1024);
     const floor = parseFileLoggingConfig({
       PAPERCLIP_SERVER_LOG_MAX_BYTES: String(64 * 1024),
       PAPERCLIP_SERVER_LOG_MAX_FILES: "2",

@@ -9,13 +9,13 @@ Telemetry (nothing leaves the host), not Observability (no OTLP endpoint
 involved), and not the run log (no database rows).
 
 Privacy: the pino lines in `server.log` and every `access.log` line pass
-through the existing HTTP log redaction policy. The stdio-tee copies in
-`server.log` do NOT: they are raw process output with only ANSI codes
-stripped, so anything the process prints (subprocess stderr passthrough,
-fatal-error prints) persists verbatim on the instance volume, where it used
-to live only in ephemeral container stdout. Treat new stdio writers as
-unredacted retained data — they need a privacy review. Changes confined to
-rotation, file layout, or the already-redacted lines do not.
+through the existing HTTP log redaction policy, and the sink scrubs every
+retained chunk with the shared text redaction as defence in depth. The
+stdio-tee copies in `server.log` are therefore redacted, not verbatim —
+only the console copy keeps raw process output. Treat new stdio writers as
+redacted retained data — widening what the tee may see still needs a
+privacy review. Changes confined to rotation, file layout, or the
+already-redacted lines do not.
 
 ## Files
 
@@ -45,9 +45,25 @@ not delete them; the new process appends to the existing files.
 
 ## Rotation and crash-safety
 
-- Size-based rotation per file: `server.log` + `server.log.1 … .4` by
-  default (10 MiB each, 50 MiB cap; same for `access.log`). Tune with
+- Size-based rotation per file: `server.log` + `server.log.1 … .11` by
+  default (24 MiB each, 288 MiB cap; same for `access.log`). Tune with
   `PAPERCLIP_{SERVER,ACCESS}_LOG_MAX_{BYTES,FILES}`.
+- Retention: at live-host rates measured 2026-10-22 (`server.log`
+  ~10 MiB/h, `access.log` ~4 MiB/h) the defaults hold roughly 24h+ of
+  `server.log` and several days of `access.log` — the hot forensics
+  window. Older history is whatever the container runtime keeps:
+  container stdout is unchanged, so `docker logs <container> --since …`
+  on the host reaches further back, with host-managed (not
+  app-managed) retention.
+- Permissions: every retained file is created owner-only (`0600`), and
+  newly created log directories are `0700`. Files with group/other
+  permission bits (e.g. generations written before owner-only files)
+  are tightened to owner-only when the sink opens — every generation
+  on disk, even above a lowered `MAX_FILES` cap — and as generations
+  shift through rotation; rotation itself only renames within the set,
+  so it never produces a world-readable file. Files owned by another
+  user cannot be tightened by the server process — the host must
+  `chown`/`chmod` those back to the server user.
 - Every write is a synchronous append: there is no userspace buffer to lose,
   so a hard crash (uncaught exception, OOM kill) keeps everything up to the
   final line. No `uncaughtException`/`unhandledRejection` listener is
@@ -66,12 +82,12 @@ not delete them; the new process appends to the existing files.
 |---|---|---|
 | `PAPERCLIP_FILE_LOGGING` | `true` | `false`/`0`/`no`/`off` disables both files (stdout-only) |
 | `PAPERCLIP_LOG_DIR` | explicit config `logging.logDir`, else instance logs dir | Directory for both files (explicit env wins) |
-| `PAPERCLIP_SERVER_LOG_MAX_BYTES` | `10485760` | Rotation size for `server.log` |
-| `PAPERCLIP_SERVER_LOG_MAX_FILES` | `5` | Generations kept for `server.log` |
-| `PAPERCLIP_ACCESS_LOG_MAX_BYTES` | `10485760` | Rotation size for `access.log` |
-| `PAPERCLIP_ACCESS_LOG_MAX_FILES` | `5` | Generations kept for `access.log` |
+| `PAPERCLIP_SERVER_LOG_MAX_BYTES` | `25165824` | Rotation size for `server.log` |
+| `PAPERCLIP_SERVER_LOG_MAX_FILES` | `12` | Generations kept for `server.log` |
+| `PAPERCLIP_ACCESS_LOG_MAX_BYTES` | `25165824` | Rotation size for `access.log` |
+| `PAPERCLIP_ACCESS_LOG_MAX_FILES` | `12` | Generations kept for `access.log` |
 
-Sizes accept plain bytes only (`10485760`, not `10MB` or `1e9`); invalid,
+Sizes accept plain bytes only (`25165824`, not `10MB` or `1e9`); invalid,
 suffixed, or below-floor values (minimum 64 KiB for byte caps) fall back to
 defaults with a stderr warning. Unit tests run stdout-only unless they opt
 in explicitly.
@@ -96,9 +112,9 @@ for minute in sorted(hits): print(minute, hits[minute])
 # Status mix in the same window:
 grep -h '"t":"2026-10-20T01:5' "$LOGDIR"/access.log* | grep -o '"s":[0-9]*' | sort | uniq -c
 
-# What the server printed just before it died (oldest line first):
-cat "$LOGDIR"/server.log.4 "$LOGDIR"/server.log.3 "$LOGDIR"/server.log.2 \
-    "$LOGDIR"/server.log.1 "$LOGDIR"/server.log 2>/dev/null | tail -100
+# What the server printed just before it died (oldest line first, across
+# every generation the cap keeps — GNU ls version-sort on the host):
+ls -rv "$LOGDIR"/server.log* 2>/dev/null | xargs cat 2>/dev/null | tail -100
 ```
 
 ## Rollback
