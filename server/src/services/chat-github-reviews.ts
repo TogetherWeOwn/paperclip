@@ -1351,14 +1351,19 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
           const operation = action.payload.operation;
           let receipt: Record<string, unknown>;
           if (operation === "comment" || operation === "update_comment") {
-            const fresh = await scope(session, true);
-            // Re-check before the write: shadow enabled, or a label pinned,
-            // while this dispatch was in flight still suppresses the write.
-            if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
-              throw forbidden("Shadow reviews are never published to GitHub");
+            // Re-check on every write guard inside the response writer
+            // (before and after the marker reads): shadow enabled, or a
+            // label pinned, while this dispatch was in flight still
+            // suppresses the write.
+            const assertCurrentWithShadowRecheck = async () => {
+              const fresh = await scope(session, true);
+              await assertPublicationAuthority(fresh, action);
+              if (fresh.shadowLabel || (await pinnedShadowLabel(session, fresh)))
+                throw forbidden("Shadow reviews are never published to GitHub");
+            };
             receipt = await writeGitHubResponseComment(db, source, api, lease, {
               body: publicReviewText(String(action.payload.body)), final: operation === "comment", versionAt: action.createdAt,
-            }, async () => assertPublicationAuthority(await scope(session, true), action));
+            }, assertCurrentWithShadowRecheck);
             if (operation === "comment") await githubResponseCommentService(db, fetchImpl).finishRun({ companyId: session.companyId, issueId: source.issue.id, runId: source.run.id, endpointId: source.endpoint.id }, source,
               receipt as { id: string; url: string }, api, lease, async () => assertPublicationAuthority(await scope(session, true), action));
           } else if (operation === "formal_review") {

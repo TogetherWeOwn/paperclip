@@ -2754,6 +2754,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           inlineWrites.push(JSON.parse(String(init.body)));
           return Response.json({ id: 420, html_url: "https://github.com/paperclipai/paperclip/pull/418#discussion_r420" });
         }
+        if (url.includes("/compare/")) return Response.json({ merge_base_commit: { sha: "a".repeat(40) } });
         return undefined;
       });
       const service = githubChatReviewService(db, f.providerFetch);
@@ -2761,7 +2762,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await service.execute(f.session, "submit_review", { reviewedCommit: head, score: 5, complete: true,
         summary: "Disabled summary must not be published", rationale: "Looks good",
         coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] },
-        findings: [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", body: "Example finding" }],
+        findings: [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", title: "Example note", body: "Example finding" }],
       }, "inline-only");
       expect(inlineWrites).toHaveLength(1);
       expect(f.responseWrites.map(write => write.method)).toEqual(deletedSibling ? ["POST", "POST", "PATCH"] : ["POST", "PATCH"]);
@@ -2796,13 +2797,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           head = "c".repeat(40);
           return Response.json([]);
         }
+        if (url.includes("/compare/")) return Response.json({ merge_base_commit: { sha: "a".repeat(40) } });
         return undefined;
       });
       const service = githubChatReviewService(db, f.providerFetch);
       await service.execute(f.session, "begin_review", { reviewedCommit: original });
       await service.execute(f.session, "submit_review", { reviewedCommit: original, score: 5, complete: true,
         summary: "Reviewed", rationale: "Looks good", coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] },
-        findings: phase === "after_summary" ? [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", body: "Example finding" }] : [],
+        findings: phase === "after_summary" ? [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", title: "Example note", body: "Example finding" }] : [],
       }, `head-change-${phase}`);
       expect(summaryDelivered).toBe(true);
       const [publication] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
