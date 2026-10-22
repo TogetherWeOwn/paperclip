@@ -32,17 +32,23 @@ suite("GitHub shadow arm forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const migrationTag = "0297_new_sunspot";
+      const migrationTag = "0337_new_sunspot";
       const index = journal.entries.findIndex((entry) => entry.tag === migrationTag);
       expect(index).toBeGreaterThan(0);
       const apply = async (tag: string) => {
-        const migration = await readFile(new URL(`./migrations/${tag}.sql`, import.meta.url), "utf8");
-        await legacy.begin(async (tx) => {
-          for (const statement of migration.split("--> statement-breakpoint")) {
-            if (statement.trim()) await tx.unsafe(statement);
-          }
-        });
-      };
+              const migration = await readFile(new URL(`./migrations/${tag}.sql`, import.meta.url), "utf8");
+              // CREATE INDEX CONCURRENTLY cannot run inside a transaction block;
+              // the real migrator applies such statements outside of one.
+              const withoutComments = (sql: string) => sql.split("\n").filter((line) => !line.trimStart().startsWith("--")).join("\n");
+              const isConcurrent = (s: string) => /CREATE\s+(UNIQUE\s+)?INDEX\s+CONCURRENTLY/i.test(withoutComments(s));
+              const statements = migration.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean);
+              const plain = statements.filter((s) => !isConcurrent(s));
+              const concurrent = statements.filter(isConcurrent);
+              if (plain.length) await legacy.begin(async (tx) => {
+                for (const statement of plain) await tx.unsafe(statement);
+              });
+              for (const statement of concurrent) await legacy.unsafe(statement);
+            };
       for (const entry of journal.entries.slice(0, index)) await apply(entry.tag);
       expect((await legacy`select to_regclass('public.chat_github_review_arms') as relation`)[0].relation).toBeNull();
 

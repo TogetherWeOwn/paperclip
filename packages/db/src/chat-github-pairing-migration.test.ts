@@ -23,17 +23,23 @@ suite("GitHub pairing forward migration", () => {
       const journal = JSON.parse(await readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as {
         entries: Array<{ tag: string }>;
       };
-      const tag = "0300_green_kingpin";
+      const tag = "0340_green_kingpin";
       const index = journal.entries.findIndex(entry => entry.tag === tag);
       expect(index).toBeGreaterThan(0);
       const apply = async (name: string) => {
-        const migration = await readFile(new URL(`./migrations/${name}.sql`, import.meta.url), "utf8");
-        await db.begin(async tx => {
-          for (const statement of migration.split("--> statement-breakpoint")) {
-            if (statement.trim()) await tx.unsafe(statement);
-          }
-        });
-      };
+              const migration = await readFile(new URL(`./migrations/${name}.sql`, import.meta.url), "utf8");
+              // CREATE INDEX CONCURRENTLY cannot run inside a transaction block;
+              // the real migrator applies such statements outside of one.
+              const withoutComments = (sql: string) => sql.split("\n").filter((line) => !line.trimStart().startsWith("--")).join("\n");
+              const isConcurrent = (s: string) => /CREATE\s+(UNIQUE\s+)?INDEX\s+CONCURRENTLY/i.test(withoutComments(s));
+              const statements = migration.split("--> statement-breakpoint").map((s) => s.trim()).filter(Boolean);
+              const plain = statements.filter((s) => !isConcurrent(s));
+              const concurrent = statements.filter(isConcurrent);
+              if (plain.length) await db.begin(async (tx) => {
+                for (const statement of plain) await tx.unsafe(statement);
+              });
+              for (const statement of concurrent) await db.unsafe(statement);
+            };
       for (const entry of journal.entries.slice(0, index)) await apply(entry.tag);
       const company = randomUUID(), agent = randomUUID(), application = randomUUID();
       const connection = randomUUID(), endpoint = randomUUID(), issue = randomUUID(), conversation = randomUUID();
