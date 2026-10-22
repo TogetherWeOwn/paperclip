@@ -94,6 +94,22 @@ describe("retained log file permissions", () => {
     expect(readFileSync(live, "utf8")).toContain("before\n");
   });
 
+  it("tightens pre-existing generations at open, before any rotation", () => {
+    const dir = tempDir();
+    writeFileSync(path.join(dir, "server.log.1"), "old1\n");
+    chmodSync(path.join(dir, "server.log.1"), 0o644);
+    writeFileSync(path.join(dir, "server.log.2"), "old2\n");
+    chmodSync(path.join(dir, "server.log.2"), 0o644);
+    // maxBytes is huge: no rotation fires, so any tightening below comes
+    // from the constructor, not from the rotation path.
+    const sink = track(
+      new RotatingFileSink({ dir, filename: "server.log", maxBytes: 65536, maxFiles: 4 }),
+    );
+    sink.write("live\n");
+    expectOwnerOnly(path.join(dir, "server.log.1"));
+    expectOwnerOnly(path.join(dir, "server.log.2"));
+  });
+
   it("keeps every rotation generation owner-only, including legacy files", () => {
     const dir = tempDir();
     const sink = track(

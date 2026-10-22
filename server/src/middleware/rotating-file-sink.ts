@@ -12,7 +12,9 @@
 // shared volume. Every file this sink creates is owner-only (0600), newly
 // created directories are 0700, and pre-existing files with group/other
 // permission bits are tightened on open and as they shift through rotation
-// (best-effort: foreign-owned files are left for the host to fix).
+// (best-effort and never throwing, but not silent: a file the sink cannot
+// make owner-only reports through the throttled diagnostic so the host
+// knows to fix it).
 // Rotation renames within the set, so it never produces a world-readable
 // file. As defence in depth, every chunk passes through the shared text
 // redaction before the retained write; stdout is untouched.
@@ -51,33 +53,47 @@ const LOG_DIR_MODE = 0o700;
 
 /**
  * Strip group/other permission bits from an open file. Best-effort and never
- * throws: a foreign-owned file (EPERM) or a raced-away fd is left untouched
- * for the host to fix. Owner bits are preserved, never loosened.
+ * throws. Returns null when the file is now owner-only (or was already, or
+ * the fd raced away); returns the caught error when the mode bits are still
+ * set, so the caller can report a still-world-accessible file instead of
+ * failing silent. Owner bits are preserved, never loosened.
  */
-function tightenOpenFilePermissions(fd: number): void {
+function tightenOpenFilePermissions(fd: number): unknown {
+  let mode: number;
   try {
-    const mode = fs.fstatSync(fd).mode & 0o777;
-    if (mode & 0o077) {
-      fs.fchmodSync(fd, mode & 0o700);
-    }
+    mode = fs.fstatSync(fd).mode & 0o777;
   } catch {
-    // Not our file to fix, or it vanished mid-call: leave it alone.
+    return null;
+  }
+  if ((mode & 0o077) === 0) return null;
+  try {
+    fs.fchmodSync(fd, mode & 0o700);
+    return null;
+  } catch (err) {
+    return err;
   }
 }
 
 /**
  * Strip group/other permission bits from a rotated generation by path. Same
- * best-effort contract as tightenOpenFilePermissions: rotation touches each
- * generation rarely, so a stat+chmod pair per generation is affordable.
+ * contract as tightenOpenFilePermissions: a missing generation is normal
+ * (fresh dir) and stays silent, while a failed chmod returns its error for
+ * the throttled report path. Rotation touches each generation rarely, so a
+ * stat+chmod pair per generation is affordable.
  */
-function tightenRotatedFilePermissions(filePath: string): void {
+function tightenRotatedFilePermissions(filePath: string): unknown {
+  let mode: number;
   try {
-    const mode = fs.statSync(filePath).mode & 0o777;
-    if (mode & 0o077) {
-      fs.chmodSync(filePath, mode & 0o700);
-    }
+    mode = fs.statSync(filePath).mode & 0o777;
   } catch {
-    // Missing generation, foreign-owned, or raced away: leave it alone.
+    return null;
+  }
+  if ((mode & 0o077) === 0) return null;
+  try {
+    fs.chmodSync(filePath, mode & 0o700);
+    return null;
+  } catch (err) {
+    return err;
   }
 }
 
@@ -109,10 +125,25 @@ export class RotatingFileSink {
     } catch {
       this.size = 0;
     }
-    // The mode applies when the file is created; tightenOpenFilePermissions
-    // below converges a pre-existing world-readable file to owner-only.
+    // The mode applies when the file is created; the tighten calls below
+    // converge pre-existing world-readable files to owner-only. Failures
+    // report through the throttled diagnostic: a still-world-accessible
+    // file after open is degraded file logging, not a silent condition.
     this.fd = fs.openSync(this.filePath, "a", LOG_FILE_MODE);
-    tightenOpenFilePermissions(this.fd);
+    this.reportTightenFailure(
+      tightenOpenFilePermissions(this.fd),
+      this.filePath,
+    );
+    // Pre-existing generations converge here, not only on the next
+    // rotation: a restart must not leave yesterday's world-readable files
+    // in place for hours until traffic triggers a rotate.
+    for (let i = 1; i < this.maxFiles; i += 1) {
+      const generation = `${this.filePath}.${i}`;
+      this.reportTightenFailure(
+        tightenRotatedFilePermissions(generation),
+        generation,
+      );
+    }
   }
 
   /** Absolute path of the live file. */
@@ -200,7 +231,11 @@ export class RotatingFileSink {
       // process) shift through here: tighten each so rotation converges
       // every generation to 0600 instead of preserving world-readable bits.
       for (let i = 1; i < this.maxFiles; i += 1) {
-        tightenRotatedFilePermissions(`${this.filePath}.${i}`);
+        const generation = `${this.filePath}.${i}`;
+        this.reportTightenFailure(
+          tightenRotatedFilePermissions(generation),
+          generation,
+        );
       }
       this.size = 0;
     } finally {
@@ -223,7 +258,10 @@ export class RotatingFileSink {
   private openLiveFile(context: string): void {
     try {
       this.fd = fs.openSync(this.filePath, "a", LOG_FILE_MODE);
-      tightenOpenFilePermissions(this.fd);
+      this.reportTightenFailure(
+        tightenOpenFilePermissions(this.fd),
+        this.filePath,
+      );
       try {
         this.size = fs.statSync(this.filePath).size;
       } catch {
@@ -233,6 +271,12 @@ export class RotatingFileSink {
       this.fd = null;
       this.report(err, context);
     }
+  }
+
+  /** Report a file the sink could open but not make owner-only. */
+  private reportTightenFailure(tightenError: unknown, filePath: string): void {
+    if (tightenError === null || tightenError === undefined) return;
+    this.report(tightenError, `permissions still world-accessible ${filePath}`);
   }
 
   private report(err: unknown, context: string): void {
