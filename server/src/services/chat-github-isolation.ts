@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { chatGitHubReviewCandidates, heartbeatRuns, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import { hasGitHubPrimaryBlinding } from "./chat-github-primary-blinding-state.js";
@@ -13,16 +13,21 @@ export async function githubCandidateRunBoundary(db: Db, session: {
   companyId: string; agentId: string | null; runId: string | null; issueId?: string | null;
 }) {
   if (!session.agentId || !session.runId) return null;
-  const [run] = await db.select().from(heartbeatRuns).where(and(
+  const [run] = await db.select({
+    nativeIssueId: heartbeatRuns.nativeIssueId,
+    issueId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'issueId'`,
+    taskId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'taskId'`,
+    wakeCommentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentId'`,
+  }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
     eq(heartbeatRuns.agentId, session.agentId),
   ));
   if (!run) return null;
-  const issueId = run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
-  const commentId = run.contextSnapshot?.wakeCommentId;
+  const issueId = run.nativeIssueId ?? run.issueId ?? run.taskId;
+  const commentId = run.wakeCommentId;
   // Check every persisted alias for denial, as the outbound fence does. A
   // conflicting native task must not hide a candidate contextSnapshot.taskId.
-  const issueIds = [...new Set([run.nativeIssueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
+  const issueIds = [...new Set([run.nativeIssueId, run.issueId, run.taskId]
     .filter((id): id is string => typeof id === "string"))];
   // An empty OR is elided by Drizzle, so reject it before querying.
   if (!issueIds.length && typeof commentId !== "string") return null;

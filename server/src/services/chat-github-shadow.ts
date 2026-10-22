@@ -303,9 +303,15 @@ export async function githubRunCapability(db: Store, session: {
   companyId: string; agentId: string | null; issueId: string | null; runId: string | null;
 }) {
   if (!session.agentId || !session.issueId || !session.runId) return null;
-  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, session.companyId), eq(heartbeatRuns.agentId, session.agentId), eq(heartbeatRuns.id, session.runId)));
-  if (!run || (run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId) !== session.issueId) return null;
-  const commentId = run.contextSnapshot?.wakeCommentId;
+  const [run] = await db.select({
+    nativeIssueId: heartbeatRuns.nativeIssueId,
+    issueId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'issueId'`,
+    taskId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'taskId'`,
+    wakeCommentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentId'`,
+    primaryReviewInput: sql<PrimaryReviewInput | null>`${heartbeatRuns.contextSnapshot}->'githubPrimaryReviewInput'`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, session.companyId), eq(heartbeatRuns.agentId, session.agentId), eq(heartbeatRuns.id, session.runId)));
+  if (!run || (run.nativeIssueId ?? run.issueId ?? run.taskId) !== session.issueId) return null;
+  const commentId = run.wakeCommentId;
   if (typeof commentId !== "string") return null;
   const [source] = await db.select({ endpoint: chatEndpoints, delivery: chatDeliveries, conversation: chatConversations, issue: issues })
     .from(chatMessageLinks).innerJoin(chatDeliveries, eq(chatDeliveries.id, chatMessageLinks.deliveryId))
@@ -319,7 +325,7 @@ export async function githubRunCapability(db: Store, session: {
     // Run start is not an input read. The first review-tool read seals a sticky
     // source receipt; a timed-out/live reader must never switch mid-turn.
     const seed = source.delivery.normalizedEvent.githubPairingSeed as Seed | undefined;
-    const receipt = run.contextSnapshot?.githubPrimaryReviewInput as PrimaryReviewInput | undefined;
+    const receipt = run.primaryReviewInput;
     const sealedBeforeFirstLiveRead = !receipt || (receipt.source === "snapshot"
       && receipt.deliveryId === source.delivery.id && receipt.enrollmentId === seed?.id);
     const enrollment = sealedBeforeFirstLiveRead && seed?.envelope.event && seed.envelope.snapshot
