@@ -68033,7 +68033,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         db
           .select({ body: issueComments.body })
           .from(issueComments)
-          .where(eq(issueComments.issueId, conversation!.issueId)),
+          .where(eq(issueComments.issueId, conversation!.issueId))
+          // Creation order is the assertion: without ORDER BY the rows come
+          // back in plan-dependent order and flip under CI load.
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id)),
       ).resolves.toEqual([
         { body: "@maya original mixed-case request" },
         {
