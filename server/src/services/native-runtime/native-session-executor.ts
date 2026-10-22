@@ -11165,6 +11165,10 @@ export async function createRunnerdBackend(input: {
   runnerRemoteBinaryPath?: string | null;
   runnerRemoteCodexPath?: string | null;
   runnerRemoteCodexNpmSpec?: string | null;
+  /** Local-only explicit Codex executable for hermetic fixtures; never agent-controlled. Refused on remote targets. */
+  localCodexCommand?: string;
+  /** Args for localCodexCommand; forwarded only with the explicit command. */
+  localCodexArgs?: string[];
   runnerRemoteProviderPackPath?: string | null;
   trace?: NativeRunTrace;
   toolTrace?: NativeToolTrace;
@@ -11600,6 +11604,13 @@ async function createRunnerdBackendWithinSessionClaim(
           )
         : posix.join(remoteRuntimeRoot, "bin", "codex")
       : null;
+  // Hermetic-fixture override for the local Codex executable. Remote runs
+  // always use the staged remote binary above; an explicit local command on a
+  // remote target is a caller bug, never agent-controlled input.
+  const localCodexCommand = input.localCodexCommand?.trim() || null;
+  if (localCodexCommand && remoteRuntimeRoot) {
+    throw new Error("local_codex_command_remote_unsupported");
+  }
   const remoteSessionDigest = createHash("sha256")
     .update(nativeSessionKey(input.execution))
     .digest("hex");
@@ -13310,7 +13321,8 @@ async function createRunnerdBackendWithinSessionClaim(
         prepareExternalRunnerState,
         archiveExternalRunnerState,
         runnerBinary: controllerRunnerBinary,
-        codexCommand: remoteCodexBinary ?? undefined,
+        codexCommand: remoteCodexBinary ?? localCodexCommand ?? undefined,
+        codexArgs: localCodexCommand ? input.localCodexArgs : undefined,
         sourceCodexHome: remoteTarget
           ? resolveSourceCodexHome(resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment))
           : undefined,
