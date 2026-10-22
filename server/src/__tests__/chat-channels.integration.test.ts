@@ -9855,8 +9855,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("primary run start (working milestone) before capture still seals, and the primary's first read uses the snapshot", async () => {
       // Production order on tog.17 (e.g. nntunev2#408): mention -> durable wake ->
       // run running -> "The assistant is working…" milestone -> capture commits.
-      // The milestone follows run status only; the first review-tool read came
-      // 3.3-133 s after capture in all 16 production pairs voided this way.
+      // Upgraded GitHub endpoints no longer emit that automatic milestone
+      // (tool-authored replies only); the first review-tool read came 3.3-133 s
+      // after capture in all 16 production pairs voided this way.
       const { chatGitHubReviewEnrollments, chatGitHubReviewCandidates } = await import("@paperclipai/db");
       const { enqueueChatRunMilestones } = await import("../services/chat-run-publications.js");
       await deferPairCaptureToSweep();
@@ -9866,16 +9867,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const [delivery] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
       expect(delivery!.normalizedEvent.githubPairingPending).toBeDefined();
       expect(delivery!.normalizedEvent.githubPairingSeed).toBeUndefined();
-      // The primary run is already running (no review tool called yet), and the
-      // production milestone producer publishes its lifecycle milestone.
+      // The primary run is already running (no review tool called yet). The
+      // milestone producer stages no automatic runner-prose milestone for an
+      // upgraded GitHub endpoint; the capture seal below must hold with no
+      // lifecycle row present.
       const session = await shadowTestSession(f, primary);
       // Inbound chat wakes carry contextSource `chat:<provider>` (queueIssueAssignmentWakeup).
       await db.update(heartbeatRuns).set({ startedAt: new Date(), contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || '{"source":"chat:github"}'::jsonb` })
         .where(eq(heartbeatRuns.id, session.runId));
       await enqueueChatRunMilestones(db, { since: new Date(Date.now() - 60_000) });
       const milestones = await db.select().from(chatPublications).where(eq(chatPublications.conversationId, delivery!.conversationId!));
-      expect(milestones.map(p => [p.idempotencyKey, p.payload.progressState])).toContainEqual(
-        [`run:${session.runId}:working:${f.endpoint.id}`, "working"]);
+      expect(milestones.filter(p => p.idempotencyKey.startsWith(`run:${session.runId}:`))).toEqual([]);
       installShadowRecorder(f, head);
       await f.service.processPendingDeliveries();
       const [enrollment] = await db.select().from(chatGitHubReviewEnrollments).where(eq(chatGitHubReviewEnrollments.endpointId, f.endpoint.id));
@@ -10348,28 +10350,33 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const f = await reviewBotFixture();
       const endpointRuntime = f.runtime.endpoints.get(f.endpoint.id);
       if (!endpointRuntime) throw new Error("Expected GitHub runtime");
-      endpointRuntime.reactionErrors.push(
-        Object.assign(new Error("GitHub reaction rate limited"), {
-          status: 429,
-          retryAfterMs: 1,
-        }),
-      );
       const conversation = await deliverShadowTestMention(
         f,
         "910003",
         "@maya receipt staged before shadow mode",
       );
       expect(conversation).toBeDefined();
-      const [staged] = await shadowTestActions(f.endpoint.id, "receipt_reaction");
+      // Upstream tool-authored replies acknowledge through the editable
+      // response comment: GitHub mentions stage no new eyes receipts.
+      expect(await shadowTestActions(f.endpoint.id, "receipt_reaction")).toHaveLength(0);
+      expect(endpointRuntime.reactions).toEqual([]);
+      // Model a pre-upgrade staged receipt awaiting retry (same legacy shape
+      // as deliverLegacyGitHubReceipt): shadow mode must still cancel it.
+      const [delivery] = await db.select().from(chatDeliveries).where(and(
+        eq(chatDeliveries.endpointId, f.endpoint.id),
+        eq(chatDeliveries.providerEventId, `${conversation!.externalThreadId}:910003`),
+      ));
+      if (!delivery) throw new Error("Expected admitted shadow mention delivery");
+      const fence = delivery.normalizedEvent.runtimeContext as { generation: number; credentialFingerprint: string };
+      const [staged] = await db.insert(chatActions).values({ companyId: delivery.companyId,
+        endpointId: f.endpoint.id, deliveryId: delivery.id, kind: "receipt_reaction",
+        providerActionId: `receipt_reaction:${delivery.id}`, status: "failed",
+        result: { retryable: true, retryAt: new Date(0).toISOString() },
+        payload: { version: 1, operation: "add", threadId: conversation!.externalThreadId, messageId: "910003",
+          reaction: "eyes", runtimeGeneration: fence.generation, credentialFingerprint: fence.credentialFingerprint },
+      }).returning();
       expect(staged).toBeDefined();
       await saveShadowMode(f, true);
-      await db
-        .update(chatActions)
-        .set({
-          result: { ...staged.result, retryAt: new Date(0).toISOString() },
-          updatedAt: new Date(),
-        })
-        .where(eq(chatActions.id, staged.id));
       await f.service.processPendingReceiptReactions(1, staged.id);
       const [settled] = await db
         .select()
@@ -10386,12 +10393,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       if (!endpointRuntime) throw new Error("Expected GitHub runtime");
       const head = "b".repeat(40);
       const admitted = await admitShadowTestPullRequest(f, head);
-      endpointRuntime.reactionErrors.push(
-        Object.assign(new Error("GitHub reaction rate limited"), {
-          status: 429,
-          retryAfterMs: 1,
-        }),
-      );
       await deliverShadowTestMention(
         f,
         "910004",
@@ -10405,7 +10406,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           eq(chatConversations.externalThreadId, "github:paperclipai/paperclip:97"),
         ));
       expect(conversation).toBeDefined();
-      const [staged] = await shadowTestActions(f.endpoint.id, "receipt_reaction");
+      // Upstream tool-authored replies acknowledge through the editable
+      // response comment: GitHub mentions stage no new eyes receipts.
+      expect(await shadowTestActions(f.endpoint.id, "receipt_reaction")).toHaveLength(0);
+      expect(endpointRuntime.reactions).toEqual([]);
+      // Model a pre-upgrade staged receipt awaiting retry (same legacy shape
+      // as deliverLegacyGitHubReceipt): the pinned label must still cancel it.
+      const [delivery] = await db.select().from(chatDeliveries).where(and(
+        eq(chatDeliveries.endpointId, f.endpoint.id),
+        eq(chatDeliveries.providerEventId, `${conversation!.externalThreadId}:910004`),
+      ));
+      if (!delivery) throw new Error("Expected admitted shadow mention delivery");
+      const fence = delivery.normalizedEvent.runtimeContext as { generation: number; credentialFingerprint: string };
+      const [staged] = await db.insert(chatActions).values({ companyId: delivery.companyId,
+        endpointId: f.endpoint.id, deliveryId: delivery.id, kind: "receipt_reaction",
+        providerActionId: `receipt_reaction:${delivery.id}`, status: "failed",
+        result: { retryable: true, retryAt: new Date(0).toISOString() },
+        payload: { version: 1, operation: "add", threadId: conversation!.externalThreadId, messageId: "910004",
+          reaction: "eyes", runtimeGeneration: fence.generation, credentialFingerprint: fence.credentialFingerprint },
+      }).returning();
       expect(staged).toBeDefined();
       // Admission pins the label when shadow is on; pin a clone of the
       // admitted review row onto the mention's task directly to model a
@@ -10421,13 +10440,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         policySnapshot: admitted.policySnapshot, event: admitted.event,
         state: "queued", shadowLabel: "meta-shadow",
       });
-      await db
-        .update(chatActions)
-        .set({
-          result: { ...staged.result, retryAt: new Date(0).toISOString() },
-          updatedAt: new Date(),
-        })
-        .where(eq(chatActions.id, staged.id));
+      // The legacy receipt was inserted already due; the pinned label must
+      // cancel it before any provider write.
       await f.service.processPendingReceiptReactions(1, staged.id);
       const [settled] = await db
         .select()
@@ -10572,10 +10586,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("cancels an assessment publication staged before shadow mode was enabled without any provider call", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
-      let failMarkerRead = true;
+      // Fail every matching listing while armed (not one-shot): settling the
+      // admission delivery kicks tryAcknowledge, which lists this same route
+      // and swallows errors into a retryable ack. That ack failure is harmless
+      // here; the publication's own marker-read failure is what must stage
+      // the retryable publication below. Disarmed right after submit so the
+      // shadow retry exercises the real authorization fence, not the injector.
+      let failMarkerRead = false;
       const recorder = installShadowRecorder(f, head, async (url, method) => {
         if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
-          failMarkerRead = false;
           return new Response("temporary", { status: 500 });
         }
         return undefined;
@@ -10586,12 +10605,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await service.execute(session, "read_pull_request", { section: "metadata" });
       await service.execute(session, "begin_review", { reviewedCommit: head });
       // The marker-read failure leaves the staged publication retryable.
+      failMarkerRead = true;
       expect(await service.execute(
         session,
         "submit_review",
         shadowTestAssessment(head),
         "prestaged-publication",
       )).toMatchObject({ status: "failed" });
+      failMarkerRead = false;
+      // The failure landed before any provider write, so the retry is safe.
+      expect(recorder.mutations).toHaveLength(0);
       const [staged] = await shadowTestActions(f.endpoint.id, "github_review_publication");
       expect(staged?.status).toBe("failed");
       await saveShadowMode(f, true);
@@ -10637,12 +10660,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     it("cancels an assessment dispatch when shadow mode is enabled mid-flight", async () => {
       const f = await reviewBotFixture();
       const head = "b".repeat(40);
-      let failMarkerRead = true;
+      // Fail every matching listing while armed (not one-shot): settling the
+      // admission delivery kicks tryAcknowledge, which lists this same route
+      // and swallows errors into a retryable ack. That ack failure is harmless
+      // here; the publication's own marker-read failure is what must stage
+      // the retryable publication below. Disarmed right after submit so the
+      // shadow retry exercises the real authorization fence, not the injector.
+      let failMarkerRead = false;
       let armed = false;
       let flipped = false;
       const recorder = installShadowRecorder(f, head, async (url, method) => {
         if (failMarkerRead && method === "GET" && url.includes("/issues/81/comments?")) {
-          failMarkerRead = false;
           return new Response("temporary", { status: 500 });
         }
         if (armed && !flipped && method === "POST" && url.includes("/access_tokens")) {
@@ -10656,12 +10684,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const service = githubChatReviewService(db, f.providerFetch);
       await service.execute(session, "read_pull_request", { section: "metadata" });
       await service.execute(session, "begin_review", { reviewedCommit: head });
+      // The marker-read failure leaves the staged publication retryable.
+      failMarkerRead = true;
       expect(await service.execute(
         session,
         "submit_review",
         shadowTestAssessment(head),
         "midflight-publication",
       )).toMatchObject({ status: "failed" });
+      failMarkerRead = false;
+      // The failure landed before any provider write, so the retry is safe.
+      expect(recorder.mutations).toHaveLength(0);
       const [staged] = await shadowTestActions(f.endpoint.id, "github_review_publication");
       expect(staged?.status).toBe("failed");
       await db
@@ -73903,6 +73936,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       typeof committedChatResponseRecoveryFixture
     >[3],
     summary?: Parameters<typeof committedChatResponseRecoveryFixture>[4],
+    options?: { legacyUnupgradedGitHub?: boolean },
   ) {
     const egress = vi
       .spyOn(attachmentEgress, "guardedRemoteHttpFetch")
@@ -73917,6 +73951,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         beforeAcceptance,
         summary,
       );
+      if (options?.legacyUnupgradedGitHub) {
+        // The omission-final DELIVERY contract (exact text, no Board link,
+        // privacy scrubbing, cancellation gates) is upgrade-independent: the
+        // same postSafePublication code serves legacy endpoints and upgraded
+        // explicit-operator sends. Qualify these delivery tests as legacy so
+        // runner-prose repair can stage; the upgraded fence itself is covered
+        // by the dedicated upgraded-path test (repair refuses, runner prose
+        // stays local, nothing posts).
+        await db.delete(chatGitHubConfigurations).where(and(
+          eq(chatGitHubConfigurations.companyId, context.fixture.companyId),
+          eq(chatGitHubConfigurations.endpointId, context.endpoint.id),
+        ));
+      }
       return {
         ...context,
         egress,
@@ -73934,31 +73981,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   }
 
-  it("posts the GitHub native omission final without a Board link", async () => {
+  it("withholds the GitHub runner-prose omission final on upgraded endpoints", async () => {
     const context = await githubOmissionFixture();
     try {
+      // Upgraded GitHub replies are tool-authored: runner-selected prose stays
+      // local even though the committed answer exists and no tool reply went out.
       await expect(context.repair()).resolves.toBe(false);
-      await context.service.processPendingPublications(100);
-      const expected = context.result.summary;
-      expect(context.providerRuntime.posts.map((post) => post.text)).toEqual([
-        expected,
-      ]);
-      const [publication] = await db
-        .select()
-        .from(chatPublications)
-        .where(
-          and(
-            eq(chatPublications.endpointId, context.endpoint.id),
-            isNotNull(chatPublications.commentId),
+      // Explicit no-runner-publication coverage: repair materialized no
+      // comment and staged no publication, so the sweep posts nothing and
+      // leaks nothing (in particular, no Board link and no PRIVATE narration).
+      await expect(
+        db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.createdByRunId, context.runId)),
+      ).resolves.toEqual([]);
+      await expect(
+        db
+          .select({ id: chatPublications.id })
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
           ),
-        );
-      expect(publication).toMatchObject({
-        state: "published",
-        attempts: 1,
-        payload: { text: expected },
-      });
+      ).resolves.toEqual([]);
       await context.service.processPendingPublications(100);
-      expect(context.providerRuntime.posts).toHaveLength(1);
+      expect(context.providerRuntime.posts).toEqual([]);
+      expect(context.providerRuntime.edits).toEqual([]);
+      await context.service.processPendingPublications(100);
+      expect(context.providerRuntime.posts).toEqual([]);
       await expect(
         db
           .select({ id: issueAttachments.id })
@@ -73979,7 +74032,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   ])(
     "never adds Board navigation to GitHub omission finals for Board origin %s",
     async (base) => {
-      const context = await githubOmissionFixture();
+      // Legacy-qualified delivery coverage (see githubOmissionFixture): the
+      // no-Board-link/privacy contract is upgrade-independent.
+      const context = await githubOmissionFixture(true, undefined, undefined, {
+        legacyUnupgradedGitHub: true,
+      });
       let restarted: ReturnType<typeof createService> | undefined;
       try {
         await expect(context.repair()).resolves.toBe(true);
@@ -74023,8 +74080,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   ] as const)(
     "does not add a Board link to GitHub omission finals from $0",
     async (mode) => {
+      // Legacy-qualified delivery coverage (see githubOmissionFixture): the
+      // no-Board-link/cancellation contract is upgrade-independent.
       const context = await githubOmissionFixture(
         !["no_omission", "forged_hint"].includes(mode),
+        undefined,
+        undefined,
+        { legacyUnupgradedGitHub: true },
       );
       try {
         await expect(context.repair()).resolves.toBe(true);
