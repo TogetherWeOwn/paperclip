@@ -443,17 +443,47 @@ export async function githubCandidateMayWake(db: Store, candidate: Candidate): P
     && config?.configuration.shadowRoutes?.some(r => r.enabled && r.agentId === candidate.agentId && r.label === candidate.shadowLabel) === true;
 }
 
-interface PairCapture { id: string; startedAt: string; attempts: number; lastError?: string }
+export interface PairCapture { id: string; startedAt: string; attempts: number; lastError?: string }
 const MAX_PAIR_CAPTURE_ATTEMPTS = 3;
 
-async function failGitHubPairCapture(db: Store, deliveryId: string, capture: PairCapture, reason: string) {
+/** Coarse, log-safe cause for a thrown pair-capture failure. The PGSTATE code
+ * distinguishes a concurrency abort (40P01 deadlock, 40001 serialization)
+ * from a constraint bug at a glance; row-bearing `detail` is deliberately
+ * excluded. */
+export function describePairCaptureError(error: unknown): { error: string; errorCode?: string } {
+  const described: { error: string; errorCode?: string } = {
+    error: error instanceof Error ? error.message : String(error),
+  };
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && current !== null && typeof current === "object"; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && code) { described.errorCode = code; break; }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return described;
+}
+
+/** Exported for the claim-release regression test; production callers use the capture flow above. */
+export async function failGitHubPairCapture(db: Store, deliveryId: string, capture: PairCapture, reason: string,
+  opts?: { releaseClaim?: boolean }) {
   // Preserve the selected arms for ALL_ASSIGNED/missing-pair accounting even
   // when no enrollment could be projected. Fence late workers by capture id.
-  const normalizedEvent = capture.attempts >= MAX_PAIR_CAPTURE_ATTEMPTS
+  const terminal = capture.attempts >= MAX_PAIR_CAPTURE_ATTEMPTS;
+  // A known-dead kick holds no lease worth defending: backdate its claim past
+  // the stale window so the recovery sweep reclaims immediately instead of
+  // waiting out the full window. Attempts and lastError are preserved, so the
+  // terminal denominator after 3 attempts is unchanged; the id fence below
+  // keeps any live worker's claim untouched.
+  const releasedAt = opts?.releaseClaim === true && !terminal
+    ? new Date(Date.now() - githubShadowCaptureClaimStaleMs() - 1_000).toISOString()
+    : null;
+  const normalizedEvent = terminal
     ? sql`(${chatDeliveries.normalizedEvent} - 'githubPairingPending' - 'githubPairingCapture') ||
         jsonb_build_object('githubPairingFailure', (${chatDeliveries.normalizedEvent}->'githubPairingPending') ||
           ${JSON.stringify({ reason, attempts: capture.attempts })}::jsonb)`
-    : sql`jsonb_set(${chatDeliveries.normalizedEvent}, '{githubPairingCapture,lastError}', to_jsonb(${reason}::text))`;
+    : releasedAt
+      ? sql`jsonb_set(jsonb_set(${chatDeliveries.normalizedEvent}, '{githubPairingCapture,lastError}', to_jsonb(${reason}::text)), '{githubPairingCapture,startedAt}', to_jsonb(${releasedAt}::text))`
+      : sql`jsonb_set(${chatDeliveries.normalizedEvent}, '{githubPairingCapture,lastError}', to_jsonb(${reason}::text))`;
   await db.update(chatDeliveries).set({ normalizedEvent }).where(and(eq(chatDeliveries.id, deliveryId),
     sql`${chatDeliveries.normalizedEvent} ? 'githubPairingPending'`,
     sql`not (${chatDeliveries.normalizedEvent} ? 'githubPairingSeed')`,
@@ -522,6 +552,7 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
     let outcome = "pair_admission_failed";
     const claimedAt = Date.now();
     let lockedMs: number | null = null;
+    let captureError: { error: string; errorCode?: string } | null = null;
     try {
       const claim = await db.transaction(async tx => {
         const [delivery] = await tx.select().from(chatDeliveries).where(eq(chatDeliveries.id, row.id)).for("update", { skipLocked: true });
@@ -598,14 +629,26 @@ async function capturePendingGitHubPairs(db: Db, limit: number, fetchImpl: typeo
           request: source.comment.body, policy, revision: pending.revision, authority });
         outcome = "snapshot" in sealed && sealed.snapshot ? "sealed" : sealed.snapshotFailure ?? "admission_snapshot_unavailable";
       }).finally(() => { if (lockStartedAt !== undefined) lockedMs = Date.now() - lockStartedAt; }));
-    } catch {
+    } catch (error) {
       outcome = "pair_admission_failed";
-      if (capture) await failGitHubPairCapture(db, row.id, capture, outcome).catch(() => undefined);
+      // Everything below the claim that can fail expectedly (prepare, disable/
+      // late checks, supersede) is handled above; a throw here is the admission
+      // transaction itself, typically a concurrency abort under lock contention.
+      // Log the cause: without it production kick failures are undiagnosable.
+      // Kicks (admission/first_read) release their claim so the sweep retries
+      // immediately; sweep failures keep the stale window so a persistent
+      // outage still backs off across attempts.
+      captureError = describePairCaptureError(error);
+      logger.warn({ deliveryId: row.id, trigger, outcome, attempt: capture?.attempts ?? null, ...captureError },
+        "GitHub paired snapshot capture attempt failed");
+      if (capture) await failGitHubPairCapture(db, row.id, capture, outcome, {
+        releaseClaim: trigger !== "sweep",
+      }).catch(() => undefined);
     } finally {
       // One line per claimed attempt so admission->seal latency is observable.
       if (capture) logger.info({ deliveryId: row.id, trigger, outcome, attempt: capture.attempts,
         msSinceAdmission: Number.isFinite(admittedAt) ? claimedAt - admittedAt : null,
-        msSpent: Date.now() - claimedAt, lockedMs }, "GitHub paired snapshot capture attempt");
+        msSpent: Date.now() - claimedAt, lockedMs, ...captureError }, "GitHub paired snapshot capture attempt");
     }
   }
 }
