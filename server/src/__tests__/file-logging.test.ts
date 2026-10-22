@@ -244,6 +244,33 @@ describe("initFileLogging", () => {
     expect(matched).toContain("***REDACTED***");
   });
 
+  it.each(["stdout", "stderr"] as const)(
+    "redacts credentials in a >64 KiB newline-less %s tee write before truncation",
+    (stream) => {
+      const dir = tempDir();
+      initFileLogging({ ...parseFileLoggingConfig({}), dir });
+      const marker = `tee-redact-truncated-${stream}`;
+      const fakes = [
+        "ghs_faketestvalue000000000001",
+        "github_pat_faketestvalue00000002",
+        "faketoken-json-test-value-0001",
+      ];
+      const prefix = `${marker} ${fakes[0]} ${fakes[1]} {"token":"${fakes[2]}"} `;
+      // Cross the limit without a newline so only the truncation path can write.
+      const maxLineBytes = 64 * 1024;
+      const crossingToken = "github_pat_fakecrossingtestvalue";
+      const line = `${prefix}${"x".repeat(maxLineBytes - prefix.length - 17)} ${crossingToken}`;
+      process[stream].write(line);
+      const content = readFileSync(path.join(dir, "server.log"), "utf8");
+      expect(content).toContain(`${stream} ${marker}`);
+      expect(content).toContain("…[truncated]\n");
+      expect(content).toContain("***REDACTED***");
+      for (const fake of fakes) expect(content).not.toContain(fake);
+      // A token straddling the cut must be redacted before slicing, not after.
+      expect(content).not.toContain("github_pat_");
+    },
+  );
+
   it("redacts a token JSON field in tee lines before the retained write", () => {
     const dir = tempDir();
     initFileLogging({ ...parseFileLoggingConfig({}), dir });

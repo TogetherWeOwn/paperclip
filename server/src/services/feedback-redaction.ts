@@ -39,7 +39,7 @@ const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   },
   {
     kind: "github_token",
-    regex: /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
+    regex: /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g,
     replacement: "[REDACTED_GITHUB_TOKEN]",
   },
   {
