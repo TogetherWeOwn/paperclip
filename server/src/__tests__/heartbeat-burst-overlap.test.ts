@@ -167,8 +167,22 @@ describeEmbeddedPostgres("heartbeat burst overlap (TOG-28460)", () => {
     await db.delete(issueRelations);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
+    // TOG-35997 (red CI 2026-10-22): trailing run-completion activity/event
+    // writes can land after the first activityLog sweep above, tripping the
+    // activity_log -> heartbeat_runs FK on the runs delete. Re-sweep and
+    // retry the run tail; trailing writes are finite once runs have drained,
+    // so a retry that re-sweeps first always converges.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.delete(activityLog);
+        await db.delete(heartbeatRunEvents);
+        await db.delete(heartbeatRuns);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
