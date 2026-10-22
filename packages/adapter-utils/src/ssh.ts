@@ -28,7 +28,7 @@ import {
   type SshTarFlavor,
 } from "./ssh-workspace-excludes.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { mergeChangedFilesWithBaseline, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -665,6 +665,55 @@ export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedP
   }
   return {
     changedPaths: [...changed].sort(),
+    deletedPaths: [...deleted].sort(),
+  };
+}
+
+/**
+ * The remote shell script the changed-files sync-back runs to list what the
+ * run left dirty: `git status --porcelain=v1 -z -uall` over the whole tree,
+ * parsed by {@link parseSshPorcelainStatusV1Z}. Status paths are
+ * repo-root-relative, so the script refuses to run anywhere but a toplevel
+ * checkout first: an empty `--show-prefix` proves `remoteDir` is the root,
+ * and any other outcome (a subdir, a non-repo, a broken git) exits nonzero
+ * so the caller falls back to the full copy instead of mis-resolving every
+ * path against the wrong root.
+ */
+export function buildSshRemoteStatusScript(remoteDir: string): string {
+  const gitDir = `git -C ${shellQuote(remoteDir)}`;
+  return (
+    `prefix=$(${gitDir} rev-parse --show-prefix) && test -z "$prefix" && ` +
+    `${gitDir} status --porcelain=v1 -z -uall --`
+  );
+}
+
+/**
+ * Resolve the final sync-back transfer and delete sets from the remote
+ * worktree status plus the paths the run's new commits changed (a local
+ * `git diff` of the merge-base against the imported head, which shares the
+ * transfer/delete shape). The worktree is authoritative where the two
+ * disagree: a committed delete the run then recreated transfers (the remote
+ * has the file), and a committed add the run then deleted is a delete, never
+ * a transfer — asking tar for a missing member fails the whole download, so
+ * a path the worktree deleted must never reach the transfer list. Both sets
+ * are sorted and deduped so the transfer command is deterministic.
+ */
+export function resolveSshSyncBackTransferSets(input: {
+  status: SshPorcelainChangedPaths;
+  committed: SshPorcelainChangedPaths;
+}): { transferPaths: string[]; deletedPaths: string[] } {
+  const statusChanged = new Set(input.status.changedPaths);
+  const statusDeleted = new Set(input.status.deletedPaths);
+  const deleted = new Set<string>(input.status.deletedPaths);
+  for (const entry of input.committed.deletedPaths) {
+    if (!statusChanged.has(entry)) deleted.add(entry);
+  }
+  const transfer = new Set<string>();
+  for (const entry of [...input.status.changedPaths, ...input.committed.changedPaths]) {
+    if (!deleted.has(entry)) transfer.add(entry);
+  }
+  return {
+    transferPaths: [...transfer].sort(),
     deletedPaths: [...deleted].sort(),
   };
 }
@@ -2230,7 +2279,7 @@ interface SshSeedGitSnapshot {
   ignoredPaths: string[];
 }
 
-function isSafeSeedRelativePath(value: string): boolean {
+function isSafeGitRelativePath(value: string): boolean {
   return Boolean(value) && !value.includes("\0") && !path.posix.isAbsolute(value) && !path.win32.isAbsolute(value) &&
     !value.split(/[\\/]/).some((part) => part === ".." || part === ".");
 }
@@ -2254,7 +2303,7 @@ function parseNulPathList(stdout: string): string[] {
   // No trimming: `git -z` emits byte-exact names, and a filename may legally
   // start or end with whitespace. Only the trailing empty entry is dropped
   // (a filename cannot be empty), which filter(Boolean) already does.
-  return stdout.split("\0").filter(Boolean).filter(isSafeSeedRelativePath);
+  return stdout.split("\0").filter(Boolean).filter(isSafeGitRelativePath);
 }
 
 /**
@@ -2386,7 +2435,7 @@ async function stageSshOverlayPaths(
 ): Promise<number> {
   let count = 0;
   for (const relative of overlay) {
-    if (!isSafeSeedRelativePath(relative)) continue;
+    if (!isSafeGitRelativePath(relative)) continue;
     const source = path.join(sourceRoot, relative);
     const target = path.join(targetDir, relative);
     const stats = await fs.lstat(source).catch(() => null);
@@ -2631,6 +2680,168 @@ export async function prepareWorkspaceForSshExecution(input: {
   return { gitBacked: false, seedMode: "full-copy" };
 }
 
+/**
+ * List the paths the run's new commits changed, as seen from the local
+ * checkout that already fetched them: `git diff` of the merge-base against
+ * the imported head, split into transfer and delete sets. The merge-base
+ * (not the current local head) is the diff root so a concurrent local
+ * commit can never shrink the transfer set below what the full copy would
+ * apply. Throws when the delta is unknowable — a non-toplevel workspace, an
+ * unborn local head, or histories with no common ancestor — and the caller
+ * falls back to the full copy.
+ */
+async function readSshSyncBackCommittedPaths(
+  localDir: string,
+  importedHead: string,
+): Promise<SshPorcelainChangedPaths> {
+  const prefix = await runLocalGit(localDir, ["rev-parse", "--show-prefix"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  });
+  if (prefix.stdout.trim() !== "") {
+    throw new Error(`SSH changed-files sync-back requires a toplevel local checkout: ${localDir}`);
+  }
+  const head = await runLocalGit(localDir, ["rev-parse", "HEAD"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  });
+  const localHead = head.stdout.trim();
+  if (!localHead) {
+    throw new Error("SSH changed-files sync-back requires a local head commit");
+  }
+  const mergeBase = await runLocalGit(localDir, ["merge-base", localHead, importedHead], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  });
+  const base = mergeBase.stdout.trim();
+  if (!base) {
+    throw new Error("SSH changed-files sync-back found no common ancestor for the committed delta");
+  }
+  const [transferDiff, deleteDiff] = await Promise.all([
+    runLocalGit(
+      localDir,
+      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMTUXB", base, importedHead, "--"],
+      { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+    ),
+    runLocalGit(
+      localDir,
+      ["diff", "--no-renames", "--name-only", "-z", "--diff-filter=D", base, importedHead, "--"],
+      { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+    ),
+  ]);
+  return {
+    changedPaths: parseNulPathList(transferDiff.stdout),
+    deletedPaths: parseNulPathList(deleteDiff.stdout),
+  };
+}
+
+/**
+ * List what the run left dirty in the remote worktree, parsed by
+ * {@link parseSshPorcelainStatusV1Z}. The status script exits nonzero
+ * anywhere but a toplevel checkout, and `runSshCommand` surfaces that as a
+ * rejection, so every unusable remote falls back to the full copy.
+ */
+async function readSshRemoteSyncBackStatus(
+  spec: SshRemoteExecutionSpec,
+  remoteDir: string,
+): Promise<SshPorcelainChangedPaths> {
+  const result = await runSshCommand(spec, buildSshRemoteStatusScript(remoteDir), {
+    timeoutMs: 60_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return parseSshPorcelainStatusV1Z(result.stdout);
+}
+
+/**
+ * Attempt the changed-files sync-back into `stagingDir`: transfer exactly
+ * the remote status paths plus the run's committed paths, then merge the
+ * partial tree over the workspace with explicit deletes. Returns true when
+ * the incremental restore completed, false when the caller must run the
+ * full copy instead (fast path disabled, delta unknowable, path list over
+ * the remote command budget, or a listed path missing remotely).
+ *
+ * The fallback window ends at the merge: a failed download leaves nothing
+ * the full copy cannot heal (staging is emptied before returning false, so
+ * the full extract never mixes with a partial tree), but a failed merge
+ * has no remedy in the full path — both merges share the target, the
+ * baseline, and the history integration — so merge errors propagate. A
+ * size-cap refusal also propagates instead of falling back: the delta is a
+ * subset of the full tree under the same excludes, so the full copy would
+ * refuse too, after burning a second transfer.
+ */
+async function tryRestoreChangedFilesFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+  baseline: DirectorySnapshot;
+  importedHead: string;
+  stagingDir: string;
+  exclude: string[];
+  beforeApply?: () => Promise<void>;
+  onProgress?: RuntimeProgressSink;
+  progressLabel?: string;
+}): Promise<boolean> {
+  if (!isSshIncrementalSyncEnabled()) return false;
+  const fallBack = async (reason: string, error: unknown): Promise<false> => {
+    console.warn(
+      { reason, error: error instanceof Error ? error.message : String(error) },
+      "[paperclip] SSH changed-files sync-back unavailable; falling back to full copy",
+    );
+    // Emptied, not abandoned: the caller's full extract lands in this same
+    // staging directory, and a partial incremental tree mixed into it would
+    // merge phantom deletes. If the clear itself fails the error propagates
+    // instead of risking that mix.
+    await clearLocalDirectory(input.stagingDir);
+    return false;
+  };
+  // Local first: a workspace that cannot even name its committed delta must
+  // not spend a remote round trip before falling back.
+  let committed: SshPorcelainChangedPaths;
+  try {
+    committed = await readSshSyncBackCommittedPaths(input.localDir, input.importedHead);
+  } catch (error) {
+    return fallBack("committed-diff", error);
+  }
+  let status: SshPorcelainChangedPaths;
+  try {
+    status = await readSshRemoteSyncBackStatus(input.spec, input.remoteDir);
+  } catch (error) {
+    return fallBack("remote-status", error);
+  }
+  const sets = resolveSshSyncBackTransferSets({ status, committed });
+  // Baseline-excluded paths (agent-local scratch, seed-omitted ignored
+  // files) would be skipped by the merge anyway; dropping them here keeps
+  // them off the wire and out of the command budget. The safety filter is
+  // defense in depth: git-sourced paths cannot be absolute or escape the
+  // root, but a tar member that did would write outside staging.
+  const keep = (entry: string): boolean =>
+    isSafeGitRelativePath(entry) && !shouldExcludePath(entry, input.baseline.exclude);
+  const transferPaths = sets.transferPaths.filter(keep);
+  const deletedPaths = sets.deletedPaths.filter(keep);
+  try {
+    await downloadChangedFilesFromSsh({
+      spec: input.spec,
+      remoteDir: input.remoteDir,
+      stagingDir: input.stagingDir,
+      paths: transferPaths,
+      exclude: input.exclude,
+      onProgress: input.onProgress,
+      progressLabel: input.progressLabel,
+    });
+  } catch (error) {
+    if (error instanceof SshSyncBackSizeLimitExceededError) throw error;
+    return fallBack("download", error);
+  }
+  await mergeChangedFilesWithBaseline({
+    baseline: input.baseline,
+    sourceDir: input.stagingDir,
+    deletedPaths,
+    targetDir: input.localDir,
+    beforeApply: input.beforeApply,
+  });
+  return true;
+}
+
 export async function restoreWorkspaceFromSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -2671,6 +2882,18 @@ export async function restoreWorkspaceFromSshExecution(input: {
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
       : null;
+    // The baseline exclude is merge grammar and may predate the SSH
+    // agent-local scratch; `baseline` has it merged in, and tar needs the
+    // scratch anchored to the root so this inner transfer (staging
+    // directory into staging directory) carries neither nested worktrees
+    // nor build outputs, yet keeps nested source named like them. Omitted
+    // git-ignored entries get the same root anchoring (plus glob
+    // escaping, since they are repository-controlled names) for the same
+    // reason: an unanchored `nested` would also prune tracked
+    // `src/nested/` from the sync-back.
+    const transferExclude = toSshTarExcludes(
+      baseline.exclude.map((entry) => ignored.has(entry) ? `./${escapeTarExcludeLiteral(entry)}` : entry),
+    );
     try {
       const importedHead = input.restoreGitHistory
         ? await exportGitWorkspaceFromSsh({
@@ -2682,40 +2905,48 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
-      await syncDirectoryFromSsh({
-        spec: input.spec,
-        remoteDir,
-        localDir: stagingDir,
-        // The baseline exclude is merge grammar and may predate the SSH
-        // agent-local scratch; `baseline` has it merged in, and tar needs the
-        // scratch anchored to the root so this inner transfer (staging
-        // directory into staging directory) carries neither nested worktrees
-        // nor build outputs, yet keeps nested source named like them. Omitted
-        // git-ignored entries get the same root anchoring (plus glob
-        // escaping, since they are repository-controlled names) for the same
-        // reason: an unanchored `nested` would also prune tracked
-        // `src/nested/` from the sync-back.
-        exclude: toSshTarExcludes(
-          baseline.exclude.map((entry) => ignored.has(entry) ? `./${escapeTarExcludeLiteral(entry)}` : entry),
-        ),
-        onProgress: input.onProgress,
-        progressLabel: "workspace",
-      });
-      await mergeDirectoryWithBaseline({
-        baseline,
-        sourceDir: stagingDir,
-        targetDir: input.localDir,
-        // Git history advances via integrateImportedGitHead; the working tree
-        // still comes from the remote file snapshot so dirty remote edits win.
-        beforeApply: importedHead
-          ? async () => {
-            await integrateImportedGitHead({
-              localDir: input.localDir,
-              importedHead,
-            });
-          }
-          : undefined,
-      });
+      // Git history advances via integrateImportedGitHead; the working tree
+      // still comes from the remote file snapshot so dirty remote edits win.
+      const beforeApply = importedHead
+        ? async () => {
+          await integrateImportedGitHead({
+            localDir: input.localDir,
+            importedHead,
+          });
+        }
+        : undefined;
+      // Changed-files fast path: without git history there is no committed
+      // delta to name, so non-git workspaces always take the full copy.
+      const restoredIncrementally = input.restoreGitHistory && importedHead
+        ? await tryRestoreChangedFilesFromSsh({
+          spec: input.spec,
+          remoteDir,
+          localDir: input.localDir,
+          baseline,
+          importedHead,
+          stagingDir,
+          exclude: transferExclude,
+          beforeApply,
+          onProgress: input.onProgress,
+          progressLabel: "workspace",
+        })
+        : false;
+      if (!restoredIncrementally) {
+        await syncDirectoryFromSsh({
+          spec: input.spec,
+          remoteDir,
+          localDir: stagingDir,
+          exclude: transferExclude,
+          onProgress: input.onProgress,
+          progressLabel: "workspace",
+        });
+        await mergeDirectoryWithBaseline({
+          baseline,
+          sourceDir: stagingDir,
+          targetDir: input.localDir,
+          beforeApply,
+        });
+      }
     } finally {
       if (importedRef) {
         await runLocalGit(input.localDir, ["update-ref", "-d", importedRef], {
