@@ -5,8 +5,9 @@ import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // NOTE: no static imports of the app or file-logging modules here. The test
-// stubs env first, then dynamically imports the real createApp, so the
-// module-level file-logging setup runs against a temp dir.
+// stubs env first, then dynamically imports the real createApp and
+// explicitly inits file logging (the server-boot equivalent) against a
+// temp dir: importing the app alone never initializes.
 
 describe("access log parser rejects", () => {
   let dir: string | null = null;
@@ -39,6 +40,12 @@ describe("access log parser rejects", () => {
     vi.stubEnv("PAPERCLIP_CONFIG", path.join(dir, "no-config.json"));
 
     const { createApp } = await import("../app.js");
+    // Explicit init, as server boot does: the access logger resolves its
+    // sink per request, so init-before-requests retains the reject lines.
+    const { initFileLogging, parseFileLoggingConfig } = await import(
+      "../middleware/file-logging.js"
+    );
+    initFileLogging(parseFileLoggingConfig());
     const app = await createApp({} as never, {
       uiMode: "none",
       serverPort: 3100,

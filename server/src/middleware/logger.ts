@@ -20,19 +20,21 @@ const sharedOpts = {
 const isProduction = process.env.NODE_ENV === "production";
 
 // Retained copy of every pino line under the instance logs dir (see
-// file-logging.ts). Stdout keeps working exactly as before; when the file
-// sink is unavailable the logger below is built without it.
-const fileLogStream = (() => {
-  try {
-    const sink = getFileLogging().serverSink;
-    return sink ? { write: (chunk: string) => sink.write(chunk) } : null;
-  } catch {
-    return null;
-  }
-})();
+// file-logging.ts). The sink resolves lazily at write time: server boot calls
+// initServerFileLogging() explicitly, while any other process that merely
+// imports this module (CLI subcommands, tests) stays stdout-only — importing
+// the logger must never touch the log dir, open sinks, or install the tee.
+const fileLogStream: DestinationStream = {
+  write: (chunk: string) => {
+    try {
+      getFileLogging().serverSink?.write(chunk);
+    } catch {
+      // The retained copy must never break stdout logging.
+    }
+  },
+};
 
 function withFileCopy(stream: DestinationStream): DestinationStream {
-  if (!fileLogStream) return stream;
   // Each leg gets the same serialized JSON chunk; the pretty transport
   // formats its copy for stdout while the file keeps greppable JSON.
   // Both legs pin level trace: multistream defaults a leg without a level
@@ -45,18 +47,13 @@ function withFileCopy(stream: DestinationStream): DestinationStream {
 }
 
 export const logger = isProduction
-  ? fileLogStream
-    ? pino(
-        {
-          level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
-          redact: [...HTTP_LOG_REDACT_PATHS],
-        },
-        withFileCopy(process.stdout),
-      )
-    : pino({
+  ? pino(
+      {
         level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info",
         redact: [...HTTP_LOG_REDACT_PATHS],
-      })
+      },
+      withFileCopy(process.stdout),
+    )
   : pino(
       {
         level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug",
@@ -74,22 +71,6 @@ export const logger = isProduction
         }),
       ),
     );
-
-if (fileLogStream) {
-  try {
-    const { config, serverSink, accessSink } = getFileLogging();
-    logger.info(
-      {
-        logDir: config.dir,
-        serverLog: serverSink?.path,
-        accessLog: accessSink?.path ?? null,
-      },
-      "retained file logging enabled",
-    );
-  } catch {
-    // The startup line is informational; never fail boot for it.
-  }
-}
 
 function requestClassificationUrl(req: {
   originalUrl?: unknown;

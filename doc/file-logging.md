@@ -10,12 +10,18 @@ involved), and not the run log (no database rows).
 
 Privacy: the pino lines in `server.log` and every `access.log` line pass
 through the existing HTTP log redaction policy. The stdio-tee copies in
-`server.log` do NOT: they are raw process output with only ANSI codes
-stripped, so anything the process prints (subprocess stderr passthrough,
-fatal-error prints) persists verbatim on the instance volume, where it used
-to live only in ephemeral container stdout. Treat new stdio writers as
-unredacted retained data — they need a privacy review. Changes confined to
-rotation, file layout, or the already-redacted lines do not.
+`server.log` pass through the shared text redaction (`redactSensitiveText`:
+GitHub `gh[pousr]_`/`github_pat_` tokens, `sk-` keys, `{"token":"…"}`-shaped
+JSON fields, bearer credentials) before the retained write — they are no
+longer raw process output, only ANSI-stripping. Only the long-lived server
+process ever opens the sinks or installs the tee: server boot calls
+`initServerFileLogging()` explicitly, and a bare logger import in any other
+process (CLI subcommands, scripts, tests) stays stdout-only without touching
+the log dir. So the tee can only ever see the server process's own console
+output, and only in redacted form. Treat new stdio writers as retained data
+(they are redacted, not verbatim) — widening what the tee may see still needs
+a privacy review. Changes confined to rotation, file layout, or the
+already-redacted lines do not.
 
 ## Files
 

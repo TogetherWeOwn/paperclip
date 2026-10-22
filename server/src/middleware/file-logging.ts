@@ -18,6 +18,7 @@
 
 import { readRawConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
+import { redactSensitiveText } from "../redaction.js";
 import { RotatingFileSink } from "./rotating-file-sink.js";
 
 export const SERVER_LOG_FILENAME = "server.log";
@@ -151,6 +152,10 @@ export function parseFileLoggingConfig(
 }
 
 let state: FileLoggingState | null = null;
+// Cached pre-init answer for getFileLogging(): parsing the config reads the
+// config file, which is too expensive to repeat on every log line through
+// the logger's lazily-resolved file leg.
+let uninitializedState: FileLoggingState | null = null;
 let teeInstalled = false;
 let teeSink: RotatingFileSink | null = null;
 // Captured before the tee wraps the stdio writers, so sink diagnostics can
@@ -202,24 +207,40 @@ export function initFileLogging(config: FileLoggingConfig): FileLoggingState {
 }
 
 /**
- * Process-wide singleton. Unit tests run with stdout-only logging unless
- * they opt in explicitly, so importing the server logger never writes to a
- * developer's real logs dir as a side effect.
+ * Server-boot entry point: parse the env config and init. Only the server
+ * entrypoint calls this; CLI/subcommand processes never do, so they stay
+ * stdout-only. Unit tests keep the opt-out: stdout-only unless
+ * PAPERCLIP_FILE_LOGGING is set explicitly.
+ */
+export function initServerFileLogging(
+  env: NodeJS.ProcessEnv = process.env,
+): FileLoggingState {
+  const config = parseFileLoggingConfig(env);
+  if (
+    env.VITEST_WORKER_ID !== undefined &&
+    env.PAPERCLIP_FILE_LOGGING === undefined
+  ) {
+    return initFileLogging({ ...config, enabled: false });
+  }
+  return initFileLogging(config);
+}
+
+/**
+ * Process-wide singleton. Never initializes: before an explicit
+ * initFileLogging() call (server boot only) this returns null sinks without
+ * touching the log dir, opening files, or installing the stdio tee — so a
+ * bare logger import in a CLI/subcommand process is side-effect-free.
  */
 export function getFileLogging(): FileLoggingState {
   if (!state) {
-    if (
-      process.env.VITEST_WORKER_ID !== undefined &&
-      process.env.PAPERCLIP_FILE_LOGGING === undefined
-    ) {
-      state = {
-        config: { ...parseFileLoggingConfig(), enabled: false },
+    if (!uninitializedState) {
+      uninitializedState = {
+        config: parseFileLoggingConfig(),
         serverSink: null,
         accessSink: null,
       };
-      return state;
     }
-    state = initFileLogging(parseFileLoggingConfig());
+    return uninitializedState;
   }
   return state;
 }
@@ -230,6 +251,7 @@ export function __resetFileLoggingForTests(): void {
   state?.accessSink?.close();
   state = null;
   teeSink = null;
+  uninitializedState = null;
 }
 
 type StdioWrite = (
@@ -269,13 +291,18 @@ function teeFd(kind: "stdout" | "stderr"): void {
         const clean = stripControlSequences(pending.slice(0, newline));
         pending = pending.slice(newline + 1);
         if (clean.length > 0 && !PINO_JSON_PREFIX.test(clean)) {
-          sink.write(`${new Date().toISOString()} ${kind} ${clean}\n`);
+          // Redact BEFORE the retained write: raw process output has carried
+          // credential material (GitHub App token JSON); it must never reach
+          // the file. The console copy above is untouched.
+          sink.write(
+            `${new Date().toISOString()} ${kind} ${redactSensitiveText(clean)}\n`,
+          );
         }
         newline = pending.indexOf("\n");
       }
       if (pending.length > MAX_TEE_LINE_BYTES) {
         sink.write(
-          `${new Date().toISOString()} ${kind} ${stripControlSequences(pending).slice(0, MAX_TEE_LINE_BYTES)}…[truncated]\n`,
+          `${new Date().toISOString()} ${kind} ${redactSensitiveText(stripControlSequences(pending)).slice(0, MAX_TEE_LINE_BYTES)}…[truncated]\n`,
         );
         pending = "";
       }
