@@ -587,6 +587,62 @@ export async function measureDirectoryFileBytes(dir: string): Promise<number> {
   return total;
 }
 
+/**
+ * The two path sets a `git status --porcelain=v1 -z -uall` listing splits
+ * into for an incremental sync-back: paths whose remote content must
+ * transfer, and paths the remote deleted (applied as baseline-guarded
+ * deletes, never inferred from transfer absence).
+ */
+export interface SshPorcelainChangedPaths {
+  changedPaths: string[];
+  deletedPaths: string[];
+}
+
+/**
+ * Parse `git status --porcelain=v1 -z` output into transfer and delete sets.
+ * Every entry whose worktree content still exists remotely transfers
+ * (modifications, untracked files, unmerged entries, rename destinations);
+ * only pure deletions (`D `, ` D`, `DD`) and rename sources land in the
+ * delete set. Ignored entries (`!!`, only present with `--ignored`) are
+ * skipped. A record without a status prefix transfers defensively rather
+ * than silently dropping a remote path. Both sets are sorted and deduped so
+ * the transfer command is deterministic.
+ */
+export function parseSshPorcelainStatusV1Z(output: string): SshPorcelainChangedPaths {
+  const changed = new Set<string>();
+  const deleted = new Set<string>();
+  const records = output.split("\0");
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index] ?? "";
+    if (!record) continue;
+    if (record.length > 3 && record[2] === " ") {
+      const status = record.slice(0, 2);
+      const entryPath = record.slice(3);
+      if (status === "!!") continue;
+      // Rename/copy entries carry the destination first and the source as a
+      // bare follow-up record (`R  new\0old\0`); the source is a delete.
+      if (status[0] === "R" || status[0] === "C") {
+        if (entryPath) changed.add(entryPath);
+        const from = records[index + 1] ?? "";
+        index += 1;
+        if (from) deleted.add(from);
+        continue;
+      }
+      if (status === "D " || status === " D" || status === "DD") {
+        if (entryPath) deleted.add(entryPath);
+      } else if (entryPath) {
+        changed.add(entryPath);
+      }
+      continue;
+    }
+    changed.add(record);
+  }
+  return {
+    changedPaths: [...changed].sort(),
+    deletedPaths: [...deleted].sort(),
+  };
+}
+
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
 // We only need approximate fidelity here (the estimate feeds a clamped percent),
 // so we support the literal names and `*`/`?` globs used in practice.
