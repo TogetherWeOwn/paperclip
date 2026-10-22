@@ -42,6 +42,10 @@ import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 // every assertion below runs without an SSH lab.
 const FAKE_REMOTE_ROOT = "/stub-ssh-remote";
 const STUB_SOURCE = `#!/bin/sh
+if [ "\${STUB_SSH_DEPTH:-0}" -ge 1 ]; then
+  echo "stub-ssh: recursive invocation refused" >&2; exit 99
+fi
+export STUB_SSH_DEPTH=1
 last=""
 for arg in "$@"; do last="$arg"; done
 case "$last" in
@@ -81,6 +85,10 @@ async function installStubSsh(): Promise<void> {
 // read mentions the nonce marker, so intercepting it cannot misroute any
 // other remote command.
 const STUB_DECOY_SOURCE = `#!/bin/sh
+if [ "\${STUB_SSH_DEPTH:-0}" -ge 1 ]; then
+  echo "stub-ssh: recursive invocation refused" >&2; exit 99
+fi
+export STUB_SSH_DEPTH=1
 last=""
 for arg in "$@"; do last="$arg"; done
 case "$last" in
@@ -190,6 +198,81 @@ async function initSeedTestRepo(): Promise<{
   const head = await git(repoDir, ["rev-parse", "HEAD"]);
   const branch = await git(repoDir, ["rev-parse", "--abbrev-ref", "HEAD"]);
   return { repoDir, head, branch };
+}
+
+async function expectFullCopyOmissionsRoundTrip(input: {
+  repoDir: string;
+  localRemoteDir: string;
+  remoteDir: string;
+  spec: SshRemoteExecutionSpec;
+  prepared: Awaited<ReturnType<typeof prepareWorkspaceForSshExecution>>;
+  bulkIgnoredFiles?: string[];
+}): Promise<void> {
+  const { repoDir, localRemoteDir, remoteDir, spec, prepared } = input;
+  const bulkIgnoredFiles = input.bulkIgnoredFiles ?? [];
+  expect(prepared.ignoredPaths?.slice().sort()).toEqual(
+    [".env", "app.log", "nested", ...bulkIgnoredFiles].sort(),
+  );
+  expect(prepared.seedState?.ignoredFingerprint).toBeUndefined();
+  const ignoredFiles = new Map([
+    [".env", "LOCAL=1\n"],
+    ["app.log", "ignored log\n"],
+    ["nested/node_modules/junk.txt", "ignored junk\n"],
+    ...bulkIgnoredFiles.map((name): [string, string] => [
+      name,
+      "ignored bulk\n",
+    ]),
+  ]);
+  for (const [name, content] of ignoredFiles) {
+    expect(await pathExists(path.join(localRemoteDir, name)), name).toBe(false);
+    await expect(readFile(path.join(repoDir, name), "utf8")).resolves.toBe(
+      content,
+    );
+  }
+  await expect(
+    readFile(path.join(localRemoteDir, "tracked.txt"), "utf8"),
+  ).resolves.toBe("v1\n");
+  // Force-added source under an ignored-name directory must still round-trip.
+  await expect(
+    readFile(path.join(localRemoteDir, "src/nested/keep.txt"), "utf8"),
+  ).resolves.toBe("nested source\n");
+  const baselineSnapshot = await captureDirectorySnapshot(repoDir, {
+    exclude: [
+      ...GIT_ARCHIVE_EXCLUDES,
+      ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+      ...(prepared.ignoredPaths ?? []),
+    ],
+  });
+  await writeFile(path.join(localRemoteDir, "tracked.txt"), "remote tracked\n");
+  await writeFile(
+    path.join(localRemoteDir, "src/nested/keep.txt"),
+    "remote nested\n",
+  );
+  await writeFile(path.join(repoDir, ".env"), "LOCAL=2\n");
+  ignoredFiles.set(".env", "LOCAL=2\n");
+  // Exercise the plain/full restore too, not just an incremental happy path.
+  await withIncrementalEnv("0", () =>
+    restoreWorkspaceFromSshExecution({
+      spec,
+      localDir: repoDir,
+      remoteDir,
+      baselineSnapshot,
+      restoreGitHistory: false,
+      ignoredPaths: prepared.ignoredPaths,
+      seedState: prepared.seedState,
+    }),
+  );
+  await expect(
+    readFile(path.join(repoDir, "tracked.txt"), "utf8"),
+  ).resolves.toBe("remote tracked\n");
+  await expect(
+    readFile(path.join(repoDir, "src/nested/keep.txt"), "utf8"),
+  ).resolves.toBe("remote nested\n");
+  for (const [name, content] of ignoredFiles) {
+    await expect(readFile(path.join(repoDir, name), "utf8")).resolves.toBe(
+      content,
+    );
+  }
 }
 
 async function withMirrorEnv<T>(
@@ -473,22 +556,21 @@ describe("ssh seed mirror", () => {
 
       expect(prepared.gitBacked).toBe(true);
       expect(prepared.seedMode).toBe("full-copy");
-      expect(prepared.ignoredPaths).toBeUndefined();
+      expect(prepared.ignoredPaths).toEqual(
+        expect.arrayContaining([".env", "app.log", "nested"]),
+      );
       expect(await readdir(mirrorRoot)).toHaveLength(0);
       expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
       await expect(
         readFile(path.join(localRemoteDir, "modified.txt"), "utf8"),
       ).resolves.toBe("changed\n");
-      // Legacy behavior preserved: ignored files transfer with the full tree.
-      await expect(
-        readFile(
-          path.join(localRemoteDir, "nested", "node_modules", "junk.txt"),
-          "utf8",
-        ),
-      ).resolves.toBe("ignored junk\n");
-      await expect(
-        readFile(path.join(localRemoteDir, "app.log"), "utf8"),
-      ).resolves.toBe("ignored log\n");
+      await expectFullCopyOmissionsRoundTrip({
+        repoDir,
+        localRemoteDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        spec,
+        prepared,
+      });
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
@@ -777,9 +859,11 @@ describe("ssh seed mirror", () => {
       const { repoDir, head } = await initSeedTestRepo();
       // Individually-ignored files inside tracked directories: `--directory`
       // cannot collapse them, so each becomes its own restore exclude.
+      const bulkIgnoredFiles: string[] = [];
       for (let index = 0; index < 350; index += 1) {
         const name = `bulk-ignored-${String(index).padStart(4, "0")}-padding-to-grow-the-exclude-list.log`;
         await writeFile(path.join(repoDir, name), "ignored bulk\n");
+        bulkIgnoredFiles.push(name);
       }
       const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
       const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
@@ -801,32 +885,27 @@ describe("ssh seed mirror", () => {
           }),
         );
         expect(prepared.seedMode).toBe("full-copy");
-        expect(prepared.ignoredPaths).toBeUndefined();
-        // The legacy seed carries the same reconcile state: the bulk-ignored
-        // files are ignored, so the overlay is just the repo's dirt — plus
-        // the deleted list and the fingerprint of the carried ignored set
-        // (the 350 bulk files plus app.log, .env, and the nested junk).
+        expect(prepared.ignoredPaths).toEqual(
+          expect.arrayContaining([".env", "app.log", "nested"]),
+        );
+        // The fallback keeps the overlay/deletion provenance, but omitted
+        // ignored files need no carried-file fingerprint.
         expect(prepared.seedState).toMatchObject({
           headCommit: head.trim(),
           overlayPaths: ["modified.txt", "run-me.sh", "untracked.txt"],
           deletedPaths: ["deleted.txt"],
         });
-        expect(prepared.seedState?.ignoredFingerprint?.count).toBe(353);
-        expect(prepared.seedState?.ignoredFingerprint?.digest).toMatch(
-          /^[0-9a-f]{40} [0-9a-f]{40}$/,
-        );
+        expect(prepared.seedState?.ignoredFingerprint).toBeUndefined();
         expect(await readdir(mirrorRoot)).toHaveLength(0);
         expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
-        // Legacy behavior preserved: ignored files transfer with the full tree.
-        await expect(
-          readFile(
-            path.join(
-              localRemoteDir,
-              "bulk-ignored-0000-padding-to-grow-the-exclude-list.log",
-            ),
-            "utf8",
-          ),
-        ).resolves.toBe("ignored bulk\n");
+        await expectFullCopyOmissionsRoundTrip({
+          repoDir,
+          localRemoteDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+          spec,
+          prepared,
+          bulkIgnoredFiles,
+        });
       } finally {
         console.warn = originalWarn;
       }
@@ -1189,11 +1268,20 @@ describe("ssh seed mirror", () => {
       );
 
       expect(prepared.seedMode).toBe("full-copy");
-      expect(prepared.ignoredPaths).toBeUndefined();
+      expect(prepared.ignoredPaths).toEqual(
+        expect.arrayContaining([".env", "app.log", "nested"]),
+      );
       // The fallback carries the submodule files the mirror checkout omits.
       await expect(
         readFile(path.join(localRemoteDir, "vendor", "sub", "lib.txt"), "utf8"),
       ).resolves.toBe("submodule content\n");
+      await expectFullCopyOmissionsRoundTrip({
+        repoDir,
+        localRemoteDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        spec,
+        prepared,
+      });
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
@@ -1243,11 +1331,20 @@ describe("ssh seed mirror", () => {
       );
 
       expect(prepared.seedMode).toBe("full-copy");
-      expect(prepared.ignoredPaths).toBeUndefined();
+      expect(prepared.ignoredPaths).toEqual(
+        expect.arrayContaining([".env", "app.log", "nested"]),
+      );
       // The fallback carries the smudged working bytes.
       await expect(
         readFile(path.join(localRemoteDir, "data.bin"), "utf8"),
       ).resolves.toBe("ABC\n");
+      await expectFullCopyOmissionsRoundTrip({
+        repoDir,
+        localRemoteDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        spec,
+        prepared,
+      });
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
@@ -1313,15 +1410,21 @@ describe("ssh seed mirror", () => {
       );
 
       // A mismatched secret is a cross-host (or unreadable-path) signal: the
-      // legacy full copy runs, ignored files included, with no mirror built.
+      // full copy runs with repository-owned omissions and no mirror built.
       expect(prepared.gitBacked).toBe(true);
       expect(prepared.seedMode).toBe("full-copy");
-      expect(prepared.ignoredPaths).toBeUndefined();
+      expect(prepared.ignoredPaths).toEqual(
+        expect.arrayContaining([".env", "app.log", "nested"]),
+      );
       expect(await readdir(mirrorRoot)).toHaveLength(0);
       expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
-      await expect(
-        readFile(path.join(localRemoteDir, ".env"), "utf8"),
-      ).resolves.toBe("LOCAL=1\n");
+      await expectFullCopyOmissionsRoundTrip({
+        repoDir,
+        localRemoteDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        spec,
+        prepared,
+      });
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
