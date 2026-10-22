@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import {
   __resetFileLoggingForTests,
   getFileLogging,
   initFileLogging,
+  initServerFileLogging,
   parseFileLoggingConfig,
 } from "../middleware/file-logging.js";
 
@@ -213,14 +214,115 @@ describe("initFileLogging", () => {
     const matched = content.split("\n").find((line) => line.includes(marker));
     expect(matched).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z stdout /);
   });
+
+  // All fixtures below are obviously fake: the shapes must match the
+  // credential patterns (gh[pousr]_/github_pat_ + 20 chars, "token" JSON
+  // field) while never resembling real token material.
+  it("redacts a ghs-shaped value in tee lines before the retained write", () => {
+    const dir = tempDir();
+    initFileLogging({ ...parseFileLoggingConfig({}), dir });
+    const marker = `tee-redact-ghs-${Date.now()}`;
+    const fake = "ghs_faketestvalue000000000001";
+    process.stdout.write(`${marker} token=${fake}\n`);
+    const content = readFileSync(path.join(dir, "server.log"), "utf8");
+    const matched = content.split("\n").find((line) => line.includes(marker));
+    expect(matched).toBeDefined();
+    expect(matched).not.toContain(fake);
+    expect(matched).toContain("***REDACTED***");
+  });
+
+  it("redacts a github_pat-shaped value in tee lines before the retained write", () => {
+    const dir = tempDir();
+    initFileLogging({ ...parseFileLoggingConfig({}), dir });
+    const marker = `tee-redact-pat-${Date.now()}`;
+    const fake = "github_pat_faketestvalue00000002";
+    process.stdout.write(`${marker} key=${fake}\n`);
+    const content = readFileSync(path.join(dir, "server.log"), "utf8");
+    const matched = content.split("\n").find((line) => line.includes(marker));
+    expect(matched).toBeDefined();
+    expect(matched).not.toContain(fake);
+    expect(matched).toContain("***REDACTED***");
+  });
+
+  it.each(["stdout", "stderr"] as const)(
+    "redacts credentials in a >64 KiB newline-less %s tee write before truncation",
+    (stream) => {
+      const dir = tempDir();
+      initFileLogging({ ...parseFileLoggingConfig({}), dir });
+      const marker = `tee-redact-truncated-${stream}`;
+      const fakes = [
+        "ghs_faketestvalue000000000001",
+        "github_pat_faketestvalue00000002",
+        "faketoken-json-test-value-0001",
+      ];
+      const prefix = `${marker} ${fakes[0]} ${fakes[1]} {"token":"${fakes[2]}"} `;
+      // Cross the limit without a newline so only the truncation path can write.
+      const maxLineBytes = 64 * 1024;
+      const crossingToken = "github_pat_fakecrossingtestvalue";
+      const line = `${prefix}${"x".repeat(maxLineBytes - prefix.length - 17)} ${crossingToken}`;
+      process[stream].write(line);
+      const content = readFileSync(path.join(dir, "server.log"), "utf8");
+      expect(content).toContain(`${stream} ${marker}`);
+      expect(content).toContain("…[truncated]\n");
+      expect(content).toContain("***REDACTED***");
+      for (const fake of fakes) expect(content).not.toContain(fake);
+      // A token straddling the cut must be redacted before slicing, not after.
+      expect(content).not.toContain("github_pat_");
+    },
+  );
+
+  it("redacts a token JSON field in tee lines before the retained write", () => {
+    const dir = tempDir();
+    initFileLogging({ ...parseFileLoggingConfig({}), dir });
+    const marker = `tee-redact-json-${Date.now()}`;
+    const fake = "faketoken-json-test-value-0001";
+    process.stdout.write(`${marker} {"token":"${fake}","app_id":1234}\n`);
+    const content = readFileSync(path.join(dir, "server.log"), "utf8");
+    const matched = content.split("\n").find((line) => line.includes(marker));
+    expect(matched).toBeDefined();
+    expect(matched).not.toContain(fake);
+    expect(matched).toContain("***REDACTED***");
+  });
 });
 
 describe("getFileLogging", () => {
+  it("never initializes on its own: null sinks, no dir touched", () => {
+    const sentinel = path.join(
+      tmpdir(),
+      `file-logging-never-init-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    vi.stubEnv("PAPERCLIP_LOG_DIR", sentinel);
+    vi.stubEnv("PAPERCLIP_FILE_LOGGING", "true");
+    const state = getFileLogging();
+    expect(state.serverSink).toBeNull();
+    expect(state.accessSink).toBeNull();
+    expect(existsSync(sentinel)).toBe(false);
+  });
+});
+
+describe("initServerFileLogging", () => {
   it("stays stdout-only under unit tests unless explicitly enabled", () => {
     expect(process.env.VITEST_WORKER_ID).toBeDefined();
-    const state = getFileLogging();
+    const dir = tempDir();
+    const state = initServerFileLogging({
+      ...process.env,
+      PAPERCLIP_LOG_DIR: dir,
+      PAPERCLIP_FILE_LOGGING: undefined,
+    });
     expect(state.config.enabled).toBe(false);
     expect(state.serverSink).toBeNull();
     expect(state.accessSink).toBeNull();
+  });
+
+  it("inits from env when explicitly enabled, even under unit tests", () => {
+    const dir = tempDir();
+    const state = initServerFileLogging({
+      ...process.env,
+      PAPERCLIP_LOG_DIR: dir,
+      PAPERCLIP_FILE_LOGGING: "true",
+      PAPERCLIP_CONFIG: path.join(dir, "no-config.json"),
+    });
+    expect(state.serverSink?.path).toBe(path.join(dir, "server.log"));
+    expect(state.accessSink?.path).toBe(path.join(dir, "access.log"));
   });
 });

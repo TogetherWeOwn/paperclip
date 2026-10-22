@@ -67904,19 +67904,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // request is queued. The duplicate delivery callback becomes a no-op.
     expect(deferred).toHaveLength(4);
     await drainDeferred();
-    await vi.waitFor(async () => {
-      const deliveries = await db
-        .select({
-          eventKind: chatDeliveries.eventKind,
-          state: chatDeliveries.state,
-        })
-        .from(chatDeliveries)
-        .where(eq(chatDeliveries.endpointId, endpoint.id));
-      expect(deliveries).toHaveLength(3);
-      expect(
-        deliveries.every((delivery) => delivery.state === "processed"),
-      ).toBe(true);
-    });
+    // Lifecycle callbacks finish on background work the deferred drain does
+    // not capture; convergence measures ~0.9s under load, so the 1s default
+    // flakes on loaded runners. 10s matches repo precedent for such waits.
+    await vi.waitFor(
+      async () => {
+        const deliveries = await db
+          .select({
+            eventKind: chatDeliveries.eventKind,
+            state: chatDeliveries.state,
+          })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        expect(deliveries).toHaveLength(3);
+        expect(
+          deliveries.every((delivery) => delivery.state === "processed"),
+        ).toBe(true);
+      },
+      { timeout: 10000 },
+    );
 
     const [conversation] = await db
       .select()
@@ -67944,33 +67950,39 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toMatchObject({ ok: true });
     expect(deferred).toHaveLength(1);
     await drainDeferred();
-    await vi.waitFor(() => expect(deferred).toHaveLength(1));
-    await drainDeferred();
-    await vi.waitFor(async () => {
-      await expect(
-        db
-          .select({
-            eventKind: chatDeliveries.eventKind,
-            redactedError: chatDeliveries.redactedError,
-            state: chatDeliveries.state,
-          })
-          .from(chatDeliveries)
-          .where(
-            and(
-              eq(chatDeliveries.endpointId, endpoint.id),
-              eq(chatDeliveries.eventKind, "message_updated"),
-              eq(chatDeliveries.state, "filtered"),
-            ),
-          ),
-      ).resolves.toEqual([
-        {
-          eventKind: "message_updated",
-          redactedError:
-            "Message edit arrived after the provider message was deleted",
-          state: "filtered",
-        },
-      ]);
+    // Same loaded-runner margin as the first wait in this test.
+    await vi.waitFor(() => expect(deferred).toHaveLength(1), {
+      timeout: 10000,
     });
+    await drainDeferred();
+    await vi.waitFor(
+      async () => {
+        await expect(
+          db
+            .select({
+              eventKind: chatDeliveries.eventKind,
+              redactedError: chatDeliveries.redactedError,
+              state: chatDeliveries.state,
+            })
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                eq(chatDeliveries.eventKind, "message_updated"),
+                eq(chatDeliveries.state, "filtered"),
+              ),
+            ),
+        ).resolves.toEqual([
+          {
+            eventKind: "message_updated",
+            redactedError:
+              "Message edit arrived after the provider message was deleted",
+            state: "filtered",
+          },
+        ]);
+      },
+      { timeout: 10000 },
+    );
     await expect(
       db
         .select({ body: issueComments.body })

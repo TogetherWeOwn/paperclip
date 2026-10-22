@@ -443,6 +443,7 @@ describe("redaction", () => {
     const jwt =
       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     const githubToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
+    const fineGrainedPat = "github_pat_1234567890abcdefghijklmnop";
     const input = [
       "Authorization: Bearer live-bearer-token-value",
       `payload {"apiKey":"json-secret-value"}`,
@@ -450,6 +451,7 @@ describe("redaction", () => {
       `escaped {\\"apiKey\\":\\"escaped-json-secret\\"}`,
       `export PAPERCLIP_API_KEY='paperclip-shell-secret'`,
       `GITHUB_TOKEN=${githubToken}`,
+      `deploy key ${fineGrainedPat} active`,
       `session=${jwt}`,
     ].join("\n");
 
@@ -462,6 +464,7 @@ describe("redaction", () => {
     expect(result).not.toContain("escaped-json-secret");
     expect(result).not.toContain("paperclip-shell-secret");
     expect(result).not.toContain(githubToken);
+    expect(result).not.toContain(fineGrainedPat);
     expect(result).not.toContain(jwt);
   });
 

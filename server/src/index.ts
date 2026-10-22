@@ -49,6 +49,7 @@ import { initializeGitHubPrimaryBlinding } from "./services/chat-github-primary-
 import { initializeGitHubPrimaryReviewers } from "./services/chat-github-primary-reviewers.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { initServerFileLogging } from "./middleware/file-logging.js";
 import { installUncaughtExceptionPolicy } from "./fatal-exception-policy.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -210,6 +211,25 @@ export async function startServer(): Promise<StartedServer> {
 async function startServerWithDatabaseTeardown(
   startupDatabase: StartupDatabaseTeardown,
 ): Promise<StartedServer> {
+  // The ONLY production call site for retained file logging: importing the
+  // logger never inits (CLI/subcommand processes stay stdout-only), so boot
+  // does it explicitly here, before the first retained line. The startup line
+  // is informational; it must never fail boot.
+  const fileLogging = initServerFileLogging();
+  if (fileLogging.serverSink) {
+    try {
+      logger.info(
+        {
+          logDir: fileLogging.config.dir,
+          serverLog: fileLogging.serverSink.path,
+          accessLog: fileLogging.accessSink?.path ?? null,
+        },
+        "retained file logging enabled",
+      );
+    } catch {
+      // Informational only.
+    }
+  }
   setStartupRecoveryPhase("starting");
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 

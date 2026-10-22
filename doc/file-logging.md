@@ -9,12 +9,20 @@ Telemetry (nothing leaves the host), not Observability (no OTLP endpoint
 involved), and not the run log (no database rows).
 
 Privacy: the pino lines in `server.log` and every `access.log` line pass
-through the existing HTTP log redaction policy, and the sink scrubs every
-retained chunk with the shared text redaction as defence in depth. The
-stdio-tee copies in `server.log` are therefore redacted, not verbatim —
-only the console copy keeps raw process output. Treat new stdio writers as
-redacted retained data — widening what the tee may see still needs a
-privacy review. Changes confined to rotation, file layout, or the
+through the existing HTTP log redaction policy. The stdio-tee copies in
+`server.log` pass through the shared text redaction (`redactSensitiveText`:
+GitHub `gh[pousr]_`/`github_pat_` tokens, `sk-` keys, `{"token":"…"}`-shaped
+JSON fields, bearer credentials) before the retained write, and the sink
+scrubs every retained chunk with the same redaction as defence in depth —
+they are no longer raw process output; only the console copy keeps raw
+process output. Only the long-lived server process ever opens the sinks or
+installs the tee: server boot calls `initServerFileLogging()` explicitly,
+and a bare logger import in any other process (CLI subcommands, scripts,
+tests) stays stdout-only without touching the log dir. So the tee can only
+ever see the server process's own console output, and only in redacted form.
+Treat new stdio writers as retained data (they are redacted, not verbatim) —
+widening what the tee may see still needs a privacy review. Changes confined
+to rotation, file layout, or the
 already-redacted lines do not.
 
 ## Files
