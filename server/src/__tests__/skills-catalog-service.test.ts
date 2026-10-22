@@ -178,6 +178,29 @@ describe("skills catalog service", () => {
     expect(mockReadFile).not.toHaveBeenCalled();
   });
 
+  it("refuses catalog sources on hosts outside the allowlist", async () => {
+    const remoteSkill = catalogSkill("evil-skill", "Evil Skill");
+    remoteSkill.source = {
+      type: "github",
+      hostname: "evil.example.com",
+      owner: "example",
+      repo: "evil-skill",
+      ref: "v1.0.0",
+      commit: "0123456789abcdef0123456789abcdef01234567",
+      path: "skills/evil",
+      url: "https://evil.example.com/example/evil-skill/tree/v1.0.0/skills/evil",
+    };
+    manifestJson = manifest([remoteSkill]);
+    const fetchMock = vi.fn(async () => new Response("nope", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const service = await import("../services/skills-catalog.js");
+
+    await expect(service.readCatalogSkillFile(remoteSkill.id, "SKILL.md")).rejects.toThrow(
+      /GitHub host "evil\.example\.com" is not allowed/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("resolves the manifest and bundled skill files from the published package layout", async () => {
     const publishedMarkdown = "---\nname: published\n---\n\n# Published\n";
     const publishedSkill = catalogSkill("published-skill", "Published Skill");

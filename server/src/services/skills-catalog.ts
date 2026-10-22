@@ -12,7 +12,11 @@ import type {
 } from "@paperclipai/shared";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { ghFetch, resolveRawGitHubUrl } from "./github-fetch.js";
+import {
+  assertAllowedGitHubHost,
+  ghFetch,
+  resolveRawGitHubUrl,
+} from "./github-fetch.js";
 import { normalizePortablePath } from "./portable-path.js";
 
 interface CatalogManifestFile {
@@ -217,6 +221,7 @@ async function fetchCatalogSourceFile(
   if (source.type !== "github") {
     throw unprocessable(`Unsupported catalog source type: ${(source as { type: string }).type}`);
   }
+  assertAllowedGitHubHost(source.hostname);
 
   const sourcePath = resolveCatalogSourcePath(source, relativePath);
   const url = resolveRawGitHubUrl(source.hostname, source.owner, source.repo, source.commit, sourcePath);

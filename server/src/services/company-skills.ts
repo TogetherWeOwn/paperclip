@@ -104,7 +104,15 @@ import {
 } from "@paperclipai/shared";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
-import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import {
+  assertAllowedGitHubHost,
+  disallowedGitHubHostMessage,
+  ghFetch,
+  gitHubApiBase,
+  isAllowedGitHubHost,
+  normalizeGitHubHostname,
+  resolveRawGitHubUrl,
+} from "./github-fetch.js";
 import { agentService } from "./agents.js";
 import { issueDocumentSelect, mapIssueDocumentRow } from "./documents.js";
 import { toIssueWorkProduct } from "./work-products.js";
@@ -768,7 +776,7 @@ async function resolveGitHubCommitSha(owner: string, repo: string, ref: string, 
   return sha;
 }
 
-function parseGitHubSourceUrl(rawUrl: string) {
+export function parseGitHubSourceUrl(rawUrl: string) {
   const url = parseRemoteSkillImportUrl(rawUrl);
   if (url.protocol !== "https:") {
     throw unprocessable("GitHub source URL must use HTTPS");
@@ -780,6 +788,9 @@ function parseGitHubSourceUrl(rawUrl: string) {
   if (parts.length < 2) {
     throw unprocessable("Invalid GitHub URL");
   }
+  // The import URL is member-supplied, so pin its host to github.com or an
+  // operator-configured GitHub Enterprise host before anything is fetched.
+  assertAllowedGitHubHost(url.hostname);
   const owner = parts[0]!;
   const repo = parts[1]!.replace(/\.git$/i, "");
   let ref = "main";
@@ -796,7 +807,9 @@ function parseGitHubSourceUrl(rawUrl: string) {
     basePath = filePath ? path.posix.dirname(filePath) : "";
     explicitRef = true;
   }
-  return { hostname: url.hostname, owner, repo, ref, basePath, filePath, explicitRef };
+  // Return the canonical hostname so stored metadata and every URL builder see
+  // the same value the allowlist checked (e.g. "github.com." -> "github.com").
+  return { hostname: normalizeGitHubHostname(url.hostname), owner, repo, ref, basePath, filePath, explicitRef };
 }
 
 function parseRemoteSkillImportUrl(rawUrl: string) {
@@ -4281,6 +4294,17 @@ export function companySkillService(db: Db) {
     }
 
     const hostname = asString(metadata.hostname) || "github.com";
+    if (!isAllowedGitHubHost(hostname)) {
+      return {
+        supported: false,
+        reason: disallowedGitHubHostMessage(hostname),
+        trackingRef: trackingRef ?? null,
+        currentRef: skill.sourceRef ?? null,
+        latestRef: null,
+        hasUpdate: false,
+        ...statusMeta,
+      };
+    }
     const apiBase = gitHubApiBase(hostname);
     const latestRef = await resolveGitHubCommitSha(owner, repo, trackingRef, apiBase);
     return {
@@ -4339,6 +4363,9 @@ export function companySkillService(db: Db) {
       if (!owner || !repo) {
         throw unprocessable("Skill source metadata is incomplete.");
       }
+      // Stored metadata carries the import-time hostname; re-pin it so a host
+      // that was never (or is no longer) allowed cannot steer this fetch.
+      assertAllowedGitHubHost(hostname);
       const repoPath = normalizePortablePath(path.posix.join(repoSkillDir, normalizedPath));
       try {
         content = await fetchText(resolveRawGitHubUrl(hostname, owner, repo, ref, repoPath));
