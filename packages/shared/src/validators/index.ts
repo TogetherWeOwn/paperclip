@@ -37,6 +37,8 @@ export {
   type DecisionSpecInput,
 } from "./decision.js";
 
+export { registerIssueWaitCoverageSchema, issueWaitCoverageSchema, type RegisterIssueWaitCoverage, type IssueWaitCoverage } from "./issue-wait-coverage.js";
+
 export {
   instanceSettingsSchema,
   instanceGeneralSettingsSchema,

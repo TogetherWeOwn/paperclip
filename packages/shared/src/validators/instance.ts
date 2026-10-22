@@ -59,6 +59,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   // Global admission/wake kill switch for paired reviews, independent of the
   // primary endpoint and permanent capture-only fences. Preparation is inert.
   githubReviewShadowEnabled: z.boolean().default(false),
+  eventBackedWaitMode: z.enum(["off", "shadow", "enforce"]).default("off"),
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),
   enableMemoryConnectors: z.boolean().default(false),

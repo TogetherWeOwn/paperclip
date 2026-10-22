@@ -24,6 +24,7 @@ export const API = {
   stalledReviewDecision: `${API_PREFIX}/issues/:issueId/stalled-review-decision`,
   issueWatchdog: `${API_PREFIX}/issues/:issueId/watchdog`,
   issueTreeControl: `${API_PREFIX}/issues/:issueId/tree-control`,
+  issueWaitCoverage: `${API_PREFIX}/companies/:companyId/issues/:issueId/wait-coverage`,
   issueTreeHolds: `${API_PREFIX}/issues/:issueId/tree-holds`,
   summarySlot: `${API_PREFIX}/companies/:companyId/summary-slots/:scopeKind/:slotKey`,
   summarySlotRevisions: `${API_PREFIX}/companies/:companyId/summary-slots/:scopeKind/:slotKey/revisions`,

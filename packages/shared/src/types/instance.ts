@@ -80,6 +80,8 @@ export interface InstanceExperimentalSettings {
   enableChatConnectors: boolean;
   /** Global paired-review admission switch. Default OFF; never changes primary review or capture-only fences. */
   githubReviewShadowEnabled: boolean;
+  /** Reserved durable-wait rollout mode. Default off; no admission sites consume it yet. */
+  eventBackedWaitMode: "off" | "shadow" | "enforce";
   /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
   enableMcpAggregators: boolean;
   /** Show experimental memory connection setup. Existing connections remain usable. */

@@ -7,6 +7,8 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  registerIssueWaitCoverageSchema,
+  issueWaitCoverageSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -1567,6 +1569,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications",
   "GET /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status",
   "GET /api/issues/{issueId}/chat-binding",
+  "POST /api/companies/{companyId}/issues/{issueId}/wait-coverage",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
@@ -4174,6 +4177,23 @@ registry.registerPath({
   },
   responses: {
     202: { description: "Goal control accepted" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/{issueId}/wait-coverage",
+  tags: ["issues"],
+  summary: "Register an authenticated board observation without dispatching work",
+  body: registerIssueWaitCoverageSchema,
+  responses: {
+    200: r.ok(issueWaitCoverageSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,

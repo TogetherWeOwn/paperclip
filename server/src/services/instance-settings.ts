@@ -43,6 +43,7 @@ const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSc
     // A malformed stored experiment switch must fail closed without resetting
     // unrelated primary runtime settings. API writes remain strictly validated.
     githubReviewShadowEnabled: instanceExperimentalSettingsSchema.shape.githubReviewShadowEnabled.catch(false),
+    eventBackedWaitMode: instanceExperimentalSettingsSchema.shape.eventBackedWaitMode.catch("off"),
   })
   .strip();
 const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
@@ -243,6 +244,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableMcpAggregators: true,
       enableChatConnectors: parsed.data.enableChatConnectors ?? false,
       githubReviewShadowEnabled: parsed.data.githubReviewShadowEnabled ?? false,
+      eventBackedWaitMode: parsed.data.eventBackedWaitMode ?? "off",
       enableMemoryConnectors: parsed.data.enableMemoryConnectors ?? false,
       enablePipelines: parsed.data.enablePipelines ?? false,
       enableCases: parsed.data.enableCases ?? false,
@@ -288,6 +290,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableMcpAggregators: true,
     enableChatConnectors: false,
     githubReviewShadowEnabled: false,
+    eventBackedWaitMode: "off",
     enableMemoryConnectors: false,
     enablePipelines: false,
     enableCases: false,

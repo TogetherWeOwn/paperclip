@@ -2157,6 +2157,13 @@
       "when": 1792296920447,
       "tag": "0309_chat_actions_delivery_kind",
       "breakpoints": true
+    },
+    {
+      "idx": 310,
+      "version": "7",
+      "when": 1792697897715,
+      "tag": "0310_fancy_vector",
+      "breakpoints": true
     }
   ]
 }
