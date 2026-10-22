@@ -5923,7 +5923,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const checks = githubReviewCheckService(db, f.providerFetch);
       const [activeEndpoint] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
       await checks.enqueue(activeEndpoint, githubAutomaticReviewEvent(payload, duplicateDeliveryId)!, true, "authorized");
-      await checks.processPending();
+      // The admission ack briefly holds the per-PR lease while posting its
+      // working comment; a check dispatch that loses the lease silently
+      // skips, leaving the intent received with a null result. Once the ack
+      // releases the lease the retry lands the dispatch. Later dispatches
+      // are no-ops: the landed action is processed.
+      await expect.poll(async () => {
+        await checks.processPending();
+        const [row] = await db.select().from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id),
+          eq(chatActions.providerActionId, `github-check:${duplicateDeliveryId}`),
+        ));
+        return row?.result ?? null;
+      }, { timeout: 10000 }).toMatchObject({ code: "assessment_owns_check", reviewId: assessed.id });
       const [action] = await db.select().from(chatActions).where(and(
         eq(chatActions.endpointId, f.endpoint.id),
         eq(chatActions.providerActionId, `github-check:${duplicateDeliveryId}`),
@@ -10621,11 +10633,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return undefined;
       });
       await admitShadowTestPullRequest(f, head);
+      // Settling the admission delivery kicks a background tryAcknowledge
+      // that holds the per-PR lease while posting its working comment; a
+      // check dispatch that loses the lease silently skips without listing,
+      // so the flip below never fires. Wait for the ack to settle first —
+      // its working-comment post must also land before the mutation reset
+      // below, or it pollutes the no-provider-call assertion. Processed,
+      // failed, or cancelled all mean it will never list again: nothing
+      // retries it during this test.
+      await expect.poll(async () => {
+        const [row] = await db.select({ status: chatActions.status }).from(chatActions).where(and(
+          eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+        return row !== undefined && ["processed", "failed", "cancelled"].includes(row.status);
+      }, { timeout: 10000 }).toBe(true);
       const [staged] = await shadowTestActions(f.endpoint.id, "github_review_check");
       expect(staged?.status).toBe("received");
       recorder.mutations.length = 0;
       armed = true;
-      await githubReviewCheckService(db, f.providerFetch).processPending();
+      // Retry until the dispatch lists: a lease loss skips silently, and
+      // only a listing lands the mid-flight flip. Later dispatches are
+      // no-ops: the landed action is cancelled with shadow_mode.
+      await expect.poll(async () => {
+        await githubReviewCheckService(db, f.providerFetch).processPending();
+        return flipped;
+      }, { timeout: 10000 }).toBe(true);
       expect(flipped).toBe(true);
       const [settled] = await db
         .select()
