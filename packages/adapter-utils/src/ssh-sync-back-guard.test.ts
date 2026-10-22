@@ -38,7 +38,7 @@ esac
 rewritten=$(printf '%s' "$payload" | sed "s|$STUB_SSH_REMOTE_ROOT|$STUB_SSH_FIXTURE_DIR|g")
 if [ -n "$STUB_SSH_REMOTE_BIN" ]; then
   PATH="$STUB_SSH_REMOTE_BIN:$PATH"
-  # The preflight sources login profiles. Restore the selected tar afterwards,
+  # A remote login shell sources login profiles. Restore the selected tar afterwards,
   # from a fixture-owned home, rather than let /etc/profile reset the matrix.
   HOME="$STUB_SSH_REMOTE_BIN/home"
   mkdir -p "$HOME"
@@ -350,7 +350,7 @@ describe("SSH workspace excludes are anchored to the workspace root", () => {
     }
   }, TEST_TIMEOUT_MS);
 
-  it("uses the selected remote tar for both preflight and download", async () => {
+  it("uses the selected remote tar for the single download (no separate size probe)", async () => {
     const remoteBin = await createFixtureRootDir("paperclip-recording-remote-tar-");
     const { stdout } = await execFileAsync("sh", ["-c", "command -v tar"], {
       env: { ...process.env, PATH: originalPath },
@@ -373,9 +373,11 @@ exec "$STUB_SSH_REAL_TAR" "$@"
     });
 
     const calls = (await readFile(process.env.STUB_SSH_TAR_LOG, "utf8")).trim().split("\n");
-    expect(calls.filter((call) => call === "--version")).toHaveLength(2);
-    expect(calls.filter((call) => call.includes(" -cf - ."))).toHaveLength(2);
-    expect(calls).toHaveLength(4);
+    // One dialect probe plus one archive stream: the old `| wc -c` size probe
+    // is gone, and the cap is enforced while the single transfer streams.
+    expect(calls.filter((call) => call === "--version")).toHaveLength(1);
+    expect(calls.filter((call) => call.includes(" -cf - ."))).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe(NESTED_SOURCE_FILES["keep.txt"]);
   }, TEST_TIMEOUT_MS);
 

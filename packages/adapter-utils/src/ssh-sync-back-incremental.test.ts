@@ -1,9 +1,15 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { parseSshPorcelainStatusV1Z } from "./ssh.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  createSshSyncBackCapTransform,
+  parseSshPorcelainStatusV1Z,
+  SshSyncBackSizeLimitExceededError,
+  syncDirectoryFromSsh,
+  type SshRemoteExecutionSpec,
+} from "./ssh.js";
 
 const tempDirs: string[] = [];
 
@@ -11,6 +17,60 @@ async function createTempDir(prefix: string): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
+}
+
+// Same stub-ssh pattern as ssh-seed-mirror.test.ts: the fake `ssh` executes
+// the trailing `sh -c` payload locally after remapping the fake remote root.
+const FAKE_REMOTE_ROOT = "/stub-ssh-remote";
+const STUB_SOURCE = `#!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  "sh -c "*) payload=\${last#"sh -c "};;
+  *) echo "stub-ssh: unexpected trailing arg: $last" >&2; exit 99;;
+esac
+rewritten=$(printf '%s' "$payload" | sed "s|$STUB_SSH_REMOTE_ROOT|$STUB_SSH_FIXTURE_DIR|g")
+eval "sh -c $rewritten"
+`;
+
+const TEST_TIMEOUT_MS = 30_000;
+const originalPath = process.env.PATH ?? "";
+const originalTmpdir = process.env.TMPDIR;
+
+// Sync-back staging Dirs live under os.tmpdir(), which every parallel test
+// worker shares. These tests scope TMPDIR to a private directory per test so
+// the staging-leak assertions below observe only this file's own transfers.
+async function installPrivateTmpdir(): Promise<void> {
+  const privateTmp = await mkdtemp(path.join(os.tmpdir(), "paperclip-syncback-test-tmp-"));
+  tempDirs.push(privateTmp);
+  process.env.TMPDIR = privateTmp;
+}
+
+async function installStubSsh(): Promise<void> {
+  await installPrivateTmpdir();
+  const binDir = await createTempDir("paperclip-syncback-stub-ssh-bin-");
+  await writeFile(path.join(binDir, "ssh"), STUB_SOURCE, { mode: 0o755 });
+  process.env.PATH = `${binDir}${path.delimiter}${originalPath}`;
+}
+
+function buildStubSpec(fixtureDir: string): SshRemoteExecutionSpec {
+  process.env.STUB_SSH_REMOTE_ROOT = FAKE_REMOTE_ROOT;
+  process.env.STUB_SSH_FIXTURE_DIR = fixtureDir;
+  return {
+    host: "stub",
+    port: 22,
+    username: "stub",
+    remoteWorkspacePath: FAKE_REMOTE_ROOT,
+    privateKey: null,
+    knownHosts: null,
+    strictHostKeyChecking: false,
+    remoteCwd: FAKE_REMOTE_ROOT,
+  };
+}
+
+async function listSyncBackStagingDirs(): Promise<string[]> {
+  const entries = await readdir(os.tmpdir()).catch(() => []);
+  return entries.filter((entry) => entry.startsWith("paperclip-ssh-sync-back-")).sort();
 }
 
 function git(cwd: string, args: string[]): Promise<string> {
@@ -26,6 +86,12 @@ function git(cwd: string, args: string[]): Promise<string> {
 }
 
 afterEach(async () => {
+  process.env.PATH = originalPath;
+  if (originalTmpdir === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = originalTmpdir;
+  delete process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES;
+  delete process.env.STUB_SSH_REMOTE_ROOT;
+  delete process.env.STUB_SSH_FIXTURE_DIR;
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
@@ -101,4 +167,87 @@ describe("parseSshPorcelainStatusV1Z", () => {
       deletedPaths: [],
     });
   });
+});
+
+describe("createSshSyncBackCapTransform", () => {
+  it("passes chunks through while the cumulative bytes stay within the cap", async () => {
+    const cap = createSshSyncBackCapTransform({ capBytes: 10, remoteDir: FAKE_REMOTE_ROOT });
+    const received: Buffer[] = [];
+    cap.on("data", (chunk: Buffer) => received.push(chunk));
+    cap.write(Buffer.alloc(6, 0x41));
+    cap.write(Buffer.alloc(4, 0x42));
+    await new Promise<void>((resolve, reject) => {
+      cap.on("error", reject);
+      cap.end(resolve);
+    });
+    expect(Buffer.concat(received)).toEqual(Buffer.concat([Buffer.alloc(6, 0x41), Buffer.alloc(4, 0x42)]));
+  });
+
+  it("destroys the stream with the cap error once cumulative bytes exceed it", async () => {
+    const cap = createSshSyncBackCapTransform({ capBytes: 10, remoteDir: FAKE_REMOTE_ROOT });
+    cap.resume();
+    cap.write(Buffer.alloc(6, 0x41));
+    const failure = await new Promise<unknown>((resolve) => {
+      cap.on("error", resolve);
+      cap.write(Buffer.alloc(5, 0x42));
+    });
+    expect(failure).toBeInstanceOf(SshSyncBackSizeLimitExceededError);
+    expect((failure as Error).message).toContain(FAKE_REMOTE_ROOT);
+    expect((failure as Error).message).toContain("PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES");
+  });
+});
+
+describe("sync-back streaming cap", () => {
+  beforeEach(installStubSsh);
+
+  it("refuses an over-cap sync-back from the single transfer stream", async () => {
+    const remoteDir = await createTempDir("paperclip-syncback-cap-remote-");
+    await writeFile(path.join(remoteDir, "big.bin"), Buffer.alloc(64 * 1024, 0x41));
+    const spec = buildStubSpec(remoteDir);
+    const localDir = await createTempDir("paperclip-syncback-cap-local-");
+    process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = "1024";
+    const stagingBefore = await listSyncBackStagingDirs();
+
+    const failure = await syncDirectoryFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      localDir,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(SshSyncBackSizeLimitExceededError);
+    expect(await readdir(localDir)).toEqual([]);
+    expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+  }, TEST_TIMEOUT_MS);
+
+  it("still refuses when hardlinked extraction exceeds the cap the stream fit", async () => {
+    // The tar stream carries one 200 KiB copy plus hardlink entries, but the
+    // extraction lands 21 paths: only the post-extract staging check can
+    // refuse this, proving it survived the probe removal.
+    const { link } = await import("node:fs/promises");
+    const remoteDir = await createTempDir("paperclip-syncback-links-remote-");
+    await writeFile(path.join(remoteDir, "orig.bin"), Buffer.alloc(200 * 1024, 0x41));
+    for (let index = 0; index < 20; index += 1) {
+      await link(path.join(remoteDir, "orig.bin"), path.join(remoteDir, `copy-${index}.bin`));
+    }
+    const spec = buildStubSpec(remoteDir);
+    const localDir = await createTempDir("paperclip-syncback-links-local-");
+    process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(1024 * 1024);
+    const stagingBefore = await listSyncBackStagingDirs();
+
+    const failure = await syncDirectoryFromSsh({
+      spec,
+      remoteDir: FAKE_REMOTE_ROOT,
+      localDir,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(SshSyncBackSizeLimitExceededError);
+    expect(await readdir(localDir)).toEqual([]);
+    expect(await listSyncBackStagingDirs()).toEqual(stagingBefore);
+  }, TEST_TIMEOUT_MS);
 });
