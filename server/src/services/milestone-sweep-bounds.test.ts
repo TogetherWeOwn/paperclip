@@ -32,7 +32,7 @@ describe("milestone sweep + skills cache bounds", () => {
   it("keeps the milestone sweep index migration idempotent", () => {
     const migration = readFileSync(
       new URL(
-        "../../../packages/db/src/migrations/0296_volatile_star_brand.sql",
+        "../../../packages/db/src/migrations/0336_volatile_star_brand.sql",
         import.meta.url,
       ),
       "utf8",
@@ -68,10 +68,12 @@ describe("milestone sweep + skills cache bounds", () => {
   });
 
   it("resolves agent GET from reporting ancestors only", () => {
-    const source = readFileSync(new URL("./agents.ts", import.meta.url), "utf8");
+    // Agent data access lives in lib/agent-records.ts on this line (the
+    // sync-base extraction); assert on the implementation there.
+    const source = readFileSync(new URL("../lib/agent-records.ts", import.meta.url), "utf8");
     const getById = source.slice(
       source.indexOf("async function getById(id: string)"),
-      source.indexOf("async function requireGetById"),
+      source.indexOf("async function ensureManager"),
     );
     expect(getById).toContain("reportsTo");
     expect(getById).not.toContain("listCompanyAgentRows");

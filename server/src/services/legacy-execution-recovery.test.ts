@@ -134,9 +134,14 @@ const reviewWait = {
   },
 };
 
-it("does not reopen a gate-cancelled review-wait continuation that never started a provider", () => {
+it("holds a gate-cancelled review-wait continuation until retained evidence is checked", () => {
+  // The row receipt matches the never-started shape, but the synchronous
+  // classifier stays conservative: only legacyExecutionNeedsReconciliation-
+  // WithEvidence (after isPreDispatchReviewWaitVerified finds no launch or
+  // cleanup rows) may lift the hold. See the wake-queue "verified
+  // pre-dispatch review wait" cases for the exempt-vs-held matrix.
   expect(isReviewWaitNeverStartedCancellation(reviewWait)).toBe(true);
-  expect(legacyExecutionNeedsReconciliation(reviewWait)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation(reviewWait)).toBe(true);
 });
 
 it.each([

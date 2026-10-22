@@ -33,9 +33,12 @@ export function legacyExecutionNeedsReconciliation(
     return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
-  // A gate-cancelled review-wait continuation never reached a provider, so
-  // there is no action outcome to reconcile and no retry budget to spend.
-  if (isReviewWaitNeverStartedCancellation(run)) return false;
+  // NOTE: fork #160 exempted gate-cancelled review-wait continuations here,
+  // but this tree verifies pre-dispatch state against retained evidence
+  // (isPreDispatchReviewWaitVerified in *WithEvidence below), which already
+  // exempts the no-evidence case and must still hold runs that show launch
+  // or cleanup activity. An unconditional column-only exemption here would
+  // discard that evidence, so it lives only in the verified path.
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;

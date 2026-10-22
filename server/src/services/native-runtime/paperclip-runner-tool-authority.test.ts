@@ -1398,8 +1398,10 @@ describe("PaperclipRunnerToolAuthority", () => {
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     // The delegation test above leaves active person-a/person-b memberships
     // behind (shared database). This scenario needs person-a unauthorized so
-    // the responsible-user check fires before any credential use.
-    await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
+    // the responsible-user check fires before any credential use. Downgrade
+    // instead of deleting: other guards need the rows present.
+    await db.update(companyMemberships).set({ membershipRole: "viewer" })
+      .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, "person-a")));
     await initializeRunIdentity(db, { companyId, runId, issueId, responsibleUserId: "person-a", cause: "instruction" });
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
