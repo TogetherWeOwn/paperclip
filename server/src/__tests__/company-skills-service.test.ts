@@ -2530,6 +2530,86 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     }
   });
 
+  it("rejects file reads for stored skills on disallowed GitHub hosts before fetching", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/evil-skill`,
+      slug: "evil-skill",
+      name: "Evil Skill",
+      description: null,
+      markdown: "# Evil Skill (stored)\n",
+      sourceType: "github",
+      sourceLocator: "https://evil.example.com/acme/evil-skill",
+      sourceRef: "main",
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { owner: "acme", repo: "evil-skill", ref: "main", repoSkillDir: ".", hostname: "evil.example.com" },
+    });
+
+    const fetchMock = vi.fn(async () => new Response("nope", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(svc.readFile(companyId, skillId, "SKILL.md")).rejects.toThrow(
+        /GitHub host "evil\.example\.com" is not allowed/,
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reports stored skills on disallowed GitHub hosts as unsupported without fetching", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/delisted-skill`,
+      slug: "delisted-skill",
+      name: "Delisted Skill",
+      description: null,
+      markdown: "# Delisted Skill\n",
+      sourceType: "github",
+      sourceLocator: "https://evil.example.com/acme/delisted-skill",
+      sourceRef: "abc1234",
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { owner: "acme", repo: "delisted-skill", trackingRef: "main", hostname: "evil.example.com" },
+    });
+
+    const fetchMock = vi.fn(async () => new Response("nope", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const status = await svc.updateStatus(companyId, skillId);
+      expect(status).toMatchObject({
+        supported: false,
+        trackingRef: "main",
+        currentRef: "abc1234",
+        latestRef: null,
+        hasUpdate: false,
+      });
+      expect(status?.reason).toMatch(/GitHub host "evil\.example\.com" is not allowed/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("seeds an initial version on create and snapshots a version on each changed save", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

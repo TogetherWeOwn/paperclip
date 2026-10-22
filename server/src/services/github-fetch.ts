@@ -1,7 +1,11 @@
 import { unprocessable } from "../errors.js";
 
+export function normalizeGitHubHostname(hostname: string): string {
+  return hostname.trim().toLowerCase().replace(/\.$/, "");
+}
+
 export function isGitHubDotCom(hostname: string) {
-  const h = hostname.toLowerCase();
+  const h = normalizeGitHubHostname(hostname);
   return h === "github.com" || h === "www.github.com";
 }
 
@@ -24,10 +28,6 @@ export function resolveRawGitHubUrl(hostname: string, owner: string, repo: strin
  */
 export const GITHUB_ENTERPRISE_HOSTS_ENV_VAR =
   "PAPERCLIP_GITHUB_ENTERPRISE_HOSTS";
-
-function normalizeGitHubHostname(hostname: string): string {
-  return hostname.trim().toLowerCase().replace(/\.$/, "");
-}
 
 export function getAdditionalGitHubHosts(
   env: NodeJS.ProcessEnv = process.env,

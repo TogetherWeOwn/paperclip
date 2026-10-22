@@ -77,6 +77,7 @@ import {
   assertAllowedGitHubHost,
   ghFetch,
   gitHubApiBase,
+  normalizeGitHubHostname,
   resolveRawGitHubUrl,
 } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
@@ -3504,7 +3505,9 @@ export function parseGitHubSourceUrl(rawUrl: string) {
   if (url.protocol !== "https:") {
     throw unprocessable("GitHub source URL must use HTTPS");
   }
-  const hostname = url.hostname;
+  // Canonicalize so stored metadata and every URL builder see the same value
+  // the allowlist checked (e.g. "github.com." -> "github.com").
+  const hostname = normalizeGitHubHostname(url.hostname);
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts.length < 2) {
     throw unprocessable("Invalid GitHub URL");

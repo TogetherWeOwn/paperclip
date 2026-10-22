@@ -110,6 +110,7 @@ import {
   ghFetch,
   gitHubApiBase,
   isAllowedGitHubHost,
+  normalizeGitHubHostname,
   resolveRawGitHubUrl,
 } from "./github-fetch.js";
 import { agentService } from "./agents.js";
@@ -806,7 +807,9 @@ export function parseGitHubSourceUrl(rawUrl: string) {
     basePath = filePath ? path.posix.dirname(filePath) : "";
     explicitRef = true;
   }
-  return { hostname: url.hostname, owner, repo, ref, basePath, filePath, explicitRef };
+  // Return the canonical hostname so stored metadata and every URL builder see
+  // the same value the allowlist checked (e.g. "github.com." -> "github.com").
+  return { hostname: normalizeGitHubHostname(url.hostname), owner, repo, ref, basePath, filePath, explicitRef };
 }
 
 function parseRemoteSkillImportUrl(rawUrl: string) {

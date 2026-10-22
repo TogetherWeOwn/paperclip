@@ -6,7 +6,10 @@ import {
   disallowedGitHubHostMessage,
   GITHUB_ENTERPRISE_HOSTS_ENV_VAR,
   getAdditionalGitHubHosts,
+  gitHubApiBase,
   isAllowedGitHubHost,
+  isGitHubDotCom,
+  resolveRawGitHubUrl,
 } from "../services/github-fetch.js";
 
 describe("GitHub host allowlist", () => {
@@ -81,6 +84,24 @@ describe("GitHub host allowlist", () => {
         "https://ghe.example.com/acme/app/tree/main/skills",
       ).hostname,
     ).toBe("ghe.example.com");
+  });
+
+  it("builds github.com API/raw URLs for trailing-dot and mixed-case hosts", () => {
+    expect(isGitHubDotCom("github.com.")).toBe(true);
+    expect(isGitHubDotCom(" www.GITHUB.com ")).toBe(true);
+    expect(gitHubApiBase("github.com.")).toBe("https://api.github.com");
+    expect(
+      resolveRawGitHubUrl("github.com.", "acme", "app", "main", "SKILL.md"),
+    ).toBe("https://raw.githubusercontent.com/acme/app/main/SKILL.md");
+  });
+
+  it("returns a canonical hostname for trailing-dot import URLs", () => {
+    expect(
+      parseSkillGitHubSourceUrl("https://github.com./acme/app").hostname,
+    ).toBe("github.com");
+    expect(
+      parsePortabilityGitHubSourceUrl("https://github.com./acme/app").hostname,
+    ).toBe("github.com");
   });
 
   it("pins company import source hosts to the allowlist", () => {
