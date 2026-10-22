@@ -167,6 +167,22 @@ Nested source such as `src/commands/target/` still transfers. Do not use a root
 `target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
 tracks it.
 
+Full-copy workspace seeds also omit untracked files ignored by root or nested
+repository-owned `.gitignore` rules, including when
+`PAPERCLIP_SSH_INCREMENTAL_SYNC=0` disables incremental sync. Git evaluates negations;
+force-added tracked files still transfer, even inside an ignored directory.
+Host-global excludes and `.git/info/exclude` do not determine these omissions.
+Non-Git folders use a temporary empty Git index outside the source folder to
+apply their `.gitignore` files without creating repository metadata in the source.
+An unreadable ignore scan stops the seed rather than exporting ignored files.
+
+The seed returns its omitted paths for the restore baseline and plain restore's
+local-preservation list, so local configuration such as an ignored `.env` survives.
+Full-copy uploads use a NUL-delimited, non-recursive tar file list to retain
+symlinks and literal filenames without growing the command arguments. Large
+restore exclusion scripts travel on SSH stdin instead of overflowing a single
+exec argument; the streaming and extracted-size caps still apply.
+
 The archive creator selects root-relative exclude syntax from its own `tar
 --version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server
 and remote can use different implementations. Unknown implementations fail the
