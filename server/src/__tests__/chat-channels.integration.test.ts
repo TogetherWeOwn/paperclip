@@ -6875,6 +6875,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         mutations: [] as Array<{ url: string; method: string }>,
         fetches: [] as Array<{ url: string; method: string }>,
       };
+      // Persist posted comment bodies like GitHub would, so ownership
+      // re-reads (GET .../comments/<id>) see what was written.
+      const postedCommentBodies = new Map<number, string>();
+      const readPostedBody = (raw: unknown): string | undefined => {
+        try {
+          const body = (JSON.parse(String(raw ?? "{}")) as { body?: unknown }).body;
+          return typeof body === "string" ? body : undefined;
+        } catch {
+          return undefined;
+        }
+      };
       f.setSupplementalProviderFetch(async (input, init) => {
         const url = String(input);
         const method = init?.method ?? "GET";
@@ -6884,7 +6895,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
         if (method !== "GET") {
           recorder.mutations.push({ url, method });
+          const postedBody = readPostedBody(init?.body);
+          if (postedBody !== undefined) {
+            const target = /\/(?:issues|pulls)\/comments\/(\d+)(?:[?#]|$)/.exec(url);
+            postedCommentBodies.set(target ? Number(target[1]) : 1, postedBody);
+          }
           return Response.json({ id: 1, html_url: "https://github.com/test/unexpected" });
+        }
+        const commentById = /\/(?:issues|pulls)\/comments\/(\d+)(?:[?#]|$)/.exec(url);
+        if (commentById) {
+          const body = postedCommentBodies.get(Number(commentById[1]));
+          if (body === undefined) return Response.json([]);
+          return Response.json({ id: Number(commentById[1]), body,
+            user: { login: (f.endpoint as { botUsername?: string }).botUsername ?? "bot" },
+            html_url: "https://github.com/test/comment" });
         }
         if (url.endsWith("/pulls/81"))
           return Response.json({
