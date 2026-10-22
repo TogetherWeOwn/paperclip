@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { accessSync, constants as fsConstants, readFileSync, statSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,11 +9,14 @@ import {
   createSshSyncBackCapTransform,
   downloadChangedFilesFromSsh,
   parseSshPorcelainStatusV1Z,
+  restoreWorkspaceFromSshExecution,
   SshSyncBackSizeLimitExceededError,
   syncDirectoryFromSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
+import { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES } from "./ssh-workspace-excludes.js";
 import { SSH_REMOTE_ARG_MAX_BYTES } from "./remote-execution-env.js";
+import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 const tempDirs: string[] = [];
 
@@ -93,8 +97,11 @@ afterEach(async () => {
   if (originalTmpdir === undefined) delete process.env.TMPDIR;
   else process.env.TMPDIR = originalTmpdir;
   delete process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES;
+  delete process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC;
   delete process.env.STUB_SSH_REMOTE_ROOT;
   delete process.env.STUB_SSH_FIXTURE_DIR;
+  delete process.env.STUB_GIT_ARGV_LOG;
+  delete process.env.STUB_REAL_GIT;
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
@@ -410,4 +417,263 @@ describe("downloadChangedFilesFromSsh", () => {
       }),
     ).rejects.toThrow();
   }, TEST_TIMEOUT_MS);
+});
+
+describe("incremental sync-back bundle export", () => {
+  const GIT_TIMEOUT_MS = 60_000;
+
+  beforeEach(installStubSsh);
+
+  // Resolve the REAL git binary for the argv-log shim to exec. Inside a
+  // Paperclip run, PATH starts with the live managed launcher, so a naive
+  // `command -v git` returns the launcher shim — and a logging shim that execs
+  // the launcher recurses without bound (the launcher re-resolves `git` to the
+  // logging shim). On 2026-10-22 that fork-bombed the shared container to its
+  // PID limit and the run was killed by the PID guard. Strip every launcher
+  // dir and test bin dir, then fail closed unless the result is an absolute,
+  // executable, non-shim path.
+  function resolveRealGitPath(): string {
+    const cleanPath = originalPath
+      .split(path.delimiter)
+      .filter(
+        (entry) =>
+          entry.length > 0 &&
+          !entry.includes("paperclip-github-runtime") &&
+          !tempDirs.includes(entry),
+      )
+      .join(path.delimiter);
+    const resolved = execFileSync("sh", ["-c", "command -v git"], {
+      env: { ...process.env, PATH: cleanPath },
+    })
+      .toString()
+      .trim();
+    if (resolved.length === 0 || !path.isAbsolute(resolved)) {
+      throw new Error(
+        `git-argv-log: no absolute real git found (got ${JSON.stringify(resolved)})`,
+      );
+    }
+    if (!statSync(resolved, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error(`git-argv-log: real git is not a file: ${resolved}`);
+    }
+    try {
+      accessSync(resolved, fsConstants.X_OK);
+    } catch {
+      throw new Error(`git-argv-log: real git is not executable: ${resolved}`);
+    }
+    // Refuse shims even if PATH filtering missed one: our own shim embeds
+    // STUB_REAL_GIT, the managed launcher embeds its credential-cache marker.
+    const head = readFileSync(resolved, "utf8").slice(0, 4096);
+    if (
+      head.includes("STUB_REAL_GIT") ||
+      head.includes("paperclip-github-credential-cache") ||
+      head.includes("managedDigests")
+    ) {
+      throw new Error(
+        `git-argv-log: resolved git is a shim, refusing: ${resolved}`,
+      );
+    }
+    return resolved;
+  }
+
+  // Log every git invocation (local and stub-remote alike — both resolve
+  // through the test process PATH) so the tests can count `bundle create`
+  // attempts and inspect the revision range each one carried.
+  async function installGitArgvLog(): Promise<{ logPath: string }> {
+    const binDir = await createTempDir("paperclip-git-log-bin-");
+    const logPath = path.join(binDir, "git-argv.log");
+    await writeFile(path.join(binDir, "git"), `#!/bin/sh
+# Recursion guard: a misresolved STUB_REAL_GIT re-entering this shim would
+# fork without bound (PID-guard kill, 2026-10-22). Real git nests child git
+# processes at most a couple deep; past that, fail loudly instead.
+depth=\${STUB_GIT_ARGV_DEPTH:-0}
+depth=$((depth + 1))
+if [ "$depth" -gt 5 ]; then
+  echo "git-argv-log: recursion depth $depth exceeds bound; STUB_REAL_GIT=$STUB_REAL_GIT" >&2
+  exit 99
+fi
+export STUB_GIT_ARGV_DEPTH="$depth"
+printf '%s\\n' "$*" >> "$STUB_GIT_ARGV_LOG"
+exec "$STUB_REAL_GIT" "$@"
+`, { mode: 0o755 });
+    process.env.STUB_REAL_GIT = resolveRealGitPath();
+    process.env.STUB_GIT_ARGV_LOG = logPath;
+    process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
+    return { logPath };
+  }
+
+  async function bundleCreateArgvs(logPath: string): Promise<string[]> {
+    const content = await readFile(logPath, "utf8").catch(() => "");
+    return content.split("\n").filter((line) => line.includes("bundle create"));
+  }
+
+  async function initRepo(): Promise<string> {
+    const repoDir = await createTempDir("paperclip-bundle-repo-");
+    await git(repoDir, ["init", "-b", "main"]);
+    await git(repoDir, ["config", "user.email", "bundle-test@example.com"]);
+    await git(repoDir, ["config", "user.name", "Bundle Test"]);
+    return repoDir;
+  }
+
+  async function commitFile(repoDir: string, relative: string, content: string, message: string): Promise<string> {
+    const full = path.join(repoDir, relative);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, content);
+    await git(repoDir, ["add", "-A"]);
+    await git(repoDir, ["commit", "-m", message]);
+    return git(repoDir, ["rev-parse", "HEAD"]);
+  }
+
+  function gitRemoteClone(sourceDir: string, targetDir: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile("git", ["clone", "-q", sourceDir, targetDir], (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error((stderr || stdout || error.message).trim()));
+          return;
+        }
+        resolve(stdout);
+      });
+    });
+  }
+
+  it("skips the bundle entirely when the remote made no commits", async () => {
+    const localDir = await initRepo();
+    const head = await commitFile(localDir, "tracked.txt", "v1\n", "initial");
+    const remoteDir = await createTempDir("paperclip-bundle-remote-");
+    await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+    const checkoutDir = path.join(remoteDir, "checkout");
+    // The remote run edited the worktree without committing.
+    await writeFile(path.join(checkoutDir, "tracked.txt"), "v2\n");
+    const spec = buildStubSpec(remoteDir);
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [".git", ".git/*", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    });
+    const { logPath } = await installGitArgvLog();
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+      baselineSnapshot: baseline,
+      restoreGitHistory: true,
+    });
+
+    expect(await bundleCreateArgvs(logPath)).toEqual([]);
+    await expect(readFile(path.join(localDir, "tracked.txt"), "utf8")).resolves.toBe("v2\n");
+    expect(await git(localDir, ["rev-parse", "HEAD"])).toBe(head);
+  }, GIT_TIMEOUT_MS);
+
+  it("fetches only the new commits when the remote advanced", async () => {
+    const localDir = await initRepo();
+    const baseHead = await commitFile(localDir, "tracked.txt", "v1\n", "initial");
+    const remoteDir = await createTempDir("paperclip-bundle-remote-");
+    await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+    const checkoutDir = path.join(remoteDir, "checkout");
+    await git(checkoutDir, ["config", "user.email", "bundle-test@example.com"]);
+    await git(checkoutDir, ["config", "user.name", "Bundle Test"]);
+    await commitFile(checkoutDir, "tracked.txt", "v2\n", "remote work");
+    const remoteHead = await commitFile(checkoutDir, "second.txt", "more\n", "remote work 2");
+    const spec = buildStubSpec(remoteDir);
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [".git", ".git/*", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    });
+    const { logPath } = await installGitArgvLog();
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+      baselineSnapshot: baseline,
+      restoreGitHistory: true,
+    });
+
+    const bundles = await bundleCreateArgvs(logPath);
+    expect(bundles).toHaveLength(1);
+    // baseHead carries the rev-parse trailing newline; the logged argv joins
+    // args with spaces.
+    expect(bundles[0]).toContain(`^${baseHead.trim()}`);
+    expect(await git(localDir, ["rev-parse", "HEAD"])).toBe(remoteHead);
+    await expect(readFile(path.join(localDir, "tracked.txt"), "utf8")).resolves.toBe("v2\n");
+    await expect(readFile(path.join(localDir, "second.txt"), "utf8")).resolves.toBe("more\n");
+  }, GIT_TIMEOUT_MS);
+
+  it("falls back to the full bundle when the remote lacks the local base", async () => {
+    const localDir = await initRepo();
+    await commitFile(localDir, "local.txt", "local\n", "initial");
+    // A remote with an unrelated history: the incremental `^base` range
+    // cannot resolve there, so the export must retry as a full bundle.
+    const remoteDir = await createTempDir("paperclip-bundle-remote-");
+    const checkoutDir = path.join(remoteDir, "checkout");
+    await mkdir(checkoutDir, { recursive: true });
+    await git(checkoutDir, ["init", "-b", "main"]);
+    await git(checkoutDir, ["config", "user.email", "bundle-test@example.com"]);
+    await git(checkoutDir, ["config", "user.name", "Bundle Test"]);
+    const remoteHead = await commitFile(checkoutDir, "remote.txt", "remote\n", "unrelated root");
+    const spec = buildStubSpec(remoteDir);
+    const { logPath } = await installGitArgvLog();
+
+    // The non-baseline git path resets the workspace to the imported head,
+    // which is well-defined even for unrelated histories.
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+    });
+
+    const bundles = await bundleCreateArgvs(logPath);
+    expect(bundles).toHaveLength(2);
+    expect(bundles[0]).toContain("^");
+    expect(bundles[1]).not.toContain("^");
+    expect(await git(localDir, ["rev-parse", "HEAD"])).toBe(remoteHead);
+    await expect(readFile(path.join(localDir, "remote.txt"), "utf8")).resolves.toBe("remote\n");
+  }, GIT_TIMEOUT_MS);
+
+  it("uses the full bundle when the incremental kill switch is set", async () => {
+    const localDir = await initRepo();
+    await commitFile(localDir, "tracked.txt", "v1\n", "initial");
+    const remoteDir = await createTempDir("paperclip-bundle-remote-");
+    await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+    const spec = buildStubSpec(remoteDir);
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [".git", ".git/*", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+    });
+    const { logPath } = await installGitArgvLog();
+    process.env.PAPERCLIP_SSH_INCREMENTAL_SYNC = "0";
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+      baselineSnapshot: baseline,
+      restoreGitHistory: true,
+    });
+
+    const bundles = await bundleCreateArgvs(logPath);
+    expect(bundles).toHaveLength(1);
+    expect(bundles[0]).not.toContain("^");
+  }, GIT_TIMEOUT_MS);
+
+  it("keeps reset semantics on the skip path: staged changes reset like the full export", async () => {
+    const localDir = await initRepo();
+    await commitFile(localDir, "tracked.txt", "v1\n", "initial");
+    const remoteDir = await createTempDir("paperclip-bundle-remote-");
+    await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
+    // Stage (but do not commit) a local change while the remote stayed at
+    // HEAD: the full export's `reset --hard` wipes it and the tree overlay
+    // restores HEAD content, ending clean. The skip path must behave
+    // identically (not leave the worktree/index disagreeing as "MM").
+    await writeFile(path.join(localDir, "tracked.txt"), "staged\n");
+    await git(localDir, ["add", "tracked.txt"]);
+    const spec = buildStubSpec(remoteDir);
+    const { logPath } = await installGitArgvLog();
+
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir,
+      remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+    });
+
+    expect(await bundleCreateArgvs(logPath)).toEqual([]);
+    await expect(readFile(path.join(localDir, "tracked.txt"), "utf8")).resolves.toBe("v1\n");
+    expect(await git(localDir, ["status", "--porcelain"])).toBe("");
+  }, GIT_TIMEOUT_MS);
 });

@@ -1115,6 +1115,103 @@ async function importGitWorkspaceToSsh(input: {
   }
 }
 
+// Heads for an incremental sync-back export: the local HEAD the sync-back
+// started from plus the remote HEAD the run left behind. Null when either
+// side cannot answer (no commits yet, remote not a repo, probe failed): the
+// export then falls back to the legacy full bundle.
+async function readIncrementalExportHeads(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+}): Promise<{ baseHead: string; remoteHead: string } | null> {
+  const [localHead, remoteHead] = await Promise.all([
+    runLocalGit(input.localDir, ["rev-parse", "HEAD"], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    }).then(
+      (result) => result.stdout.trim(),
+      () => "",
+    ),
+    runSshCommand(input.spec, `git -C ${shellQuote(input.remoteDir)} rev-parse HEAD`, {
+      timeoutMs: 10_000,
+      maxBuffer: 16 * 1024,
+    }).then(
+      (result) => result.stdout.trim(),
+      () => "",
+    ),
+  ]);
+  // rev-parse answers are interpolated into the export script: only hex SHAs
+  // (sha1 or sha256) continue down the incremental path.
+  const shaPattern = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+  if (!shaPattern.test(localHead) || !shaPattern.test(remoteHead)) return null;
+  return { baseHead: localHead, remoteHead };
+}
+
+async function runExportAttempt(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+  bundlePath: string;
+  importedRef: string;
+  // Revision range for `bundle create`: the export ref alone (full history)
+  // or `^base <export ref>` (only the run's new commits).
+  bundleRange: string;
+  resetLocalWorkspace?: boolean;
+  onProgress?: RuntimeProgressSink;
+}): Promise<string> {
+  const exportScript = [
+    "set -e",
+    `git -C ${shellQuote(input.remoteDir)} update-ref refs/paperclip/ssh-sync/export HEAD`,
+    `mkdir -p ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime"))}`,
+    `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "export-XXXXXX.bundle"))})`,
+    'cleanup() { rm -f "$tmp_bundle"; git -C ' + shellQuote(input.remoteDir) + ' update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }',
+    'trap cleanup EXIT',
+    `git -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" ${input.bundleRange} >/dev/null`,
+    'cat "$tmp_bundle"',
+  ].join("\n");
+
+  // The remote bundle size isn't known before streaming, so report bytes
+  // received (MB mode) with a terminal completion line.
+  const progress = input.onProgress
+    ? createTransferProgress({
+      onProgress: input.onProgress,
+      phase: "Exporting git history",
+      direction: "from",
+      totalBytes: null,
+      estimated: false,
+    })
+    : null;
+
+  try {
+    await streamSshToLocalFile({
+      spec: input.spec,
+      remoteScript: exportScript,
+      localFile: input.bundlePath,
+      progress: progress ?? undefined,
+    });
+    await progress?.finish();
+  } catch (error) {
+    await progress?.fail();
+    throw error;
+  }
+
+  await runLocalGit(input.localDir, ["fetch", "--force", input.bundlePath, `refs/paperclip/ssh-sync/export:${input.importedRef}`], {
+    timeout: 60_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (input.resetLocalWorkspace !== false) {
+    await runLocalGit(input.localDir, ["reset", "--hard", input.importedRef], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+  }
+  const importedHead = await runLocalGit(input.localDir, ["rev-parse", input.importedRef], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  });
+  return importedHead.stdout.trim();
+}
+
 async function exportGitWorkspaceFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
@@ -1128,57 +1225,41 @@ async function exportGitWorkspaceFromSsh(input: {
   const importedRef = input.importedRef ?? `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
 
   try {
-    const exportScript = [
-      "set -e",
-      `git -C ${shellQuote(input.remoteDir)} update-ref refs/paperclip/ssh-sync/export HEAD`,
-      `mkdir -p ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime"))}`,
-      `tmp_bundle=$(mktemp ${shellQuote(path.posix.join(input.remoteDir, ".paperclip-runtime", "export-XXXXXX.bundle"))})`,
-      'cleanup() { rm -f "$tmp_bundle"; git -C ' + shellQuote(input.remoteDir) + ' update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }',
-      'trap cleanup EXIT',
-      `git -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
-      'cat "$tmp_bundle"',
-    ].join("\n");
-
-    // The remote bundle size isn't known before streaming, so report bytes
-    // received (MB mode) with a terminal completion line.
-    const progress = input.onProgress
-      ? createTransferProgress({
-        onProgress: input.onProgress,
-        phase: "Exporting git history",
-        direction: "from",
-        totalBytes: null,
-        estimated: false,
-      })
+    // Incremental export, under the same kill switch as the seed fast path:
+    // a run that made no commits skips the bundle entirely, otherwise only
+    // the ^base range crosses the wire. A remote that cannot resolve the
+    // base (unrelated history, shallow clone without it) fails the
+    // incremental attempt and the legacy full bundle runs instead.
+    const heads = isSshIncrementalSyncEnabled()
+      ? await readIncrementalExportHeads(input).catch(() => null)
       : null;
-
-    try {
-      await streamSshToLocalFile({
-        spec: input.spec,
-        remoteScript: exportScript,
-        localFile: bundlePath,
-        progress: progress ?? undefined,
-      });
-      await progress?.finish();
-    } catch (error) {
-      await progress?.fail();
-      throw error;
+    if (heads && heads.remoteHead === heads.baseHead) {
+      if (input.resetLocalWorkspace !== false) {
+        await runLocalGit(input.localDir, ["reset", "--hard", heads.remoteHead], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+      }
+      return heads.remoteHead;
     }
-
-    await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
-    if (input.resetLocalWorkspace !== false) {
-      await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {
-        timeout: 60_000,
-        maxBuffer: 1024 * 1024,
-      });
+    if (heads) {
+      try {
+        return await runExportAttempt({
+          ...input,
+          bundlePath,
+          importedRef,
+          bundleRange: `${shellQuote(`^${heads.baseHead}`)} refs/paperclip/ssh-sync/export`,
+        });
+      } catch {
+        // Fall through to the full bundle below.
+      }
     }
-    const importedHead = await runLocalGit(input.localDir, ["rev-parse", importedRef], {
-      timeout: 10_000,
-      maxBuffer: 16 * 1024,
+    return await runExportAttempt({
+      ...input,
+      bundlePath,
+      importedRef,
+      bundleRange: "refs/paperclip/ssh-sync/export",
     });
-    return importedHead.stdout.trim();
   } finally {
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["update-ref", "-d", importedRef], {
