@@ -3982,7 +3982,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         await githubBotToolsForSession(db, { ...session, issueId: randomUUID() }),
       ).toHaveLength(0);
-      const mutations: Array<{ url: string; body: Record<string, unknown> }> = [];
+      const mutations: Array<{
+        url: string;
+        method: "POST" | "PATCH";
+        body: Record<string, unknown>;
+      }> = [];
       const comments = new Map<
         number,
         {
@@ -4008,6 +4012,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         id: 98,
         details_url: "https://github.com/paperclipai/paperclip/pull/91",
       };
+      let exposeReviewPublicationCheckRows = false;
+      const newerCheckFromOtherPull = {
+        id: 102,
+        external_id: `${f.endpoint.id}:92:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://github.com/paperclipai/paperclip/pull/92",
+      };
+      const olderMatchingCheck = {
+        id: 103,
+        external_id: `${f.endpoint.id}:91:${head}`,
+        app: { id: Number(f.endpoint.botExternalId) },
+        details_url: "https://internal.example/reviews",
+      };
       const pull = () => ({
         number: 91,
         title: "Test PR",
@@ -4024,7 +4041,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         if (!url.includes("/repos/paperclipai/paperclip/")) return undefined;
         if (init?.method === "POST" || init?.method === "PATCH") {
           const body = JSON.parse(String(init.body));
-          mutations.push({ url, body });
+          mutations.push({ url, method: init.method, body });
           const id =
             init.method === "PATCH"
               ? Number(url.split("/").at(-1))
@@ -4090,13 +4107,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               deletions: 1,
             },
           ]);
-        if (url.includes("/check-runs?"))
+        if (url.includes("/check-runs?")) {
+          if (exposeReviewPublicationCheckRows) {
+            const filter = new URL(url).searchParams.get("filter");
+            return Response.json({
+              check_runs:
+                filter === "all"
+                  ? [newerCheckFromOtherPull, olderMatchingCheck]
+                  : [newerCheckFromOtherPull],
+            });
+          }
           return Response.json({
             check_runs:
               check.details_url === "https://current-vanity.example/reviews"
                 ? [duplicateCheck, check]
                 : [check],
           });
+        }
         return Response.json([]);
       });
       const service = githubChatReviewService(db, f.providerFetch);
@@ -4196,6 +4223,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ...assessment,
         findings: [{ ...assessment.findings[1], basePath: "src/math.ts" }],
       })).rejects.toThrow("basePath must match GitHub's base filename");
+      const checkMutationCountBeforePublication = mutations.filter((mutation) =>
+        mutation.url.includes("/check-runs"),
+      ).length;
+      const readCountBeforePublication = reads.length;
+      exposeReviewPublicationCheckRows = true;
       const result = await service.execute(
         session,
         "submit_review",
@@ -4203,6 +4235,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "first-invocation",
       );
       expect(result).toMatchObject({ score: 2, conclusion: "failure" });
+      const reviewCheckMutations = mutations
+        .filter((mutation) => mutation.url.includes("/check-runs"))
+        .slice(checkMutationCountBeforePublication);
+      expect(reviewCheckMutations).toHaveLength(1);
+      expect(reviewCheckMutations[0]).toMatchObject({
+        method: "PATCH",
+        url: `https://api.github.com/repos/paperclipai/paperclip/check-runs/${olderMatchingCheck.id}`,
+        body: {
+          details_url: "https://github.com/paperclipai/paperclip/pull/91",
+        },
+      });
+      const reviewCheckRequests = reads
+        .slice(readCountBeforePublication)
+        .filter((url) => url.includes("/check-runs?"));
+      expect(reviewCheckRequests).toHaveLength(1);
+      expect(
+        new URL(reviewCheckRequests[0]!).searchParams.get("filter"),
+      ).toBe("all");
+      exposeReviewPublicationCheckRows = false;
       const [publication] = await db
         .select()
         .from(chatActions)
@@ -69513,17 +69564,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await vi.waitFor(() =>
         expect(dm.post).toHaveBeenCalledWith(visibleFailure),
       );
-      await expect(
-        db
-          .select({ kind: chatActions.kind, status: chatActions.status })
-          .from(chatActions)
-          .where(eq(chatActions.deliveryId, delivery.id)),
-      ).resolves.toEqual(
-        expect.arrayContaining([
-          { kind: "inbound_wakeup", status: "failed" },
-          { kind: "provider_effect", status: "processed" },
-        ]),
-      );
+      // The DM post is observable before its provider_effect row settles,
+      // so under suite load the row can still be mid-settlement when the
+      // mock resolves (drew a processing row in CI on 2026-10-22). Wait
+      // for the bookkeeping, bounded, like the ephemeral-post paths do.
+      await vi.waitFor(async () => {
+        expect(
+          await db
+            .select({ kind: chatActions.kind, status: chatActions.status })
+            .from(chatActions)
+            .where(eq(chatActions.deliveryId, delivery.id)),
+        ).toEqual(
+          expect.arrayContaining([
+            { kind: "inbound_wakeup", status: "failed" },
+            { kind: "provider_effect", status: "processed" },
+          ]),
+        );
+      });
     } finally {
       await retirePublicationFixture(service, endpoint.id);
     }

@@ -52,7 +52,7 @@ Ported in this release: `877a4a0f` (#108, port of #61 `b3aad750`, nested checkou
 | 9f0164b8 | fix(runner): gate warm attach rotation on attach-event commit (#96) | not-needed | Test-only; prod gate added then reverted. |
 | 993151a6 | chore(lockfile): refresh pnpm-lock.yaml (#97) | not-needed | Lockfile churn only. |
 | 7b243bc7 | fix(chat): keep GitHub chat output free of internal references (#78) | already-equivalent | Deploy `cffd3bce15` (port #103) covers #78. |
-| 1c470343 | fix(chat-github): search all check runs before replacement (#100) | keep-for-tog.9 | Follow-up port: latest-only lookup caused duplicate POSTs. Deploy-tip #105 does not cover it (different change). |
+| 1c470343 | fix(chat-github): search all check runs before replacement (#100) | keep-for-tog.9 (ported via #247) | Ported on the deploy line via #247: final review publisher reuses the paginated all-results lookup (`filter=all`) instead of the latest-only check list (port of `1c470343`); fail-closed throw on exhausted pagination; import-block conflict resolved (deploy-only review-snapshot imports kept), lookup hunk + test deltas line-identical to source (88+/18- across 4 files); 5/5 reconciliation tests + shared-head integration test pass with red-before mutant proof + server tsc clean. |
 | 99868069 | ci(workflows): repair validation and prevent fork publication (#40) | not-needed | CI-only validation + publication guard. |
 
 Counts (audit range only; the supplemental ports #109 and #110 are outside it): keep-for-tog.9: 13 (5 ported on the deploy line, 8 as follow-up small PRs) · already-equivalent: 21 · not-needed: 7.
