@@ -200,6 +200,17 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
     expect(recorded!.envKeys).not.toContain("BIG_B");
   });
 
+  it("sends the host-verifiable binding with an authorized launch", async () => {
+    const result = await launchWith(executor(async (recorded) => sign(recorded)));
+    expect(result.exitCode).toBe(0);
+    const sent = readFileSync(marker, "utf8");
+    expect(sent).toContain("paperclip_expected_argv");
+    expect(sent).toContain("paperclip_expected_env");
+    expect(sent).toContain(REQUEST_ID);
+    expect(sent).toContain('exec "$@"');
+    expect(sent).not.toContain("exec env ");
+  });
+
   it("accepts an executor bound by the active run scope instead of an explicit option", async () => {
     const result = await runWithNativeSshHostExecutor(executor(async (recorded) => sign(recorded)), () => launchWith());
     expect(result.exitCode).toBe(0);
@@ -323,6 +334,10 @@ describe("native SSH authority off (server environment)", () => {
     expect(result.exitCode).toBe(0);
     expect(childStarted()).toBe(true);
     expect(result.nativeSshAuthority).toBeNull();
+    // No authority, no verifier: the legacy `exec env` script is sent as before.
+    const sent = readFileSync(marker, "utf8");
+    expect(sent).not.toContain("paperclip_");
+    expect(sent).toContain("exec env ");
     expect(await tempArtifacts()).toEqual([]);
   });
 

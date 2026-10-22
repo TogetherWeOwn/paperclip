@@ -99,10 +99,11 @@ export const SSH_REMOTE_ARG_MAX_BYTES = 128 * 1024 - 4 * 1024;
 export const SSH_REMOTE_ENV_MAX_BYTES = 96 * 1024;
 
 // ssh.ts's shellQuote wraps the value in single quotes and expands each
-// embedded quote to `'\''`; the whole script is quoted once more at launch,
-// so every inner quote costs another 3 bytes in the final argument. Mirror
-// both expansions exactly: raw-byte accounting undercounts quote-heavy
-// values by up to 4x and lets the assembled argument blow the limit.
+// embedded quote to `'"'"'` (1 -> 5 bytes, +4); the whole script is quoted
+// once more at launch with the same quoter, so every inner quote costs
+// another 4 bytes in the final argument. Mirror both expansions exactly:
+// raw-byte accounting undercounts quote-heavy values and lets the assembled
+// argument blow the limit.
 function countSingleQuotes(value: string): number {
   let count = 0;
   for (let i = 0; i < value.length; i++) {
@@ -116,27 +117,33 @@ function shellQuotedBytes(value: string): number {
 }
 
 // Bytes the outer script re-quote adds to a script fragment: each single
-// quote inside expands 1 -> 4 (+3) and the wrapper adds 2.
+// quote inside expands 1 -> 5 (+4) and the wrapper adds 2.
 export function sshScriptOuterQuotedBytes(script: string): number {
-  return Buffer.byteLength(script) + 2 + 3 * countSingleQuotes(script);
+  return Buffer.byteLength(script) + 2 + 4 * countSingleQuotes(script);
 }
 
 // Bytes an entry adds to the final `sh -c '<script>'` ssh argument: the
 // inner-quoted `KEY=VALUE` plus the outer re-quote's expansion of each inner
-// quote (+3 bytes) and one entry separator.
-function sshEnvEntryFinalBytes(key: string, value: string): number {
+// quote (+4 bytes) and one entry separator. The inner form holds the wrapper
+// pair plus three quotes per embedded quote (`'"'"'`), hence 2 + 3q.
+// Exported so the verified-script lane can extend it for its own shape.
+export function sshEnvEntryFinalBytes(key: string, value: string): number {
   return (
     Buffer.byteLength(key) +
     1 +
     shellQuotedBytes(value) +
-    3 * (2 + countSingleQuotes(value)) +
+    4 * (2 + 3 * countSingleQuotes(value)) +
     1
   );
 }
 
 export function budgetSshRemoteEnvWithReport(
   env: Record<string, string> | NodeJS.ProcessEnv,
-  options: { reservedArgBytes?: number } = {},
+  options: {
+    reservedArgBytes?: number;
+    /** Per-entry final-argument bytes; defaults to the legacy `KEY='V' ` form. */
+    entryFinalBytes?: (key: string, value: string) => number;
+  } = {},
 ): { env: Record<string, string>; dropped: string[] } {
   // The quoted remote command shares the launch argument with the env
   // block, so the env budget shrinks by whatever the rest of the argument
@@ -151,18 +158,18 @@ export function budgetSshRemoteEnvWithReport(
   const { env: pruned, dropped } = pruneOversizedLaunchEnvWithReport(env);
   const kept: Record<string, string> = {};
   let totalBytes = 0;
+  const entryFinalBytes = options.entryFinalBytes ?? sshEnvEntryFinalBytes;
   const candidates = Object.entries(pruned)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     // Keep the largest entries first: a payload-carrying value must not be
     // crowded out by smaller optional settings when both would fit.
     .sort(
       (a, b) =>
-        sshEnvEntryFinalBytes(b[0], b[1]) -
-          sshEnvEntryFinalBytes(a[0], a[1]) ||
+        entryFinalBytes(b[0], b[1]) - entryFinalBytes(a[0], a[1]) ||
         (a[0] < b[0] ? -1 : 1),
     );
   for (const [key, value] of candidates) {
-    const entryBytes = sshEnvEntryFinalBytes(key, value);
+    const entryBytes = entryFinalBytes(key, value);
     if (totalBytes + entryBytes > envBudget) {
       dropped.push(key);
       continue;

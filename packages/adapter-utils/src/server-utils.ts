@@ -3818,7 +3818,8 @@ async function resolveSpawnTarget(
               remoteCwd: remote.remoteCwd,
             },
             // What the remote command actually gets after the SSH size budget.
-            env: sshLaunchEnv({ spec: remote, command, args, env: sshEnv }).env,
+            // Verified exactly when a proof will be spent at the build site.
+            env: sshLaunchEnv({ spec: remote, command, args, env: sshEnv, verified: hostExecutor != null }).env,
           },
           options.signal ? { signal: options.signal } : undefined,
         )

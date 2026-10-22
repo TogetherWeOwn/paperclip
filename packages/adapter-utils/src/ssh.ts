@@ -12,7 +12,15 @@ import {
   throwIfLaunchCancelled,
   type NativeSshSignedEnvelope,
 } from "./host-executor.js";
-import { budgetSshRemoteEnvWithReport, sshScriptOuterQuotedBytes } from "./remote-execution-env.js";
+import {
+  buildNativeSshVerifiedRemoteScript,
+  type NativeSshHostVerifierBinding,
+} from "./native-ssh-host-verifier.js";
+import {
+  budgetSshRemoteEnvWithReport,
+  sshEnvEntryFinalBytes,
+  sshScriptOuterQuotedBytes,
+} from "./remote-execution-env.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -1504,7 +1512,7 @@ export async function runSshCommand(
 // .bash_profile typically sources .bashrc itself; only source .bashrc
 // directly when no .bash_profile exists, so a host that adds nvm in
 // .bashrc still resolves node without a double-run of the setup.
-const SSH_LOGIN_PROFILE_LINES = [
+export const SSH_LOGIN_PROFILE_LINES = [
   'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
   'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
   'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
@@ -1516,6 +1524,30 @@ function sshRemoteCommandParts(input: { command: string; args: string[] }): stri
 }
 
 /**
+ * Fixed-size stand-in binding for the verified-script reservation: the
+ * reservation render measures bytes, and the embedded opaque id (36 chars)
+ * and expiry epoch (10 digits through the year 2286) never vary in length, so
+ * a render with this binding reserves exactly the fixed overhead of a render
+ * with the real one. Pinned by the byte-mirror test.
+ */
+export const SSH_VERIFIED_RESERVATION_BINDING: NativeSshHostVerifierBinding = {
+  expiresAt: "2033-05-18T03:33:20.000Z",
+  opaqueRequestId: "00000000-0000-4000-8000-000000000000",
+};
+
+/**
+ * Final-argument bytes each env entry costs in the verified script: the
+ * legacy `KEY='V' ` bytes plus the verified shape's extra per entry — its own
+ * `export KEY='V'` &&-link (`export ` + ` && `) plus a `"KEY=$KEY"` word in
+ * the env-hash subshell. The extra is quoteless, so the outer re-quote adds
+ * nothing. Mirror of the generator in native-ssh-host-verifier.ts; the
+ * byte-mirror test fails if they drift.
+ */
+export function sshVerifiedEnvEntryFinalBytes(key: string, value: string): number {
+  return sshEnvEntryFinalBytes(key, value) + 2 * Buffer.byteLength(key) + 15;
+}
+
+/**
  * The environment an SSH agent launch actually sends, after the size budget.
  * The whole remote env is folded into a single `sh -c` argv string, so the
  * assembled env block needs a per-argument byte budget as well (E2BIG).
@@ -1523,13 +1555,37 @@ function sshRemoteCommandParts(input: { command: string; args: string[] }): stri
  * quoted command and args, wrappers) so a large command shrinks the env
  * budget instead of overflowing the assembled argument. Pure: no key
  * material or connection, so an authority can be issued for its result.
+ *
+ * With `verified`, the launch carries an executor-issued authority and the
+ * remote script carries the embedded host verifier, whose fixed overhead and
+ * per-entry shape differ from the legacy script. The reservation mirrors the
+ * verified shape exactly so the budgeted env always fits the final argument.
+ * Both the authorize site and the build site must pass the same flag for a
+ * launch: they derive it from the same fact (executor bound / proof spent).
  */
 export function sshLaunchEnv(input: {
-  spec: Pick<SshRemoteExecutionSpec, "remoteCwd">;
+  spec: Pick<SshRemoteExecutionSpec, "remoteCwd" | "username">;
   command: string;
   args: string[];
   env: Record<string, string>;
+  verified?: boolean;
 }): { env: Record<string, string>; dropped: string[] } {
+  if (input.verified) {
+    const envFreeScript = buildNativeSshVerifiedRemoteScript({
+      profileLines: SSH_LOGIN_PROFILE_LINES,
+      username: input.spec.username,
+      remoteCwd: input.spec.remoteCwd,
+      command: input.command,
+      args: input.args,
+      launchEnv: {},
+      binding: SSH_VERIFIED_RESERVATION_BINDING,
+    });
+    const reservedArgBytes = 6 + sshScriptOuterQuotedBytes(envFreeScript);
+    return budgetSshRemoteEnvWithReport(input.env, {
+      reservedArgBytes,
+      entryFinalBytes: sshVerifiedEnvEntryFinalBytes,
+    });
+  }
   const envFreeScript = [
     ...SSH_LOGIN_PROFILE_LINES,
     `cd ${shellQuote(input.spec.remoteCwd)}`,
@@ -1549,6 +1605,8 @@ export async function buildSshSpawnTarget(input: {
    * remote target was signed for this launch. Checked and spent before any
    * argv, environment or key material is touched, so a refused launch leaves
    * nothing behind. Required when the server requires native SSH authority.
+   * A launch built with a proof sends the embedded host verifier with it;
+   * without one the legacy script is sent unchanged.
    */
   authority?: NativeSshSignedEnvelope | null;
   /**
@@ -1564,7 +1622,9 @@ export async function buildSshSpawnTarget(input: {
 }> {
   // First gate: the proof stays unspent and no key file exists for a dead run.
   throwIfLaunchCancelled(input.signal, "Native SSH launch");
-  const { env: launchEnv, dropped } = sshLaunchEnv(input);
+  // The budget must match the authorize site's: both derive `verified` from
+  // the same fact (a proof is spent here iff an executor was bound there).
+  const { env: launchEnv, dropped } = sshLaunchEnv({ ...input, verified: input.authority != null });
   // The authority covers the environment the remote command actually gets,
   // after the size budget, so it is checked here and not on `input.env`.
   if (input.authority != null || isNativeSshAuthorityRequired()) {
@@ -1595,19 +1655,35 @@ export async function buildSshSpawnTarget(input: {
       throw new Error(`Invalid SSH environment variable key: ${key}`);
     }
   }
-  const remoteCommandParts = sshRemoteCommandParts(input);
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(launchEnv)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
-  const remoteScript = [
-    ...SSH_LOGIN_PROFILE_LINES,
-    `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
-  ].join(" && ");
+  // An authority-carrying launch sends its binding with it: the host rechecks
+  // user, directory, expiry, argv and env before exec. Without an authority
+  // the legacy script is byte-identical to before.
+  let remoteScript: string;
+  if (input.authority != null) {
+    remoteScript = buildNativeSshVerifiedRemoteScript({
+      profileLines: SSH_LOGIN_PROFILE_LINES,
+      username: input.spec.username,
+      remoteCwd: input.spec.remoteCwd,
+      command: input.command,
+      args: input.args,
+      launchEnv,
+      binding: input.authority.authority,
+    });
+  } else {
+    const remoteCommandParts = sshRemoteCommandParts(input);
+    const envArgs = Object.entries(launchEnv)
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+      .map(([key, value]) => `${key}=${shellQuote(value)}`);
+    remoteScript = [
+      ...SSH_LOGIN_PROFILE_LINES,
+      `cd ${shellQuote(input.spec.remoteCwd)}`,
+      envArgs.length > 0
+        ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
+        : `exec ${remoteCommandParts}`,
+    ].join(" && ");
+  }
 
   sshArgs.push(
     "-p",
