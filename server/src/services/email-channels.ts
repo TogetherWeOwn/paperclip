@@ -1584,6 +1584,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         if (!reply)
           throw badRequest("Reply target is not in this inbox conversation");
       }
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.email);
       await insertChatPublications(tx, {
         id: input.idempotencyKey,
         companyId,
