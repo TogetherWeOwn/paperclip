@@ -115,6 +115,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  noCodeWorkspaceSelectionConflict,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
@@ -9746,7 +9747,10 @@ export function issueService(db: Db) {
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
-      if (!isolatedWorkspacesEnabled) {
+      const noCodeWorkspaceRequested = parseObject(issueData.executionWorkspaceSettings).mode === "no_code";
+      const noCodeConflict = noCodeWorkspaceSelectionConflict(issueData);
+      if (noCodeConflict) throw unprocessable(noCodeConflict);
+      if (!isolatedWorkspacesEnabled && !noCodeWorkspaceRequested) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
@@ -9910,6 +9914,7 @@ export function issueService(db: Db) {
             issueData.projectId === workspaceSource.projectId;
           if (
             inheritsSourceProject &&
+            !noCodeWorkspaceRequested &&
             projectWorkspaceId == null &&
             workspaceSource.projectWorkspaceId
           ) {
@@ -10011,7 +10016,7 @@ export function issueService(db: Db) {
               ),
             ) as Record<string, unknown> | null;
         }
-        if (!projectWorkspaceId && issueData.projectId) {
+        if (!noCodeWorkspaceRequested && !projectWorkspaceId && issueData.projectId) {
           const project = await tx
             .select({
               executionWorkspacePolicy: projects.executionWorkspacePolicy,
@@ -10662,10 +10667,24 @@ export function issueService(db: Db) {
       // Warm sandbox continuity is runtime bookkeeping, independent of the
       // opt-in UI for creating isolated worktrees. Public updates still obey
       // the feature gate; only the internal shared-workspace binding bypasses it.
-      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace) {
+      const effectiveNoCodeSelection = {
+        executionWorkspaceSettings: existing.executionWorkspaceSettings,
+        projectWorkspaceId: existing.projectWorkspaceId,
+        executionWorkspaceId: existing.executionWorkspaceId,
+        executionWorkspacePreference: existing.executionWorkspacePreference,
+        assigneeAdapterOverrides: existing.assigneeAdapterOverrides,
+        ...issueData,
+      };
+      const noCodeConflict = noCodeWorkspaceSelectionConflict(effectiveNoCodeSelection);
+      if (noCodeConflict) throw unprocessable(noCodeConflict);
+      const noCodeWorkspaceRequested = parseObject(effectiveNoCodeSelection.executionWorkspaceSettings).mode === "no_code";
+      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace && !noCodeWorkspaceRequested) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
-        delete issueData.executionWorkspaceSettings;
+        // Clearing a no-code opt-in remains possible when isolated worktrees are off.
+        if (!(parseObject(existing.executionWorkspaceSettings).mode === "no_code" && issueData.executionWorkspaceSettings === null)) {
+          delete issueData.executionWorkspaceSettings;
+        }
       }
 
       if (issueData.status) {

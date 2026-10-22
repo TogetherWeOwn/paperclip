@@ -467,6 +467,7 @@ import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   mergeIssueAdapterConfigOverrides,
+  noCodeWorkspaceSelectionConflict,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -12944,8 +12945,43 @@ export function heartbeatService(
     opts?: {
       useProjectWorkspace?: boolean | null;
       executionEnvironmentDriver?: string | null;
+      noCodeIssueId?: string;
     },
   ): Promise<ResolvedWorkspaceForRun> {
+    if (opts?.noCodeIssueId) {
+      const home = resolveDefaultAgentWorkspaceDir(agent.id);
+      await fs.mkdir(home, { recursive: true });
+      const canonicalHome = await fs.realpath(home);
+      let cwd = canonicalHome;
+      // A separate ordinary task directory cannot adopt an old repository/session.
+      // Refuse symlinks and Git roots instead of deleting or reusing their contents.
+      for (const segment of ["no-code", opts.noCodeIssueId]) {
+        if (await fs.lstat(path.join(cwd, ".git")).then(() => true, (error) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        })) throw new Error("No-code execution directory conflicts with an existing Git workspace");
+        cwd = path.join(cwd, segment);
+        await fs.mkdir(cwd).catch((error) => {
+          if (error.code !== "EEXIST") throw error;
+        });
+        const stats = await fs.lstat(cwd);
+        if (!stats.isDirectory() || stats.isSymbolicLink()) {
+          throw new Error("No-code execution directory must be an ordinary directory inside the agent workspace");
+        }
+      }
+      if (!(await fs.realpath(cwd)).startsWith(`${canonicalHome}${path.sep}`)) {
+        throw new Error("No-code execution directory escaped the agent workspace");
+      }
+      if (await fs.lstat(path.join(cwd, ".git")).then(() => true, (error) => {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      })) throw new Error("No-code execution directory conflicts with an existing Git workspace");
+      return {
+        cwd, source: "agent_home", projectId: readNonEmptyString(context.projectId),
+        workspaceId: null, repoUrl: null, repoRef: null, workspaceHints: [], warnings: [],
+        baseCwdFallback: false, materializationFailures: [], additionalWorkspaces: [], referencedProjectFailures: [],
+      };
+    }
     const anchor = await resolveAnchorWorkspaceForRun(
       agent,
       context,
@@ -21365,7 +21401,13 @@ export function heartbeatService(
         parseIssueExecutionWorkspaceSettings(
           issueContext?.executionWorkspaceSettings,
         );
-      const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled
+      const noCodeWorkspace = parsedIssueExecutionWorkspaceSettings?.mode === "no_code";
+      const noCodeConflict = noCodeWorkspaceSelectionConflict({
+        ...issueContext,
+        executionWorkspaceSettings: parsedIssueExecutionWorkspaceSettings,
+      });
+      if (noCodeConflict) throw new Error(noCodeConflict);
+      const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled || noCodeWorkspace
         ? parsedIssueExecutionWorkspaceSettings
         : null;
       const environmentExecutionWorkspaceSettings =
@@ -21873,6 +21915,9 @@ export function heartbeatService(
           : null;
       const persistedNativeExecutionWorkspaceId =
         persistedNativeExecutionInput?.binding.executionWorkspaceId ?? null;
+      if (noCodeWorkspace && persistedNativeExecutionWorkspaceId) {
+        throw new Error("No-code workspace selection conflicts with the immutable native recovery workspace binding");
+      }
       const requestedExecutionWorkspaceId =
         persistedNativeExecutionWorkspaceId ??
         readNonEmptyString(issueRef?.executionWorkspaceId);
@@ -22434,7 +22479,7 @@ export function heartbeatService(
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const previousSessionParams =
+      const previousSessionParams = noCodeWorkspace ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
           agent.adapterType,
@@ -22476,6 +22521,11 @@ export function heartbeatService(
           return preflightEnvironment.driver;
         },
         resolveWorkspace: async () => {
+          if (noCodeWorkspace && issueRef) {
+            const workspace = await resolveWorkspaceForRun(agent, context, null, { noCodeIssueId: issueRef.id });
+            runtimeConfig = { ...runtimeConfig, cwd: workspace.cwd };
+            return { ...workspace, projectId: issueRef.projectId };
+          }
           if (nativeChatWorkspaceScope && !nativeChatWorkspaceScope.projectId) {
             const cwd = await materializeNativeChatTaskRoot(
               nativeChatWorkspaceScope,
@@ -22734,8 +22784,15 @@ export function heartbeatService(
                   resolveGitAuth: workspaceGitAuthProvider,
                 })
             : null,
-          realizeWorkspace: () =>
-            realizeExecutionWorkspace({
+          realizeWorkspace: () => noCodeWorkspace
+            ? Promise.resolve({
+                ...executionWorkspaceBase,
+                strategy: "project_primary" as const,
+                cwd: executionWorkspaceBase.baseCwd,
+                branchName: null, worktreePath: null, warnings: [],
+                created: false, branchCreatedByRuntime: false,
+              })
+            : realizeExecutionWorkspace({
               db,
               base: executionWorkspaceBase,
               config: hostExecutionWorkspaceConfig,
@@ -23008,7 +23065,7 @@ export function heartbeatService(
                 },
               )
             : (adoptedAllocatedExecutionWorkspace ??
-              (resolvedProjectId
+              (resolvedProjectId && !noCodeWorkspace
                 ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,

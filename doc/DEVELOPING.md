@@ -798,6 +798,26 @@ If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs f
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.
 
+## Explicit no-code tasks
+
+Set `executionWorkspaceSettings: { "mode": "no_code" }` through the normal task
+create or update API to select an ordinary task directory under the agent workspace.
+This per-task opt-in is independent of the isolated-worktree feature flag. It is
+not inferred from a role, task text, `ask` or `planning` work mode, missing
+repositories, or `agent_default`. Children must opt in separately.
+
+No-code preparation skips project and referenced repository checkout, repository
+provisioning and working-tree seed/restore. The task keeps its project identity
+and all company, environment, sandbox, credential and authorization checks.
+Runtime instructions, skills and authentication assets may still transfer.
+
+A conflicting execution-workspace binding or preference, project-workspace choice,
+or task-level workspace strategy, runtime or cwd override must be explicitly
+removed first. The API rejects conflicts rather than discarding either choice.
+It never deletes an existing code workspace. Clear the opt-in for future dispatches
+to restore normal workspace selection. An existing low-trust isolation requirement
+can still reject a no-code run; this mode does not grant a sandbox exception.
+
 ## Project Repository Checkouts
 
 Tasks use every distinct repository attached to their project, including repository-only sources with no local folder. Paperclip creates a managed checkout when no local folder is configured. The selected repository remains at the task workspace root. Other project repositories have editable, independent Git checkouts under `.paperclip-repositories/<name>-<key>`. Workspace hints expose each checkout path to the agent.
