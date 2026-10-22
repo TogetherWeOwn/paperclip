@@ -6,7 +6,9 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -340,6 +342,45 @@ describe("ssh seed mirror", () => {
           ignored,
         ).toBe(false);
       }
+    },
+    SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps relative symlink targets in the seed overlay",
+    async () => {
+      const { repoDir, head } = await initSeedTestRepo();
+      // Untracked, so both ride the overlay (not `*.log`: ignored names never
+      // transfer). The stub ssh IS the same-host condition — local paths are
+      // visible to the "remote" — so only the link target string, not the
+      // bytes behind it, can prove the staging copy kept the link relative.
+      await writeFile(path.join(repoDir, "two.txt"), "target bytes\n");
+      await symlink("two.txt", path.join(repoDir, "cur.txt"));
+      const mirrorRoot = await createTempDir("paperclip-ssh-mirrors-");
+      const fixtureDir = await createFixtureRootDir("paperclip-seed-remote-");
+      const spec = buildStubSpec(fixtureDir);
+      const runId = randomUUID();
+      const localRemoteDir = path.join(fixtureDir, "runs", runId, "workspace");
+
+      const prepared = await withMirrorEnv(mirrorRoot, () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir: repoDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/runs/${runId}/workspace`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("shared-mirror");
+      expect(await git(localRemoteDir, ["rev-parse", "HEAD"])).toBe(head);
+      expect(
+        (await lstat(path.join(localRemoteDir, "cur.txt"))).isSymbolicLink(),
+      ).toBe(true);
+      await expect(
+        readlink(path.join(localRemoteDir, "cur.txt")),
+      ).resolves.toBe("two.txt");
+      await expect(
+        readFile(path.join(localRemoteDir, "two.txt"), "utf8"),
+      ).resolves.toBe("target bytes\n");
     },
     SSH_SEED_MIRROR_TEST_TIMEOUT_MS,
   );
