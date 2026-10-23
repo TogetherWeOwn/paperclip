@@ -1894,12 +1894,6 @@ async function buildRuntime(input: {
     url,
     connectionId,
   }));
-  const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = runtimeMcpServers.map((server) => ({
-    type: "http",
-    name: server.name,
-    url: server.url,
-    headers: [{ name: "Authorization", value: `Bearer ${server.token}` }],
-  }));
   // Resolve the wall-clock timeout through the shared execution-target
   // resolver so sandbox-backed runs pick up the 4h backstop default while
   // local/SSH runs keep the historical "0 = no adapter timeout" behavior.
@@ -2340,6 +2334,7 @@ async function buildRuntime(input: {
           adapterKey: input.engine.adapterType,
           timeoutSec,
           hostApiToken: env.PAPERCLIP_API_KEY,
+          mcpServers: runtimeMcpServers,
           enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(remoteTarget),
           duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(remoteTarget),
           onLog: input.ctx.onLog,
@@ -2496,6 +2491,15 @@ async function buildRuntime(input: {
     : agentCommand;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
+  // Bind after transport startup: remote ACP session/new and session/load must
+  // receive only this run's bridge capability, never the host-held MCP tokens.
+  const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> =
+    (paperclipBridge?.mcpServers ?? runtimeMcpServers).map((server) => ({
+      type: "http",
+      name: server.name,
+      url: server.url,
+      headers: [{ name: "Authorization", value: `Bearer ${server.token}` }],
+    }));
   const loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,
     includeRuntimeKeys: ["HOME"],
@@ -4220,6 +4224,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 session_options: {
                   ...record.acpx?.session_options,
                   env: { ...prepared.env },
+                  mcpServers: prepared.mcpServers,
                 },
               },
             };

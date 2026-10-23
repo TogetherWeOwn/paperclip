@@ -162,10 +162,14 @@ Issue execution may also use project execution workspace policies and workspace 
 The Claude and Codex CLI lanes register managed MCP endpoints on the host before
 serializing runtime assets for a sandbox callback bridge. Synced JSON/TOML carries
 only an opaque bridge endpoint and bearer, never the host run JWT or a managed
-connections/plugin bearer. The host selects each upstream credential from its
-run-local endpoint map and overwrites the forwarded run ID. Caller-provided URLs
-and query parameters cannot select an upstream endpoint. Redirects are refused.
-Trusted local runs keep their established MCP configuration.
+connections/plugin bearer. The shared ACP engine binds the same endpoints after
+bridge startup for both `session/new` and `session/load`. Resumes replace stored
+MCP session options with the new run's bridge URLs and bearer; the reusable staged
+runtime does not supply credentials. The host selects each upstream credential
+from its run-local endpoint map and overwrites the forwarded run ID. Raw paths
+must match the host route allowlist, and opaque MCP paths reject all query
+parameters before URL parsing. Redirects are refused. Trusted local runs keep
+their established MCP configuration.
 
 Sandbox bridge credentials expire after 15 minutes, including while the gateway
 listener and copied files survive. Teardown revokes forwarding before stopping

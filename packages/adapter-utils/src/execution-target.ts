@@ -4811,7 +4811,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       };
     }
     const mcp = mcpEndpoints.get(request.path);
-    if (request.path.startsWith("/mcp/bridge/") && !mcp) {
+    // A capability names one exact endpoint. Validate the raw queue/HTTP2
+    // path and query before URL parsing can normalize attacker-controlled bytes.
+    if (authorizeSandboxCallbackBridgeRequestWithRoutes(request) ||
+        (request.path.startsWith("/mcp/") && (!mcp || request.query !== ""))) {
       return {
         status: 403,
         headers: { "content-type": "application/json" },
