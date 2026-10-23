@@ -39,6 +39,7 @@ import {
 } from "../fixtures/issueChatLongThreadFixture";
 import { expiredSecretProposalInteraction } from "../fixtures/issueThreadInteractionFixtures";
 import type {
+  IssueChatComment,
   IssueChatLinkedRun,
   IssueChatTranscriptEntry,
 } from "../lib/issue-chat-messages";
@@ -731,6 +732,308 @@ describe("IssueChatThread", () => {
       expect(vi.getTimerCount()).toBe(0);
       unmountThread();
       await act(async () => resolveCopy());
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
+
+  describe.each([false, true])("sibling clipboard lifecycle (StrictMode=%s)", (strictMode) => {
+    const surfaces = [
+      { name: "assistant message", label: "Copy message", text: "Copy this assistant message" },
+      { name: "code block", label: "Copy", text: "const clipboardValue = 42;\nclipboardValue;" },
+      { name: "system-notice body", label: "Copy system notice", text: "Copy this system notice body" },
+      { name: "system-notice link", label: "Copy link to system notice", text: null },
+    ] as const;
+    let root: ReturnType<typeof createRoot> | null;
+    let clipboardDescriptor: PropertyDescriptor | undefined;
+    let execCommandDescriptor: PropertyDescriptor | undefined;
+    let originalUrl: string;
+    let writeText: ReturnType<typeof vi.fn<(text: string) => Promise<void>>>;
+    let execCommand: ReturnType<typeof vi.fn<(command: string) => boolean>>;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      root = null;
+      originalUrl = window.location.href;
+      window.history.replaceState(null, "", "/acceptance/thread");
+      clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      execCommandDescriptor = Object.getOwnPropertyDescriptor(document, "execCommand");
+      writeText = vi.fn(async () => {});
+      execCommand = vi.fn(() => false);
+      vi.stubGlobal("isSecureContext", true);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: execCommand,
+      });
+    });
+
+    function unmountThread() {
+      act(() => root?.unmount());
+      root = null;
+    }
+
+    function button(label: string) {
+      const result = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+      expect(result, `${label} must reach a real production button`).not.toBeNull();
+      if (!result) throw new Error(`${label} button missing`);
+      return result;
+    }
+
+    function hasFeedback(label: string) {
+      return button(label).querySelector(".lucide-check") !== null;
+    }
+
+    async function copy(label: string) {
+      await act(async () => button(label).click());
+      // Flush jsdom's fallback selection events, not the feedback deadline.
+      act(() => vi.advanceTimersByTime(0));
+    }
+
+    function mountSurface(name: typeof surfaces[number]["name"]) {
+      const isNotice = name.startsWith("system-notice");
+      const comments: IssueChatComment[] = name === "code block" ? [] : [{
+        id: isNotice ? "clipboard-notice" : "clipboard-assistant",
+        companyId: "company-1",
+        issueId: "issue-1",
+        authorAgentId: isNotice ? null : "agent-1",
+        authorUserId: null,
+        authorType: isNotice ? "system" : "agent",
+        body: isNotice ? "Copy this system notice body" : "Copy this assistant message",
+        presentation: null,
+        metadata: null,
+        createdAt: new Date("2026-04-06T12:00:00.000Z"),
+        updatedAt: new Date("2026-04-06T12:00:00.000Z"),
+      }];
+      const linkedRuns: IssueChatLinkedRun[] = name === "code block" ? [{
+        runId: "clipboard-output-run",
+        status: "succeeded",
+        agentId: "agent-1",
+        agentName: "Example assistant",
+        createdAt: new Date("2026-04-06T12:00:00.000Z"),
+        startedAt: new Date("2026-04-06T12:00:00.000Z"),
+        finishedAt: new Date("2026-04-06T12:01:00.000Z"),
+        hasStoredOutput: true,
+      }] : [];
+      const transcripts = new Map<string, readonly IssueChatTranscriptEntry[]>([["clipboard-output-run", [{
+        kind: "provider_activity",
+        ts: "2026-04-06T12:00:01.000Z",
+        family: "tool_execution",
+        status: "completed",
+        title: "Clipboard output fixture",
+        payload: { output: "const clipboardValue = 42;\nclipboardValue;" },
+      }]]]);
+      const thread = (
+        <MemoryRouter>
+          <IssueChatThread
+            comments={comments}
+            linkedRuns={linkedRuns}
+            timelineEvents={[]}
+            liveRuns={[]}
+            transcriptsByRunId={transcripts}
+            hasOutputForRun={(runId) => transcripts.has(runId)}
+            onAdd={async () => {}}
+            showComposer={false}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>
+      );
+      root = createRoot(container);
+      act(() => root?.render(strictMode ? <StrictMode>{thread}</StrictMode> : thread));
+      if (name === "code block") {
+        // Real transcript -> run disclosure -> completed work -> provider output
+        // -> CopyablePreBlock. MarkdownBody's test double is not the code surface.
+        const run = Array.from(container.querySelectorAll("button")).find((entry) =>
+          entry.textContent?.startsWith("Example assistant"),
+        );
+        expect(run, "completed run disclosure").toBeDefined();
+        act(() => run?.click());
+        const worked = Array.from(container.querySelectorAll("button")).find((entry) =>
+          entry.textContent?.startsWith("Worked"),
+        );
+        expect(worked, "completed transcript work disclosure").toBeDefined();
+        act(() => worked?.click());
+        const output = Array.from(container.querySelectorAll("button")).find((entry) =>
+          entry.textContent?.includes("Clipboard output fixture"),
+        );
+        expect(output, "provider output disclosure").toBeDefined();
+        act(() => output?.click());
+        expect(container.querySelector("pre")?.textContent).toBe("const clipboardValue = 42;\nclipboardValue;");
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    }
+
+    afterEach(() => {
+      unmountThread();
+      // Ownership assertions happen in the tests, before this drain. Even RED
+      // callbacks must not escape into another fixture or jsdom teardown.
+      act(() => vi.runOnlyPendingTimers());
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      } else {
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+      if (execCommandDescriptor) {
+        Object.defineProperty(document, "execCommand", execCommandDescriptor);
+      } else {
+        Reflect.deleteProperty(document, "execCommand");
+      }
+      window.history.replaceState(null, "", originalUrl);
+      vi.unstubAllGlobals();
+    });
+
+    describe.each(surfaces)("$name", (surface) => {
+      beforeEach(() => mountSurface(surface.name));
+
+      function expectedText() {
+        return surface.text ?? `${window.location.origin}/acceptance/thread#comment-clipboard-notice`;
+      }
+
+      it("shows successful copy feedback for two seconds, then resets", async () => {
+        expect(hasFeedback(surface.label)).toBe(false);
+        await copy(surface.label);
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(expectedText());
+        expect(hasFeedback(surface.label)).toBe(true);
+        expect(vi.getTimerCount()).toBe(1);
+        act(() => vi.advanceTimersByTime(1999));
+        expect(hasFeedback(surface.label)).toBe(true);
+        act(() => vi.advanceTimersByTime(1));
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("keeps the repeated-copy feedback until two seconds after the latest success", async () => {
+        await copy(surface.label);
+        act(() => vi.advanceTimersByTime(1000));
+        await copy(surface.label);
+        expect(writeText.mock.calls).toEqual([[expectedText()], [expectedText()]]);
+        act(() => vi.advanceTimersByTime(1000));
+        expect(hasFeedback(surface.label)).toBe(true);
+        act(() => vi.advanceTimersByTime(999));
+        expect(hasFeedback(surface.label)).toBe(true);
+        act(() => vi.advanceTimersByTime(1));
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("owns only one pending reset after repeated successful copies", async () => {
+        await copy(surface.label);
+        await copy(surface.label);
+        await copy(surface.label);
+        expect(writeText.mock.calls).toEqual([[expectedText()], [expectedText()], [expectedText()]]);
+        expect(hasFeedback(surface.label)).toBe(true);
+        expect(vi.getTimerCount()).toBe(1);
+      });
+
+      it("releases the successful copy reset callback on unmount", async () => {
+        await copy(surface.label);
+        expect(hasFeedback(surface.label)).toBe(true);
+        expect(vi.getTimerCount()).toBe(1);
+        unmountThread();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("releases all reset callbacks when repeated copies are unmounted", async () => {
+        await copy(surface.label);
+        act(() => vi.advanceTimersByTime(1000));
+        await copy(surface.label);
+        expect(hasFeedback(surface.label)).toBe(true);
+        unmountThread();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not schedule feedback when deferred clipboard success settles after unmount", async () => {
+        let resolveCopy!: () => void;
+        writeText.mockImplementationOnce(() => new Promise<void>((resolve) => {
+          resolveCopy = resolve;
+        }));
+        await copy(surface.label);
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(expectedText());
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        unmountThread();
+        await act(async () => resolveCopy());
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not claim success or schedule a reset when clipboard and fallback fail", async () => {
+        writeText.mockRejectedValueOnce(new Error("Clipboard denied"));
+        await copy(surface.label);
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(expectedText());
+        expect(execCommand).toHaveBeenCalledExactlyOnceWith("copy");
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not schedule feedback when deferred clipboard rejection settles after unmount", async () => {
+        let rejectCopy!: (reason: Error) => void;
+        writeText.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+          rejectCopy = reject;
+        }));
+        await copy(surface.label);
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(expectedText());
+        unmountThread();
+        await act(async () => rejectCopy(new Error("Clipboard denied")));
+        act(() => vi.advanceTimersByTime(0));
+        expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("copies the actual value via execCommand in an insecure context", async () => {
+        vi.stubGlobal("isSecureContext", false);
+        let selectedValue: string | undefined;
+        execCommand.mockImplementation(() => {
+          selectedValue = document.querySelector<HTMLTextAreaElement>('textarea[aria-hidden="true"]')?.value;
+          return true;
+        });
+        await copy(surface.label);
+        expect(writeText).not.toHaveBeenCalled();
+        expect(execCommand).toHaveBeenCalledExactlyOnceWith("copy");
+        expect(selectedValue).toBe(expectedText());
+        expect(hasFeedback(surface.label)).toBe(true);
+        expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+        act(() => vi.advanceTimersByTime(2000));
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not claim success when the clipboard fallback throws", async () => {
+        writeText.mockRejectedValueOnce(new Error("Clipboard denied"));
+        execCommand.mockImplementation(() => { throw new Error("Fallback denied"); });
+        await copy(surface.label);
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(expectedText());
+        expect(execCommand).toHaveBeenCalledExactlyOnceWith("copy");
+        expect(hasFeedback(surface.label)).toBe(false);
+        expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+    });
+
+    it.each([
+      ["Copy system notice", "Copy link to system notice"],
+      ["Copy link to system notice", "Copy system notice"],
+    ])("keeps system-notice body/link feedback independent: %s before %s", async (first, second) => {
+      mountSurface("system-notice body");
+      await copy(first);
+      expect(hasFeedback(first)).toBe(true);
+      expect(hasFeedback(second)).toBe(false);
+      act(() => vi.advanceTimersByTime(1000));
+      await copy(second);
+      const body = "Copy this system notice body";
+      const link = `${window.location.origin}/acceptance/thread#comment-clipboard-notice`;
+      expect(writeText.mock.calls).toEqual(first === "Copy system notice" ? [[body], [link]] : [[link], [body]]);
+      expect(vi.getTimerCount()).toBe(2);
+      act(() => vi.advanceTimersByTime(1000));
+      expect(hasFeedback(first)).toBe(false);
+      expect(hasFeedback(second)).toBe(true);
+      expect(vi.getTimerCount()).toBe(1);
+      act(() => vi.advanceTimersByTime(999));
+      expect(hasFeedback(second)).toBe(true);
+      act(() => vi.advanceTimersByTime(1));
+      expect(hasFeedback(second)).toBe(false);
       expect(vi.getTimerCount()).toBe(0);
     });
   });
