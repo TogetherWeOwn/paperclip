@@ -3006,6 +3006,12 @@ async function readSshRemoteFullCopyIgnoredPaths(
     "set -e",
     `cd ${shellQuote(remoteDir)}`,
     "if inside=$(git rev-parse --is-inside-work-tree 2>/dev/null); then",
+    // A plain workspace nested in another checkout has no index authority of
+    // its own. Match the incremental status probe's toplevel requirement.
+    "  if [ \"$inside\" = true ]; then",
+    "    prefix=$(git rev-parse --show-prefix)",
+    "    [ -z \"$prefix\" ] || inside=false",
+    "  fi",
     "  printf '%s' \"$inside\"",
     "else",
     "  code=$?; current=$(pwd -P)",
@@ -3362,14 +3368,12 @@ async function tryRestoreChangedFilesFromSsh(input: {
     if (!keep(entry) || deleted.has(entry) || transfer.has(entry)) continue;
     transfer.add(entry);
   }
-  // Remote ignored records (`!!`): the full copy restores an ignored file
-  // that did not exist at seed time, so the delta must carry it too. A
-  // baseline-present record the excludes did not already drop (a tracked
-  // file the run uncached under an ignore rule, whose `D ` the delete below
-  // must not honor) transfers as well: the merge no-ops byte-identical
-  // content, and the seed-time masses never reach this loop — mirror seeds
-  // exclude them from the baseline, and a matching legacy fingerprint
-  // clears the records above.
+  // Remote ignored records (`!!`) also include host-global/info excludes,
+  // which are not transfer authority. Carry any record the baseline still
+  // allows, canceling a staged deletion of the same path. Current repository
+  // ignores are already excluded by both restore paths; legacy carried-file
+  // fingerprints instead retain their original contract and clear unchanged
+  // ignored records above.
   for (const entry of status.ignoredPaths) {
     if (!keep(entry) || transfer.has(entry)) continue;
     deleted.delete(entry);
@@ -3448,13 +3452,12 @@ export async function restoreWorkspaceFromSshExecution(input: {
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  // Full copies independently evaluate the remote repository's rules; seed
-  // omissions additionally preserve local-only config even if rules changed.
-  // The baseline branch probes only after the incremental path falls back.
-  // Earlier full-copy seeds carried ignored files. Their fingerprint proves
-  // that older transfer contract; preserve it when restoring an in-flight run.
+  // Both restore paths evaluate the current remote rules before selecting a
+  // transfer; seed omissions additionally preserve local-only config even if
+  // rules changed. Earlier full-copy seeds carried ignored files. Their
+  // fingerprint proves that older contract; preserve it for in-flight runs.
   const carriedIgnoredFiles = (input.seedState?.ignoredFingerprint?.count ?? 0) > 0;
-  const fullCopyIgnored = input.baselineSnapshot || carriedIgnoredFiles
+  const fullCopyIgnored = carriedIgnoredFiles
     ? []
     : await readSshRemoteFullCopyIgnoredPaths(input.spec, remoteDir);
   const ignoredRestorePaths = [...new Set([...(input.ignoredPaths ?? []), ...fullCopyIgnored])]
@@ -3466,8 +3469,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   if (input.baselineSnapshot) {
     // The sync-back never carries the agent-local scratch, so the merge must
     // not read its absence as a remote deletion of the local copies.
-    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
-    const ignored = new Set(input.ignoredPaths ?? []);
+    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot, ignoredRestorePaths);
+    const ignored = new Set(ignoredRestorePaths);
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -3523,19 +3526,16 @@ export async function restoreWorkspaceFromSshExecution(input: {
         })
         : false;
       if (!restoredIncrementally) {
-        const fullCopyIgnored = carriedIgnoredFiles
-          ? []
-          : await readSshRemoteFullCopyIgnoredPaths(input.spec, remoteDir);
         await syncDirectoryFromSsh({
           spec: input.spec,
           remoteDir,
           localDir: stagingDir,
-          exclude: [...transferExclude, ...fullCopyIgnored.map((entry) => `./${escapeTarExcludeLiteral(entry)}`)],
+          exclude: transferExclude,
           onProgress: input.onProgress,
           progressLabel: "workspace",
         });
         await mergeDirectoryWithBaseline({
-          baseline: withSshAgentLocalExcludes(baseline, fullCopyIgnored),
+          baseline,
           sourceDir: stagingDir,
           targetDir: input.localDir,
           beforeApply,

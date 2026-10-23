@@ -172,11 +172,14 @@ repository-owned `.gitignore` rules, including when
 `PAPERCLIP_SSH_INCREMENTAL_SYNC=0` disables incremental sync. Git evaluates negations;
 force-added tracked files still transfer, even inside an ignored directory.
 Host-global excludes and `.git/info/exclude` do not determine these omissions.
-Full-copy restores independently evaluate the remote repository's rules before
-download, including when seed provenance is unavailable. Plain non-Git folders
-retain their full-copy fallback: a `.gitignore` file alone does not supply index
-authority. An unreadable ignore scan in a known repository stops the transfer
-rather than exporting ignored files.
+Both incremental and full-copy restores independently evaluate the current remote
+repository's rules before download, including when seed provenance is unavailable.
+Plain non-Git folders retain their full-copy fallback: a `.gitignore` file alone
+does not supply index authority, and a plain remote workspace nested inside
+another checkout does not inherit that checkout's ignore rules. An unreadable
+ignore scan in a known repository stops the transfer rather than exporting ignored
+files. Older in-flight seeds that carried ignored files retain their fingerprinted
+restore contract.
 
 The seed returns its omitted paths for the restore baseline and plain restore's
 local-preservation list, so local configuration such as an ignored `.env` survives.
