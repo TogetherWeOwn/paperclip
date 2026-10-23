@@ -63,6 +63,7 @@ import {
 } from "./local-service-supervisor.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { ensurePaperclipCommitMsgHook } from "./paperclip-git-hooks.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -3621,6 +3622,11 @@ async function provisionExecutionWorktree(input: {
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
 }) {
+  // Always-on trailer-hook wiring (fail-open, never throws): point the base
+  // checkout's local core.hooksPath at the image-baked Paperclip hooks so
+  // agent commits carry Paperclip-Agent/Run trailers. Linked worktrees share
+  // the base's local config, so this one set covers every execution worktree.
+  await ensurePaperclipCommitMsgHook(input.repoRoot);
   const provisionCommand = resolveWorkspaceProvisionCommand(input.strategy, input.repoRoot);
   if (!provisionCommand) return;
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
@@ -3732,6 +3738,10 @@ export async function realizeExecutionWorkspace(input: {
         },
       );
     }
+    // Shared-checkout strategy: agents commit directly in the base checkout,
+    // so wire the trailer hook here (the git_worktree paths go through
+    // provisionExecutionWorktree instead). Fail-open, never throws.
+    await ensurePaperclipCommitMsgHook(input.base.baseCwd);
     return {
       ...input.base,
       strategy: "project_primary",
@@ -4194,6 +4204,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     if (!await directoryExists(cwd)) {
       return null;
     }
+    // Shared-checkout strategy: see realizeExecutionWorkspace. Fail-open.
+    await ensurePaperclipCommitMsgHook(cwd);
     return realized;
   }
   // Validate the base checkout before the git spawn. A missing or empty base
