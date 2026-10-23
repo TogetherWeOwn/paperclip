@@ -500,6 +500,53 @@ describe("run cancellation before spawn", () => {
     expect(await tempArtifacts()).toEqual([]);
   });
 
+  it("refuses after cancellation during key staging and cleans up before spawn", async () => {
+    const controller = new AbortController();
+    const requestEnvelope = vi.fn(async (recorded: NativeSshLaunchAuthority) => sign(recorded));
+    const writeFile = fs.writeFile.bind(fs);
+    const stagedKeys: string[] = [];
+    const onSpawn = vi.fn(async () => {});
+    const write = vi.spyOn(fs, "writeFile").mockImplementation(async (file, data, options) => {
+      await writeFile(file, data, options);
+      if (data === `${spec.privateKey}\n`) {
+        // This real write is inside asynchronous target resolution, after the
+        // initial buildSshSpawnTarget gate and a successful signer round trip.
+        expect(requestEnvelope).toHaveBeenCalledOnce();
+        expect(controller.signal.aborted).toBe(false);
+        const keyPath = String(file);
+        expect(await fs.readFile(keyPath, "utf8")).toBe(`${spec.privateKey}\n`);
+        stagedKeys.push(keyPath);
+        controller.abort();
+      }
+    });
+
+    try {
+      const error = await runChildProcess(RUN, COMMAND, ARGS, {
+        cwd: sandbox,
+        env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn,
+        remoteExecution: spec,
+        hostExecutor: executor(requestEnvelope),
+        signal: controller.signal,
+      }).then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(stagedKeys).toHaveLength(1);
+      expect(controller.signal.aborted).toBe(true);
+      expect(error).toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+      expect(onSpawn).not.toHaveBeenCalled();
+      expect(childStarted()).toBe(false);
+      expect(await tempArtifacts()).toEqual([]);
+      await expect(fs.stat(stagedKeys[0])).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it("refuses before resolving anything when already cancelled", async () => {
     const controller = new AbortController();
     controller.abort();

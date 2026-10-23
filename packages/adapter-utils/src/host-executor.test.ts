@@ -485,11 +485,10 @@ describe("launch cancellation", () => {
     expect(persistEnvelope).not.toHaveBeenCalled();
   });
 
-  it("refuses after the signer answers when the run died waiting", async () => {
+  it("refuses when cancellation wins the signer answer race", async () => {
     const controller = new AbortController();
-    // The signer answers, but the run is already dead: the abort fires while
-    // the answer is still settling, so the post-answer re-check refuses before
-    // verification and envelope persistence.
+    // Synchronous abort wins askSigner's race before the answer settles; this
+    // covers cancellation during the wait, not the post-answer re-check.
     const { target, verifyEnvelope, persistEnvelope } = cancelledTarget(() => {
       controller.abort();
       return Promise.resolve(signEnvelope(expectedAuthority()));
@@ -497,6 +496,27 @@ describe("launch cancellation", () => {
     await expect(target.authorizeLaunch(launchInput, { signal: controller.signal })).rejects.toMatchObject({
       code: "launch_cancelled",
     });
+    expect(verifyEnvelope).not.toHaveBeenCalled();
+    expect(persistEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("refuses cancellation after the signer answer wins the race but before verification", async () => {
+    const controller = new AbortController();
+    const settled = Promise.resolve(signEnvelope(expectedAuthority()));
+    const { target, requestEnvelope, verifyEnvelope, persistEnvelope } = cancelledTarget(() => {
+      // Let the fulfilled answer win askSigner's race, then abort before its
+      // caller resumes. Removing only the post-answer re-check must expose
+      // verification/persistence, rather than be rescued by the abort race.
+      void settled.then((value) => value).then((value) => value).then(() => controller.abort());
+      return settled;
+    });
+
+    await expect(target.authorizeLaunch(launchInput, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+      name: "LaunchCancelledError",
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(requestEnvelope).toHaveBeenCalledOnce();
     expect(verifyEnvelope).not.toHaveBeenCalled();
     expect(persistEnvelope).not.toHaveBeenCalled();
   });
