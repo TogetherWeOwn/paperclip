@@ -567,7 +567,176 @@ describe("IssueChatThread", () => {
     });
   });
 
+  describe.each([false, true])("clipboard lifecycle (StrictMode=%s)", (strictMode) => {
+    let root: ReturnType<typeof createRoot> | null;
+    let clipboardDescriptor: PropertyDescriptor | undefined;
+    let execCommandDescriptor: PropertyDescriptor | undefined;
+    let writeText: ReturnType<typeof vi.fn<(text: string) => Promise<void>>>;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      execCommandDescriptor = Object.getOwnPropertyDescriptor(document, "execCommand");
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: vi.fn(() => false),
+      });
+      writeText = vi.fn(async () => {});
+      vi.stubGlobal("isSecureContext", true);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      root = createRoot(container);
+      const thread = (
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[{
+              id: "clipboard-lifecycle",
+              companyId: "company-1",
+              issueId: "issue-1",
+              authorAgentId: null,
+              authorUserId: "user-1",
+              authorType: "user",
+              body: "Copy this lifecycle message",
+              presentation: null,
+              metadata: null,
+              createdAt: new Date("2026-04-06T12:00:00.000Z"),
+              updatedAt: new Date("2026-04-06T12:00:00.000Z"),
+            }]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            onAdd={async () => {}}
+            showComposer={false}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>
+      );
+      act(() => root?.render(strictMode ? <StrictMode>{thread}</StrictMode> : thread));
+    });
+
+    function unmountThread() {
+      act(() => root?.unmount());
+      root = null;
+    }
+
+    function copyButton() {
+      const button = container.querySelector<HTMLButtonElement>('button[aria-label="Copy message"]');
+      expect(button).not.toBeNull();
+      if (!button) throw new Error("Copy message button missing");
+      return button;
+    }
+
+    async function copyMessage() {
+      await act(async () => {
+        copyButton().click();
+      });
+      // jsdom queues zero-delay selectionchange events during clipboard fallback.
+      // Flush those browser events without consuming the two-second reset.
+      act(() => vi.advanceTimersByTime(0));
+    }
+
+    afterEach(() => {
+      unmountThread();
+      // Drain only after each test has asserted lifecycle ownership. Never discard
+      // pending callbacks or let this fixture leak them into jsdom teardown.
+      act(() => vi.runOnlyPendingTimers());
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      } else {
+        Reflect.deleteProperty(navigator, "clipboard");
+      }
+      if (execCommandDescriptor) {
+        Object.defineProperty(document, "execCommand", execCommandDescriptor);
+      } else {
+        Reflect.deleteProperty(document, "execCommand");
+      }
+      vi.unstubAllGlobals();
+    });
+
+    it("shows successful copy feedback for two seconds, then resets", async () => {
+      expect(vi.getTimerCount()).toBe(0);
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledWith("Copy this lifecycle message");
+      expect(copyButton().querySelector(".lucide-check")).not.toBeNull();
+      act(() => vi.advanceTimersByTime(1999));
+      expect(copyButton().querySelector(".lucide-check")).not.toBeNull();
+      act(() => vi.advanceTimersByTime(1));
+      expect(copyButton().querySelector(".lucide-check")).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("releases the successful copy reset callback on unmount", async () => {
+      await copyMessage();
+      expect(copyButton().querySelector(".lucide-check")).not.toBeNull();
+      expect(vi.getTimerCount()).toBe(1);
+      unmountThread();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("restarts the feedback deadline after a repeated successful copy", async () => {
+      await copyMessage();
+      act(() => vi.advanceTimersByTime(1000));
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledTimes(2);
+      act(() => vi.advanceTimersByTime(1000));
+      expect(copyButton().querySelector(".lucide-check")).not.toBeNull();
+      act(() => vi.advanceTimersByTime(999));
+      expect(copyButton().querySelector(".lucide-check")).not.toBeNull();
+      act(() => vi.advanceTimersByTime(1));
+      expect(copyButton().querySelector(".lucide-check")).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("releases all reset callbacks when repeated copies are unmounted", async () => {
+      await copyMessage();
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledTimes(2);
+      unmountThread();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not show success or schedule a reset when copying fails", async () => {
+      writeText.mockRejectedValueOnce(new Error("Clipboard denied"));
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(copyButton().querySelector(".lucide-check")).toBeNull();
+      expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not schedule feedback when clipboard rejection settles after unmount", async () => {
+      let rejectCopy!: (reason: Error) => void;
+      writeText.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+        rejectCopy = reject;
+      }));
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      unmountThread();
+      await act(async () => rejectCopy(new Error("Clipboard denied")));
+      act(() => vi.advanceTimersByTime(0));
+      expect(document.querySelector('textarea[aria-hidden="true"]')).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not schedule feedback when clipboard success settles after unmount", async () => {
+      let resolveCopy!: () => void;
+      writeText.mockImplementationOnce(() => new Promise<void>((resolve) => {
+        resolveCopy = resolve;
+      }));
+      await copyMessage();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(copyButton().querySelector(".lucide-check")).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+      unmountThread();
+      await act(async () => resolveCopy());
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
+
   it("falls back to execCommand for comment copy actions in insecure contexts", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const clipboardWrite = vi.fn(async () => {
       throw new Error("Clipboard API blocked");
     });
@@ -642,11 +811,15 @@ describe("IssueChatThread", () => {
 
       expect(clipboardWrite).not.toHaveBeenCalled();
       expect(execCommand).toHaveBeenCalledWith("copy");
+      act(() => vi.advanceTimersByTime(0));
+      expect(vi.getTimerCount()).toBe(1);
 
       act(() => {
         root.unmount();
       });
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
+      act(() => vi.runOnlyPendingTimers());
       if (originalClipboard) {
         Object.defineProperty(navigator, "clipboard", originalClipboard);
       } else {

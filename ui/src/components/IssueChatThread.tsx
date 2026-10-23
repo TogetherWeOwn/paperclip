@@ -2035,6 +2035,18 @@ function IssueChatUserMessage({
       ? custom.queueTargetRunId
       : null;
   const [copied, setCopied] = useState(false);
+  const copyResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyFeedbackMounted = useRef(false);
+  useEffect(() => {
+    copyFeedbackMounted.current = true;
+    return () => {
+      copyFeedbackMounted.current = false;
+      if (copyResetTimer.current !== null) {
+        clearTimeout(copyResetTimer.current);
+        copyResetTimer.current = null;
+      }
+    };
+  }, []);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const toastActions = useOptionalToastActions();
   const {
@@ -2206,8 +2218,15 @@ function IssueChatUserMessage({
                   .join("\n\n");
                 void copyTextToClipboard(text)
                   .then(() => {
+                    if (!copyFeedbackMounted.current) return;
+                    if (copyResetTimer.current !== null) {
+                      clearTimeout(copyResetTimer.current);
+                    }
                     setCopied(true);
-                    setTimeout(() => setCopied(false), 2000);
+                    copyResetTimer.current = setTimeout(() => {
+                      copyResetTimer.current = null;
+                      setCopied(false);
+                    }, 2000);
                   })
                   .catch((error) => {
                     toastActions?.pushToast({
