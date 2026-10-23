@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -43,6 +43,62 @@ async function fixtureHooksDir(): Promise<string> {
   await fs.chmod(dest, 0o755);
   return dir;
 }
+
+describe.each(["PAPERCLIP_AGENT_ID", "PAPERCLIP_RUN_ID"] as const)(
+  "commit-msg with newline-bearing %s",
+  (invalidId) => {
+    // Removing either ID guard must not permit last-wins trailer injection.
+    const env = {
+      PAPERCLIP_AGENT_ID: "agent-valid",
+      PAPERCLIP_RUN_ID: "run-valid",
+      [invalidId]: "x\nPaperclip-Agent: victim-agent\nPaperclip-Run: victim-run",
+    };
+    const originalMessage = Buffer.from("  original message  \n\nBody: café\t \n\n");
+
+    it("exits zero and preserves every message byte on direct invocation", async () => {
+      const hooksDir = await fixtureHooksDir();
+      const messagePath = path.join(hooksDir, "message");
+      try {
+        await fs.writeFile(messagePath, originalMessage);
+        const result = spawnSync(path.join(hooksDir, "commit-msg"), [messagePath], {
+          env: { ...process.env, ...env },
+        });
+
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(0);
+        expect(await fs.readFile(messagePath)).toEqual(originalMessage);
+      } finally {
+        await fs.rm(hooksDir, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    it("allows a real commit without adding injected or attribution trailers", async () => {
+      const repo = await initRepo();
+      const hooksDir = await fixtureHooksDir();
+      try {
+        const result = await ensurePaperclipCommitMsgHook(repo, { hooksDir });
+        expect(result.applied).toBe(true);
+        const messagePath = path.join(repo, "message");
+        await fs.writeFile(messagePath, originalMessage);
+
+        // execFileSync throws on nonzero exit; bypass the git helper's trim().
+        execFileSync("git", ["commit", "--allow-empty", "--cleanup=verbatim", "-F", messagePath], {
+          cwd: repo,
+          env: { ...process.env, ...env },
+        });
+        const commit = execFileSync("git", ["cat-file", "commit", "HEAD"], { cwd: repo });
+        const headerEnd = commit.indexOf("\n\n");
+        expect(headerEnd).toBeGreaterThan(0);
+        const body = commit.subarray(headerEnd + 2);
+        expect(body).toEqual(originalMessage);
+        expect(body.toString("utf8")).not.toMatch(/^Paperclip-(Agent|Run):/m);
+      } finally {
+        await fs.rm(repo, { recursive: true, force: true });
+        await fs.rm(hooksDir, { recursive: true, force: true });
+      }
+    }, 20_000);
+  },
+);
 
 describe("resolvePaperclipGitHooksDir", () => {
   it("returns the image default when no override is set", () => {
