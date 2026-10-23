@@ -4,7 +4,7 @@ export function githubLauncherSource(): string {
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
@@ -16,6 +16,35 @@ const executable = originalPath.map(p => path.join(p, program)).find(p => {
 if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
+}
+const LOCAL_GIT_COMMANDS = new Set([
+  'status', 'diff', 'log', 'show', 'rev-parse', 'rev-list', 'branch', 'worktree', 'ls-files', 'ls-tree',
+  'cat-file', 'config', 'init', 'add', 'rm', 'mv', 'restore', 'checkout', 'switch', 'reset', 'grep', 'blame',
+  'describe', 'diff-tree', 'diff-index', 'diff-files', 'for-each-ref', 'show-ref', 'symbolic-ref', 'update-ref',
+  'merge-base', 'name-rev', 'shortlog', 'reflog', 'check-ignore', 'check-attr', 'check-ref-format', 'hash-object',
+  'write-tree', 'read-tree', 'update-index', 'count-objects', 'clean', 'apply', 'stripspace', 'mktree', 'help',
+  'version', 'sparse-checkout', 'range-diff', 'whatchanged', 'show-branch', 'cherry',
+]);
+const LOCAL_REMOTE_SUBCOMMANDS = new Set(['add', 'get-url', 'set-url', 'rename', 'remove', 'rm', '-v', '--verbose']);
+const GIT_OPTIONS_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env']);
+function gitNeedsCredentials(args, env) {
+  const globals = [];
+  let index = 0;
+  while (index < args.length && args[index].startsWith('-')) {
+    const arg = args[index++];
+    globals.push(arg);
+    if (GIT_OPTIONS_WITH_VALUE.has(arg) && index < args.length) globals.push(args[index++]);
+  }
+  const command = args[index];
+  if (!command) return false;
+  const local = command === 'remote'
+    ? index + 1 >= args.length || LOCAL_REMOTE_SUBCOMMANDS.has(args[index + 1])
+    : LOCAL_GIT_COMMANDS.has(command);
+  if (!local) return true;
+  const probe = spawnSync(executable, [...globals, 'config', '--get', 'extensions.partialClone'], {
+    env: { ...env, PATH: originalPath.join(path.delimiter) }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  return probe.status === 0 && probe.stdout.trim() !== '';
 }
 async function main() {
   let env = { ...process.env };
@@ -50,9 +79,10 @@ async function main() {
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    const wantsCredentials = program === 'gh' || gitNeedsCredentials(process.argv.slice(2), env);
     try {
     let response;
-    if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
+    if (wantsCredentials && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
@@ -96,7 +126,7 @@ async function main() {
         }
       }
       }
-    } else { diagnostic('capability_missing'); }
+    } else if (wantsCredentials) { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
   }
   // Only this invocation and its children inherit the captured credential.
