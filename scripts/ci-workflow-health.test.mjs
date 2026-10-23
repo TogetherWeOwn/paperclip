@@ -6,6 +6,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { affectedWork } from "./ci-affected-work.mjs";
+// Collect the offline qualification acceptance tests through Workflow Health's
+// existing node --test entry point, without changing any workflow gates.
+import "./fork-pinned-qualification.test.mjs";
 
 const workflowPath = (name) => fileURLToPath(new URL(`../.github/workflows/${name}.yml`, import.meta.url));
 const workflow = (name) => readFileSync(workflowPath(name), "utf8");
