@@ -2061,7 +2061,7 @@ exec "$STUB_REAL_GIT" "$@"
   );
 
   it(
-    "restores an ignored file the run created when none existed at seed time",
+    "omits newly ignored files while restoring tracked edits and preserving concurrent local ignored files",
     async () => {
       const localDir = await initRepo();
       await writeFile(
@@ -2073,12 +2073,24 @@ exec "$STUB_REAL_GIT" "$@"
       const remoteDir = await createTempDir("paperclip-wire-ignored-remote-");
       await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
       const checkoutDir = path.join(remoteDir, "checkout");
-      // No .log file exists locally at seed time, so no ignored entry is
-      // baseline-blind here; the run's creation must come back.
+      // New ignored files obey the same repository rules as a full restore.
+      // Tracked edits must still transfer; concurrent local ignored work wins.
       await writeFile(path.join(checkoutDir, "run.log"), "remote log\n");
+      await writeFile(
+        path.join(checkoutDir, "local.log"),
+        "remote collision\n",
+      );
+      await writeFile(
+        path.join(checkoutDir, "seed.txt"),
+        "remote tracked edit\n",
+      );
       const baseline = await captureDirectorySnapshot(localDir, {
         exclude: baselineExcludes(),
       });
+      await writeFile(
+        path.join(localDir, "local.log"),
+        "concurrent local log\n",
+      );
       const spec = buildStubSpec(remoteDir);
       const { logPath } = await installSshArgvLog();
       process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
@@ -2094,7 +2106,13 @@ exec "$STUB_REAL_GIT" "$@"
 
       await expect(
         readFile(path.join(localDir, "run.log"), "utf8"),
-      ).resolves.toBe("remote log\n");
+      ).rejects.toThrow(/ENOENT/);
+      await expect(
+        readFile(path.join(localDir, "local.log"), "utf8"),
+      ).resolves.toBe("concurrent local log\n");
+      await expect(
+        readFile(path.join(localDir, "seed.txt"), "utf8"),
+      ).resolves.toBe("remote tracked edit\n");
       expect(await countStatusQueries(logPath)).toBe(1);
       expect(await countTarDownloads(logPath)).toBe(1);
     },
@@ -2330,22 +2348,37 @@ exec "$STUB_REAL_GIT" "$@"
   );
 
   it(
-    "applies a force-added file the run uncached and edited",
+    "preserves local bytes when the remote uncaches an ignored file while tracked edits transfer",
     async () => {
       const localDir = await initRepo();
       await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
       await writeFile(path.join(localDir, "tracked.log"), "v1\n");
-      await git(localDir, ["add", "-f", "tracked.log", ".gitignore"]);
+      await writeFile(path.join(localDir, "deliverable.txt"), "seed source\n");
+      await git(localDir, [
+        "add",
+        "-f",
+        "tracked.log",
+        ".gitignore",
+        "deliverable.txt",
+      ]);
       await git(localDir, ["commit", "-m", "seed"]);
       const remoteDir = await createTempDir("paperclip-wire-uncache-remote-");
       await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
       const checkoutDir = path.join(remoteDir, "checkout");
       // The run uncaches the ignore-matched file and edits it: real git
       // reports `D tracked.log` plus `!! tracked.log` (not `??`), so the
-      // path reaches reconciliation only through the ignored records. The
-      // baseline holds v1 (tracked at seed), but the remote v2 must win.
+      // remote index no longer tracks it. Match full-copy ignore authority:
+      // retain the local v1 instead of importing v2 or applying the index delete.
       await git(checkoutDir, ["rm", "--cached", "-q", "tracked.log"]);
       await writeFile(path.join(checkoutDir, "tracked.log"), "v2\n");
+      await writeFile(
+        path.join(checkoutDir, "deliverable.txt"),
+        "remote source\n",
+      );
+      expect(await git(checkoutDir, ["ls-files", "tracked.log"])).toBe("");
+      expect(
+        (await git(checkoutDir, ["check-ignore", "tracked.log"])).trim(),
+      ).toBe("tracked.log");
       const baseline = await captureDirectorySnapshot(localDir, {
         exclude: baselineExcludes(),
       });
@@ -2364,7 +2397,10 @@ exec "$STUB_REAL_GIT" "$@"
 
       await expect(
         readFile(path.join(localDir, "tracked.log"), "utf8"),
-      ).resolves.toBe("v2\n");
+      ).resolves.toBe("v1\n");
+      await expect(
+        readFile(path.join(localDir, "deliverable.txt"), "utf8"),
+      ).resolves.toBe("remote source\n");
       expect(await countStatusQueries(logPath)).toBe(1);
       expect(await countTarDownloads(logPath)).toBe(1);
     },

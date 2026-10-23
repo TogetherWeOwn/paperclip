@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import {
   access,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -18,7 +19,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  measureDirectoryFileBytes,
   prepareWorkspaceForSshExecution,
+  readSshSeedIgnoredFingerprint,
   restoreWorkspaceFromSshExecution,
   SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
   type SshRemoteExecutionSpec,
@@ -64,7 +67,17 @@ args = shlex.split(sys.argv[-1])
 if len(args) != 3 or args[:2] != ["sh", "-c"]:
     sys.exit("fake SSH requires one sh -c payload")
 script = args[2].replace("${REMOTE}", os.environ["ACCEPTANCE_REMOTE"])
-child = subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
+stdin_script = None
+if script == "sh -s":
+    stdin_script = sys.stdin.buffer.read(1024 * 1024 + 1)
+    if len(stdin_script) > 1024 * 1024:
+        sys.exit("acceptance SSH script budget exceeded")
+    stdin_script = stdin_script.replace(b"${REMOTE}", os.fsencode(os.environ["ACCEPTANCE_REMOTE"]))
+child = subprocess.Popen(
+    ["/bin/sh", "-s"] if stdin_script is not None else ["/bin/sh", "-c", script],
+    stdin=subprocess.PIPE if stdin_script is not None else None,
+    start_new_session=True,
+)
 def stop(signum, frame):
     try:
         os.killpg(child.pid, signal.SIGKILL)
@@ -74,7 +87,8 @@ def stop(signum, frame):
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 try:
-    sys.exit(child.wait(timeout=20))
+    child.communicate(input=stdin_script, timeout=20)
+    sys.exit(child.returncode)
 except subprocess.TimeoutExpired:
     stop(None, None)
 `;
@@ -531,6 +545,311 @@ describe("SSH full-copy repository ignore acceptance", () => {
     expect(await exists(local, "new-ignored.tmp")).toBe(false);
     expect(await stagingDirs()).toEqual([]);
   }, 30_000);
+
+  it("incremental restore omits newly ignored files and preserves concurrent local ignored content", async () => {
+    await initRepo(local);
+    await writeTree(local, {
+      ".gitignore": "*.tmp\n",
+      "keep.txt": "seed\n",
+      // A full download exceeds the restore cap; only a real delta can pass.
+      "unchanged.bin": Buffer.alloc(96 * 1024, 0x41),
+    });
+    await commit(local);
+    const prepared = await prepareWorkspaceForSshExecution({
+      spec,
+      localDir: local,
+      remoteDir: REMOTE,
+    });
+    expect(prepared.seedState).toBeDefined();
+    expect(prepared.seedState?.ignoredFingerprint).toBeUndefined();
+    const captured = await baseline(prepared.ignoredPaths);
+    await writeTree(local, { "concurrent.tmp": "concurrent local content\n" });
+    await writeTree(remote, {
+      "keep.txt": "remote edit\n",
+      "new-ignored.tmp": "remote ignored creation\n",
+      "concurrent.tmp": "remote must not overwrite local\n",
+    });
+    vi.stubEnv("PAPERCLIP_SSH_INCREMENTAL_SYNC", "1");
+    vi.stubEnv("PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES", String(64 * 1024));
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir: local,
+      remoteDir: REMOTE,
+      baselineSnapshot: captured,
+      restoreGitHistory: true,
+      ignoredPaths: prepared.ignoredPaths,
+      seedState: prepared.seedState,
+    });
+    await expectTree(local, { "keep.txt": "remote edit\n" });
+    expect.soft(await exists(local, "new-ignored.tmp")).toBe(false);
+    expect
+      .soft(await readFile(path.join(local, "concurrent.tmp"), "utf8"))
+      .toBe("concurrent local content\n");
+    expect(await readFile(path.join(local, "unchanged.bin"))).toEqual(
+      Buffer.alloc(96 * 1024, 0x41),
+    );
+    expect(await stagingDirs()).toEqual([]);
+  }, 30_000);
+
+  it.each(["unchanged", "edited", "deleted"] as const)(
+    "legacy carried-ignored fingerprint retains %s restore behavior",
+    async (change) => {
+      await initRepo(local);
+      await writeTree(local, {
+        ".gitignore": "*.tmp\n",
+        "keep.txt": "seed\n",
+        "unchanged.bin": Buffer.alloc(96 * 1024, 0x41),
+      });
+      await commit(local);
+      const prepared = await prepareWorkspaceForSshExecution({
+        spec,
+        localDir: local,
+        remoteDir: REMOTE,
+      });
+      // Reconstruct an in-flight legacy seed, which carried ignored files.
+      await writeTree(local, { "carried.tmp": "seed ignored bytes\n" });
+      await writeTree(remote, { "carried.tmp": "seed ignored bytes\n" });
+      const ignoredFingerprint = await readSshSeedIgnoredFingerprint(local);
+      expect(ignoredFingerprint?.count).toBe(1);
+      if (!ignoredFingerprint || !prepared.seedState)
+        throw new Error("missing legacy seed fixture");
+      const captured = await baseline();
+      await writeTree(remote, { "keep.txt": "remote edit\n" });
+      if (change === "edited")
+        await writeTree(remote, { "carried.tmp": "remote ignored edit\n" });
+      if (change === "deleted") await rm(path.join(remote, "carried.tmp"));
+      if (change !== "unchanged")
+        await writeTree(remote, { "new.tmp": "legacy remote creation\n" });
+      vi.stubEnv("PAPERCLIP_SSH_INCREMENTAL_SYNC", "1");
+      // An unchanged fingerprint must permit the delta, not silently fall back.
+      if (change === "unchanged")
+        vi.stubEnv("PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES", String(64 * 1024));
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir: local,
+        remoteDir: REMOTE,
+        baselineSnapshot: captured,
+        restoreGitHistory: true,
+        seedState: { ...prepared.seedState, ignoredFingerprint },
+      });
+      await expectTree(local, { "keep.txt": "remote edit\n" });
+      if (change === "deleted")
+        expect(await exists(local, "carried.tmp")).toBe(false);
+      else
+        await expectTree(local, {
+          "carried.tmp":
+            change === "edited"
+              ? "remote ignored edit\n"
+              : "seed ignored bytes\n",
+        });
+      if (change !== "unchanged")
+        await expectTree(local, { "new.tmp": "legacy remote creation\n" });
+      expect(await stagingDirs()).toEqual([]);
+    },
+    30_000,
+  );
+
+  it.each(["plain", "baseline"] as const)(
+    "%s non-git restore does not inherit ignore authority from a remote parent repository",
+    async (mode) => {
+      const parent = path.join(root, "parent-repo");
+      await mkdir(parent);
+      await initRepo(parent);
+      await writeTree(parent, {
+        ".gitignore": "*.log\n",
+        "parent.txt": "parent\n",
+      });
+      await commit(parent);
+      remote = path.join(parent, "checkout");
+      vi.stubEnv("ACCEPTANCE_REMOTE", remote);
+      await writeTree(local, { "keep.txt": "plain seed\n" });
+      const prepared = await prepareWorkspaceForSshExecution({
+        spec,
+        localDir: local,
+        remoteDir: REMOTE,
+      });
+      expect(prepared.gitBacked).toBe(false);
+      expect(await exists(remote, ".git")).toBe(false);
+      const captured = mode === "baseline" ? await baseline() : undefined;
+      await writeTree(remote, {
+        "keep.txt": "remote edit\n",
+        "output.log": "plain deliverable\n",
+      });
+      // The parent really ignores it, but that index does not own this workspace.
+      expect(
+        (await git(parent, "check-ignore", "checkout/output.log")).trim(),
+      ).toBe("checkout/output.log");
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir: local,
+        remoteDir: REMOTE,
+        baselineSnapshot: captured,
+      });
+      await expectTree(local, {
+        "keep.txt": "remote edit\n",
+        "output.log": "plain deliverable\n",
+      });
+      expect(await exists(local, ".git")).toBe(false);
+      expect(await stagingDirs()).toEqual([]);
+    },
+    30_000,
+  );
+
+  it.each(["streaming", "postextract"] as const)(
+    "git-local %s cap refusal preserves HEAD, staged edits and every local worktree entry",
+    async (capKind) => {
+      await initRepo(local);
+      await writeTree(local, {
+        ".gitignore": "*.tmp\n",
+        "keep.txt": "committed seed\n",
+        "staged.txt": "committed staged seed\n",
+      });
+      await commit(local);
+      await prepareWorkspaceForSshExecution({
+        spec,
+        localDir: local,
+        remoteDir: REMOTE,
+      });
+      await writeTree(remote, {
+        "keep.txt": "new remote commit\n",
+        "collision.txt": "remote committed file\n",
+      });
+      await commit(remote);
+      const remoteHead = (await git(remote, "rev-parse", "HEAD")).trim();
+      await writeTree(remote, { "keep.txt": "dirty remote bytes\n" });
+      if (capKind === "streaming") {
+        await writeTree(remote, {
+          "payload.bin": Buffer.alloc(256 * 1024, 0x42),
+        });
+      } else {
+        // Real hardlinks: the archive fits under the wire cap, but extracted
+        // per-path bytes exceed it. This must reach the second size check.
+        await writeTree(remote, {
+          "payload.bin": Buffer.alloc(16 * 1024, 0x42),
+        });
+        for (let i = 0; i < 12; i++) {
+          await link(
+            path.join(remote, "payload.bin"),
+            path.join(remote, `hardlink-${i}.bin`),
+          );
+        }
+      }
+      const cap = 64 * 1024;
+      const archive = path.join(root, "cap-proof.tar");
+      await exec(
+        "/usr/bin/tar",
+        ["-cf", archive, "--exclude=./.git", "-C", remote, "."],
+        { timeout: 10_000 },
+      );
+      const wireBytes = (await lstat(archive)).size;
+      if (capKind === "streaming") expect(wireBytes).toBeGreaterThan(cap);
+      else expect(wireBytes).toBeLessThan(cap);
+      expect(await measureDirectoryFileBytes(remote)).toBeGreaterThan(cap);
+      await writeTree(local, {
+        "keep.txt": "concurrent local dirty bytes\n",
+        "staged.txt": "concurrent staged bytes\n",
+        "collision.txt": "local untracked collision\n",
+        "local-only.txt": "local untracked\n",
+        "private.tmp": "local ignored\n",
+      });
+      await git(local, "add", "staged.txt");
+      const headBefore = await git(local, "rev-parse", "HEAD");
+      expect(headBefore.trim()).not.toBe(remoteHead);
+      const indexBefore = await git(local, "diff", "--cached", "--binary");
+      const statusBefore = await git(
+        local,
+        "status",
+        "--porcelain=v1",
+        "--ignored",
+        "--untracked-files=all",
+      );
+      const before = await captureDirectorySnapshot(local, {
+        exclude: [".git", ".git/*"],
+      });
+      vi.stubEnv("PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES", String(cap));
+      await expect(
+        restoreWorkspaceFromSshExecution({
+          spec,
+          localDir: local,
+          remoteDir: REMOTE,
+        }),
+      ).rejects.toBeInstanceOf(SshSyncBackSizeLimitExceededError);
+      expect.soft(await git(local, "rev-parse", "HEAD")).toBe(headBefore);
+      expect
+        .soft(await git(local, "diff", "--cached", "--binary"))
+        .toBe(indexBefore);
+      expect
+        .soft(
+          await git(
+            local,
+            "status",
+            "--porcelain=v1",
+            "--ignored",
+            "--untracked-files=all",
+          ),
+        )
+        .toBe(statusBefore);
+      expect
+        .soft(
+          await captureDirectorySnapshot(local, {
+            exclude: [".git", ".git/*"],
+          }),
+        )
+        .toEqual(before);
+      expect(
+        await git(
+          local,
+          "for-each-ref",
+          "--format=%(refname)",
+          "refs/paperclip/ssh-sync/imported/",
+        ),
+      ).toBe("");
+      expect(await stagingDirs()).toEqual([]);
+    },
+    30_000,
+  );
+
+  it("full restore handles more than 124 KiB of outer-quoted ignored paths via SSH stdin", async () => {
+    await initRepo(local);
+    await writeTree(local, { ".gitignore": "*.tmp\n", "keep.txt": "seed\n" });
+    await commit(local);
+    const ignored = Object.fromEntries(
+      Array.from({ length: 2500 }, (_, i) => [
+        `ignored-${String(i).padStart(4, "0")}-${"x".repeat(64)}-'quote.tmp`,
+        "local ignored bytes\n",
+      ]),
+    );
+    // Even before shell/exclusion overhead this is beyond both the 124 KiB
+    // budget and Linux's 128 KiB single-argument ceiling, unlike 350 short paths.
+    expect(Buffer.byteLength(Object.keys(ignored).join("\n"))).toBeGreaterThan(
+      128 * 1024,
+    );
+    await writeTree(local, ignored);
+    const prepared = await prepareWorkspaceForSshExecution({
+      spec,
+      localDir: local,
+      remoteDir: REMOTE,
+    });
+    expect(prepared.ignoredPaths).toHaveLength(2500);
+    const captured = await baseline(prepared.ignoredPaths);
+    await writeTree(remote, {
+      "keep.txt": "remote tracked edit\n",
+      "remote-only.tmp": "omit this too\n",
+    });
+    await restoreWorkspaceFromSshExecution({
+      spec,
+      localDir: local,
+      remoteDir: REMOTE,
+      baselineSnapshot: captured,
+      ignoredPaths: prepared.ignoredPaths,
+    });
+    await expectTree(local, {
+      "keep.txt": "remote tracked edit\n",
+      ...ignored,
+    });
+    expect(await exists(local, "remote-only.tmp")).toBe(false);
+    expect(await stagingDirs()).toEqual([]);
+  }, 60_000);
 
   it("uses safe full-copy seeding when a content-filter checkout cannot use the mirror", async () => {
     vi.stubEnv("PAPERCLIP_SSH_INCREMENTAL_SYNC", "1");
