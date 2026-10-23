@@ -1,5 +1,5 @@
 name: Fork Pinned Source Qualification
-run-name: Qualify pinned source 321499c232ea (workflow ${{ github.sha }})
+run-name: Qualify pinned source 0ac24abceaf7 (workflow ${{ github.sha }})
 
 # Qualification only. This does not publish, deploy, or waive release gates.
 # After review and merge, an authorized operator dispatches this workflow on
@@ -51,8 +51,8 @@ jobs:
           repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
           data = {
               'schema_version': 1,
-              'expected_source_sha': '321499c232ea4e1966367b85763ad0c53969ffac',
-              'source_url': f'{repo_url}/commit/321499c232ea4e1966367b85763ad0c53969ffac',
+              'expected_source_sha': '0ac24abceaf77ec92959b9cf6f989c8dc6fc8649',
+              'source_url': f'{repo_url}/commit/0ac24abceaf77ec92959b9cf6f989c8dc6fc8649',
               'workflow_sha': os.environ['WORKFLOW_SHA'],
               'workflow_ref': os.environ['WORKFLOW_REF'],
               'workflow_url': f"{repo_url}/blob/{os.environ['WORKFLOW_SHA']}/.github/workflows/fork-pinned-qualification.yml",
@@ -69,7 +69,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: TogetherWeOwn/paperclip
-          ref: 321499c232ea4e1966367b85763ad0c53969ffac
+          ref: 0ac24abceaf77ec92959b9cf6f989c8dc6fc8649
           path: source
           persist-credentials: false
           fetch-depth: 1
@@ -82,7 +82,7 @@ jobs:
           evidence="$RUNNER_TEMP/fork-qualification"
           actual="$(git rev-parse HEAD)"
           printf '%s\n' "$actual" > "$evidence/checked-out-source-sha.txt"
-          test "$actual" = 321499c232ea4e1966367b85763ad0c53969ffac
+          test "$actual" = 0ac24abceaf77ec92959b9cf6f989c8dc6fc8649
           test "$(git remote get-url origin)" = https://github.com/TogetherWeOwn/paperclip
           printf 'verified=true\n' >> "$GITHUB_OUTPUT"
 
@@ -192,7 +192,7 @@ jobs:
           checked_out = root / 'checked-out-source-sha.txt'
           data['verified_source_sha'] = checked_out.read_text().strip() if checked_out.is_file() else None
           data['source_verified'] = (os.environ['SOURCE_VERIFIED'] == 'true'
-              and data['verified_source_sha'] == '321499c232ea4e1966367b85763ad0c53969ffac')
+              and data['verified_source_sha'] == '0ac24abceaf77ec92959b9cf6f989c8dc6fc8649')
           data['install_outcome'] = os.environ['INSTALL_OUTCOME']
           data['commands_outcome'] = os.environ['COMMANDS_OUTCOME']
           data['commands'] = []
