@@ -36,39 +36,248 @@ const summaries = [
   "Tests  7 passed | 2 skipped (9)",
 ];
 
-// Extract the checked-in literal blocks, not a second implementation of the
-// qualification rules. Fail if the workflow moves outside this small YAML subset.
-function steps(text) {
-  const result = new Map();
-  for (const block of text.split(/^ {6}- name: /m).slice(1)) {
-    const id = block.match(/^ {8}id: (\w+)$/m)?.[1] ?? block.split("\n")[0];
-    const lines = block.split("\n");
-    const start = lines.indexOf("        run: |");
-    if (start < 0) continue;
-    const script = [];
-    for (const line of lines.slice(start + 1)) {
-      if (line.trim() && !line.startsWith("          ")) break;
-      script.push(line.slice(10));
-    }
-    assert.ok(
-      script.some((line) => line.trim()),
-      `${id}: missing literal run block`,
+// Read only this workflow's small block-YAML subset. Unknown shapes must fail,
+// not disappear from the production control-flow assertions or script fixtures.
+function qualificationJob(text) {
+  const sections = text.split(/^jobs:\n/m);
+  assert.equal(sections.length, 2, "expected one jobs mapping");
+  const jobs = sections[1].split(/^\S/m)[0];
+  const matches = [...jobs.matchAll(/^ {2}qualify:\n/gm)];
+  assert.equal(matches.length, 1, "expected one qualify job");
+  return jobs
+    .slice(matches[0].index + matches[0][0].length)
+    .split(/^ {2}\S/m)[0];
+}
+
+function jobEligibility(text) {
+  const header = qualificationJob(text).split(/^ {4}steps:\n/m)[0];
+  const conditions = [...header.matchAll(/^ {4}if:(.*)$/gm)];
+  assert.equal(
+    conditions.length,
+    1,
+    "qualify: expected one explicit job eligibility condition",
+  );
+  const following = header
+    .slice(conditions[0].index + conditions[0][0].length)
+    .split("\n")
+    .find((line) => line.trim() && !line.trimStart().startsWith("#"));
+  assert.ok(
+    !following?.startsWith("      "),
+    "unsupported multiline job eligibility",
+  );
+  let expression = conditions[0][1].trim();
+  if (expression.startsWith("${{")) {
+    assert.ok(expression.endsWith("}}"), "unsupported job eligibility wrapper");
+    expression = expression.slice(3, -2).trim();
+  }
+  assert.ok(
+    expression.length <= 1024,
+    "job eligibility expression exceeds bounded grammar",
+  );
+  const clauses = expression.split(/\s*&&\s*/);
+  assert.ok(clauses.length <= 8, "job eligibility has too many clauses");
+  // This intentionally supports only conjunctions of context/string equalities.
+  // Parse every clause before evaluating, including otherwise unreachable text.
+  const comparisons = clauses.map((clause) => {
+    const match = clause.match(
+      /^github\.(repository|event_name|ref)\s*==\s*'([^'\n]+)'$/,
     );
-    const envBlock =
-      block.split("        env:\n")[1]?.split(/^ {8}\S/m)[0] ?? "";
-    const env = Object.fromEntries(
-      [...envBlock.matchAll(/^ {10}(\w+): (.+)$/gm)].map(([, key, value]) => [
-        key,
-        value,
-      ]),
+    assert.ok(match, `unsupported job eligibility syntax: ${clause}`);
+    return [match[1], match[2].toLowerCase()];
+  });
+  return (github) =>
+    comparisons.every(([key, value]) => {
+      assert.equal(typeof github[key], "string", `missing github.${key}`);
+      // GitHub string equality is case-insensitive.
+      return github[key].toLowerCase() === value;
+    });
+}
+
+function steps(text) {
+  const sections = qualificationJob(text).split(/^ {4}steps:\n/m);
+  assert.equal(
+    sections.length,
+    2,
+    "qualify: expected one block steps sequence",
+  );
+  const [prefix, ...blocks] = sections[1].split(/^ {6}- /m);
+  assert.equal(prefix.trim(), "", "unsupported steps sequence shape");
+  assert.ok(blocks.length > 0, "qualify: missing steps");
+  const result = new Map();
+  const names = new Set();
+  for (const block of blocks) {
+    const lines = block.split("\n");
+    const name = lines.shift().match(/^name: (.+)$/)?.[1];
+    assert.ok(name, "every step must have a plain name");
+    assert.ok(!names.has(name), `duplicate step name: ${name}`);
+    names.add(name);
+    const fields = { name };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim() || line.trimStart().startsWith("#")) continue;
+      const field = line.match(/^ {8}([\w-]+):(?: (.+))?$/);
+      assert.ok(field, `${name}: unsupported step shape: ${line}`);
+      const [, key, value] = field;
+      assert.ok(!Object.hasOwn(fields, key), `${name}: duplicate ${key}`);
+      assert.ok(
+        [
+          "id",
+          "if",
+          "uses",
+          "working-directory",
+          "timeout-minutes",
+          "env",
+          "with",
+          "run",
+        ].includes(key),
+        `${name}: unsupported step field ${key}`,
+      );
+      if (key === "run") {
+        assert.equal(value, "|", `${name}: expected literal run block`);
+        const script = [];
+        while (
+          i + 1 < lines.length &&
+          (!lines[i + 1].trim() || lines[i + 1].startsWith("          "))
+        ) {
+          script.push(lines[++i].slice(10));
+        }
+        assert.ok(
+          script.some((entry) => entry.trim()),
+          `${name}: missing literal run block`,
+        );
+        fields.run = script.join("\n");
+      } else if (key === "env" || key === "with") {
+        assert.equal(
+          value,
+          undefined,
+          `${name}: expected block ${key} mapping`,
+        );
+        const entries = {};
+        while (i + 1 < lines.length && lines[i + 1].startsWith("          ")) {
+          const entry = lines[++i].match(/^ {10}([\w-]+): (.+)$/);
+          assert.ok(entry, `${name}: unsupported ${key} entry`);
+          assert.ok(
+            !Object.hasOwn(entries, entry[1]),
+            `${name}: duplicate ${key}.${entry[1]}`,
+          );
+          entries[entry[1]] = entry[2];
+        }
+        fields[key] = entries;
+      } else {
+        assert.ok(value, `${name}: missing ${key}`);
+        fields[key] = key === "uses" ? value.split(" #")[0] : value;
+      }
+    }
+    const id = fields.id ?? name;
+    assert.ok(!result.has(id), `duplicate step id: ${id}`);
+    assert.notEqual(
+      Boolean(fields.run),
+      Boolean(fields.uses),
+      `${id}: expected exactly one run or uses`,
     );
     result.set(id, {
-      script: script.join("\n"),
-      env,
-      cwd: block.match(/^ {8}working-directory: (.+)$/m)?.[1],
+      ...fields,
+      script: fields.run,
+      env: fields.env ?? {},
+      cwd: fields["working-directory"],
     });
   }
   return result;
+}
+
+function assertJobEligibility(text) {
+  const eligible = jobEligibility(text);
+  for (const repository of [
+    "TogetherWeOwn/paperclip",
+    "paperclipai/paperclip",
+    "example/paperclip",
+    "TogetherWeOwn/other",
+  ]) {
+    for (const event_name of [
+      "workflow_dispatch",
+      "push",
+      "pull_request",
+      "schedule",
+      "workflow_call",
+    ]) {
+      for (const ref of [
+        "refs/heads/master",
+        "refs/heads/main",
+        "refs/heads/feature",
+        "refs/tags/master",
+        "refs/tags/v1",
+        "",
+      ]) {
+        assert.equal(
+          eligible({ repository, event_name, ref }),
+          repository === "TogetherWeOwn/paperclip" &&
+            event_name === "workflow_dispatch" &&
+            ref === "refs/heads/master",
+          `job eligibility: ${repository}/${event_name}/${ref || "missing ref"}`,
+        );
+      }
+    }
+  }
+}
+
+function assertSourceOrder(text) {
+  const ordered = steps(text);
+  const required = [
+    "initialize",
+    "checkout",
+    "source",
+    "integrity",
+    "node",
+    "pnpm",
+    "native",
+    "install",
+    "commands",
+    "report",
+    "upload",
+    gateName,
+  ];
+  assert.deepEqual(
+    [...ordered.keys()].sort(),
+    [...required].sort(),
+    "required steps must exist uniquely; review unknown steps explicitly",
+  );
+  for (const id of required) {
+    const step = ordered.get(id);
+    assert.equal(
+      Boolean(step.uses),
+      ["checkout", "node", "pnpm", "upload"].includes(id),
+      `${id}: unexpected run/action shape`,
+    );
+    assert.equal(
+      step.if,
+      ["report", "upload", gateName].includes(id) ? "always()" : undefined,
+      `${id}: unsupported step condition`,
+    );
+  }
+  const checkout = ordered.get("checkout");
+  assert.match(checkout.uses, /^actions\/checkout@[0-9a-f]{40}$/);
+  assert.equal(checkout.with?.repository, "TogetherWeOwn/paperclip");
+  assert.equal(checkout.with?.ref, sourceSha);
+  assert.equal(checkout.with?.path, "source");
+  assert.equal(ordered.get("source").cwd, "source");
+  assert.equal(
+    ordered.get("pnpm").with?.package_json_file,
+    "source/package.json",
+  );
+  const ids = [...ordered.keys()];
+  const before = (first, second) =>
+    assert.ok(
+      ids.indexOf(first) < ids.indexOf(second),
+      `source ordering: ${first} must precede ${second}`,
+    );
+  before("initialize", "checkout");
+  before("checkout", "source");
+  before("source", "integrity");
+  // Includes action-only setup: pnpm reads source/package.json before install.
+  for (const id of ["node", "pnpm", "native", "install", "commands"]) {
+    before("source", id);
+    before("integrity", id);
+  }
 }
 
 const gateName = "Require complete green evidence and artifact upload";
@@ -249,6 +458,8 @@ if test "$name" = "$FIXTURE_FAIL_COMMAND"; then exit 23; fi`,
     return result;
   };
   function capture() {
+    // Script-block probe only, not a GitHub scheduler. Actions are not executed.
+    // assertSourceOrder separately checks the actual production sequence.
     ok("initialize");
     const source = run("source");
     if (source.status !== 0) return source;
@@ -279,6 +490,216 @@ if test "$name" = "$FIXTURE_FAIL_COMMAND"; then exit 23; fi`,
         ? readFileSync(env.FIXTURE_CALLS, "utf8").trim().split("\n")
         : [],
   };
+}
+
+test("actual job eligibility admits only same-repository master dispatches", () => {
+  assertJobEligibility(workflow);
+});
+
+test("actual source ordering verifies and snapshots before every setup or source-executing step", () => {
+  assertSourceOrder(workflow);
+});
+
+const eligibilityLine = workflow.match(/^ {4}if: .+$/m)?.[0];
+function replaceEligibility(value) {
+  assert.ok(eligibilityLine, "expected checked-in eligibility fixture");
+  return mutateOnce(eligibilityLine, `    if: ${value}`);
+}
+
+test("mutation sensitivity: bounded eligibility parser supports reordered and wrapped conjunctions", () => {
+  const condition =
+    "github.ref == 'refs/heads/master' && github.repository == 'TogetherWeOwn/paperclip' && github.event_name == 'workflow_dispatch'";
+  assertJobEligibility(replaceEligibility(`\${{ ${condition} }}`));
+  assert.equal(
+    jobEligibility(workflow)({
+      repository: "togetherweown/paperclip",
+      event_name: "workflow_dispatch",
+      ref: "refs/heads/master",
+    }),
+    true,
+    "GitHub case-insensitive string comparison",
+  );
+});
+
+for (const value of [
+  "true",
+  `\${{ true }}`,
+  "always()",
+  "",
+  ">-",
+  "github.repository != 'paperclipai/paperclip'",
+  "github.repository == 'TogetherWeOwn/paperclip' || true",
+  "github.repository == 'never' && contains(github.ref, 'master')",
+  "github.unknown == 'value'",
+  "github.repository == 'x'; process.exit(0)",
+  "github.repository == 'TogetherWeOwn/paperclip'\n      || true",
+]) {
+  test(`mutation sensitivity: unsupported eligibility fails closed: ${JSON.stringify(value)}`, () => {
+    assert.throws(
+      () => assertJobEligibility(replaceEligibility(value)),
+      /unsupported.*(?:eligibility|syntax)/,
+    );
+  });
+}
+
+// Mutate only disposable text; the checked-in workflow is never rewritten.
+function stepBlocks() {
+  const [header, ...blocks] = workflow.split(/(?=^ {6}- name: )/m);
+  assert.equal(
+    blocks.length,
+    12,
+    "expected all production step fixtures including actions",
+  );
+  return { header, blocks };
+}
+function moveVerificationAfter(id) {
+  const { header, blocks } = stepBlocks();
+  const guards = blocks.filter((block) =>
+    /^ {8}id: (source|integrity)$/m.test(block),
+  );
+  assert.equal(guards.length, 2);
+  const rest = blocks.filter((block) => !guards.includes(block));
+  const index = rest.findIndex((block) =>
+    block.includes(`        id: ${id}\n`),
+  );
+  assert.ok(index >= 0, `missing mutation target: ${id}`);
+  rest.splice(index + 1, 0, ...guards);
+  return header + rest.join("");
+}
+
+function moveStepBefore(id, target) {
+  const { header, blocks } = stepBlocks();
+  const index = blocks.findIndex((block) =>
+    block.includes(`        id: ${id}\n`),
+  );
+  assert.ok(index >= 0, `missing mutation step: ${id}`);
+  const [step] = blocks.splice(index, 1);
+  const destination = blocks.findIndex((block) =>
+    block.includes(`        id: ${target}\n`),
+  );
+  assert.ok(destination >= 0, `missing mutation destination: ${target}`);
+  blocks.splice(destination, 0, step);
+  return header + blocks.join("");
+}
+
+test("mutation sensitivity: source ordering rejects missing or duplicate steps including action-only setup", () => {
+  const { header, blocks } = stepBlocks();
+  for (const block of blocks) {
+    assert.throws(
+      () =>
+        assertSourceOrder(
+          header + blocks.filter((entry) => entry !== block).join(""),
+        ),
+      /required steps must exist uniquely/,
+    );
+    assert.throws(
+      () => assertSourceOrder(header + blocks.join("") + block),
+      /duplicate step (?:name|id)/,
+    );
+  }
+  assert.throws(
+    () => assertSourceOrder(mutateOnce("        id: pnpm", "        id: node")),
+    /duplicate step id: node/,
+  );
+});
+
+test("mutation sensitivity: source ordering rejects unsupported step shapes rather than dropping them", () => {
+  for (const [from, to] of [
+    [
+      "      - name: Set up Node without shared caches",
+      "      - uses: unsupported/action@v1",
+    ],
+    ["        id: pnpm", "        id: pnpm\n        continue-on-error: true"],
+    [
+      "        run: |\n          evidence=",
+      "        run: >-\n          evidence=",
+    ],
+    [
+      "          package_json_file: source/package.json",
+      "          package_json_file: {file: source/package.json}",
+    ],
+    ["        id: native", "        id: native\n        if: always()"],
+    [
+      "        id: commands",
+      "        id: commands\n        uses: unknown/action@v1",
+    ],
+  ]) {
+    // The literal-run prefix occurs more than once; change the first only.
+    assert.ok(
+      workflow.includes(from),
+      `missing shape mutation target: ${from}`,
+    );
+    assert.throws(() => assertSourceOrder(workflow.replace(from, to)), {
+      code: "ERR_ASSERTION",
+    });
+  }
+});
+
+for (const [name, mutant, probe, message] of [
+  [
+    "missing eligibility",
+    () => mutateOnce(`${eligibilityLine}\n`, ""),
+    assertJobEligibility,
+    "explicit job eligibility condition",
+  ],
+  [
+    "unconditional eligibility",
+    () => replaceEligibility("true"),
+    assertJobEligibility,
+    "unsupported job eligibility syntax",
+  ],
+  ...["repository", "event_name", "ref"].map((key) => [
+    `missing ${key} clause`,
+    () =>
+      replaceEligibility(
+        eligibilityLine
+          .slice("    if: ".length)
+          .split(" && ")
+          .filter((clause) => !clause.startsWith(`github.${key} `))
+          .join(" && "),
+      ),
+    assertJobEligibility,
+    "job eligibility:",
+  ]),
+  [
+    "pnpm action before verification",
+    () => moveStepBefore("pnpm", "source"),
+    assertSourceOrder,
+    "source must precede pnpm",
+  ],
+  [
+    "pnpm action before integrity",
+    () => moveStepBefore("pnpm", "integrity"),
+    assertSourceOrder,
+    "integrity must precede pnpm",
+  ],
+  [
+    "verification before checkout",
+    () => moveStepBefore("source", "checkout"),
+    assertSourceOrder,
+    "checkout must precede source",
+  ],
+  [
+    "integrity before verification",
+    () => moveStepBefore("integrity", "source"),
+    assertSourceOrder,
+    "source must precede integrity",
+  ],
+  ...["node", "pnpm", "install"].map((id) => [
+    `verification after ${id}`,
+    () => moveVerificationAfter(id),
+    assertSourceOrder,
+    "source must precede node",
+  ]),
+]) {
+  test(`mutation sensitivity: ${name} is killed by ordinary control-flow assertions`, (t) => {
+    assert.throws(
+      () => probe(mutant()),
+      (error) =>
+        error.code === "ERR_ASSERTION" && error.message.includes(message),
+    );
+    t.diagnostic(`KILLED ${name}: ${message}`);
+  });
 }
 
 function assertSourceRejected(f) {
@@ -441,9 +862,9 @@ test("exact source pin captures four commands and qualifies only with a successf
   );
 });
 
-test("mismatched source SHA is rejected before source command execution", (t) =>
+test("source script rejects mismatched SHA before fixture command execution", (t) =>
   assertSourceRejected(fixture(t, workflow, { sourceSha: otherSha })));
-test("wrong source remote is rejected before source command execution", (t) =>
+test("source script rejects wrong remote before fixture command execution", (t) =>
   assertSourceRejected(
     fixture(t, workflow, { remote: "https://github.com/example/wrong" }),
   ));
