@@ -896,6 +896,18 @@ type ManagedMcpGatewayRunConfig = {
   }>;
 };
 
+export const RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS = 60 * 60 * 1_000;
+export const RUN_GATEWAY_TOKEN_MIN_TTL_MS = 60 * 1_000;
+export const RUN_GATEWAY_TOKEN_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export function runGatewayTokenTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = readNonEmptyString(env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS);
+  if (!configured || !/^\d+$/.test(configured)) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  const ttlMs = Number(configured);
+  if (ttlMs < RUN_GATEWAY_TOKEN_MIN_TTL_MS) return RUN_GATEWAY_TOKEN_DEFAULT_TTL_MS;
+  return Math.min(ttlMs, RUN_GATEWAY_TOKEN_MAX_TTL_MS);
+}
+
 export function configuredPaperclipApiBaseUrl(): string | null {
   const configured = readNonEmptyString(process.env.PAPERCLIP_API_URL);
   return configured
@@ -1239,7 +1251,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       clientLabel: `${input.agent.name} heartbeat run`,
       ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: new Date(Date.now() + runGatewayTokenTtlMs()),
     },
     actor: { agentId: input.agent.id },
   });
@@ -1548,7 +1560,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + runGatewayTokenTtlMs());
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({

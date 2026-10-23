@@ -39,6 +39,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const originalApiUrl = process.env.PAPERCLIP_API_URL;
+  const originalTokenTtl = process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-runtime-mcp-");
@@ -48,6 +49,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   afterEach(async () => {
     if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = originalApiUrl;
+    if (originalTokenTtl === undefined) delete process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS;
+    else process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS = originalTokenTtl;
     await db.delete(toolMcpGatewayTokens);
     await db.delete(activityLog);
     await db.delete(toolAccessAuditEvents);
@@ -428,6 +431,40 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     });
     await expect(service.initializeNamedGatewayProtocol({ gatewayId: shared.id, bearerToken: token.token }))
       .resolves.toMatchObject({ agentId: other!.agent.id });
+  });
+
+  it("mints run tokens with the configured lifetime at both mint sites", async () => {
+    process.env.PAPERCLIP_RUN_GATEWAY_TOKEN_TTL_MS = String(24 * 60 * 60 * 1000);
+    const [owner, other] = await seedAssignedAgents(2);
+    const before = Date.now();
+    const [native] = await buildPaperclipRuntimeMcpServers({ db, agent: owner!.agent, runId: owner!.run.id });
+    const [gateway] = await db.select().from(toolMcpGateways);
+    await db.update(toolMcpGateways).set({ agentId: null, contextScopeType: "none", contextScopeId: null });
+    const [sharedProfile] = await db.insert(toolProfiles).values({
+      companyId: owner!.agent.companyId, profileKey: `shared:${randomUUID()}`,
+      name: "Explicit shared profile", defaultAction: "deny",
+    }).returning();
+    const [nativeEntry] = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, gateway!.profileId));
+    await db.insert(toolProfileEntries).values({
+      companyId: owner!.agent.companyId, profileId: sharedProfile!.id, selectorType: "connection", effect: "include",
+      applicationId: nativeEntry!.applicationId, connectionId: nativeEntry!.connectionId,
+    });
+    const shared = await createToolGatewayService(db).createNamedGateway({
+      companyId: owner!.agent.companyId,
+      body: { name: "Explicit company gateway", slug: `shared-${randomUUID()}`, profileId: sharedProfile!.id,
+        defaultProfileMode: "gateway_only" },
+      actor: { agentId: owner!.agent.id },
+    });
+    const managed = await createManagedMcpRunConfig({ db, agent: other!.agent, runId: other!.run.id,
+      config: {}, projectId: null, issueId: null });
+    expect(native?.token).toMatch(/^pcgw_/);
+    expect(managed?.gateways.map((entry) => entry.id)).toEqual([shared.id]);
+    const tokens = await db.select().from(toolMcpGatewayTokens);
+    expect(tokens.map((token) => token.subjectId).sort()).toEqual([owner!.run.id, other!.run.id].sort());
+    for (const token of tokens) {
+      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000);
+      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000);
+    }
   });
 
   it("does not repair a gateway with conflicting ownership metadata", async () => {
