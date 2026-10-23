@@ -1,3 +1,4 @@
+import { SandboxBridgeLifetimeError } from "./sandbox-bridge-lifetime.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -4611,6 +4612,8 @@ async function startLocalAdapterExecutionTargetPaperclipBridge(input: {
 }
 
 export async function startAdapterExecutionTargetPaperclipBridge(input: {
+  signal?: AbortSignal;
+  onFailure?: (error: SandboxBridgeLifetimeError) => void;
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
   runtimeRootDir: string | null | undefined;
@@ -4757,6 +4760,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // Revoke synchronously, before the first await, even on pre-handle failure.
     stopped = true;
     runAbort.abort();
+    input.signal?.removeEventListener("abort", cancel);
     if (!stopPromise) stopPromise = (async () => {
       const errors: unknown[] = [];
       for (const cleanup of [...transportCleanup, () => bridgeAsset.cleanup(), scrubMcpAssets]) {
@@ -4770,6 +4774,26 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       if (errors.length > 1) throw new AggregateError(errors, "Sandbox bridge cleanup failed.");
     })();
     return stopPromise;
+  };
+
+  const cancel = () => {
+    stopped = true;
+    runAbort.abort();
+  };
+  input.signal?.addEventListener("abort", cancel, { once: true });
+  if (input.signal?.aborted) cancel();
+  const fail = (error: SandboxBridgeLifetimeError) => {
+    cancel();
+    input.onFailure?.(error);
+  };
+  const denyIfRevoked = () => {
+    if (!stopped && Date.now() >= expiresAt) {
+      fail(new SandboxBridgeLifetimeError(
+        "sandbox_bridge_deadline_expired",
+        "Sandbox bridge credential lifetime expired; a new authorized attempt is required.",
+      ));
+    }
+    return stopped;
   };
 
   try {
@@ -4826,7 +4850,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       },
     ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
       const method = request.method.trim().toUpperCase() || "GET";
-      if (stopped || Date.now() >= expiresAt) {
+      if (denyIfRevoked()) {
         return {
           status: 401,
           headers: { "content-type": "application/json" },
@@ -4886,7 +4910,22 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
         forwardInit.body = request.body as BodyInit;
       }
+      // Any earlier logging/read work may have yielded to cancellation. Admission
+      // linearizes here in this process; a queued request is not grandfathered in.
+      if (denyIfRevoked()) {
+        return { status: 401, headers: { "content-type": "application/json" }, body: Buffer.from('{"error":"Bridge credential expired or revoked."}') };
+      }
       const response = await fetch(mcp ? mcp.url : buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+      if (response.status === 401) {
+        fail(new SandboxBridgeLifetimeError(
+          "sandbox_bridge_upstream_auth_failed",
+          "Host callback credential authentication failed. Start a new authorized run after repairing credential validity.",
+        ));
+        // Do not read an aborted upstream body: that would mask a definitive 401
+        // as an indeterminate mutation failure. No upstream detail is exported.
+        void response.body?.cancel().catch(() => {});
+        return { status: 401, headers: { "content-type": "application/json" }, body: Buffer.from('{"error":"Host callback credential authentication failed.","retryable":false}') };
+      }
       // `manual` surfaces a redirect as an opaqueredirect response instead of
       // following it. Refuse it here: passing the foreign Location back to the
       // sandbox caller would launder the redirect (and a re-issued body) to an

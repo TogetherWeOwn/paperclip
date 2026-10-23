@@ -1,3 +1,4 @@
+import { runWithSandboxBridgeExecution } from "@paperclipai/adapter-utils/sandbox-bridge-execution";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -446,6 +447,10 @@ export async function runClaudeLogin(input: {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return runWithSandboxBridgeExecution(ctx, executeInternal);
+}
+
+async function executeInternal(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -637,6 +642,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+        signal: ctx.signal,
+        onFailure: ctx.onSandboxBridgeFailure,
         runId,
         target: overrideAdapterExecutionTargetRemoteCwd(executionTarget, "/"),
         runtimeRootDir: path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "claude"),
@@ -827,6 +834,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       useLocalPaperclipBridge
     ) {
       paperclipBridge ??= await startAdapterExecutionTargetPaperclipBridge({
+        signal: ctx.signal,
+        onFailure: ctx.onSandboxBridgeFailure,
         runId,
         target: runtimeExecutionTarget,
         enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),

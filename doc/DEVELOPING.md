@@ -178,6 +178,20 @@ changing a sandbox clock cannot extend host authorization. There is currently no
 in-run renewal: requests after the deadline fail closed and require a new run.
 This limit also applies to API callbacks using the same sandbox bridge bearer.
 
+Observed execution cancellation (including controller-lease loss) revokes callback
+forwarding before provider settlement. The host rechecks local revocation at the
+actual fetch boundary, after any asynchronous envelope/log work. An upstream 401
+revokes the bridge without trying another principal; it remains a 401 to the
+caller and a typed failed adapter result even if the provider exits zero. The
+final result retains non-sensitive configured-value/remediation details. The
+shared ACP engine and seven direct CLI consumers refuse sandbox callback budgets
+above four hours, unlimited or non-finite before provider launch; the general
+timeout resolver and local/SSH timeout semantics are unchanged. This preflight is
+not yet enforced by the low-level bridge factory for other callers.
+These failure controls do not implement the approved longer-lived authority:
+current-generation admission, managed-token validity proof and host-owned bounded
+activation remain release blockers for long turns.
+
 ### Sandbox MCP asset teardown
 
 Bridge teardown revokes host forwarding before asynchronous cleanup, then removes

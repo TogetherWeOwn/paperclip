@@ -1,3 +1,4 @@
+import { runWithSandboxBridgeExecution } from "@paperclipai/adapter-utils/sandbox-bridge-execution";
 import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import os from "node:os";
@@ -206,6 +207,10 @@ async function buildGeminiSkillsDir(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return runWithSandboxBridgeExecution(ctx, executeInternal);
+}
+
+async function executeInternal(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveGeminiExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -468,6 +473,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+      signal: ctx.signal,
+      onFailure: ctx.onSandboxBridgeFailure,
       runId,
       target: runtimeExecutionTarget,
       enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),

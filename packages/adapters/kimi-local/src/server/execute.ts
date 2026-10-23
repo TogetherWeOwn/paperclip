@@ -1,3 +1,4 @@
+import { runWithSandboxBridgeExecution } from "@paperclipai/adapter-utils/sandbox-bridge-execution";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -186,6 +187,10 @@ async function buildKimiSkillsDir(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return runWithSandboxBridgeExecution(ctx, executeInternal);
+}
+
+async function executeInternal(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveKimiExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -405,6 +410,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+      signal: ctx.signal,
+      onFailure: ctx.onSandboxBridgeFailure,
       runId,
       target: runtimeExecutionTarget,
       runtimeRootDir: remoteRuntimeRootDir,

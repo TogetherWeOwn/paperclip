@@ -1,3 +1,4 @@
+import { prepareSandboxBridgeExecution } from "../sandbox-bridge-execution.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -2328,6 +2329,8 @@ async function buildRuntime(input: {
         ),
       startPaperclipBridge: (runtimeRootDir) =>
         startAdapterExecutionTargetPaperclipBridge({
+          signal: input.ctx.signal,
+          onFailure: input.ctx.onSandboxBridgeFailure,
           runId,
           target: { ...remoteTarget, streamRunLogs: false },
           runtimeRootDir,
@@ -3843,6 +3846,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const engine = resolveEngineSettings(deps);
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+    const bridgeExecution = prepareSandboxBridgeExecution(ctx);
+    ctx = bridgeExecution.ctx;
     let billingIdentity: AcpxEngineBillingIdentity | null = null;
     try {
       billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
@@ -3958,6 +3963,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     const interruptionTools = new Map<string, { kind?: string; status?: string }>();
     let incompleteToolInventory = false;
     try {
+      bridgeExecution.preflight();
       await ctx.onCancellationReady?.();
       if (ctx.signal?.aborted) return {
         exitCode: null, signal: null, timedOut: false,
@@ -5447,7 +5453,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           };
         },
       };
-      return await runAttempt(plan);
+      return bridgeExecution.normalize(await runAttempt(plan));
+    } catch (error) {
+      return bridgeExecution.fromError(error);
     } finally {
       clearTimeout(stopTimer);
       removeStopListener?.();

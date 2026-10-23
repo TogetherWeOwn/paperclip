@@ -75,6 +75,9 @@ export type AdapterExecutionErrorFamily =
   | "refresh_token_invalidated";
 
 export interface AdapterExecutionResult {
+  /** Stable, non-sensitive diagnostics for host-enforced execution refusals. */
+  errorDetails?: { configuredValue: unknown; remediation: string };
+  remediation?: string;
   /** Positive evidence for retrying bootstrap; absent evidence never authorizes replay. */
   executionRecovery?: { kind: "bootstrap"; providerWorkStarted: false } | {
     kind: "interrupted";
@@ -202,6 +205,8 @@ export interface AdapterRuntimeEvent {
 export interface AdapterExecutionContext {
   /** Run-scoped operator cancellation; adapters must settle before returning. */
   signal?: AbortSignal;
+  /** Host-only terminal callback failure sink; never serialized into runtime assets. */
+  onSandboxBridgeFailure?: (error: import("./sandbox-bridge-lifetime.js").SandboxBridgeLifetimeError) => void;
   /** Opt in to signal-based cancellation before starting provider work. */
   onCancellationReady?: () => Promise<void>;
   /** Host-owned stop of this run's sandbox during setup. Resolves only after

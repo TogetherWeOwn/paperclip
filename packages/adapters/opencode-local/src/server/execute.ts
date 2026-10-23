@@ -1,3 +1,4 @@
+import { runWithSandboxBridgeExecution } from "@paperclipai/adapter-utils/sandbox-bridge-execution";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -222,6 +223,10 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return runWithSandboxBridgeExecution(ctx, executeInternal);
+}
+
+async function executeInternal(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
@@ -475,6 +480,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+        signal: ctx.signal,
+        onFailure: ctx.onSandboxBridgeFailure,
         runId,
         target: runtimeExecutionTarget,
         enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
