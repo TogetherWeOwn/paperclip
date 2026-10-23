@@ -1935,23 +1935,24 @@ export async function prepareSandboxManagedRuntime(input: {
         outboundTasks,
         input.client.allowConcurrentSyncOperations === true,
         SYNC_OPERATION_CONCURRENCY_LIMIT,
-      ).finally(async () => {
-        // Runtime credentials are not reusable workspace state. Scrub through
-        // the remote client even when copy-back fails, before lease release.
+      );
+      const errors = outboundResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      // Runtime credentials are not reusable workspace state. Scrub after every
+      // copy-back settles, retaining both restore and security cleanup failures.
+      try {
         await input.client.run(
           `rm -rf -- ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config"))} ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config-upload.tar"))}*`,
           { timeoutMs: input.spec.timeoutMs },
         );
-      });
-
-      // Every outbound restore is a required operation: a rejection is fatal.
-      // The workspace comes first, then each asset in order. Raise the first
-      // rejection in stable task order, so two failures raise the earlier one.
-      for (const result of outboundResults) {
-        if (result.status === "rejected") {
-          throw result.reason;
+      } catch (error) {
+        if (errors.length > 0) {
+          throw new AggregateError([...errors, error], "Sandbox restore and MCP cleanup failed.");
         }
+        throw error;
       }
+      // Preserve stable first-restore failure identity when the scrub succeeds;
+      // each later restore failure has its own phase diagnostics already.
+      if (errors.length > 0) throw errors[0];
     },
   };
 }

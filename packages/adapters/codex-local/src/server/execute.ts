@@ -40,6 +40,7 @@ import {
   ensurePaperclipSkillSymlink,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
+  rethrowCleanupErrors,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
@@ -770,6 +771,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let releaseManagedMcpConfig: (() => Promise<void>) | null = null;
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, asNumber(config.timeoutSec, 0));
+  const executionErrors: unknown[] = [];
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
@@ -1646,41 +1648,54 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionError = error;
       throw error;
     } finally {
+      const cleanupErrors: unknown[] = [];
       try {
         if (paperclipBridge) {
           const bridge = paperclipBridge;
           paperclipBridge = null;
           await bridge.stop();
         }
-      } finally {
-        if (restoreRemoteWorkspace) {
-          try {
-            await onLog(
-              "stdout",
-              `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-            );
-            await restoreRemoteWorkspace();
-          } catch (error) {
-            await Promise.resolve(
-              onLog(
-                "stderr",
-                `[paperclip] Failed to restore workspace changes from ${describeAdapterExecutionTarget(
-                  executionTarget,
-                )}: ${error instanceof Error ? error.message : String(error)}\n`,
-              ),
-            ).catch(() => undefined);
-            // A provider failure remains the primary outcome. When provider work
-            // succeeded, however, silently accepting a failed copy-back can lose
-            // the only workspace edits before a replacement sandbox starts.
-            if (executionError === null) throw error;
-          }
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (restoreRemoteWorkspace) {
+        try {
+          await onLog(
+            "stdout",
+            `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+          ).catch(() => {});
+          await restoreRemoteWorkspace();
+        } catch (error) {
+          await Promise.resolve(
+            onLog(
+              "stderr",
+              `[paperclip] Failed to restore workspace changes from ${describeAdapterExecutionTarget(
+                executionTarget,
+              )}: ${error instanceof Error ? error.message : String(error)}\n`,
+            ),
+          ).catch(() => undefined);
+          // Copy-back remains fail-soft after a provider failure, but a bridge
+          // security-cleanup failure must never replace that primary evidence.
+          if (executionError === null || cleanupErrors.length > 0) cleanupErrors.push(error);
         }
       }
+      rethrowCleanupErrors(
+        executionError === null ? [] : [executionError],
+        cleanupErrors,
+        "Codex execution and remote cleanup failed.",
+      );
     }
+  } catch (error) {
+    executionErrors.push(error);
+    throw error;
   } finally {
+    const cleanupErrors: unknown[] = [];
     try {
       await paperclipBridge?.stop();
-    } finally {
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
       // Remove the staged CODEX_HOME allowlist temp dir on every exit path
       // (teardown AND error), never only the happy path. Cleanup failure is
       // logged, not fatal — a leaked temp dir must not crash the run.
@@ -1718,6 +1733,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           });
         }
       }
+    } catch (error) {
+      cleanupErrors.push(error);
     }
+    rethrowCleanupErrors(executionErrors, cleanupErrors, "Codex execution and cleanup failed.");
   }
 }

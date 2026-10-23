@@ -2696,10 +2696,13 @@ function mergeRuntimeEnvironment(
 // `stopTransport` effect. The bridge tokens are run-scoped, so they die with the
 // bridges here (Amendment B).
 async function stopRunTransport(prepared: AcpxPreparedRuntime): Promise<void> {
-  await Promise.allSettled([
+  const results = await Promise.allSettled([
     prepared.processSessionBridge?.stop(),
     prepared.paperclipBridge?.stop(),
   ]);
+  const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "ACPX bridge cleanup failed.");
 }
 
 // The site sync-back. This is the settlement `syncBack` effect. It runs AFTER the
@@ -4042,6 +4045,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // sanitize) still cannot put a raw `Error.message` — and the host path
       // or process id it can carry — on the run log.
       const SYNC_BACK_SETTLEMENT_STEP = "settlement-sync_back";
+      const transportCleanupErrors: unknown[] = [];
       const recordTeardownError = async (step: string, teardownErr: unknown) => {
         const reason =
           step === SYNC_BACK_SETTLEMENT_STEP
@@ -5354,6 +5358,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // sync-back finishes, so the release cannot move earlier into settlement.
         releaseStagingLease: () => {},
         recordError: async (step, error) => {
+          if (step === "stop_transport") transportCleanupErrors.push(error);
           await recordTeardownError(`settlement-${step}`, error);
         },
       };
@@ -5411,6 +5416,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               resultJson: { ...capturedResult.resultJson, executionCancellation: {
                 state: "acknowledged", acknowledgedAt: new Date().toISOString(), forced: forcedStop,
               } },
+            };
+          }
+          // Credential cleanup is a security boundary, not the fail-soft
+          // copy-back policy. Settlement still finishes every remaining step,
+          // but a clean provider turn cannot conceal failed revocation/scrub.
+          if (transportCleanupErrors.length > 0) {
+            runFailed = true;
+            capturedResult = {
+              ...capturedResult,
+              exitCode: capturedResult.exitCode || 1,
+              errorMessage: [capturedResult.errorMessage, "Sandbox bridge credential cleanup failed."].filter(Boolean).join(" "),
+              errorCode: capturedResult.errorCode ?? "sandbox_bridge_cleanup_failed",
+              resultJson: { ...capturedResult.resultJson, sandboxBridgeCleanupFailed: true },
             };
           }
           // The sync-back settlement step runs before this reproduces the result

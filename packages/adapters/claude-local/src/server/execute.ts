@@ -44,6 +44,7 @@ import {
   isForbiddenConfigEnvKey,
   isPaperclipRuntimeEnvKey,
   refreshPaperclipWorkspaceEnvForExecution,
+  rethrowCleanupErrors,
   renderTemplate,
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
@@ -632,6 +633,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  const executionErrors: unknown[] = [];
   try {
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
@@ -1543,17 +1545,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+  } catch (error) {
+    executionErrors.push(error);
+    throw error;
   } finally {
+    const cleanupErrors: unknown[] = [];
     try {
       await paperclipBridge?.stop();
-    } finally {
-      if (restoreRemoteWorkspace) {
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (restoreRemoteWorkspace) {
+      try {
         await onLog(
           "stdout",
           `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-        );
+        ).catch(() => {});
         await restoreRemoteWorkspace();
+      } catch (error) {
+        cleanupErrors.push(error);
       }
     }
+    rethrowCleanupErrors(executionErrors, cleanupErrors, "Claude execution and cleanup failed.");
   }
 }

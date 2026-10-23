@@ -2110,110 +2110,118 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxQueueDepth: input.maxQueueDepth,
     maxBodyBytes: input.maxBodyBytes,
   });
-  const nodeCommand = input.nodeCommand?.trim() || "node";
-  const startResult = await input.runner.execute({
-    command: shellCommand,
-    args: shellCommandArgs(
-      [
-        `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
-        `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
-          `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
-        "pid=$!",
-        `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
-      ].join("\n"),
-    ),
-    cwd: input.remoteCwd,
-    env: {
-      [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
-      ...env,
-    },
-    timeoutMs,
-  });
-  requireSuccessfulResult("start sandbox callback bridge", startResult);
-
-  const readyResult = await runShell(
-    input.runner,
-    input.remoteCwd,
-    [
-      "i=0",
-      `while [ \"$i\" -lt 200 ]; do`,
-      `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
-      `    cat ${shellQuote(directories.readyFile)}`,
-      "    exit 0",
-      "  fi",
-      `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cat ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
-      `    cat ${shellQuote(directories.logFile)} >&2`,
-      "    exit 1",
-      "  fi",
-      "  i=$((i + 1))",
-      "  sleep 0.05",
-      "done",
-      `echo "Timed out waiting for bridge readiness." >&2`,
-      `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
-      "exit 1",
-    ].join("\n"),
-    timeoutMs,
-    shellCommand,
-  );
-  requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
-
-  let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
-  try {
-    readyData = JSON.parse(readyResult.stdout.trim()) as { host?: string; port?: number; baseUrl?: string; pid?: number };
-  } catch (error) {
-    throw new Error(
-      `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
-    ? readyData.host.trim()
-    : "127.0.0.1";
-  const port = typeof readyData.port === "number" && Number.isFinite(readyData.port) ? readyData.port : 0;
-  if (!port) {
-    throw new Error("Sandbox callback bridge did not report a listening port.");
-  }
-  const baseUrl =
-    typeof readyData.baseUrl === "string" && readyData.baseUrl.trim().length > 0
-      ? readyData.baseUrl.trim()
-      : `http://${host}:${port}`;
-
-  return {
-    baseUrl,
-    host,
-    port,
-    pid: typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0,
-    directories,
-    stop: async () => {
-      const stopResult = await input.runner.execute({
-        command: shellCommand,
-        args: shellCommandArgs(
-          [
-            `if [ -s ${shellQuote(directories.pidFile)} ]; then`,
-            `  pid="$(cat ${shellQuote(directories.pidFile)})"`,
-            "  kill \"$pid\" 2>/dev/null || true",
-            "  i=0",
-            "  while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
-            "    i=$((i + 1))",
-            "    sleep 0.05",
-            "  done",
-            "fi",
-            `rm -f ${shellQuote(directories.pidFile)} ${shellQuote(directories.readyFile)}`,
-          ].join("\n"),
-        ),
-        cwd: input.remoteCwd,
-        env: {
-          [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
-        },
-        timeoutMs,
-      });
-      if (stopResult.timedOut) {
-        throw new Error(buildRunnerFailureMessage("stop sandbox callback bridge", stopResult));
-      }
-    },
+  const stop = async () => {
+    const stopResult = await input.runner.execute({
+      command: shellCommand,
+      args: shellCommandArgs(
+        [
+          `if [ -s ${shellQuote(directories.pidFile)} ]; then`,
+          `  pid="$(cat ${shellQuote(directories.pidFile)})"`,
+          "  kill \"$pid\" 2>/dev/null || true",
+          "  i=0",
+          "  while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
+          "    i=$((i + 1))",
+          "    sleep 0.05",
+          "  done",
+          "fi",
+          `rm -f ${shellQuote(directories.pidFile)} ${shellQuote(directories.readyFile)}`,
+        ].join("\n"),
+      ),
+      cwd: input.remoteCwd,
+      env: { [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE },
+      timeoutMs,
+    });
+    requireSuccessfulResult("stop sandbox callback bridge", stopResult);
   };
+  const nodeCommand = input.nodeCommand?.trim() || "node";
+  try {
+    const startResult = await input.runner.execute({
+      command: shellCommand,
+      args: shellCommandArgs(
+        [
+          `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
+          `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
+          `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
+            `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
+          "pid=$!",
+          `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
+          "printf '{\"pid\":%s}\\n' \"$pid\"",
+        ].join("\n"),
+      ),
+      cwd: input.remoteCwd,
+      env: {
+        [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
+        ...env,
+      },
+      timeoutMs,
+    });
+    requireSuccessfulResult("start sandbox callback bridge", startResult);
+
+    const readyResult = await runShell(
+      input.runner,
+      input.remoteCwd,
+      [
+        "i=0",
+        `while [ \"$i\" -lt 200 ]; do`,
+        `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
+        `    cat ${shellQuote(directories.readyFile)}`,
+        "    exit 0",
+        "  fi",
+        `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cat ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
+        `    cat ${shellQuote(directories.logFile)} >&2`,
+        "    exit 1",
+        "  fi",
+        "  i=$((i + 1))",
+        "  sleep 0.05",
+        "done",
+        `echo "Timed out waiting for bridge readiness." >&2`,
+        `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
+        "exit 1",
+      ].join("\n"),
+      timeoutMs,
+      shellCommand,
+    );
+    requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
+
+    let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
+    try {
+      readyData = JSON.parse(readyResult.stdout.trim()) as { host?: string; port?: number; baseUrl?: string; pid?: number };
+    } catch (error) {
+      throw new Error(
+        `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
+      ? readyData.host.trim()
+      : "127.0.0.1";
+    const port = typeof readyData.port === "number" && Number.isFinite(readyData.port) ? readyData.port : 0;
+    if (!port) {
+      throw new Error("Sandbox callback bridge did not report a listening port.");
+    }
+    const baseUrl =
+      typeof readyData.baseUrl === "string" && readyData.baseUrl.trim().length > 0
+        ? readyData.baseUrl.trim()
+        : `http://${host}:${port}`;
+
+    return {
+      baseUrl,
+      host,
+      port,
+      pid: typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0,
+      directories,
+      stop,
+    };
+  } catch (error) {
+    // Startup may have launched a listener without returning its handle. Stop
+    // from the run-owned PID file before the factory relinquishes ownership.
+    try {
+      await stop();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Sandbox callback startup and cleanup failed.");
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

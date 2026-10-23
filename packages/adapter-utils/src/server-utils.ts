@@ -38,6 +38,18 @@ import type {
   AdapterSkillSnapshot,
 } from "./types.js";
 
+/** A cleanup failure is fatal, but must retain any earlier execution evidence. */
+export function rethrowCleanupErrors(
+  executionErrors: readonly unknown[],
+  cleanupErrors: readonly unknown[],
+  message: string,
+): void {
+  if (cleanupErrors.length === 0) return;
+  const errors = [...executionErrors, ...cleanupErrors];
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
+}
+
 export function buildRuntimeToolsEnv(
   access: AdapterRuntimeToolAccess | null | undefined,
 ): Record<string, string> {

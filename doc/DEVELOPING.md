@@ -180,14 +180,23 @@ This limit also applies to API callbacks using the same sandbox bridge bearer.
 
 ### Sandbox MCP asset teardown
 
-Bridge teardown removes the remote `mcp-config` directory and transfer fragments,
-including when adapter setup fails after the bridge starts. Codex also removes
+Bridge teardown revokes host forwarding before asynchronous cleanup, then removes
+the remote `mcp-config` directory and transfer fragments. This also runs when
+startup fails before a bridge handle returns: partial queue listeners and bound
+HTTP/2 sessions/channels are closed by their startup owner. Codex also removes
 its generated remote `home/config.toml`; subscription auth copy-back is separate.
+
+Every MCP removal must succeed; a successful later archive removal cannot mask a
+failed config removal. Cleanup attempts the remaining operations even after a
+failure. CLI execution and cleanup failures are preserved together, and ACP
+settlement cannot report a successful turn after bridge credential cleanup fails.
+Workspace copy-back still runs after a bridge cleanup error.
 
 Sandbox managed-runtime restore removes `<runtimeRoot>/mcp-config` and
 `<runtimeRoot>/mcp-config-upload.tar*` through the remote client after all
-copy-back operations settle. The scrub also runs when copy-back fails and its
-failure propagates to the caller. Other runtime assets remain intact.
+copy-back operations settle. The scrub also runs when copy-back fails. Combined
+restore/scrub errors retain both causes; restore-only failures keep their stable
+first-failure ordering. Other runtime assets remain intact.
 This cleanup is defense in depth. It does not protect credentials while a run
 is active or remove copies already captured in a provider snapshot.
 
