@@ -1,0 +1,277 @@
+name: Fork Pinned Source Qualification
+run-name: Qualify pinned source 321499c232ea (workflow ${{ github.sha }})
+
+# Qualification only. This does not publish, deploy, or waive release gates.
+# After review and merge, an authorized operator dispatches this workflow on
+# master at or after the merged workflow commit, NOT at the source commit.
+# There are no inputs. Dispatches on any other ref skip without an artifact.
+# The operator verifies the dispatched workflow blob out of band before dispatch.
+# Download fork-qualification-<run-id>-<attempt> and inspect qualification.json
+# and all four logs. Any failure or missing evidence means NOT qualified.
+# Do not rerun until green. Route source failures back to the source owner.
+# Rollback: revert this workflow in a separate reviewed PR; no SQL/history edits.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No concurrency group on purpose: every dispatch runs to completion and uploads
+# its own artifact. A shared group would silently drop queued runs beyond one pending.
+jobs:
+  qualify:
+    if: github.repository == 'TogetherWeOwn/paperclip' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "true"
+      NO_COLOR: "1"
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Initialize evidence before checkout
+        id: initialize
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          mkdir -p "$evidence"
+          # EVIDENCE_DIR is deliberately NOT exported: source-controlled install
+          # and test processes must not inherit the evidence path. Trusted steps
+          # below resolve the same fixed path locally instead.
+          printf 'PAPERCLIP_HOME=%s\n' "$RUNNER_TEMP/paperclip-qualification-home" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'fork-qualification'
+          repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+          data = {
+              'schema_version': 1,
+              'expected_source_sha': '321499c232ea4e1966367b85763ad0c53969ffac',
+              'source_url': f'{repo_url}/commit/321499c232ea4e1966367b85763ad0c53969ffac',
+              'workflow_sha': os.environ['WORKFLOW_SHA'],
+              'workflow_ref': os.environ['WORKFLOW_REF'],
+              'workflow_url': f"{repo_url}/blob/{os.environ['WORKFLOW_SHA']}/.github/workflows/fork-pinned-qualification.yml",
+              'dispatch_ref': os.environ['DISPATCH_REF'],
+              'run_url': f"{repo_url}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+          }
+          (root / 'provenance.json').write_text(json.dumps(data, indent=2) + '\n')
+          PY
+
+      - name: Checkout only the fixed same-repository source
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TogetherWeOwn/paperclip
+          ref: 321499c232ea4e1966367b85763ad0c53969ffac
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify source before executing any source code
+        id: source
+        working-directory: source
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          actual="$(git rev-parse HEAD)"
+          printf '%s\n' "$actual" > "$evidence/checked-out-source-sha.txt"
+          test "$actual" = 321499c232ea4e1966367b85763ad0c53969ffac
+          test "$(git remote get-url origin)" = https://github.com/TogetherWeOwn/paperclip
+          printf 'verified=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Snapshot trusted evidence integrity
+        id: integrity
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          manifest="$RUNNER_TEMP/fork-qualification-integrity"
+          mkdir -p "$manifest"
+          # Last trusted write before source-controlled code runs (pnpm install
+          # executes postinstall scripts). The report re-hashes these files and
+          # fails closed on any mismatch, so accidental corruption cannot pass
+          # as qualified. The trust root remains the pinned, auditable source SHA.
+          (cd "$evidence" && sha256sum provenance.json checked-out-source-sha.txt > "$manifest/manifest.sha256")
+
+      - name: Set up Node without shared caches
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up source-pinned pnpm without shared caches
+        id: pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: source/package.json
+          run_install: false
+          cache: false
+
+      - name: Prepare pinned native toolchain for disposable tests
+        id: native
+        timeout-minutes: 10
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          { rustc +1.97.1 --version; cargo +1.97.1 --version; cc --version; } > "$evidence/native-versions.txt"
+
+      - name: Install exact-source dependencies once
+        id: install
+        working-directory: source
+        timeout-minutes: 20
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          { node --version; pnpm --version; } > "$evidence/tool-versions.txt"
+          set +e
+          timeout --signal=TERM --kill-after=30s 18m pnpm install --frozen-lockfile 2>&1 | tee "$evidence/install.log"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${codes[0]}" > "$evidence/install.exit-code"
+          printf '%s\n' "${codes[1]}" > "$evidence/install.log-exit-code"
+          test "${codes[0]}" = 0 && test "${codes[1]}" = 0
+
+      - name: Capture every qualification command independently
+        id: commands
+        working-directory: source
+        timeout-minutes: 190
+        run: |
+          evidence="$RUNNER_TEMP/fork-qualification"
+          capture() {
+            local name="$1" budget="$2"
+            shift 2
+            printf '%s\n' "$*" > "$evidence/$name.command"
+            set +e
+            timeout --signal=TERM --kill-after=30s "$budget" "$@" 2>&1 | tee "$evidence/$name.log"
+            local codes=("${PIPESTATUS[@]}")
+            set -e
+            printf '%s\n' "${codes[0]}" > "$evidence/$name.exit-code"
+            printf '%s\n' "${codes[1]}" > "$evidence/$name.log-exit-code"
+          }
+          # Do not short-circuit after a source failure. The aggregate below is
+          # the gate; this step only captures evidence, with no retries/skips.
+          capture typecheck 30m pnpm -r typecheck
+          capture tests 90m pnpm test:run
+          capture build 30m pnpm build
+          capture migrations 30m pnpm --filter @paperclipai/db check:migrations
+
+      - name: Build qualification report even after failure
+        id: report
+        if: always()
+        env:
+          SOURCE_VERIFIED: ${{ steps.source.outputs.verified }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          COMMANDS_OUTCOME: ${{ steps.commands.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'fork-qualification'
+          root.mkdir(parents=True, exist_ok=True)
+          provenance = root / 'provenance.json'
+          data = json.loads(provenance.read_text()) if provenance.is_file() else {}
+          manifest = Path(os.environ['RUNNER_TEMP']) / 'fork-qualification-integrity' / 'manifest.sha256'
+          entries = manifest.read_text().splitlines() if manifest.is_file() else []
+          integrity = bool(entries)
+          for line in entries:
+              parts = line.split()
+              if len(parts) != 2:
+                  integrity = False
+                  break
+              digest, name = parts
+              target = root / os.path.basename(name)
+              if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                  integrity = False
+                  break
+          data['evidence_integrity'] = integrity
+          checked_out = root / 'checked-out-source-sha.txt'
+          data['verified_source_sha'] = checked_out.read_text().strip() if checked_out.is_file() else None
+          data['source_verified'] = (os.environ['SOURCE_VERIFIED'] == 'true'
+              and data['verified_source_sha'] == '321499c232ea4e1966367b85763ad0c53969ffac')
+          data['install_outcome'] = os.environ['INSTALL_OUTCOME']
+          data['commands_outcome'] = os.environ['COMMANDS_OUTCOME']
+          data['commands'] = []
+          for name, command in [
+              ('typecheck', 'pnpm -r typecheck'),
+              ('tests', 'pnpm test:run'),
+              ('build', 'pnpm build'),
+              ('migrations', 'pnpm --filter @paperclipai/db check:migrations'),
+          ]:
+              def code(suffix):
+                  path = root / f'{name}.{suffix}'
+                  text = path.read_text().strip() if path.is_file() else ''
+                  return int(text) if re.fullmatch(r'[0-9]{1,3}', text) else None
+              log = root / f'{name}.log'
+              recorded = root / f'{name}.command'
+              data['commands'].append({
+                  'name': name, 'command': command,
+                  'exit_code': code('exit-code'), 'log_exit_code': code('log-exit-code'),
+                  'log': log.name, 'log_bytes': log.stat().st_size if log.is_file() else 0,
+                  'command_matches': recorded.is_file() and recorded.read_text().strip() == command,
+              })
+          tests_log = root / 'tests.log'
+          text = tests_log.read_text(errors='replace') if tests_log.is_file() else ''
+          text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+          data['suite_test_summaries'] = [line.strip() for line in text.splitlines()
+              if re.match(r'^\s*(Test Files|Test Suites|Tests)\s+', line)]
+          data['counts_available'] = bool(data['suite_test_summaries'])
+          data['counts_partial'] = data['commands'][1]['exit_code'] != 0
+          data['qualified'] = (bool(data.get('workflow_sha')) and data['source_verified']
+              and data.get('dispatch_ref') == 'refs/heads/master'
+              and data['evidence_integrity']
+              and data['counts_available']
+              and data['install_outcome'] == 'success' and data['commands_outcome'] == 'success'
+              and all(c['exit_code'] == 0 and c['log_exit_code'] == 0
+                  and c['log_bytes'] > 0 and c['command_matches'] for c in data['commands']))
+          data['next_action'] = ('Return this evidence to the source owner; release gates remain separate.'
+              if data['qualified'] else 'Not qualified. Inspect failed or missing evidence; return to the source owner. Do not rerun until green.')
+          (root / 'qualification.json').write_text(json.dumps(data, indent=2) + '\n')
+          lines = ['# Pinned source qualification', '',
+              f"Result: {'QUALIFIED' if data['qualified'] else 'NOT QUALIFIED'} (artifact upload must also succeed)",
+              f"Source: {data['verified_source_sha'] or 'not verified'}",
+              f"Workflow revision: {data.get('workflow_sha', 'missing')}",
+              f"Workflow: {data.get('workflow_url', 'missing')}",
+              f"Dispatch ref: {data.get('dispatch_ref', 'missing')}",
+              f"Evidence integrity: {'verified' if data['evidence_integrity'] else 'FAILED'}",
+              f"Run: {data.get('run_url', 'missing')}", '',
+              '| Command | Exit | Log capture exit | Log bytes |', '| --- | --- | --- | --- |']
+          for c in data['commands']:
+              lines.append(f"| `{c['command']}` | {c['exit_code']} | {c['log_exit_code']} | {c['log_bytes']} |")
+          lines += ['', '## Available suite/test summaries', '']
+          lines += data['suite_test_summaries'] or ['Unavailable; inspect tests.log. No counts are inferred.']
+          lines += ['', f"Counts partial: {data['counts_partial']}. Existing skipped tests remain visible in the raw summaries.",
+              'Command success does not prove that every optional test ran. Inspect the skipped counts before any downstream decision.',
+              '', data['next_action'], '', 'Qualification is not deployment or release permission.']
+          (root / 'summary.md').write_text('\n'.join(lines) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"qualified={str(data['qualified']).lower()}\n")
+          PY
+
+      - name: Preserve qualification evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-qualification/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Require complete green evidence and artifact upload
+        if: always()
+        env:
+          QUALIFIED: ${{ steps.report.outputs.qualified }}
+          REPORT_OUTCOME: ${{ steps.report.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          if test -f "$RUNNER_TEMP/fork-qualification/summary.md"; then
+            cat "$RUNNER_TEMP/fork-qualification/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          test "$REPORT_OUTCOME" = success
+          test "$UPLOAD_OUTCOME" = success
+          test "$QUALIFIED" = true

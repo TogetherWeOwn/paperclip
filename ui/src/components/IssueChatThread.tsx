@@ -1538,6 +1538,37 @@ function IssueChatRollingToolPart({
   );
 }
 
+function useCopyFeedback() {
+  const [copied, setCopied] = useState(false);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (resetTimer.current !== null) {
+        clearTimeout(resetTimer.current);
+        resetTimer.current = null;
+      }
+    };
+  }, []);
+
+  const showCopyFeedback = useCallback(() => {
+    if (!mounted.current) return;
+    if (resetTimer.current !== null) {
+      clearTimeout(resetTimer.current);
+    }
+    setCopied(true);
+    resetTimer.current = setTimeout(() => {
+      resetTimer.current = null;
+      setCopied(false);
+    }, 2000);
+  }, []);
+
+  return [copied, showCopyFeedback] as const;
+}
+
 function CopyablePreBlock({
   children,
   className,
@@ -1545,7 +1576,7 @@ function CopyablePreBlock({
   children: string;
   className?: string;
 }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, showCopyFeedback] = useCopyFeedback();
   const toastActions = useOptionalToastActions();
   return (
     <div className="group/pre relative">
@@ -1560,10 +1591,7 @@ function CopyablePreBlock({
         aria-label="Copy"
         onClick={() => {
           void copyTextToClipboard(children)
-            .then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 2000);
-            })
+            .then(showCopyFeedback)
             .catch((error) => {
               toastActions?.pushToast({
                 title: "Copy failed",
@@ -2034,7 +2062,7 @@ function IssueChatUserMessage({
     typeof custom.queueTargetRunId === "string"
       ? custom.queueTargetRunId
       : null;
-  const [copied, setCopied] = useState(false);
+  const [copied, showCopyFeedback] = useCopyFeedback();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const toastActions = useOptionalToastActions();
   const {
@@ -2205,10 +2233,7 @@ function IssueChatUserMessage({
                   .map((p) => p.text)
                   .join("\n\n");
                 void copyTextToClipboard(text)
-                  .then(() => {
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 2000);
-                  })
+                  .then(showCopyFeedback)
                   .catch((error) => {
                     toastActions?.pushToast({
                       title: "Copy failed",
@@ -2376,7 +2401,7 @@ function IssueChatAssistantMessage({
     messageId: message.id,
     isFoldable,
   });
-  const [copied, setCopied] = useState(false);
+  const [copied, showCopyFeedback] = useCopyFeedback();
   const toastActions = useOptionalToastActions();
   const copyText = deleted ? "" : getThreadMessageCopyText(message);
 
@@ -2438,10 +2463,7 @@ function IssueChatAssistantMessage({
         aria-label="Copy message"
         onClick={() => {
           void copyTextToClipboard(copyText)
-            .then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 2000);
-            })
+            .then(showCopyFeedback)
             .catch((error) => {
               toastActions?.pushToast({
                 title: "Copy failed",
@@ -3524,8 +3546,8 @@ function SystemNoticeCommentContent({
     runId,
     metadata: commentMetadata,
   });
-  const [copied, setCopied] = useState(false);
-  const [copiedLink, setCopiedLink] = useState(false);
+  const [copied, showCopyFeedback] = useCopyFeedback();
+  const [copiedLink, showLinkCopyFeedback] = useCopyFeedback();
 
   const source = (() => {
     const runAgentName = runAgentId
@@ -3566,10 +3588,7 @@ function SystemNoticeCommentContent({
 
   const handleCopy = () => {
     void copyTextToClipboard(bodyText)
-      .then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      })
+      .then(showCopyFeedback)
       .catch((error) => {
         toastActions?.pushToast({
           title: "Copy failed",
@@ -3586,10 +3605,7 @@ function SystemNoticeCommentContent({
     if (!anchorId || typeof window === "undefined") return;
     const url = `${window.location.origin}${window.location.pathname}#${anchorId}`;
     void copyTextToClipboard(url)
-      .then(() => {
-        setCopiedLink(true);
-        setTimeout(() => setCopiedLink(false), 2000);
-      })
+      .then(showLinkCopyFeedback)
       .catch((error) => {
         toastActions?.pushToast({
           title: "Copy failed",
