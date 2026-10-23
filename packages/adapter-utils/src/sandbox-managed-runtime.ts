@@ -1935,7 +1935,14 @@ export async function prepareSandboxManagedRuntime(input: {
         outboundTasks,
         input.client.allowConcurrentSyncOperations === true,
         SYNC_OPERATION_CONCURRENCY_LIMIT,
-      );
+      ).finally(async () => {
+        // Runtime credentials are not reusable workspace state. Scrub through
+        // the remote client even when copy-back fails, before lease release.
+        await input.client.run(
+          `rm -rf -- ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config"))} ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config-upload.tar"))}*`,
+          { timeoutMs: input.spec.timeoutMs },
+        );
+      });
 
       // Every outbound restore is a required operation: a rejection is fatal.
       // The workspace comes first, then each asset in order. Raise the first

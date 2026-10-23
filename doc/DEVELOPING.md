@@ -157,6 +157,15 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### Sandbox MCP asset teardown
+
+Sandbox managed-runtime restore removes `<runtimeRoot>/mcp-config` and
+`<runtimeRoot>/mcp-config-upload.tar*` through the remote client after all
+copy-back operations settle. The scrub also runs when copy-back fails and its
+failure propagates to the caller. Other runtime assets remain intact.
+This cleanup is defense in depth. It does not protect credentials while a run
+is active or remove copies already captured in a provider snapshot.
+
 ### SSH workspace synchronization
 
 SSH execution excludes workspace-root `.paperclip-runtime/`, `.claude/worktrees/`,
