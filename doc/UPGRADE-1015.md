@@ -261,7 +261,11 @@ The existing authorized metadata executor must, in trusted custody:
    tool, re-review changed/unapproved catalog metadata, reactivate a disabled
    profile, replace a narrowed/deny profile with broader connection-wide includes,
    erase quarantine, create an unapproved install/binding/profile, change guest or
-   sponsor authority, or overwrite unknown/stale state. Existing statuses alone
+   sponsor authority, or overwrite unknown/stale state. A missing binding, or a
+   missing install when enabled, likewise means **STOP with zero write requests**;
+   do not treat absence as consent to create it during the author-filter PUT.
+   An absent install when disabled is not created by this source, but all other
+   affected state still requires the complete preflight. Existing statuses alone
    are not evidence of authority. No endpoint-specific approval is supplied here.
 4. The conservative eligible case has all exact-source catalog definitions/metadata
    already independently authorized and in the expected status, the existing

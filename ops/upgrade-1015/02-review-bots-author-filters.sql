@@ -29,8 +29,9 @@
 --
 -- Before ANY PUT, runbook §2's complete tool-sync preflight MUST pass under
 -- exclusive relevant writers and existing independent authority. Unchanged or
--- false toolsEnabled is NOT proof: every save syncs catalog/profile/entries/
--- installs/bindings and derives guest/sponsor metadata. Unknown/widening effects
+-- false toolsEnabled is NOT proof: every save calls syncGitHubBotTools on
+-- catalog/profile/entries/installs/bindings and derives guest/sponsor metadata.
+-- Unknown/widening effects
 -- STOP with zero write requests. This inventory does not qualify that write set.
 -- Prior-config PUT reruns sync; it does NOT restore erased narrowed tool decisions.
 -- Apply ONLY through authorized GET/PUT
