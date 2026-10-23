@@ -83,6 +83,34 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc9324
          c.queue === full
            ? queries.push(q)
            : c.execute(q) || move(c, full)
+diff --git a/cjs/src/queue.js b/cjs/src/queue.js
+index 8438f5da92cf7637d98a33491d75c75b1c817c25..c4e30d988fa3310867a83e70b5e8e47ffd32bad7 100644
+--- a/cjs/src/queue.js
++++ b/cjs/src/queue.js
+@@ -9,10 +9,10 @@ function Queue(initial = []) {
+       return xs.length - index
+     },
+     remove: (x) => {
+-      const index = xs.indexOf(x)
+-      return index === -1
++      const i = xs.indexOf(x, index)
++      return i === -1
+         ? null
+-        : (xs.splice(index, 1), x)
++        : (xs.splice(i, 1), x)
+     },
+     push: (x) => (xs.push(x), x),
+     shift: () => {
+@@ -21,6 +21,9 @@ function Queue(initial = []) {
+       if (index === xs.length) {
+         index = 0
+         xs = []
++      } else if (index > 64 && index * 2 >= xs.length) {
++        xs = xs.slice(index)
++        index = 0
+       } else {
+         xs[index - 1] = undefined
+       }
 diff --git a/src/connection.js b/src/connection.js
 index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..c95c326a2747c680c2c22b04b1c5f2e27a4e8c90 100644
 --- a/src/connection.js
@@ -168,3 +196,31 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..f0888986add8ba02c8853f792ae42dd1
          c.queue === full
            ? queries.push(q)
            : c.execute(q) || move(c, full)
+diff --git a/src/queue.js b/src/queue.js
+index c4ef97164f057db99dce1b9af3401dbb1af37e31..d0f1564c7f5ab5cedcfebe4264dbc781e31daa08 100644
+--- a/src/queue.js
++++ b/src/queue.js
+@@ -9,10 +9,10 @@ function Queue(initial = []) {
+       return xs.length - index
+     },
+     remove: (x) => {
+-      const index = xs.indexOf(x)
+-      return index === -1
++      const i = xs.indexOf(x, index)
++      return i === -1
+         ? null
+-        : (xs.splice(index, 1), x)
++        : (xs.splice(i, 1), x)
+     },
+     push: (x) => (xs.push(x), x),
+     shift: () => {
+@@ -21,6 +21,9 @@ function Queue(initial = []) {
+       if (index === xs.length) {
+         index = 0
+         xs = []
++      } else if (index > 64 && index * 2 >= xs.length) {
++        xs = xs.slice(index)
++        index = 0
+       } else {
+         xs[index - 1] = undefined
+       }

@@ -322,6 +322,17 @@ PostgreSQL backends and checks rejection, pool recovery, and transaction isolati
 Remove the patch when an upstream release passes these tests. Installs of the
 unmodified `postgres` package outside this workspace do not include the patch.
 
+The same patch also bounds the internal queues of the driver. In postgres.js
+3.4.9, a queue releases its storage only when it becomes fully empty. A pool
+that is never idle keeps the open, busy, and pending queues non-empty, so each
+queue grows on every query until the process fails with
+`RangeError: Invalid array length`. The patch applies the fix from
+[porsager/postgres#1235](https://github.com/porsager/postgres/pull/1235): a
+queue compacts its storage when its consumed prefix is longer than 64 entries
+and at least as long as its live entries, and `remove` starts its search at the
+first live entry. Remove these hunks when a postgres.js release includes that
+fix.
+
 Trusted-header actor synchronization retries transient connection failures,
 including `CONNECT_TIMEOUT`, at most twice. This retry applies only to the
 idempotent actor synchronization operations, not arbitrary transactions. A
