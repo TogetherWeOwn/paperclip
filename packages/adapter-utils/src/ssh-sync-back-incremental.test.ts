@@ -51,6 +51,10 @@ async function createTempDir(prefix: string): Promise<string> {
 // the trailing `sh -c` payload locally after remapping the fake remote root.
 const FAKE_REMOTE_ROOT = "/stub-ssh-remote";
 const STUB_SOURCE = `#!/bin/sh
+if [ "\${STUB_SSH_DEPTH:-0}" -ge 1 ]; then
+  echo "stub-ssh: recursive invocation refused" >&2; exit 99
+fi
+export STUB_SSH_DEPTH=1
 last=""
 for arg in "$@"; do last="$arg"; done
 case "$last" in
@@ -1520,14 +1524,14 @@ describe("changed-files sync-back wiring", () => {
     }
   }
 
-  // Fault injection for the seed-state gate: a PATH `git` shim that fails
-  // exactly the ignored-fingerprint `ls-files` scan and delegates everything
-  // else to the real binary. Positional argv matching (never `$*` substring)
-  // so remote `git -C ...` calls and the overlay scan pass through; the same
-  // absolute-path resolution plus depth guard as the argv-log shim, for the
-  // same PID-guard reason.
-  async function installFailingFingerprintGitStub(): Promise<void> {
-    const binDir = await createTempDir("paperclip-git-fp-fail-bin-");
+  // Fail one seed-provenance scan, not the repository ignore/transfer scan.
+  // Positional argv matching and the real-binary/depth guards keep the
+  // fault narrow and prevent a misresolved launcher from recursing.
+  async function installFailingSeedScanGitStub(
+    scan: "fingerprint" | "overlay",
+  ): Promise<{ failureLogPath: string }> {
+    const binDir = await createTempDir("paperclip-git-seed-scan-fail-bin-");
+    const failureLogPath = path.join(binDir, "failed-scan.log");
     await writeFile(
       path.join(binDir, "git"),
       `#!/bin/sh
@@ -1538,15 +1542,18 @@ if [ "$depth" -gt 5 ]; then
   exit 99
 fi
 export STUB_GIT_FP_FAIL_DEPTH="$depth"
-# runLocalGit prefixes every local call with "-C <dir>"; shift past it so
-# the match below sees the git subcommand. Only the fingerprint scan
-# carries this exact argv (the remote probe rephrases it as shell, and no
-# prepare-time remote call lists ignored files), so nothing else can match.
+# runLocalGit prefixes local calls with "-C <dir>". These positional
+# signatures distinguish the legacy fingerprint and overlay scans from
+# the full-copy ignore scan, which must succeed independently.
 a1="$1"; a2="$2"; a3="$3"; a4="$4"
 if [ "$a1" = "-C" ]; then a1="$3"; a2="$4"; a3="$5"; a4="$6"; fi
-if [ "$a1" = "ls-files" ] && [ "$a2" = "--others" ] && [ "$a3" = "--ignored" ] && [ "$a4" = "--exclude-per-directory=.gitignore" ]; then
-  echo "git-fp-fail: failing the ignored fingerprint scan" >&2
-  exit 1
+if [ "$a1" = "ls-files" ] && [ "$a2" = "--others" ]; then
+  if { [ "${scan}" = "fingerprint" ] && [ "$a3" = "--ignored" ] && [ "$a4" = "--exclude-per-directory=.gitignore" ]; } ||
+     { [ "${scan}" = "overlay" ] && [ "$a3" = "--exclude-per-directory=.gitignore" ]; }; then
+    printf '%s\\n' '${scan}' >> '${failureLogPath}'
+    echo "git-seed-scan-fail: failing the ${scan} scan" >&2
+    exit 1
+  fi
 fi
 exec "$STUB_REAL_GIT" "$@"
 `,
@@ -1554,6 +1561,7 @@ exec "$STUB_REAL_GIT" "$@"
     );
     process.env.STUB_REAL_GIT = resolveRealGitPath();
     process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
+    return { failureLogPath };
   }
 
   it(
@@ -2053,7 +2061,7 @@ exec "$STUB_REAL_GIT" "$@"
   );
 
   it(
-    "restores an ignored file the run created when none existed at seed time",
+    "omits newly ignored files while restoring tracked edits and preserving concurrent local ignored files",
     async () => {
       const localDir = await initRepo();
       await writeFile(
@@ -2065,12 +2073,24 @@ exec "$STUB_REAL_GIT" "$@"
       const remoteDir = await createTempDir("paperclip-wire-ignored-remote-");
       await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
       const checkoutDir = path.join(remoteDir, "checkout");
-      // No .log file exists locally at seed time, so no ignored entry is
-      // baseline-blind here; the run's creation must come back.
+      // New ignored files obey the same repository rules as a full restore.
+      // Tracked edits must still transfer; concurrent local ignored work wins.
       await writeFile(path.join(checkoutDir, "run.log"), "remote log\n");
+      await writeFile(
+        path.join(checkoutDir, "local.log"),
+        "remote collision\n",
+      );
+      await writeFile(
+        path.join(checkoutDir, "seed.txt"),
+        "remote tracked edit\n",
+      );
       const baseline = await captureDirectorySnapshot(localDir, {
         exclude: baselineExcludes(),
       });
+      await writeFile(
+        path.join(localDir, "local.log"),
+        "concurrent local log\n",
+      );
       const spec = buildStubSpec(remoteDir);
       const { logPath } = await installSshArgvLog();
       process.env.PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES = String(64 * 1024);
@@ -2086,7 +2106,13 @@ exec "$STUB_REAL_GIT" "$@"
 
       await expect(
         readFile(path.join(localDir, "run.log"), "utf8"),
-      ).resolves.toBe("remote log\n");
+      ).rejects.toThrow(/ENOENT/);
+      await expect(
+        readFile(path.join(localDir, "local.log"), "utf8"),
+      ).resolves.toBe("concurrent local log\n");
+      await expect(
+        readFile(path.join(localDir, "seed.txt"), "utf8"),
+      ).resolves.toBe("remote tracked edit\n");
       expect(await countStatusQueries(logPath)).toBe(1);
       expect(await countTarDownloads(logPath)).toBe(1);
     },
@@ -2322,22 +2348,37 @@ exec "$STUB_REAL_GIT" "$@"
   );
 
   it(
-    "applies a force-added file the run uncached and edited",
+    "preserves local bytes when the remote uncaches an ignored file while tracked edits transfer",
     async () => {
       const localDir = await initRepo();
       await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
       await writeFile(path.join(localDir, "tracked.log"), "v1\n");
-      await git(localDir, ["add", "-f", "tracked.log", ".gitignore"]);
+      await writeFile(path.join(localDir, "deliverable.txt"), "seed source\n");
+      await git(localDir, [
+        "add",
+        "-f",
+        "tracked.log",
+        ".gitignore",
+        "deliverable.txt",
+      ]);
       await git(localDir, ["commit", "-m", "seed"]);
       const remoteDir = await createTempDir("paperclip-wire-uncache-remote-");
       await gitRemoteClone(localDir, path.join(remoteDir, "checkout"));
       const checkoutDir = path.join(remoteDir, "checkout");
       // The run uncaches the ignore-matched file and edits it: real git
       // reports `D tracked.log` plus `!! tracked.log` (not `??`), so the
-      // path reaches reconciliation only through the ignored records. The
-      // baseline holds v1 (tracked at seed), but the remote v2 must win.
+      // remote index no longer tracks it. Match full-copy ignore authority:
+      // retain the local v1 instead of importing v2 or applying the index delete.
       await git(checkoutDir, ["rm", "--cached", "-q", "tracked.log"]);
       await writeFile(path.join(checkoutDir, "tracked.log"), "v2\n");
+      await writeFile(
+        path.join(checkoutDir, "deliverable.txt"),
+        "remote source\n",
+      );
+      expect(await git(checkoutDir, ["ls-files", "tracked.log"])).toBe("");
+      expect(
+        (await git(checkoutDir, ["check-ignore", "tracked.log"])).trim(),
+      ).toBe("tracked.log");
       const baseline = await captureDirectorySnapshot(localDir, {
         exclude: baselineExcludes(),
       });
@@ -2356,7 +2397,10 @@ exec "$STUB_REAL_GIT" "$@"
 
       await expect(
         readFile(path.join(localDir, "tracked.log"), "utf8"),
-      ).resolves.toBe("v2\n");
+      ).resolves.toBe("v1\n");
+      await expect(
+        readFile(path.join(localDir, "deliverable.txt"), "utf8"),
+      ).resolves.toBe("remote source\n");
       expect(await countStatusQueries(logPath)).toBe(1);
       expect(await countTarDownloads(logPath)).toBe(1);
     },
@@ -2686,7 +2730,7 @@ exec "$STUB_REAL_GIT" "$@"
   );
 
   it(
-    "omits the seed state when the ignored fingerprint scan fails",
+    "keeps full-copy seed provenance without fingerprinting omitted ignored files",
     async () => {
       const localDir = await initRepo();
       await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
@@ -2694,10 +2738,10 @@ exec "$STUB_REAL_GIT" "$@"
       await writeFile(path.join(localDir, "a.log"), "ignored\n");
       const remoteDir = await createTempDir("paperclip-wire-fpgate-remote-");
       const spec = buildStubSpec(remoteDir);
-      // The kill switch forces the legacy seed deterministically; the stub
-      // fails only the fingerprint scan, so the seed itself must still land
-      // while the restore-affecting seed state stays omitted.
-      await installFailingFingerprintGitStub();
+      // The kill switch forces the full-copy seed. The obsolete carried-file
+      // fingerprint must not run: these ignored bytes never leave the source.
+      const { failureLogPath } =
+        await installFailingSeedScanGitStub("fingerprint");
       const prepared = await withIncrementalEnv("0", () =>
         prepareWorkspaceForSshExecution({
           spec,
@@ -2708,10 +2752,104 @@ exec "$STUB_REAL_GIT" "$@"
 
       expect(prepared.gitBacked).toBe(true);
       expect(prepared.seedMode).toBe("full-copy");
-      expect(prepared.seedState).toBeUndefined();
+      expect(prepared.ignoredPaths).toEqual(["a.log"]);
+      expect(prepared.seedState).toEqual(await cleanTreeSeedState(localDir));
+      expect(prepared.seedState?.ignoredFingerprint).toBeUndefined();
+      expect(await readFile(failureLogPath, "utf8").catch(() => "")).toBe("");
       await expect(
         readFile(path.join(remoteDir, "checkout", "seed.txt"), "utf8"),
       ).resolves.toBe("seed\n");
+      await expect(
+        lstat(path.join(remoteDir, "checkout", "a.log")),
+      ).rejects.toThrow(/ENOENT/);
+      const baselineSnapshot = await captureDirectorySnapshot(localDir, {
+        exclude: [...baselineExcludes(), ...(prepared.ignoredPaths ?? [])],
+      });
+      await writeFile(
+        path.join(remoteDir, "checkout", "seed.txt"),
+        "remote edit\n",
+      );
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot,
+        restoreGitHistory: true,
+        ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
+      });
+      await expect(
+        readFile(path.join(localDir, "seed.txt"), "utf8"),
+      ).resolves.toBe("remote edit\n");
+      await expect(
+        readFile(path.join(localDir, "a.log"), "utf8"),
+      ).resolves.toBe("ignored\n");
+    },
+    GIT_TIMEOUT_MS,
+  );
+
+  it(
+    "omits unsafe seed provenance when the full-copy overlay scan is unreadable",
+    async () => {
+      const localDir = await initRepo();
+      await writeFile(path.join(localDir, ".gitignore"), "*.log\n");
+      await commitFile(localDir, "seed.txt", "seed\n", "seed");
+      await writeFile(
+        path.join(localDir, "untracked.txt"),
+        "seeded untracked\n",
+      );
+      await writeFile(path.join(localDir, "a.log"), "ignored\n");
+      const remoteDir = await createTempDir(
+        "paperclip-wire-overlaygate-remote-",
+      );
+      const spec = buildStubSpec(remoteDir);
+      const { failureLogPath } = await installFailingSeedScanGitStub("overlay");
+      const prepared = await withIncrementalEnv("0", () =>
+        prepareWorkspaceForSshExecution({
+          spec,
+          localDir,
+          remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        }),
+      );
+
+      expect(prepared.seedMode).toBe("full-copy");
+      expect(prepared.seedState).toBeUndefined();
+      await expect(readFile(failureLogPath, "utf8")).resolves.toBe("overlay\n");
+      await expect(
+        readFile(path.join(remoteDir, "checkout", "untracked.txt"), "utf8"),
+      ).resolves.toBe("seeded untracked\n");
+      const baselineSnapshot = await captureDirectorySnapshot(localDir, {
+        exclude: [...baselineExcludes(), ...(prepared.ignoredPaths ?? [])],
+      });
+      // Without provenance, a deleted seeded-untracked path is unknowable
+      // to Git's delta. Full restore must still apply the remote deletion.
+      await rm(path.join(remoteDir, "checkout", "untracked.txt"));
+      await writeFile(
+        path.join(remoteDir, "checkout", "seed.txt"),
+        "remote edit\n",
+      );
+      const { logPath } = await installSshArgvLog();
+      await restoreWorkspaceFromSshExecution({
+        spec,
+        localDir,
+        remoteDir: `${FAKE_REMOTE_ROOT}/checkout`,
+        baselineSnapshot,
+        restoreGitHistory: true,
+        ignoredPaths: prepared.ignoredPaths,
+        seedState: prepared.seedState,
+      });
+
+      expect(await countStatusQueries(logPath)).toBe(0);
+      expect(await countTarDownloads(logPath)).toBe(1);
+      await expect(lstat(path.join(localDir, "untracked.txt"))).rejects.toThrow(
+        /ENOENT/,
+      );
+      await expect(
+        readFile(path.join(localDir, "seed.txt"), "utf8"),
+      ).resolves.toBe("remote edit\n");
+      await expect(
+        readFile(path.join(localDir, "a.log"), "utf8"),
+      ).resolves.toBe("ignored\n");
     },
     GIT_TIMEOUT_MS,
   );

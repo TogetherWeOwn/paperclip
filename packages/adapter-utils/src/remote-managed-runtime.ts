@@ -147,19 +147,14 @@ export async function prepareRemoteManagedRuntime(input: {
         // The SSH transfer never carries the agent-local scratch, so keep it
         // out of the baseline: the restore merge then leaves the local copies
         // alone and skips walking and hashing huge dependency trees.
-        exclude: preparedWorkspace.gitBacked
-          ? [
-              ...GIT_ARCHIVE_EXCLUDES,
-              ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
-              // The mirror seed never transfers git-ignored files; keep them
-              // out of the baseline too, so the restore merge cannot read
-              // their remote absence as a deletion of local-only files (such
-              // as `.env`). Merge grammar anchors plain entries at the root.
-              // Legacy full-copy seeds transfer ignored files, so they leave
-              // this unset and keep today's merge behavior exactly.
-              ...(preparedWorkspace.ignoredPaths ?? []),
-            ]
-          : [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES],
+        exclude: [
+          ...(preparedWorkspace.gitBacked ? GIT_ARCHIVE_EXCLUDES : []),
+          ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES,
+          // Both mirror and full-copy seeds omit ignored files, including
+          // non-Git folders. Their absence must not delete local-only config.
+          // Merge grammar anchors plain entries at the workspace root.
+          ...(preparedWorkspace.ignoredPaths ?? []),
+        ],
       })
     : null;
 

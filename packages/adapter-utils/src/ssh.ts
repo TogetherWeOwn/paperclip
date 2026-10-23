@@ -455,13 +455,15 @@ export { SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLU
  * agent worktrees). Dropping the entries and adding the excludes makes the
  * merge ignore these paths on both sides, however the baseline was captured.
  */
-export function withSshAgentLocalExcludes(baseline: DirectorySnapshot): DirectorySnapshot {
+export function withSshAgentLocalExcludes(
+  baseline: DirectorySnapshot,
+  omittedPaths: readonly string[] = [],
+): DirectorySnapshot {
+  const excludes = [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...omittedPaths];
   return {
-    exclude: [...new Set([...baseline.exclude, ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES])],
+    exclude: [...new Set([...baseline.exclude, ...excludes])],
     entries: new Map(
-      [...baseline.entries].filter(
-        ([relative]) => !shouldExcludePath(relative, SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES),
-      ),
+      [...baseline.entries].filter(([relative]) => !shouldExcludePath(relative, excludes)),
     ),
   };
 }
@@ -1852,11 +1854,29 @@ export async function buildSshSpawnTarget(input: {
   };
 }
 
+/** Literal omissions use a NUL file list, not argv-sized tar exclude patterns. */
+async function listSshArchivePaths(localDir: string, omitPaths: readonly string[]): Promise<string[]> {
+  const paths = ["."];
+  const omitted = new Set(omitPaths);
+  const walk = async (relative: string): Promise<void> => {
+    for (const entry of await fs.readdir(path.join(localDir, relative), { withFileTypes: true })) {
+      const child = relative ? `${relative}/${entry.name}` : entry.name;
+      if (omitted.has(child)) continue;
+      paths.push(`./${child}`);
+      // Never follow directory symlinks, just as tar without -h does not.
+      if (entry.isDirectory()) await walk(child);
+    }
+  };
+  await walk("");
+  return paths;
+}
+
 export async function syncDirectoryToSsh(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
   remoteDir: string;
   exclude?: string[];
+  omitPaths?: readonly string[];
   followSymlinks?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
@@ -1893,6 +1913,9 @@ export async function syncDirectoryToSsh(input: {
     const flavor = hasRootRelativeTarExcludes(input.exclude)
       ? resolveSshTarFlavor((await execFileText("tar", ["--version"])).stdout)
       : "gnu";
+    const archivePaths = input.omitPaths
+      ? await listSshArchivePaths(input.localDir, input.omitPaths)
+      : null;
     await new Promise<void>((resolve, reject) => {
     const tarArgs = [
       ...(input.followSymlinks ? ["-h"] : []),
@@ -1901,10 +1924,10 @@ export async function syncDirectoryToSsh(input: {
       ...tarExcludeArgs(input.exclude, flavor),
       "-cf",
       "-",
-      ".",
+      ...(archivePaths ? ["--null", "--no-recursion", "-T", "-"] : ["."]),
     ];
     const tar = spawn("tar", tarArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [archivePaths ? "pipe" : "ignore", "pipe", "pipe"],
       env: tarSpawnEnv(),
     });
     const ssh = spawn("ssh", sshArgs, {
@@ -1945,6 +1968,8 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    tar.stdin?.on("error", fail);
+    if (archivePaths) tar.stdin?.end(`${archivePaths.join("\0")}\0`);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1996,17 +2021,20 @@ async function extractRemoteTarStreamToStaging(input: {
   progress: TransferProgress | null;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
+  // Full-copy fallback may omit thousands of ignored paths. Keep the SSH
+  // exec argument bounded without dropping any exclusions or the byte cap.
+  const scriptViaStdin = sshScriptOuterQuotedBytes(input.remoteScript) > SSH_REMOTE_ARG_MAX_BYTES;
   const sshArgs = [
     ...auth.args,
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(input.remoteScript)}`,
+    `sh -c ${shellQuote(scriptViaStdin ? "sh -s" : input.remoteScript)}`,
   ];
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [scriptViaStdin ? "pipe" : "ignore", "pipe", "pipe"],
       });
       const tar = spawn("tar", ["-xf", "-", "-C", input.stagingDir], {
         stdio: ["pipe", "ignore", "pipe"],
@@ -2043,6 +2071,8 @@ async function extractRemoteTarStreamToStaging(input: {
         reject(error);
       };
 
+      ssh.stdin?.on("error", fail);
+      if (scriptViaStdin) ssh.stdin?.end(`${input.remoteScript}\n`);
       // The streaming cap sits first in the pipe so over-cap bytes never
       // reach the extractor; its error kills both processes via `fail`.
       const cap = createSshSyncBackCapTransform({ capBytes: input.capBytes, remoteDir: input.remoteDir });
@@ -2084,6 +2114,7 @@ export async function syncDirectoryFromSsh(input: {
   localDir: string;
   exclude?: string[];
   preserveLocalEntries?: readonly string[];
+  beforeApply?: () => Promise<void>;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -2129,6 +2160,7 @@ export async function syncDirectoryFromSsh(input: {
     const stagedBytes = await measureDirectoryFileBytes(stagingDir);
     assertSshSyncBackSizeWithinCap({ sourceBytes: stagedBytes, capBytes, remoteDir: input.remoteDir });
 
+    await input.beforeApply?.();
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
@@ -2835,10 +2867,9 @@ async function seedGitWorkspaceToSshViaMirror(input: {
  * the sync-back tar script — twice over, since root-relative excludes ship
  * both the GNU and bsdtar dialects — and the whole script travels as one
  * `sh -c` argv entry with a 128 KiB per-string exec limit
- * (see `SSH_REMOTE_ARG_MAX_BYTES`). Past this budget the mirror seed would
- * succeed and then fail every restore with E2BIG, with no fallback at
- * restore time, so the seed falls back to the legacy full copy instead
- * (which transfers ignored files and needs no excludes).
+ * (see `SSH_REMOTE_ARG_MAX_BYTES`). Keep the mirror seed's existing metadata
+ * budget: longer lists select the full copy, which uses a file-list upload
+ * and can stream long restore scripts without dropping exclusions.
  */
 const SSH_SEED_MAX_IGNORED_EXCLUDE_BYTES = 32 * 1024;
 
@@ -2896,6 +2927,109 @@ async function trySeedGitWorkspaceViaMirror(input: {
   };
 }
 
+/**
+ * Git supplies nested rules and negations, but only repository-owned rules:
+ * host-global excludes and info/exclude must not change the transferred tree.
+ * Collapse ignored directories unless they contain force-added tracked files,
+ * which must remain visible to both the transfer and restore baseline.
+ * Both seed and full restore use this selection; plain non-Git folders retain
+ * their unfiltered fallback. Scan errors fail closed for known repositories.
+ */
+async function readSshRepositoryIgnoredPaths(
+  runGit: (args: string[]) => Promise<SshCommandResult>,
+): Promise<string[]> {
+  const args = [
+    "--others", "--ignored", "-z", "--exclude-per-directory=.gitignore",
+    "--", ".", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES.map((entry) => `:!${entry}`),
+  ];
+  const readPaths = (stdout: string): string[] => {
+    const paths = stdout.split("\0").filter(Boolean);
+    if (paths.some((entry) => !isSafeGitRelativePath(entry))) {
+      throw new Error("SSH ignore scan returned an unsupported path; refusing an unfiltered full copy");
+    }
+    return paths;
+  };
+  const [ignored, tracked] = await Promise.all([
+    runGit(["ls-files", "--directory", ...args]),
+    runGit(["ls-files", "--cached", "-z", "--", "."]),
+  ]);
+  const trackedAncestors = new Set<string>();
+  for (const entry of readPaths(tracked.stdout)) {
+    trackedAncestors.add(entry);
+    for (let slash = entry.indexOf("/"); slash !== -1; slash = entry.indexOf("/", slash + 1)) {
+      trackedAncestors.add(entry.slice(0, slash));
+    }
+  }
+  const ignoredPaths = readPaths(ignored.stdout).map((entry) => entry.replace(/\/+$/, ""));
+  const expanded = ignoredPaths.filter((entry) => trackedAncestors.has(entry));
+  if (expanded.length === 0) return ignoredPaths;
+  const leaves = readPaths((await runGit(["ls-files", ...args])).stdout);
+  return [
+    ...ignoredPaths.filter((entry) => !expanded.includes(entry)),
+    ...leaves.filter((entry) => expanded.some((root) => entry.startsWith(`${root}/`))),
+  ];
+}
+
+async function readSshFullCopyIgnoredPaths(localDir: string): Promise<string[]> {
+  try {
+    return await readSshRepositoryIgnoredPaths((args) => runLocalGit(localDir, args, {
+      timeout: 60_000,
+      maxBuffer: 64 * 1024 * 1024,
+    }));
+  } catch (error) {
+    // Exit 128 alone also covers broken metadata. Only a folder with no Git
+    // marker in its physical ancestry may use the plain fallback; never classify
+    // a repository by localized stderr or hide a timeout/output-limit error.
+    const code = (error as { code?: unknown }).code;
+    if ((code !== 128 && code !== "ENOENT") || process.env.GIT_DIR || process.env.GIT_WORK_TREE) throw error;
+    let ancestor = await fs.realpath(localDir);
+    while (true) {
+      const marker = await fs.lstat(path.join(ancestor, ".git")).catch((markerError: NodeJS.ErrnoException) => {
+        if (markerError.code === "ENOENT") return null;
+        throw markerError;
+      });
+      if (marker) throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+  }
+  // A plain directory has no Git index authority; retain its full-copy fallback.
+  return [];
+}
+
+async function readSshRemoteFullCopyIgnoredPaths(
+  spec: SshRemoteExecutionSpec,
+  remoteDir: string,
+): Promise<string[]> {
+  const probe = await runSshCommand(spec, [
+    "set -e",
+    `cd ${shellQuote(remoteDir)}`,
+    "if inside=$(git rev-parse --is-inside-work-tree 2>/dev/null); then",
+    // A plain workspace nested in another checkout has no index authority of
+    // its own. Match the incremental status probe's toplevel requirement.
+    "  if [ \"$inside\" = true ]; then",
+    "    prefix=$(git rev-parse --show-prefix)",
+    "    [ -z \"$prefix\" ] || inside=false",
+    "  fi",
+    "  printf '%s' \"$inside\"",
+    "else",
+    "  code=$?; current=$(pwd -P)",
+    "  while :; do",
+    "    if [ -e \"$current/.git\" ] || [ -L \"$current/.git\" ]; then exit \"$code\"; fi",
+    "    parent=$(dirname \"$current\"); [ \"$parent\" != \"$current\" ] || break; current=$parent",
+    "  done",
+    "  case $code in 128|127) printf 'false' ;; *) exit \"$code\" ;; esac",
+    "fi",
+  ].join("\n"), { timeoutMs: 60_000, maxBuffer: 16 * 1024 });
+  if (probe.stdout.trim() !== "true") return [];
+  return await readSshRepositoryIgnoredPaths((args) => runSshCommand(
+    spec,
+    `git -C ${shellQuote(remoteDir)} ${args.map(shellQuote).join(" ")}`,
+    { timeoutMs: 60_000, maxBuffer: 64 * 1024 * 1024 },
+  ));
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -2932,12 +3066,11 @@ export async function prepareWorkspaceForSshExecution(input: {
     }
   }
   const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
+  const ignoredPaths = await readSshFullCopyIgnoredPaths(input.localDir);
+  const omitPaths = [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredPaths];
 
   if (gitSnapshot) {
-    // Read before the transfers below: like the mirror snapshot, the
-    // overlay and the ignored fingerprint describe the tree at seed time.
     const overlayPaths = await readSshSeedOverlayPaths(input.localDir);
-    const ignoredFingerprint = await readSshSeedIgnoredFingerprint(input.localDir);
     await importGitWorkspaceToSsh({
       spec: input.spec,
       localDir: input.localDir,
@@ -2950,6 +3083,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       localDir: input.localDir,
       remoteDir,
       exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+      omitPaths,
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -2958,15 +3092,14 @@ export async function prepareWorkspaceForSshExecution(input: {
       remoteDir,
       deletedPaths: gitSnapshot.deletedPaths,
     });
-    // An unreadable overlay or ignored scan omits the seed state instead of
-    // guessing it: the restore then fails closed to the full copy. An empty
-    // ignored set omits just the fingerprint: with nothing carried, remote
-    // creations are plain `!!` transfers and deletes are impossible.
+    // No fingerprint is needed: ignored files stay local, as on mirror seeds.
+    // An unreadable overlay still omits seed provenance for a full restore.
     const overlaySet = new Set(overlayPaths ?? []);
     return {
       gitBacked: true,
       seedMode: "full-copy",
-      ...(overlayPaths && ignoredFingerprint
+      ignoredPaths,
+      ...(overlayPaths
         ? {
             seedState: {
               headCommit: gitSnapshot.headCommit,
@@ -2980,7 +3113,6 @@ export async function prepareWorkspaceForSshExecution(input: {
                   !overlaySet.has(entry) &&
                   !isSshSeedAgentLocalScratchPath(entry),
               ),
-              ...(ignoredFingerprint.count > 0 ? { ignoredFingerprint } : {}),
             },
           }
         : {}),
@@ -2997,10 +3129,11 @@ export async function prepareWorkspaceForSshExecution(input: {
     localDir: input.localDir,
     remoteDir,
     exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES],
+    omitPaths: omitPaths.filter((entry) => entry !== ".git"),
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
-  return { gitBacked: false, seedMode: "full-copy" };
+  return { gitBacked: false, seedMode: "full-copy", ignoredPaths };
 }
 
 /**
@@ -3235,14 +3368,12 @@ async function tryRestoreChangedFilesFromSsh(input: {
     if (!keep(entry) || deleted.has(entry) || transfer.has(entry)) continue;
     transfer.add(entry);
   }
-  // Remote ignored records (`!!`): the full copy restores an ignored file
-  // that did not exist at seed time, so the delta must carry it too. A
-  // baseline-present record the excludes did not already drop (a tracked
-  // file the run uncached under an ignore rule, whose `D ` the delete below
-  // must not honor) transfers as well: the merge no-ops byte-identical
-  // content, and the seed-time masses never reach this loop — mirror seeds
-  // exclude them from the baseline, and a matching legacy fingerprint
-  // clears the records above.
+  // Remote ignored records (`!!`) also include host-global/info excludes,
+  // which are not transfer authority. Carry any record the baseline still
+  // allows, canceling a staged deletion of the same path. Current repository
+  // ignores are already excluded by both restore paths; legacy carried-file
+  // fingerprints instead retain their original contract and clear unchanged
+  // ignored records above.
   for (const entry of status.ignoredPaths) {
     if (!keep(entry) || transfer.has(entry)) continue;
     deleted.delete(entry);
@@ -3321,10 +3452,15 @@ export async function restoreWorkspaceFromSshExecution(input: {
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  // Seed-omitted ignored paths, for the plain restores below: their remote
-  // copies (if any) must not download over the local ones, and the local
-  // ones must survive the clear that precedes the copy-back.
-  const ignoredRestorePaths = (input.ignoredPaths ?? [])
+  // Both restore paths evaluate the current remote rules before selecting a
+  // transfer; seed omissions additionally preserve local-only config even if
+  // rules changed. Earlier full-copy seeds carried ignored files. Their
+  // fingerprint proves that older contract; preserve it for in-flight runs.
+  const carriedIgnoredFiles = (input.seedState?.ignoredFingerprint?.count ?? 0) > 0;
+  const fullCopyIgnored = carriedIgnoredFiles
+    ? []
+    : await readSshRemoteFullCopyIgnoredPaths(input.spec, remoteDir);
+  const ignoredRestorePaths = [...new Set([...(input.ignoredPaths ?? []), ...fullCopyIgnored])]
     .map((entry) => entry.replace(/\/+$/, ""))
     .filter(Boolean);
   const ignoredRestoreTarExcludes = ignoredRestorePaths.map(
@@ -3333,8 +3469,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   if (input.baselineSnapshot) {
     // The sync-back never carries the agent-local scratch, so the merge must
     // not read its absence as a remote deletion of the local copies.
-    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot);
-    const ignored = new Set(input.ignoredPaths ?? []);
+    const baseline = withSshAgentLocalExcludes(input.baselineSnapshot, ignoredRestorePaths);
+    const ignored = new Set(ignoredRestorePaths);
     const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
@@ -3419,22 +3555,40 @@ export async function restoreWorkspaceFromSshExecution(input: {
   const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
-    await exportGitWorkspaceFromSsh({
-      spec: input.spec,
-      remoteDir,
-      localDir: input.localDir,
-      onProgress: input.onProgress,
-    });
-    await syncDirectoryFromSsh({
-      spec: input.spec,
-      remoteDir,
-      localDir: input.localDir,
-      exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
-      // Excluded from the download, so nothing replaces them: keep the local copies.
-      preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
-      onProgress: input.onProgress,
-      progressLabel: "workspace",
-    });
+    const importedRef = `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
+    try {
+      const importedHead = await exportGitWorkspaceFromSsh({
+        spec: input.spec,
+        remoteDir,
+        localDir: input.localDir,
+        importedRef,
+        resetLocalWorkspace: false,
+        onProgress: input.onProgress,
+      });
+      await syncDirectoryFromSsh({
+        spec: input.spec,
+        remoteDir,
+        localDir: input.localDir,
+        exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
+        // Excluded from the download, so nothing replaces them: keep the local copies.
+        preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
+        // Like baseline restores, defer worktree mutation until both byte caps
+        // pass. An over-cap transfer must not reset local edits to HEAD first.
+        beforeApply: async () => {
+          await runLocalGit(input.localDir, ["reset", "--hard", importedHead], {
+            timeout: 60_000,
+            maxBuffer: 1024 * 1024,
+          });
+        },
+        onProgress: input.onProgress,
+        progressLabel: "workspace",
+      });
+    } finally {
+      await runLocalGit(input.localDir, ["update-ref", "-d", importedRef], {
+        timeout: 10_000,
+        maxBuffer: 16 * 1024,
+      }).catch(() => undefined);
+    }
     return;
   }
 
@@ -3442,8 +3596,10 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
-    preserveLocalEntries: [...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
+    // A remote Git source can restore into a plain local folder. Its history
+    // and configuration are not working-tree deliverables on this path.
+    exclude: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_TAR_EXCLUDES, ...ignoredRestoreTarExcludes],
+    preserveLocalEntries: [".git", ...SSH_WORKSPACE_AGENT_LOCAL_EXCLUDES, ...ignoredRestorePaths],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
