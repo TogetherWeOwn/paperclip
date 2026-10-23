@@ -624,7 +624,8 @@ describe("IssueChatThread", () => {
     function copyButton() {
       const button = container.querySelector<HTMLButtonElement>('button[aria-label="Copy message"]');
       expect(button).not.toBeNull();
-      return button!;
+      if (!button) throw new Error("Copy message button missing");
+      return button;
     }
 
     async function copyMessage() {
