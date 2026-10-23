@@ -157,7 +157,28 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### Sandbox MCP bridge credentials
+
+The Claude and Codex CLI lanes register managed MCP endpoints on the host before
+serializing runtime assets for a sandbox callback bridge. Synced JSON/TOML carries
+only an opaque bridge endpoint and bearer, never the host run JWT or a managed
+connections/plugin bearer. The host selects each upstream credential from its
+run-local endpoint map and overwrites the forwarded run ID. Caller-provided URLs
+and query parameters cannot select an upstream endpoint. Redirects are refused.
+Trusted local runs keep their established MCP configuration.
+
+Sandbox bridge credentials expire after 15 minutes, including while the gateway
+listener and copied files survive. Teardown revokes forwarding before stopping
+the transport. Expiry is enforced on both the host and the generated gateway;
+changing a sandbox clock cannot extend host authorization. There is currently no
+in-run renewal: requests after the deadline fail closed and require a new run.
+This limit also applies to API callbacks using the same sandbox bridge bearer.
+
 ### Sandbox MCP asset teardown
+
+Bridge teardown removes the remote `mcp-config` directory and transfer fragments,
+including when adapter setup fails after the bridge starts. Codex also removes
+its generated remote `home/config.toml`; subscription auth copy-back is separate.
 
 Sandbox managed-runtime restore removes `<runtimeRoot>/mcp-config` and
 `<runtimeRoot>/mcp-config-upload.tar*` through the remote client after all

@@ -43,6 +43,7 @@ import {
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+  SANDBOX_MCP_BRIDGE_HEADER_ALLOWLIST,
   sandboxCallbackBridgeDirectories,
   sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
@@ -91,6 +92,7 @@ import {
   type StartupSpanContext,
 } from "./acpx-engine/startup-timing.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
+import type { AdapterRuntimeMcpServer } from "./types.js";
 import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 import type { RunnerIngressEndpoint } from "./runner-connectivity.js";
 
@@ -317,6 +319,8 @@ export interface AdapterExecutionTargetShellOptions {
 
 export interface AdapterExecutionTargetPaperclipBridgeHandle {
   env: Record<string, string>;
+  /** Sandbox-only endpoint capabilities; real MCP credentials stay on the host. */
+  mcpServers?: AdapterRuntimeMcpServer[];
   /**
    * Present when the sandbox target opted into run-log streaming
    * (`streamRunLogs`). Create one handle per CLI attempt and pass it to
@@ -1786,7 +1790,7 @@ function buildBridgeResponseHeaders(response: Response): Record<string, string> 
   // server reads that header to map the 504 to a terminal 409. If the forward
   // drops the header, the server keeps the retryable 504 and a caller that
   // retries 5xx can repeat a mutation that already committed.
-  for (const key of ["content-type", "etag", "last-modified", "x-paperclip-bridge-outcome"]) {
+  for (const key of ["content-type", "etag", "last-modified", "mcp-session-id", "mcp-protocol-version", "x-paperclip-bridge-outcome"]) {
     const value = response.headers.get(key);
     if (value && value.trim().length > 0) out[key] = value.trim();
   }
@@ -4612,6 +4616,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   runtimeRootDir: string | null | undefined;
   adapterKey: string;
   timeoutSec?: number | null;
+  /** Registered before any sandbox-visible MCP config is serialized. */
+  mcpServers?: readonly AdapterRuntimeMcpServer[];
+  /** Generated files relative to runtimeRootDir, removed on every bridge teardown. */
+  mcpConfigFiles?: readonly string[];
   hostApiToken: string | null | undefined;
   hostApiUrl?: string | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -4678,6 +4686,24 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
   const bridgeToken = createSandboxCallbackBridgeToken();
+  const expiresAt = Date.now() + 15 * 60_000;
+  let stopped = false;
+  const runAbort = new AbortController();
+  const mcpEndpoints = new Map<string, { server: AdapterRuntimeMcpServer; url: URL }>();
+  for (const server of input.mcpServers ?? []) {
+    const url = new URL(server.url);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash) {
+      throw new Error("Invalid managed MCP endpoint.");
+    }
+    mcpEndpoints.set(`/mcp/bridge/${randomBytes(16).toString("hex")}`, { server, url });
+  }
+  const sandboxMcpServers = (baseUrl: string): AdapterRuntimeMcpServer[] =>
+    [...mcpEndpoints].map(([endpoint, { server }]) => ({
+      name: server.name,
+      connectionId: server.connectionId,
+      url: `${baseUrl}${endpoint}`,
+      token: bridgeToken,
+    }));
   const maxBodyBytes = resolveBridgeMaxBodyBytes(input.maxBodyBytes);
   // The bridge worker runs inside the same process that serves the Paperclip
   // API, so forwarded sandbox calls must target the LOCAL listen origin. The
@@ -4694,6 +4720,24 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
   const runner = adapterExecutionTargetCommandRunner(target);
+  const mcpConfigFiles = (input.mcpConfigFiles ?? []).map((file) => {
+    if (!file || path.posix.isAbsolute(file) || file.split("/").some((part) => part === ".." || part === ".")) {
+      throw new Error("Invalid generated MCP config path.");
+    }
+    return path.posix.join(runtimeRootDir, file);
+  });
+  const scrubMcpAssets = async () => {
+    const result = await runner.execute({
+      command: shellCommand,
+      args: shellCommandArgs([
+        `rm -rf -- ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config"))}`,
+        `rm -f -- ${shellQuote(path.posix.join(runtimeRootDir, "mcp-config-upload.tar"))}* ${mcpConfigFiles.map(shellQuote).join(" ")}`,
+      ].join("\n")),
+      cwd: "/",
+      timeoutMs: 30_000,
+    });
+    if (result.timedOut || result.exitCode !== 0) throw new Error("Failed to scrub remote MCP runtime assets.");
+  };
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
@@ -4759,6 +4803,21 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
   ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
     const method = request.method.trim().toUpperCase() || "GET";
+    if (stopped || Date.now() >= expiresAt) {
+      return {
+        status: 401,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "Bridge credential expired or revoked." })),
+      };
+    }
+    const mcp = mcpEndpoints.get(request.path);
+    if (request.path.startsWith("/mcp/bridge/") && !mcp) {
+      return {
+        status: 403,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "Unregistered MCP endpoint." })),
+      };
+    }
     // The per-request debug log prints the method and the sanitized
     // origin+path. The duplex path suppresses it, so no route rides a log line
     // there. The file path keeps the existing behavior minus the query.
@@ -4767,17 +4826,21 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       await onLog("stdout", `[paperclip] Bridge proxy ${method} ${bridgeDebugOrigin}${request.path}\n`);
     }
     const headers = new Headers();
-    for (const [key, value] of Object.entries(request.headers)) {
+    const forwardedHeaders = sanitizeSandboxCallbackBridgeHeaders(
+      request.headers,
+      mcp ? SANDBOX_MCP_BRIDGE_HEADER_ALLOWLIST : undefined,
+    );
+    for (const [key, value] of Object.entries(forwardedHeaders)) {
       if (value.trim().length === 0) continue;
       headers.set(key, value);
     }
-    headers.set("authorization", `Bearer ${hostApiToken}`);
+    headers.set("authorization", `Bearer ${mcp?.server.token ?? hostApiToken}`);
     headers.set("x-paperclip-run-id", input.runId);
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
     // the forward budget here, whichever comes first.
     const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
-    const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const forwardSignal = AbortSignal.any([runAbort.signal, timeoutSignal, ...(signal ? [signal] : [])]);
     // Build the request-body init. A GET or a HEAD carries no body. The file
     // bridge passes legacy JSON as a string and binary data as a `Buffer`;
     // HTTP/2 passes raw `Buffer` bodies. Undici accepts a `Buffer` request body directly (a
@@ -4797,7 +4860,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
       forwardInit.body = request.body as BodyInit;
     }
-    const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+    const response = await fetch(mcp ? mcp.url : buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
     // `manual` surfaces a redirect as an opaqueredirect response instead of
     // following it. Refuse it here: passing the foreign Location back to the
     // sandbox caller would launder the redirect (and a re-issued body) to an
@@ -4958,6 +5021,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       const gatewayEnv: Record<string, string> = {
         PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
         PAPERCLIP_BRIDGE_TOKEN: bridgeToken,
+        PAPERCLIP_BRIDGE_EXPIRES_AT: String(expiresAt),
         PAPERCLIP_BRIDGE_HOST: "127.0.0.1",
         PAPERCLIP_BRIDGE_PORT: String(assignedPort),
         PAPERCLIP_BRIDGE_NONCE: nonce,
@@ -5098,6 +5162,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             bridgeToken,
             forwardRequest: http2ForwardRequest,
             routes: HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+            headerAllowlist: SANDBOX_MCP_BRIDGE_HEADER_ALLOWLIST,
             // The same resolved limit the launch environment hands the
             // sandbox-side gateway (`PAPERCLIP_BRIDGE_MAX_BODY_BYTES`,
             // below), so the host check and the gateway check enforce one
@@ -5170,6 +5235,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
               PAPERCLIP_API_KEY: bridgeToken,
               PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
             },
+            mcpServers: sandboxMcpServers(sandboxOrigin),
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
             // Atomically read the latch and mark the orderly completion for the
@@ -5180,12 +5246,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             onLoss: (listener: (reason: DuplexLossReason) => void): (() => void) =>
               dispositionLatch.onLoss(listener),
             stop: async () => {
+              stopped = true;
+              runAbort.abort();
               // Close the HTTP/2 server's sessions, then the channel, before
               // lease release, so no live provider session remains when the
               // caller releases the lease.
-              await http2Server.close();
-              await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
-              await bridgeAsset.cleanup();
+              try {
+                await http2Server.close();
+                await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+              } finally {
+                await bridgeAsset.cleanup();
+                await scrubMcpAssets();
+              }
             },
           };
         }
@@ -5224,6 +5296,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       assetRemoteDir,
       queueDir,
       bridgeToken,
+      expiresAt,
       bridgeAsset,
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
@@ -5256,8 +5329,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
     },
+    mcpServers: sandboxMcpServers(server.baseUrl),
     runLogTail,
     stop: async () => {
+      stopped = true;
+      runAbort.abort();
       await Promise.allSettled([
         server?.stop(),
       ]);
@@ -5265,6 +5341,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         worker?.stop(),
         bridgeAsset.cleanup(),
       ]);
+      await scrubMcpAssets();
     },
   };
 }

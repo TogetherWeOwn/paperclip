@@ -125,6 +125,10 @@ export interface SandboxCallbackBridgeRouteRule {
 // reverse bridge. Keep this in sync with the Paperclip skill in
 // `skills/paperclip/SKILL.md` and `references/api-reference.md`.
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCallbackBridgeRouteRule[] = [
+  // Opaque MCP paths resolve only through this run's host-held endpoint map.
+  { method: "POST", path: /^\/mcp\/bridge\/[a-f0-9]{32}$/ },
+  { method: "GET", path: /^\/mcp\/bridge\/[a-f0-9]{32}$/ },
+  { method: "DELETE", path: /^\/mcp\/bridge\/[a-f0-9]{32}$/ },
   // Runtime capability authentication is independently checked by the controller.
   { method: "POST", path: /^\/runtime-tools\/github\/credentials$/ },
   // Identity, inbox, agent self-management
@@ -234,6 +238,13 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+] as const;
+
+export const SANDBOX_MCP_BRIDGE_HEADER_ALLOWLIST = [
+  ...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
+  "mcp-session-id",
+  "mcp-protocol-version",
+  "last-event-id",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {
@@ -469,6 +480,7 @@ export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallba
 export function buildSandboxCallbackBridgeEnv(input: {
   queueDir: string;
   bridgeToken: string;
+  expiresAt?: number;
   host?: string;
   port?: number | null;
   pollIntervalMs?: number | null;
@@ -480,6 +492,7 @@ export function buildSandboxCallbackBridgeEnv(input: {
     PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_FILE_MODE,
     PAPERCLIP_BRIDGE_QUEUE_DIR: input.queueDir,
     PAPERCLIP_BRIDGE_TOKEN: input.bridgeToken,
+    ...(input.expiresAt !== undefined ? { PAPERCLIP_BRIDGE_EXPIRES_AT: String(input.expiresAt) } : {}),
     PAPERCLIP_BRIDGE_HOST: input.host?.trim() || "127.0.0.1",
     PAPERCLIP_BRIDGE_PORT: String(input.port && input.port > 0 ? Math.trunc(input.port) : 0),
     PAPERCLIP_BRIDGE_POLL_INTERVAL_MS: String(
@@ -2059,6 +2072,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   assetRemoteDir: string;
   queueDir: string;
   bridgeToken: string;
+  expiresAt?: number;
   bridgeAsset?: SandboxCallbackBridgeAsset | null;
   host?: string;
   port?: number | null;
@@ -2088,6 +2102,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   const env = buildSandboxCallbackBridgeEnv({
     queueDir: input.queueDir,
     bridgeToken: input.bridgeToken,
+    expiresAt: input.expiresAt,
     host: input.host,
     port: input.port,
     pollIntervalMs: input.pollIntervalMs,
@@ -2487,6 +2502,7 @@ import { Duplex } from "node:stream";
 const bridgeMode = process.env.PAPERCLIP_API_BRIDGE_MODE || "${SANDBOX_CALLBACK_BRIDGE_FILE_MODE}";
 const queueDir = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
 const bridgeToken = process.env.PAPERCLIP_BRIDGE_TOKEN;
+const expiresAt = Number(process.env.PAPERCLIP_BRIDGE_EXPIRES_AT || Date.now() + 15 * 60_000);
 const host = process.env.PAPERCLIP_BRIDGE_HOST || "127.0.0.1";
 const port = Number(process.env.PAPERCLIP_BRIDGE_PORT || "0");
 // The host assigns the loopback port and passes it through the launch
@@ -2505,7 +2521,7 @@ const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DE
 // inbound request to these headers before they forward it. One copy serves both
 // modes. The route allowlist stays on the host: both modes forward a request to
 // the host, and the host enforces the same route allowlist for each.
-const allowedHeaders = new Set(${JSON.stringify([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST])});
+const allowedHeaders = new Set(${JSON.stringify([...SANDBOX_MCP_BRIDGE_HEADER_ALLOWLIST])});
 
 if (!bridgeToken) {
   throw new Error("PAPERCLIP_BRIDGE_TOKEN is required.");
@@ -2644,6 +2660,7 @@ async function readBodyBytes(req) {
 }
 
 function tokensMatch(received) {
+  if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) return false;
   const expected = Buffer.from(bridgeToken, "utf8");
   const actual = Buffer.from(typeof received === "string" ? received : "", "utf8");
   if (expected.length !== actual.length) return false;

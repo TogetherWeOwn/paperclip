@@ -768,6 +768,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // writeManagedCodexMcpConfig). Called from the outer `finally`, so the run
   // JWT and gateway bearers it carries never outlive the run on disk.
   let releaseManagedMcpConfig: (() => Promise<void>) | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, asNumber(config.timeoutSec, 0));
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
@@ -789,10 +791,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runtimeMcpGateways,
           managedMcpGatewaysFromContext(context),
         );
+    if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
+      paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId,
+        target: overrideAdapterExecutionTargetRemoteCwd(executionTarget, "/"),
+        runtimeRootDir: path.posix.join(adapterExecutionTargetRemoteCwd(executionTarget, cwd), ".paperclip-runtime", "codex"),
+        adapterKey: "codex",
+        timeoutSec,
+        hostApiToken: authToken,
+        mcpConfigFiles: ["home/config.toml"],
+        mcpServers: managedMcpGateways.map((gateway, index) => ({
+          name: gateway.name,
+          url: new URL(gateway.endpointPath, paperclipBaseEnv.PAPERCLIP_API_URL).toString(),
+          token: gateway.bearerToken,
+          connectionId: `codex-${index}`,
+        })),
+        enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(executionTarget),
+        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(executionTarget),
+        onLog,
+      });
+    }
     const managedMcp = await writeManagedCodexMcpConfig({
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
-      gateways: managedMcpGateways,
+      gateways: paperclipBridge?.mcpServers?.map((server) => ({
+        name: server.name,
+        endpointPath: server.url,
+        bearerToken: server.token,
+      })) ?? managedMcpGateways,
       // A user-supplied CODEX_HOME is not ours to clean up.
       scrubOnRelease: isManagedCodexHomePath(process.env, agent.companyId, effectiveCodexHome),
     });
@@ -816,10 +842,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         skillsEntries: codexSkillEntries,
         desiredSkillNames,
       },
-    );
-    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
-      executionTarget,
-      asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
     let effectiveExecutionCwd = targetWorkspaceRealization?.mode === "in_place"
@@ -906,7 +928,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const restoreRemoteWorkspace = preparedExecutionTargetRuntime
       ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
       : null;
-    let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
     const remoteCodexHome = executionTargetIsRemote
       ? preparedExecutionTargetRuntime?.assetDirs.home ??
         path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "codex", "home")
@@ -1001,7 +1022,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_API_KEY = authToken;
     }
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
-      paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+      paperclipBridge ??= await startAdapterExecutionTargetPaperclipBridge({
         runId,
         target: runtimeExecutionTarget,
         enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
@@ -1625,68 +1646,77 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionError = error;
       throw error;
     } finally {
-      if (paperclipBridge) {
-        await paperclipBridge.stop();
-      }
-      if (restoreRemoteWorkspace) {
-        try {
-          await onLog(
-            "stdout",
-            `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-          );
-          await restoreRemoteWorkspace();
-        } catch (error) {
-          await Promise.resolve(
-            onLog(
-              "stderr",
-              `[paperclip] Failed to restore workspace changes from ${describeAdapterExecutionTarget(
-                executionTarget,
-              )}: ${error instanceof Error ? error.message : String(error)}\n`,
-            ),
-          ).catch(() => undefined);
-          // A provider failure remains the primary outcome. When provider work
-          // succeeded, however, silently accepting a failed copy-back can lose
-          // the only workspace edits before a replacement sandbox starts.
-          if (executionError === null) throw error;
+      try {
+        if (paperclipBridge) {
+          const bridge = paperclipBridge;
+          paperclipBridge = null;
+          await bridge.stop();
+        }
+      } finally {
+        if (restoreRemoteWorkspace) {
+          try {
+            await onLog(
+              "stdout",
+              `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+            );
+            await restoreRemoteWorkspace();
+          } catch (error) {
+            await Promise.resolve(
+              onLog(
+                "stderr",
+                `[paperclip] Failed to restore workspace changes from ${describeAdapterExecutionTarget(
+                  executionTarget,
+                )}: ${error instanceof Error ? error.message : String(error)}\n`,
+              ),
+            ).catch(() => undefined);
+            // A provider failure remains the primary outcome. When provider work
+            // succeeded, however, silently accepting a failed copy-back can lose
+            // the only workspace edits before a replacement sandbox starts.
+            if (executionError === null) throw error;
+          }
         }
       }
     }
   } finally {
-    // Remove the staged CODEX_HOME allowlist temp dir on every exit path
-    // (teardown AND error), never only the happy path. Cleanup failure is
-    // logged, not fatal — a leaked temp dir must not crash the run.
-    if (stagedCodexHomeDir) {
-      await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
-        await onLog(
-          "stderr",
-          `[paperclip] Failed to remove staged Codex home "${stagedCodexHomeDir}": ${
-            error instanceof Error ? error.message : String(error)
-          }\n`,
-        );
-      });
-    }
-    // Restore the managed config.toml so PAPERCLIP_CODEX_PROVIDERS changes
-    // (or removal) between runs never leave stale provider routing behind. This
-    // finally starts the moment prepareCodexRuntimeConfig returns, so a throw
-    // anywhere in the remaining setup (skill injection, remote runtime
-    // preparation, command building) restores the original config.toml too.
-    // If the process dies before reaching this, the next
-    // prepareCodexRuntimeConfig restores the original from the pre-run backup
-    // written at prepare time.
     try {
-      await preparedRuntimeConfig.cleanup();
+      await paperclipBridge?.stop();
     } finally {
-      // After the provider-config restore above, which rewrites config.toml from
-      // its pre-run copy, so a stale MCP block cannot be restored behind us.
-      if (releaseManagedMcpConfig) {
-        await releaseManagedMcpConfig().catch(async (error) => {
+      // Remove the staged CODEX_HOME allowlist temp dir on every exit path
+      // (teardown AND error), never only the happy path. Cleanup failure is
+      // logged, not fatal — a leaked temp dir must not crash the run.
+      if (stagedCodexHomeDir) {
+        await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
           await onLog(
             "stderr",
-            `[paperclip] Failed to remove the managed MCP block from the Codex config: ${
+            `[paperclip] Failed to remove staged Codex home "${stagedCodexHomeDir}": ${
               error instanceof Error ? error.message : String(error)
             }\n`,
           );
         });
+      }
+      // Restore the managed config.toml so PAPERCLIP_CODEX_PROVIDERS changes
+      // (or removal) between runs never leave stale provider routing behind. This
+      // finally starts the moment prepareCodexRuntimeConfig returns, so a throw
+      // anywhere in the remaining setup (skill injection, remote runtime
+      // preparation, command building) restores the original config.toml too.
+      // If the process dies before reaching this, the next
+      // prepareCodexRuntimeConfig restores the original from the pre-run backup
+      // written at prepare time.
+      try {
+        await preparedRuntimeConfig.cleanup();
+      } finally {
+        // After the provider-config restore above, which rewrites config.toml from
+        // its pre-run copy, so a stale MCP block cannot be restored behind us.
+        if (releaseManagedMcpConfig) {
+          await releaseManagedMcpConfig().catch(async (error) => {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to remove the managed MCP block from the Codex config: ${
+                error instanceof Error ? error.message : String(error)
+              }\n`,
+            );
+          });
+        }
       }
     }
   }
