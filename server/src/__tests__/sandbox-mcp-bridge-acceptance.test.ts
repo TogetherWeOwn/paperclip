@@ -604,7 +604,10 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
         for (const entry of observed.entries) {
           const response = await fetch(entry.url, {
             method: "POST",
-            headers: { authorization: `Bearer ${entry.token}` },
+            headers: {
+              authorization: `Bearer ${entry.token}`,
+              "content-type": "application/json",
+            },
             body: "{}",
           });
           expect(response.status).toBe(200);
@@ -617,7 +620,10 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
         for (const entry of observed.entries) {
           const response = await fetch(entry.url, {
             method: "POST",
-            headers: { authorization: `Bearer ${entry.token}` },
+            headers: {
+              authorization: `Bearer ${entry.token}`,
+              "content-type": "application/json",
+            },
             body: "{}",
             signal: AbortSignal.timeout(3_000),
           });
