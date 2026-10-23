@@ -121,6 +121,7 @@ export const heartbeatRuns = pgTable(
         OR ${table.scopeKind} = 'issue'`,
     ),
     costAccountingPendingIdx: index("heartbeat_runs_cost_accounting_pending_idx").on(table.updatedAt, table.id).where(sql`${table.costAccountingPending} = true`),
+    updatedAtIdIdx: index("heartbeat_runs_updated_at_id_idx").on(table.updatedAt, table.id).concurrently(),
     costDataQualityIdx: index("heartbeat_runs_cost_data_quality_idx")
       .on(table.companyId, sql`coalesce(${table.finishedAt}, ${table.createdAt}) desc`, table.id)
       .where(sql`${table.costAccountingPending} = true and ${table.status} in ('succeeded','failed','timed_out','cancelled','interrupted')`),

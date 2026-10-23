@@ -504,6 +504,7 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
   "0332_little_night_nurse.sql",
   "0345_luxuriant_carmella_unuscione.sql",
   "0369_late_logan.sql",
+  "0376_reflective_mephisto.sql",
 ]);
 
 async function applyPendingMigrationsManually(

@@ -50,6 +50,8 @@ const OWNERSHIP_ATTENTION_CODES = [
   "native_adopted_runner_authentication_timeout",
 ] as const;
 
+export const CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT = 200;
+
 export { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON };
 
 // Only upgraded GitHub bots have the task-scoped response tools. Legacy
@@ -667,7 +669,7 @@ export async function enqueueChatRunMilestones(
   } = {},
 ): Promise<number> {
   const since = input.since ?? new Date(Date.now() - 24 * 60 * 60_000);
-  const limit = Math.max(1, Math.min(input.limit ?? 200, 1_000));
+  const limit = Math.max(1, Math.min(input.limit ?? CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT, 1_000));
   const issueIdFromContext = boundRunIssueIdSql();
   const explicitlyAuthoredCommentReason = sql<boolean>`(
     ${issueComments.metadata} ->> 'authorizationReason' = 'paperclip_runner_protocol'
