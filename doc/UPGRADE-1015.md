@@ -167,7 +167,7 @@ only. Valid old saves required a boolean, but raw historical JSON needs inspecti
 | --- | --- | --- |
 | `true` | Not denied by this predicate | Retain row/flag; never add to includes |
 | `false` | Denied | Add verified login to effective excludes everywhere |
-| Missing | Denied | Add verified login to excludes; retain missing field |
+| Missing | Denied | STOP pending a separately reviewed endpoint mapping; then add verified login to excludes and retain missing field |
 | `null`, `0`, empty string | Denied, malformed old input | STOP; inventory required denial, do not coerce/save |
 | Nonempty string (including `"false"`), nonzero number, object, array | Truthy but malformed | STOP; no guess/cleanup/new opt-in |
 | No matching person | No per-person denial | Leave membership/authorization rules unchanged |
@@ -176,8 +176,12 @@ Present nonboolean flags, malformed roots/arrays/filters, invalid login/ID,
 duplicate IDs or uncertain renamed logins STOP that endpoint's conversion. Resolve
 through a separately reviewed correction, not by inventing a flag or dropping a
 person. The new validator accepts missing flags, not present nonbooleans
-(`packages/shared/src/validators/chat-github.ts:63-79`). Any old-denied malformed
-row remains denied operationally by the STOP until its reviewed mapping exists.
+(`packages/shared/src/validators/chat-github.ts:63-79`). Acceptance by that validator
+is not a reviewed decision for a missing historical flag. Record the exact endpoint,
+revision, verified identity, old denial and proposed effective-excludes mapping for
+independent review before conversion; absent that decision, STOP remains in force.
+This pack supplies no endpoint decision. Any old-denied malformed row likewise
+remains denied operationally by the STOP until its reviewed mapping exists.
 
 For each valid endpoint snapshot:
 
@@ -238,7 +242,13 @@ The new operator defaults are 14 null-scope keys (`company-member-roles.ts:57-75
 `users:invite`, `tasks:assign`, `pipelines:write`, `tools:manage_connections`,
 `tools:manage_profiles`, `tools:manage_runtime`, `tools:use`, `tools:admin`,
 `tools:view_audit`, `audit:view_agent_actions`. O had only `tasks:assign` in that
-role (`company-member-roles.ts:57-58`). Owner/admin/viewer lists are unchanged.
+role (`company-member-roles.ts:57-58`). Owner/admin/viewer lists are unchanged,
+but startup still repairs their missing defaults. The `03` per-key projection uses
+the complete owner (12), admin (11), operator (14) and viewer (0) sets from I
+`server/src/services/company-member-roles.ts:28-75`. Those are set sizes, not insert
+counts: existing keys, including scoped/custom grants, reduce the missing count.
+Viewers have a separate zero-default summary, not fabricated permission-key rows;
+zero defaults does not imply zero effective access or revoke their stored grants.
 
 Every boot backfills missing normalized role defaults for active human memberships
 (`server/src/index.ts:711-716`;

@@ -10,8 +10,10 @@
 -- chat-github-review-policy.ts:154-158 denies person && !person.automaticReviews.
 -- Missing/null/false/0/empty-string flags were falsy; nonempty strings (even
 -- "false"), nonzero numbers, objects and arrays were truthy but malformed.
--- Valid old schema required a boolean. Missing is accepted by the new schema;
--- any present nonboolean flag, invalid login/ID, duplicate ID, malformed config
+-- Valid old schema required a boolean. Missing is accepted by the new schema,
+-- but conversion must STOP pending a separately reviewed endpoint/revision/identity
+-- denial mapping (runbook §2). This pack provides no such decision.
+-- Any present nonboolean flag, invalid login/ID, duplicate ID, malformed config
 -- or ambiguous ID-to-current-login mapping must STOP conversion, not be coerced.
 -- Retain people and automaticReviews unchanged: workflow-trigger sender checks
 -- still require strict true (chat-github-review-policy.ts:333-362).
