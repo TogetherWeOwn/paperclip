@@ -34,13 +34,55 @@ export class NativeSshAuthorityError extends Error {
   }
 }
 
+/**
+ * A launch refused because its run was cancelled before spawn. Deliberately
+ * NOT a NativeSshAuthorityError: a cancellation is not a policy refusal, and
+ * must never read as one in logs or alerting. The stable `code` lets callers
+ * tell "cancelled before spawn" apart from signer and authority failures.
+ */
+export class LaunchCancelledError extends Error {
+  readonly code = "launch_cancelled" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "LaunchCancelledError";
+  }
+}
+
+/**
+ * Refuses the launch when the run was already cancelled. No-op without a
+ * signal, so callers that have no cancellation source keep current behavior.
+ * The producer's abort reason is intentionally ignored: the refusal identity
+ * is always this stable code, never ambient text.
+ */
+export function throwIfLaunchCancelled(signal: AbortSignal | null | undefined, what: string): void {
+  if (signal?.aborted) {
+    throw new LaunchCancelledError(`${what} refused: run was cancelled before spawn`);
+  }
+}
+
+/** The same refusal for race callbacks, where throwing cannot reject the outer wait. */
+function cancelledLaunch(what: string): LaunchCancelledError {
+  return new LaunchCancelledError(`${what} refused: run was cancelled before spawn`);
+}
+
 export interface NativeSshSignerRequest {
   readonly version: typeof NATIVE_SSH_SIGNER_REQUEST_VERSION;
   readonly opaqueRequestId: string;
 }
 
+export interface NativeSshSignerRequestOptions {
+  /**
+   * Run-cancellation signal. When it aborts mid-round-trip the transport
+   * stops waiting and the launch is refused as cancelled, never as
+   * signer-unavailable. Transports that predate this option simply ignore it;
+   * the executor races the abort itself, so the wait always ends.
+   */
+  readonly signal?: AbortSignal | null;
+}
+
 export interface NativeSshSignerTransport {
-  requestEnvelope(request: NativeSshSignerRequest): Promise<unknown>;
+  requestEnvelope(request: NativeSshSignerRequest, options?: NativeSshSignerRequestOptions): Promise<unknown>;
 }
 
 export interface NativeSshRemoteTarget {
@@ -94,10 +136,22 @@ export interface NativeSshLaunchInput {
 /** Decides whether the signer's signature over the envelope is genuine. Never trusts the transport. */
 export type NativeSshEnvelopeVerifier = (envelope: NativeSshSignedEnvelope) => boolean | Promise<boolean>;
 
+export interface NativeSshAuthorizeLaunchOptions {
+  /**
+   * Run-cancellation signal. Checked before any ledger write, raced against
+   * the signer wait, and re-checked after the signer answers: a cancelled run
+   * never authorizes a launch. Omitted when the caller has no source.
+   */
+  readonly signal?: AbortSignal | null;
+}
+
 export interface NativeSshHostExecutorTarget {
   readonly kind: "native_ssh";
   /** Issues one single-use, signer-verified authorization for exactly this launch. */
-  authorizeLaunch(input: NativeSshLaunchInput): Promise<NativeSshSignedEnvelope>;
+  authorizeLaunch(
+    input: NativeSshLaunchInput,
+    options?: NativeSshAuthorizeLaunchOptions,
+  ): Promise<NativeSshSignedEnvelope>;
 }
 
 export interface CreateNativeSshHostExecutorTargetInput {
@@ -276,6 +330,7 @@ function parseSignerRequest(value: unknown): NativeSshSignerRequest {
 export async function requestNativeSshSignerEnvelope(
   signer: NativeSshSignerTransport | null | undefined,
   request: unknown,
+  options?: NativeSshSignerRequestOptions,
 ): Promise<unknown> {
   if (!signer || typeof signer.requestEnvelope !== "function") {
     throw new NativeSshAuthorityError(
@@ -283,7 +338,7 @@ export async function requestNativeSshSignerEnvelope(
       "Native SSH signer transport is unavailable",
     );
   }
-  return signer.requestEnvelope(parseSignerRequest(request));
+  return signer.requestEnvelope(parseSignerRequest(request), options);
 }
 
 function parseAuthority(value: unknown): NativeSshLaunchAuthority | null {
@@ -460,13 +515,20 @@ async function recordInLedger(what: string, write: () => Promise<void>): Promise
   }
 }
 
-/** Bounded signer round trip; a transport failure or silence is "signer unavailable". */
+/**
+ * Bounded signer round trip; a transport failure or silence is "signer
+ * unavailable". A run cancelled mid-wait refuses as cancelled instead, so a
+ * signer that answers within its budget cannot start a dead run's launch.
+ */
 async function askSigner(
   signer: NativeSshSignerTransport | null | undefined,
   request: NativeSshSignerRequest,
   timeoutMs: number,
+  signal?: AbortSignal | null,
 ): Promise<unknown> {
+  throwIfLaunchCancelled(signal, "Native SSH signer request");
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
       () =>
@@ -479,16 +541,30 @@ async function askSigner(
       timeoutMs,
     );
   });
+  // Raced here rather than trusted to the transport: a transport that predates
+  // the signal option still ends its wait when the run is cancelled.
+  const aborted = signal
+    ? new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(cancelledLaunch("Native SSH signer request"));
+        signal.addEventListener("abort", onAbort, { once: true });
+      })
+    : null;
   try {
-    return await Promise.race([requestNativeSshSignerEnvelope(signer, request), timeout]);
+    return await Promise.race([
+      requestNativeSshSignerEnvelope(signer, request, signal ? { signal } : undefined),
+      timeout,
+      ...(aborted ? [aborted] : []),
+    ]);
   } catch (error) {
     if (error instanceof NativeSshAuthorityError) throw error;
+    if (error instanceof LaunchCancelledError) throw error;
     throw new NativeSshAuthorityError(
       "native_ssh_signer_unavailable",
       `Native SSH signer request failed: ${errorMessage(error)}`,
     );
   } finally {
     clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -522,7 +598,13 @@ export function createNativeSshHostExecutorTarget(
   // the signer reads it. A failure never blocks later launches.
   let authorizeTail: Promise<unknown> = Promise.resolve();
 
-  async function authorizeLaunchInner(launchInput: NativeSshLaunchInput): Promise<NativeSshSignedEnvelope> {
+  async function authorizeLaunchInner(
+    launchInput: NativeSshLaunchInput,
+    signal?: AbortSignal | null,
+  ): Promise<NativeSshSignedEnvelope> {
+    // A cancelled run fails before any ledger write or signer round trip, even
+    // when it waited behind another launch in the queue below.
+    throwIfLaunchCancelled(signal, "Native SSH launch");
     assertLaunchInput(launchInput);
     // Fail before any ledger write or signer round trip when trust roots are missing.
     if (!input.signer || typeof input.signer.requestEnvelope !== "function") {
@@ -562,9 +644,16 @@ export function createNativeSshHostExecutorTarget(
       new Date(issuedAt.getTime() + maxLifetimeMs),
     );
     await recordInLedger("authority", () => input.persistAuthority(authority));
-    const envelope = parseEnvelope(
-      await askSigner(input.signer, { version: NATIVE_SSH_SIGNER_REQUEST_VERSION, opaqueRequestId }, signerTimeoutMs),
+    const rawEnvelope = await askSigner(
+      input.signer,
+      { version: NATIVE_SSH_SIGNER_REQUEST_VERSION, opaqueRequestId },
+      signerTimeoutMs,
+      signal,
     );
+    // The signer answered in time but the run died waiting: refuse before
+    // signature verification and envelope persistence, not after.
+    throwIfLaunchCancelled(signal, "Native SSH launch");
+    const envelope = parseEnvelope(rawEnvelope);
     if (!(await input.verifyEnvelope(envelope))) {
       throw new NativeSshAuthorityError(
         "native_ssh_signature_invalid",
@@ -593,8 +682,16 @@ export function createNativeSshHostExecutorTarget(
 
   return Object.freeze({
     kind: "native_ssh" as const,
-    authorizeLaunch(launchInput: NativeSshLaunchInput) {
-      const run = authorizeTail.then(() => authorizeLaunchInner(launchInput));
+    authorizeLaunch(launchInput: NativeSshLaunchInput, options?: NativeSshAuthorizeLaunchOptions) {
+      // Refuse before queueing: a cancelled launch must not wait behind, or
+      // block, authorizations for live runs. Rejected (not thrown) so the
+      // method keeps its async contract for `.catch` callers.
+      try {
+        throwIfLaunchCancelled(options?.signal, "Native SSH launch");
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      const run = authorizeTail.then(() => authorizeLaunchInner(launchInput, options?.signal));
       authorizeTail = run.catch(() => {});
       return run;
     },

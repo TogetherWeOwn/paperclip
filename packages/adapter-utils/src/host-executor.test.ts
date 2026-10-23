@@ -8,8 +8,10 @@ import {
   createEd25519NativeSshEnvelopeVerifier,
   createNativeSshHostExecutorTarget,
   getActiveNativeSshHostExecutor,
+  LaunchCancelledError,
   NATIVE_SSH_ENVELOPE_AUDIENCE,
   NATIVE_SSH_SIGNER_REQUEST_VERSION,
+  NativeSshAuthorityError,
   isNativeSshAuthorityRequired,
   nativeSshEnvelopeSigningPayload,
   requestNativeSshSignerEnvelope,
@@ -435,5 +437,106 @@ describe("barrel browser safety", () => {
     const root = path.dirname(new URL(import.meta.url).pathname);
     const barrel = readFileSync(path.join(root, "index.ts"), "utf8");
     expect(barrel).not.toContain("host-executor");
+  });
+});
+
+describe("launch cancellation", () => {
+  function cancelledTarget(
+    requestEnvelopeImpl: () => Promise<unknown> = async () => signEnvelope(expectedAuthority()),
+  ) {
+    const requestEnvelope = vi.fn(requestEnvelopeImpl);
+    const persistAuthority = vi.fn(async () => {});
+    const persistEnvelope = vi.fn(async () => {});
+    const verifyEnvelope = vi.fn(async () => true);
+    const target = makeTarget({ requestEnvelope }, { persistAuthority, persistEnvelope, verifyEnvelope });
+    return { target, requestEnvelope, persistAuthority, persistEnvelope, verifyEnvelope };
+  }
+
+  it("refuses before any ledger write or signer round trip when already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { target, requestEnvelope, persistAuthority } = cancelledTarget();
+    const error = await target.authorizeLaunch(launchInput, { signal: controller.signal }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(LaunchCancelledError);
+    expect(error).not.toBeInstanceOf(NativeSshAuthorityError);
+    expect(error).toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+    expect(persistAuthority).not.toHaveBeenCalled();
+    expect(requestEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("aborts the signer wait when the run is cancelled mid-sign", async () => {
+    const controller = new AbortController();
+    // A signer that never answers: only the abort can end the wait.
+    const { target, requestEnvelope, persistAuthority, persistEnvelope } = cancelledTarget(
+      () => new Promise<never>(() => {}),
+    );
+    const pending = target.authorizeLaunch(launchInput, { signal: controller.signal });
+    // Let the executor reach the signer wait, then cancel. No timer is
+    // involved, so the abort deterministically wins over the 10s budget.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(requestEnvelope).toHaveBeenCalledOnce();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+    // The authority was recorded before the wait; no envelope was persisted.
+    expect(persistAuthority).toHaveBeenCalledOnce();
+    expect(persistEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("refuses when cancellation wins the signer answer race", async () => {
+    const controller = new AbortController();
+    // Synchronous abort wins askSigner's race before the answer settles; this
+    // covers cancellation during the wait, not the post-answer re-check.
+    const { target, verifyEnvelope, persistEnvelope } = cancelledTarget(() => {
+      controller.abort();
+      return Promise.resolve(signEnvelope(expectedAuthority()));
+    });
+    await expect(target.authorizeLaunch(launchInput, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+    });
+    expect(verifyEnvelope).not.toHaveBeenCalled();
+    expect(persistEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("refuses cancellation after the signer answer wins the race but before verification", async () => {
+    const controller = new AbortController();
+    const settled = Promise.resolve(signEnvelope(expectedAuthority()));
+    const { target, requestEnvelope, verifyEnvelope, persistEnvelope } = cancelledTarget(() => {
+      // Let the fulfilled answer win askSigner's race, then abort before its
+      // caller resumes. Removing only the post-answer re-check must expose
+      // verification/persistence, rather than be rescued by the abort race.
+      void settled.then((value) => value).then((value) => value).then(() => controller.abort());
+      return settled;
+    });
+
+    await expect(target.authorizeLaunch(launchInput, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+      name: "LaunchCancelledError",
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(requestEnvelope).toHaveBeenCalledOnce();
+    expect(verifyEnvelope).not.toHaveBeenCalled();
+    expect(persistEnvelope).not.toHaveBeenCalled();
+  });
+
+  it("ignores the producer's abort reason: the refusal identity stays stable", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("boom"));
+    const { target } = cancelledTarget();
+    await expect(target.authorizeLaunch(launchInput, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+      name: "LaunchCancelledError",
+      message: "Native SSH launch refused: run was cancelled before spawn",
+    });
+  });
+
+  it("authorizes normally when the signal never aborts", async () => {
+    const controller = new AbortController();
+    const { target, requestEnvelope } = cancelledTarget();
+    const envelope = await target.authorizeLaunch(launchInput, { signal: controller.signal });
+    expect(envelope.authority.opaqueRequestId).toBe(REQUEST_ID);
+    expect(requestEnvelope).toHaveBeenCalledOnce();
   });
 });

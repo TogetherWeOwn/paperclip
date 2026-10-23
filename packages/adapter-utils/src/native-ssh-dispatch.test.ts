@@ -114,7 +114,7 @@ function executor(
   });
 }
 
-function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null) {
+function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null, opts: { signal?: AbortSignal | null } = {}) {
   return runChildProcess(RUN, COMMAND, ARGS, {
     cwd: sandbox,
     env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
@@ -123,6 +123,7 @@ function launchWith(hostExecutor?: NativeSshHostExecutorTarget | null) {
     onLog: async () => {},
     remoteExecution: spec,
     ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
 }
 
@@ -197,6 +198,19 @@ describe("native SSH egress enforcement at the agent-launch dispatch site", () =
     expect(sent).not.toContain("BIG_B=");
     expect(recorded!.envKeys).toContain("BIG_A");
     expect(recorded!.envKeys).not.toContain("BIG_B");
+  });
+
+  it("sends the host-verifiable binding with an authorized launch", async () => {
+    const result = await launchWith(executor(async (recorded) => sign(recorded)));
+    expect(result.exitCode).toBe(0);
+    const sent = readFileSync(marker, "utf8");
+    expect(sent).toContain("command does not match the launch authority");
+    expect(sent).toContain("environment does not match the launch authority");
+    expect(sent).not.toContain("paperclip_expected_argv=");
+    expect(sent).not.toContain("paperclip_expected_env=");
+    expect(sent).toContain(REQUEST_ID);
+    expect(sent).toContain('exec "$@"');
+    expect(sent).not.toContain("exec env ");
   });
 
   it("accepts an executor bound by the active run scope instead of an explicit option", async () => {
@@ -322,6 +336,10 @@ describe("native SSH authority off (server environment)", () => {
     expect(result.exitCode).toBe(0);
     expect(childStarted()).toBe(true);
     expect(result.nativeSshAuthority).toBeNull();
+    // No authority, no verifier: the legacy `exec env` script is sent as before.
+    const sent = readFileSync(marker, "utf8");
+    expect(sent).not.toContain("paperclip_");
+    expect(sent).toContain("exec env ");
     expect(await tempArtifacts()).toEqual([]);
   });
 
@@ -463,6 +481,101 @@ describe("ssh call-site inventory", () => {
       resolveCommandForLogs(COMMAND, sandbox, { PATH: fakeBin }, { remoteExecution: spec }),
     ).resolves.toContain("ssh://fixture-agent@fixture.example.test:22");
     expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+});
+
+describe("run cancellation before spawn", () => {
+  it("refuses and starts nothing when the run is cancelled while the signer answers", async () => {
+    const controller = new AbortController();
+    const hanging = executor(() => {
+      controller.abort();
+      return new Promise<never>(() => {});
+    });
+    await expect(launchWith(hanging, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+      name: "LaunchCancelledError",
+    });
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses after cancellation during key staging and cleans up before spawn", async () => {
+    const controller = new AbortController();
+    const requestEnvelope = vi.fn(async (recorded: NativeSshLaunchAuthority) => sign(recorded));
+    const writeFile = fs.writeFile.bind(fs);
+    const stagedKeys: string[] = [];
+    const onSpawn = vi.fn(async () => {});
+    const write = vi.spyOn(fs, "writeFile").mockImplementation(async (file, data, options) => {
+      await writeFile(file, data, options);
+      if (data === `${spec.privateKey}\n`) {
+        // This real write is inside asynchronous target resolution, after the
+        // initial buildSshSpawnTarget gate and a successful signer round trip.
+        expect(requestEnvelope).toHaveBeenCalledOnce();
+        expect(controller.signal.aborted).toBe(false);
+        const keyPath = String(file);
+        expect(await fs.readFile(keyPath, "utf8")).toBe(`${spec.privateKey}\n`);
+        stagedKeys.push(keyPath);
+        controller.abort();
+      }
+    });
+
+    try {
+      const error = await runChildProcess(RUN, COMMAND, ARGS, {
+        cwd: sandbox,
+        env: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        onSpawn,
+        remoteExecution: spec,
+        hostExecutor: executor(requestEnvelope),
+        signal: controller.signal,
+      }).then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(stagedKeys).toHaveLength(1);
+      expect(controller.signal.aborted).toBe(true);
+      expect(error).toMatchObject({ code: "launch_cancelled", name: "LaunchCancelledError" });
+      expect(onSpawn).not.toHaveBeenCalled();
+      expect(childStarted()).toBe(false);
+      expect(await tempArtifacts()).toEqual([]);
+      await expect(fs.stat(stagedKeys[0])).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it("refuses before resolving anything when already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    // No executor is forwarded: cancellation wins over enforcement.
+    await expect(launchWith(undefined, { signal: controller.signal })).rejects.toMatchObject({
+      code: "launch_cancelled",
+    });
+    expect(childStarted()).toBe(false);
+    expect(await tempArtifacts()).toEqual([]);
+  });
+
+  it("refuses before key staging when the run died after the signer answered", async () => {
+    const proof = await executor(async (recorded) => sign(recorded)).authorizeLaunch(launch);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      buildSshSpawnTarget({
+        spec,
+        command: COMMAND,
+        args: ARGS,
+        env: {},
+        authority: proof,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "launch_cancelled" });
+    expect(await tempArtifacts()).toEqual([]);
+    // The refusal spent nothing: the same proof still authorizes a live launch.
+    const live = await buildSshSpawnTarget({ spec, command: COMMAND, args: ARGS, env: {}, authority: proof });
+    await live.cleanup();
     expect(await tempArtifacts()).toEqual([]);
   });
 });
