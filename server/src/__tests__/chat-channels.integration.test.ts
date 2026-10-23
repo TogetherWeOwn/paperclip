@@ -1187,6 +1187,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     };
   }
 
+  function readChatConversationsByEndpointId(value: (typeof chatConversations.$inferSelect)["endpointId"]) {
+    return db.select().from(chatConversations).where(eq(chatConversations.endpointId, value));
+  }
   function createService(
     runtime = new FakeChatSdkRuntime(),
     providerFetch: typeof globalThis.fetch = fakeSlackFetch() as typeof globalThis.fetch,
@@ -1918,6 +1921,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
       .privateKey.export({ type: "pkcs8", format: "pem" })
       .toString();
+    const responseComments = new Map<number, { id: number; body: string; html_url: string; user: { login: string }; thread: string }>();
+    const responseWrites: Array<{ method: string; id: number; body: string }> = [];
+    let nextResponseId = 800000;
     const providerFetch = (async (
       input: string | URL | Request,
       init?: RequestInit,
@@ -1925,6 +1931,29 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const url = String(input);
       const supplemental = await supplementalProviderFetch?.(input, init);
       if (supplemental) return supplemental;
+      const list = /\/repos\/paperclipai\/paperclip\/(issues|pulls)\/([1-9][0-9]*)\/comments(?:\?.*)?$/.exec(url);
+      const reply = /\/repos\/paperclipai\/paperclip\/pulls\/([1-9][0-9]*)\/comments\/[1-9][0-9]*\/replies$/.exec(url);
+      const item = /\/repos\/paperclipai\/paperclip\/(issues|pulls)\/comments\/([1-9][0-9]*)$/.exec(url);
+      if (item) {
+        const comment = responseComments.get(Number(item[2]));
+        if (!comment) return Response.json({ message: "Not Found" }, { status: 404 });
+        if (init?.method === "PATCH") {
+          comment.body = JSON.parse(String(init.body)).body;
+          responseWrites.push({ method: "PATCH", id: comment.id, body: comment.body });
+        }
+        return Response.json(comment);
+      }
+      if ((list || reply) && init?.method === "POST") {
+        const id = ++nextResponseId;
+        const thread = list ? `${list[1]}:${list[2]}` : `pulls:${reply![1]}`;
+        const body = JSON.parse(String(init.body)).body;
+        const comment = { id, body, thread, html_url: `https://github.com/paperclipai/paperclip/issues/${list?.[2] ?? reply![1]}#issuecomment-${id}`,
+          user: { login: `maya-${fixture.companyId.slice(0, 8)}[bot]` } };
+        responseComments.set(id, comment);
+        responseWrites.push({ method: "POST", id, body });
+        return Response.json(comment, { status: 201 });
+      }
+      if (list && (!init?.method || init.method === "GET")) return Response.json([...responseComments.values()].filter(row => row.thread === `${list[1]}:${list[2]}`));
       if (url === "https://api.github.com/app/hook/config") {
         expect(init?.method).toBe("PATCH");
         const config = JSON.parse(String(init?.body)) as Record<
@@ -2064,6 +2093,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       callbacks,
       webhookSecret,
       providerFetch,
+      responseComments,
+      responseWrites,
       webhookSyncRequests,
       setSupplementalProviderFetch(value: typeof supplementalProviderFetch) {
         supplementalProviderFetch = value;
@@ -2147,6 +2178,75 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
       return { ...fixture, ...context, endpoint, principal, management };
     }
+    async function toolReplyFixture(threadId = "github:paperclipai/paperclip:issue:418", reportOnly = false) {
+      const f = await reviewBotFixture();
+      if (reportOnly) {
+        const config = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: config.revision,
+          configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, ratingThreshold: null } },
+        }, "owner-user");
+      }
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: threadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41801", text: "Are you there?", userId: "42", userName: "octocat", mentioned: true }) });
+      const [conversation] = await readChatConversationsByEndpointId(f.endpoint.id);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({
+          endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "github", providerMessageId: "41801",
+        }) }).returning();
+      const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run.id };
+      return { ...f, conversation, run, session };
+    }
+    it.each([
+      { label: "returns the confirmed GitHub assessment when publication takes longer than ten seconds", delayMs: 11_000, timeoutMs: undefined },
+      { label: "preserves an explicit shorter GitHub tool deadline and reconciles without duplicate publication", delayMs: 200, timeoutMs: 50 },
+    ])("$label", async ({ delayMs, timeoutMs }) => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      const checks: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && init?.method) {
+          checks.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 419, html_url: "https://github.com/checks/419" });
+        }
+        if (url.includes("/issues/comments/") && init?.method === "PATCH") {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+        return undefined;
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tools = await githubBotToolsForSession(db, f.session);
+      const tool = tools.find(tool => tool.upstreamToolName === "submit_review")!;
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 5, complete: true, summary: "Looks good", rationale: "Reviewed the changed file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, timeoutMs })
+        .then(value => ({ value }), error => ({ error }));
+      await expect.poll(async () => {
+        const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
+        return action?.status;
+      }, { timeout: 15_000 }).toBe("processed");
+      expect(f.responseComments.size).toBe(1);
+      expect(f.responseWrites.map(write => write.method)).toEqual(["POST", "PATCH"]);
+      expect(checks).toContainEqual(expect.objectContaining({ conclusion: "neutral", status: "completed" }));
+      if (timeoutMs === undefined) {
+        expect(result).toMatchObject({ value: { status: "completed", result: { data: { status: "processed", score: 5, conclusion: "neutral" } } } });
+      } else {
+        expect(result).toMatchObject({ error: { status: 504, reasonCode: "tool_timeout" } });
+      }
+      const writes = f.responseWrites.length;
+      await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment });
+      expect(f.responseWrites).toHaveLength(writes);
+    }, 40_000);
     it("uses the manifest state parameter and rejects expired, reused, and wrong-origin registrations", async () => {
       const fixture = await seedCompany();
       const { service } = createService(
