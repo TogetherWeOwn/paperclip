@@ -403,6 +403,33 @@ describe("direct Markdown skill import destination acceptance (offline)", () => 
     },
   );
 
+  it("normalizes a trailing-dot raw-content hostname before the direct Markdown fetch", async () => {
+    const source =
+      "https://raw.githubusercontent.com./example/skills/main/SKILL.md";
+    // Script either spelling so rejection or noncanonical fetching fails product
+    // assertions, never an incidental missing transport fixture.
+    replies.set(source, { status: 200 });
+    const { result, error } = await attempt(source);
+
+    expect(connections.map((entry) => entry.url)).toEqual([
+      "https://raw.githubusercontent.com/example/skills/main/SKILL.md",
+    ]);
+    if (error) throw error;
+    expect(result?.imported).toHaveLength(1);
+    expect(result?.imported[0]).toMatchObject({
+      markdown: MARKDOWN,
+      sourceType: "url",
+      sourceLocator: source,
+    });
+    expect(database.importedRows).toHaveLength(1);
+    expect(database.importedRows[0]).toMatchObject({
+      companyId: COMPANY_ID,
+      markdown: MARKDOWN,
+      sourceType: "url",
+      sourceLocator: source,
+    });
+  });
+
   it("positive: deliberately supports the exact configured Enterprise HTTPS host", async () => {
     vi.stubEnv("PAPERCLIP_GITHUB_ENTERPRISE_HOSTS", "ghe.example.test");
     replies.set(ENTERPRISE_URL, { status: 200 });
