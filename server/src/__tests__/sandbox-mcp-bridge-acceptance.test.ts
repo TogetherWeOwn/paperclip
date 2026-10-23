@@ -29,6 +29,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const processBoundary = vi.hoisted(() => ({
   run: vi.fn<(...args: unknown[]) => Promise<RunProcessResult>>(),
+  bridgeReady:
+    vi.fn<
+      (bridge: {
+        env: Record<string, string>;
+        mcpServers?: Array<{ name: string; url: string; token: string }>;
+      }) => Promise<void>
+    >(),
 }));
 
 // Only the provider CLI is replaced. Asset generation, archives, bridge, HTTP
@@ -43,6 +50,16 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
     resolveAdapterExecutionTargetCommandForLogs: async (command: string) =>
       command,
     runAdapterExecutionTargetProcess: processBoundary.run,
+    startAdapterExecutionTargetPaperclipBridge: async (
+      input: Parameters<
+        typeof actual.startAdapterExecutionTargetPaperclipBridge
+      >[0],
+    ) => {
+      const bridge =
+        await actual.startAdapterExecutionTargetPaperclipBridge(input);
+      if (bridge) await processBoundary.bridgeReady(bridge);
+      return bridge;
+    },
   };
 });
 
@@ -111,9 +128,15 @@ async function allFiles(directory: string): Promise<string[]> {
 }
 
 // Real shell/tar/base64 behavior, but only within disposable local directories.
-function localRunner(bin: string): CommandManagedRuntimeRunner {
+function localRunner(
+  bin: string,
+  beforeCommand?: (
+    input: Parameters<CommandManagedRuntimeRunner["execute"]>[0],
+  ) => Promise<void>,
+): CommandManagedRuntimeRunner {
   return {
     async execute(input) {
+      await beforeCommand?.(input);
       const startedAt = new Date().toISOString();
       return new Promise((resolve, reject) => {
         const child = spawn(input.command, input.args ?? [], {
@@ -126,6 +149,9 @@ function localRunner(bin: string): CommandManagedRuntimeRunner {
           },
           stdio: ["pipe", "pipe", "pipe"],
         });
+        const killTimer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+        child.once("close", () => clearTimeout(killTimer));
+        child.once("error", () => clearTimeout(killTimer));
         const stdout: Buffer[] = [];
         const stderr: Buffer[] = [];
         child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -240,6 +266,13 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
   let runId: string;
   let host: ReturnType<typeof createServer>;
   let observed: Observed;
+  let runnerCommandHook:
+    | ((
+        input: Parameters<CommandManagedRuntimeRunner["execute"]>[0],
+      ) => Promise<void>)
+    | undefined;
+  let holdUpstream: boolean;
+  let upstreamClosed: boolean;
   let hostCalls: Array<{
     path: string;
     authorization: string | undefined;
@@ -248,6 +281,7 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
 
   beforeEach(async () => {
     processBoundary.run.mockReset();
+    processBoundary.bridgeReady.mockReset();
     root = await mkdtemp(path.join(os.tmpdir(), "sandbox-mcp-acceptance-"));
     bin = path.join(root, "bin");
     await mkdir(bin);
@@ -278,6 +312,9 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       ) ?? "";
     expect(hostJwt).not.toBe("");
     hostCalls = [];
+    runnerCommandHook = undefined;
+    holdUpstream = false;
+    upstreamClosed = false;
     host = createServer((req, res) => {
       hostCalls.push({
         path: req.url ?? "",
@@ -292,6 +329,12 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
             : hostJwt;
       req.resume();
       req.on("end", () => {
+        if (holdUpstream) {
+          res.on("close", () => {
+            upstreamClosed = true;
+          });
+          return;
+        }
         res.writeHead(
           req.headers.authorization === `Bearer ${want}` ? 200 : 401,
           { "content-type": "application/json" },
@@ -330,7 +373,8 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
     adapter: "claude" | "codex",
     remote = true,
     duringRun?: () => Promise<void>,
-    outcome: "success" | "error" | "cancel" = "success",
+    outcome: "success" | "error" | "cancel" | "timeout" = "success",
+    timeoutSec: unknown = 30,
   ) {
     const workspace = path.join(root, `workspace-${adapter}`);
     const remoteDir = path.join(root, `remote-${adapter}`);
@@ -428,6 +472,13 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       await duringRun?.();
       if (outcome === "cancel")
         throw new DOMException("fixture run cancelled", "AbortError");
+      if (outcome === "timeout")
+        return {
+          ...exited(),
+          timedOut: true,
+          exitCode: null,
+          signal: "SIGTERM",
+        };
       return outcome === "error"
         ? { ...exited(), exitCode: 1, stderr: "fixture provider failure" }
         : exited();
@@ -451,7 +502,7 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       config: {
         engine: "cli",
         command: adapter,
-        timeoutSec: 30,
+        timeoutSec,
         env: { CLAUDE_CONFIG_DIR: configDir, CODEX_HOME: configDir },
       },
       context: {
@@ -468,13 +519,17 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
               streamRunLogs: false,
               timeoutMs: 30_000,
               shellCommand: "sh",
-              runner: localRunner(bin),
+              runner: localRunner(bin, async (input) => {
+                await runnerCommandHook?.(input);
+              }),
             },
           }
         : {}),
       onLog: async () => {},
     } as unknown as AdapterExecutionContext;
-    await (adapter === "claude" ? executeClaude(ctx) : executeCodex(ctx));
+    return await (adapter === "claude"
+      ? executeClaude(ctx)
+      : executeCodex(ctx));
   }
 
   it.each(["claude", "codex"] as const)(
@@ -581,65 +636,131 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
   );
 
   it.each(["claude", "codex"] as const)(
-    "%s sandbox MCP credentials expire within fifteen minutes even while files and bridge survive",
+    "%s cached CLI headers work at +16m and just before the full 4h deadline, but never at D or O",
     async (adapter) => {
-      const offsetFile = path.join(root, "clock-offset");
-      const clockModule = path.join(root, "fixture-clock.cjs");
-      await writeFile(offsetFile, "0");
-      await writeFile(
-        clockModule,
-        `
-      const fs = require('node:fs');
-      const OriginalDate = Date;
-      const offset = () => Number(fs.readFileSync(${JSON.stringify(offsetFile)}, 'utf8'));
-      global.Date = class extends OriginalDate {
-        constructor(...args) { super(...(args.length ? args : [OriginalDate.now() + offset()])); }
-        static now() { return OriginalDate.now() + offset(); }
-      };
-    `,
-      );
-      vi.stubEnv("NODE_OPTIONS", `--require=${clockModule}`);
+      // Security contract: B=14,400s, A=I, D=I+14,400s, O=I+15,300s.
+      // The sandbox clock is deliberately wrong; only host time can authorize.
       const baseline = Date.now();
-      await invoke(adapter, true, async () => {
-        for (const entry of observed.entries) {
-          const response = await fetch(entry.url, {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${entry.token}`,
-              "content-type": "application/json",
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(baseline);
+      let elapsed = 0;
+      const mono = process.hrtime.bigint();
+      const perf = performance.now();
+      vi.spyOn(process.hrtime, "bigint").mockImplementation(
+        () => mono + BigInt(elapsed) * 1_000_000n,
+      );
+      vi.spyOn(performance, "now").mockImplementation(() => perf + elapsed);
+      await invoke(
+        adapter,
+        true,
+        async () => {
+          const cached = structuredClone(observed.entries);
+          const callbacks = [
+            ...cached,
+            {
+              ...cached[0],
+              name: "API comment callback",
+              token: cached[0]?.token ?? "",
+              url: `${new URL(cached[0]?.url ?? "").origin}/api/issues/fixture-issue/comments`,
             },
-            body: "{}",
-          });
-          expect(response.status).toBe(200);
-          await response.arrayBuffer();
-        }
-        // Only Date advances, not timers; the real HTTP bridge and queue remain live.
-        vi.useFakeTimers({ toFake: ["Date"] });
-        vi.setSystemTime(baseline + 16 * 60_000);
-        await writeFile(offsetFile, String(16 * 60_000));
-        for (const entry of observed.entries) {
-          const response = await fetch(entry.url, {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${entry.token}`,
-              "content-type": "application/json",
-            },
-            body: "{}",
-            signal: AbortSignal.timeout(3_000),
-          });
-          expect
-            .soft([401, 403], `unbounded lifetime: ${entry.name}`)
-            .toContain(response.status);
-          await response.arrayBuffer();
-        }
-        const retained = await allFiles(path.join(root, `remote-${adapter}`));
-        expect(retained.some((file) => file.endsWith("surviving.json"))).toBe(
-          true,
-        );
-        vi.useRealTimers();
-        await writeFile(offsetFile, "0");
-      });
+          ];
+          for (const sample of [
+            { ms: 0, allow: true },
+            { ms: 960_000, allow: true },
+            { ms: 14_399_999, allow: true },
+            { ms: 14_400_000, allow: false },
+            { ms: 15_300_000, allow: false },
+          ]) {
+            elapsed = sample.ms;
+            vi.setSystemTime(baseline + elapsed);
+            const before = hostCalls.length;
+            for (const entry of callbacks) {
+              const response = await fetch(entry.url, {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${entry.token}`,
+                  "content-type": "application/json",
+                },
+                body: "{}",
+                signal: AbortSignal.timeout(3_000),
+              });
+              if (sample.allow)
+                expect
+                  .soft(response.status, `${entry.name} +${elapsed}ms`)
+                  .toBe(200);
+              else
+                expect
+                  .soft([401, 403], `cutoff ${entry.name} +${elapsed}ms`)
+                  .toContain(response.status);
+              await response.arrayBuffer();
+            }
+            expect
+              .soft(hostCalls.length - before, `dispatch count +${elapsed}ms`)
+              .toBe(sample.allow ? 4 : 0);
+          }
+          const retained = await allFiles(path.join(root, `remote-${adapter}`));
+          expect(retained.some((file) => file.endsWith("surviving.json"))).toBe(
+            true,
+          );
+          expect(observed.entries).toEqual(cached);
+          vi.useRealTimers();
+        },
+        "success",
+        14_400,
+      );
     },
+    30_000,
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "%s transport readiness cannot authorize API forwarding before the host launches the turn",
+    async (adapter) => {
+      processBoundary.bridgeReady.mockImplementation(async (bridge) => {
+        const response = await fetch(
+          `${bridge.env.PAPERCLIP_API_URL}/api/agents/me`,
+          {
+            headers: {
+              authorization: `Bearer ${bridge.env.PAPERCLIP_API_KEY}`,
+            },
+            signal: AbortSignal.timeout(3_000),
+          },
+        );
+        expect
+          .soft([401, 403], "ready is not host activation")
+          .toContain(response.status);
+        await response.arrayBuffer();
+        expect
+          .soft(hostCalls, "pre-activation upstream dispatch")
+          .toHaveLength(0);
+      });
+      await invoke(
+        adapter,
+        true,
+        async () => {
+          for (const entry of observed.entries) {
+            const response = await fetch(entry.url, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${entry.token}`,
+                "content-type": "application/json",
+              },
+              body: "{}",
+              signal: AbortSignal.timeout(3_000),
+            });
+            expect
+              .soft(
+                response.status,
+                "host launch activates the admitted attempt",
+              )
+              .toBe(200);
+            await response.arrayBuffer();
+          }
+        },
+        "success",
+        14_400,
+      );
+    },
+    30_000,
   );
 
   it.each([
@@ -749,6 +870,399 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
         }
       }
     },
+  );
+
+  it.each([
+    ["claude", 899_999, true],
+    ["claude", 900_000, true],
+    ["claude", 900_001, false],
+    ["codex", 899_999, true],
+    ["codex", 900_000, true],
+    ["codex", 900_001, false],
+  ] as const)(
+    "%s startup at +%ims preserves full B or refuses before launch (allowed=%s)",
+    async (adapter, startupMs, allowed) => {
+      const issuance = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(issuance);
+      let elapsed = 0;
+      const mono = process.hrtime.bigint();
+      const perf = performance.now();
+      vi.spyOn(process.hrtime, "bigint").mockImplementation(
+        () => mono + BigInt(elapsed) * 1_000_000n,
+      );
+      vi.spyOn(performance, "now").mockImplementation(() => perf + elapsed);
+      processBoundary.bridgeReady.mockImplementation(async () => {
+        elapsed = startupMs;
+        vi.setSystemTime(issuance + elapsed);
+      });
+      let launched = false;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          launched = true;
+          if (!allowed) return;
+          const cached = structuredClone(observed.entries);
+          for (const [ms, allow] of [
+            [startupMs + 960_000, true],
+            [startupMs + 14_399_999, true],
+            [startupMs + 14_400_000, false],
+            [15_300_000, false],
+          ] as const) {
+            elapsed = ms;
+            vi.setSystemTime(issuance + elapsed);
+            const before = hostCalls.length;
+            for (const entry of cached) {
+              const response = await fetch(entry.url, {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${entry.token}`,
+                  "content-type": "application/json",
+                },
+                body: "{}",
+                signal: AbortSignal.timeout(3_000),
+              });
+              if (allow)
+                expect.soft(response.status, `full B at +${ms}ms`).toBe(200);
+              else
+                expect
+                  .soft([401, 403], `immutable cutoff at +${ms}ms`)
+                  .toContain(response.status);
+              await response.arrayBuffer();
+            }
+            expect
+              .soft(hostCalls.length - before, `dispatches +${ms}ms`)
+              .toBe(allow ? 3 : 0);
+          }
+        },
+        "success",
+        14_400,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect
+        .soft(launched, "late startup must not launch an agent turn")
+        .toBe(allowed);
+      if (!allowed) {
+        expect.soft(hostCalls).toHaveLength(0);
+        expect
+          .soft(
+            "error" in outcome ||
+              ("value" in outcome && outcome.value.exitCode !== 0),
+            "late-start refusal must be explicit",
+          )
+          .toBe(true);
+      }
+      vi.useRealTimers();
+    },
+    30_000,
+  );
+
+  it.each([
+    ["claude", 14_401],
+    ["claude", -1],
+    ["claude", Number.POSITIVE_INFINITY],
+    ["claude", Number.NaN],
+    ["codex", 14_401],
+    ["codex", -1],
+    ["codex", Number.POSITIVE_INFINITY],
+    ["codex", Number.NaN],
+  ] as const)(
+    "%s refuses unsupported budget %s before launching instead of silently truncating a turn",
+    async (adapter, budget) => {
+      let launched = false;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          launched = true;
+        },
+        "success",
+        budget,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect.soft(launched, "unsupported budget launched provider").toBe(false);
+      expect.soft(hostCalls).toHaveLength(0);
+      expect
+        .soft(
+          "error" in outcome ||
+            ("value" in outcome && outcome.value.exitCode !== 0),
+          "unsupported lifetime must fail explicitly",
+        )
+        .toBe(true);
+      // The decision requires semantic fields but does not name their spelling.
+      const diagnostic = "error" in outcome ? outcome.error : outcome.value;
+      const fields =
+        diagnostic && typeof diagnostic === "object"
+          ? (diagnostic as Record<string, unknown>)
+          : {};
+      expect
+        .soft(
+          fields.errorCode ?? fields.code,
+          "stable machine-readable refusal code",
+        )
+        .toEqual(expect.any(String));
+      expect
+        .soft(
+          fields.remediation ?? fields.nextAction ?? fields.next_action,
+          "actionable lifetime remediation",
+        )
+        .toEqual(expect.any(String));
+    },
+    30_000,
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "%s refuses before launch if the actual host run JWT cannot cover admitted B",
+    async (adapter) => {
+      vi.stubEnv("PAPERCLIP_AGENT_JWT_TTL_SECONDS", "60");
+      hostJwt =
+        createLocalAgentJwt(
+          agentId,
+          companyId,
+          `${adapter}_local`,
+          runId,
+          "fixture-user",
+        ) ?? "";
+      let launched = false;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          launched = true;
+        },
+        "success",
+        14_400,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect
+        .soft(launched, "short-lived host credential launched a four-hour turn")
+        .toBe(false);
+      expect.soft(hostCalls).toHaveLength(0);
+      const diagnostic = "error" in outcome ? outcome.error : outcome.value;
+      const fields =
+        diagnostic && typeof diagnostic === "object"
+          ? (diagnostic as Record<string, unknown>)
+          : {};
+      expect
+        .soft(
+          fields.errorCode ?? fields.code,
+          "machine-readable credential lifetime failure",
+        )
+        .toEqual(expect.any(String));
+      expect
+        .soft(
+          fields.remediation ?? fields.nextAction ?? fields.next_action,
+          "credential preflight remediation",
+        )
+        .toEqual(expect.any(String));
+    },
+    30_000,
+  );
+
+  it.each([
+    ["claude", 60],
+    ["claude", 600],
+    ["codex", 60],
+    ["codex", 600],
+  ] as const)(
+    "%s admits the full shorter %is budget but denies at D and B+900s, not a fixed max TTL",
+    async (adapter, budget) => {
+      const issuance = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(issuance);
+      let elapsed = 0;
+      const mono = process.hrtime.bigint();
+      const perf = performance.now();
+      vi.spyOn(process.hrtime, "bigint").mockImplementation(
+        () => mono + BigInt(elapsed) * 1_000_000n,
+      );
+      vi.spyOn(performance, "now").mockImplementation(() => perf + elapsed);
+      await invoke(
+        adapter,
+        true,
+        async () => {
+          for (const [ms, allowed] of [
+            [budget * 1000 - 1, true],
+            [budget * 1000, false],
+            [(budget + 900) * 1000, false],
+          ] as const) {
+            elapsed = ms;
+            vi.setSystemTime(issuance + ms);
+            const before = hostCalls.length;
+            for (const entry of observed.entries) {
+              const response = await fetch(entry.url, {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${entry.token}`,
+                  "content-type": "application/json",
+                },
+                body: "{}",
+                signal: AbortSignal.timeout(3_000),
+              });
+              if (allowed)
+                expect
+                  .soft(response.status, `admitted shorter budget +${ms}ms`)
+                  .toBe(200);
+              else
+                expect
+                  .soft([401, 403], `shorter immutable cutoff +${ms}ms`)
+                  .toContain(response.status);
+              await response.arrayBuffer();
+            }
+            expect.soft(hostCalls.length - before).toBe(allowed ? 3 : 0);
+          }
+          vi.useRealTimers();
+        },
+        "success",
+        budget,
+      );
+    },
+    30_000,
+  );
+
+  it.each([
+    ["claude", "success"],
+    ["claude", "error"],
+    ["claude", "cancel"],
+    ["claude", "timeout"],
+    ["codex", "success"],
+    ["codex", "error"],
+    ["codex", "cancel"],
+    ["codex", "timeout"],
+  ] as const)(
+    "%s %s revokes and aborts upstream before blocked remote credential cleanup can finish",
+    async (adapter, terminal) => {
+      let enterCleanup!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enterCleanup = resolve;
+      });
+      let releaseCleanup!: () => void;
+      const cleanupGate = new Promise<void>((resolve) => {
+        releaseCleanup = resolve;
+      });
+      let providerStarted = false;
+      runnerCommandHook = async (input) => {
+        const script = input.args?.at(-1) ?? "";
+        if (
+          providerStarted &&
+          script.includes("/mcp-config") &&
+          /\brm\s/.test(script) &&
+          !/\b(?:tar|mkdir|base64)\s/.test(script)
+        ) {
+          enterCleanup();
+          await cleanupGate;
+        }
+      };
+      let inFlight: Promise<unknown> | undefined;
+      const execution = invoke(
+        adapter,
+        true,
+        async () => {
+          providerStarted = true;
+          holdUpstream = true;
+          const entry = observed.entries[0];
+          if (!entry) throw new Error("missing generated MCP entry");
+          inFlight = fetch(entry.url, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${entry.token}`,
+              "content-type": "application/json",
+            },
+            body: "{}",
+            signal: AbortSignal.timeout(8_000),
+          }).then(
+            async (response) => {
+              await response.arrayBuffer();
+              return response.status;
+            },
+            () => "closed",
+          );
+          await vi.waitFor(() => expect(hostCalls).toHaveLength(1), {
+            timeout: 3_000,
+          });
+        },
+        terminal,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      try {
+        await Promise.race([
+          entered,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("fixture cleanup boundary not reached")),
+              5_000,
+            ),
+          ),
+        ]);
+        expect
+          .soft(
+            (await allFiles(path.join(root, `remote-${adapter}`))).some(
+              (file) => file.endsWith("surviving.json"),
+            ),
+            "cleanup is still blocked with copied files present",
+          )
+          .toBe(true);
+        await vi.waitFor(
+          () =>
+            expect(
+              upstreamClosed,
+              "in-flight upstream socket survived terminal revocation",
+            ).toBe(true),
+          { timeout: 3_000 },
+        );
+        const before = hostCalls.length;
+        for (const entry of observed.entries) {
+          const status = await fetch(entry.url, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${entry.token}`,
+              "content-type": "application/json",
+            },
+            body: "{}",
+            signal: AbortSignal.timeout(2_000),
+          }).then(
+            async (response) => {
+              await response.arrayBuffer();
+              return response.status;
+            },
+            (error) => {
+              const code = (error as { cause?: { code?: string } }).cause?.code;
+              if (
+                code !== "ECONNREFUSED" &&
+                code !== "ECONNRESET" &&
+                (error as Error).name !== "TimeoutError" &&
+                (error as Error).name !== "AbortError"
+              )
+                throw error;
+              return 401;
+            },
+          );
+          expect
+            .soft([401, 403], "retained credential during pending cleanup")
+            .toContain(status);
+        }
+        expect
+          .soft(
+            hostCalls.length - before,
+            "dispatch while terminal cleanup blocked",
+          )
+          .toBe(0);
+      } finally {
+        releaseCleanup();
+        await execution;
+        await inFlight;
+      }
+    },
+    30_000,
   );
 
   it.each(["claude", "codex"] as const)(

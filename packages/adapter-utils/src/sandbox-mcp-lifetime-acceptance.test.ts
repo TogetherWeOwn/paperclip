@@ -19,6 +19,9 @@ function fixtureRunner(): CommandManagedRuntimeRunner {
           env: { ...process.env, ...input.env },
           stdio: ["pipe", "pipe", "pipe"],
         });
+        const killTimer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+        child.once("close", () => clearTimeout(killTimer));
+        child.once("error", () => clearTimeout(killTimer));
         const stdout: Buffer[] = [];
         const stderr: Buffer[] = [];
         child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -126,7 +129,7 @@ describe("shared sandbox bridge credential lifetime acceptance", () => {
     });
   }
 
-  it("rejects its copied bridge bearer after a finite short TTL while its listener and files survive", async () => {
+  it("rejects a copied bearer at the 60s-budget plus 900s-startup outer ceiling while listener and files survive", async () => {
     const before = await getIdentity();
     expect(before.status).toBe(200);
     await before.arrayBuffer();

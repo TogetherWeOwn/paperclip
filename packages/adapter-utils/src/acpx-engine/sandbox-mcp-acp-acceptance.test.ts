@@ -132,6 +132,9 @@ function localRunner(): CommandManagedRuntimeRunner {
           env: { ...process.env, ...input.env, BASH_ENV: "" },
           stdio: ["pipe", "pipe", "pipe"],
         });
+        const killTimer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+        child.once("close", () => clearTimeout(killTimer));
+        child.once("error", () => clearTimeout(killTimer));
         const stdout: Buffer[] = [];
         const stderr: Buffer[] = [];
         child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -192,6 +195,8 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
     | ((observation: Observation, bridge: Bridge) => Promise<void>)
     | undefined;
   let failRuntimeConstruction: boolean;
+  let configuredBudget: number;
+  let beforeHostLaunch: ((bridge: Bridge) => Promise<void>) | undefined;
   let logs: string[];
   let execute: ReturnType<typeof createAcpxEngineExecutor>;
   const servers = () =>
@@ -231,6 +236,8 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
     redirectStatus = 307;
     duringSession = undefined;
     failRuntimeConstruction = false;
+    configuredBudget = 30;
+    beforeHostLaunch = undefined;
     host = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -281,6 +288,7 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
             handle,
             runtimeRoot: fixtureValue(input.runtimeRootDir),
           });
+        if (handle) await beforeHostLaunch?.(handle);
         return handle;
       },
     );
@@ -330,6 +338,7 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
       await new Promise<void>((resolve, reject) =>
         host.close((error) => (error ? reject(error) : resolve())),
       );
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     await rm(root, {
@@ -348,7 +357,10 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
       .map((line) => JSON.parse(line));
   }
 
-  async function invoke(previous?: AdapterExecutionResult) {
+  async function invoke(
+    previous?: AdapterExecutionResult,
+    expectSuccess = true,
+  ) {
     const result = await execute({
       runId: activeRun,
       agent: {
@@ -370,7 +382,7 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
         stateDir: path.join(root, "state"),
         cwd: localCwd,
         mode: "persistent",
-        timeoutSec: 30,
+        timeoutSec: configuredBudget,
         env: { FIXTURE_OBSERVATIONS: observationsFile },
       },
       context: {},
@@ -390,7 +402,7 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
         logs.push(text);
       },
     });
-    expect(result.exitCode, logs.join("")).toBe(0);
+    if (expectSuccess) expect(result.exitCode, logs.join("")).toBe(0);
     return result;
   }
 
@@ -448,6 +460,7 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
 
   it("resumes via actual ACP session/load with fresh URLs and tokens, not stored session_options or cached credentials", async () => {
     const first = await invoke();
+    const retiredWire = fixtureValue((await readObservations())[0]);
     const sessionsDir = path.join(root, "state", "sessions");
     const files = (await readdir(sessionsDir)).filter((file) =>
       file.endsWith(".json"),
@@ -490,6 +503,25 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
       "fixture-host-plugin-b",
     ];
     duringSession = async (wire, bridge) => {
+      // A saved provider session/config is data, not authority for the new epoch.
+      for (const server of wire.params.mcpServers) {
+        const stale = await fetch(server.url, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${retiredWire.env.apiKey}`,
+            "content-type": "application/json",
+          },
+          body: BODY,
+          signal: AbortSignal.timeout(3_000),
+        });
+        expect
+          .soft([401, 403], "retired bearer accepted by replacement listener")
+          .toContain(stale.status);
+        await stale.arrayBuffer();
+      }
+      expect
+        .soft(calls, "old-epoch request dispatched under new owner")
+        .toHaveLength(0);
       for (const server of wire.params.mcpServers) {
         const response = await post(bridge, endpoint(server));
         expect.soft(response.status, `resumed ${server.name}`).toBe(200);
@@ -547,6 +579,224 @@ describe("shared remote ACP MCP bridge acceptance (failing-first)", () => {
         .not.toContain(token);
     }
   }, 45_000);
+
+  async function prepareSandboxClock() {
+    const module = path.join(root, "sandbox-clock.cjs");
+    const offset = path.join(root, "sandbox-clock-offset");
+    await writeFile(offset, "0");
+    await writeFile(
+      module,
+      `
+      const fs = require('node:fs');
+      const RealDate = Date;
+      const offset = () => Number(fs.readFileSync(${JSON.stringify(offset)}, 'utf8'));
+      global.Date = class extends RealDate {
+        constructor(...args) { super(...(args.length ? args : [RealDate.now() + offset()])); }
+        static now() { return RealDate.now() + offset(); }
+      };
+    `,
+    );
+    vi.stubEnv("NODE_OPTIONS", `--require=${module}`);
+    return offset;
+  }
+
+  it.each(["new", "load"] as const)(
+    "actual ACP session/%s keeps its delivered static headers at +16m and near D, including a rolled-back sandbox clock",
+    async (sessionKind) => {
+      const previous = sessionKind === "load" ? await invoke() : undefined;
+      if (previous) {
+        activeRun = "fixture-run-b";
+        activeTokens = [
+          "fixture-host-run-b",
+          "fixture-host-connections-b",
+          "fixture-host-plugin-b",
+        ];
+      }
+      configuredBudget = 14_400;
+      const issuance = Date.now();
+      const sandboxOffset = await prepareSandboxClock();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(issuance);
+      let elapsed = 0;
+      const mono = process.hrtime.bigint();
+      const perf = performance.now();
+      // Do not freeze ACPX's session-recovery polling while it loads a record.
+      // Bridge issuance is fixed; only request dispatch uses the elapsed clock.
+      beforeHostLaunch = async () => {
+        vi.useRealTimers();
+      };
+      const installDispatchClock = () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(issuance);
+        vi.spyOn(process.hrtime, "bigint").mockImplementation(
+          () => mono + BigInt(elapsed) * 1_000_000n,
+        );
+        vi.spyOn(performance, "now").mockImplementation(() => perf + elapsed);
+      };
+      calls = [];
+      duringSession = async (wire) => {
+        expect(wire.method).toBe(`session/${sessionKind}`);
+        installDispatchClock();
+        await writeFile(sandboxOffset, "-86400000");
+        const cached = structuredClone(wire.params.mcpServers);
+        for (const ms of [960_000, 14_399_999]) {
+          elapsed = ms;
+          vi.setSystemTime(issuance + elapsed);
+          for (const server of cached) {
+            const response = await fetch(server.url, {
+              method: "POST",
+              headers: {
+                ...Object.fromEntries(
+                  server.headers.map((h) => [h.name, h.value]),
+                ),
+                "content-type": "application/json",
+              },
+              body: BODY,
+              signal: AbortSignal.timeout(3_000),
+            });
+            expect
+              .soft(response.status, `${wire.method} ${server.name} +${ms}ms`)
+              .toBe(200);
+            await response.arrayBuffer();
+          }
+        }
+        expect.soft(calls).toHaveLength(6);
+        expect(wire.params.mcpServers).toEqual(cached);
+        for (const call of calls)
+          expect.soft(call.headers["x-paperclip-run-id"]).toBe(activeRun);
+        for (let i = 0; i < calls.length; i++)
+          expect
+            .soft(calls[i]?.headers.authorization)
+            .toBe(`Bearer ${activeTokens[i % 3]}`);
+        // Advance only around bridge dispatch. ACPX's unrelated scheduler and
+        // filesystem locks settle on real elapsed time, never a four-hour jump.
+        await writeFile(sandboxOffset, "0");
+        elapsed = 0;
+        vi.setSystemTime(issuance);
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+      };
+      await invoke(previous);
+    },
+    45_000,
+  );
+
+  it.each([15_300_000])(
+    "actual ACP wire bearer is denied at the immutable outer ceiling +%ims with zero dispatches despite sandbox and host wall rollback",
+    async (cutoff) => {
+      configuredBudget = 14_400;
+      const issuance = Date.now();
+      const sandboxOffset = await prepareSandboxClock();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(issuance);
+      let elapsed = 0;
+      const mono = process.hrtime.bigint();
+      const perf = performance.now();
+      // Do not freeze ACPX's session-recovery polling while it loads a record.
+      // Bridge issuance is fixed; only request dispatch uses the elapsed clock.
+      beforeHostLaunch = async () => {
+        vi.useRealTimers();
+      };
+      const installDispatchClock = () => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(issuance);
+        vi.spyOn(process.hrtime, "bigint").mockImplementation(
+          () => mono + BigInt(elapsed) * 1_000_000n,
+        );
+        vi.spyOn(performance, "now").mockImplementation(() => perf + elapsed);
+      };
+      duringSession = async (wire, bridge) => {
+        installDispatchClock();
+        await writeFile(sandboxOffset, "-86400000");
+        elapsed = cutoff;
+        // Host wall and sandbox wall remain at issuance. Only trusted host
+        // monotonic time advances: a sandbox-side expiry check cannot pass this.
+        const before = calls.length;
+        for (const server of wire.params.mcpServers) {
+          const response = await fetch(server.url, {
+            method: "POST",
+            headers: {
+              authorization: bearer(server),
+              "content-type": "application/json",
+            },
+            body: BODY,
+            signal: AbortSignal.timeout(3_000),
+          });
+          expect
+            .soft([401, 403], "host elapsed deadline, not sandbox clock")
+            .toContain(response.status);
+          await response.arrayBuffer();
+        }
+        expect
+          .soft(calls.length - before, "dispatch after immutable cutoff")
+          .toBe(0);
+        expect
+          .soft(
+            await exists(fixtureValue(bridge.env.PAPERCLIP_BRIDGE_QUEUE_DIR)),
+          )
+          .toBe(true);
+        await writeFile(sandboxOffset, "0");
+        elapsed = 0;
+        vi.setSystemTime(issuance);
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+      };
+      await invoke(undefined, false);
+    },
+    30_000,
+  );
+
+  it("ACP transport readiness is not authority before host turn launch", async () => {
+    beforeHostLaunch = async (bridge) => {
+      const response = await fetch(
+        `${bridge.env.PAPERCLIP_API_URL}/api/agents/me`,
+        {
+          headers: { authorization: `Bearer ${bridge.env.PAPERCLIP_API_KEY}` },
+          signal: AbortSignal.timeout(3_000),
+        },
+      );
+      expect.soft([401, 403]).toContain(response.status);
+      await response.arrayBuffer();
+      expect.soft(calls, "pre-activation dispatch").toHaveLength(0);
+    };
+    await invoke();
+  }, 30_000);
+
+  it.each([14_401, -1, Number.POSITIVE_INFINITY, Number.NaN])(
+    "ACP refuses unsupported budget %s before any session/new or prompt",
+    async (budget) => {
+      configuredBudget = budget;
+      const outcome = await invoke(undefined, false).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect
+        .soft(
+          (await readObservations()).map((wire) => wire.method),
+          "unsupported lifetime launched the ACP provider session",
+        )
+        .toEqual([]);
+      expect.soft(calls).toHaveLength(0);
+      const diagnostic = "error" in outcome ? outcome.error : outcome.value;
+      const fields =
+        diagnostic && typeof diagnostic === "object"
+          ? (diagnostic as Record<string, unknown>)
+          : {};
+      expect
+        .soft(
+          fields.errorCode ?? fields.code,
+          "stable unsupported-lifetime code",
+        )
+        .toEqual(expect.any(String));
+      expect
+        .soft(
+          fields.remediation ?? fields.nextAction ?? fields.next_action,
+          "actionable lifetime remediation",
+        )
+        .toEqual(expect.any(String));
+    },
+    30_000,
+  );
 
   it("registered endpoints preserve their own host token/run and MCP protocol/session headers", async () => {
     duringSession = async (wire, bridge) => {
