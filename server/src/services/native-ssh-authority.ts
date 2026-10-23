@@ -48,6 +48,8 @@ export interface CreateNativeSshHostExecutorForRunInput
     | "maxLifetimeMs"
   > {
   readonly issueId: string | null;
+  readonly endpoint?: string | null | undefined;
+  readonly publicKeyPem?: string | null | undefined;
   readonly target: AdapterExecutionTarget | null | undefined;
   readonly holder: RunModelDecisionHolderSelection;
   readonly decision: Pick<RunModelDecisionRecord, "model" | "outcome" | "pluginKey"> | null | undefined;
@@ -90,9 +92,15 @@ export function createNativeSshHostExecutorForRun(
   input: CreateNativeSshHostExecutorForRunInput,
 ): NativeSshHostExecutorTarget | null {
   if (!isSshTarget(input.target) || !isNativeSshAuthorityRequired()) return null;
-  const { target: _target, holder, decision, issueId, ...seed } = input;
+  const { target: _target, holder, decision, issueId, endpoint, publicKeyPem, ...seed } = input;
   return createNativeSshHostExecutorTarget({
     ...seed,
+    ...resolveNativeSshSignerPair({
+      signer: seed.signer,
+      verifyEnvelope: seed.verifyEnvelope,
+      endpoint,
+      publicKeyPem,
+    }),
     issueId: issueId ?? "",
     assignedModel: assignedModelForNativeSsh(holder, decision),
   });

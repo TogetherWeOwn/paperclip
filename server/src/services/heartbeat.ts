@@ -625,7 +625,6 @@ import {
 import {
   createNativeSshHostExecutorForRun,
   nativeSshAuthorityRunLedger,
-  resolveNativeSshSignerPair,
   runWithRunNativeSshHostExecutor,
 } from "./native-ssh-authority.js";
 import {
@@ -23587,12 +23586,10 @@ export function heartbeatService(
         target: executionTarget,
         holder: modelDecision.holder,
         decision: modelDecision.record,
-        ...resolveNativeSshSignerPair({
-          signer: options.nativeSshSigner,
-          verifyEnvelope: options.nativeSshEnvelopeVerifier,
-          endpoint: options.nativeSshSignerEndpoint,
-          publicKeyPem: options.nativeSshSignerPublicKeyPem,
-        }),
+        signer: options.nativeSshSigner,
+        verifyEnvelope: options.nativeSshEnvelopeVerifier,
+        endpoint: options.nativeSshSignerEndpoint,
+        publicKeyPem: options.nativeSshSignerPublicKeyPem,
         ...nativeSshAuthorityRunLedger(db, run.id, context),
       });
       let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;

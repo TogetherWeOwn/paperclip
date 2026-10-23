@@ -7,7 +7,7 @@ Paperclip can require a signed launch authority before it starts a process on an
 - one environment: its sorted key names and a digest of its values;
 - one remote target.
 
-A signer outside the Paperclip server approves it.
+The authority design requires approval by a signer outside the Paperclip server. The code below supplies a **dormant transport and reference implementation**, not a production authority boundary. No production signer is constructed here, and the original cancellation, signer-integration, and authenticated-host-verification activation prerequisites remain open (see Production blockers).
 
 ## Enforcement switch
 
@@ -16,7 +16,7 @@ The server environment variable `PAPERCLIP_NATIVE_SSH_AUTHORITY` controls enforc
 - Unset, empty or `off`: SSH launches work as before. If a caller binds an executor anyway, that executor is enforced in full.
 - `required` (or any other value): every SSH launch through `runChildProcess` needs an executor-issued authority. Without one, the launch is refused before `ssh` is resolved or a key file is written. Any value other than unset, empty or `off` enforces, so a typo cannot disable the check.
 
-Set `required` only after a signer is reachable. If no signer is configured, every SSH-target run is refused.
+Do not set `required` until every production blocker below has independently accepted evidence and the separate activation gate passes. A reachable socket alone is insufficient. If no signer is configured, every SSH-target run is refused.
 
 ## What is gated
 
@@ -51,11 +51,13 @@ Signer transport failures, signer silence and ledger write failures refuse the l
 
 ## Configuration
 
-The heartbeat service takes the signer pair two ways. Explicit `nativeSshSigner` (the transport to the signer) and `nativeSshEnvelopeVerifier` (for example `createEd25519NativeSshEnvelopeVerifier(publicKeyPem)`) pass straight through, for tests and embeds. Or set endpoint config — `nativeSshSignerEndpoint` (the AF_UNIX socket path of the out-of-process signer) plus `nativeSshSignerPublicKeyPem` (its Ed25519 public key, SPKI PEM) — and the heartbeat builds the pair itself. Both null (the default) leaves the seam dormant. Setting exactly one, mixing endpoint config with an explicit pair, or passing an unusable key refuses the SSH run before any launch. The socket path and key are explicit arguments only; nothing reads them from the environment. Local and sandbox targets are not affected.
+The heartbeat service takes the signer pair two ways. Explicit `nativeSshSigner` (the transport to the signer) and `nativeSshEnvelopeVerifier` (for example `createEd25519NativeSshEnvelopeVerifier(publicKeyPem)`) pass straight through, for tests and embeds. Or set endpoint config — `nativeSshSignerEndpoint` (the AF_UNIX socket path of the out-of-process signer) plus `nativeSshSignerPublicKeyPem` (its Ed25519 public key, SPKI PEM) — and the heartbeat builds the pair itself. Both null (the default) leaves the seam dormant. The run builder applies SSH-target and enforcement gating before resolving these options: setting exactly one, mixing endpoint config with an explicit pair, or passing an unusable key refuses a required-authority SSH run before any launch. While enforcement is off, these options are not resolved. The socket path and key are explicit arguments only; nothing reads them from the environment. Local and sandbox targets are not affected.
 
 The built-in transport (`packages/adapter-utils/src/native-ssh-signer-transport.ts`) speaks framed protocol v1 over the socket: a 4-byte big-endian length prefix plus UTF-8 JSON, a 64 KiB cap each way, and 2-second connect plus 8-second read budgets inside the executor's 10-second signer wait. Every transport failure refuses the launch with `native_ssh_signer_unavailable`.
 
-The reference signer (`server/src/services/native-ssh-signer-daemon.ts`) is a starting point for the out-of-process daemon and is never auto-started: it binds the peer (uid/gid/executable/cgroup), re-validates the recorded authority for the opaque id, and issues each id once. Production plugs its run ledger into `loadRecordedAuthority`.
+The reference signer (`server/src/services/native-ssh-signer-daemon.ts`) is a starting point for the out-of-process daemon and is never auto-started: it checks the injected peer identity (uid/gid/executable/cgroup), re-validates the recorded authority for the opaque id, and issues each id once in its configured ledger. A real peer-credential resolver, production run-ledger loader, durable atomic issue ledger, and explicit deployment policy are not supplied here. The reference policy hook defaults to permit after the other checks; that is not a production policy.
+
+Its socket path must be absolute and normalized. The parent must already exist, be canonical (no symlink aliases), owned by the daemon's effective uid, and not group/other writable. The daemon uid and directory ancestors must be trusted; this is not protection against that uid or an administrator changing the filesystem concurrently. The daemon never creates those directories or removes an occupied configured pathname, including a stale socket. It binds inside a private temporary directory under that parent, sets socket permissions there, and publishes an exclusive hard link; unsupported filesystems refuse rather than fall back to replacing a path. On close, Node removes only the private bind path. Public cleanup checks the parent and socket device/inode/uid identities before removing its own socket, preserving unrelated replacements. An occupied or crash-left path needs separately authorized operator inspection/cleanup, not automatic deletion.
 
 The environment that is bound is the one the remote command actually gets, after the SSH size budget drops oversized values. The authority holds its sorted key names and a digest. The values are not stored in it.
 
@@ -64,5 +66,15 @@ No database migration is needed. The authority and the envelope digest use the e
 ## Threat model limits
 
 - The signer's approval binds what the server asks to launch. It does not protect against code running inside the Paperclip server process. That code holds the SSH key and can construct its own executor.
-- The host verifies the launch binding, not the signature. Authority-carrying launches embed a POSIX verifier (`packages/adapter-utils/src/native-ssh-host-verifier.ts`) that rechecks the user, directory, expiry, and argv/env digests before exec, and refuses with exit 125 — running nothing — on mismatch. Host-side signature verification needs a provisioned trust root, which does not exist yet; the signature stays verified server-side before the script is built.
-- Cancelling the run refuses the launch before spawn once the producer passes its signal: `runChildProcess` takes an optional `AbortSignal`, threaded through authorization to the signer wait, and a cancelled launch fails with `launch_cancelled`, never an authority code. No producer passes a signal yet — threading heartbeat run-stop through to the adapter is separate work, and the hook is inert until then.
+- The embedded POSIX host verifier (`packages/adapter-utils/src/native-ssh-host-verifier.ts`) checks **unsigned consistency**, not independent authorization: user, absolute directory, expiry, and per-record argv/env digests derived from the same script inputs. A mismatch refuses with exit 125, but replacing the whole script also replaces its expected digests. Those digests are not the signed canonical envelope digests. No signer envelope/signature or trusted host-side replay ledger is checked on the host; host/port are not rechecked and relative directories skip the directory check. Server-side signature verification does not resolve that boundary.
+- With a caller-supplied signal, `runChildProcess` threads an optional `AbortSignal` through authorization to the signer wait; cancellation refuses with `launch_cancelled` before spawn and cleans staged keys. The production run-stop controller reaches `adapter.execute`, but the adapter/execution-target launch path does not forward it to `runChildProcess`. Thus these hooks do not yet make production run-stop prevent a launch during signer wait.
+
+## Production blockers
+
+These are unresolved activation prerequisites, not completed features or provisioning permission:
+
+1. **Cancellation forwarding:** carry the heartbeat run-stop signal through adapter execution and execution-target dispatch to every authorized SSH launch, with independent stop-during-sign and stop-during-staging no-spawn proofs on the actual route.
+2. **Production signer integration:** supply authenticated native peer credentials, a production recorded-authority loader, durable atomic issuance/replay protection, and explicit fail-closed deployment policy. The injectable reference core and memory ledger alone do not establish an independent production signer.
+3. **Authenticated host enforcement:** deliver fail-closed envelope/signature, target/command/environment, expiry and replay verification against an independent host trust root. The current embedded consistency checks are insufficient. Code can be tested offline with synthetic identities; any host trust-root provisioning or live test still needs its own accepted gate.
+
+Merging this dormant code does not clear these blockers. Keep the authority switch UNSET, with no daemon start, host mutation, key/identity/env/secret provisioning, live canary, or enforcement flip as part of this delivery.

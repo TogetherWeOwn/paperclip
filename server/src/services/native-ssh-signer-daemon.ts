@@ -1,8 +1,8 @@
 import { createHash, createPrivateKey, sign as cryptoSign, type KeyObject } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { chmod, mkdir, unlink } from "node:fs/promises";
+import { createReadStream, type BigIntStats } from "node:fs";
+import { chmod, link, lstat, mkdtemp, realpath, rmdir, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import {
   NATIVE_SSH_ENVELOPE_AUDIENCE,
   NATIVE_SSH_MAX_AUTHORITY_LIFETIME_MS,
@@ -481,9 +481,18 @@ function normalizePrivateKey(privateKey: string | KeyObject): KeyObject {
  * `{ ok: false }` responses; the daemon never crashes on peer input.
  */
 export function createNativeSshSignerDaemon(config: NativeSshSignerDaemonConfig): NativeSshSignerDaemon {
-  if (typeof config?.socketPath !== "string" || config.socketPath.length === 0) {
-    throw configError("socketPath must be a non-empty path");
+  if (
+    typeof config?.socketPath !== "string" ||
+    !isAbsolute(config.socketPath) ||
+    normalize(config.socketPath) !== config.socketPath ||
+    config.socketPath.includes("\0")
+  ) {
+    throw configError("socketPath must be a normalized absolute filesystem path");
   }
+  const socketDirectory = dirname(config.socketPath);
+  const daemonUid = process.geteuid?.();
+  if (daemonUid === undefined) throw configError("Unix effective uid is unavailable");
+  const ownerUid = BigInt(daemonUid);
   const socketMode = config.socketMode ?? DEFAULT_SOCKET_MODE;
   if (!Number.isInteger(socketMode) || socketMode < 0 || socketMode > 0o777) {
     throw configError("socketMode must be an integer between 0 and 0o777");
@@ -504,8 +513,62 @@ export function createNativeSshSignerDaemon(config: NativeSshSignerDaemonConfig)
   const hashExecutable = config.hashExecutable ?? hashExecutableFile;
   const now = config.now ?? (() => new Date());
   const onRefusal = config.onRefusal;
-  let server: Server | null = null;
+  interface ListenerOwnership {
+    listener: Server;
+    directory: BigIntStats;
+    privateDirectory: string;
+    privateDirectoryIdentity: BigIntStats;
+    socket: BigIntStats | null;
+    published: boolean;
+  }
+  let server: ListenerOwnership | null = null;
+  let lifecycle: Promise<unknown> = Promise.resolve();
   const connections = new Set<Socket>();
+
+  function serialized<T>(operation: () => Promise<T>): Promise<T> {
+    const result = lifecycle.then(operation);
+    lifecycle = result.catch(() => {});
+    return result;
+  }
+
+  function sameEntry(left: BigIntStats, right: BigIntStats): boolean {
+    return left.dev === right.dev && left.ino === right.ino && left.uid === right.uid;
+  }
+
+  async function protectedDirectory(): Promise<BigIntStats> {
+    const entry = await lstat(socketDirectory, { bigint: true });
+    if (
+      !entry.isDirectory() || entry.uid !== ownerUid || (entry.mode & 0o022n) !== 0n ||
+      await realpath(socketDirectory) !== socketDirectory
+    ) {
+      throw configError("socket directory must already exist, be canonical, owned by the daemon uid, and not group/other writable");
+    }
+    return entry;
+  }
+
+  async function removeOwnedEntry(path: string, identity: BigIntStats, socket: boolean): Promise<void> {
+    try {
+      const current = await lstat(path, { bigint: true });
+      if (!sameEntry(current, identity)) return;
+      if (socket && current.isSocket()) await unlink(path);
+      if (!socket && current.isDirectory()) await rmdir(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+  }
+
+  async function dispose(owned: ListenerOwnership): Promise<void> {
+    // Node/libuv unlinks the pathname passed to listen() on close. Never bind
+    // the public path: a later replacement there must survive even that unlink.
+    await new Promise<void>((resolve) => owned.listener.close(() => resolve()));
+    const directory = await protectedDirectory();
+    if (!sameEntry(directory, owned.directory)) return;
+    try {
+      if (owned.published && owned.socket) await removeOwnedEntry(config.socketPath, owned.socket, true);
+    } finally {
+      await removeOwnedEntry(owned.privateDirectory, owned.privateDirectoryIdentity, false);
+    }
+  }
 
   function respond(socket: Socket, response: Record<string, unknown>): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -569,44 +632,67 @@ export function createNativeSshSignerDaemon(config: NativeSshSignerDaemonConfig)
 
   return {
     socketPath: config.socketPath,
-    async listen(): Promise<string> {
-      if (server) return config.socketPath;
-      await mkdir(dirname(config.socketPath), { recursive: true });
-      try {
-        await unlink(config.socketPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
-      }
-      const listener = createServer((socket) => {
-        void handleConnection(socket).catch(() => socket.destroy());
-      });
-      await new Promise<void>((resolve, reject) => {
-        listener.once("error", reject);
-        listener.listen(config.socketPath, backlog, () => {
-          listener.off("error", reject);
-          // Post-bind server errors are unexpected; per-connection failures
-          // are all handled on their socket, so this only avoids a throw.
-          listener.on("error", () => {});
-          resolve();
+    listen(): Promise<string> {
+      return serialized(async () => {
+        if (server) {
+          const current = await lstat(config.socketPath, { bigint: true });
+          if (
+            !current.isSocket() || !server.socket || !sameEntry(current, server.socket) ||
+            !sameEntry(await protectedDirectory(), server.directory)
+          ) {
+            throw configError("published socket path changed");
+          }
+          return config.socketPath;
+        }
+        const directory = await protectedDirectory();
+        const privateDirectory = await mkdtemp(join(socketDirectory, ".signer-"));
+        const privateSocketPath = join(privateDirectory, "socket");
+        const listener = createServer((socket) => {
+          void handleConnection(socket).catch(() => socket.destroy());
         });
+        const owned: ListenerOwnership = {
+          listener,
+          directory,
+          privateDirectory,
+          privateDirectoryIdentity: await lstat(privateDirectory, { bigint: true }),
+          socket: null,
+          published: false,
+        };
+        try {
+          await new Promise<void>((resolve, reject) => {
+            listener.once("error", reject);
+            listener.listen(privateSocketPath, backlog, () => {
+              listener.off("error", reject);
+              listener.on("error", () => {});
+              resolve();
+            });
+          });
+          await chmod(privateSocketPath, socketMode);
+          owned.socket = await lstat(privateSocketPath, { bigint: true });
+          if (!sameEntry(await protectedDirectory(), directory)) {
+            throw configError("socket directory changed while binding");
+          }
+          // link() publishes without replacing anything: occupied regular
+          // files, symlinks, and live/stale sockets all refuse with EEXIST.
+          await link(privateSocketPath, config.socketPath);
+          owned.published = true;
+          server = owned;
+          return config.socketPath;
+        } catch (error) {
+          await dispose(owned);
+          throw error;
+        }
       });
-      await chmod(config.socketPath, socketMode);
-      server = listener;
-      return config.socketPath;
     },
-    async close(): Promise<void> {
-      for (const socket of connections) socket.destroy();
-      connections.clear();
-      if (server) {
+    close(): Promise<void> {
+      return serialized(async () => {
+        if (!server) return;
         const closing = server;
         server = null;
-        await new Promise<void>((resolve) => closing.close(() => resolve()));
-      }
-      try {
-        await unlink(config.socketPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
-      }
+        for (const socket of connections) socket.destroy();
+        connections.clear();
+        await dispose(closing);
+      });
     },
   };
 }
