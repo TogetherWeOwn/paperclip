@@ -2857,7 +2857,7 @@ describe("gemini ACP flag selection", () => {
     );
   });
 
-  it("keeps the sandbox backstop for an explicit timeoutSec of 0 but honors a negative opt-out", async () => {
+  it("keeps the zero/default sandbox backstop but refuses unlimited callback bridge authority before launch", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const cwd = path.join(root, "worktree");
@@ -2880,20 +2880,47 @@ describe("gemini ACP flag selection", () => {
       DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC * 1000,
     );
 
-    // A negative timeoutSec is the documented opt-out from any adapter
-    // wall-clock timeout, sandbox targets included.
-    const negativeOptOut = await runExecutor(
+    // Negative configuration remains a documented opt-out locally. The bounded
+    // sandbox callback contract must refuse it, not rewrite it or launch a turn
+    // whose callbacks will expire mid-run.
+    const localOptOut = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd, timeoutSec: -1 },
-      sandboxContext,
     );
-    expect(negativeOptOut.runtimeOptions[0]?.timeoutMs).toBeUndefined();
-    const startLine = negativeOptOut.logs.find(
+    expect(localOptOut.runtimeOptions[0]?.timeoutMs).toBeUndefined();
+    const startLine = localOptOut.logs.find(
       (entry) => entry.stream === "stderr" && entry.text.includes("Adapter execution timeout:"),
     );
     expect(startLine!.text).toContain(
       "Adapter execution timeout: none (explicitly disabled via adapterConfig.timeoutSec; " +
         "set it to a positive value to add one).",
     );
+    let launched = false;
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => {
+        launched = true;
+        return buildRuntime() as never;
+      },
+    });
+    const config = { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd, timeoutSec: -1 };
+    const outcome = await execute({
+      runId: "unlimited-bridge-refusal",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {}, config, context: {}, authToken: "synthetic-host-token",
+      executionTarget: {
+        ...sandboxContext.executionTarget,
+        runner: createLocalSandboxRunner(),
+      },
+      onLog: async () => {}, onMeta: async () => {},
+    } as never).then(value => ({ value }), error => ({ error }));
+    expect.soft(launched, "unlimited bridge launched ACP runtime").toBe(false);
+    expect(config.timeoutSec).toBe(-1);
+    expect.soft("value" in outcome, "refusal must survive adapter result normalization").toBe(true);
+    if ("value" in outcome) {
+      expect.soft(outcome.value.exitCode).not.toBe(0);
+      expect.soft(outcome.value.errorCode).toEqual(expect.any(String));
+      expect.soft(outcome.value.errorMessage).toEqual(expect.stringMatching(/-1/));
+      expect.soft(outcome.value.errorMessage).toEqual(expect.stringMatching(/timeoutSec|finite|supported|positive/i));
+    }
   });
 
   it("reports a self-describing timeout error when the wall-clock timer kills a turn", async () => {

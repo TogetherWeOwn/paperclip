@@ -130,6 +130,8 @@ describe("shared sandbox bridge credential lifetime acceptance", () => {
   }
 
   it("rejects a copied bearer at the 60s-budget plus 900s-startup outer ceiling while listener and files survive", async () => {
+    // Host turn launch, not gateway readiness, grants callback authority.
+    (bridge as typeof bridge & { activate?: () => void })?.activate?.();
     const before = await getIdentity();
     expect(before.status).toBe(200);
     await before.arrayBuffer();
@@ -161,6 +163,8 @@ describe("shared sandbox bridge credential lifetime acceptance", () => {
   });
 
   it("stops authorizing a retained bearer when bridge.stop settles", async () => {
+    // Host turn launch, not gateway readiness, grants callback authority.
+    (bridge as typeof bridge & { activate?: () => void })?.activate?.();
     const before = await getIdentity();
     expect(before.status).toBe(200);
     await before.arrayBuffer();

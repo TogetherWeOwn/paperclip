@@ -261,6 +261,8 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
   let bin: string;
   let hostUrl: string;
   let hostJwt: string;
+  let managedToken: string | undefined;
+  let upstreamAuthFailure: boolean;
   let agentId: string;
   let companyId: string;
   let runId: string;
@@ -315,6 +317,8 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
     runnerCommandHook = undefined;
     holdUpstream = false;
     upstreamClosed = false;
+    managedToken = undefined;
+    upstreamAuthFailure = false;
     host = createServer((req, res) => {
       hostCalls.push({
         path: req.url ?? "",
@@ -336,7 +340,9 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
           return;
         }
         res.writeHead(
-          req.headers.authorization === `Bearer ${want}` ? 200 : 401,
+          !upstreamAuthFailure && req.headers.authorization === `Bearer ${want}`
+            ? 200
+            : 401,
           { "content-type": "application/json" },
         );
         res.end(
@@ -385,7 +391,7 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       ),
     );
     await writeFile(path.join(configDir, "auth.json"), "{}\n");
-    const servers: Entry[] = [
+    const registeredServers: Entry[] = [
       {
         name: "Paperclip projects",
         url: `${hostUrl}${PROJECTS}`,
@@ -401,10 +407,15 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       {
         name: "Managed plugin",
         url: `${hostUrl}${PLUGIN}`,
-        token: PLUGIN_TOKEN,
+        token: managedToken ?? PLUGIN_TOKEN,
         connectionId: "plugin",
       },
     ];
+    // Isolate managed-validity cases: an unrelated opaque connection must not
+    // become the reason the actual short/unknown plugin credential is refused.
+    const servers = managedToken
+      ? registeredServers.filter((server) => server.connectionId === "plugin")
+      : registeredServers;
     processBoundary.run.mockImplementation(async (...args) => {
       const argv = args[3] as string[];
       const options = args[4] as { env: Record<string, string> };
@@ -426,7 +437,7 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
             token: collectBearers(entry)[0]?.token ?? "",
           }),
         );
-        expect(collectBearers(config)).toHaveLength(3);
+        expect(collectBearers(config)).toHaveLength(managedToken ? 1 : 3);
       } else {
         const file = path.join(options.env.CODEX_HOME, "config.toml");
         observed.runtimeRoot = path.dirname(options.env.CODEX_HOME);
@@ -445,7 +456,7 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
           token,
           connectionId: String(index),
         }));
-        expect(tokens).toHaveLength(3);
+        expect(tokens).toHaveLength(managedToken ? 1 : 3);
       }
       // Seed both complete and interrupted transfer remnants. The real teardown
       // must remove them before execute resolves and its caller can release a lease.
@@ -989,6 +1000,38 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
       expect.soft(hostCalls).toHaveLength(0);
       expect
         .soft(
+          "value" in outcome,
+          "unsupported-lifetime diagnostics must survive final adapter normalization",
+        )
+        .toBe(true);
+      if ("value" in outcome)
+        expect
+          .soft(outcome.value.errorCode)
+          .toEqual(expect.stringMatching(/\S/));
+      if ("value" in outcome && Number.isFinite(budget)) {
+        const result = outcome.value as unknown as Record<string, unknown>;
+        const details = (result.errorDetails ??
+          result.details ??
+          result) as Record<string, unknown>;
+        expect
+          .soft(
+            details.configuredValue ??
+              details.configuredTimeoutSec ??
+              details.timeoutSec,
+          )
+          .toBe(budget);
+        expect
+          .soft(
+            result.remediation ??
+              result.nextAction ??
+              result.next_action ??
+              details.remediation ??
+              details.next_action,
+          )
+          .toEqual(expect.stringMatching(/\S/));
+      }
+      expect
+        .soft(
           "error" in outcome ||
             ("value" in outcome && outcome.value.exitCode !== 0),
           "unsupported lifetime must fail explicitly",
@@ -1062,6 +1105,212 @@ describe("sandbox MCP credential acceptance (frozen failing-first)", () => {
           "credential preflight remediation",
         )
         .toEqual(expect.any(String));
+    },
+    30_000,
+  );
+
+  // The actual managed gateway issuer creates opaque pcgw tokens and persists
+  // expiry. Its adapter export has only name/url/token/connectionId; that loss
+  // of validity evidence must not silently authorize a four-hour launch.
+  it.each(["claude", "codex"] as const)(
+    "%s refuses an actually issued 60s managed gateway credential and returns structured preflight diagnostics",
+    async (adapter) => {
+      const gateway = {
+        id: randomUUID(),
+        companyId,
+        gatewayPublicId: `gw_${"a".repeat(32)}`,
+        status: "active",
+      };
+      let inserted: Record<string, unknown> | undefined;
+      const db = {
+        select: () => ({
+          from: () => ({ where: () => ({ limit: async () => [gateway] }) }),
+        }),
+        insert: (table: unknown) => ({
+          values: (row: Record<string, unknown>) => {
+            expect(table).toBe(toolMcpGatewayTokens);
+            inserted = row;
+            return {
+              returning: async () => [
+                { ...row, revokedAt: null, lastUsedAt: null },
+              ],
+            };
+          },
+        }),
+      };
+      const issued = await createToolGatewayService(
+        db as never,
+      ).createNamedGatewayToken({
+        companyId,
+        gatewayId: gateway.id,
+        body: {
+          name: "synthetic short run credential",
+          subjectType: "heartbeat_run",
+          subjectId: runId,
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      });
+      expect(issued.token.startsWith("pcgw_")).toBe(true);
+      expect(inserted?.tokenHash).toBe(
+        createHash("sha256").update(issued.token).digest("hex"),
+      );
+      const recordedExpiry = inserted?.expiresAt;
+      expect(recordedExpiry).toBeInstanceOf(Date);
+      expect(
+        (recordedExpiry as Date).getTime() - Date.now(),
+      ).toBeLessThanOrEqual(60_000);
+      managedToken = issued.token;
+      let launched = false;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          launched = true;
+        },
+        "success",
+        14_400,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect
+        .soft(launched, "short opaque managed token launched four-hour CLI")
+        .toBe(false);
+      expect.soft(hostCalls).toHaveLength(0);
+      expect
+        .soft(
+          "value" in outcome,
+          "credential failure was lost before final adapter result",
+        )
+        .toBe(true);
+      if ("value" in outcome) {
+        expect.soft(outcome.value.exitCode).not.toBe(0);
+        const result = outcome.value as unknown as Record<string, unknown>;
+        expect
+          .soft(result.errorCode, "stable final error code")
+          .toEqual(expect.stringMatching(/\S/));
+        const details = (result.errorDetails ??
+          result.details ??
+          result) as Record<string, unknown>;
+        expect
+          .soft(
+            details.configuredValue ??
+              details.configuredTimeoutSec ??
+              details.timeoutSec,
+            "final result retains configured execution value",
+          )
+          .toBe(14_400);
+        expect
+          .soft(
+            result.remediation ??
+              result.nextAction ??
+              result.next_action ??
+              details.remediation ??
+              details.next_action,
+            "final result retains actionable remediation",
+          )
+          .toEqual(expect.stringMatching(/\S/));
+      }
+    },
+    30_000,
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "%s refuses unknown managed credential validity rather than inferring a default TTL",
+    async (adapter) => {
+      managedToken = "pcgw_synthetic_opaque_unknown_validity";
+      let launched = false;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          launched = true;
+        },
+        "success",
+        14_400,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect.soft(launched).toBe(false);
+      expect
+        .soft(
+          "value" in outcome,
+          "unknown validity refusal must be a final result",
+        )
+        .toBe(true);
+      if ("value" in outcome) {
+        expect.soft(outcome.value.exitCode).not.toBe(0);
+        expect
+          .soft(outcome.value.errorCode)
+          .toEqual(expect.stringMatching(/\S/));
+        expect
+          .soft(outcome.value.errorMessage)
+          .toEqual(expect.stringMatching(/validity|credential|lifetime/i));
+      }
+    },
+    30_000,
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "%s terminal upstream 401 fails the final run without credential substitution",
+    async (adapter) => {
+      let callbackStatus: number | undefined;
+      const outcome = await invoke(
+        adapter,
+        true,
+        async () => {
+          upstreamAuthFailure = true;
+          const entry = observed.entries[2];
+          const response = await fetch(entry.url, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${entry.token}`,
+              "content-type": "application/json",
+            },
+            body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            signal: AbortSignal.timeout(3_000),
+          });
+          callbackStatus = response.status;
+          await response.arrayBuffer();
+        },
+        "success",
+        60,
+      ).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      expect(callbackStatus).toBe(401);
+      expect
+        .soft(
+          hostCalls,
+          "authentication failure must not retry another principal",
+        )
+        .toHaveLength(1);
+      expect
+        .soft(hostCalls.map((call) => call.authorization))
+        .toEqual([`Bearer ${PLUGIN_TOKEN}`]);
+      expect
+        .soft(
+          "value" in outcome,
+          "terminal auth error must reach final adapter result",
+        )
+        .toBe(true);
+      if ("value" in outcome) {
+        expect
+          .soft(
+            outcome.value.exitCode,
+            "CLI zero exit concealed failed required callbacks",
+          )
+          .not.toBe(0);
+        expect
+          .soft(outcome.value.errorCode)
+          .toEqual(expect.stringMatching(/\S/));
+        expect
+          .soft(outcome.value.errorMessage)
+          .toEqual(expect.stringMatching(/401|auth|credential/i));
+      }
     },
     30_000,
   );
