@@ -27,6 +27,12 @@
 -- Preserve all other fields, especially authority, invocation/events, filters,
 -- toolsEnabled, shadow/shadowRoutes and publication controls. See runbook §2.
 --
+-- Before ANY PUT, runbook §2's complete tool-sync preflight MUST pass under
+-- exclusive relevant writers and existing independent authority. Unchanged or
+-- false toolsEnabled is NOT proof: every save syncs catalog/profile/entries/
+-- installs/bindings and derives guest/sponsor metadata. Unknown/widening effects
+-- STOP with zero write requests. This inventory does not qualify that write set.
+-- Prior-config PUT reruns sync; it does NOT restore erased narrowed tool decisions.
 -- Apply ONLY through authorized GET/PUT
 -- /api/chat-endpoints/:endpointId/github/configuration, using
 -- {expectedRevision:<read revision>, configuration:<complete corrected snapshot>}.
@@ -102,6 +108,12 @@ SELECT c.endpoint_id, c.company_id, c.revision, o.key AS repository_id,
             WHEN o.key IS NULL THEN 'valid-empty-repositories'
             WHEN jsonb_typeof(o.value) IS DISTINCT FROM 'object'
               THEN 'STOP-malformed-override'
+            WHEN (o.value ? 'includeAuthors')
+                 AND jsonb_typeof(o.value->'includeAuthors') IS DISTINCT FROM 'array'
+              THEN 'STOP-malformed-filter'
+            WHEN (o.value ? 'excludeAuthors')
+                 AND jsonb_typeof(o.value->'excludeAuthors') IS DISTINCT FROM 'array'
+              THEN 'STOP-malformed-filter'
             WHEN o.value ? 'excludeAuthors' THEN 'append-denials-here-too'
             ELSE 'inherits-corrected-defaults' END AS exclusion_action
 FROM chat_github_configurations c
