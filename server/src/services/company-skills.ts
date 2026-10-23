@@ -737,8 +737,8 @@ function deriveTrustLevel(fileInventory: CompanySkillFileInventoryEntry[]): Comp
   return "markdown_only";
 }
 
-async function fetchText(url: string) {
-  const response = await ghFetch(url);
+async function fetchText(url: string, init?: RequestInit) {
+  const response = await ghFetch(url, init);
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
@@ -1720,9 +1720,25 @@ async function readUrlSkillImports(
   }
 
   if (url.startsWith("http://") || url.startsWith("https://")) {
-    const markdown = await fetchText(url);
+    const urlObj = parseRemoteSkillImportUrl(url);
+    urlObj.hostname = normalizeGitHubHostname(urlObj.hostname);
+    // Direct files do not pass through parseGitHubSourceUrl. Pin their origin
+    // before DNS/fetch; configured Enterprise hosts are an operator trust root,
+    // not an arbitrary-URL address filter or DNS-rebinding protection.
+    if (
+      urlObj.protocol !== "https:"
+      || urlObj.port
+      || urlObj.username || urlObj.password || urlObj.search || urlObj.hash
+      || (urlObj.hostname !== "raw.githubusercontent.com" && !isAllowedGitHubHost(urlObj.hostname))
+    ) {
+      throw unprocessable(
+        "Direct Markdown imports require HTTPS on port 443 from github.com, www.github.com, raw.githubusercontent.com, or an operator-configured GitHub Enterprise host; credentials, query parameters, and fragments are not allowed.",
+      );
+    }
+    // No redirect target inherits the source's approval (including same-origin
+    // hops). Use the final approved raw URL rather than following a /raw link.
+    const markdown = await fetchText(urlObj.toString(), { redirect: "error" });
     const parsedMarkdown = parseFrontmatterMarkdown(markdown);
-    const urlObj = new URL(url);
     const fileName = path.posix.basename(urlObj.pathname);
     const slug = deriveImportedSkillSlug(parsedMarkdown.frontmatter, fileName.replace(/\.md$/i, ""));
     const skillKey = readCanonicalSkillKey(
