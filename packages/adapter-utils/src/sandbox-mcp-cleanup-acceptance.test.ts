@@ -201,6 +201,23 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
     rmTrace = path.join(root, "rm-trace");
     await mkdir(localCwd);
     await mkdir(remoteCwd);
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    for (const command of ["claude", "codex", "fixture-cli"]) {
+      await writeFile(
+        path.join(bin, command),
+        "#!/bin/sh\nprintf 'synthetic CLI 1.0.0\\n'\n",
+        { mode: 0o700 },
+      );
+    }
+    for (const command of ["npm", "curl", "wget"]) {
+      await writeFile(
+        path.join(bin, command),
+        "#!/bin/sh\nprintf 'unexpected external installer\\n' >&2\nexit 97\n",
+        { mode: 0o700 },
+      );
+    }
+    vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
     await writeFile(path.join(localCwd, "fixture-acp.mjs"), AGENT);
     logs = [];
     handles = [];
@@ -410,6 +427,7 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
   it("rejects a first mcp-config rm failure even when the following archive rm succeeds", async () => {
     const dir = await seedAssets();
     const bridge = await startBridge();
+    (bridge as Bridge & { activate?: () => void }).activate?.();
     expect(await request(bridge)).toBe(200);
     scrubFault = "first-rm";
     const outcome = await observe(bridge.stop());
@@ -437,6 +455,7 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
   it("control: successful stop removes only MCP assets and revokes the copied bearer", async () => {
     const dir = await seedAssets();
     const bridge = await startBridge();
+    (bridge as Bridge & { activate?: () => void }).activate?.();
     expect(await request(bridge)).toBe(200);
     await bridge.stop();
     expect(await exists(path.join(dir, "mcp-config"))).toBe(false);
@@ -452,6 +471,7 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
   it("control: an unambiguous scrub rejection is fatal but forwarding is already revoked", async () => {
     await seedAssets();
     const bridge = await startBridge();
+    (bridge as Bridge & { activate?: () => void }).activate?.();
     expect(await request(bridge)).toBe(200);
     scrubFault = "throw";
     const outcome = await observe(bridge.stop());
@@ -829,7 +849,9 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
         onLog: async (stream, text) => {
           await onLog(stream, text);
           if (text.includes("HTTP/2 transport ready")) {
-            expect(await http2Request()).toBe(200);
+            // The handle has not returned: READY must still deny forwarding.
+            // Keep the intended startup error even if this assertion fails.
+            expect.soft([401, 403]).toContain(await http2Request());
             throw new Error(STARTUP);
           }
         },
@@ -851,6 +873,6 @@ describe("fail-closed sandbox MCP cleanup acceptance (immutable test-only handof
     expect
       .soft(after.value, "failed startup left an authorizing HTTP2 channel")
       .not.toBe(200);
-    expect.soft(forwards).toBe(1);
+    expect.soft(forwards).toBe(0);
   }, 15_000);
 });
