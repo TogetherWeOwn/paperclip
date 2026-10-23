@@ -1,10 +1,10 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { existsSync } from "node:fs";
-import { stat, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync } from "node:fs";
+import { stat, writeFile, rm, lstat } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   createEd25519NativeSshEnvelopeVerifier,
   NATIVE_SSH_ENVELOPE_AUDIENCE,
@@ -23,6 +23,9 @@ import {
   type NativeSshSignerPeerIdentity,
 } from "./native-ssh-signer-daemon.js";
 
+// Existing wire cases also obey the ownership contract: pre-existing private parent.
+const TEST_ROOT = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "d-"));
+afterAll(async () => { await rm(TEST_ROOT, { recursive: true, force: true }); });
 const NOW = new Date("2026-08-29T12:00:00.000Z");
 const REQUEST_ID = "73efe034-f471-4a3c-a5f0-50187895d33a";
 const OTHER_REQUEST_ID = "83efe034-f471-4a3c-a5f0-50187895d33b";
@@ -354,7 +357,7 @@ describe("signer issue core", () => {
 describe("daemon configuration", () => {
   function config(overrides: Record<string, unknown> = {}) {
     return {
-      socketPath: join(tmpdir(), `native-ssh-signer-config-${process.pid}.sock`),
+      socketPath: join(TEST_ROOT, `native-ssh-signer-config-${process.pid}.sock`),
       expectedPeer: { ...EXPECTED_PEER },
       policy: { audience: NATIVE_SSH_ENVELOPE_AUDIENCE, maxLifetimeSeconds: 60 },
       privateKey: keys.privateKey,
@@ -407,7 +410,7 @@ describe("daemon wire protocol", () => {
   });
 
   function socketPath(): string {
-    return join(tmpdir(), `native-ssh-signer-${process.pid}-${socketCounter++}.sock`);
+    return join(TEST_ROOT, `s-${socketCounter++}`);
   }
 
   async function startDaemon(overrides: Record<string, unknown> = {}) {
@@ -423,8 +426,8 @@ describe("daemon wire protocol", () => {
       now: () => new Date(NOW),
       ...(overrides as Record<string, never>),
     });
-    await daemon.listen();
     daemons.push(daemon);
+    await daemon.listen();
     return { daemon, records };
   }
 
@@ -567,21 +570,27 @@ describe("daemon wire protocol", () => {
     ]);
   });
 
-  it("binds the socket with mode 0660, replaces a stale path, and unlinks on close", async () => {
-    const path = socketPath();
-    await writeFile(path, "stale");
-    const { daemon } = await startDaemon({ socketPath: path });
-    expect(existsSync(path)).toBe(true);
-    expect((await stat(path)).mode & 0o777).toBe(0o660);
+  it("binds an unoccupied socket with mode 0660 and unlinks its own socket on close", async () => {
+    const { daemon } = await startDaemon();
+    expect(existsSync(daemon.socketPath)).toBe(true);
+    expect((await stat(daemon.socketPath)).mode & 0o777).toBe(0o660);
     await daemon.close();
-    expect(existsSync(path)).toBe(false);
+    expect(existsSync(daemon.socketPath)).toBe(false);
   });
 
-  it("creates missing parent directories for the socket", async () => {
-    const nested = join(tmpdir(), `native-ssh-signer-nested-${process.pid}`, "a", "b", "signer.sock");
-    const { daemon } = await startDaemon({ socketPath: nested });
-    expect(existsSync(nested)).toBe(true);
-    await daemon.close();
+  it("refuses a stale regular file instead of treating it as an owned socket", async () => {
+    const path = socketPath();
+    await writeFile(path, "synthetic-stale-sentinel");
+    const before = await lstat(path);
+    await expect(startDaemon({ socketPath: path })).rejects.toThrow();
+    expect((await lstat(path)).ino).toBe(before.ino);
+    expect((await lstat(path)).isFile()).toBe(true);
+  });
+
+  it("refuses missing parent directories instead of creating them", async () => {
+    const missing = join(TEST_ROOT, "missing");
+    await expect(startDaemon({ socketPath: join(missing, "a", "b", "s") })).rejects.toThrow();
+    expect(existsSync(missing)).toBe(false);
   });
 });
 
@@ -591,7 +600,7 @@ describe("signer daemon self-disable pins", () => {
     vi.stubEnv("PAPERCLIP_NATIVE_SSH_SIGNER_SOCKET", "/nonexistent/rogue.sock");
     const records = new Map<string, NativeSshLaunchAuthority>([[REQUEST_ID, validAuthority()]]);
     const daemon = createNativeSshSignerDaemon({
-      socketPath: join(tmpdir(), `native-ssh-signer-env-${process.pid}.sock`),
+      socketPath: join(TEST_ROOT, `native-ssh-signer-env-${process.pid}.sock`),
       expectedPeer: { ...EXPECTED_PEER },
       policy: { audience: NATIVE_SSH_ENVELOPE_AUDIENCE, maxLifetimeSeconds: 60 },
       privateKey: keys.privateKey,
