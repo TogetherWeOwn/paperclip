@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const ORIGINAL_ENV = { ...process.env };
 const CI_ENV_VARS = ["CI", "CONTINUOUS_INTEGRATION", "BUILD_NUMBER", "GITHUB_ACTIONS", "GITLAB_CI"];
+// Telemetry kill-switches must not leak in from the ambient environment:
+// CI qualification deliberately sets PAPERCLIP_TELEMETRY_DISABLED=1, which
+// would force initTelemetry to return null and fail the assertions below.
+const TELEMETRY_ENV_VARS = ["PAPERCLIP_TELEMETRY_DISABLED", "DO_NOT_TRACK"];
 
 function makeConfigPath(root: string, enabled: boolean): string {
   const configPath = path.join(root, ".paperclip", "config.json");
@@ -71,7 +75,7 @@ function makeConfigPath(root: string, enabled: boolean): string {
 describe("cli telemetry", () => {
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
-    for (const key of CI_ENV_VARS) {
+    for (const key of [...CI_ENV_VARS, ...TELEMETRY_ENV_VARS]) {
       delete process.env[key];
     }
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true })));
