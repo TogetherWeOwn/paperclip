@@ -45,7 +45,8 @@ custody, before any later execution. This checklist conveys no new access:
   distinguish old-schema inventory from post-schema `unpricedUsagePolicy` reads.
 - Snapshot each review endpoint's revision, people/flags, defaults, **every** repo
   override and enabled repository set. Validate ID-to-current-login correspondence;
-  do not widen filters to compensate for unresolved/renamed identities.
+  do not widen filters to compensate for unresolved/renamed identities. Include the
+  complete tool-sync affected-state/authority manifest in §2, not just config JSON.
 - Count **all active human raw-role categories and normalized roles**, grant/scope
   categories and predicted missing defaults (§3). Never dump raw restricted scopes.
 - Collect sanitized stored-tool metadata (§4) and persistent-identity recipient,
@@ -199,19 +200,110 @@ For each valid endpoint snapshot:
    defaults-only repos, custom include/exclude overrides and explicit-empty arrays.
    Preserve pre-existing exclusions and test opted-in authors outside a nonempty
    include list remain denied. Readback must compare the entire preserved snapshot.
-5. Apply only via authorized `GET`/`PUT
+5. **Before any PUT, satisfy the complete tool-sync preflight below.** A passing
+   author matrix, unchanged `toolsEnabled`, or configuration revision CAS is not
+   sufficient. Unknown or widening side effects mean **STOP with zero write
+   requests**; do not apply the author correction first and repair tools later.
+6. Only for an endpoint proven non-widening under existing independent authority,
+   apply via authorized `GET`/`PUT
    /api/chat-endpoints/:endpointId/github/configuration`, body
    `{ "expectedRevision": <read revision>, "configuration": <complete snapshot> }`.
    The revision is checked under lock; conflict/validation failure means STOP,
-   refresh/re-review, not SQL bypass. Read back the expected next revision and
-   effective overrides (`routes/chat-channels.ts:228-235`;
-   `chat-github-management.ts:152-168`; validator `chat-github.ts:142-147`).
-   Rollback uses the complete prior snapshot with the **current** expected revision;
-   history is not reset. Recheck denials before any old/new admission resumes.
+   refresh/re-review, not SQL bypass. Reconcile the expected next revision, complete
+   config, effective overrides **and every affected state/audit item below** before
+   admission (`server/src/routes/chat-channels.ts:228-235`;
+   `server/src/services/chat-github-management.ts:152-168,251-269`;
+   `packages/shared/src/validators/chat-github.ts:142-147`). Ambiguous outcomes are
+   reconciled without blind retries, while all writers/admission remain quiesced.
 
-The `02` template inventories structure, flags and effective override filters; the
-unsafe defaults-only SQL write template is **removed**. API validation is not a
-substitute for the non-widening assertions.
+### Mandatory pre-write tool-sync guard — configuration-only CAS is insufficient
+
+Every save calls `syncGitHubBotTools`, **even if `toolsEnabled` is unchanged**
+(I `server/src/services/chat-github-management.ts:251-261`). Its source-defined
+write set is wider than the configuration row:
+
+| Affected state | Proposed effect at I, not permission to perform it |
+| --- | --- |
+| Endpoint guest/sponsor metadata | Recomputes `allowUnlinkedPeople` from guest presence and sets `sponsorUserId` from `responsibleUserId` (`chat-github-management.ts:251-260`) |
+| Every built-in catalog entry on this connection | Upserts by connection/name; replaces tool/schema/risk/hash metadata, sets `active` or `removed`, and stamps the saving actor/time as reviewer (`server/src/services/chat-github-tools.ts:150-181`) |
+| Agent connection install | When enabled, ensures the endpoint's assigned-agent install (`chat-github-tools.ts:182-192`) |
+| Bot profile `github-bot:<endpointId>` | Ensures the profile and sets `active` or `disabled`; existing non-status fields are retained on conflict (`chat-github-tools.ts:193-209`) |
+| All entries for that profile | Deletes **all** prior entries and inserts a single `selectorType: connection`, `effect: include` entry for this connection, **including when disabled** (`chat-github-tools.ts:210-224`) |
+| Agent profile binding | Ensures the endpoint's assigned-agent binding, regardless of enabled flag (`chat-github-tools.ts:225-235`) |
+
+The exact built-in definitions are I `server/src/services/chat-github-tools.ts:33-131`.
+A new or removed catalog tool is not authorized by copying a boolean. A disabled
+profile, narrowed entries, deny/quarantine decision or reviewed catalog revision
+must not be silently replaced by defaults. `toolsEnabled: false` is **not** a safe
+bypass: it still replaces entries and ensures a profile/binding. Disabled discovery
+now does not prove preserved authority on a later activation.
+
+The existing authorized metadata executor must, in trusted custody:
+
+1. Capture the exact endpoint/company/connection/assigned-agent identities and
+   revisions, source/config SHA, catalog definitions and **all** connection catalog
+   rows (including removed/quarantined/custom rows), tool profile and full entries,
+   agent installs/bindings, endpoint guest/sponsor fields, related restrictions and
+   their existing authorization/audit provenance. Use opaque aliases, counts,
+   status/selector categories and fingerprints in shared reports; retain complete
+   comparison/restore evidence only in permitted custody, never credentials, raw
+   restricted scopes or provider payloads. Missing read access/evidence is STOP,
+   not permission to enumerate a new surface or infer an empty state.
+2. Establish exclusive configuration ownership and quiesce **all** other relevant
+   config, endpoint, catalog, profile-entry, install and binding writers plus work
+   admission. Config `expectedRevision` does not guard these other tables or the
+   endpoint identities read before the transaction. If exclusivity, identity or
+   unchanged snapshot cannot be guaranteed, STOP before any write. Re-read and
+   compare the complete expected state immediately before the request.
+3. Derive the **complete proposed sync delta from the exact pinned source**, not
+   just `toolsEnabled`, and compare it with independently authorized prior state.
+   STOP with **zero write requests** if it would activate an unapproved/new/removed
+   tool, re-review changed/unapproved catalog metadata, reactivate a disabled
+   profile, replace a narrowed/deny profile with broader connection-wide includes,
+   erase quarantine, create an unapproved install/binding/profile, change guest or
+   sponsor authority, or overwrite unknown/stale state. Existing statuses alone
+   are not evidence of authority. No endpoint-specific approval is supplied here.
+4. The conservative eligible case has all exact-source catalog definitions/metadata
+   already independently authorized and in the expected status, the existing
+   profile in the expected status with equivalent connection-wide include and no
+   narrowing/deny entries lost, existing authorized install (when enabled) and
+   binding, and unchanged endpoint guest/sponsor authority. Preserve all other
+   restrictions. Explicitly reconcile the unavoidable entry-ID replacement and
+   saving-actor review/time attribution against the prior audit history; do not
+   label these writes a no-op or historical approval by the prior reviewer.
+   Unknown semantics or a failed comparison retains STOP, including for disabled
+   profiles with narrowed entries. No toggling `toolsEnabled` to pass this guard.
+5. For a stopped endpoint, retain maintenance/admission STOP until a **separately
+   reviewed source fix/non-widening path**, or genuinely separately authorized exact
+   operational decision, resolves the specific effect. Do not clear restrictions,
+   enable a tool/profile, restore defaults, use SQL bypasses or production probes.
+   A config correction, green fixture suite or this checklist grants no broadening
+   authority. Pin any replacement source and repeat affected security/CI/staging.
+6. For an eligible later staging apply, compare complete before/proposed/after
+   state: catalog identity/count/status/schema/risk/hash, profiles/entries and
+   effective restrictions, install/binding targets/counts, endpoint guest/sponsor,
+   config revision/overrides and actor/time/audit receipts. Require `unapproved
+   activations=0`, `authority widening=0`, expected entry-ID replacements and
+   `unexpected changes=0`; reconcile `chat_github.configuration_updated` with the
+   external state manifest because its payload records endpoint/revision, not the
+   whole tool delta (`chat-github-management.ts:262-269`). Prove allow/deny behavior
+   with fake providers in isolated staging, not live production requests.
+
+**Rollback limit:** PUTting the complete prior configuration with the **current**
+expected revision reruns this same synchronization. It **does not restore erased
+narrowed profile entries, prior catalog disablement/quarantine, install/binding
+state or review attribution**. It is not a tool-state rollback. A prior-config PUT
+is eligible only after this same full preflight for the reverse direction and
+staging proof of its complete expected effects. Otherwise retain STOP and use the
+existing separately reviewed complete-state recovery contract; no ad hoc SQL or
+invented restore API is supplied. Rehearse full-stop matched isolated DB/artifact
+restore (§6B/§7), including all affected tool-state comparisons and retained audit
+evidence, **before production**. Recheck denials before any old/new admission.
+
+The `02` template inventories structure, flags and effective override filters; it
+**does not inventory or qualify this tool-sync write set**. The unsafe defaults-only
+SQL write template remains **removed**. API validation, configuration readback and
+post-write widening detection cannot substitute for this pre-write STOP guard.
 
 Keep `memberAccess`, sponsor/responsible-user checks, invocation, event selection
 (including issue settings), draft/bot/branch/label/path restrictions, trusted bot
@@ -398,6 +490,9 @@ a future separately authorized host execution contract, not work performed here.
    and projected versus observed bootstrap grants. No ordinary jobs yet.
 3. Apply reviewed budget and review-config mappings via their audited APIs with
    the guards/readbacks above, keeping all unrelated writers/admission quiesced.
+   Review-config PUT requires §2's **pre-write** complete tool-sync comparison and
+   zero-request STOP on widening/unknown effects, even with unchanged toolsEnabled.
+   Record all affected tool/endpoint state and audit deltas, not just config JSON.
 4. Actually run plugin smoke, adapter-family checks on authorized synthetic
    fixtures, review-bot **shadow soak without GitHub publication**, author matrices,
    budget exact-window/expected-state matrices, principal effective-grant/restart
@@ -405,8 +500,11 @@ a future separately authorized host execution contract, not work performed here.
    environment, times, source/config SHAs, artifact digest, counts and failures.
 5. **Rehearse rollback now**: full drain/stop, restore pre-upgrade isolated DB with
    matching separately held wrapping key and old artifact, prove health and prior
-   budget/review/grant behavior. Compare public identity IDs for continuity only;
-   never expose material or clone identities to active development agents.
+   budget/review/grant behavior **and the complete §2 affected tool/endpoint state**
+   (catalog status/metadata, profiles/entries, installs/bindings, guest/sponsor and
+   audit reconciliation). Prior-config PUT is not a restore of erased tool decisions.
+   Compare public identity IDs for continuity only; never expose material or clone
+   identities to active development agents.
 6. Preserve restore logs/health outcomes and return to the reviewed staging state
    only under the same contract; capture final soak evidence. Failure or drift
    retains the STOP. No waiver by marking a card complete.
@@ -433,16 +531,23 @@ compatible wrapping-key custody under the existing executor contract; validate
 health and prior configuration. Rehearse this in **staging before production**.
 Do not delete data/history, improvise down-migrations or force a downgrade.
 
-For a single configuration rollback, use the guarded same-policy budget API or
-revision-checked complete prior review snapshot (§1/§2), not raw SQL. An unexpected
-state requires reconciliation. Neither restore nor JWT expiry revokes persistent
-keys already distributed to runtimes. Do not assert rollback recalls identity.
+For a single budget rollback, use the guarded same-policy API (§1), not raw SQL.
+For review configuration, a revision-checked complete prior snapshot PUT (§2)
+**reruns tool sync and cannot restore erased narrowed tool decisions**. Require the
+same full affected-state preflight in reverse and demonstrated non-widening effects;
+otherwise STOP for the separately reviewed complete-state recovery contract. Full
+matched DB/artifact restore must compare catalog/profile/entries/install/binding,
+endpoint metadata and audit evidence, not just configuration JSON. No tool-state
+restore API or SQL bypass is invented here. Unexpected state requires reconciliation.
+Neither restore nor JWT expiry revokes persistent keys already distributed to
+runtimes. Do not assert rollback recalls identity.
 
 ## 8. Security-verdict correction map and evidence boundaries
 
 | Full-verdict item | Correction in this pack | Still required, not claimed |
 | --- | --- | --- |
 | 1: include-list widening, repo overrides, malformed flags, sender flags | §2 and `02`: identical includes; preserved excludes plus old denials at defaults/owned overrides including `[]`; invalid-input STOP; people retained | Unchanged independent acceptance artifact results and later actual config readback/shadow proof |
+| Re-review F1: unconditional config-save tool sync can widen authority | §2: complete catalog/profile/entries/install/binding/endpoint metadata write set, independent prior authority, exclusive writers, pre-write zero-request STOP even with unchanged/false toolsEnabled; §6B/§7 complete-state rollback limits | Independent F1 acceptance and favorable exact-revision security re-review; actual authorized snapshots/deltas/audit, non-widening staging and complete-state restore proof. No endpoint cleared by this pack |
 | 2: metric/window ambiguity, usage audit, unaudited broad fallback | §1 and `01`: existing ID/full key/expected state, actual-window join, subscription unpriced exclusion, explicit API/exclusivity/counts/rollback; SQL writes removed | Reviewed real policy manifest, actual prior/after rows and audit; exact-source enforcement tests/staging |
 | 3: incomplete raw roles, fixed insert count, role-only narrowing | §3 and `03`: all active categories + normalized roles; per-key projection and scoped conflict preservation; atomic API/auth/last-owner/restart guidance | Actual sanitized principal diff, authorized expansion/narrowing decision, effective/restart proof |
 | 4: stored-tool metadata/provenance gaps | §4 and `03`: no raw-scope dump, all-root audit plan, finite fake-provider matrix; upstream SHA separate from unresolved local reference | Sanitized exporter results, counts and authority-reference resolution; no clearance claimed |
