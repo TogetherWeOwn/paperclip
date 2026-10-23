@@ -206,6 +206,7 @@ export function isConnectionGrantAudienceAllowed(
 // `tool_timeout` even though the approval succeeded. Give approved executions
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
+const GITHUB_BOT_TOOL_TIMEOUT_MS = 60_000;
 const ACTION_REQUEST_EXECUTION_POLL_MS = 25;
 // Approval execution performs live target, signature, managed-argument, and
 // issue-state checks before provider dispatch. Give that preparation a
@@ -713,8 +714,10 @@ function gatewaySessionFromRow(
   };
 }
 
-function timeoutMs(value: number | undefined) {
-  if (!Number.isFinite(value)) return DEFAULT_TOOL_TIMEOUT_MS;
+function timeoutMs(value: number | undefined, tool?: ToolGatewayDescriptor) {
+  if (!Number.isFinite(value)) return tool?.providerType === "paperclip_github_chat"
+    ? GITHUB_BOT_TOOL_TIMEOUT_MS
+    : DEFAULT_TOOL_TIMEOUT_MS;
   return Math.max(
     1,
     Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)),
@@ -7234,7 +7237,7 @@ export function createToolGatewayService(
 
     const startedAt = Date.now();
     try {
-      const executionTimeoutMs = timeoutMs(args.timeoutMs);
+      const executionTimeoutMs = timeoutMs(args.timeoutMs, args.tool);
       const connectedMcpExecution =
         (args.tool.providerType === "mcp_remote_http" || args.tool.providerType === "provider_rest")
           ? await executeRemoteHttpTool(
@@ -10582,7 +10585,7 @@ export function createToolGatewayService(
       });
 
       try {
-        const executionTimeoutMs = timeoutMs(input.timeoutMs);
+        const executionTimeoutMs = timeoutMs(input.timeoutMs, tool);
         if (
           tool.providerType === "paperclip_plugin" &&
           (!session.agentId || !session.runId)
