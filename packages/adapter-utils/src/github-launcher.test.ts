@@ -51,7 +51,7 @@ describe("managed GitHub launchers", () => {
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
-    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
+    const result = await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Probe"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
@@ -182,4 +182,73 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+
+  async function brokerFixture(prefix: string) {
+    const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), repo = path.join(root, "repo"), upstream = path.join(root, "upstream");
+    for (const dir of [bin, repo, upstream]) await mkdir(dir, { recursive: true });
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(String(req.headers["x-paperclip-github-capability"]));
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "managed-token", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      PATH: `${bin}:${process.env.PATH}`,
+    };
+    await exec("git", ["init", upstream]);
+    await exec("git", ["-C", upstream, "-c", "user.name=U", "-c", "user.email=u@example.test", "commit", "--allow-empty", "-m", "upstream"]);
+    await exec("git", ["init", repo]);
+    await exec("git", ["-C", repo, "remote", "add", "origin", upstream]);
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: repo, env });
+    return { root, bin, repo, requests, env, git };
+  }
+
+  it("captures credentials only for network, identity, and unknown Git commands", async () => {
+    const f = await brokerFixture("paperclip-github-local-commands-");
+    for (const args of [
+      ["status", "--porcelain"], ["-c", "core.quotePath=false", "status"], ["-C", f.repo, "diff"], ["log", "--oneline", "-1", "--all"],
+      ["rev-parse", "--git-dir"], ["branch", "--list"], ["worktree", "list"], ["config", "user.name", "Local"], ["remote"], ["remote", "-v"],
+      ["remote", "get-url", "origin"], ["--no-pager", "show-ref"], ["--version"],
+    ]) await f.git(...args).catch(() => undefined);
+    expect(f.requests).toEqual([]);
+    await f.git("fetch", "origin");
+    expect(f.requests).toHaveLength(1);
+    await f.git("-C", f.repo, "-c", "protocol.version=2", "ls-remote", "origin");
+    await f.git("remote", "update");
+    await f.git("commit", "--allow-empty", "-m", "managed identity");
+    expect(f.requests).toHaveLength(4);
+    expect((await f.git("log", "-1", "--format=%an")).stdout.trim()).toBe("Managed");
+    await f.git("var", "GIT_AUTHOR_IDENT");
+    expect(f.requests).toHaveLength(5);
+  }, 30_000);
+
+  it("captures credentials for local commands in a partial clone, which can fetch objects on demand", async () => {
+    const f = await brokerFixture("paperclip-github-partial-clone-");
+    await exec("git", ["-C", f.repo, "config", "core.repositoryformatversion", "1"]);
+    await exec("git", ["-C", f.repo, "config", "extensions.partialClone", "origin"]);
+    await f.git("status", "--porcelain");
+    expect(f.requests).toEqual(["run-capability"]);
+  }, 30_000);
+
+  it("ends a local command when two launcher directories are on PATH", async () => {
+    const f = await brokerFixture("paperclip-github-stacked-");
+    const second = path.join(f.root, "second");
+    await mkdir(second);
+    await writeFile(path.join(second, "git"), githubLauncherSource(), { mode: 0o700 });
+    const env = { ...f.env, PATH: `${f.bin}:${second}:${process.env.PATH}` };
+    const result = await exec(path.join(f.bin, "git"), ["status", "--porcelain"], { cwd: f.repo, env, timeout: 15_000 });
+    expect(result.stdout).toBe("");
+    expect(f.requests).toEqual([]);
+  }, 30_000);
 });
