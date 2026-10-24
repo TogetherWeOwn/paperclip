@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, is, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -47,6 +48,7 @@ import {
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { withDeadlockRetry } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -309,6 +311,18 @@ export function claudeOAuthClaimRejectedError(): HttpError {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
+
+/** Drizzle transaction handle that supports a nested transaction (SAVEPOINT). */
+type SavepointDb = DbTransaction & Pick<Db, "transaction">;
+
+function asSavepointDb(candidate: Db | DbTransaction): SavepointDb | null {
+  // Only a caller-held transaction needs the SAVEPOINT. drizzle's public `is`
+  // matches every driver's transaction subclass by entity kind; the root
+  // database is never a PgTransaction. On the root path the audit stays a
+  // bare insert: no extra BEGIN/COMMIT and no extra db.transaction call for
+  // transaction-counting callers and tests to observe.
+  return is(candidate, PgTransaction) ? (candidate as SavepointDb) : null;
+}
 
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
   const seen = new Set<unknown>();
@@ -1184,28 +1198,50 @@ export function secretService(db: Db | DbTransaction) {
     errorCode?: string | null;
   }) {
     if (!input.context) return;
-    await db.insert(secretAccessEvents).values({
+    const context = input.context;
+    // The heartbeat_run_id and issue_id FK checks take FOR KEY SHARE on rows
+    // the runtime identity path locks FOR UPDATE (issues, then
+    // heartbeat_runs). Postgres runs FK checks in trigger-name order, i.e.
+    // constraint creation order: with the constraints in name order, as in
+    // production, the run row is checked first, the reverse order, and either
+    // side can lose a deadlock. Retry a lost race so the audit record survives
+    // instead of being dropped by the callers' best-effort catch.
+    const values = {
       companyId: input.companyId,
       secretId: input.secretId,
       userSecretDefinitionId: input.userSecretDefinitionId ?? null,
       secretScope: input.secretScope ?? "company",
       version: input.version,
       provider: input.provider,
-      responsibleUserId: input.context.responsibleUserId ?? null,
+      responsibleUserId: context.responsibleUserId ?? null,
       credentialOwnerUserId: input.credentialOwnerUserId ?? null,
       credentialSubjectType: input.credentialSubjectType ?? null,
       credentialSubjectId: input.credentialSubjectId ?? null,
-      actorType: input.context.actorType ?? "system",
-      actorId: input.context.actorId ?? null,
-      consumerType: input.context.consumerType,
-      consumerId: input.context.consumerId,
-      configPath: input.context.configPath ?? null,
-      issueId: input.context.issueId ?? null,
-      heartbeatRunId: input.context.heartbeatRunId ?? null,
-      pluginId: input.context.pluginId ?? null,
+      actorType: context.actorType ?? "system",
+      actorId: context.actorId ?? null,
+      consumerType: context.consumerType,
+      consumerId: context.consumerId,
+      configPath: context.configPath ?? null,
+      issueId: context.issueId ?? null,
+      heartbeatRunId: context.heartbeatRunId ?? null,
+      pluginId: context.pluginId ?? null,
       outcome: input.outcome,
       errorCode: input.errorCode ?? null,
-    });
+    };
+    const savepointDb = asSavepointDb(db);
+    if (savepointDb) {
+      // secretService is bound to a caller-held transaction (e.g. the broker
+      // token-mint path). The insert runs in its own nested transaction so a
+      // deadlock abort rolls back only to the SAVEPOINT instead of aborting
+      // the whole outer transaction with 25P02.
+      await withDeadlockRetry(() =>
+        savepointDb.transaction(async (t) => {
+          await t.insert(secretAccessEvents).values(values);
+        }),
+      );
+      return;
+    }
+    await withDeadlockRetry(() => db.insert(secretAccessEvents).values(values));
   }
 
   async function assertSecretInCompany(
