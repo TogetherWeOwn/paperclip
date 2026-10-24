@@ -14856,16 +14856,30 @@ export function issueRoutes(
         }
 
         // Entering `blocked` mints a new `blockedTransitionAt` cycle on every
-        // restore, so a bare status-only restore must not attempt a readiness
-        // wake: the new cycle key would defeat the level-triggered dedup and
-        // re-admit the assignee forever with no new context. Only restores that
-        // carry a genuine signal — changed blocker edges, a handoff to a new
+        // restore, so a restore with no new readiness context must not attempt
+        // a readiness wake: the new cycle key would defeat the level-triggered
+        // dedup and re-admit the assignee forever. Only restores that carry a
+        // genuine signal — changed blocker edges, a handoff to a new
         // assignee, or a terminal reopen — attempt the wake; the dedup still
-        // suppresses same-state duplicates within the attempt.
+        // suppresses same-state duplicates within the attempt. Edge presence
+        // alone is not a signal: loop restores echo unchanged edges, so the
+        // request is compared against the pre-update relations.
+        const requestedBlockedByIds = Array.isArray(req.body.blockedByIssueIds)
+          ? [...new Set(req.body.blockedByIssueIds as string[])].sort()
+          : null;
+        const previousBlockedByIds = [...new Set(
+          (existingRelations?.blockedBy ?? []).map((relation) => relation.id),
+        )].sort();
+        const blockerEdgesChanged =
+          requestedBlockedByIds !== null &&
+          (requestedBlockedByIds.length !== previousBlockedByIds.length ||
+            requestedBlockedByIds.some(
+              (id, index) => id !== previousBlockedByIds[index],
+            ));
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
-          (Array.isArray(req.body.blockedByIssueIds) ||
+          (blockerEdgesChanged ||
             existing.assigneeAgentId !== issue.assigneeAgentId ||
             existing.status === "done" ||
             existing.status === "cancelled");
