@@ -1401,6 +1401,7 @@ export const PLUGIN_CAPABILITIES = [
   "plugin.state.read",
   "plugin.state.write",
   // Runtime / Integration
+  "run.model.resolve",
   "events.subscribe",
   "events.emit",
   "jobs.schedule",

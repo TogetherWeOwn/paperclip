@@ -660,6 +660,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
           wakeReason: "issue_assigned",
           ...(source === undefined ? {} : { source }),
           paperclipWake: { privateTestMarker: "not-for-the-status-effect" },
+          modelDecision: { outcome: "decided", decisionId: "d1", model: "fixture-model" },
         },
       });
       const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
@@ -683,6 +684,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         previousStatus: "queued",
         errorCode: "issue_terminal_status",
         contextSource: expected,
+        modelDecision: { outcome: "decided", decisionId: "d1", model: "fixture-model" },
       });
       expect(effect).not.toHaveProperty("contextSnapshot");
       expect(JSON.stringify(effect)).not.toContain("not-for-the-status-effect");

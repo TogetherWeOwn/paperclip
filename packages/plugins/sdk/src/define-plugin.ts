@@ -53,6 +53,8 @@ import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paper
 
 import type { PluginContext } from "./types.js";
 import type {
+  ResolveRunModelParams,
+  ResolveRunModelResult,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
@@ -362,6 +364,9 @@ export interface PluginDefinition {
 
   /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
   onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
+
+  /** Propose a run-local model/effort and declared env values. Requires run.model.resolve. */
+  onResolveRunModel?(params: ResolveRunModelParams): Promise<ResolveRunModelResult>;
 
   /**
    * Called when Paperclip needs the current normalized status for one external

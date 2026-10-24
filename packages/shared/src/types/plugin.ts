@@ -691,6 +691,8 @@ export interface PaperclipPluginManifestV1 {
   agentLifecycle?: true;
   /** Opt into the native pooled-connection catalog, setup, and management UI. */
   aiConnectionRouter?: { name: string; description: string };
+  /** Plain-string run env overrides allowed for run.model.resolve; never secret refs. */
+  modelRouting?: { envKeys: string[] };
   /** Entrypoint paths relative to the package root. */
   entrypoints: {
     /** Path to the worker entrypoint (required). */

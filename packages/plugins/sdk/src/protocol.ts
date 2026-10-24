@@ -1,5 +1,27 @@
 import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
+
+/** Run-local model selection; no credentials or agent mutation authority. */
+export interface ResolveRunModelParams {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  issueId: string | null;
+  adapterType: string;
+  invocationSource: string;
+  wakeReason: string | null;
+  agentDefaultModel: string | null;
+  previous: { runId: string; model: string | null; decisionId: string | null } | null;
+  issueOverrideModel: string | null;
+  /** Host RPC deadline, in milliseconds. */
+  deadlineMs: number;
+}
+export type ResolveRunModelResult =
+  | { kind: "keep" }
+  | { kind: "defer"; retryAfterMs: number; reason: string }
+  | { kind: "decide"; decisionId: string; model: string; effort?: string;
+      env?: Record<string, string>; tier?: string; source: string; fallback?: boolean; reason?: string };
+
 /**
  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
  * channel.
@@ -1361,6 +1383,7 @@ export interface HostToWorkerMethods {
     result: DetectExternalObjectsResult,
   ];
   routeAiConnection: [params: AiConnectionRouterRequest, result: AiConnectionRouterResult];
+  resolveRunModel: [params: ResolveRunModelParams, result: ResolveRunModelResult];
   resolveExternalObject: [
     params: ResolveExternalObjectParams,
     result: PluginExternalObjectResolveResult,
@@ -1493,6 +1516,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "executeTool",
   "detectExternalObjects",
   "routeAiConnection",
+  "resolveRunModel",
   "resolveExternalObject",
   "refreshExternalObjects",
   "environmentValidateConfig",

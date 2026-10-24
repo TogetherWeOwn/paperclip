@@ -25,6 +25,8 @@ export type RunStatusEvent = {
   errorCode: string | null;
   /** Source-only projection from the committed run; never its full wake context. */
   contextSource: string | null;
+  /** Run-local model selection for plugin accounting; never the full config/env. */
+  modelDecision?: unknown;
   startedAt: Date | null;
   finishedAt: Date | null;
   result: Record<string, unknown>;

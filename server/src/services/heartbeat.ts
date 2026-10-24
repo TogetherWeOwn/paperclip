@@ -282,6 +282,7 @@ import {
 } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
+import { applyRunModelDecision, runModelResolverService, RunModelDecisionDeferral, RUN_MODEL_RESOLVE_RETRY_REASON, RUN_MODEL_RESOLVE_MAX_ATTEMPTS, type RunModelResolution } from "./run-model-resolver.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import {
   getExecutionBlocker,
@@ -2645,6 +2646,45 @@ export function heartbeatService(
           throw new ConfigurationIncompleteFailure(error instanceof Error ? error.message : "Configure this connection pool", { configurationIncomplete: { reason: "ai_connection_unavailable", companyId: agent.companyId, agentId: agent.id, responsibleUserId, actionUrl: `/agents/${agent.id}/runtime`, fingerprint: `ai-router:${requestedAiBinding.connectionId}` } });
         }
       }
+      let modelDecision: RunModelResolution;
+      try {
+        modelDecision = await runModelResolverService(db, options.pluginWorkerManager)({
+          params: {
+            runId: run.id, companyId: agent.companyId, agentId: agent.id, issueId,
+            adapterType: agent.adapterType, invocationSource: run.invocationSource,
+            wakeReason: readNonEmptyString(context.wakeReason),
+            agentDefaultModel: readNonEmptyString(config.model),
+            issueOverrideModel: readNonEmptyString(issueAssigneeOverrides?.adapterConfig?.model),
+          },
+          baseEnv: { ...parseObject(config.env), ...parseObject(issueAssigneeOverrides?.adapterConfig?.env) },
+          // Explicit native connection bindings and human assignments retain ownership of routing.
+          skipReason: requestedAiBinding ? "explicit_ai_binding"
+            : issueContext?.assigneeUserId ? "human_assignee" : undefined,
+        });
+        if (modelDecision.record.reason !== "no_model_resolver") {
+          context.modelDecision = modelDecision.record;
+          await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ modelDecision: modelDecision.record })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+        }
+      } catch (error) {
+        if (!(error instanceof RunModelDecisionDeferral)) throw error;
+        const now = new Date();
+        context.modelDecision = error.record;
+        const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
+          error: error.message, errorCode: RUN_MODEL_RESOLVE_RETRY_REASON, finishedAt: now,
+          resultJson: { executionRecovery: { kind: RUN_MODEL_RESOLVE_RETRY_REASON, providerWorkStarted: false } },
+          contextSnapshot: context,
+        });
+        if (cancelled.updated) {
+          await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: error.message });
+          const retry = await scheduleBoundedRetryForRun(cancelled.run ?? run, agent, {
+            now, retryReason: RUN_MODEL_RESOLVE_RETRY_REASON, wakeReason: "model_decision_retry",
+            maxAttempts: RUN_MODEL_RESOLVE_MAX_ATTEMPTS, delayMs: error.retryAfterMs,
+          });
+          if (retry.outcome !== "scheduled") await releaseIssueExecutionAndPromote(cancelled.run ?? run);
+          await finalizeAgentStatus(run.agentId, "cancelled");
+        }
+        return;
+      }
       if (isConversation(issueContext)) {
         delete context.resumeSessionParams;
         delete context.resumeSessionDisplayId;
@@ -3059,9 +3099,11 @@ export function heartbeatService(
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
       const mergedConfig = {
-        ...workspaceManagedConfig,
-        ...Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
-        ...(requestedAiBinding?.mode === "router" ? parseObject(parseObject(context.aiRouterSelection).runtimeConfig) : {}),
+        ...applyRunModelDecision({
+          ...workspaceManagedConfig,
+          ...Object.fromEntries(Object.entries(issueAssigneeOverrides?.adapterConfig ?? {}).filter(([key]) => requestedAiBinding?.mode !== "router" || !["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"].includes(key))),
+          ...(requestedAiBinding?.mode === "router" ? parseObject(parseObject(context.aiRouterSelection).runtimeConfig) : {}),
+        }, modelDecision.answer),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),
@@ -4466,6 +4508,7 @@ export function heartbeatService(
             issueAssigneeOverrides,
             resolvedConfig,
             managedAiRuntime,
+            modelDecision: modelDecision.answer,
           },
           recovery: runOptions,
           trace: { providerTraceRequested, providerTraceCapture },

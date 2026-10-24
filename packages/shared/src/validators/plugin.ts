@@ -784,6 +784,9 @@ export const pluginManifestV1Schema = z.object({
   capabilities: z.array(z.enum(PLUGIN_CAPABILITIES)).min(1),
   agentLifecycle: z.literal(true).optional(),
   aiConnectionRouter: z.object({ name: z.string().trim().min(1).max(100), description: z.string().trim().min(1).max(500) }).strict().optional(),
+  modelRouting: z.object({
+    envKeys: z.array(z.string().regex(/^[A-Z_][A-Z0-9_]*$/)).max(32),
+  }).strict().optional(),
   entrypoints: z.object({
     worker: z.string().min(1),
     ui: z.string().min(1).optional(),
@@ -843,6 +846,10 @@ export const pluginManifestV1Schema = z.object({
 
   if (manifest.aiConnectionRouter && !manifest.capabilities.includes("ai.connections.route")) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "ai.connections.route is required for aiConnectionRouter", path: ["capabilities"] });
+  }
+
+  if (manifest.modelRouting && !manifest.capabilities.includes("run.model.resolve")) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "run.model.resolve is required for modelRouting", path: ["capabilities"] });
   }
 
   // tools require agent.tools.register (PLUGIN_SPEC.md §11)

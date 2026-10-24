@@ -4,6 +4,7 @@ import {
   type createHeartbeatRunPreparation,
 } from "./run-preparation.js";
 import { dotRunnerBroker } from "../dot-runner-broker.js";
+import { applyRunModelDecision, type RunModelResolution } from "../run-model-resolver.js";
 import { isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
 import { isConversation } from "../agent-conversations.js";
 import { renewLegacyControllerLease } from "../legacy-controller-lease.js";
@@ -128,6 +129,7 @@ export interface HeartbeatRuntimeSelectionInput {
     issueAssigneeOverrides: { adapterConfig: Record<string, unknown> | null } | null;
     resolvedConfig: Record<string, unknown>;
     managedAiRuntime: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    modelDecision?: RunModelResolution["answer"];
   };
   recovery: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim };
   trace: { providerTraceRequested: boolean; providerTraceCapture: { metadata: { id: string } } | null };
@@ -695,15 +697,17 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       });
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
-      const nativeProviderConfig = nativeRuntimeResolution.profile.backend === "codex_app_server"
-        || nativeRuntimeResolution.profile.backend === "opencode_server"
-        ? projectPaperclipRunnerTaskConfig(
-            nativeRuntimeResolution.profile.backend,
-            agent.adapterConfig,
-            issueAssigneeOverrides?.adapterConfig,
-            managedAiRuntime ? readNonEmptyString(resolvedConfig.model) ?? undefined : undefined,
-          )
-        : agent.adapterConfig;
+      const nativeProviderConfig = applyRunModelDecision(parseObject(
+        nativeRuntimeResolution.profile.backend === "codex_app_server"
+          || nativeRuntimeResolution.profile.backend === "opencode_server"
+          ? projectPaperclipRunnerTaskConfig(
+              nativeRuntimeResolution.profile.backend,
+              agent.adapterConfig,
+              issueAssigneeOverrides?.adapterConfig,
+              managedAiRuntime ? readNonEmptyString(resolvedConfig.model) ?? undefined : undefined,
+            )
+          : agent.adapterConfig,
+      ), input.config.modelDecision ?? { kind: "keep" });
       const requestedNativeProvider = resolvePaperclipRunnerNativeProviderInput({
         backend: nativeRuntimeResolution.profile.backend,
         adapterConfig: nativeProviderConfig, managedProfile, agentCoreProfile, dotBinding,

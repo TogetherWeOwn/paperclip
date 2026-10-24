@@ -1299,6 +1299,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       error: run.error,
       errorCode: run.errorCode,
       issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+      modelDecision: parseObject(run.contextSnapshot).modelDecision,
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
     });
@@ -1314,6 +1315,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     error: string | null;
     errorCode: string | null;
     issueId: string | null;
+    modelDecision?: unknown;
     startedAt: Date | null;
     finishedAt: Date | null;
   }) {
@@ -1346,6 +1348,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         error: run.error ?? null,
         errorCode: run.errorCode ?? null,
         issueId: run.issueId,
+        ...(run.modelDecision ? { modelDecision: run.modelDecision } : {}),
         startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
         finishedAt: run.finishedAt
           ? new Date(run.finishedAt).toISOString()

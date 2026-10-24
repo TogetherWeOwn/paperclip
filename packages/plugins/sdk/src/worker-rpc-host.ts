@@ -60,6 +60,7 @@ import type {
   PluginConfigValidationResult,
   PluginWebhookInput,
 } from "./define-plugin.js";
+import type { ResolveRunModelParams } from "./protocol.js";
 import type {
   PluginContext,
   PluginEvent,
@@ -1666,6 +1667,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "routeAiConnection":
         if (!plugin.definition.onRouteAiConnection) throw methodNotImplemented("routeAiConnection");
         return plugin.definition.onRouteAiConnection(params as AiConnectionRouterRequest);
+      case "resolveRunModel":
+        if (!plugin.definition.onResolveRunModel) throw methodNotImplemented("resolveRunModel");
+        return plugin.definition.onResolveRunModel(params as ResolveRunModelParams);
       case "resolveExternalObject":
         return handleResolveExternalObject(params as ResolveExternalObjectParams);
       case "refreshExternalObjects":
@@ -1785,6 +1789,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onDetectExternalObjects) supportedMethods.push("detectExternalObjects");
     if (plugin.definition.onAgentLifecycle) supportedMethods.push("agentLifecycle");
     if (plugin.definition.onRouteAiConnection) supportedMethods.push("routeAiConnection");
+    if (plugin.definition.onResolveRunModel) supportedMethods.push("resolveRunModel");
     if (plugin.definition.onResolveExternalObject) supportedMethods.push("resolveExternalObject");
     if (plugin.definition.onRefreshExternalObjects) supportedMethods.push("refreshExternalObjects");
     if (plugin.definition.onEnvironmentValidateConfig) supportedMethods.push("environmentValidateConfig");

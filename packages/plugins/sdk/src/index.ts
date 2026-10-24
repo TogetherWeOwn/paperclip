@@ -135,6 +135,8 @@ export type {
 
 // JSON-RPC protocol types
 export type {
+  ResolveRunModelParams,
+  ResolveRunModelResult,
   JsonRpcId,
   JsonRpcInvocationScope,
   JsonRpcInvocationContext,

@@ -177,6 +177,7 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
     error: run.error,
     errorCode: run.errorCode,
     contextSource: readNonEmptyString(parseObject(run.contextSnapshot).source),
+    modelDecision: parseObject(run.contextSnapshot).modelDecision,
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
     result: parseObject(run.resultJson),
