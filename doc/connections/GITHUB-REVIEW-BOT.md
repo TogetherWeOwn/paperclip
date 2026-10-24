@@ -188,6 +188,12 @@ old runs cannot publish over the latest head. One current summary is updated in
 place, with history and task/run links retained. Stable finding keys prevent
 duplicate inline comments on repeated reviews.
 
+GitHub bot tools allow up to 60 seconds by default for their provider requests
+and publication receipts. An explicit shorter tool deadline still applies.
+The assessment and publication intent are saved before publication. A timeout
+does not cancel that durable publication or prove that GitHub rejected it;
+check the review's publication links before starting another review.
+
 The check's **Details** link opens its Paperclip task on the current instance
 hostname, or the connector's Reviews page when no task has been created yet.
 
