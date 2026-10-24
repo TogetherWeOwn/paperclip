@@ -434,6 +434,131 @@ export function createSandboxCallbackBridgeToken(bytes = DEFAULT_BRIDGE_TOKEN_BY
   return randomBytes(bytes).toString("base64url");
 }
 
+/** The reason {@link parseCanonicalCallbackBridgeTarget} rejected one request target. */
+export type CanonicalCallbackBridgeTargetRejection =
+  | "non_origin_form"
+  | "fragment"
+  | "encoded_slash"
+  | "encoded_backslash"
+  | "backslash"
+  | "nul_byte"
+  | "dot_segment"
+  | "invalid_encoding"
+  | "control_character";
+
+/**
+ * The one parsed request target. Every bridge leg authorizes AND forwards
+ * this same value: the route allowlist reads `pathname`, and the forward URL
+ * builder sends `pathname` plus `query` to the pinned origin. No leg parses
+ * the raw target a second, independent time.
+ */
+export interface CanonicalCallbackBridgeTarget {
+  pathname: string;
+  /** The query string, in `URL.search` form: empty, or a leading `?`. */
+  query: string;
+}
+
+export type CanonicalCallbackBridgeTargetResult =
+  | { ok: true; value: CanonicalCallbackBridgeTarget }
+  | { ok: false; reason: CanonicalCallbackBridgeTargetRejection };
+
+/**
+ * Validate one raw callback request target and return the single canonical
+ * target every leg authorizes and forwards. The query portion is split off
+ * verbatim at the first `?` and never inspected for traversal: query data
+ * that merely looks like a traversal (`?next=../x`) stays allowed, while a
+ * `#` anywhere rejects (a fragment would silently change the authorized
+ * route). The pathname must be origin-form (one leading `/`, never `//` or
+ * absolute-form), carry no backslash, NUL byte, ASCII control/space, encoded
+ * slash/backslash, or malformed percent encoding, and no literal or
+ * percent-encoded dot segment — checked on the raw segments before URL
+ * normalization could silently remove them. The returned pathname comes from
+ * the one URL parse, so it is exactly what the forward sends.
+ */
+export function parseCanonicalCallbackBridgeTarget(
+  rawTarget: unknown,
+): CanonicalCallbackBridgeTargetResult {
+  if (typeof rawTarget !== "string" || rawTarget.length === 0) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (rawTarget.includes("#")) {
+    return { ok: false, reason: "fragment" };
+  }
+  const queryIndex = rawTarget.indexOf("?");
+  const rawPathname = queryIndex === -1 ? rawTarget : rawTarget.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : rawTarget.slice(queryIndex);
+  if (
+    !rawPathname.startsWith("/") ||
+    rawPathname.startsWith("//") ||
+    rawPathname.includes("://")
+  ) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (/%2f/i.test(rawPathname)) {
+    return { ok: false, reason: "encoded_slash" };
+  }
+  if (/%5c/i.test(rawPathname)) {
+    return { ok: false, reason: "encoded_backslash" };
+  }
+  if (rawPathname.includes("\\")) {
+    return { ok: false, reason: "backslash" };
+  }
+  if (rawPathname.includes("\0") || /%00/i.test(rawPathname)) {
+    return { ok: false, reason: "nul_byte" };
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control/space gate.
+  if (/[\x00-\x20\x7f]/.test(rawPathname)) {
+    return { ok: false, reason: "control_character" };
+  }
+  for (const segment of rawPathname.split("/")) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return { ok: false, reason: "invalid_encoding" };
+    }
+    if (decoded === "." || decoded === "..") {
+      return { ok: false, reason: "dot_segment" };
+    }
+  }
+  // Every raw-string check above passed, and the path carries no dot segment,
+  // so URL normalization here changes nothing but percent-encoding; the
+  // pathname below is exactly what the forward sends to the pinned origin.
+  let pathname: string;
+  try {
+    pathname = new URL(rawTarget, "http://bridge.internal").pathname;
+  } catch {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  return { ok: true, value: { pathname, query } };
+}
+
+/**
+ * Authorize one bridge request against the route allowlist using the SAME
+ * validated canonical target the forward sends. A malformed, ambiguous, or
+ * noncanonical target is denied before any route check, before host
+ * credentials attach, and before any forward attempt. Pure: it never
+ * rewrites the request; each forward leg re-derives this same canonical
+ * target from the request it actually sends.
+ */
+export function authorizeCanonicalCallbackBridgeRequest(
+  request: Pick<SandboxCallbackBridgeRequest, "method" | "path"> & { query?: string },
+  routes: readonly SandboxCallbackBridgeRouteRule[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+): string | null {
+  const query = typeof request.query === "string" ? request.query : "";
+  const rawTarget = query.length === 0
+    ? request.path
+    : `${request.path}${query.startsWith("?") ? query : `?${query}`}`;
+  const parsed = parseCanonicalCallbackBridgeTarget(rawTarget);
+  if (!parsed.ok) {
+    return `Invalid request target: ${parsed.reason}`;
+  }
+  return authorizeSandboxCallbackBridgeRequestWithRoutes(
+    { method: request.method, path: parsed.value.pathname },
+    routes,
+  );
+}
+
 export function authorizeSandboxCallbackBridgeRequestWithRoutes(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
   routes: readonly SandboxCallbackBridgeRouteRule[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
@@ -884,8 +1009,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
+  // Default authorization validates the envelope's canonical request target
+  // before the route check: a malformed or noncanonical target is denied here,
+  // in both the dispatch path and the recovery path, before any handler — and
+  // therefore before any host credential or forward attempt.
   const authorizeRequest = input.authorizeRequest ??
-    ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
+    ((request: SandboxCallbackBridgeRequest) => authorizeCanonicalCallbackBridgeRequest(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
 
@@ -2744,10 +2873,16 @@ async function runFileGateway() {
         }
       }
 
-      const url = new URL(req.url || "/", "http://127.0.0.1");
+      // Split the raw request target without URL parsing. Normalizing here
+      // would let a crafted target reach the host as a different route than
+      // the client sent; the host validates the raw target it receives.
+      const rawGatewayTarget = req.url || "/";
+      const gatewayQueryIndex = rawGatewayTarget.indexOf("?");
+      const gatewayPath = gatewayQueryIndex === -1 ? rawGatewayTarget : rawGatewayTarget.slice(0, gatewayQueryIndex);
+      const gatewayQuery = gatewayQueryIndex === -1 ? "" : rawGatewayTarget.slice(gatewayQueryIndex);
       const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
       const multipartAttachment = req.method === "POST"
-        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
+        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(gatewayPath)
         && /^multipart\\/form-data(?:;|$)/i.test(contentType);
       if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
@@ -2764,8 +2899,8 @@ async function runFileGateway() {
       const payload = {
         id: requestId,
         method: req.method || "GET",
-        path: url.pathname,
-        query: url.search,
+        path: gatewayPath,
+        query: gatewayQuery,
         headers: normalizeHeaders(req.headers),
         ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
@@ -3021,15 +3156,29 @@ function runHttp2Gateway() {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
         return;
       }
-      const url = new URL(req.url || "/", "http://127.0.0.1");
+      // Split the raw request target without URL parsing, as in file mode:
+      // the host HTTP/2 server validates the raw path it receives, and a
+      // normalized gateway target would authorize a different route there.
+      const rawGatewayTarget = req.url || "/";
+      const gatewayQueryIndex = rawGatewayTarget.indexOf("?");
+      const gatewayPath = gatewayQueryIndex === -1 ? rawGatewayTarget : rawGatewayTarget.slice(0, gatewayQueryIndex);
+      const gatewayQuery = gatewayQueryIndex === -1 ? "" : rawGatewayTarget.slice(gatewayQueryIndex);
+      // Fail fast on a non-origin-form target before opening a stream: the
+      // HTTP/2 client cannot send absolute-form or network-path-form paths,
+      // and a stream error would surface as a 502 instead of a terminal 400.
+      // The host still validates every target it receives.
+      if (!gatewayPath.startsWith("/") || gatewayPath.startsWith("//")) {
+        writeJsonResponse(res, 400, { error: "Invalid request target: non_origin_form" });
+        return;
+      }
       const { body: requestBodyBuffer, release } = await readBodyBytes(req);
       releaseBodyReservation = release;
       let response;
       try {
         response = await forwardOverHttp2({
           method: req.method || "GET",
-          path: url.pathname,
-          query: url.search,
+          path: gatewayPath,
+          query: gatewayQuery,
           headers: normalizeHeaders(req.headers),
           body: requestBodyBuffer,
         });

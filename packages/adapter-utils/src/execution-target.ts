@@ -39,6 +39,7 @@ import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
+  parseCanonicalCallbackBridgeTarget,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
@@ -4483,13 +4484,11 @@ async function startLocalAdapterExecutionTargetPaperclipBridge(input: {
   const openSockets = new Set<net.Socket>();
   const server = http.createServer((req, res) => {
     void (async () => {
-      // Split the raw target without URL normalization: dot-segment or
-      // absolute-form tricks must reach the route authorizer verbatim, where
-      // the anchored patterns reject them.
+      // Validate the raw target to the one canonical target this leg both
+      // authorizes and forwards. A malformed or noncanonical target never
+      // reaches the route check, the body read, or the host.
       const rawTarget = req.url ?? "/";
-      const queryIndex = rawTarget.indexOf("?");
-      const path = queryIndex >= 0 ? rawTarget.slice(0, queryIndex) : rawTarget;
-      const query = queryIndex >= 0 ? rawTarget.slice(queryIndex + 1) : "";
+      const parsedTarget = parseCanonicalCallbackBridgeTarget(rawTarget);
       const method = req.method?.trim().toUpperCase() || "GET";
 
       // Authenticate first: a wrong or missing bridge token never reaches the
@@ -4511,6 +4510,15 @@ async function startLocalAdapterExecutionTargetPaperclipBridge(input: {
         return;
       }
 
+      if (!parsedTarget.ok) {
+        writeLocalBridgeJson(res, 400, { error: `Invalid request target: ${parsedTarget.reason}` });
+        return;
+      }
+      // The SAME validated canonical target flows into the route check and
+      // the forward below: dot-segment, fragment, or encoding tricks cannot
+      // authorize one route and forward another.
+      const path = parsedTarget.value.pathname;
+      const query = parsedTarget.value.query;
       const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path });
       if (denialReason) {
         writeLocalBridgeJson(res, 403, { error: denialReason });
@@ -4759,12 +4767,29 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
   ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
     const method = request.method.trim().toUpperCase() || "GET";
+    // Fail closed on a malformed or noncanonical target before the host
+    // credential attaches and before any forward attempt. The forward below
+    // sends this SAME validated canonical target the route check authorized,
+    // so normalization cannot authorize one route and forward another.
+    const rawForwardTarget = typeof request.query === "string" && request.query.length > 0
+      ? `${request.path}${request.query.startsWith("?") ? request.query : `?${request.query}`}`
+      : request.path;
+    const parsedForwardTarget = parseCanonicalCallbackBridgeTarget(rawForwardTarget);
+    if (!parsedForwardTarget.ok) {
+      return {
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "bridge refused invalid request target" }), "utf8"),
+      };
+    }
+    const forwardPath = parsedForwardTarget.value.pathname;
+    const forwardQuery = parsedForwardTarget.value.query;
     // The per-request debug log prints the method and the sanitized
     // origin+path. The duplex path suppresses it, so no route rides a log line
     // there. The file path keeps the existing behavior minus the query.
     const emitDebugLog = bridgeDebugEnabled && options?.suppressDebugLog !== true;
     if (emitDebugLog) {
-      await onLog("stdout", `[paperclip] Bridge proxy ${method} ${bridgeDebugOrigin}${request.path}\n`);
+      await onLog("stdout", `[paperclip] Bridge proxy ${method} ${bridgeDebugOrigin}${forwardPath}\n`);
     }
     const headers = new Headers();
     for (const [key, value] of Object.entries(request.headers)) {
@@ -4797,7 +4822,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (method !== "GET" && method !== "HEAD" && request.body !== undefined) {
       forwardInit.body = request.body as BodyInit;
     }
-    const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
+    const response = await fetch(
+      buildBridgeForwardUrl(hostApiUrl, { path: forwardPath, query: forwardQuery }),
+      forwardInit,
+    );
     // `manual` surfaces a redirect as an opaqueredirect response instead of
     // following it. Refuse it here: passing the foreign Location back to the
     // sandbox caller would launder the redirect (and a re-issued body) to an
@@ -4808,7 +4836,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       ([301, 302, 303, 307, 308].includes(response.status) && redirectLocation !== null);
     if (isRedirectResponse) {
       if (emitDebugLog) {
-        await onLog("stdout", `[paperclip] Bridge refused to follow redirect for ${method} ${bridgeDebugOrigin}${request.path}\n`);
+        await onLog("stdout", `[paperclip] Bridge refused to follow redirect for ${method} ${bridgeDebugOrigin}${forwardPath}\n`);
       }
       return {
         status: 502,
@@ -4819,7 +4847,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (emitDebugLog) {
       await onLog(
         "stdout",
-        `[paperclip] Bridge proxy response ${response.status} for ${method} ${bridgeDebugOrigin}${request.path}\n`,
+        `[paperclip] Bridge proxy response ${response.status} for ${method} ${bridgeDebugOrigin}${forwardPath}\n`,
       );
     }
     // The host delivered response headers, so the response-body read starts after
@@ -4882,7 +4910,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         ),
       };
     }
-    const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
+    const commentMarker = postedIssueCommentLogMarker(method, forwardPath, response.status, responseBody);
     if (commentMarker) await onLog("stdout", commentMarker);
     return {
       status: response.status,
