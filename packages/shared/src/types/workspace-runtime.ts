@@ -182,7 +182,7 @@ export interface ProjectExecutionWorkspacePolicy {
 }
 
 export interface IssueExecutionWorkspaceSettings {
-  mode?: ExecutionWorkspaceMode;
+  mode?: ExecutionWorkspaceMode | "no_code";
   sharedWorkspaceConcurrency?: SharedWorkspaceConcurrency;
   environmentId?: string | null;
   workspaceStrategy?: ExecutionWorkspaceStrategy | null;

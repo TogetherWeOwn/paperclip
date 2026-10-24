@@ -56,6 +56,7 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  prepareNoCodeExecutionTarget,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
   type AdapterExecutionTarget,
@@ -467,6 +468,7 @@ import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   mergeIssueAdapterConfigOverrides,
+  noCodeWorkspaceSelectionConflict,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -12944,8 +12946,38 @@ export function heartbeatService(
     opts?: {
       useProjectWorkspace?: boolean | null;
       executionEnvironmentDriver?: string | null;
+      noCodeIssueId?: string;
     },
   ): Promise<ResolvedWorkspaceForRun> {
+    if (opts?.noCodeIssueId) {
+      const home = path.resolve(resolveDefaultAgentWorkspaceDir(agent.id));
+      const root = path.parse(home).root;
+      let cwd = root;
+      // Validate from the filesystem root down before creating each child. A
+      // canonical destination is not authority to follow a substituted ancestor.
+      for (const segment of ["", ...home.slice(root.length).split(path.sep), "no-code", opts.noCodeIssueId]) {
+        cwd = path.join(cwd, segment);
+        const stats = await fs.lstat(cwd).catch(async (error) => {
+          if (error.code !== "ENOENT") throw error;
+          await fs.mkdir(cwd).catch((mkdirError) => {
+            if (mkdirError.code !== "EEXIST") throw mkdirError;
+          });
+          return fs.lstat(cwd);
+        });
+        if (!stats.isDirectory() || stats.isSymbolicLink() || await fs.realpath(cwd) !== cwd) {
+          throw new Error("No-code execution directory and its ancestors must be ordinary non-symlink directories inside the agent workspace");
+        }
+        if (await fs.lstat(path.join(cwd, ".git")).then(() => true, (error) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        })) throw new Error("No-code execution directory conflicts with an existing Git workspace ancestor");
+      }
+      return {
+        cwd, source: "agent_home", projectId: readNonEmptyString(context.projectId),
+        workspaceId: null, repoUrl: null, repoRef: null, workspaceHints: [], warnings: [],
+        baseCwdFallback: false, materializationFailures: [], additionalWorkspaces: [], referencedProjectFailures: [],
+      };
+    }
     const anchor = await resolveAnchorWorkspaceForRun(
       agent,
       context,
@@ -21365,7 +21397,13 @@ export function heartbeatService(
         parseIssueExecutionWorkspaceSettings(
           issueContext?.executionWorkspaceSettings,
         );
-      const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled
+      const noCodeWorkspace = parsedIssueExecutionWorkspaceSettings?.mode === "no_code";
+      const noCodeConflict = noCodeWorkspaceSelectionConflict({
+        ...issueContext,
+        executionWorkspaceSettings: parsedIssueExecutionWorkspaceSettings,
+      });
+      if (noCodeConflict) throw new Error(noCodeConflict);
+      const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled || noCodeWorkspace
         ? parsedIssueExecutionWorkspaceSettings
         : null;
       const environmentExecutionWorkspaceSettings =
@@ -21573,7 +21611,7 @@ export function heartbeatService(
         agent.adapterType,
         sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
       );
-      const explicitResumeSessionDisplayId = truncateDisplayId(
+      const explicitResumeSessionDisplayId = noCodeWorkspace ? null : truncateDisplayId(
         readNonEmptyString(context.resumeSessionDisplayId) ??
           (sessionCodec.getDisplayId
             ? sessionCodec.getDisplayId(explicitResumeSessionParams)
@@ -21873,6 +21911,30 @@ export function heartbeatService(
           : null;
       const persistedNativeExecutionWorkspaceId =
         persistedNativeExecutionInput?.binding.executionWorkspaceId ?? null;
+      if (noCodeWorkspace && persistedNativeExecutionInput) {
+        const binding = persistedNativeExecutionInput.binding;
+        const workspace = persistedNativeExecutionInput.workspace;
+        const home = await fs.realpath(resolveDefaultAgentWorkspaceDir(agent.id));
+        if (
+          binding.executionWorkspaceId !== run.id ||
+          binding.runId !== run.id || binding.companyId !== agent.companyId ||
+          binding.agentId !== agent.id || binding.issueId !== issueRef?.id ||
+          workspace.cwd !== path.join(home, "no-code", issueRef.id) ||
+          workspace.repoUrl !== null || workspace.repoRef !== null || workspace.branchName !== null
+        ) {
+          throw new Error("No-code workspace selection conflicts with the immutable native recovery workspace binding");
+        }
+        if (persistedRunnerProfile.sessionCheckpoint != null) {
+          const identity = parseObject(parseObject(persistedRunnerProfile.sessionCheckpoint).identity);
+          if (
+            identity.runId !== run.id || identity.companyId !== agent.companyId ||
+            identity.agentId !== agent.id || identity.issueId !== issueRef.id ||
+            identity.sessionId !== persistedNativeExecutionInput.session.normalizedSessionId
+          ) {
+            throw new Error("No-code recovery cannot adopt an earlier provider session checkpoint");
+          }
+        }
+      }
       const requestedExecutionWorkspaceId =
         persistedNativeExecutionWorkspaceId ??
         readNonEmptyString(issueRef?.executionWorkspaceId);
@@ -22433,8 +22495,8 @@ export function heartbeatService(
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
-      const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const previousSessionParams =
+      const taskSessionForRun = resetTaskSession || noCodeWorkspace ? null : taskSession;
+      const previousSessionParams = noCodeWorkspace ? null :
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
           agent.adapterType,
@@ -22476,6 +22538,11 @@ export function heartbeatService(
           return preflightEnvironment.driver;
         },
         resolveWorkspace: async () => {
+          if (noCodeWorkspace && issueRef) {
+            const workspace = await resolveWorkspaceForRun(agent, context, null, { noCodeIssueId: issueRef.id });
+            runtimeConfig = { ...runtimeConfig, cwd: workspace.cwd };
+            return { ...workspace, projectId: issueRef.projectId };
+          }
           if (nativeChatWorkspaceScope && !nativeChatWorkspaceScope.projectId) {
             const cwd = await materializeNativeChatTaskRoot(
               nativeChatWorkspaceScope,
@@ -22734,8 +22801,15 @@ export function heartbeatService(
                   resolveGitAuth: workspaceGitAuthProvider,
                 })
             : null,
-          realizeWorkspace: () =>
-            realizeExecutionWorkspace({
+          realizeWorkspace: () => noCodeWorkspace
+            ? Promise.resolve({
+                ...executionWorkspaceBase,
+                strategy: "project_primary" as const,
+                cwd: executionWorkspaceBase.baseCwd,
+                branchName: null, worktreePath: null, warnings: [],
+                created: false, branchCreatedByRuntime: false,
+              })
+            : realizeExecutionWorkspace({
               db,
               base: executionWorkspaceBase,
               config: hostExecutionWorkspaceConfig,
@@ -23008,7 +23082,7 @@ export function heartbeatService(
                 },
               )
             : (adoptedAllocatedExecutionWorkspace ??
-              (resolvedProjectId
+              (resolvedProjectId && !noCodeWorkspace
                 ? await executionWorkspacesSvc.create({
                   companyId: agent.companyId,
                   projectId: resolvedProjectId,
@@ -23296,7 +23370,9 @@ export function heartbeatService(
       // and lease scope instead of silently creating a per-run replacement.
       await bindIssueToPersistedExecutionWorkspace(persistedExecutionWorkspace);
       const workspaceRealization = realizationResult.workspaceRealization;
-      const executionTarget = realizationResult.executionTarget;
+      const executionTarget = noCodeWorkspace
+        ? await prepareNoCodeExecutionTarget({ runId: run.id, target: realizationResult.executionTarget }) ?? null
+        : realizationResult.executionTarget;
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -23637,7 +23713,7 @@ export function heartbeatService(
         context.projectId = executionWorkspace.projectId;
       }
       const runtimeSessionFallback =
-        taskKey || resetTaskSession
+        taskKey || resetTaskSession || noCodeWorkspace
           ? null
           : isCanonicalSessionIdForAdapter(agent.adapterType, runtime.sessionId)
             ? runtime.sessionId
@@ -24245,7 +24321,7 @@ export function heartbeatService(
                     return requests.length > 0 ? requests : undefined;
                   })(),
                 });
-          const taskNativeSessionId = !taskSessionCredentialCompatible ? null : readNonEmptyString(
+          const taskNativeSessionId = noCodeWorkspace || !taskSessionCredentialCompatible ? null : readNonEmptyString(
             taskSessionDecodedParams?.sessionId,
           );
           // Compatibility for native retry rows created before same-run restart
@@ -24301,7 +24377,7 @@ export function heartbeatService(
                   .then((rows) => rows.length > 0)
               : false;
           const compatibleLegacyRetrySource =
-            !managedAiRuntime && !isConversation(issueContext) && context.forceFreshSession !== true && isUnusedLegacyNativeRetryReplacement({
+            !noCodeWorkspace && !managedAiRuntime && !isConversation(issueContext) && context.forceFreshSession !== true && isUnusedLegacyNativeRetryReplacement({
               replacement: run,
               source: legacyRetrySource,
               hasProviderEvents: nativeBootstrapHasProviderEvidence,
@@ -24326,7 +24402,7 @@ export function heartbeatService(
           // Rows that already acquired provider authority are progress barriers,
           // even when they do not contain a usable checkpoint.
           const previousNativeRun =
-            requestedNativeSessionId &&
+            !noCodeWorkspace && requestedNativeSessionId &&
             isUnusedNativeSessionBootstrap(
               run,
               nativeBootstrapHasProviderEvidence,
@@ -24833,7 +24909,7 @@ export function heartbeatService(
           });
           if (!nativeSelected) return;
           controllerLease.stop();
-          nativeWorkspaceSync = await prepareNativeWorkspaceSync({
+          nativeWorkspaceSync = noCodeWorkspace ? null : await prepareNativeWorkspaceSync({
             db,
             runId: run.id,
             companyId: agent.companyId,
