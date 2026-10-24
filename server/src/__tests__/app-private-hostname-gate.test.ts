@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CHAT_MILESTONE_FULL_SWEEP_INTERVAL_MS,
+  CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS,
+  CHAT_MILESTONE_SWEEP_OVERLAP_MS,
   createChatReconciliationCoordinator,
   shouldEnablePrivateHostnameGuard,
 } from "../app.ts";
+import { CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT } from "../services/chat-run-publications.ts";
 
 describe("createChatReconciliationCoordinator", () => {
   it.each([false, true])(
@@ -142,6 +146,7 @@ describe("createChatReconciliationCoordinator", () => {
       });
       try {
         coordinator.reconcile();
+        coordinator.reconcileMilestones();
         await vi.waitFor(() => {
           expect(projectRunMilestones).toHaveBeenCalledTimes(1);
           expect(flushPublications).toHaveBeenCalledTimes(1);
@@ -204,6 +209,7 @@ describe("createChatReconciliationCoordinator", () => {
     });
     try {
       coordinator.reconcile();
+      coordinator.reconcileMilestones();
       await vi.waitFor(() => {
         expect(projectRunMilestones).toHaveBeenCalledOnce();
         expect(flushPublications).toHaveBeenCalledOnce();
@@ -357,6 +363,154 @@ describe("createChatReconciliationCoordinator", () => {
       }
     },
   );
+});
+
+describe("run milestone sweep window", () => {
+  function milestoneCoordinator(projectRunMilestones: (since?: Date) => Promise<number>) {
+    const flushPublications = vi.fn(async () => undefined);
+    const coordinator = createChatReconciliationCoordinator({
+      projectRunMilestones,
+      flushPublications,
+      reconcileProviderRuntimes: async () => undefined,
+      processPendingDeliveries: async () => undefined,
+      processPendingSlackFileUploadReceipts: async () => undefined,
+      processPendingSlackSessionSyncs: async () => undefined,
+      onError: vi.fn(),
+    });
+    return { coordinator, flushPublications };
+  }
+
+  async function sweep(coordinator: ReturnType<typeof createChatReconciliationCoordinator>) {
+    coordinator.reconcileMilestones();
+    await coordinator.drain();
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps the milestone sweep off the fast publication poll", async () => {
+    const projectRunMilestones = vi.fn(async (_since?: Date) => 0);
+    const { coordinator, flushPublications } = milestoneCoordinator(projectRunMilestones);
+    try {
+      coordinator.reconcile();
+      await coordinator.drain();
+      expect(flushPublications).toHaveBeenCalledTimes(1);
+      expect(projectRunMilestones).not.toHaveBeenCalled();
+      await sweep(coordinator);
+      expect(projectRunMilestones).toHaveBeenCalledTimes(1);
+      coordinator.notifyPublications();
+      await coordinator.drain();
+      expect(projectRunMilestones).toHaveBeenCalledTimes(2);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("scans the full window first and then only the runs updated since the last sweep", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-20T12:00:00.000Z"));
+    const projectRunMilestones = vi.fn(async (_since?: Date) => 0);
+    const { coordinator } = milestoneCoordinator(projectRunMilestones);
+    try {
+      await sweep(coordinator);
+      vi.setSystemTime(new Date("2026-10-20T12:00:15.000Z"));
+      await sweep(coordinator);
+      vi.setSystemTime(new Date("2026-10-20T12:00:30.000Z"));
+      await sweep(coordinator);
+      expect(projectRunMilestones.mock.calls.map(([since]) => since?.toISOString())).toEqual([
+        undefined,
+        new Date(Date.parse("2026-10-20T12:00:00.000Z") - CHAT_MILESTONE_SWEEP_OVERLAP_MS).toISOString(),
+        new Date(Date.parse("2026-10-20T12:00:15.000Z") - CHAT_MILESTONE_SWEEP_OVERLAP_MS).toISOString(),
+      ]);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("repeats the full window scan at the full sweep interval", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.parse("2026-10-20T12:00:00.000Z");
+    vi.setSystemTime(start);
+    const projectRunMilestones = vi.fn(async (_since?: Date) => 0);
+    const { coordinator } = milestoneCoordinator(projectRunMilestones);
+    try {
+      await sweep(coordinator);
+      vi.setSystemTime(start + CHAT_MILESTONE_FULL_SWEEP_INTERVAL_MS - 1);
+      await sweep(coordinator);
+      vi.setSystemTime(start + CHAT_MILESTONE_FULL_SWEEP_INTERVAL_MS);
+      await sweep(coordinator);
+      expect(projectRunMilestones.mock.calls.map(([since]) => since === undefined)).toEqual([true, false, true]);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("keeps the previous window after a sweep that reaches its insert limit", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.parse("2026-10-20T12:00:00.000Z");
+    vi.setSystemTime(start);
+    const projectRunMilestones = vi
+      .fn(async (_since?: Date) => 0)
+      .mockImplementationOnce(async () => 0)
+      .mockImplementationOnce(async () => CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT);
+    const { coordinator } = milestoneCoordinator(projectRunMilestones);
+    try {
+      await sweep(coordinator);
+      vi.setSystemTime(start + 15_000);
+      await sweep(coordinator);
+      vi.setSystemTime(start + 30_000);
+      await sweep(coordinator);
+      vi.setSystemTime(start + 45_000);
+      await sweep(coordinator);
+      const windows = projectRunMilestones.mock.calls.map(([since]) => since?.getTime());
+      expect(windows[0]).toBeUndefined();
+      expect(windows[1]).toBe(start - CHAT_MILESTONE_SWEEP_OVERLAP_MS);
+      expect(windows[2]).toBe(start - CHAT_MILESTONE_SWEEP_OVERLAP_MS);
+      expect(windows[3]).toBe(start + 30_000 - CHAT_MILESTONE_SWEEP_OVERLAP_MS);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("repeats the full window scan after a first sweep that reaches its insert limit", async () => {
+    const projectRunMilestones = vi
+      .fn(async (_since?: Date) => 0)
+      .mockImplementationOnce(async () => CHAT_RUN_MILESTONE_SWEEP_DEFAULT_LIMIT);
+    const { coordinator } = milestoneCoordinator(projectRunMilestones);
+    try {
+      await sweep(coordinator);
+      await sweep(coordinator);
+      await sweep(coordinator);
+      expect(projectRunMilestones.mock.calls.map(([since]) => since === undefined)).toEqual([true, true, false]);
+    } finally {
+      coordinator.stop();
+      await coordinator.drain();
+    }
+  });
+
+  it("does not sweep after stop", async () => {
+    const projectRunMilestones = vi.fn(async (_since?: Date) => 0);
+    const { coordinator } = milestoneCoordinator(projectRunMilestones);
+    coordinator.stop();
+    await sweep(coordinator);
+    expect(projectRunMilestones).not.toHaveBeenCalled();
+  });
+
+  it("runs the milestone sweep on its own timer in the app", () => {
+    const source = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
+    const timer = source.slice(
+      source.indexOf("let chatMilestoneTimer"),
+      source.indexOf("chatMilestoneTimer.unref"),
+    );
+    expect(timer).toContain("chatReconciliation.reconcileMilestones()");
+    expect(timer).toContain("CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS");
+    expect(CHAT_MILESTONE_RECONCILIATION_INTERVAL_MS).toBe(15_000);
+  });
 });
 
 describe("shouldEnablePrivateHostnameGuard", () => {
