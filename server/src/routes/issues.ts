@@ -13819,13 +13819,74 @@ export function issueRoutes(
       if (enteringBlocked) {
         const blockedIssue = issue;
         let ownerNotifiedAt: Date | null = null;
-        await deliverAgentUnblockNotification({
-          issue: blockedIssue,
-          wakeup: heartbeat.wakeup,
-          markNotified: async (blockedOwnerNotifiedAt) => {
-            ownerNotifiedAt = blockedOwnerNotifiedAt;
-          },
-        });
+        // A self-owned restore with all blockers done and nothing pending is the
+        // shape the 422 guard forces on a no-op round trip: notifying would
+        // re-wake the assignee every cycle with no new context. Genuine
+        // transitions — handoffs, unresolved blockers, pending
+        // interactions/approvals — still notify. Fail open: if the readiness or
+        // pending checks error, notify as before.
+        const descriptorOwner = blockedIssue.unblockDescriptor?.owner;
+        const isSelfOwnedAgentDescriptor =
+          !!descriptorOwner &&
+          descriptorOwner !== "board" &&
+          "agentId" in descriptorOwner &&
+          !!blockedIssue.assigneeAgentId &&
+          descriptorOwner.agentId === blockedIssue.assigneeAgentId;
+        let skipUnblockNotification = false;
+        if (isSelfOwnedAgentDescriptor) {
+          try {
+            const [
+              restoreReadiness,
+              pendingRestoreInteraction,
+              pendingRestoreApproval,
+            ] = await Promise.all([
+              svc.getDependencyReadiness(blockedIssue.id),
+              db
+                .select({ id: issueThreadInteractions.id })
+                .from(issueThreadInteractions)
+                .where(
+                  and(
+                    eq(issueThreadInteractions.companyId, blockedIssue.companyId),
+                    eq(issueThreadInteractions.issueId, blockedIssue.id),
+                    eq(issueThreadInteractions.status, "pending"),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null),
+              db
+                .select({ id: approvals.id })
+                .from(issueApprovals)
+                .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+                .where(
+                  and(
+                    eq(issueApprovals.companyId, blockedIssue.companyId),
+                    eq(issueApprovals.issueId, blockedIssue.id),
+                    eq(approvals.status, "pending"),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null),
+            ]);
+            skipUnblockNotification =
+              restoreReadiness.unresolvedBlockerCount === 0 &&
+              !pendingRestoreInteraction &&
+              !pendingRestoreApproval;
+          } catch (err) {
+            logger.warn(
+              { err, issueId: blockedIssue.id },
+              "failed to check no-op self-restore before unblock notification; notifying",
+            );
+          }
+        }
+        if (!skipUnblockNotification) {
+          await deliverAgentUnblockNotification({
+            issue: blockedIssue,
+            wakeup: heartbeat.wakeup,
+            markNotified: async (blockedOwnerNotifiedAt) => {
+              ownerNotifiedAt = blockedOwnerNotifiedAt;
+            },
+          });
+        }
         if (ownerNotifiedAt) {
           await db
             .update(issueRows)
@@ -14794,12 +14855,20 @@ export function issueRoutes(
           }
         }
 
+        // Entering `blocked` mints a new `blockedTransitionAt` cycle on every
+        // restore, so a bare status-only restore must not attempt a readiness
+        // wake: the new cycle key would defeat the level-triggered dedup and
+        // re-admit the assignee forever with no new context. Only restores that
+        // carry a genuine signal — changed blocker edges, a handoff to a new
+        // assignee, or a terminal reopen — attempt the wake; the dedup still
+        // suppresses same-state duplicates within the attempt.
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
-          (existing.status !== "blocked" ||
-            Array.isArray(req.body.blockedByIssueIds) ||
-            existing.assigneeAgentId !== issue.assigneeAgentId);
+          (Array.isArray(req.body.blockedByIssueIds) ||
+            existing.assigneeAgentId !== issue.assigneeAgentId ||
+            existing.status === "done" ||
+            existing.status === "cancelled");
         if (
           restoredBlockedReadyDependency &&
           typeof dependencyReadinessSvc.getDependencyReadiness === "function"

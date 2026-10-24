@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, like, lt } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
@@ -236,4 +236,57 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     }),
   );
   return covering ?? null;
+}
+
+/**
+ * Cross-cycle repeat marker for the dependency-wake backstop. Returns a
+ * completed level-triggered `issue_blockers_resolved` wake for the dependent
+ * that was requested strictly before the current blocked cycle started, or
+ * `null`.
+ *
+ * Route-time restores are gated separately (a bare status-only restore never
+ * attempts a wake), but the periodic/finalize backstop only sees current
+ * state: without this marker it would heal every no-op restore cycle — each
+ * minting a new `blockedTransitionAt` — and re-admit the assignee forever
+ * with no new context. A completed wake from an earlier cycle proves this
+ * ready state was already announced, so the backstop skips the heal.
+ *
+ * This is deliberately backstop-only. Route-time genuine signals (newly
+ * applied blocker edges, terminal reopens, blocker-done transitions) do not
+ * consult it, so they still wake. Limitation: the marker is per-dependent,
+ * not per-blocker-set — a dependent healed for one blocker set and later
+ * blocked-ready on a different set without a route-time wake will be skipped
+ * by the backstop. That shape requires a status-only restore the route also
+ * suppressed, and matches the platform's established behavior of not waking
+ * assignees on status changes by others.
+ */
+export async function findEarlierCompletedIssueBlockersResolvedWakeForDependent(
+  db: Db,
+  input: {
+    companyId: string;
+    dependentIssueId: string;
+    blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
+  },
+) {
+  const cycleStart = parseWakeCycleDate(input.blockedTransitionAt);
+  if (!cycleStart) return null;
+  // Dependent ids are UUIDs, so the LIKE prefix carries no wildcard characters.
+  const stateKeyPrefix =
+    `${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:state:${input.dependentIssueId}:`;
+  const rows = await db
+    .select({
+      id: agentWakeupRequests.id,
+      requestedAt: agentWakeupRequests.requestedAt,
+    })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, "completed"),
+        lt(agentWakeupRequests.requestedAt, cycleStart),
+        like(agentWakeupRequests.idempotencyKey, `${stateKeyPrefix}%`),
+      ),
+    )
+    .limit(1);
+  return rows[0] ?? null;
 }

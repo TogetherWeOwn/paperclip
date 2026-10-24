@@ -114,6 +114,7 @@ import {
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
+  findEarlierCompletedIssueBlockersResolvedWakeForDependent,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -5541,6 +5542,7 @@ export function recoveryService(
       checked: 0,
       healed: 0,
       existingWakeSkipped: 0,
+      repeatCycleSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -5706,6 +5708,29 @@ export function recoveryService(
         if (existingWake) {
           result.existingWakeSkipped += 1;
           continue;
+        }
+
+        // Cross-cycle repeat suppression: a no-op restore mints a new blocked
+        // cycle with no new readiness context, and route-time deliberately does
+        // not wake it. If an earlier cycle was already announced (a completed
+        // wake requested before this cycle started), healing here would re-admit
+        // the assignee forever. Fail open: a marker lookup error heals as before.
+        try {
+          const repeatWake =
+            await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
+              companyId,
+              dependentIssueId: candidate.id,
+              blockedTransitionAt: candidate.blockedTransitionAt,
+            });
+          if (repeatWake) {
+            result.repeatCycleSkipped += 1;
+            continue;
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: candidate.id },
+            "failed to check earlier dependency wake before backstop heal; healing",
+          );
         }
 
         if (
