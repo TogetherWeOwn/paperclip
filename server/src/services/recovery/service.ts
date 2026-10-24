@@ -5720,6 +5720,7 @@ export function recoveryService(
             await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
               companyId,
               dependentIssueId: candidate.id,
+              blockerIssueIds: readiness.blockerIssueIds,
               blockedTransitionAt: candidate.blockedTransitionAt,
             });
           if (repeatWake) {

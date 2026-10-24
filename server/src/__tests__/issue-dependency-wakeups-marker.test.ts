@@ -13,6 +13,7 @@ import {
 import {
   buildIssueBlockersResolvedWakeIdempotencyKey,
   buildIssueBlockersResolvedWakeStateKey,
+  buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
   findEarlierCompletedIssueBlockersResolvedWakeForDependent,
 } from "../services/issue-dependency-wakeups.js";
 
@@ -99,6 +100,7 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
     expect(found?.id).toBe(markerId);
@@ -114,6 +116,7 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
     expect(found).toBeNull();
@@ -125,6 +128,7 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
     expect(found).toBeNull();
@@ -141,6 +145,7 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
     expect(found).toBeNull();
@@ -158,6 +163,24 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
+      blockedTransitionAt: secondCycle,
+    });
+    expect(found).toBeNull();
+  });
+
+  it("ignores a previous-cycle old-key wake for the current set", async () => {
+    await clearWakes();
+    await insertWake({
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKeyWithoutCycle({
+        dependentIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+    });
+    const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
+      companyId,
+      dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
     expect(found).toBeNull();
@@ -169,6 +192,7 @@ describeEmbeddedPostgres("earlier completed dependency-wake marker", () => {
     const found = await findEarlierCompletedIssueBlockersResolvedWakeForDependent(db, {
       companyId,
       dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: null,
     });
     expect(found).toBeNull();

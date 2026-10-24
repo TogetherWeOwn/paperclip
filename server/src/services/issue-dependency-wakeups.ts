@@ -1,4 +1,4 @@
-import { and, eq, inArray, like, lt } from "drizzle-orm";
+import { and, eq, inArray, like, lt, ne } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
@@ -244,12 +244,18 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
  * that was requested strictly before the current blocked cycle started, or
  * `null`.
  *
- * Route-time restores are gated separately (a bare status-only restore never
- * attempts a wake), but the periodic/finalize backstop only sees current
- * state: without this marker it would heal every no-op restore cycle — each
- * minting a new `blockedTransitionAt` — and re-admit the assignee forever
- * with no new context. A completed wake from an earlier cycle proves this
- * ready state was already announced, so the backstop skips the heal.
+ * Route-time restores are gated separately (a restore with no edge delta,
+ * handoff, or terminal signal never attempts a wake), but the periodic /
+ * finalize backstop only sees current state: without this marker it would
+ * heal every no-op restore cycle — each minting a new `blockedTransitionAt`
+ * — and re-admit the assignee forever with no new context. A completed
+ * cycle-key wake from an earlier cycle proves this ready state was already
+ * announced, so the backstop skips the heal.
+ *
+ * The pre-cycle no-cycle key for the current set is excluded: a completed
+ * old-key wake from a previous cycle must not suppress the new cycle (it
+ * predates cycle semantics), while a same-cycle old-key wake is already
+ * covered by `findExistingIssueBlockersResolvedWakeForReadyState`.
  *
  * This is deliberately backstop-only. Route-time genuine signals (newly
  * applied blocker edges, terminal reopens, blocker-done transitions) do not
@@ -265,6 +271,7 @@ export async function findEarlierCompletedIssueBlockersResolvedWakeForDependent(
   input: {
     companyId: string;
     dependentIssueId: string;
+    blockerIssueIds: string[];
     blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
   },
 ) {
@@ -273,6 +280,7 @@ export async function findEarlierCompletedIssueBlockersResolvedWakeForDependent(
   // Dependent ids are UUIDs, so the LIKE prefix carries no wildcard characters.
   const stateKeyPrefix =
     `${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:state:${input.dependentIssueId}:`;
+  const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
   const rows = await db
     .select({
       id: agentWakeupRequests.id,
@@ -285,6 +293,7 @@ export async function findEarlierCompletedIssueBlockersResolvedWakeForDependent(
         eq(agentWakeupRequests.status, "completed"),
         lt(agentWakeupRequests.requestedAt, cycleStart),
         like(agentWakeupRequests.idempotencyKey, `${stateKeyPrefix}%`),
+        ne(agentWakeupRequests.idempotencyKey, oldStateKey),
       ),
     )
     .limit(1);
