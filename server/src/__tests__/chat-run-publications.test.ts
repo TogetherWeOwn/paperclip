@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   chatConversations,
@@ -12,15 +10,17 @@ import {
   toolApplications,
   toolConnections,
 } from "@paperclipai/db";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
+import { sql } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   contextUuid,
   enqueueChatRunMilestones,
   wakeCommentLinkMatch,
 } from "../services/chat-run-publications.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
