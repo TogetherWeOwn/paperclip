@@ -1,0 +1,1 @@
+CREATE INDEX "chat_message_links_conversation_comment_idx" ON "chat_message_links" USING btree ("company_id","conversation_id","comment_id");

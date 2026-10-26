@@ -632,6 +632,13 @@ export const chatMessageLinks = pgTable(
       table.conversationId,
       table.providerMessageId,
     ),
+    // The milestone sweep probes links by (company, conversation) and then
+    // matches comment_id; without this index that EXISTS scans the table.
+    index("chat_message_links_conversation_comment_idx").on(
+      table.companyId,
+      table.conversationId,
+      table.commentId,
+    ),
     foreignKey({
       columns: [table.companyId, table.conversationId],
       foreignColumns: [chatConversations.companyId, chatConversations.id],
