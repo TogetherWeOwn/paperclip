@@ -14625,6 +14625,9 @@ export function issueRoutes(
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
+              ...(updated.blockedTransitionAt
+                ? { blockedTransitionAt: updated.blockedTransitionAt.toISOString() }
+                : {}),
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
               ...(commentBody ? { source: "comment" } : {}),
               ...(resumeRequested === true
@@ -15011,6 +15014,9 @@ export function issueRoutes(
             identifier: issue.identifier,
             authorizationReason: issueMutationAuthorizationReason,
             changes: issueChanges,
+            ...(issue.blockedTransitionAt
+              ? { blockedTransitionAt: issue.blockedTransitionAt.toISOString() }
+              : {}),
             ...(reviewInteractionId ? { reviewInteractionId } : {}),
             ...(commentBody ? { source: "comment" } : {}),
             ...(resumeRequested === true

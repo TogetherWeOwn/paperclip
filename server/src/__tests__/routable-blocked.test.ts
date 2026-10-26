@@ -51,18 +51,20 @@ describe("routable blocked notifications", () => {
     expect(markNotified).not.toHaveBeenCalled();
   });
 
-  it("does not wake an agent that named itself as the unblock owner in its own blocked write", async () => {
+  it("records the acknowledgment without waking an agent that named itself as the unblock owner", async () => {
     const wakeup = vi.fn(async () => undefined);
     const markNotified = vi.fn(async () => undefined);
+    const now = new Date("2026-07-23T18:30:00.000Z");
 
     await expect(deliverAgentUnblockNotification({
       issue: blockedIssue(),
       wakeup,
       markNotified,
       actorAgentId: agentId,
-    })).resolves.toBe(false);
+      now: () => now,
+    })).resolves.toBe(true);
     expect(wakeup).not.toHaveBeenCalled();
-    expect(markNotified).not.toHaveBeenCalled();
+    expect(markNotified).toHaveBeenCalledWith(now);
   });
 
   it("still wakes the named agent when another agent authored the blocked write", async () => {

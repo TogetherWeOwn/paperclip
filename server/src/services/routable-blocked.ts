@@ -41,7 +41,13 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
-  if (input.actorAgentId && input.actorAgentId === owner.agentId) return false;
+  if (input.actorAgentId && input.actorAgentId === owner.agentId) {
+    // Self-authored blocked write: the owner already knows, so do not wake
+    // it. Still record the acknowledgment so the passive-wait proof can
+    // recognize this transition once the authoring run finishes.
+    await input.markNotified((input.now ?? (() => new Date()))());
+    return true;
+  }
 
   await input.wakeup(owner.agentId, {
     source: "automation",
