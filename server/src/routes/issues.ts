@@ -14801,6 +14801,7 @@ export function issueRoutes(
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
           wakeup: heartbeat.wakeup,
+          actorAgentId: actor.actorType === "agent" ? actor.agentId : null,
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },

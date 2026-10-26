@@ -51,6 +51,34 @@ describe("routable blocked notifications", () => {
     expect(markNotified).not.toHaveBeenCalled();
   });
 
+  it("does not wake an agent that named itself as the unblock owner in its own blocked write", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(deliverAgentUnblockNotification({
+      issue: blockedIssue(),
+      wakeup,
+      markNotified,
+      actorAgentId: agentId,
+    })).resolves.toBe(false);
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(markNotified).not.toHaveBeenCalled();
+  });
+
+  it("still wakes the named agent when another agent authored the blocked write", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(deliverAgentUnblockNotification({
+      issue: blockedIssue(),
+      wakeup,
+      markNotified,
+      actorAgentId: "00000000-0000-4000-8000-000000000003",
+    })).resolves.toBe(true);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(markNotified).toHaveBeenCalledTimes(1);
+  });
+
   it("deduplicates one transition and notifies again after a blocked flap", async () => {
     const wakeup = vi.fn(async () => undefined);
     const markNotified = vi.fn(async () => undefined);

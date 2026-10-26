@@ -31,6 +31,7 @@ export async function deliverAgentUnblockNotification(input: {
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
+  actorAgentId?: string | null;
   now?: () => Date;
 }) {
   const { issue } = input;
@@ -40,6 +41,7 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
+  if (input.actorAgentId && input.actorAgentId === owner.agentId) return false;
 
   await input.wakeup(owner.agentId, {
     source: "automation",
