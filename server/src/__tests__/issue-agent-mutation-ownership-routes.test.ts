@@ -1845,7 +1845,7 @@ describe("agent issue mutation checkout ownership", () => {
   }
 
   it("records the acknowledgment without waking an agent that blocks its own issue", async () => {
-    mockProspectiveBlockedUpdate();
+    const blockedTransitionAt = mockProspectiveBlockedUpdate();
 
     const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
       status: "blocked",
@@ -1858,6 +1858,13 @@ describe("agent issue mutation checkout ownership", () => {
       expect.objectContaining({ reason: "issue_unblock_requested" }),
     );
     expect(res.body.blockedOwnerNotifiedAt).toEqual(expect.any(String));
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({ blockedTransitionAt: blockedTransitionAt.toISOString() }),
+      }),
+    );
   });
 
   it("wakes the named agent owner when the board authors the blocked write", async () => {

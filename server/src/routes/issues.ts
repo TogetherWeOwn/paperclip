@@ -14625,9 +14625,6 @@ export function issueRoutes(
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               changes,
-              ...(updated.blockedTransitionAt
-                ? { blockedTransitionAt: updated.blockedTransitionAt.toISOString() }
-                : {}),
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
               ...(commentBody ? { source: "comment" } : {}),
               ...(resumeRequested === true
