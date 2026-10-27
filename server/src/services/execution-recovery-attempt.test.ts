@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 
 describe("failure attempts across resource waits", () => {
   it("preserves prior failures through subscription waits without trusting unrelated context", () => {
@@ -27,7 +27,7 @@ describe("failure attempts across resource waits", () => {
 });
 
 describe("persisted independent accounting", () => {
-  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
+  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "model_decision_pending"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
     expect(executionFailureRetryCount({ scheduledRetryReason, scheduledRetryAttempt: 20,
       contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 1 } },
     })).toBe(2);
@@ -41,5 +41,16 @@ describe("persisted independent accounting", () => {
     ]) expect(executionFailureRetryCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2,
       contextSnapshot: { executionRetryAccounting },
     })).toBe(2);
+  });
+});
+
+describe("deferred model decisions", () => {
+  it("count their own attempts without spending failure retries", () => {
+    const run = { scheduledRetryReason: "model_decision_pending", scheduledRetryAttempt: 5,
+      contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 1, maxTurnContinuations: 0 } } };
+    expect(executionRetryAttemptCount(run, "model_decision_pending")).toBe(5);
+    expect(executionRetryAttemptCount({ ...run, scheduledRetryReason: "transient_failure" }, "model_decision_pending")).toBe(0);
+    expect(accountingForScheduledRetry(run, "model_decision_pending", 6)).toMatchObject({ failureRetries: 1 });
+    expect(executionFailureRetryCount(run)).toBe(1);
   });
 });

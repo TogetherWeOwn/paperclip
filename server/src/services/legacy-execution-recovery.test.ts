@@ -35,6 +35,18 @@ it("permits subscription waits only with explicit evidence that provider work ne
   } })).toBe(true);
 });
 
+it("retries a deferred model decision only when no provider work started", () => {
+  const deferred = { runtimeMode: "legacy", status: "cancelled", errorCode: "model_decision_pending", scheduledRetryAttempt: 3,
+    resultJson: { executionRecovery: { kind: "model_decision_pending", providerWorkStarted: false } } };
+  expect(legacyExecutionNeedsReconciliation(deferred)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...deferred, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...deferred, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...deferred, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...deferred, resultJson: {
+    executionRecovery: { kind: "model_decision_pending", providerWorkStarted: true },
+  } })).toBe(true);
+});
+
 it("allows a confirmed interrupted checkpoint without treating ordinary cancellation as replay permission", () => {
   expect(legacyExecutionNeedsReconciliation(stopped)).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...stopped, resultJson: {} })).toBe(true);

@@ -298,7 +298,7 @@ import {
   adapterExecutionControls,
   createAdapterExecutionControl,
 } from "./adapter-execution-control.js";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { executionFailureRetryCount, executionRetryAttemptCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -2669,18 +2669,54 @@ export function heartbeatService(
         if (!(error instanceof RunModelDecisionDeferral)) throw error;
         const now = new Date();
         context.modelDecision = error.record;
+        // The router deferred before any provider work: a recorded, expected wait,
+        // never an unexpected stop that parks the card for reconciliation.
         const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
           error: error.message, errorCode: RUN_MODEL_RESOLVE_RETRY_REASON, finishedAt: now,
-          resultJson: { executionRecovery: { kind: RUN_MODEL_RESOLVE_RETRY_REASON, providerWorkStarted: false } },
+          resultJson: {
+            executionRecovery: { kind: RUN_MODEL_RESOLVE_RETRY_REASON, providerWorkStarted: false },
+            cancellation: {
+              source: "control_plane", expected: true, initiator: { type: "system" },
+              reason: "Waiting for the model router", recordedAt: now.toISOString(),
+            },
+          },
           contextSnapshot: context,
         });
         if (cancelled.updated) {
+          const cancelledRun = cancelled.run ?? run;
           await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: error.message });
-          const retry = await scheduleBoundedRetryForRun(cancelled.run ?? run, agent, {
+          const consumedAttempts = executionRetryAttemptCount(cancelledRun, RUN_MODEL_RESOLVE_RETRY_REASON);
+          const retry = await scheduleBoundedRetryForRun(cancelledRun, agent, {
             now, retryReason: RUN_MODEL_RESOLVE_RETRY_REASON, wakeReason: "model_decision_retry",
             maxAttempts: RUN_MODEL_RESOLVE_MAX_ATTEMPTS, delayMs: error.retryAfterMs,
           });
-          if (retry.outcome !== "scheduled") await releaseIssueExecutionAndPromote(cancelled.run ?? run);
+          const retryScheduled = retry.outcome === "scheduled";
+          await appendRunEvent(cancelledRun, {
+            eventType: "lifecycle", stream: "system", level: retryScheduled ? "info" : "warn",
+            message: retryScheduled
+              ? `Deferred: ${error.message}. Retry ${consumedAttempts + 1} of ${RUN_MODEL_RESOLVE_MAX_ATTEMPTS} scheduled; the run does not start on the default model.`
+              : `Deferred: ${error.message}. No retry remains; the issue needs attention and the run does not start on the default model.`,
+            payload: { modelDecision: error.record, consumedAttempts, maxAttempts: RUN_MODEL_RESOLVE_MAX_ATTEMPTS, retryScheduled },
+          }).catch(() => undefined);
+          if (!retryScheduled) {
+            // The escalation below owns recovery; immediate recovery would start a fresh run and a fresh retry chain.
+            await releaseIssueExecutionAndPromote(cancelledRun, { suppressImmediateRecovery: true });
+            // Exhausted: hand the card to the recovery lane so it is blocked on a named owner, not parked.
+            const strandedIssue = issueId
+              ? await db.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId))).then(rows => rows[0] ?? null)
+              : null;
+            if (strandedIssue && ["todo", "in_progress", "in_review"].includes(strandedIssue.status)) {
+              await recovery.escalateStrandedAssignedIssue({
+                issue: strandedIssue,
+                previousStatus: strandedIssue.status as "todo" | "in_progress" | "in_review",
+                latestRun: cancelledRun,
+                comment: [
+                  `The model router has not decided a model for this issue after ${consumedAttempts} scheduled attempts (last reason: ${error.reason}).`,
+                  "The run was not started on the default model. Check the model router plugin, then move the issue back to `todo`.",
+                ].join("\n\n"),
+              }).catch(err => logger.error({ err, runId: run.id }, "failed to surface exhausted model-decision deferral"));
+            }
+          }
           await finalizeAgentStatus(run.agentId, "cancelled");
         }
         return;
