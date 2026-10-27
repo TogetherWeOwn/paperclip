@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 
 export const ROUTABLE_BLOCKED_ROLLOUT_AT = new Date("2026-07-23T18:13:03.000Z");
@@ -14,6 +15,21 @@ type ProspectiveBlockedIssue = RoutableBlockedIssue & {
   status: "blocked";
   blockedTransitionAt: Date;
 };
+
+// Stable fingerprint binding an activity entry to the exact unblock descriptor
+// the author wrote. Activity details pass through secret and username
+// redaction before they are stored, so the proof cannot compare the raw
+// action text; the hex digest survives that redaction. MD5 (not SHA) because
+// Postgres md5() is built-in with no extension, and this is binding, not
+// security. Returns null for malformed input so callers fail closed.
+export function unblockDescriptorFingerprint(descriptor: unknown): string | null {
+  if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) return null;
+  const { owner, action } = descriptor as { owner?: unknown; action?: unknown };
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return null;
+  const { agentId } = owner as { agentId?: unknown };
+  if (typeof agentId !== "string" || typeof action !== "string") return null;
+  return createHash("md5").update(`${agentId}\n${action}`, "utf8").digest("hex");
+}
 
 export function isProspectiveBlockedTransition(issue: RoutableBlockedIssue): issue is ProspectiveBlockedIssue {
   return issue.status === "blocked" &&

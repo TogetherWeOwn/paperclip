@@ -3,6 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import { activityLog, agents, agentApiKeys, agentWakeupRequests, companies, createDb, heartbeatRuns, issues, issueComments, issueRelations, issueThreadInteractions, routines, routineTriggers } from "@paperclipai/db";
+import { unblockDescriptorFingerprint } from "../services/routable-blocked.js";
 import { beginIdleTrackedWork, idleWorkSnapshot } from "../services/task-admission.js";
 import { readIdleSleepSafety, type IdleSleepDrainStatus } from "../services/idle-sleep-safety.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -103,7 +104,8 @@ if (!support.supported) console.warn(`Skipping issue schedule Postgres tests: ${
     await db.update(heartbeatRuns).set({ finishedAt: new Date(now - 1000), contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, f.runId));
     const [activity] = await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.agentId,
       agentId: f.agentId, runId: f.runId, action: "issue.updated", entityType: "issue", entityId: issue.id,
-      details: { status: "blocked", blockedTransitionAt: transition.toISOString(), unblockDescriptor: descriptor },
+      details: { status: "blocked", blockedTransitionAt: transition.toISOString(), unblockDescriptor: descriptor,
+        unblockDescriptorFingerprint: unblockDescriptorFingerprint(descriptor) },
     }).returning();
     return { ...f, issue, activity, descriptor, transition };
   }
@@ -138,12 +140,25 @@ if (!support.supported) console.warn(`Skipping issue schedule Postgres tests: ${
     expect(await readIssueSchedules()).toEqual(none);
   });
 
-  it.each(["unnotified", "new_transition", "changed_action", "missing_activity", "foreign_activity", "accounting", "retry"])(
+  it("allows a blocked task when redaction rewrote the stored action text", async () => {
+    const f = await selfAcknowledgedUnblockRequest();
+    // Simulate username censoring: the stored copy no longer matches the
+    // issue row, but the fingerprint written alongside it still binds the
+    // exact descriptor the author wrote.
+    const stored = f.activity.details as Record<string, unknown>;
+    await db.update(activityLog).set({ details: { ...stored,
+      unblockDescriptor: { owner: { agentId: f.agentId }, action: "Provide the * input" } } }).where(eq(activityLog.id, f.activity.id));
+    expect(await readIssueSchedules()).toEqual(none);
+  });
+
+  it.each(["unnotified", "new_transition", "changed_action", "changed_fingerprint", "missing_activity", "foreign_activity", "accounting", "retry"])(
     "retains a blocked task with %s self-authored unblock evidence", async kind => {
       const f = await selfAcknowledgedUnblockRequest();
       if (kind === "unnotified") await db.update(issues).set({ blockedOwnerNotifiedAt: null }).where(eq(issues.id, f.issue.id));
       if (kind === "new_transition") await db.update(issues).set({ blockedTransitionAt: new Date(now - 3000), blockedOwnerNotifiedAt: new Date(now - 2000) }).where(eq(issues.id, f.issue.id));
       if (kind === "changed_action") await db.update(issues).set({ unblockDescriptor: { ...f.descriptor, action: "Different input" } }).where(eq(issues.id, f.issue.id));
+      if (kind === "changed_fingerprint") await db.update(activityLog).set({ details: { ...(f.activity.details as Record<string, unknown>),
+        unblockDescriptorFingerprint: "0".repeat(32) } }).where(eq(activityLog.id, f.activity.id));
       if (kind === "missing_activity") await db.delete(activityLog).where(eq(activityLog.id, f.activity.id));
       if (kind === "foreign_activity") await db.update(activityLog).set({ companyId: (await seed()).companyId }).where(eq(activityLog.id, f.activity.id));
       if (kind === "accounting") await db.update(heartbeatRuns).set({ costAccountingPending: true }).where(eq(heartbeatRuns.id, f.runId));

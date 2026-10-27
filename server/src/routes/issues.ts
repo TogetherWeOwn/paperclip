@@ -349,7 +349,7 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
-import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
+import { deliverAgentUnblockNotification, unblockDescriptorFingerprint } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -14994,6 +14994,11 @@ export function issueRoutes(
           activeRecoveryAction: null,
         };
       }
+      // Fingerprint of the exact descriptor written, for the self-authored
+      // passive-wait proof. Stored separately because details pass through
+      // redaction while the proof compares against the unredacted issue row.
+      const unblockDescriptorActivityFingerprint =
+        unblockDescriptorFingerprint(updateFields.unblockDescriptor);
       if (!persistReviewActivityTransactionally)
         await logActivity(db, {
           companyId: issue.companyId,
@@ -15013,6 +15018,9 @@ export function issueRoutes(
             changes: issueChanges,
             ...(issue.blockedTransitionAt
               ? { blockedTransitionAt: issue.blockedTransitionAt.toISOString() }
+              : {}),
+            ...(unblockDescriptorActivityFingerprint
+              ? { unblockDescriptorFingerprint: unblockDescriptorActivityFingerprint }
               : {}),
             ...(reviewInteractionId ? { reviewInteractionId } : {}),
             ...(commentBody ? { source: "comment" } : {}),

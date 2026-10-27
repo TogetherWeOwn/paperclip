@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   deliverAgentUnblockNotification,
   ROUTABLE_BLOCKED_ROLLOUT_AT,
+  unblockDescriptorFingerprint,
 } from "../services/routable-blocked.js";
 
 const agentId = "00000000-0000-4000-8000-000000000001";
@@ -103,4 +105,25 @@ describe("routable blocked notifications", () => {
       idempotencyKey: expect.stringContaining(secondTransition.toISOString()),
     });
   });
+});
+
+describe("unblock descriptor fingerprint", () => {
+  it("hashes the owner and action into a stable hex digest", () => {
+    const descriptor = { owner: { agentId: agentId }, action: "Review the finding" };
+    const expected = createHash("md5").update(`${agentId}\nReview the finding`, "utf8").digest("hex");
+    expect(unblockDescriptorFingerprint(descriptor)).toBe(expected);
+    expect(unblockDescriptorFingerprint(descriptor)).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("changes when the owner or action changes", () => {
+    const base = unblockDescriptorFingerprint({ owner: { agentId }, action: "Review the finding" });
+    expect(unblockDescriptorFingerprint({ owner: { agentId: `${agentId}x` }, action: "Review the finding" })).not.toBe(base);
+    expect(unblockDescriptorFingerprint({ owner: { agentId }, action: "Review another finding" })).not.toBe(base);
+  });
+
+  it.each([null, undefined, "descriptor", 42, [], {}, { owner: "board" }, { owner: {} }, { owner: { agentId: 7 } }, { owner: { agentId: agentId } }, { action: "x" }])(
+    "returns null for malformed input %j", (input) => {
+      expect(unblockDescriptorFingerprint(input)).toBeNull();
+    },
+  );
 });

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
@@ -5,6 +6,8 @@ import { getTableName, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { redactCurrentUserValue } from "../log-redaction.js";
+import { sanitizeRecord } from "../redaction.js";
 import { ROUTABLE_BLOCKED_ROLLOUT_AT } from "../services/routable-blocked.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
@@ -1858,13 +1861,39 @@ describe("agent issue mutation checkout ownership", () => {
       expect.objectContaining({ reason: "issue_unblock_requested" }),
     );
     expect(res.body.blockedOwnerNotifiedAt).toEqual(expect.any(String));
+    const expectedFingerprint = createHash("md5")
+      .update(`${ownerAgentId}\nProvide the missing input`, "utf8").digest("hex");
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         action: "issue.updated",
-        details: expect.objectContaining({ blockedTransitionAt: blockedTransitionAt.toISOString() }),
+        details: expect.objectContaining({
+          blockedTransitionAt: blockedTransitionAt.toISOString(),
+          unblockDescriptorFingerprint: expectedFingerprint,
+        }),
       }),
     );
+  });
+
+  it("keeps the descriptor fingerprint intact when username censoring rewrites the stored action", async () => {
+    mockProspectiveBlockedUpdate();
+
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Inspect /home/alice/build.log" },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const loggedDetails = mockLogActivity.mock.calls.map(([, input]) => input.details)
+      .find((details): details is Record<string, unknown> =>
+        Boolean(details) && typeof details === "object" && "unblockDescriptorFingerprint" in details);
+    expect(loggedDetails).toBeDefined();
+    // Same composition logActivity applies before storage, with censoring on.
+    const stored = redactCurrentUserValue(sanitizeRecord(loggedDetails!),
+      { userNames: ["alice"], homeDirs: ["/home/alice"] });
+    expect((stored.unblockDescriptor as { action: string }).action).not.toContain("alice");
+    expect(stored.unblockDescriptorFingerprint).toBe(loggedDetails!.unblockDescriptorFingerprint);
+    expect(stored.blockedTransitionAt).toBe(loggedDetails!.blockedTransitionAt);
   });
 
   it("wakes the named agent owner when the board authors the blocked write", async () => {

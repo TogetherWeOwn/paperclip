@@ -53,10 +53,12 @@ export function completedAgentUnblockRequest(issue: string): string {
 // without enqueueing one, so this proof keys on the durable activity entry for
 // that exact transition instead of a wake receipt. An agent may only name itself
 // as unblock owner, so a matching self-authored entry exists exactly for the
-// transitions where the wake was suppressed. When the write came from a run,
-// that run must be finished so a still-live author cannot certify its own
-// in-flight work as passive; a run-less write (agent key without run context)
-// has no execution in flight to wait for.
+// transitions where the wake was suppressed. The descriptor binding is a
+// fingerprint, not the raw text: activity details pass through secret and
+// username redaction before storage, while the issue row keeps the original.
+// When the write came from a run, that run must be finished so a still-live
+// author cannot certify its own in-flight work as passive; a run-less write
+// (agent key without run context) has no execution in flight to wait for.
 export function selfAcknowledgedAgentUnblockRequest(issue: string): string {
   return `${issue}.blocked_transition_at IS NOT NULL
     AND ${issue}.blocked_owner_notified_at >= ${issue}.blocked_transition_at
@@ -80,7 +82,9 @@ export function selfAcknowledgedAgentUnblockRequest(issue: string): string {
         AND self_block.details->>'status' = 'blocked'
         AND self_block.details->>'blockedTransitionAt'
           = to_char(${issue}.blocked_transition_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
-        AND self_block.details->'unblockDescriptor' = ${issue}.unblock_descriptor
+        AND self_block.details->>'unblockDescriptorFingerprint'
+          = md5((${issue}.unblock_descriptor->'owner'->>'agentId') || chr(10)
+            || (${issue}.unblock_descriptor->>'action'))
         AND self_block.created_at >= ${issue}.blocked_transition_at - INTERVAL '5 seconds')`;
 }
 
