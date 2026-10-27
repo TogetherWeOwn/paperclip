@@ -27,6 +27,60 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported
   ? describe
   : describe.skip;
 
+// Postgres prints a uuid column cast to text as `(alias.col)::text` and a run
+// context read as `(alias.context_snapshot ->> 'key'::text)`. The sweep's old
+// `column::text = context ->> 'key'` form is exactly one next to the other
+// around `=`, in either order.
+const CONTEXT_READ = String.raw`(?:\w+\.)?context_snapshot\s*->>\s*'\w+'::text`;
+const COLUMN_AS_TEXT = String.raw`\((?:\w+\.)?\w+\)::text`;
+const TEXT_CAST_CONTEXT_COMPARES = [
+  new RegExp(String.raw`${COLUMN_AS_TEXT}\)*\s*=\s*\(*${CONTEXT_READ}`),
+  new RegExp(String.raw`${CONTEXT_READ}\)*\s*=\s*\(*${COLUMN_AS_TEXT}`),
+  // Postgres hashes a correlated EXISTS into a subplan, so the cast moves
+  // into the subplan's output. The raw issueId read compared with a subplan
+  // column is how that shows up; the guarded form compares a CASE ... END.
+  /context_snapshot\s*->>\s*'issueId'::text\)\s*=\s*\(hashed SubPlan \d+\)\.col\d+/,
+];
+
+function hasTextCastContextCompare(condition: string) {
+  return TEXT_CAST_CONTEXT_COMPARES.some((pattern) => pattern.test(condition));
+}
+
+// context key -> the uuid column the sweep compares it with.
+const GUARDED_CONTEXT_KEYS = {
+  issueId: "issue_id",
+  interactionId: "id",
+  sourceRunId: "source_run_id",
+  wakeCommentId: "comment_id",
+  commentId: "comment_id",
+} as const;
+
+function hasGuardedUuidCompare(
+  conditions: string[],
+  column: string,
+  contextKey: string,
+) {
+  const guarded = new RegExp(
+    String.raw`\b${column}\s*=\s*CASE WHEN \(\([\w.]*context_snapshot ->> '${contextKey}'::text\) ~ `,
+  );
+  return conditions.some((condition) => guarded.test(condition));
+}
+
+function collectPlanConditions(node: unknown, conditions: string[] = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) collectPlanConditions(child, conditions);
+  } else if (node && typeof node === "object") {
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string" && /(Filter|Cond)$/.test(key)) {
+        conditions.push(value);
+      } else {
+        collectPlanConditions(value, conditions);
+      }
+    }
+  }
+  return conditions;
+}
+
 // The milestone sweep used to compare `uuid_column::text = context ->> 'x'`.
 // These tests pin that the guarded uuid form returns the same truth value
 // for every context shape, including malformed ids, so the sweep can use
@@ -131,6 +185,78 @@ describeEmbeddedPostgres("chat run milestone context id matching", () => {
         result[0]!.old_match ?? false,
       );
       expect(result[0]!.new_match ?? false, label).toBe(expected);
+    }
+  });
+
+  // `EXPLAIN` runs on the exact statements the sweep sends, so a call site
+  // that goes back to `column::text = context ->> 'x'` fails here even though
+  // every behavior test above would still pass.
+  it("keeps the sweep's uuid filters free of text casts on indexed columns", async () => {
+    // drizzle reads the logger when it builds each query; the test db is
+    // not created with one, so swap it in for the length of one sweep.
+    const session = db.session as unknown as {
+      logger: { logQuery(query: string, params: unknown[]): void };
+      client: {
+        unsafe(
+          query: string,
+          params: unknown[],
+        ): Promise<Array<Record<string, unknown>>>;
+      };
+    };
+    const originalLogger = session.logger;
+    const sweepQueries: Array<{ query: string; params: unknown[] }> = [];
+    session.logger = {
+      logQuery: (query, params) => {
+        sweepQueries.push({ query, params });
+      },
+    };
+    try {
+      await enqueueChatRunMilestones(db);
+    } finally {
+      session.logger = originalLogger;
+    }
+    // Milestone candidates and safe native progress candidates.
+    expect(sweepQueries.length).toBeGreaterThanOrEqual(2);
+
+    const conditions: string[] = [];
+    for (const { query, params } of sweepQueries) {
+      const rows = await session.client.unsafe(
+        `explain (format json) ${query}`,
+        params,
+      );
+      collectPlanConditions(rows[0]?.["QUERY PLAN"], conditions);
+    }
+    expect(conditions.length).toBeGreaterThan(0);
+
+    expect(conditions.filter(hasTextCastContextCompare)).toEqual([]);
+    for (const [contextKey, column] of Object.entries(GUARDED_CONTEXT_KEYS)) {
+      expect(
+        hasGuardedUuidCompare(conditions, column, contextKey),
+        `${column} = guarded uuid of context ${contextKey}`,
+      ).toBe(true);
+    }
+  });
+
+  it("flags the pre-fix text-cast comparison shapes", () => {
+    const preFix = [
+      "((heartbeat_runs.context_snapshot ->> 'issueId'::text) = (chat_conversations.issue_id)::text)",
+      "((question_delivery.issue_id)::text = (heartbeat_runs.context_snapshot ->> 'issueId'::text))",
+      "((interaction.id)::text = (heartbeat_runs.context_snapshot ->> 'interactionId'::text))",
+      "((comment_id)::text = (context_snapshot ->> 'wakeCommentId'::text))",
+      "((context_snapshot ->> 'issueId'::text) = (hashed SubPlan 2).col2)",
+    ];
+    for (const condition of preFix) {
+      expect(hasTextCastContextCompare(condition), condition).toBe(true);
+    }
+    const guarded = [
+      "(id = CASE WHEN ((heartbeat_runs.context_snapshot ->> 'interactionId'::text) ~ '^x$'::text) THEN ((heartbeat_runs.context_snapshot ->> 'interactionId'::text))::uuid ELSE NULL::uuid END)",
+      // Text compares between two text values are not index blockers.
+      "((question_prompt.payload ->> 'interactionId'::text) = (interaction_id)::text)",
+      "((heartbeat_runs.context_snapshot -> 'wakeCommentIds'::text) ? (comment_id)::text)",
+      "(CASE WHEN ((context_snapshot ->> 'issueId'::text) ~ '^x$'::text) THEN ((context_snapshot ->> 'issueId'::text))::uuid ELSE NULL::uuid END = (hashed SubPlan 2).col2)",
+    ];
+    for (const condition of guarded) {
+      expect(hasTextCastContextCompare(condition), condition).toBe(false);
     }
   });
 
