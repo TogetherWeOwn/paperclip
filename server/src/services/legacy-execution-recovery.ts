@@ -43,6 +43,10 @@ export function legacyExecutionNeedsReconciliation(
   // a resource wait, not a failed provider attempt or permission to replay work.
   if (run.status === "cancelled" && (run.errorCode === "ai_connection_busy" || run.errorCode === "ai_connection_pool_exhausted") &&
       evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
+  // The model router has not yet decided. Same resource-wait rule: the run was
+  // cancelled before provider work and its bounded retry owns the next attempt.
+  if (run.status === "cancelled" && run.errorCode === "model_decision_pending" &&
+      evidence?.kind === "model_decision_pending" && evidence.providerWorkStarted === false) return false;
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
