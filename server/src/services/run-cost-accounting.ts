@@ -182,14 +182,19 @@ export async function reconcileRunCosts(db: Db, hooks: BudgetServiceHooks = {}) 
 
 /** Share one full sweep across overlapping scheduler ticks. Do not enqueue
  * another sweep: the next tick retries after either success or failure. */
-export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks = {}) {
+export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks = {}, recoverServices?: () => Promise<void>) {
   let inFlight: Promise<Awaited<ReturnType<typeof reconcileRunCosts>>> | undefined;
   return () => {
     if (!inFlight) {
       inFlight = (async () => {
         try {
+          let serviceRecoveryFailure: { error: unknown } | undefined;
+          try { await recoverServices?.(); }
+          catch (error) { serviceRecoveryFailure = { error }; }
           await replayUsageReceipts(db);
-          return await reconcileRunCosts(db, hooks);
+          const result = await reconcileRunCosts(db, hooks);
+          if (serviceRecoveryFailure) throw serviceRecoveryFailure.error;
+          return result;
         } finally {
           inFlight = undefined;
         }

@@ -398,7 +398,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const two = await createAgentLifecycle(db).requestHire(companyId, { name: "Another agent" });
     await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
     await budgetService(db).getInvocationBlock(companyId, one.id);
-    expect((await current(one.id)).lifecycleHolds).toContain("company_paused");
+    // #17046 residual: admission no longer reconciles lifecycle holds.
+    expect((await current(one.id)).lifecycleHolds).not.toContain("company_paused");
     expect((await current(two.id)).lifecycleHolds).toEqual([]);
   });
 

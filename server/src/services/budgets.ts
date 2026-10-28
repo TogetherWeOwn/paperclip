@@ -301,7 +301,11 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
   const recordActivity = (input: LogActivityInput) => logActivity(db, input, publications);
   async function pauseScopeForBudget(policy: PolicyRow) {
     const now = new Date();
-    if (policy.scopeType === "agent") return;
+    if (policy.scopeType === "agent") {
+      const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
+      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, true);
+      return;
+    }
 
     if (policy.scopeType === "project") {
       await db
@@ -342,7 +346,11 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       if (await policyBlocks(db, candidate)) return;
     }
     const now = new Date();
-    if (policy.scopeType === "agent") return;
+    if (policy.scopeType === "agent") {
+      const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
+      await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, false);
+      return;
+    }
 
     if (policy.scopeType === "project") {
       await db
@@ -988,10 +996,7 @@ export async function withCurrentBudgetEnforcement<T>(db: Db, scope: BudgetEnfor
 
 /** Cancellation is an at-least-once external effect. A failed delivery never
  * rolls back committed spend, and its version remains pending for recovery. */
-export async function deliverBudgetEnforcement(db: Db, hooks: BudgetServiceHooks, companyId?: string, agentId?: string | null) {
-  const { createAgentLifecycle } = await import("./agent-lifecycle.js");
-  // Global recovery uses the bounded lifecycle sweep for policy holds.
-  if (companyId) await createAgentLifecycle(db).reconcilePolicyHolds(companyId, agentId);
+export async function deliverBudgetEnforcement(db: Db, hooks: BudgetServiceHooks, companyId?: string, _agentId?: string | null) {
   if (!hooks.cancelWorkForScope) return;
   const pending = await db.select().from(budgetPolicies).where(and(
     sql`${budgetPolicies.enforcementVersion} > ${budgetPolicies.enforcementDeliveredVersion}`,

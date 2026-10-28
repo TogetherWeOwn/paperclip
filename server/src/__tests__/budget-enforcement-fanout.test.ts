@@ -1,0 +1,134 @@
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { activityLog, agents, approvals, budgetIncidents, budgetPolicies, companies, costEvents, createDb } from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+
+vi.mock("../telemetry.js", () => ({ getTelemetryClient: () => ({ track: vi.fn() }) }));
+
+import { budgetService } from "../services/budgets.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
+import { createCostAccountingReconciler } from "../services/run-cost-accounting.ts";
+
+// Residual of upstream #17046 (30b753f61): budget enforcement delivery no longer
+// runs company-wide lifecycle reconciliation (one company accounting
+// transaction per agent), and the cost accounting sweep is single-flight.
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("budget enforcement company-lock fan-out", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-budget-enforcement-fanout-");
+    db = createDb(tempDb.connectionString);
+  }, 60_000);
+
+  afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(budgetIncidents);
+    await db.delete(approvals);
+    await db.delete(budgetPolicies);
+    await db.delete(costEvents);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function companyWithIdleAgents(count: number) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Fan-out",
+      issuePrefix: `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(Array.from({ length: count }, (_, index) => ({
+      id: randomUUID(), companyId, name: `Idle ${index}`, role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    })));
+    return companyId;
+  }
+
+  /** Runs `start` while another transaction holds the company accounting row. */
+  async function settleWhileCompanyLocked<T>(companyId: string, start: () => Promise<T>) {
+    let pending!: Promise<T>;
+    const settled = await db.transaction(async (tx) => {
+      await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).for("update");
+      pending = start();
+      return Promise.race([
+        pending.then((value) => ({ value })),
+        new Promise<"waiting">((resolve) => setTimeout(resolve, 1_000, "waiting")),
+      ]);
+    });
+    await pending;
+    return settled;
+  }
+
+  it("settles budget enforcement without a company accounting transaction per idle agent", async () => {
+    const companyId = await companyWithIdleAgents(5);
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+
+    const settled = await settleWhileCompanyLocked(companyId,
+      () => budgetService(db, { cancelWorkForScope }).deliverPendingEnforcement(companyId));
+
+    // Before the fix this waited behind the held row: reconcilePolicyHolds
+    // opened one company accounting transaction for each of the 5 idle agents
+    // on every settlement, cost event and policy sweep.
+    expect(settled).toEqual({ value: undefined });
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
+  });
+
+  it("applies an agent hard-stop hold in the budget transaction without touching other agents", async () => {
+    const companyId = await companyWithIdleAgents(3);
+    const [agent, ...others] = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agent!.id,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: true });
+    const [event] = await db.insert(costEvents).values({ companyId, agentId: agent!.id, provider: "openai", biller: "openai",
+      billingType: "metered_api", model: "fanout", inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, costCents: 150,
+      occurredAt: new Date() }).returning();
+    const service = budgetService(db);
+
+    await service.evaluateCostEvent(event!);
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]).toMatchObject({ lifecycleHolds: ["budget"] });
+    for (const other of others) {
+      expect((await db.select().from(agents).where(eq(agents.id, other.id)))[0]).toMatchObject({ lifecycleHolds: [] });
+    }
+    expect(await service.getInvocationBlock(companyId, agent!.id)).toMatchObject({ scopeType: "agent", scopeId: agent!.id });
+
+    await service.upsertPolicy(companyId, { scopeType: "agent", scopeId: agent!.id, amount: 200 }, null);
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]?.lifecycleHolds).not.toContain("budget");
+  });
+
+  it("shares one recovery sweep, including service recovery, across overlapping ticks", async () => {
+    let release!: () => void;
+    const recoverServices = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const reconcile = createCostAccountingReconciler(db, {}, recoverServices);
+
+    const first = reconcile();
+    const second = reconcile();
+    expect(second).toBe(first);
+    release();
+    await expect(first).resolves.toMatchObject({ scanned: 0, accounted: 0 });
+    expect(recoverServices).toHaveBeenCalledTimes(1);
+
+    // A failed service recovery still completes run accounting, then reports.
+    const failing = createCostAccountingReconciler(db, {}, () => Promise.reject(new Error("decision recovery failed")));
+    await expect(failing()).rejects.toThrow("decision recovery failed");
+  });
+
+  it("returns the in-flight sweep from the heartbeat service instead of starting another", async () => {
+    const heartbeat = heartbeatService(db);
+    const first = heartbeat.reconcileCostAccounting();
+    const second = heartbeat.reconcileCostAccounting();
+    expect(second).toBe(first);
+    await first;
+  });
+});

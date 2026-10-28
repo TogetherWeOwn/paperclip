@@ -47,6 +47,14 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
   return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
 }
 
+/** Budget evaluation owns the transaction and supplies the aggregate agent decision.
+ * 1023 port of upstream 30b753f61: the 1023 lifecycle store re-derives the hold
+ * from the agent's policies inside the same transaction, so `blocked` is advisory. */
+export function applyAgentBudgetHoldInTransaction(tx: Db, companyId: string, agentId: string, _blocked: boolean) {
+  void companyId;
+  return lifecycle.reconcileAgentPolicyHoldsInTransaction(tx, createAgentLifecycleEffects(), agentId);
+}
+
 function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDriver {
   return { ...driver, runHost: agent => trackIdleWork(driver.runHost(agent)),
     runPlugin: (agent, pluginId) => trackIdleWork(driver.runPlugin(agent, pluginId)) };

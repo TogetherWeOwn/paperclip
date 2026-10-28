@@ -452,14 +452,18 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     });
   });
 
-  // 1023-only: budgetService.getInvocationBlock also reconciles agent policy
-  // holds under the lock. The fast path is taken only when that is a no-op.
-  it("keeps agent hold reconciliation behind the company lock when holds are unsettled", async () => {
+  // 1023-only: an agent with unsettled holds still takes the locked admission
+  // path. Since the #17046 residual, admission no longer reconciles company-
+  // inherited lifecycle holds; the bounded lifecycle policy sweep settles them.
+  it("keeps admission behind the company lock when agent holds are unsettled", async () => {
     const { companyId, agentId } = await createBudgetFixture();
     await db.update(agents).set({ lifecycleHolds: ["company_paused"], pauseReason: "company_paused" }).where(eq(agents.id, agentId));
     const { settled, admission } = await settleWhileLocked({ companyId }, () => budgetService(db).getInvocationBlock(companyId, agentId));
     expect(settled).toBe("waiting");
     expect(await admission).toBeNull();
+    expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]).toMatchObject({ lifecycleHolds: ["company_paused"] });
+    const { createAgentLifecycle } = await import("../services/agent-lifecycle.js");
+    await createAgentLifecycle(db).reconcilePolicyHolds(companyId);
     expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]).toMatchObject({ lifecycleHolds: [], pauseReason: null });
   });
 
