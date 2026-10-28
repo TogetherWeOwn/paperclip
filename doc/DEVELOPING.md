@@ -19,12 +19,35 @@ Current implementation status:
 
 GitHub Actions owns `pnpm-lock.yaml`.
 
-- A pull request can include `pnpm-lock.yaml` only alongside a root or workspace `package.json` change. CI resolves the base lockfile with the pull request manifests and requires the result to match the committed lockfile byte-for-byte.
-- Lockfile-only edits and lockfiles that the resolver cannot reproduce fail the policy gate. The existing refresh-branch and Dependabot workflow exceptions remain unchanged.
-- Run `pnpm install --resolution-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile` locally and commit the generated lockfile with the manifest change. The policy job sets up the pinned pnpm version before this check and restores the pull request lockfile on every exit. It reads NUL-delimited filenames so large diffs and unusual workspace paths cannot skip validation.
+- A pull request can include `pnpm-lock.yaml` only alongside a root or workspace `package.json` change. CI resolves the merge-base lockfile with the committed PR head manifests in a disposable worktree and requires the result to match the head lockfile byte-for-byte. Unrelated manifests or lockfile updates in the synthetic merge ref or current base tip do not enter this proof; other policy checks still use the merge tree.
+- Lockfile-only edits and lockfiles that the resolver cannot reproduce fail the policy gate. Existing exceptions for Dependabot and reviewed repairs targeting the current `deploy/*` base remain. Refresh heads (`chore/refresh-lockfile` and `chore/refresh-lockfile-deploy-tog6`) are exempt only for same-repository PRs authored by `github-actions[bot]`; branch names alone cannot bypass the gate.
+- Run `pnpm install --resolution-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile` with pnpm **9.15.4** locally and commit the generated lockfile with the manifest change. The proof worktree is removed on every exit; the checkout's lockfile is never overwritten. The gate reads NUL-delimited filenames so large diffs and unusual workspace paths cannot skip validation.
+- This is deliberately a live-resolution reproducibility proof, not a historical integrity verifier. New registry releases that satisfy a dependency range can make an honestly generated lockfile stop reproducing. A mismatch does not imply manual editing: merge the current base and regenerate using the pinned version, then rerun CI. The gate still rejects a mismatch rather than accepting unverified dependency URLs or integrity values.
 - The gate disables both lifecycle scripts and pnpmfile hooks. [`--ignore-scripts` alone does not disable pnpmfile hooks](https://pnpm.io/pnpmfile#ignorepnpmfile); a PR hook must not supply the lockfile used as the reproducibility proof.
+To reproduce the exact proof after fetching and merging the current base, seed from the merge-base lockfile first (replace `origin/master` with your PR's target branch):
+
+```sh
+git show "$(git merge-base HEAD origin/master):pnpm-lock.yaml" > pnpm-lock.yaml
+pnpm install --resolution-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile
+```
+
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
+
+## Affected PR CI
+
+The reusable `changes` job (`ci-changes.yml`, scope `pr`) selects work with
+`scripts/ci-affected-work.mjs`. Documentation-only PRs skip the heavy lanes,
+but policy always runs. Manifest, lockfile, pnpm configuration, patches, and
+`.github` changes run all lanes. Non-PR invocations select full work.
+
+The `ci / ci-ok` check (the `ci-ok` job in `pr-trusted.yml`, reported through
+the `ci` caller job in `pr.yml`) requires successful classification, policy,
+the existing `verify` and `e2e` aggregates, serialized-server suites, and
+canary verification. Only an explicit unaffected decision admits skipped heavy
+lanes. Adding `ci / ci-ok` does not change repository protection settings;
+that switch is a repo-admin step. It is distinct from Workflow Health's bare
+`ci-ok` check, which only aggregates `changes` and `validate`.
 
 ## Trusted PR Workflow
 
@@ -43,6 +66,68 @@ remain governed by the repository ruleset.
 When changing the workflow path or branch, authorize the new reference before
 updating the caller. Retain older authorized SHA references while queued runs or
 supported reruns still use them.
+
+### Required checks and quality gates
+
+The required checks `ci / verify` and `ci / e2e` are the aggregate jobs `verify`
+and `e2e` in `.github/workflows/pr-trusted.yml`. The caller
+`.github/workflows/pr.yml` invokes that workflow on each pull request. `verify`
+aggregates the policy, typecheck, test, runner, build, Docker, and quality-gate
+lanes. `e2e` aggregates the sharded Playwright lanes. The serialized server
+suites and the canary dry run execute in the same workflow but do not gate
+`verify`.
+
+Phase-1 quality gates (job `quality_gates`, existing runners only, no paid
+Actions minutes):
+
+- Biome full scan (`pnpm lint:biome`): WARN. Reports on all code. It stays
+  report-only until existing code is clean.
+- Biome changed files (`pnpm lint:biome:changed`): HARD for newly added files;
+  findings on modified existing files are WARN until the repository baseline is
+  clean. Fix with `pnpm exec biome check --write <file>` (run it twice if
+  findings remain after the first pass).
+- Changed-test coverage report (`pnpm coverage:changed`): WARN. It runs coverage
+  for changed tests handled by the configured Vitest projects, else lists changed
+  source files without a colocated test. It does not compute changed-line coverage.
+- Supply chain (`pnpm audit`, Trivy `fs`, gitleaks `detect`): WARN. It reports
+  vulnerable dependencies and leaked secrets.
+- Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
+  gate scripts break.
+- Floor guard (`pnpm guard:floor`): WARN during calibration. It reports added
+  suppressions, skip calls in tests, deleted test files, net assertion-call
+  reductions, explicit not-implemented stubs, and lowered `CONSTRAINTS.md`
+  thresholds. See `CONSTRAINTS.md` (repo root) and `.constraintsignore` for the
+  current bar and tracked exemptions.
+- Shared ast-grep rules (`pnpm lint:ast-grep`): WARN. It scans changed files
+  with the vendored meta-only rule pack (26 rules with fixtures from the
+  ops-tooling `quality/meta-only-assets` branch) and verifies the fixtures
+  with `ast-grep test` in the same run. Resync procedure lives in
+  `scripts/quality-gates/meta-only/PROVENANCE.md`.
+- Review checklist (`scripts/quality-gates/meta-only/checklists/paperclip.yaml`):
+  the shared Muse one-question-per-request review protocol. It is manual
+  (layer 3), not a CI job: quote file, head SHA, lines, and exact excerpt
+  per answer.
+
+Run `pnpm lint:biome:changed` and `pnpm guard:floor` before push. New checks add about 5-8 minutes of
+CI on one runner. Record measured values in the pull request description.
+
+Workflow changes take effect after merge: `pr.yml` pins
+`pr-trusted.yml@master`, so a workflow pull request is validated by the
+previous master version. The new job first runs on pull requests opened after
+merge.
+
+The quality-gate lane is skipped only when the policy job confirms from the
+merge commit's base parent (`HEAD^1`, the live base tip) that `package.json`
+lacks `test:quality-gates` (for example, the pre-gates `deploy/tog6` line).
+Detection reads the checked-out merge commit, never the event's `base.sha`
+merge-base, so a stale merge-base cannot skip a lane the merge tree can run.
+Detection errors (including a non-merge checkout) fail policy closed, and
+`verify` accepts the lane's skipped result only when that explicit base-parent
+decision is false. A pull request cannot skip the lane by removing gate
+tooling from its own head. `scripts/quality-gates/workflow.test.mjs` pins this
+base-parent decision wiring (policy `outputs.quality_gate_tooling` value,
+`HEAD^1` with merge-commit guard, no event `base.sha`, lane `if`, and verify
+env) and the aggregate result handling.
 
 ## Start Dev
 
@@ -93,6 +178,27 @@ Nested source such as `src/commands/target/` still transfers. Do not use a root
 `target/` or `node_modules/` as a deliverable directory on the SSH path, even if Git
 tracks it.
 
+Full-copy workspace seeds also omit untracked files ignored by root or nested
+repository-owned `.gitignore` rules, including when
+`PAPERCLIP_SSH_INCREMENTAL_SYNC=0` disables incremental sync. Git evaluates negations;
+force-added tracked files still transfer, even inside an ignored directory.
+Host-global excludes and `.git/info/exclude` do not determine these omissions.
+Both incremental and full-copy restores independently evaluate the current remote
+repository's rules before download, including when seed provenance is unavailable.
+Plain non-Git folders retain their full-copy fallback: a `.gitignore` file alone
+does not supply index authority, and a plain remote workspace nested inside
+another checkout does not inherit that checkout's ignore rules. An unreadable
+ignore scan in a known repository stops the transfer rather than exporting ignored
+files. Older in-flight seeds that carried ignored files retain their fingerprinted
+restore contract.
+
+The seed returns its omitted paths for the restore baseline and plain restore's
+local-preservation list, so local configuration such as an ignored `.env` survives.
+Full-copy uploads use a NUL-delimited, non-recursive tar file list to retain
+symlinks and literal filenames without growing the command arguments. Large
+restore exclusion scripts travel on SSH stdin instead of overflowing a single
+exec argument; the streaming and extracted-size caps still apply.
+
 The archive creator selects root-relative exclude syntax from its own `tar
 --version`: GNU tar uses `./name`, and BSD/libarchive tar uses `^name`. The server
 and remote can use different implementations. Unknown implementations fail the
@@ -101,7 +207,8 @@ transfer rather than risk deleting nested source.
 `PAPERCLIP_SSH_SYNC_BACK_MAX_BYTES` sets the sync-back cap in bytes on the server.
 The default is 2 GiB. Missing, invalid, and non-positive values use the default.
 Sync-back measures the excluded archive before download and checks the extracted
-staging directory before replacing workspace contents. A cap refusal leaves the
+staging directory before replacing workspace contents. Plain Git restores also
+defer the local worktree reset until both checks pass. A cap refusal leaves the
 workspace untouched. Normal success and failure paths remove staging directories;
 a hard process kill can still leave one behind.
 
@@ -1030,6 +1137,8 @@ An issue can pin its isolated worktree to an exact pre-existing branch instead o
 
 When a run reuses an isolated worktree, Paperclip checks that HEAD is on the branch recorded for the workspace and repairs the drift it can prove safe. A clean worktree whose checked-out branch is forward of the recorded branch adopts that branch (`enableWorkspaceBranchReconcileForward`). A clean worktree that is detached, behind, or diverged gets the recorded branch checked out again (`enableWorkspaceDirtyQuarantineRepair`). A detached commit that no ref reaches is first pinned on `paperclip/rescue/<issue>/detached-<time>`, and a displaced named branch keeps its own ref. A dirty worktree is committed to a rescue branch before the restore. The restore is refused while another run is running in the same worktree, while a runtime service of the workspace is running, or while an interrupted git operation (rebase, merge, bisect) is in progress. Before a run starts, a branch that an operator owns only ever gets this plain checkout. Every repair writes an `execution_workspace.*` activity entry. Anything else fails closed with `workspace_validation_failed`.
 
+A background sweep applies the same plain checkout to parked issues. It selects active `workspace_validation` recoveries whose evidence reason is `git_worktree_branch_incoherence`, never-tried cards first and then the least recently tried, and processes at most five per scheduler tick. It acts only when the recovery belongs to the workspace's source issue, the source issue is still `blocked` with no unresolved blocker or pending interaction, the worktree is clean and registered, the recorded branch exists, a recovery action still matches the worktree state, and no run or runtime service is active. It does not run while heartbeat scheduling is suppressed, and it skips companies that are not active. A repaired issue returns to `todo` and its assignee is woken. Each skip is counted by reason, and it is gated by `enableWorkspaceDirtyQuarantineRepair`. `POST /api/companies/{companyId}/execution-workspaces/sweep-branch-incoherence?dryRun=true` reports the decision for each candidate without changing anything.
+
 Heavier setup that is only needed by a managed runtime service can use `workspaceStrategy.runtimeProvisionCommand`. Paperclip runs this command lazily before spawning the first service in a start batch, serializes concurrent provisioning for the same workspace, and records the attempt as `workspace_runtime_provision`. The command receives the same workspace environment as `provisionCommand` and should be idempotent because later service-start batches invoke it again.
 
 Managed runtime control actions (`start`, `stop`, `restart`, and job `run`) are mutually exclusive per execution workspace. An overlapping control is rejected with `409 workspace_runtime_control_in_progress` instead of racing the active operation, and authorization is still checked first, so the conflict never widens who may control a workspace.
@@ -1389,11 +1498,12 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_ALERT_FILE=/path/to/failure-marker` lets external cron
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
-  terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
-  the work inside this window. The default is `7`. A value of `0` disables the
-  cooldown and restores immediate reaping. A negative or non-numeric value falls
-  back to the default.
+  terminal-workspace reaper waits after every card referencing an execution
+  workspace is terminal before it archives the workspace and deletes the worktree.
+  A person can reopen the work inside this window. The default is `1` day. A value
+  of `0` disables the cooldown and restores immediate reaping. A negative or
+  non-numeric value falls back to the default. Dirty, untracked, or undelivered
+  work is not deleted.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

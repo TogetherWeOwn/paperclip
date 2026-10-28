@@ -125,18 +125,22 @@ describe("claude execute — isolateRuntime", () => {
     vi.unstubAllEnvs();
   });
 
-  it("control: without the flag the child inherits the server env and carries the token", async () => {
+  it.runIf(process.platform === "linux")("control: without the flag the child inherits the server env and carries a bridge token, never the host JWT", async () => {
     const { ctx } = buildContext({});
 
     await execute(ctx as never);
 
     const opts = spawnOpts();
     expect(opts.inheritServerEnv).toBe(true);
-    expect(opts.env.PAPERCLIP_API_KEY).toBe("run-jwt");
+    // M1 token separation: the local bridge swaps the host JWT for a
+    // host-worthless bridge token before the spawn.
+    expect(opts.env.PAPERCLIP_API_KEY).toBeDefined();
+    expect(opts.env.PAPERCLIP_API_KEY).not.toBe("run-jwt");
+    expect(JSON.stringify(opts.env)).not.toContain("run-jwt");
     expect(opts.env.GH_APP_PRIVATE_KEY).toBe(PROJECT_SECRETS.GH_APP_PRIVATE_KEY);
   });
 
-  it("starts the child from an allowlist holding the token, and logs the narrowed key set", async () => {
+  it.runIf(process.platform === "linux")("starts the child from an allowlist holding the token, and logs the narrowed key set", async () => {
     const { ctx, onMeta } = buildContext({ isolate: true });
 
     await execute(ctx as never);
@@ -144,8 +148,10 @@ describe("claude execute — isolateRuntime", () => {
     const opts = spawnOpts();
     expect(opts.inheritServerEnv).toBe(false);
     expect(opts.env.ANTHROPIC_API_KEY).toBe("sk-agent");
-    // The harness-minted run token stays exactly as today (codex drops it; claude keeps it).
-    expect(opts.env.PAPERCLIP_API_KEY).toBe("run-jwt");
+    // The child carries a host-worthless bridge token, never the harness-minted host JWT (M1 token separation).
+    expect(opts.env.PAPERCLIP_API_KEY).toBeDefined();
+    expect(opts.env.PAPERCLIP_API_KEY).not.toBe("run-jwt");
+    expect(JSON.stringify(opts.env)).not.toContain("run-jwt");
     expect(opts.env.PAPERCLIP_RUN_ID).toBe("run-iso");
     expect(opts.env.PAPERCLIP_TASK_ID).toBe("task-1");
     for (const key of [...Object.keys(PROJECT_SECRETS), "SERVER_ONLY_SECRET_X"]) {
@@ -163,7 +169,7 @@ describe("claude execute — isolateRuntime", () => {
     );
   });
 
-  it("decides model and billing from the narrowed env, not server-held keys", async () => {
+  it.runIf(process.platform === "linux")("decides model and billing from the narrowed env, not server-held keys", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-server-only");
     vi.stubEnv("ANTHROPIC_MODEL", "server-model");
     const onMeta = vi.fn(async (_meta: unknown) => {});

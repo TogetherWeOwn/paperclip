@@ -1,0 +1,7 @@
+id: py-github-first-page-api
+valid:
+- comments = api_paginated("/issues/%d/comments?per_page=100" % number)
+- api("/issues/%d/comments" % number, method="POST", body=payload)
+invalid:
+- comments = api("/issues/%d/comments?per_page=100" % number) or []
+- checks = api("/commits/%s/check-runs?per_page=100" % sha)

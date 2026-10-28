@@ -1,0 +1,16 @@
+id: bash-source-env-export
+snapshots:
+  . ./service.env; exec ./push.sh:
+    labels:
+    - source: . ./service.env
+      style: primary
+      start: 0
+      end: 15
+  ? |-
+    source ./service.env
+    ./push.sh
+  : labels:
+    - source: source ./service.env
+      style: primary
+      start: 0
+      end: 20

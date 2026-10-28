@@ -1,0 +1,5 @@
+id: py-utc-mktime
+valid:
+- stamp = calendar.timegm(time.strptime(value, fmt))
+invalid:
+- stamp = time.mktime(time.strptime(value, fmt)) - time.timezone

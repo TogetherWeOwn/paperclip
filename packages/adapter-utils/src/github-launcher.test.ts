@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { githubBrokerEnvironment, githubLauncherSource, LEGACY_GITHUB_LAUNCHER_SHA256 } from "./github-launcher.js";
+import { brokerOriginOf, githubBrokerEnvironment, githubLauncherSource, LEGACY_GITHUB_LAUNCHER_SHA256 } from "./github-launcher.js";
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
 // Launchers shipped before the recursion fix, byte for byte: 5442f2d86 ran in production, b721d24ca is on master.
@@ -29,7 +29,7 @@ describe("managed GitHub launchers", () => {
     // Other copies of this launcher are only recognised below 16 KiB.
     expect(Buffer.byteLength(githubLauncherSource())).toBeLessThan(16384);
     // When this digest changes, append the previous value to LEGACY_GITHUB_LAUNCHER_SHA256 first.
-    expect(sha256(githubLauncherSource())).toBe("c8c3de47810be11c441f704357fe44e95b9bec78d162984cc7df86c412905463");
+    expect(sha256(githubLauncherSource())).toBe("8d1270ed5d7c65561a67cb7e2a755c473d6294410a3f4916c8ac4743ebadaadf");
   });
 
   it("passes the shim-free PATH to wrappers and reaches the next Git executable once", async () => {
@@ -93,6 +93,8 @@ process.stdout.write("real git reached\\n");
     const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
       ...process.env,
       ...githubBrokerEnvironment({ WRAPPER_BIN: wrapperDir, WRAPPER_TRACE: wrapperTrace, REAL_TRACE: realTrace }, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      // The launcher accepts the explicit broker base only same-origin with the run API URL.
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: path.join(root, "config"),
       PATH: [launcherDir, wrapperDir, otherLauncherDir, legacyLauncherDir, editedLauncherDir, quotedLauncherDir, realDir, mixedDir, process.env.PATH].join(path.delimiter),
     } });
@@ -148,6 +150,7 @@ process.stdout.write(JSON.stringify({
     const result = await exec(path.join(launcherDir, "git"), ["--version"], { cwd: root, timeout: 5_000, env: {
       ...process.env,
       ...environment,
+      PAPERCLIP_API_URL: broker.url,
       GH_CONFIG_DIR: configRoot,
       GH_TOKEN: "caller-token",
       GIT_CONFIG_GLOBAL: "/caller/config",
@@ -208,12 +211,14 @@ process.stdout.write(JSON.stringify({
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
     const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      PAPERCLIP_API_URL: `http://127.0.0.1:${port}`,
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   });
@@ -232,7 +237,7 @@ process.stdout.write(JSON.stringify({
     await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
     cleanups.push(() => new Promise<void>((resolve,reject) => server.close(error => error ? reject(error) : resolve())));
     const {port} = server.address() as {port:number};
-    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
+    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PAPERCLIP_API_URL:`http://127.0.0.1:${port}`,PATH:`${bin}:${realBin}:${process.env.PATH}`}});
     expect(JSON.parse(result.stdout)).toEqual({token:null});
     expect(result.stderr).toContain("More than one managed GitHub identity matches this run");
     expect(result.stderr).not.toMatch(/host-token|must-not-be-used|run-capability/);
@@ -270,7 +275,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     const address = server.address() as { port: number };
     const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
-    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${otherBin}:${realBin}:${process.env.PATH}` };
+    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PAPERCLIP_API_URL: `http://127.0.0.1:${address.port}`, PATH: `${bin}:${otherBin}:${realBin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
     await git("config", "user.name", "Repository Author");
@@ -308,5 +313,130 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(await git("status", "--porcelain")).toBe(""); // unrelated public/local Git still works
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
+  });
+});
+
+describe("baked broker-origin approval", () => {
+  it("normalizes stager broker bases to origins", () => {
+    expect(brokerOriginOf("https://broker.example.test/api/")).toBe("https://broker.example.test");
+    expect(brokerOriginOf("http://127.0.0.1:9")).toBe("http://127.0.0.1:9");
+    expect(brokerOriginOf("  https://broker.example.test/api/  ")).toBe("https://broker.example.test");
+    expect(brokerOriginOf("")).toBe("");
+    expect(brokerOriginOf(null)).toBe("");
+    expect(brokerOriginOf(undefined)).toBe("");
+  });
+
+  it("fails closed on malformed stager broker bases instead of staging an originless launcher", () => {
+    expect(() => brokerOriginOf("notaurl")).toThrow("Invalid broker origin");
+    expect(() => brokerOriginOf("ftp://broker.example.test/")).toThrow("Invalid broker origin");
+    expect(() => brokerOriginOf("https://")).toThrow("Invalid broker origin");
+    // The rejection propagates through launcher staging (no silent "" fallback).
+    expect(() => githubLauncherSource({ expectedBrokerOrigin: "notaurl" })).toThrow("Invalid broker origin");
+  });
+
+  async function stageBaked(expectedBrokerOrigin: string) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-baked-origin-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    const realBin = path.join(root, "real");
+    await mkdir(bin);
+    await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource({ expectedBrokerOrigin }), { mode: 0o700 });
+    await writeFile(
+      path.join(realBin, "gh"),
+      '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));',
+      { mode: 0o700 },
+    );
+    return { root, bin, realBin };
+  }
+
+  async function startRecorder(): Promise<{ origin: string; urls: string[]; capabilities: unknown[] }> {
+    const urls: string[] = [];
+    const capabilities: unknown[] = [];
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        urls.push(req.url ?? "/");
+        capabilities.push(req.headers["x-paperclip-github-capability"]);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "baked-broker-token" } }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+    const { port } = server.address() as { port: number };
+    return { origin: `http://127.0.0.1:${port}`, urls, capabilities };
+  }
+
+  it("accepts the baked host broker origin even when the run API URL is loopback", async () => {
+    const broker = await startRecorder();
+    const { root, bin, realBin } = await stageBaked(broker.origin);
+    const result = await exec(path.join(bin, "gh"), [], {
+      env: {
+        ...process.env,
+        ...githubBrokerEnvironment({}, { url: broker.origin, token: "run-capability" }),
+        PAPERCLIP_API_URL: "http://127.0.0.1:9",
+        GH_CONFIG_DIR: root,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      },
+    });
+    expect(broker.urls).toEqual(["/runtime-tools/github/credentials"]);
+    expect(broker.capabilities).toEqual(["run-capability"]);
+    expect(JSON.parse(result.stdout)).toEqual({ token: "baked-broker-token" });
+  });
+
+  it("refuses an evil broker base that matches neither the baked origin nor the API origin", async () => {
+    const { root, bin, realBin } = await stageBaked("https://broker.example.test");
+    const evil = await startRecorder();
+    const result = await exec(path.join(bin, "gh"), [], {
+      env: {
+        ...process.env,
+        ...githubBrokerEnvironment({}, { url: evil.origin, token: "run-capability" }),
+        PAPERCLIP_API_URL: "https://broker.example.test",
+        GH_CONFIG_DIR: root,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      },
+    });
+    expect(evil.urls).toEqual([]);
+    expect(evil.capabilities).toEqual([]);
+    expect(result.stderr).toContain("broker_base_rejected");
+    expect(JSON.parse(result.stdout)).toEqual({ token: null });
+  });
+
+  it("refuses a fully steered env (broker and API both evil) when an origin is baked", async () => {
+    const { root, bin, realBin } = await stageBaked("https://broker.example.test");
+    const evil = await startRecorder();
+    const result = await exec(path.join(bin, "gh"), [], {
+      env: {
+        ...process.env,
+        ...githubBrokerEnvironment({}, { url: evil.origin, token: "run-capability" }),
+        PAPERCLIP_API_URL: evil.origin,
+        GH_CONFIG_DIR: root,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      },
+    });
+    expect(evil.urls).toEqual([]);
+    expect(result.stderr).toContain("broker_base_rejected");
+    expect(JSON.parse(result.stdout)).toEqual({ token: null });
+  });
+
+  it("enforces the baked origin before the empty-broker-var fallback", async () => {
+    const { root, bin, realBin } = await stageBaked("https://broker.example.test");
+    const evil = await startRecorder();
+    const result = await exec(path.join(bin, "gh"), [], {
+      env: {
+        ...process.env,
+        ...githubBrokerEnvironment({}, { url: "", token: "run-capability" }),
+        PAPERCLIP_API_URL: evil.origin,
+        GH_CONFIG_DIR: root,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      },
+    });
+    // A tampered PAPERCLIP_API_URL must not steer the capability away from
+    // the baked broker origin via the empty-var fallback.
+    expect(evil.urls).toEqual([]);
+    expect(evil.capabilities).toEqual([]);
+    expect(result.stderr).toContain("broker_base_rejected");
+    expect(JSON.parse(result.stdout)).toEqual({ token: null });
   });
 });

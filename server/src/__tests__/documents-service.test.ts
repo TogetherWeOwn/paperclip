@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   companies,
@@ -227,5 +227,55 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
       body: "# Agent replacement plan",
       lockedAt: null,
     }));
+  });
+
+  it("stores and returns byte-identical bodies for creates and revision-safe updates", async () => {
+    const BS = String.fromCharCode(92); // U+005C REVERSE SOLIDUS
+    const fixture = [
+      `# Byte-fidelity service fixture\n`,
+      `literal backslash-n: ${BS}n stays literal\n`,
+      `nested double-backslash-n: ${BS}${BS}n stays literal\n`,
+      `\`\`\`python\ns = "a${BS}nb"\n\`\`\`\n`,
+      `{"text": "a${BS}nb"}\n`,
+      `crlf-line\r\n`,
+      `cr-line\r`,
+      `tabbed café naïve ✓\n`,
+    ].join("");
+    const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+    const { issueId } = await createIssueWithDocuments();
+
+    const created = await svc.upsertIssueDocument({
+      issueId,
+      key: "bytes",
+      title: "Bytes",
+      format: "markdown",
+      body: fixture,
+    });
+    expect(created.created).toBe(true);
+    expect(created.document.body).toBe(fixture);
+    expect(sha256(created.document.body)).toBe(sha256(fixture));
+
+    const fetched = (await svc.getIssueDocumentByKey(issueId, "bytes"))!;
+    expect(fetched.body).toBe(fixture);
+    expect(Buffer.byteLength(fetched.body, "utf8")).toBe(Buffer.byteLength(fixture, "utf8"));
+    expect(sha256(fetched.body)).toBe(sha256(fixture));
+
+    const updated = await svc.upsertIssueDocument({
+      issueId,
+      key: "bytes",
+      title: "Bytes",
+      format: "markdown",
+      body: `${fixture}# appended ${BS}n literal\n`,
+      baseRevisionId: fetched.latestRevisionId,
+    });
+    expect(updated.created).toBe(false);
+    expect(updated.document.body).toBe(`${fixture}# appended ${BS}n literal\n`);
+    expect(sha256(updated.document.body)).toBe(sha256(`${fixture}# appended ${BS}n literal\n`));
+
+    const revisions = await svc.listIssueDocumentRevisions(issueId, "bytes");
+    expect(revisions.map((revision) => revision.body)).toEqual([
+      `${fixture}# appended ${BS}n literal\n`,
+      fixture,
+    ]);
   });
 });

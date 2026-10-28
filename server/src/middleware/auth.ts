@@ -420,12 +420,19 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         userId: onBehalfOfUserId,
       });
 
+      let jwtKeyScope;
+      try {
+        jwtKeyScope = normalizeAgentApiKeyScope(claims.key_scope);
+      } catch {
+        next(forbidden("Agent key scope is invalid", { code: "INVALID_KEY_SCOPE" }));
+        return;
+      }
       req.actor = {
         type: "agent",
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        keyScope: normalizeAgentApiKeyScope(claims.key_scope),
+        keyScope: jwtKeyScope,
         runId: claims.run_id,
         onBehalfOfUserId,
         identityContextId: identityRun?.activeIdentityContextId ?? null,
@@ -475,12 +482,21 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    // Fail closed: an unknown/malformed stored scope denies outright and
+    // never falls back to `standard` visibility.
+    let keyScope;
+    try {
+      keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
+    } catch {
+      next(forbidden("Agent key scope is invalid", { code: "INVALID_KEY_SCOPE" }));
+      return;
+    }
     req.actor = {
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,

@@ -739,6 +739,18 @@ npx paperclipai skills remove <skill-id-or-key-or-slug> --yes --company-id <comp
 `npx skills add …` command. See `references/company-skills.md` in the agent
 skill bundle for the source-type table.
 
+Direct Markdown file URLs are intentionally limited to HTTPS on port 443 from
+`github.com`, `www.github.com`, `raw.githubusercontent.com`, or an exact Enterprise
+hostname in `PAPERCLIP_GITHUB_ENTERPRISE_HOSTS` (case-insensitive; a trailing DNS
+dot is removed before fetching). Userinfo, query parameters, and fragments are
+not allowed. Redirects are never followed, even within an approved origin. Use
+the final raw-content URL: GitHub `/raw` links can redirect and therefore fail.
+Other hosts and nondefault ports are rejected before DNS lookup or fetching.
+This deliberately removes arbitrary-host direct-file imports; repository and
+local-path imports are unchanged. Operators must trust the DNS and routing of
+configured Enterprise hosts. This source-origin policy does not filter all
+resolved addresses or pin connections against DNS rebinding.
+
 `skills check`, `skills update`, `skills audit`, and `skills reset` are the
 maintenance loop for catalog-installed skills:
 

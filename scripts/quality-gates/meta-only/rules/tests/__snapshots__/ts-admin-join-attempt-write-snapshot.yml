@@ -1,0 +1,14 @@
+id: ts-admin-join-attempt-write
+snapshots:
+  await db.execute(sql`DELETE FROM join_attempts WHERE created_at < now()`):
+    labels:
+    - source: '`DELETE FROM join_attempts WHERE created_at < now()`'
+      style: primary
+      start: 20
+      end: 72
+  await db.execute(sql`insert into join_attempts values (1)`):
+    labels:
+    - source: '`insert into join_attempts values (1)`'
+      style: primary
+      start: 20
+      end: 58

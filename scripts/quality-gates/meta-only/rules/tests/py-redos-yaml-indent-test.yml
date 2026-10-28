@@ -1,0 +1,5 @@
+id: py-redos-yaml-indent
+valid:
+- 'pattern = re.compile(r"^  suites:\n((?:(?: {4,}.*)?\n)+)", re.M)'
+invalid:
+- pattern = re.compile(r"^\s+suites:\s*\n(?:^[ \t]+.*\n)*?^\s+timeout-minutes:\s*(\d+)", re.M)

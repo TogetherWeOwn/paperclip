@@ -1,10 +1,12 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { hashJsonValue } from "../services/audit-context.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  getConfig: vi.fn(),
   upsertConfig: vi.fn(),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
@@ -31,8 +33,10 @@ vi.mock("../services/plugin-lifecycle.js", () => ({
   pluginLifecycleManager: () => mockLifecycle,
 }));
 
+const mockLogActivity = vi.hoisted(() => vi.fn());
+
 vi.mock("../services/activity-log.js", () => ({
-  logActivity: vi.fn(),
+  logActivity: mockLogActivity,
 }));
 
 vi.mock("../services/secrets.js", () => ({
@@ -325,6 +329,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     };
     mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
     mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+    mockRegistry.getConfig.mockResolvedValue({ id: "config-1", pluginId, companyId: companyA, configJson: { old: true } });
     mockRegistry.upsertConfig.mockResolvedValue({ id: "config-1", pluginId, companyId: companyA, configJson });
 
     const { app } = await createApp({
@@ -340,6 +345,16 @@ describe.sequential("plugin install and upgrade authz", () => {
       .send({ companyId: companyA, configJson });
 
     expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "plugin.config.updated",
+        details: expect.objectContaining({
+          configHashBefore: hashJsonValue({ old: true }),
+          configHashAfter: hashJsonValue(configJson),
+        }),
+      }),
+    );
     expect(mockSecretService.getById).toHaveBeenCalledWith(secretId);
     expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
       companyA,

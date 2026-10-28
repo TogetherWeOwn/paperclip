@@ -12,6 +12,7 @@ import {
   type SandboxCallbackBridgeBody,
 } from "./sandbox-callback-bridge-body.js";
 import type { BridgeBodyReservation } from "./http2-bridge-server.js";
+import { isSafeBridgeMethod } from "./bridge-transport-contract.js";
 
 import {
   runWithoutActiveStep,
@@ -45,15 +46,17 @@ const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 // never fails at the bridge before the server ever sees it.
 const BRIDGE_MULTIPART_FRAMING_HEADROOM_BYTES = 64 * 1024;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 10 * 1024 * 1024 + BRIDGE_MULTIPART_FRAMING_HEADROOM_BYTES;
-// Per-iteration timeout for one poll-loop client call. A healthy control-plane
+// Per-phase budget for each sandbox-channel client call. A healthy control-plane
 // round trip finishes in well under one second, so 10s is far above a normal
-// iteration and never false-fires on a slow-but-live call. It is also well
-// under the in-sandbox 30s response deadline
-// (PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS), so the host loop fails fast and writes
-// 503 responses before the in-sandbox client gives up. A silently unresponsive
-// sandbox channel makes a client call hang with no reject; this timeout turns
-// that hang into a caught error, so the poll loop can back off and retry while
-// the watchdog below decides when to fail the queued requests.
+// phase and never false-fires on a slow-but-live call. Each phase gets its own
+// full budget starting at that phase, so a request's phases can sum past the
+// in-sandbox 30s response deadline (PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS) on a
+// very slow channel; the relay still fails safe (retryable 502 for safe
+// methods, indeterminate 504/409 for unsafe), and the gateway's own deadline
+// maps the same way. A silently unresponsive sandbox channel makes a client
+// call hang with no reject; this timeout turns that hang into a caught error,
+// so the phase recovers (or the poll loop backs off and retries) while the
+// watchdog below decides when to fail the queued requests.
 const DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS = 10_000;
 // Watchdog backstop for a hang that the per-iteration timeout does not catch
 // (for example many slow-but-under-timeout calls, or a stall outside the awaited
@@ -431,6 +434,131 @@ export function createSandboxCallbackBridgeToken(bytes = DEFAULT_BRIDGE_TOKEN_BY
   return randomBytes(bytes).toString("base64url");
 }
 
+/** The reason {@link parseCanonicalCallbackBridgeTarget} rejected one request target. */
+export type CanonicalCallbackBridgeTargetRejection =
+  | "non_origin_form"
+  | "fragment"
+  | "encoded_slash"
+  | "encoded_backslash"
+  | "backslash"
+  | "nul_byte"
+  | "dot_segment"
+  | "invalid_encoding"
+  | "control_character";
+
+/**
+ * The one parsed request target. Every bridge leg authorizes AND forwards
+ * this same value: the route allowlist reads `pathname`, and the forward URL
+ * builder sends `pathname` plus `query` to the pinned origin. No leg parses
+ * the raw target a second, independent time.
+ */
+export interface CanonicalCallbackBridgeTarget {
+  pathname: string;
+  /** The query string, in `URL.search` form: empty, or a leading `?`. */
+  query: string;
+}
+
+export type CanonicalCallbackBridgeTargetResult =
+  | { ok: true; value: CanonicalCallbackBridgeTarget }
+  | { ok: false; reason: CanonicalCallbackBridgeTargetRejection };
+
+/**
+ * Validate one raw callback request target and return the single canonical
+ * target every leg authorizes and forwards. The query portion is split off
+ * verbatim at the first `?` and never inspected for traversal: query data
+ * that merely looks like a traversal (`?next=../x`) stays allowed, while a
+ * `#` anywhere rejects (a fragment would silently change the authorized
+ * route). The pathname must be origin-form (one leading `/`, never `//` or
+ * absolute-form), carry no backslash, NUL byte, ASCII control/space, encoded
+ * slash/backslash, or malformed percent encoding, and no literal or
+ * percent-encoded dot segment — checked on the raw segments before URL
+ * normalization could silently remove them. The returned pathname comes from
+ * the one URL parse, so it is exactly what the forward sends.
+ */
+export function parseCanonicalCallbackBridgeTarget(
+  rawTarget: unknown,
+): CanonicalCallbackBridgeTargetResult {
+  if (typeof rawTarget !== "string" || rawTarget.length === 0) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (rawTarget.includes("#")) {
+    return { ok: false, reason: "fragment" };
+  }
+  const queryIndex = rawTarget.indexOf("?");
+  const rawPathname = queryIndex === -1 ? rawTarget : rawTarget.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : rawTarget.slice(queryIndex);
+  if (
+    !rawPathname.startsWith("/") ||
+    rawPathname.startsWith("//") ||
+    rawPathname.includes("://")
+  ) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (/%2f/i.test(rawPathname)) {
+    return { ok: false, reason: "encoded_slash" };
+  }
+  if (/%5c/i.test(rawPathname)) {
+    return { ok: false, reason: "encoded_backslash" };
+  }
+  if (rawPathname.includes("\\")) {
+    return { ok: false, reason: "backslash" };
+  }
+  if (rawPathname.includes("\0") || /%00/i.test(rawPathname)) {
+    return { ok: false, reason: "nul_byte" };
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control/space gate.
+  if (/[\x00-\x20\x7f]/.test(rawPathname)) {
+    return { ok: false, reason: "control_character" };
+  }
+  for (const segment of rawPathname.split("/")) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return { ok: false, reason: "invalid_encoding" };
+    }
+    if (decoded === "." || decoded === "..") {
+      return { ok: false, reason: "dot_segment" };
+    }
+  }
+  // Every raw-string check above passed, and the path carries no dot segment,
+  // so URL normalization here changes nothing but percent-encoding; the
+  // pathname below is exactly what the forward sends to the pinned origin.
+  let pathname: string;
+  try {
+    pathname = new URL(rawTarget, "http://bridge.internal").pathname;
+  } catch {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  return { ok: true, value: { pathname, query } };
+}
+
+/**
+ * Authorize one bridge request against the route allowlist using the SAME
+ * validated canonical target the forward sends. A malformed, ambiguous, or
+ * noncanonical target is denied before any route check, before host
+ * credentials attach, and before any forward attempt. Pure: it never
+ * rewrites the request; each forward leg re-derives this same canonical
+ * target from the request it actually sends.
+ */
+export function authorizeCanonicalCallbackBridgeRequest(
+  request: Pick<SandboxCallbackBridgeRequest, "method" | "path"> & { query?: string },
+  routes: readonly SandboxCallbackBridgeRouteRule[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+): string | null {
+  const query = typeof request.query === "string" ? request.query : "";
+  const rawTarget = query.length === 0
+    ? request.path
+    : `${request.path}${query.startsWith("?") ? query : `?${query}`}`;
+  const parsed = parseCanonicalCallbackBridgeTarget(rawTarget);
+  if (!parsed.ok) {
+    return `Invalid request target: ${parsed.reason}`;
+  }
+  return authorizeSandboxCallbackBridgeRequestWithRoutes(
+    { method: request.method, path: parsed.value.pathname },
+    routes,
+  );
+}
+
 export function authorizeSandboxCallbackBridgeRequestWithRoutes(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path">,
   routes: readonly SandboxCallbackBridgeRouteRule[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
@@ -799,9 +927,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
-  // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
-  // poll and one `processRequestFile`). On timeout the loop `catch` runs
-  // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
+  // Per-phase budget for each sandbox-channel client call (the `listJsonFiles`
+  // poll, queue stat/read, authorize, host forward, response/backstop/recovery
+  // writes and request removes). A forward-phase timeout aborts the handler
+  // and delivers its own terminal (502 safe / 504 indeterminate) with no
+  // recovery pass; any other phase timeout rejects to the loop `catch`, which
+  // runs `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
   iterationTimeoutMs?: number | null;
   // Watchdog threshold. When the loop makes no successful iteration within this
   // time, the watchdog runs `failPendingRequests` and surfaces a run-level error
@@ -878,10 +1009,36 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
+  // Default authorization validates the envelope's canonical request target
+  // before the route check: a malformed or noncanonical target is denied here,
+  // in both the dispatch path and the recovery path, before any handler — and
+  // therefore before any host credential or forward attempt.
   const authorizeRequest = input.authorizeRequest ??
-    ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
+    ((request: SandboxCallbackBridgeRequest) => authorizeCanonicalCallbackBridgeRequest(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
+
+  // Surface a bridge-worker failure through the run trace, not only stdout. A
+  // failed span under `input.runtimeSpan` records the error against the live run
+  // span, so the run and the orchestrator see the hang. When no `runtimeSpan`
+  // runner is wired (no injected tracer), the helper still writes a warn line,
+  // so the failure is never silent. Defined early so phase timeouts inside
+  // `processRequestFile` can surface immediately before their grace wait,
+  // breaking the deadlock where a test (or caller) waits for the run error to
+  // release a handler the grace itself waits for.
+  const surfaceRunError = async (error: Error) => {
+    if (input.runtimeSpan) {
+      try {
+        await input.runtimeSpan(CALLBACK_BRIDGE_WORKER_FAILED_SPAN, async () => {
+          throw error;
+        });
+      } catch {
+        // `runtimeSpan` re-throws after it records the failed span. The error is
+        // now on the trace; swallow it here so the worker recovery continues.
+      }
+    }
+    console.warn(`[paperclip] ${error.message}`);
+  };
 
   // Per-attempt finalization guard. Each `processRequestFile` call registers one,
   // keyed by the request file name. The guard is the completion fence between the
@@ -936,10 +1093,41 @@ export async function startSandboxCallbackBridgeWorker(input: {
     controller: AbortController;
     finalized: boolean;
     backstopTimer?: ReturnType<typeof setTimeout>;
+    // Normalized HTTP method for the request, set once the request is parsed.
+    // The aborted-handler backstop reads it to choose a truthful terminal
+    // status: a safe method never commits, so its backstop stays retryable;
+    // an unsafe (possibly-committed) method stays non-retryable indeterminate.
+    // Unknown until parse; treated as unsafe until known.
+    method: string;
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
+  // Files whose terminal response already landed but whose request-file remove
+  // timed out or failed. The response is delivered, so the request must never
+  // go through handleRequest again; later polls retry only the bounded remove.
+  // This keeps a hung remove from wedging the serial loop without re-running a
+  // possibly-committed mutation. Covers finalize, backstop, and recovery paths.
+  const deliveredPendingRemove = new Set<string>();
 
   const processRequestFile = async (fileName: string) => {
+    // A terminal response already landed for this file but its request-file
+    // remove timed out or failed. Retry only the bounded remove; never run the
+    // handler again, or a possibly-committed mutation applies twice.
+    if (deliveredPendingRemove.has(fileName)) {
+      const pendingRequestPath = path.posix.join(directories.requestsDir, fileName);
+      try {
+        await withTimeout(
+          input.client.remove(pendingRequestPath),
+          iterationTimeoutMs,
+          `Sandbox callback bridge remove request ${fileName}`,
+        );
+        deliveredPendingRemove.delete(fileName);
+        lastSuccessfulIterationAt = Date.now();
+      } catch {
+        // Keep the file in the set for the next poll; the bound kept the serial
+        // loop moving.
+      }
+      return;
+    }
     // Skip a request that already has an active attempt. The guard map holds only
     // in-flight attempts; the attempt's finally removes its guard when it ends. A
     // file that still has a guard is in flight, or it waits for its aborted-handler
@@ -954,6 +1142,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       claim: "unclaimed",
       controller: new AbortController(),
       finalized: false,
+      method: "",
     };
     inFlightRequestGuards.set(fileName, guard);
     const reservation = createBridgeBodyReservation();
@@ -1004,7 +1193,21 @@ export async function startSandboxCallbackBridgeWorker(input: {
             iterationTimeoutMs,
             `Sandbox callback bridge write response for ${response.id}`,
           );
-          await input.client.remove(requestPath).catch(() => undefined);
+          // The response landed. Remove the request file exactly once: a timed-out
+          // or failed remove must not look like completion. Mark the file for
+          // remove-only retry so the next poll never re-runs the host mutation.
+          try {
+            await withTimeout(
+              input.client.remove(requestPath),
+              iterationTimeoutMs,
+              `Sandbox callback bridge remove request ${fileName}`,
+            );
+            deliveredPendingRemove.delete(fileName);
+          } catch {
+            deliveredPendingRemove.add(fileName);
+          }
+          // The response delivered: count it as loop progress.
+          lastSuccessfulIterationAt = Date.now();
           return;
         } catch (error) {
           lastWriteError = error instanceof Error ? error.message : String(error);
@@ -1030,8 +1233,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // Bound the read and its encoded/parsed copies before allocating. Built-in
       // clients stat first so a high configured file limit does not reserve that
       // whole limit for a tiny request. Older clients use the conservative cap.
+      // Each pre-forward client call gets its own phase bound, so a hang before
+      // the host operation still fails fast into the same recovery pass.
       const envelopeBytes = input.client.fileSize
-        ? await input.client.fileSize(requestPath).catch(() => maxEnvelopeBytes)
+        ? await withTimeout(
+            input.client.fileSize(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge stat request ${fileName}`,
+          ).catch(() => maxEnvelopeBytes)
         : maxEnvelopeBytes;
       if (envelopeBytes > maxEnvelopeBytes) {
         await finalize({
@@ -1053,15 +1262,28 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
       let raw: string;
       try {
-        raw = await input.client.readTextFile(requestPath, readLimit);
+        // Phase-bound the queue read separately from the host forward below,
+        // so slow-but-live host handling keeps its full budget instead of
+        // sharing one total with queue latency. A hung read still fails fast
+        // here and triggers the same recovery pass as before.
+        raw = await withTimeout(
+          input.client.readTextFile(requestPath, readLimit),
+          iterationTimeoutMs,
+          `Sandbox callback bridge read request ${fileName}`,
+        );
       } catch (error) {
         // The gateway deletes a request file when its caller stops waiting
         // (client-side timeout cleanup). A read that fails because the file is
         // gone is that benign race, not a channel fault: confirm the file
         // vanished and skip quietly instead of escalating into a recovery
         // pass. A file that is still listed rethrows, so a real read fault
-        // keeps its existing handling.
-        const remaining = await input.client.listJsonFiles(directories.requestsDir).catch(() => null);
+        // keeps its existing handling. Bound the confirmation list the same as
+        // every other pre-forward client call, so it cannot hang the attempt.
+        const remaining = await withTimeout(
+          input.client.listJsonFiles(directories.requestsDir),
+          iterationTimeoutMs,
+          `Sandbox callback bridge confirm vanished request ${fileName}`,
+        ).catch(() => null);
         if (remaining !== null && !remaining.includes(fileName)) {
           return;
         }
@@ -1084,6 +1306,17 @@ export async function startSandboxCallbackBridgeWorker(input: {
         return;
       }
 
+      // Record the normalized method for the aborted-handler backstop, which
+      // reads it to choose a truthful terminal status (safe stays retryable,
+      // unsafe stays indeterminate). Set it here, right after a successful
+      // parse, so every handler-claimed request carries it.
+      guard.method = typeof request.method === "string" && request.method.trim().length > 0
+        ? request.method.trim().toUpperCase()
+        : "GET";
+      // The queue read finished: count it as loop progress, so a slow but live
+      // multi-phase request does not look idle to the watchdog below.
+      lastSuccessfulIterationAt = Date.now();
+
       // Keep only the actual request allocation reserved while forwarding;
       // an abandoned small request must not retain a maximum-sized reservation.
       envelopeReadReservation.release();
@@ -1094,7 +1327,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
           completedAt: new Date().toISOString() });
         return;
       }
-      const denialReason = await authorizeRequest(request);
+      // Bound the authorization step like every other pre-forward phase. A
+      // hung authorizer must fail fast into the same recovery pass instead of
+      // stranding the attempt with no terminal response.
+      const denialReason = await withTimeout(
+        Promise.resolve().then(() => authorizeRequest(request)),
+        iterationTimeoutMs,
+        `Sandbox callback bridge authorize request ${request.id}`,
+      );
+      // Authorization finished: the attempt is progressing, not stuck.
+      lastSuccessfulIterationAt = Date.now();
       if (denialReason) {
         await finalize({
           id: request.id,
@@ -1117,14 +1359,66 @@ export async function startSandboxCallbackBridgeWorker(input: {
 
       // Build the response, then finalize once. The handler already holds the
       // claim, so `finalize` writes the real response.
+      //
+      // Phase-bound the host forward separately from the queue read above and
+      // the response delivery in `finalize` below. The forward gets the full
+      // per-iteration budget starting here, so near-budget host latency
+      // (for example 9.5s against a 10s budget) plus queue/finalization
+      // overhead no longer false-fires a single total that covers the whole
+      // attempt. Delivery keeps its own per-attempt bound inside `finalize`
+      // and the backstop, so a committed write still delivers truthfully
+      // instead of timing out during its own response write.
       let response: SandboxCallbackBridgeResponse;
       let handlerReturned = false;
       try {
         const { bodyEncoding, ...forwardRequest } = request;
-        const result = await input.handleRequest({ ...forwardRequest,
+        let result: Awaited<ReturnType<typeof input.handleRequest>>;
+        const forwardPromise = input.handleRequest({ ...forwardRequest,
           body: bodyEncoding === "base64" ? decodeSandboxBridgeBody(request, maxBodyBytes) : request.body,
         }, { signal: guard.controller.signal, reservation });
+        try {
+          result = await withTimeout(
+            forwardPromise,
+            iterationTimeoutMs,
+            `Sandbox callback bridge forward request ${request.id}`,
+          );
+        } catch (forwardError) {
+          // The forward phase exceeded its own budget. Abort the handler so a
+          // cooperating forward stops promptly, then give it the same grace the
+          // recovery path gives an aborted handler: a handler that ignores the
+          // signal and returns a real response inside the grace still delivers
+          // truthfully (its real response wins); one that rejects or never
+          // settles falls through to the terminal below. Without this grace an
+          // ignoring handler's late real response would lose to an immediate
+          // timeout terminal even though the real response exists.
+          //
+          // Surface the timeout immediately, before the grace wait. A caller
+          // (or test) that waits for the run error to release a pending handler
+          // would otherwise deadlock: the grace waits for the handler, the
+          // handler waits for the release, and the release waits for the run
+          // error. Surfacing first breaks that cycle; the grace below still
+          // decides truthful (real) versus terminal delivery.
+          const timeoutError = forwardError instanceof Error ? forwardError : new Error(String(forwardError));
+          await surfaceRunError(new Error(buildWorkerFailureMessage(timeoutError)));
+          if (!guard.controller.signal.aborted) {
+            guard.controller.abort(timeoutError);
+          }
+          try {
+            result = await withTimeout(
+              forwardPromise,
+              abortedHandlerGraceMs,
+              `Sandbox callback bridge forward request ${request.id} grace`,
+            );
+            // The handler settled late with a real response inside the grace.
+            // Fall through to deliver it truthfully; the run error above already
+            // recorded the timeout.
+          } catch {
+            throw timeoutError;
+          }
+        }
         handlerReturned = true;
+        // The host forward finished: count it as loop progress before delivery.
+        lastSuccessfulIterationAt = Date.now();
         const responseBytes = Buffer.byteLength(result.body ?? "");
         if (responseBytes > maxBodyBytes) throw new Error("Bridge response body exceeded the configured size limit.");
         if (!reservation.reserve(4 * sandboxBridgeEnvelopeLimit(responseBytes))) {
@@ -1143,16 +1437,31 @@ export async function startSandboxCallbackBridgeWorker(input: {
           `[paperclip] sandbox callback bridge handler failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
         );
         // Tell a worker abort apart from a normal handler failure. The recovery
-        // path aborts `guard.controller` when the per-iteration timeout or the
-        // watchdog fires. The abort reaches this catch only after the handler
-        // claimed the request and started the host operation. The bridge cannot
-        // cancel a host operation that is in flight, so the mutation may have
-        // committed. A 502 (or 503) is a retryable status: the caller retries it
-        // and applies the mutation twice. So return a non-retryable 504 and mark
-        // the outcome indeterminate. The caller must not retry a 504 from the
-        // bridge, unlike the retry-safe 503 that the recovery path writes only
-        // before the host operation starts.
-        if (guard.controller.signal.aborted || (handlerReturned && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(request.method))) {
+        // path aborts `guard.controller` when a phase timeout or the watchdog
+        // fires. The abort reaches this catch only after the handler claimed
+        // the request and started the host operation. The bridge cannot cancel
+        // a host operation that is in flight, so an unsafe mutation may have
+        // committed. A 502 (or 503) is a retryable status: the caller retries
+        // it and applies the mutation twice. So an aborted unsafe method (or a
+        // post-return failure for an unsafe method, where the commit already
+        // happened but response processing failed) returns a non-retryable 504
+        // with an indeterminate outcome. A safe method never commits, so its
+        // abort stays a retryable 502: reporting indeterminate 504 for a GET
+        // would be a false possibly-committed claim that needlessly blocks a
+        // safe retry. The caller must not retry a 504 from the bridge, unlike
+        // the retry-safe 503 that the recovery path writes only before the
+        // host operation starts.
+        //
+        // The forward phase timeout above aborts the same controller, so a
+        // forward that exceeds its own phase budget follows this same truthful
+        // split: unsafe stays indeterminate, safe stays retryable.
+        // Read the normalized method from the guard, not the raw request: the
+        // request comes from parsed JSON, so `request.method` can be a
+        // non-string that makes `isSafeBridgeMethod` throw and skip `finalize`.
+        if (
+          (guard.controller.signal.aborted && !isSafeBridgeMethod(guard.method)) ||
+          (handlerReturned && !isSafeBridgeMethod(guard.method))
+        ) {
           response = {
             id: request.id,
             status: 504,
@@ -1180,6 +1489,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
         }
       }
       await finalize(response);
+      // The forward phase timeout (if any) already surfaced through
+      // `surfaceRunError` before the grace wait above, so no re-throw here. A
+      // re-throw would run a duplicate recovery pass and a duplicate run error
+      // for a timeout that already delivered its terminal truthfully.
     } finally {
       envelopeReadReservation.release();
       reservation.release();
@@ -1196,11 +1509,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
     }
   };
 
-  // Write the non-retryable 504 backstop for an aborted handler that did not
-  // finalize inside the grace. The `finalized` fence makes this a no-op when the
-  // handler already wrote its own response. The request file name is the request
-  // id plus `.json`, so derive the id from it without another client read that
+  // Write the terminal backstop for an aborted handler that did not finalize
+  // inside the grace. The `finalized` fence makes this a no-op when the handler
+  // already wrote its own response. The request file name is the request id
+  // plus `.json`, so derive the id from it without another client read that
   // could hang on the same dead channel.
+  //
+  // The backstop is method-aware: a safe method never commits, so its backstop
+  // stays a retryable 502 with no indeterminate marker (a 504/409 there would
+  // be a false possibly-committed claim). An unsafe method may have committed
+  // before the abort, so its backstop stays a non-retryable 504 indeterminate.
+  // The guard method is set at parse time; an unknown method (empty) is treated
+  // as unsafe, so a missing method never downgrades to retryable.
   const writeAbortedHandlerBackstop = async (
     fileName: string,
     guard: RequestFinalizeGuard,
@@ -1214,31 +1534,58 @@ export async function startSandboxCallbackBridgeWorker(input: {
     const requestPath = path.posix.join(directories.requestsDir, fileName);
     const responsePath = path.posix.join(directories.responsesDir, fileName);
     const requestId = fileName.replace(/\.json$/i, "") || randomUUID();
+    const backstopSafe = guard.method.trim().length > 0 && isSafeBridgeMethod(guard.method);
+    const backstopResponse: SandboxCallbackBridgeResponse = backstopSafe
+      ? {
+        id: requestId,
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ error: message }),
+        completedAt: new Date().toISOString(),
+      }
+      : {
+        id: requestId,
+        status: 504,
+        headers: {
+          "content-type": "application/json",
+          "x-paperclip-bridge-outcome": "indeterminate",
+        },
+        body: JSON.stringify({ error: message, outcome: "indeterminate", retryable: false }),
+        completedAt: new Date().toISOString(),
+      };
+    const backstopLabel = backstopSafe ? "502" : "504";
     for (let attempt = 1; attempt <= MAX_BACKSTOP_WRITE_ATTEMPTS; attempt += 1) {
       try {
         await withTimeout(
           writeBridgeResponse(input.client, requestPath, responsePath, {
-            id: requestId,
-            status: 504,
-            headers: {
-              "content-type": "application/json",
-              "x-paperclip-bridge-outcome": "indeterminate",
-            },
-            body: JSON.stringify({ error: message, outcome: "indeterminate", retryable: false }),
+            ...backstopResponse,
             completedAt: new Date().toISOString(),
           }, {
             requireRequestPath: false,
           }),
           iterationTimeoutMs,
-          `Sandbox callback bridge write 504 backstop for ${requestId}`,
+          `Sandbox callback bridge write ${backstopLabel} backstop for ${requestId}`,
         );
-        // The 504 backstop reached the caller. Remove the request file, so the
-        // poll loop does not list it again and re-run the mutation.
-        await input.client.remove(requestPath).catch(() => undefined);
+        // The backstop reached the caller. Remove the request file, so the
+        // poll loop does not list it again and re-run the mutation. Bound
+        // like every other client call, so a hung remove never wedges the
+        // serial poll loop. A timed-out or failed remove marks the file for
+        // remove-only retry; the terminal already landed, so the next poll
+        // must never re-run the handler.
+        try {
+          await withTimeout(
+            input.client.remove(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          deliveredPendingRemove.add(fileName);
+        }
         return;
       } catch (error) {
         console.warn(
-          `[paperclip] sandbox callback bridge failed to write 504 backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
+          `[paperclip] sandbox callback bridge failed to write ${backstopLabel} backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
         );
         if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
           await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
@@ -1325,6 +1672,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
       "Sandbox callback bridge list pending requests",
     ).catch(() => [] as string[]);
     for (const fileName of fileNames) {
+      // A terminal response already landed for this file but its request-file
+      // remove timed out or failed. Retry only the bounded remove; never write
+      // another terminal or re-run the handler.
+      if (deliveredPendingRemove.has(fileName)) {
+        const pendingRequestPath = path.posix.join(directories.requestsDir, fileName);
+        try {
+          await withTimeout(
+            input.client.remove(pendingRequestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          // Keep the file in the set for the next pass.
+        }
+        continue;
+      }
       const guard = inFlightRequestGuards.get(fileName);
       if (guard && guard.claim === "handler" && (options.abandonInFlight || guard.controller.signal.aborted)) {
         // The handler already started this request's host operation, or it already
@@ -1350,6 +1714,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       const responsePath = path.posix.join(directories.responsesDir, fileName);
       const requestId = fileName.replace(/\.json$/i, "") || randomUUID();
       let responseId = requestId;
+      let denialStatus: { status: 403; body: string } | null = null;
       try {
         const raw = await withTimeout(
           input.client.readTextFile(requestPath),
@@ -1359,6 +1724,40 @@ export async function startSandboxCallbackBridgeWorker(input: {
         const parsed = JSON.parse(raw) as Partial<SandboxCallbackBridgeRequest>;
         if (typeof parsed.id === "string" && parsed.id.length > 0) {
           responseId = parsed.id;
+        }
+        // Preserve authorization: a denied route must stay denied (403), not
+        // become a retryable 503. The handler checks the same allowlist before
+        // it runs the host operation, so a denied request never commits; the
+        // recovery path must not convert that terminal denial into a retryable
+        // status that makes the caller repeat a request the host would deny
+        // again. When the request parses enough to authorize (method+path),
+        // run the same authorizer here and remember a denial for the write
+        // below. A parse that cannot authorize falls through to the 503 path.
+        if (typeof parsed.method === "string" && typeof parsed.path === "string") {
+          try {
+            // Bound the recovery authorizer like every other recovery client
+            // call. A hung authorizer (for example the handler's own authorize
+            // step still pending on the same request) must not hang the
+            // recovery pass: fall through to the 503 path on timeout, so the
+            // handler still bails at its claim and the caller still gets a
+            // terminal. A timeout here is a channel fault, not a denial.
+            const denialReason = await withTimeout(
+              Promise.resolve().then(() => authorizeRequest(
+                parsed as SandboxCallbackBridgeRequest,
+              )),
+              iterationTimeoutMs,
+              `Sandbox callback bridge authorize pending request ${requestId}`,
+            );
+            if (denialReason) {
+              denialStatus = {
+                status: 403,
+                body: JSON.stringify({ error: denialReason }),
+              };
+            }
+          } catch {
+            // An authorizer fault is a channel fault, not a denial. Fall through
+            // to the 503 path so a later pass can still deliver a terminal.
+          }
         }
       } catch (error) {
         // The read or the parse failed, most likely on the same dead channel that
@@ -1370,74 +1769,77 @@ export async function startSandboxCallbackBridgeWorker(input: {
         );
         continue;
       }
-      // Write the 503 first, then remove the request file only after the write
-      // lands. Retry a transient failure, bounded by the per-iteration timeout,
-      // exactly like the finalize and 504 backstop writes. When every attempt
-      // fails, keep the request file. A later recovery pass, or the caller retry,
-      // then still finds the queued request and delivers a terminal 503, instead
-      // of a silent drop that strands the caller until its own deadline. The
-      // request is unclaimed or abandoned, so its host mutation never ran; a later
-      // 503 stays exactly-once.
-      let wrote503 = false;
-      let lastWriteError = "Sandbox callback bridge could not write the recovery 503.";
+      // Write the terminal recovery response first, then remove the request file
+      // only after the write lands. A denied route stays a 403 here, not a 503:
+      // the denial is terminal and the mutation never ran, so a retryable 503
+      // would only make the caller repeat a request the host would deny again.
+      // An allowed request stays a retryable 503. Retry a transient failure,
+      // bounded by the per-iteration timeout, exactly like the finalize and
+      // backstop writes. When every attempt fails, keep the request file. A
+      // later recovery pass, or the caller retry, then still finds the queued
+      // request and delivers a terminal, instead of a silent drop that strands
+      // the caller until its own deadline. The request is unclaimed or
+      // abandoned, so its host mutation never ran; a later terminal stays
+      // exactly-once.
+      const recoveryStatus = denialStatus !== null ? 403 : 503;
+      const recoveryBody = denialStatus !== null ? denialStatus.body : JSON.stringify({ error: message });
+      const recoveryLabel = denialStatus !== null ? "403" : "503";
+      let wroteRecovery = false;
+      let lastWriteError = `Sandbox callback bridge could not write the recovery ${recoveryLabel}.`;
       for (let attempt = 1; attempt <= MAX_BACKSTOP_WRITE_ATTEMPTS; attempt += 1) {
         try {
           await withTimeout(
             writeBridgeResponse(input.client, requestPath, responsePath, {
               id: responseId,
-              status: 503,
+              status: recoveryStatus,
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ error: message }),
+              body: recoveryBody,
               completedAt: new Date().toISOString(),
             }, {
               requireRequestPath: false,
             }),
             iterationTimeoutMs,
-            `Sandbox callback bridge write 503 for ${requestId}`,
+            `Sandbox callback bridge write ${recoveryLabel} for ${requestId}`,
           );
-          wrote503 = true;
+          wroteRecovery = true;
           break;
         } catch (error) {
           lastWriteError = error instanceof Error ? error.message : String(error);
           console.warn(
-            `[paperclip] sandbox callback bridge failed to write recovery 503 for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
+            `[paperclip] sandbox callback bridge failed to write recovery ${recoveryLabel} for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
           );
           if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
             await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
           }
         }
       }
-      if (wrote503) {
-        // The 503 landed. Remove the request file, so the poll loop does not
-        // re-process it.
-        await input.client.remove(requestPath).catch(() => undefined);
+      if (wroteRecovery) {
+        // The recovery response landed. Remove the request file, so the poll
+        // loop does not re-process it. Bound like every other client call,
+        // so a hung remove never wedges the recovery pass. A timed-out or
+        // failed remove marks the file for remove-only retry; the terminal
+        // already landed, so a later pass must never write again.
+        try {
+          await withTimeout(
+            input.client.remove(requestPath),
+            iterationTimeoutMs,
+            `Sandbox callback bridge remove request ${fileName}`,
+          );
+          deliveredPendingRemove.delete(fileName);
+        } catch {
+          deliveredPendingRemove.add(fileName);
+        }
       } else {
-        // Every 503 write failed. Keep the request file for a later recovery pass.
+        // Every recovery write failed. Keep the request file for a later recovery pass.
         console.warn(
-          `[paperclip] sandbox callback bridge kept queued request ${requestId} after every recovery 503 write failed: ${lastWriteError}`,
+          `[paperclip] sandbox callback bridge kept queued request ${requestId} after every recovery ${recoveryLabel} write failed: ${lastWriteError}`,
         );
       }
     }
   };
 
-  // Surface a bridge-worker failure through the run trace, not only stdout. A
-  // failed span under `input.runtimeSpan` records the error against the live run
-  // span, so the run and the orchestrator see the hang. When no `runtimeSpan`
-  // runner is wired (no injected tracer), the helper still writes a warn line,
-  // so the failure is never silent.
-  const surfaceRunError = async (error: Error) => {
-    if (input.runtimeSpan) {
-      try {
-        await input.runtimeSpan(CALLBACK_BRIDGE_WORKER_FAILED_SPAN, async () => {
-          throw error;
-        });
-      } catch {
-        // `runtimeSpan` re-throws after it records the failed span. The error is
-        // now on the trace; swallow it here so the worker recovery continues.
-      }
-    }
-    console.warn(`[paperclip] ${error.message}`);
-  };
+  // `surfaceRunError` is defined near the top (before `processRequestFile`) so
+  // phase timeouts can surface immediately before their grace wait. See above.
 
   // The timestamp of the last successful loop iteration. The watchdog compares
   // it to the current time. The idle branch and every processed request update
@@ -1557,19 +1959,26 @@ export async function startSandboxCallbackBridgeWorker(input: {
             // live parent switches to `agent.turn` during the turn and back to
             // `task.run` after it. Without a runner, the request runs under the
             // run parent with no wrapper span, exactly like the earlier behavior.
-            // The per-iteration timeout wraps the whole request, so a hung
-            // request rejects and the catch below runs the recovery pass.
-            await withTimeout(
-              input.runtimeSpan
-                ? input.runtimeSpan(CALLBACK_BRIDGE_RELAY_REQUEST_SPAN, () =>
-                    processRequestFile(fileName),
-                  )
-                : runWithRuntimeParent(input.getRuntimeParentContext?.(), () =>
-                    processRequestFile(fileName),
-                  ),
-              iterationTimeoutMs,
-              `Sandbox callback bridge process request ${fileName}`,
-            );
+            //
+            // Phase deadlines live inside `processRequestFile`, not here: the
+            // queue read and the host forward each get the full per-iteration
+            // budget starting at their own phase, and response delivery keeps
+            // its own per-attempt bound in `finalize` plus the backstop. A
+            // single total around the whole attempt would false-fire when
+            // near-budget host latency (for example 9.5s against a 10s budget)
+            // plus queue/finalization overhead exceeds the total even though
+            // the host already committed and the real response exists. A hung
+            // phase still rejects through its own `withTimeout` below and the
+            // catch runs the same recovery pass.
+            if (input.runtimeSpan) {
+              await input.runtimeSpan(CALLBACK_BRIDGE_RELAY_REQUEST_SPAN, () =>
+                processRequestFile(fileName),
+              );
+            } else {
+              await runWithRuntimeParent(input.getRuntimeParentContext?.(), () =>
+                processRequestFile(fileName),
+              );
+            }
             lastSuccessfulIterationAt = Date.now();
           } catch (error) {
             // A single request attempt failed or hung. Run the same recovery
@@ -2464,10 +2873,16 @@ async function runFileGateway() {
         }
       }
 
-      const url = new URL(req.url || "/", "http://127.0.0.1");
+      // Split the raw request target without URL parsing. Normalizing here
+      // would let a crafted target reach the host as a different route than
+      // the client sent; the host validates the raw target it receives.
+      const rawGatewayTarget = req.url || "/";
+      const gatewayQueryIndex = rawGatewayTarget.indexOf("?");
+      const gatewayPath = gatewayQueryIndex === -1 ? rawGatewayTarget : rawGatewayTarget.slice(0, gatewayQueryIndex);
+      const gatewayQuery = gatewayQueryIndex === -1 ? "" : rawGatewayTarget.slice(gatewayQueryIndex);
       const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
       const multipartAttachment = req.method === "POST"
-        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
+        && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(gatewayPath)
         && /^multipart\\/form-data(?:;|$)/i.test(contentType);
       if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
@@ -2484,8 +2899,8 @@ async function runFileGateway() {
       const payload = {
         id: requestId,
         method: req.method || "GET",
-        path: url.pathname,
-        query: url.search,
+        path: gatewayPath,
+        query: gatewayQuery,
         headers: normalizeHeaders(req.headers),
         ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
@@ -2741,15 +3156,29 @@ function runHttp2Gateway() {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
         return;
       }
-      const url = new URL(req.url || "/", "http://127.0.0.1");
+      // Split the raw request target without URL parsing, as in file mode:
+      // the host HTTP/2 server validates the raw path it receives, and a
+      // normalized gateway target would authorize a different route there.
+      const rawGatewayTarget = req.url || "/";
+      const gatewayQueryIndex = rawGatewayTarget.indexOf("?");
+      const gatewayPath = gatewayQueryIndex === -1 ? rawGatewayTarget : rawGatewayTarget.slice(0, gatewayQueryIndex);
+      const gatewayQuery = gatewayQueryIndex === -1 ? "" : rawGatewayTarget.slice(gatewayQueryIndex);
+      // Fail fast on a non-origin-form target before opening a stream: the
+      // HTTP/2 client cannot send absolute-form or network-path-form paths,
+      // and a stream error would surface as a 502 instead of a terminal 400.
+      // The host still validates every target it receives.
+      if (!gatewayPath.startsWith("/") || gatewayPath.startsWith("//")) {
+        writeJsonResponse(res, 400, { error: "Invalid request target: non_origin_form" });
+        return;
+      }
       const { body: requestBodyBuffer, release } = await readBodyBytes(req);
       releaseBodyReservation = release;
       let response;
       try {
         response = await forwardOverHttp2({
           method: req.method || "GET",
-          path: url.pathname,
-          query: url.search,
+          path: gatewayPath,
+          query: gatewayQuery,
           headers: normalizeHeaders(req.headers),
           body: requestBodyBuffer,
         });

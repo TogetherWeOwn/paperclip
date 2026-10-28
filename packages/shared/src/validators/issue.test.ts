@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
@@ -318,6 +319,16 @@ describe("issue validators", () => {
     });
 
     expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "cancelled",
+    });
+
+    expect(
       resolveIssueRecoveryActionSchema.safeParse({
         outcome: "cancelled",
         sourceIssueStatus: "blocked",
@@ -439,7 +450,7 @@ describe("issue validators", () => {
     expect(parsed.description).toBe("Line 1\n\nLine 2");
   });
 
-  it("normalizes escaped line breaks in thread summaries and documents", () => {
+  it("normalizes escaped line breaks in thread summaries but preserves document bytes", () => {
     const response = respondIssueThreadInteractionSchema.parse({
       answers: [],
       summaryMarkdown: "Summary\\n\\nNext action",
@@ -450,7 +461,44 @@ describe("issue validators", () => {
     });
 
     expect(response.summaryMarkdown).toBe("Summary\n\nNext action");
-    expect(document.body).toBe("# Plan\n\nShip it");
+    expect(document.body).toBe("# Plan\\n\\nShip it");
+  });
+
+  it("preserves exact issue-document bytes including escape-shaped sequences", () => {
+    const BS = String.fromCharCode(92); // U+005C REVERSE SOLIDUS
+    const LF = "\n";
+    const CRLF = "\r\n";
+    const CR = "\r";
+    const TAB = "\t";
+    const DQ = String.fromCharCode(34);
+    const lines = [
+      `# Byte-fidelity fixture${LF}`,
+      `literal backslash-n: ${BS}n stays literal${LF}`,
+      `literal backslash-r: ${BS}r stays literal${LF}`,
+      `literal backslash-r-backslash-n: ${BS}r${BS}n stays literal${LF}`,
+      `nested double-backslash-n: ${BS}${BS}n stays literal${LF}`,
+      `\`\`\`python${LF}`,
+      `s = ${DQ}a${BS}nb${BS}tc${DQ}${LF}`,
+      `pat = r${DQ}${BS}d+${BS}s*${BS}n${DQ}${LF}`,
+      `\`\`\`${LF}`,
+      `{"text": ${DQ}a${BS}nb${DQ}, ${DQ}path${DQ}: ${DQ}C:${BS}${BS}tmp${DQ}}${LF}`,
+      `crlf-line${CRLF}`,
+      `cr-line${CR}`,
+      `${TAB}tabbed café naïve ✓${LF}`,
+    ];
+    const fixture = lines.join("");
+    const parsed = upsertIssueDocumentSchema.parse({
+      format: "markdown",
+      body: fixture,
+    });
+
+    expect(parsed.body).toBe(fixture);
+    expect(Buffer.byteLength(parsed.body, "utf8")).toBe(
+      Buffer.byteLength(fixture, "utf8"),
+    );
+    expect(createHash("sha256").update(parsed.body, "utf8").digest("hex")).toBe(
+      createHash("sha256").update(fixture, "utf8").digest("hex"),
+    );
   });
 
   it("clamps oversized requestDepth values on create", () => {

@@ -1,0 +1,16 @@
+id: gha-branch-name-trust
+snapshots:
+  ? |-
+    jobs:
+      gate:
+        if: github.head_ref != 'release-please--branches--main'
+        runs-on: ubuntu-latest
+  : labels:
+    - source: |-
+        jobs:
+          gate:
+            if: github.head_ref != 'release-please--branches--main'
+            runs-on: ubuntu-latest
+      style: primary
+      start: 0
+      end: 100

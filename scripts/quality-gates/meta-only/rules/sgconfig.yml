@@ -1,0 +1,13 @@
+ruleDirs:
+- rust
+- ts
+- python
+- bash
+- github-actions
+testConfigs:
+- testDir: tests
+languageGlobs:
+  TypeScript:
+  - '**/*.cjs'
+  - '**/*.mjs'
+  - '**/*.js'

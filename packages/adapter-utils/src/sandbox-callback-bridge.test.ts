@@ -1691,10 +1691,10 @@ describe("sandbox callback bridge", () => {
     return { runtimeSpan, workerErrors };
   }
 
-  function bridgeRequestJson(id: string): string {
+  function bridgeRequestJson(id: string, method = "GET"): string {
     return `${JSON.stringify({
       id,
-      method: "GET",
+      method,
       path: "/api/agents/me",
       query: "",
       headers: {},
@@ -1890,7 +1890,7 @@ describe("sandbox callback bridge", () => {
     const responsePath = path.posix.join(directories.responsesDir, requestFile);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(requestPath, bridgeRequestJson("req-abort"));
+    requestBodies.set(requestPath, bridgeRequestJson("req-abort", "POST"));
     const responseWrites: Array<{ path: string; status: number }> = [];
     const requestRemovals: string[] = [];
 
@@ -1987,7 +1987,7 @@ describe("sandbox callback bridge", () => {
     const responsePath = path.posix.join(directories.responsesDir, requestFile);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(requestPath, bridgeRequestJson("req-stuck"));
+    requestBodies.set(requestPath, bridgeRequestJson("req-stuck", "POST"));
     const responseWrites: Array<{ path: string; status: number; body: string }> = [];
     const requestRemovals: string[] = [];
 
@@ -2085,7 +2085,7 @@ describe("sandbox callback bridge", () => {
     const responsePath = path.posix.join(directories.responsesDir, requestFile);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(requestPath, bridgeRequestJson("req-late-abort"));
+    requestBodies.set(requestPath, bridgeRequestJson("req-late-abort", "POST"));
     const responseWrites: Array<{ path: string; status: number; body: string }> = [];
     const requestRemovals: string[] = [];
 
@@ -2190,7 +2190,7 @@ describe("sandbox callback bridge", () => {
     const responsePath = path.posix.join(directories.responsesDir, requestFile);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(requestPath, bridgeRequestJson("req-retry"));
+    requestBodies.set(requestPath, bridgeRequestJson("req-retry", "POST"));
     const responseWrites: Array<{ path: string; status: number; body: string }> = [];
     const requestRemovals: Array<{ path: string; afterWrites: number }> = [];
     let writeAttempts = 0;
@@ -2379,7 +2379,7 @@ describe("sandbox callback bridge", () => {
     const responsePath = path.posix.join(directories.responsesDir, requestFile);
 
     const requestBodies = new Map<string, string>();
-    requestBodies.set(requestPath, bridgeRequestJson("req-write-backstop"));
+    requestBodies.set(requestPath, bridgeRequestJson("req-write-backstop", "POST"));
     const responseWrites: Array<{ path: string; status: number; body: string }> = [];
     const requestRemovals: string[] = [];
     let writeAttempts = 0;
@@ -3773,6 +3773,827 @@ describe("sandbox callback bridge", () => {
     expect(seenRequests).toHaveLength(1);
     expect(typeof seenRequests[0]?.body).toBe("string");
     expect(seenRequests[0]?.body).toBe(requestBodyText);
+  });
+
+  it("delivers a near-budget committed write truthfully when queue plus delivery overhead exceeds the old single total", async () => {
+    // Reproduce the live failure: host handling takes ~180ms against a 200ms
+    // phase budget (near-budget, like 9.5s against 10s live), plus slow queue
+    // delivery (~150ms, like remote write/removal latency). The old single
+    // total around the whole attempt (330ms > 200ms) false-fired and reported
+    // indeterminate 409 for a committed PATCH. Phase budgets give the forward
+    // its full 200ms starting at the forward, and delivery its own bound, so
+    // the real 200 wins with exactly one commit and no false indeterminate.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/near-budget";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-near-budget.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-near-budget", "PATCH"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const requestRemovals: string[] = [];
+    let commitCount = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        // Slow finalization: remote write/removal latency on top of host time.
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestRemovals.push(remotePath);
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 200,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async () => {
+        // Near-budget host latency that commits before returning.
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        commitCount += 1;
+        return { status: 200, body: "patched" };
+      },
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 5_000);
+
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // Truthful delivery: the committed PATCH returns its real 200, not 504/409.
+    expect(requestResponses[0]?.status).toBe(200);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(200);
+    // No false possibly-committed claim for a delivered real response.
+    expect(parsed.headers?.["x-paperclip-bridge-outcome"]).toBeUndefined();
+    // Exactly one commit: no duplicated write, no retry after a false timeout.
+    expect(commitCount).toBe(1);
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    // No false timeout: the forward kept its full phase budget, so no run error.
+    expect(workerErrors.some((message) => message.includes("timed out"))).toBe(false);
+    expect(requestRemovals).toContain(requestPath);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("reports a committed write as indeterminate (not inert) when delivery truly fails, without duplicating the commit", async () => {
+    // The write commits on the host, then every delivery write fails. The
+    // bridge must not claim the write was inert (no 502/503/200 claiming no
+    // commit) and must not run the mutation twice. The terminal is a
+    // non-retryable 504 indeterminate for the unsafe PATCH.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/commit-delivery-fail";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-commit-fail.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-commit-fail", "PATCH"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let commitCount = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      // Fail every `finalize` delivery write (which carries the request path),
+      // but let the backstop (which omits it) land, so the terminal 504 still
+      // reaches the caller instead of stranding.
+      writeResponseFile: async (remotePath, body, options) => {
+        const opts = (options ?? {}) as { requestPath?: string };
+        if (typeof opts.requestPath === "string" && opts.requestPath.length > 0) {
+          throw new Error("simulated persistent delivery failure");
+        }
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 500,
+      watchdogTimeoutMs: 10_000,
+      abortedHandlerGraceMs: 30,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async () => {
+        commitCount += 1;
+        return { status: 200, body: "patched" };
+      },
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 5_000);
+
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // The commit happened but delivery failed: indeterminate, not inert.
+    expect(requestResponses[0]?.status).toBe(504);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(504);
+    const responseBody = JSON.parse(parsed.body);
+    expect(responseBody.outcome).toBe("indeterminate");
+    expect(responseBody.retryable).toBe(false);
+    expect(parsed.headers?.["x-paperclip-bridge-outcome"]).toBe("indeterminate");
+    // Exactly one commit: the failed delivery never re-ran the mutation.
+    expect(commitCount).toBe(1);
+    // No false inert-write claim (no retryable or success claiming no commit).
+    expect(responseWrites.some((write) => write.status === 502)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 200)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("finalizes an aborted safe request as retryable 502, never indeterminate 504", async () => {
+    // A GET never commits, so aborting it must stay retryable. Reporting
+    // indeterminate 504 (mapped to 409 by the gateway) for a safe method is a
+    // false possibly-committed claim that needlessly blocks a safe retry. This
+    // covers both the handler's own abort response and the backstop path.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/safe-abort";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-safe-abort.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-safe-abort", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 50,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      // Cooperating safe handler: rejects on the worker abort.
+      handleRequest: (_request, options) =>
+        new Promise<{ status: number; body?: string }>((_resolve, reject) => {
+          options?.signal.addEventListener("abort", () => {
+            reject(new Error("aborted by worker"));
+          });
+        }),
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 3_000);
+
+    expect(workerErrors.some((message) => message.includes("timed out"))).toBe(true);
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // Safe stays retryable: 502 with no indeterminate marker, never 504/409.
+    expect(requestResponses[0]?.status).toBe(502);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(502);
+    expect(parsed.headers?.["x-paperclip-bridge-outcome"]).toBeUndefined();
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("writes the safe 502 backstop when the aborted handler never settles", async () => {
+    // The cooperating-handler test above only exercises the handler's own
+    // abort response (the forward-timeout catch finalizes it). The backstop
+    // itself runs only when an outside recovery aborts an in-flight forward
+    // whose handler then never settles: here the watchdog fires long before
+    // the forward's own phase budget, aborts the handler, and the grace
+    // expires with no settlement, so `writeAbortedHandlerBackstop` must
+    // deliver a retryable 502 with no indeterminate marker, never 504.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/safe-abort-backstop";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-safe-backstop.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-safe-backstop", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let handlerCalls = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      // The forward budget is deliberately long so the watchdog (not the
+      // forward phase) owns the abort; the backstop then owns the terminal.
+      iterationTimeoutMs: 1_000,
+      watchdogTimeoutMs: 50,
+      abortedHandlerGraceMs: 30,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      // Non-cooperating safe handler: ignores the abort signal and never
+      // settles, so only the backstop can terminate the request.
+      handleRequest: async () => {
+        handlerCalls += 1;
+        return await new Promise<{ status: number; body?: string }>(() => {});
+      },
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 5_000);
+
+    expect(workerErrors.length).toBeGreaterThan(0);
+    expect(handlerCalls).toBe(1);
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // Safe backstop stays retryable: 502 with no indeterminate marker.
+    expect(requestResponses[0]?.status).toBe(502);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(502);
+    expect(parsed.headers?.["x-paperclip-bridge-outcome"]).toBeUndefined();
+    const responseBody = JSON.parse(parsed.body);
+    expect(responseBody.outcome).toBeUndefined();
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("keeps serving later requests when a delivered request hangs on remove", async () => {
+    // A response that delivered but whose request-file remove never settles
+    // must not wedge the serial poll loop. The remove gets the same
+    // per-phase bound as every other client call, so the loop times it out
+    // and serves the next request instead of stalling behind the first.
+    // The timed-out remove must not re-run the host mutation: the file stays
+    // queued, so the next poll retries only the remove, never the handler.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/hung-remove";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-remove-a.json";
+    const fileB = "req-remove-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-remove-a", "POST"));
+    requestBodies.set(pathB, bridgeRequestJson("req-remove-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      // Never settle the caller and leave the file queued: a silently hung
+      // sandbox channel where the request file is still listed. Without the
+      // remove bound the loop stalls on the first request and the second is
+      // never handled. Without the delivered-pending-remove guard the next
+      // poll re-runs the host mutation and writes a duplicate response.
+      remove: async () => {
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // Both requests served exactly once with their real status, despite the
+    // hung removes behind them. The extra delay covers several poll intervals
+    // (100ms iteration): a replaying worker would forward the POST again and
+    // write duplicate responses here.
+    expect(handled).toContain("req-remove-a");
+    expect(handled).toContain("req-remove-b");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const handledA = handled.filter((id) => id === "req-remove-a");
+    const handledB = handled.filter((id) => id === "req-remove-b");
+    expect(handledA).toHaveLength(1);
+    expect(handledB).toHaveLength(1);
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(200);
+    expect(responsesB[0]?.status).toBe(200);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    expect(responseWrites.some((write) => write.status === 504)).toBe(false);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("bounds the backstop remove so a hung backstop cannot stall later requests", async () => {
+    // The finalize write fails, so finalize awaits the backstop inline. The
+    // backstop writes its terminal, then its remove hangs (file already
+    // deleted, caller never settles). Without the backstop remove bound the
+    // awaited backstop stalls processRequestFile and the second request is
+    // never served. Un-bounding the backstop remove must fail this test.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/backstop-remove-bound";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-backstop-a.json";
+    const fileB = "req-backstop-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-backstop-a", "POST"));
+    requestBodies.set(pathB, bridgeRequestJson("req-backstop-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        const status = JSON.parse(body.trim()).status as number;
+        // Fail the real response for fileA so finalize falls through to the
+        // awaited backstop; the backstop terminal and fileB succeed.
+        if (remotePath === responseA && status !== 504) {
+          throw new Error("transient write fault for backstop test");
+        }
+        responseWrites.push({ path: remotePath, status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // FileA got its backstop terminal (unsafe POST -> 504 indeterminate);
+    // fileB got its real response. The hung backstop remove did not stall it.
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(504);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesB[0]?.status).toBe(200);
+    expect(handled).toContain("req-backstop-a");
+    expect(handled).toContain("req-backstop-b");
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("bounds the recovery remove so a hung recovery cannot stall the loop", async () => {
+    // FileA's authorization hangs, so its attempt times out and the loop catch
+    // runs the recovery pass. Recovery writes 503s, then its remove hangs
+    // (files already deleted, caller never settles). Without the recovery
+    // remove bound the awaited recovery stalls and the test times out.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/recovery-remove-bound";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const fileA = "req-recovery-a.json";
+    const fileB = "req-recovery-b.json";
+    const pathA = path.posix.join(directories.requestsDir, fileA);
+    const pathB = path.posix.join(directories.requestsDir, fileB);
+    const responseA = path.posix.join(directories.responsesDir, fileA);
+    const responseB = path.posix.join(directories.responsesDir, fileB);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(pathA, bridgeRequestJson("req-recovery-a", "GET"));
+    requestBodies.set(pathB, bridgeRequestJson("req-recovery-b", "GET"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    const handled: string[] = [];
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+        return await new Promise<void>(() => {});
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 100,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      // Hang only fileA's authorization; fileB authorizes normally. The
+      // bounded authorize times out, the attempt throws to the loop catch,
+      // and recovery owns both unclaimed files (its own authorize hang for
+      // fileA falls through to the 503 path, not a skip).
+      authorizeRequest: async (request) => {
+        if (request.id === "req-recovery-a") {
+          return await new Promise<null>(() => {});
+        }
+        return null;
+      },
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    await waitFor(
+      () =>
+        responseWrites.some((write) => write.path === responseA) &&
+        responseWrites.some((write) => write.path === responseB),
+      10_000,
+    );
+
+    // Recovery owned both unclaimed files: retryable 503s, no handler run, no
+    // stall behind the hung recovery remove.
+    const responsesA = responseWrites.filter((write) => write.path === responseA);
+    const responsesB = responseWrites.filter((write) => write.path === responseB);
+    expect(responsesA).toHaveLength(1);
+    expect(responsesA[0]?.status).toBe(503);
+    expect(responsesB).toHaveLength(1);
+    expect(responsesB[0]?.status).toBe(503);
+    expect(handled).toHaveLength(0);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("keeps an authorization denial denied (403) through recovery instead of converting it to 503", async () => {
+    // Recovery must not weaken authorization. A denied route never runs its
+    // mutation, so its terminal stays 403. Converting it to retryable 503 would
+    // make the caller repeat a request the host would deny again.
+    const queueDir = "/virtual-bridge/denied-recovery";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-denied.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-denied", "POST"));
+    const responseWrites: Array<{ path: string; status: number; body: string }> = [];
+    let handlerCalls = 0;
+
+    const base = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      readTextFile: async (remotePath: string) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath: string, body: string) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status, body });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath: string) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+    let listCalls = 0;
+    const client: SandboxCallbackBridgeQueueClient = {
+      ...base,
+      // Stall the first poll so the watchdog recovery (not the handler) owns
+      // the denied request. Later calls succeed so recovery can enumerate.
+      listJsonFiles: async (dir) => {
+        listCalls += 1;
+        if (listCalls === 1 && dir === directories.requestsDir) {
+          return await new Promise<string[]>(() => {});
+        }
+        if (dir !== directories.requestsDir) return [];
+        return [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort();
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 400,
+      watchdogTimeoutMs: 50,
+      runtimeSpan,
+      authorizeRequest: async () => "Route not allowed (test denial).",
+      handleRequest: async () => {
+        handlerCalls += 1;
+        return { status: 200, body: "must never run" };
+      },
+    });
+
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 5_000);
+
+    const requestResponses = responseWrites.filter((write) => write.path === responsePath);
+    expect(requestResponses).toHaveLength(1);
+    // Denied stays denied through recovery.
+    expect(requestResponses[0]?.status).toBe(403);
+    const parsed = JSON.parse(requestResponses[0]?.body ?? "{}");
+    expect(parsed.status).toBe(403);
+    expect(responseWrites.some((write) => write.status === 503)).toBe(false);
+    // The mutation never ran on either path.
+    expect(handlerCalls).toBe(0);
+
+    await worker.stop({ drainTimeoutMs: 400 });
+  });
+
+  it("cleans up guards so a re-queued request still processes instead of leaking", async () => {
+    // Queues and in-flight work must not leak indefinitely. After a request
+    // finalizes, its guard leaves the map: re-queueing the same file name
+    // processes again instead of skipping as in-flight forever.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+
+    const queueDir = "/virtual-bridge/guard-cleanup";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-reuse.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-reuse", "GET"));
+    const responseWrites: Array<{ path: string; status: number }> = [];
+    let handlerCalls = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir
+          ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)).sort()
+          : [],
+      readTextFile: async (remotePath) => {
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        responseWrites.push({ path: remotePath, status: JSON.parse(body.trim()).status });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 500,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async () => {
+        handlerCalls += 1;
+        return { status: 200, body: `attempt-${handlerCalls}` };
+      },
+    });
+
+    await waitFor(
+      () => responseWrites.filter((write) => write.path === responsePath).length >= 1,
+      3_000,
+    );
+    expect(handlerCalls).toBe(1);
+
+    // Re-queue the same file name after the first attempt removed it. A leaked
+    // guard would skip it as still in-flight; a cleaned guard processes it.
+    requestBodies.set(requestPath, bridgeRequestJson("req-reuse", "GET"));
+    await waitFor(
+      () => responseWrites.filter((write) => write.path === responsePath).length >= 2,
+      3_000,
+    );
+    expect(handlerCalls).toBe(2);
+    expect(responseWrites.filter((write) => write.path === responsePath)).toHaveLength(2);
+
+    await worker.stop({ drainTimeoutMs: 10 });
   });
 });
 

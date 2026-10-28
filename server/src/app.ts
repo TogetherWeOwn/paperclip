@@ -25,6 +25,8 @@ import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { auditContextMiddleware } from "./services/audit-context.js";
+import { observerCeiling } from "./middleware/observer-ceiling.js";
 import {
   privateHostnameGuard,
   resolvePrivateHostnameAllowSet,
@@ -73,6 +75,7 @@ import { routineRoutes } from "./routes/routines.js";
 import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
+import { sourceTransportValidationRoutes } from "./routes/source-transport-validation.js";
 import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
@@ -571,6 +574,13 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // Observer deny-by-default ceiling: after actor resolution on purpose,
+  // before every route, so observer
+  // credentials can never reach generic permissions or mutation handlers.
+  app.use(observerCeiling());
+  // Stamps actorSource / credential row id / change reason onto every activity
+  // row written while serving the request.
+  app.use(auditContextMiddleware());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -767,6 +777,7 @@ export async function createApp(
     }),
   );
   api.use(executionWorkspaceRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(sourceTransportValidationRoutes(db));
   api.use(emailRoutes(db, emailChannels));
   api.use(goalRoutes(db));
   api.use(onboardingSeedRoutes(db));

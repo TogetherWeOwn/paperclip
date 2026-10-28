@@ -1,0 +1,5 @@
+id: ts-probe-unbounded-buffer
+valid:
+- async function probe(res) { return await readBoundedText(res, MAX_PROBE_BODY_BYTES); }
+invalid:
+- async function probe(res) { const body = await res.arrayBuffer(); return parse(body); }

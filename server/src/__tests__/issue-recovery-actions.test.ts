@@ -2098,6 +2098,44 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status: "todo", assigneeAgentId: coderId });
   });
 
+  it("allows a recovery resolution to cancel its source issue", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:cancel-source",
+      evidence: { sourceRunId: "run-cancel-source" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const resolved = await request(createApp())
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+        resolutionNote: "The source work is no longer required.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "cancelled",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+  });
+
   it("hands restored work back to the recorded return owner and records the outcome", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db

@@ -1,0 +1,5 @@
+id: ts-vacuous-literal-expect
+valid:
+- it("pins behavior", () => { expect(check()).toBe(true); });
+invalid:
+- it("pins behavior", () => { expect(true).toBe(true); });

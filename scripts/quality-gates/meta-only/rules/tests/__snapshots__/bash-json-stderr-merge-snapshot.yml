@@ -1,0 +1,10 @@
+id: bash-json-stderr-merge
+snapshots:
+  ? |-
+    payload=$(python3 probe.py 2>&1)
+    parse_json "$payload"
+  : labels:
+    - source: $(python3 probe.py 2>&1)
+      style: primary
+      start: 8
+      end: 32

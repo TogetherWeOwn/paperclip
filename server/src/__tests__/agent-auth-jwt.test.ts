@@ -79,6 +79,28 @@ describe("agent local JWT", () => {
     expect(claims?.key_scope).toEqual({ kind: "skill_test", issueId });
   });
 
+  it("rejects a token carrying a malformed key scope instead of standard", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const now = Math.floor(Date.now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(
+      JSON.stringify({
+        sub: "agent-1",
+        company_id: "company-1",
+        adapter_type: "claude_local",
+        run_id: "run-1",
+        key_scope: { kind: "nope" },
+        iat: now,
+        exp: now + 3600,
+      }),
+    ).toString("base64url");
+    const signingInput = `${header}.${payload}`;
+    // Sign under the legacy raw-secret fallback so the signature verifies and
+    // the scope check is what rejects the token.
+    const signature = createHmac("sha256", "test-secret").update(signingInput).digest("base64url");
+    expect(verifyLocalAgentJwt(`${signingInput}.${signature}`)).toBeNull();
+  });
+
   it("returns null when secret is missing", () => {
     process.env[secretEnv] = "";
     const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");

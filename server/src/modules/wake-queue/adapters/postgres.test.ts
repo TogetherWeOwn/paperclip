@@ -876,6 +876,44 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       expect(wakeRows).toHaveLength(0);
     });
 
+    it("stores the trigger reason on the coalesced receipt payload", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const runId = await seedRun({ companyId, agentId, status: "queued", contextSnapshot: { taskKey: "issue-1" } });
+      const writer = createWakeAdmissionWriter();
+
+      await db.transaction(async (tx) => {
+        const scope = createAdmissionTransactionScope(companyId, tx as unknown as Db);
+        await writer.coalesceIntoActiveExecutionRun(scope, {
+          companyId,
+          activeExecutionRunId: runId,
+          mergedContextSnapshot: { taskKey: "issue-1", commentId: "c1" },
+          agentId,
+          source: "automation",
+          triggerDetail: null,
+          payload: { issueId: "issue-1", commentId: "c1" },
+          requestedReason: "issue_commented",
+          requestedByActorType: "user",
+          requestedByActorId: "user-1",
+          idempotencyKey: null,
+        });
+      });
+
+      const wakeRows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakeRows).toHaveLength(1);
+      expect(wakeRows[0]).toMatchObject({
+        reason: "issue_execution_same_name",
+        status: "coalesced",
+        coalescedCount: 1,
+        runId,
+      });
+      expect(wakeRows[0]?.payload).toMatchObject({
+        issueId: "issue-1",
+        commentId: "c1",
+        requestedReason: "issue_commented",
+      });
+    });
+
     // Review test (d): a transaction-port call cannot use the root database
     // executor. The module rejects a missing scope handle and a mismatched
     // scope handle, and neither case writes a row.

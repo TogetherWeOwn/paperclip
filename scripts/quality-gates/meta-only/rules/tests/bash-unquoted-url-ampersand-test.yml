@@ -1,0 +1,5 @@
+id: bash-unquoted-url-ampersand
+valid:
+- ENDPOINT='https://example.invalid/?x=1&y=2'
+invalid:
+- ENDPOINT=https://example.invalid/?x=1&y=2

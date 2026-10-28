@@ -46,6 +46,14 @@ vi.mock("../services/agent-action-audit.js", () => ({
   agentActionAuditService: () => mockAgentActionAuditService,
 }));
 
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: vi.fn(),
+  redactActivityDetails: async (
+    _db: unknown,
+    details: Record<string, unknown> | null,
+  ) => details,
+}));
+
 async function createApp(
   actor: Record<string, unknown> = {
     type: "board",
@@ -56,9 +64,10 @@ async function createApp(
   },
 ) {
   vi.resetModules();
-  const [{ errorHandler }, { activityRoutes }] = await Promise.all([
+  const [{ errorHandler }, { activityRoutes }, { auditContextMiddleware }] = await Promise.all([
     import("../middleware/index.js") as Promise<typeof import("../middleware/index.js")>,
     import("../routes/activity.js") as Promise<typeof import("../routes/activity.js")>,
+    import("../services/audit-context.js") as Promise<typeof import("../services/audit-context.js")>,
   ]);
   const app = express();
   app.use(express.json());
@@ -69,6 +78,7 @@ async function createApp(
     };
     next();
   });
+  app.use(auditContextMiddleware());
   app.use("/api", activityRoutes({} as any));
   app.use(errorHandler);
   return app;
@@ -275,6 +285,49 @@ describe.sequential("activity routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockActivityService.create).not.toHaveBeenCalled();
+  });
+
+  it("stamps request provenance on POST /activity regardless of the claimed actor", async () => {
+    mockActivityService.create.mockImplementation(async (input: unknown) => ({
+      id: "activity-1",
+      ...(input as Record<string, unknown>),
+    }));
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      companyIds: ["company-1"],
+      source: "board_key",
+      keyId: "key-7",
+    });
+    const bodies = [
+      // No actorType: schema defaults the claimed actor to system.
+      { actorId: "user-1", action: "test.event", entityType: "issue", entityId: "issue-1", details: { n: 1 } },
+      // Claims a different user's id.
+      { actorType: "user", actorId: "user-2", action: "test.event", entityType: "issue", entityId: "issue-1", details: { n: 1 } },
+      // Claims the caller's own id.
+      { actorType: "user", actorId: "user-1", action: "test.event", entityType: "issue", entityId: "issue-1", details: { n: 1 } },
+    ];
+    for (const body of bodies) {
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl)
+          .post("/api/companies/company-1/activity")
+          .set("X-Paperclip-Change-Reason", "cap timer: weekly window")
+          .set("X-Paperclip-Correlation-Id", "cap-timer/2026-10-11")
+          .send(body),
+      );
+      expect(res.status).toBe(201);
+    }
+
+    expect(mockActivityService.create).toHaveBeenCalledTimes(3);
+    for (const call of mockActivityService.create.mock.calls as unknown[][]) {
+      expect((call[0] as Record<string, { audit: unknown }>).details.audit).toEqual({
+        actorSource: "board_key",
+        keyId: "key-7",
+        reason: "cap timer: weekly window",
+        correlationId: "cap-timer/2026-10-11",
+      });
+    }
   });
 
   it("returns 200 [] (not 404) when listing issues for another company's run, preserving API contract and the cross-tenant oracle", async () => {

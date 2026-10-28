@@ -31,6 +31,7 @@ import {
   chatGitHubConfigurations,
   chatGitHubReviews,
   chatMessageLinks,
+  companyMemberships,
   heartbeatRuns,
   issues,
   projects,
@@ -53,8 +54,11 @@ import {
   githubReviewConclusion,
   githubReviewPathIsExcluded,
   githubReviewLineIsInPatch,
+  githubWorkflowTriggerPersonAllowed,
+  githubWorkflowTriggerReviewDecision,
   validateGitHubReviewAssessment,
   validatePersistedGitHubReviewAssessment,
+  type GitHubWorkflowTriggerMarker,
 } from "./chat-github-review-policy.js";
 import {
   isIssueWithinLowTrustBoundary,
@@ -229,6 +233,50 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         ?.allowed
     )
       throw forbidden("Automatic review authority is no longer available");
+    const workflowTrigger = source.delivery.normalizedEvent
+      .githubWorkflowTrigger as GitHubWorkflowTriggerMarker | undefined;
+    if (workflowTrigger) {
+      const [saved] = await db
+        .select()
+        .from(chatGitHubConfigurations)
+        .where(eq(chatGitHubConfigurations.endpointId, source.endpoint.id));
+      const person = saved?.configuration.people.find(
+        (candidate) =>
+          candidate.githubUserId === workflowTrigger.senderGithubUserId,
+      );
+      let sponsor:
+        | { status?: string | null; membershipRole?: string | null }
+        | undefined;
+      if (person?.kind === "guest") {
+        const [row] = await db
+          .select({
+            status: companyMemberships.status,
+            membershipRole: companyMemberships.membershipRole,
+          })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, source.endpoint.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, person.sponsorUserId),
+            ),
+          );
+        sponsor = row;
+      }
+      if (
+        !githubWorkflowTriggerPersonAllowed({
+          provider: source.endpoint.provider,
+          isMe: false,
+          isSystem: false,
+          isBot: true,
+          triggerHeadSha: workflowTrigger.headSha,
+          allowUnlinkedPeople: source.endpoint.allowUnlinkedPeople,
+          person,
+          sponsor,
+        })
+      )
+        throw forbidden("Workflow review-trigger authority is no longer available");
+    }
     const repositoryId = String(
       source.resource.metadata?.providerRepositoryId ?? "",
     );
@@ -378,6 +426,31 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
     source: Awaited<ReturnType<typeof scope>>,
     pull: Pull,
   ) {
+    const trigger = source.delivery.normalizedEvent.githubWorkflowTrigger as
+      | GitHubWorkflowTriggerMarker
+      | undefined;
+    if (trigger) {
+      const decision = githubWorkflowTriggerReviewDecision({
+        policy: source.policy,
+        triggerHeadSha: trigger.headSha,
+        pull: {
+          headSha: pull.head.sha,
+          draft: pull.draft,
+          labels: pull.labels.map((l) => l.name),
+          baseBranch: pull.base.ref,
+          authorLogin: pull.user.login,
+          authorIsBot: pull.user.type === "Bot",
+        },
+      });
+      if (!decision.allowed && decision.reason === "stale_head")
+        throw conflict(
+          "This workflow review trigger was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
+        );
+      if (!decision.allowed)
+        throw forbidden(
+          `Workflow review trigger is not reviewable: ${decision.reason}`,
+        );
+    }
     const [prior] = await db
       .select()
       .from(chatGitHubReviews)
@@ -602,6 +675,30 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
       throw conflict(
         "This automatic review was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
       );
+    const workflowTrigger = source.delivery.normalizedEvent
+      .githubWorkflowTrigger as GitHubWorkflowTriggerMarker | undefined;
+    if (workflowTrigger) {
+      const decision = githubWorkflowTriggerReviewDecision({
+        policy: source.policy,
+        triggerHeadSha: workflowTrigger.headSha,
+        pull: {
+          headSha: pull.head.sha,
+          draft: pull.draft,
+          labels: pull.labels.map((l) => l.name),
+          baseBranch: pull.base.ref,
+          authorLogin: pull.user.login,
+          authorIsBot: pull.user.type === "Bot",
+        },
+      });
+      if (!decision.allowed && decision.reason === "stale_head")
+        throw conflict(
+          "This workflow review trigger was requested for an older pull request head. Continue with the newest authorized PR event or an authorized manual request.",
+        );
+      if (!decision.allowed)
+        throw forbidden(
+          `Workflow review trigger is not reviewable: ${decision.reason}`,
+        );
+    }
     if (name === "read_pull_request") {
       const parsed = readSchema.parse(input);
       if (parsed.section === "metadata") {
@@ -1065,7 +1162,17 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
         if (!session || session.companyId !== action.companyId)
           throw forbidden("Invalid GitHub publication binding");
         try {
-          const source = await scope(session, true);
+          const publicationScope = async () => {
+            const source = await scope(session, true);
+            if (
+              source.endpoint.id !== action.endpointId ||
+              source.conversation.id !== action.conversationId ||
+              source.delivery.id !== action.deliveryId
+            )
+              throw forbidden("GitHub publication context changed");
+            return source;
+          };
+          const source = await publicationScope();
           const egressScope = await githubEgressReferenceScope(
             db,
             source.endpoint.companyId,
@@ -1076,12 +1183,6 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               projectSafeChatPublicationText(text),
               egressScope,
             );
-          if (
-            source.endpoint.id !== action.endpointId ||
-            source.conversation.id !== action.conversationId ||
-            source.delivery.id !== action.deliveryId
-          )
-            throw forbidden("GitHub publication context changed");
           await assertPublicationAuthority(source, action);
           const api = await client(source, lease.fetch);
           const publicationMarker = marker(
@@ -1111,7 +1212,20 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             );
           };
           const currentHead = async (expected: string) => {
-            const currentSource = await scope(session, true);
+            const currentSource = await publicationScope();
+            // The repository slug is intentionally not pinned here: renames and
+            // canonical-case syncs change providerResourceId in place while the
+            // numeric repositoryId (pinned below) stays stable, and scope()
+            // already rejects thread/resource disagreement case-insensitively.
+            if (
+              currentSource.endpoint.connectionId !== source.endpoint.connectionId ||
+              currentSource.resource.id !== source.resource.id ||
+              currentSource.repositoryId !== source.repositoryId ||
+              currentSource.number !== source.number ||
+              currentSource.isIssue !== source.isIssue ||
+              currentSource.replyId !== source.replyId
+            )
+              throw forbidden("GitHub publication context changed");
             await assertPublicationAuthority(currentSource, action);
             if (action.payload.operation === "formal_review")
               assertFormalPermission(
@@ -1172,6 +1286,10 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               `/pulls/${source.number}/reviews`,
               publicationMarker,
             );
+            // Recover an existing effect without duplicating it. A new POST
+            // needs fresh authority and head checks after the history lookup;
+            // this preflight still is not an atomic transaction with GitHub.
+            if (!prior) await currentHead(parsed.reviewedCommit);
             const posted =
               prior ??
               (await api.request<{ id: number; html_url: string }>(

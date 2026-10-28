@@ -79,6 +79,7 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { withRequestAuditDetails } from "./audit-context.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 
@@ -1694,7 +1695,7 @@ export function routineService(
       entityType: "issue",
       entityId: input.issueId,
       responsibleUserId: input.userId,
-      details: { source: "manual_routine_run" },
+      details: withRequestAuditDetails({ source: "manual_routine_run" }, { actorType: "user", actorId: input.userId }),
       createdAt: input.touchedAt,
     });
 

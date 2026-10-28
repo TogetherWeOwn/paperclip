@@ -37,6 +37,12 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
+const mockSweepWorkspaceValidationRecoveries = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/workspace-validation-sweep.js", () => ({
+  sweepWorkspaceValidationRecoveries: mockSweepWorkspaceValidationRecoveries,
+}));
+
 const mockEnvironmentRuntimeService = vi.hoisted(() => ({
   destroyReusableSandboxLeases: vi.fn(async () => undefined),
 }));
@@ -454,6 +460,36 @@ describe.sequential("execution workspace routes", () => {
     expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).not.toHaveBeenCalled();
   });
 
+  it("refuses the archive from a blocked reopen-pending preflight without attempting the lifecycle write", async () => {
+    // The close-readiness preflight exposes the reopen-pending refusal before any
+    // preservation or archive work starts. When the preflight is already blocked,
+    // PATCH surfaces its blocker with the readiness payload and never attempts
+    // the under-lock archive write.
+    const reopenBlockingReason = "Execution workspace was reopened and cannot be archived right now";
+    const readiness = {
+      state: "blocked",
+      blockingReasons: [reopenBlockingReason],
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      status: "active",
+      mode: "isolated_workspace",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue(readiness);
+
+    const res = await request(createApp())
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe(reopenBlockingReason);
+    expect(res.body.closeReadiness).toEqual(readiness);
+    expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).not.toHaveBeenCalled();
+  });
+
   it("destroys the reusable sandbox leases inside the destruction fence when the archive wins", async () => {
     // The archive wins the lifecycle race. The fence runs the destroy callback,
     // so the reusable sandbox lease teardown runs with the worktree teardown.
@@ -544,5 +580,36 @@ describe.sequential("execution workspace routes", () => {
     expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).toHaveBeenCalledTimes(1);
     // The reopen keeps its reusable leases because the fence skipped the destroy.
     expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
+  });
+
+  it("runs the branch-incoherence sweep as a dry run scoped to the company", async () => {
+    mockSweepWorkspaceValidationRecoveries.mockResolvedValue({
+      enabled: true,
+      dryRun: true,
+      scanned: 0,
+      deferred: 0,
+      restored: 0,
+      wouldRestore: 0,
+      refused: 0,
+      skipped: {},
+      items: [],
+    });
+
+    const res = await request(createApp())
+      .post("/api/companies/company-1/execution-workspaces/sweep-branch-incoherence?dryRun=true");
+
+    expect(res.status).toBe(200);
+    expect(mockSweepWorkspaceValidationRecoveries).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({ companyId: "company-1", dryRun: true }),
+    );
+  });
+
+  it("refuses the branch-incoherence sweep without dryRun=true", async () => {
+    const res = await request(createApp())
+      .post("/api/companies/company-1/execution-workspaces/sweep-branch-incoherence");
+
+    expect(res.status).toBe(400);
+    expect(mockSweepWorkspaceValidationRecoveries).not.toHaveBeenCalled();
   });
 });

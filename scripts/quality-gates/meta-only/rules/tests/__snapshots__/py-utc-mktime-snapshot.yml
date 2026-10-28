@@ -1,0 +1,8 @@
+id: py-utc-mktime
+snapshots:
+  stamp = time.mktime(time.strptime(value, fmt)) - time.timezone:
+    labels:
+    - source: time.mktime(time.strptime(value, fmt)) - time.timezone
+      style: primary
+      start: 8
+      end: 62

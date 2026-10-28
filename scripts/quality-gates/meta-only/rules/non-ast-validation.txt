@@ -1,0 +1,24 @@
+test_advisory_job_and_expression_step_rejected (__main__.Checks.test_advisory_job_and_expression_step_rejected) ... ok
+test_bad_sha_fails (__main__.Checks.test_bad_sha_fails) ... ok
+test_conditional_ci_not_claimed_proven (__main__.Checks.test_conditional_ci_not_claimed_proven) ... ok
+test_direct_inventory (__main__.Checks.test_direct_inventory) ... ok
+test_exact_head_positive (__main__.Checks.test_exact_head_positive) ... ok
+test_fenced_user_cron_and_non_shell_ignored (__main__.Checks.test_fenced_user_cron_and_non_shell_ignored) ... ok
+test_indirect_discovery_requires_adapter (__main__.Checks.test_indirect_discovery_requires_adapter) ... ok
+test_inline_cron_user_and_system_forms_preserve_lines (__main__.Checks.test_inline_cron_user_and_system_forms_preserve_lines) ... ok
+test_inventory_command_substrings_are_not_execution (__main__.Checks.test_inventory_command_substrings_are_not_execution) ... ok
+test_inventory_dark_new_suite (__main__.Checks.test_inventory_dark_new_suite) ... ok
+test_inventory_parse_only_and_comment_do_not_count (__main__.Checks.test_inventory_parse_only_and_comment_do_not_count) ... ok
+test_migration_inventory (__main__.Checks.test_migration_inventory) ... ok
+test_mutation_gate_rejects_setup_kills_and_vacuity (__main__.Checks.test_mutation_gate_rejects_setup_kills_and_vacuity) ... ok
+test_nested_lockfiles_retained (__main__.Checks.test_nested_lockfiles_retained) ... ok
+test_neutral_skipped_and_empty_fail (__main__.Checks.test_neutral_skipped_and_empty_fail) ... ok
+test_new_attempt_overrides_old_green (__main__.Checks.test_new_attempt_overrides_old_green) ... ok
+test_nul (__main__.Checks.test_nul) ... ok
+test_shell_extraction_is_static (__main__.Checks.test_shell_extraction_is_static) ... ok
+test_wrong_head_and_app_fail (__main__.Checks.test_wrong_head_and_app_fail) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.021s
+
+OK

@@ -1,0 +1,14 @@
+id: py-default-redirect-opener
+snapshots:
+  urllib.request.urlopen(req, timeout=20):
+    labels:
+    - source: urllib.request.urlopen(req, timeout=20)
+      style: primary
+      start: 0
+      end: 39
+  urlopen(req, timeout=20):
+    labels:
+    - source: urlopen(req, timeout=20)
+      style: primary
+      start: 0
+      end: 24

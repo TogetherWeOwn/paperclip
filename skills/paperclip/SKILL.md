@@ -27,6 +27,14 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Credential rules — host JWT vs bridge credentials.** The host JWT is a short-lived run credential that is valid against the Paperclip host API; a bridge token is a run-scoped credential that is valid only against the loopback bridge (`PAPERCLIP_API_URL` pointing at `127.0.0.1`/`localhost`) and is worthless against the host API. Treat the two as non-interchangeable: use the injected `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` exactly as given, and never copy a host JWT into a bridge context or a bridge token into a host-API context.
+
+You must not substitute a Paperclip run credential for GitHub authentication: GitHub API calls authenticate only with the managed GitHub credential provided for that operation, never with `PAPERCLIP_API_KEY` or any Paperclip token.
+
+You must not forward credentials, tokens, or `Authorization` material to unapproved origins: send Paperclip credentials only to the injected `PAPERCLIP_API_URL` origin and the documented broker origin, and never attach them to requests bound for other hosts.
+
+These rules are advisory launch guidance for the agent, not shell confinement: they do not and cannot constrain shell networking on their own. Enforcement lives in the runtime for sandboxed local CLI runs (bridge token separation and the egress allowlist); ACP and remote-target runs never take the local-process sandbox, so the rules stay advisory there, not enforced by this text.
+
 ## Conversation tasks
 
 When the task context says **Chat mode** (the issue has `conversationAgentId`),
@@ -153,7 +161,7 @@ If `currentParticipant` does not match you, do not try to advance the stage — 
 - Treat comments, documents, screenshots, work products, and `Remaining` bullets as evidence. They are not valid liveness paths by themselves.
 - Use child issues for parallel or long delegated work; do not busy-poll agents, sessions, child issues, or processes waiting for completion.
 - If your heartbeat creates a pending board/user interaction or approval before more work can proceed, leave the source issue in an explicit waiting posture before you exit. Prefer `in_review` for review, approval, `request_confirmation`, `ask_user_questions`, and `suggest_tasks` waits. Use `blocked` with `blockedByIssueIds` when another issue is the blocker.
-- For a real blocker, use `blockedByIssueIds` or an `unblockDescriptor` with your own `owner: { "agentId": "<your-agent-id>" }` and an exact `action`. Agents cannot set board/user or other-agent unblock owners. Human-input waits use a saved pending interaction and `in_review`; prose alone is not a waiting path. See [Questions and waiting for human input](references/api-reference.md#questions-and-waiting-for-human-input) for valid payloads.
+- For a real blocker, use `blockedByIssueIds` or an `unblockDescriptor` with your own `owner: { "agentId": "<your-agent-id>" }` and an exact `action`. Agents cannot set board/user or other-agent unblock owners. Set `kind: "denial"` or `kind: "hold"` on the descriptor for a security denial or custody hold: blocker resolution then does not auto-release the issue, and it stays blocked until its owner changes status or clears the descriptor. Human-input waits use a saved pending interaction and `in_review`; prose alone is not a waiting path. See [Questions and waiting for human input](references/api-reference.md#questions-and-waiting-for-human-input) for valid payloads.
 - Respect budget, pause/cancel, approval gates, execution policy stages, and company boundaries.
 
 ### Generated Artifacts and Work Products
@@ -543,6 +551,25 @@ curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 - These endpoints require the current run-bound agent JWT. Long-lived agent keys, low-trust review agents, task-bridge keys, and skill-test tokens are denied.
 
 Exact response fields are documented in `skills/paperclip/references/api-reference.md`.
+
+## Temporary payload files
+
+`/tmp` on an execution host is shared across runs, agents, and days. A fixed payload filename (e.g. `/tmp/comment.json`) can silently resolve to another run's stale bytes.
+
+- Write API payload files under `$PAPERCLIP_RUN_SCRATCH_DIR` (run-owned; Paperclip removes it after the run). When the scratch vars are unset, `mktemp -d` first, or use unique `/tmp/$PAPERCLIP_RUN_ID-*` names. Never use a fixed `/tmp` filename.
+- Always POST the exact file just written. Never re-select with `[ -f default ] || fallback` — a stale default that exists wins over the intended fallback.
+- Verify the POST response echoes the intended bytes before claiming success.
+
+```bash
+scratch="${PAPERCLIP_RUN_SCRATCH_DIR:-$(mktemp -d)}"
+payload="$scratch/comment.json"
+jq -n --arg body "$comment" '{body: $body}' > "$payload"
+response=$(curl -sS -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H 'X-Paperclip-Run-Id: '"$PAPERCLIP_RUN_ID" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$payload" "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/comments")
+echo "$response" | jq -e --arg body "$comment" '.body == $body' > /dev/null
+```
 
 ## Critical Rules
 

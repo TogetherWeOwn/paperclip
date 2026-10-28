@@ -85,6 +85,29 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
   await fs.chmod(commandPath, 0o755);
 }
 
+async function writeFakeBwrapCommand(bwrapPath: string): Promise<void> {
+  // Test double for Bubblewrap: the default egress allowlist routes every
+  // local CLI spawn through bwrap, which CI/dev hosts may not have installed.
+  // The confined argv ends with ["--", <command>, ...args], so the fake splits
+  // there and execs the inner command with stdio inherited. These tests keep
+  // their real-spawn coverage of execute()'s argv/env plumbing without
+  // depending on host sandbox tooling. The confined argv shape itself is pinned
+  // by mocked-spawn tests, not here.
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const argv = process.argv.slice(2);
+const index = argv.indexOf("--");
+if (index < 0 || index + 1 >= argv.length) {
+  console.error("fake bwrap: expected [<flags...> -- <command> ...args]");
+  process.exit(127);
+}
+const result = spawnSync(argv[index + 1], argv.slice(index + 2), { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`;
+  await fs.writeFile(bwrapPath, script, "utf8");
+  await fs.chmod(bwrapPath, 0o755);
+}
+
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -301,6 +324,9 @@ async function setupExecuteEnv(
   await fs.mkdir(workspace, { recursive: true });
   await fs.mkdir(binDir, { recursive: true });
   await (options?.commandWriter ?? writeFakeClaudeCommand)(commandPath);
+  // binDir is prepended to PATH below, so local CLI spawns resolve this fake
+  // instead of requiring a host Bubblewrap install (see writeFakeBwrapCommand).
+  await writeFakeBwrapCommand(path.join(binDir, "bwrap"));
   const previousHome = process.env.HOME;
   const previousPath = process.env.PATH;
   process.env.HOME = root;
@@ -764,6 +790,9 @@ describe("claude execute", () => {
     await fs.mkdir(binDir, { recursive: true });
     await fs.mkdir(claudeConfigDir, { recursive: true });
     await writeFakeClaudeCommand(commandPath);
+    // binDir is prepended to PATH below; the fake satisfies the default
+    // allowlist's bwrap spawn without a host Bubblewrap install.
+    await writeFakeBwrapCommand(path.join(binDir, "bwrap"));
 
     const previousHome = process.env.HOME;
     const previousPath = process.env.PATH;
@@ -1109,6 +1138,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-bundle-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     const capturePath1 = path.join(root, "capture-1.json");
     const capturePath2 = path.join(root, "capture-2.json");
     const instructionsPath = path.join(root, "AGENTS.md");
@@ -1143,6 +1176,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
           env: {
@@ -1192,6 +1226,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
           env: {
@@ -1291,6 +1326,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-reset-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     const capturePath1 = path.join(root, "capture-before.json");
     const capturePath2 = path.join(root, "capture-after.json");
     const instructionsPath = path.join(root, "AGENTS.md");
@@ -1326,6 +1365,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
           env: {
@@ -1358,6 +1398,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
           env: {
@@ -1398,6 +1439,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-transient-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     await fs.mkdir(workspace, { recursive: true });
     await writeFailingClaudeCommand(commandPath, {
       resultEvent: {
@@ -1434,6 +1479,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
         },
@@ -1465,6 +1511,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-subtype-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     await fs.mkdir(workspace, { recursive: true });
     await writeFailingClaudeCommand(commandPath, {
       exitCode: 1,
@@ -1500,6 +1550,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
         },
@@ -1523,6 +1574,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     await fs.mkdir(workspace, { recursive: true });
     await writeFailingClaudeCommand(commandPath, {
       resultEvent: {
@@ -1557,6 +1612,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
         },
@@ -1582,6 +1638,10 @@ describe("claude execute", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-max-turns-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
+    // The default egress allowlist spawns bwrap for local runs; point the
+    // documented sandbox-command knob at a fake so no host install is needed.
+    const bwrapPath = path.join(root, "bwrap");
+    await writeFakeBwrapCommand(bwrapPath);
     await fs.mkdir(workspace, { recursive: true });
     await writeFailingClaudeCommand(commandPath, {
       resultEvent: {
@@ -1615,6 +1675,7 @@ describe("claude execute", () => {
         config: {
           engine: "cli",
           command: commandPath,
+          filesystemSandboxCommand: bwrapPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
         },

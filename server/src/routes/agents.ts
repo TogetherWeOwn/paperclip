@@ -64,6 +64,7 @@ import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { inheritNativeRunnerAdapterConfig } from "../services/native-runtime/native-agent-runtime-inheritance.js";
 import { agentInstructionsBundleMode } from "../services/agent-instructions.js";
+import { hashJsonValue } from "../services/audit-context.js";
 import {
   agentService,
   agentInstructionsService,
@@ -85,6 +86,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { handleObserverHeartbeatRuns, handleObserverLiveRuns, isObserverRequest } from "./observer.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
@@ -3999,6 +4001,8 @@ export function agentRoutes(
           supported: snapshot.supported,
           entryCount: snapshot.entries.length,
           warningCount: snapshot.warnings.length,
+          configHashBefore: hashJsonValue(agent.adapterConfig ?? null),
+          configHashAfter: hashJsonValue(updated.adapterConfig ?? null),
         },
       });
 
@@ -5144,6 +5148,9 @@ export function agentRoutes(
     assertExternalInstructionsAdmin(req, existing);
 
     const actor = getActorInfo(req);
+    const previousFile = await instructions
+      .readFile(existing, req.body.path)
+      .catch(() => null);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
     });
@@ -5178,6 +5185,8 @@ export function agentRoutes(
         path: result.file.path,
         size: result.file.size,
         clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate === true,
+        contentHashBefore: previousFile ? hashJsonValue(previousFile.content) : null,
+        contentHashAfter: hashJsonValue(result.file.content),
       },
     });
 
@@ -5421,7 +5430,15 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(requestedRuntimeConfig
+          ? {
+              runtimeConfigHashBefore: hashJsonValue(existing.runtimeConfig ?? null),
+              runtimeConfigHashAfter: hashJsonValue(requestedRuntimeConfig),
+            }
+          : {}),
+      },
     });
 
     res.json(redactAgentRowForResponse(agent));
@@ -5684,6 +5701,16 @@ export function agentRoutes(
     const id = req.params.id as string;
     const agent = await getAccessibleAgent(req, res, id);
     if (!agent) {
+      return;
+    }
+    // No observer issuance in this admission:
+    // minting/placement is a separate later authorized act. Observer scopes
+    // exist only as synthetic test fixtures until then.
+    if (req.body.scope?.kind === "observer") {
+      res.status(403).json({
+        error: "Observer scope issuance is not authorized",
+        code: "OBSERVER_ISSUANCE_DENIED",
+      });
       return;
     }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
@@ -6640,8 +6667,86 @@ export function agentRoutes(
     }
   });
 
+  /**
+   * Observer live-run rows for the held cap-zero flow. A minimal
+   * column set selected for the observer projection: status/time/retry
+   * metadata plus the sanitized issue reference. Log stores/refs, session
+   * ids, usage, result JSON, stdout/stderr excerpts and process details are
+   * never selected here, so they cannot leak through the projection even if
+   * the JSON allowlist drifts. Pure selects only.
+   */
+  async function queryObserverLiveRunRows(
+    companyId: string,
+    filters: { limit: number; minCount: number },
+  ) {
+    const columns = {
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+      invocationSource: heartbeatRuns.invocationSource,
+      triggerDetail: heartbeatRuns.triggerDetail,
+      errorCode: heartbeatRuns.errorCode,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
+      processLossRetryCount: heartbeatRuns.processLossRetryCount,
+      scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      continuationAttempt: heartbeatRuns.continuationAttempt,
+      livenessState: heartbeatRuns.livenessState,
+      livenessReason: heartbeatRuns.livenessReason,
+      lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+      lastOutputAt: heartbeatRuns.lastOutputAt,
+      startedAt: heartbeatRuns.startedAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      createdAt: heartbeatRuns.createdAt,
+      updatedAt: heartbeatRuns.updatedAt,
+      issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
+    };
+    const liveRows = await db
+      .select(columns)
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(filters.limit);
+    const targetRowCount = Math.min(filters.minCount, filters.limit);
+    if (targetRowCount > 0 && liveRows.length < targetRowCount) {
+      const activeIds = liveRows.map((row) => row.id);
+      const recentRows = await db
+        .select(columns)
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            not(inArray(heartbeatRuns.status, ["queued", "running"])),
+            ...(activeIds.length > 0 ? [not(inArray(heartbeatRuns.id, activeIds))] : []),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(targetRowCount - liveRows.length);
+      return [...liveRows, ...recentRows];
+    }
+    return liveRows;
+  }
+
   router.get("/companies/:companyId/heartbeat-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Bounded observer projection: before
+    // generic actor permissions. Pure heartbeat list reads plus the observer
+    // projection; run redactions and telemetry gates below are not entered.
+    if (isObserverRequest(req)) {
+      await handleObserverHeartbeatRuns(req, res, companyId, {
+        listHeartbeatRuns: (cid, agentId, limit, options) =>
+          heartbeat.list(cid, agentId, limit, options),
+      });
+      return;
+    }
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     const agentId = req.query.agentId as string | undefined;
@@ -6683,6 +6788,18 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Bounded observer projection: before
+    // generic actor permissions. Minimal observer columns plus the sanitized
+    // execution safety join; agent display fields, output silence and run
+    // redactions below are not entered.
+    if (isObserverRequest(req)) {
+      await handleObserverLiveRuns(req, res, companyId, {
+        queryLiveRuns: (cid, filters) => queryObserverLiveRunRows(cid, filters),
+        getExecutionProjections: (cid, runIds) =>
+          executionProjectionsForRuns(db, cid, runIds),
+      });
+      return;
+    }
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
 

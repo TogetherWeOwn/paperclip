@@ -1,0 +1,21 @@
+{
+  "at_utc": "2026-10-11T15:08:00.196032+00:00",
+  "tool_command": [
+    "npx",
+    "--yes",
+    "--package",
+    "@ast-grep/cli@0.50.0",
+    "ast-grep"
+  ],
+  "scratch": "temporary-validation-directory",
+  "version": "ast-grep 0.50.0",
+  "ast_fixture_exit_code": 0,
+  "non_ast_unit_exit_code": 0,
+  "status": "passed",
+  "rules": 26,
+  "positive_fixtures": 38,
+  "negative_fixtures": 37,
+  "historical_candidates": 30,
+  "historical_matched": 27,
+  "scratch_removed": true
+}

@@ -1,3 +1,4 @@
+import { handleObserverIssuesList, isObserverRequest } from "./observer.js";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -261,6 +262,8 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  holdsIssueAgainstAutoRelease,
+  shouldWakeAfterStopRelay,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -7914,6 +7917,18 @@ export function issueRoutes(
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
+    // Bounded observer projection for the held cap-zero flow: before
+    // generic actor permissions and before the recovery-revalidating standard
+    // path. Pure read services only; the standard handler below is never
+    // entered for observer credentials.
+    if (isObserverRequest(req)) {
+      await handleObserverIssuesList(req, res, companyId, {
+        listIssues: (cid, filters) => svc.list(cid, filters),
+        listActiveRecoveries: (cid, ids) => recoveryActionsSvc.listActiveForIssues(cid, ids),
+        listHandoffs: (cid, ids) => listSuccessfulRunHandoffStates(db, cid, ids),
+      });
+      return;
+    }
     assertCompanyAccess(req, companyId);
     if (isTaskBridgeKeyActor(req)) {
       res.status(403).json({
@@ -14962,6 +14977,7 @@ export function issueRoutes(
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
+          !holdsIssueAgainstAutoRelease(issue.unblockDescriptor, issue.status) &&
           (existing.status !== "blocked" ||
             Array.isArray(req.body.blockedByIssueIds) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);
@@ -15010,10 +15026,7 @@ export function issueRoutes(
               childStatus: issue.status,
             },
           });
-          if (
-            stopRelay.parent.assigneeAgentId &&
-            !isClosedIssueStatus(stopRelay.parent.status)
-          ) {
+          if (shouldWakeAfterStopRelay(stopRelay.parent)) {
             addWakeup(stopRelay.parent.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",

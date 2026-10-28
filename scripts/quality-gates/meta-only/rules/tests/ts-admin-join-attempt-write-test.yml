@@ -1,0 +1,6 @@
+id: ts-admin-join-attempt-write
+valid:
+- await db.execute(sql`SELECT * FROM join_attempts`)
+invalid:
+- await db.execute(sql`DELETE FROM join_attempts WHERE created_at < now()`)
+- await db.execute(sql`insert into join_attempts values (1)`)

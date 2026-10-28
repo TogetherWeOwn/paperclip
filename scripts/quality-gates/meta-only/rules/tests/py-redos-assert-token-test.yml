@@ -1,0 +1,5 @@
+id: py-redos-assert-token
+valid:
+- pattern = re.compile(r"\b(?=\w*assert)\w+!\s*\(")
+invalid:
+- pattern = re.compile(r"\b\w*assert\w*!\s*\(")

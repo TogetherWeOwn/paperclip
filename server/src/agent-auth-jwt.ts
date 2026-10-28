@@ -213,9 +213,16 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
       ? claims.responsible_user_id.trim()
       : null
     : undefined;
-  const keyScopeClaim = Object.hasOwn(claims, "key_scope")
-    ? normalizeAgentApiKeyScope(claims.key_scope)
-    : undefined;
+  // Fail closed: a malformed key_scope claim rejects the JWT outright.
+  // It must never normalize to `standard` and inherit full agent visibility.
+  let keyScopeClaim: AgentApiKeyScope | undefined;
+  if (Object.hasOwn(claims, "key_scope")) {
+    try {
+      keyScopeClaim = normalizeAgentApiKeyScope(claims.key_scope);
+    } catch {
+      return null;
+    }
+  }
   const iat = typeof claims.iat === "number" ? claims.iat : null;
   const exp = typeof claims.exp === "number" ? claims.exp : null;
   if (!sub || !adapterType || !runId || !iat || !exp) return null;

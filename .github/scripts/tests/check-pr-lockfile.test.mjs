@@ -17,10 +17,29 @@ test('passes when lockfile changed by refresh bot on correct branch', () => {
   assert.equal(result.passed, true);
 });
 
+test('passes when lockfile changed by refresh bot on deploy head', () => {
+  const result = checkLockfile(
+    makeFiles(['pnpm-lock.yaml']),
+    'github-actions[bot]',
+    'chore/refresh-lockfile-deploy-tog6'
+  );
+  assert.equal(result.passed, true);
+});
+
 test('fails when lockfile changed by regular user', () => {
   const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'fix/bug');
   assert.equal(result.passed, false);
   assert.ok(result.failures[0].includes('pnpm-lock.yaml'));
+});
+
+test('fails when lockfile changed by regular user on refresh head', () => {
+  const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'chore/refresh-lockfile');
+  assert.equal(result.passed, false);
+});
+
+test('fails when lockfile changed by regular user on deploy head', () => {
+  const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'chore/refresh-lockfile-deploy-tog6');
+  assert.equal(result.passed, false);
 });
 
 test('fails when lockfile changed by bot on wrong branch', () => {

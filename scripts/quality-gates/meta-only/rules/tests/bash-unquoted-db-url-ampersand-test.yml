@@ -1,0 +1,5 @@
+id: bash-unquoted-db-url-ampersand
+valid:
+- DATABASE_URL='postgresql://example.invalid/db?sslmode=require&channel_binding=require'
+invalid:
+- DATABASE_URL=postgresql://example.invalid/db?sslmode=require&channel_binding=require

@@ -1437,6 +1437,17 @@ test.describe("Exact failed chat run retry", () => {
             ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
             : `/${seed.prefix}/inbox/all`;
         await page.goto(startPath);
+        if (surface === "agent run") {
+          // The agent route canonicalizes the UUID agent ref to its
+          // human-readable key once the agent loads, via a replace
+          // navigation. Clicking Retry before that navigation settles can
+          // drop the mutation error state on remount and flake the denial
+          // assertion on slow runs, so wait for the canonical URL first.
+          await expect(page).toHaveURL(
+            new RegExp(`/${seed.prefix}/agents/maya/runs/${failedRunId}$`),
+            { timeout: 15_000 },
+          );
+        }
         const retry = page
           .getByRole("button", { name: "Retry", exact: true })
           .filter({ visible: true });

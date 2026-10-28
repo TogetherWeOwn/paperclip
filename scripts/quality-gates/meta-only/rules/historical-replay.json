@@ -1,0 +1,7 @@
+{
+  "kind": "aggregate-historical-rule-validation",
+  "candidate_count": 30,
+  "matched_count": 27,
+  "not_matched_count": 3,
+  "note": "Path-level examples and source identifiers are omitted from this public summary."
+}

@@ -1,0 +1,5 @@
+id: py-release-branch-exemption
+valid:
+- generated = trusted_bot_pr(actor, head_repo, base_repo, head_ref)
+invalid:
+- generated = head_ref.startswith("release-please--")

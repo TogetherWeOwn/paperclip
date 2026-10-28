@@ -39,6 +39,8 @@ export type CancelStaleQueuedRunInput = {
   companyId: string;
   now: Date;
   expectedStatus: "queued" | "running";
+  /** Retire only a never-started, resolved attention wake for a non-assignee. */
+  onlyResolvedInteractionPending?: boolean;
 };
 
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {

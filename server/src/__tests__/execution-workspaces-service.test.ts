@@ -29,14 +29,17 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
+  EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
+  clearMetadataReopenPendingConsumption,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
   readMetadataReopenPendingConsumptionSince,
+  setMetadataReopenPendingConsumption,
 } from "../services/execution-workspaces.ts";
 import { issueService } from "../services/issues.ts";
 import {
@@ -385,7 +388,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     pullRequestDetailsByKey.set(`${companyId}:10624`, {
       state: "merged",
       headRef: "unrelated-delivery",
-      headSha,
+      // A different branch carries a different commit. Delivery matches by
+      // head SHA (same repo), so this must not equal the workspace HEAD —
+      // otherwise it would (correctly) count as delivery. Card-free publish
+      // refs reuse the workspace HEAD and are covered separately.
+      headSha: "0000000000000000000000000000000000000000",
     });
     pullRequestDetailsByKey.set(`${companyId}:10625`, {
       state: "merged",
@@ -474,6 +481,49 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep.archived).toBe(1);
     expect(archived).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
+  }, 20_000);
+
+  it("reports a card-free publish ref delivery as merged_via_pr", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-cardfree-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+    await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
+    await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
+    await runGit(worktreePath, ["add", "delivered.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
+
+    const seeded = await seedTerminalWorkspace();
+    // Card-free publish: the agent keeps commits on the workspace branch but
+    // opens the PR from a different ref carrying the same HEAD commit.
+    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, {
+      state: "merged",
+      headRef: "fix/short-slug",
+      headSha: await readGit(worktreePath, ["rev-parse", "HEAD"]),
+    });
+    await db.update(executionWorkspaces).set({
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      providerType: "git_worktree",
+      baseRef: "main",
+      repoUrl: "https://github.com/paperclipai/paperclip.git",
+      branchName: "PAP-16015-delivery",
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId: seeded.sourceIssueId,
+      type: "pull_request",
+      provider: "github",
+      title: "Card-free delivery",
+      url: "https://github.com/paperclipai/paperclip/pull/10623",
+      status: "merged",
+    });
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.deliveryState).toBe("merged_via_pr");
+    expect(readiness?.git?.isMergedIntoBase).toBe(false);
   }, 20_000);
 
   async function seedAncestryTerminalWorkspace(overrides: { updatedAt?: Date } = {}) {
@@ -933,6 +983,60 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
     }, 20_000);
   });
+
+  it("waits for the last workspace-linked issue and archives at the 24-hour boundary", async () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+    const cooldownService = (cooldownDays: number) => executionWorkspaceService(db, {
+      resolvePullRequestDetails: async (companyId, reference) =>
+        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+        ?? { state: "unknown", headRef: null, headSha: null },
+      now: () => new Date(nowMs),
+      workspaceReaperCooldownDays: cooldownDays,
+    });
+    const statusOf = async (executionWorkspaceId: string) => {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    };
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    await db
+      .update(issues)
+      .set({ completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    const linkedIssueId = randomUUID();
+    const linkedIdentifier = `${seeded.identifier.split("-")[0]}-2`;
+    await db.insert(issues).values({
+      id: linkedIssueId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      executionWorkspaceId: seeded.executionWorkspaceId,
+      identifier: linkedIdentifier,
+      title: "Independent card using the isolated workspace",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ updatedAt: new Date(nowMs - 2 * DAY_MS) })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const blockedSweep = await cooldownService(1).sweepTerminalWorkspaces();
+    expect(blockedSweep).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(nowMs - DAY_MS) })
+      .where(eq(issues.id, linkedIssueId));
+    const eligibleSweep = await cooldownService(1).sweepTerminalWorkspaces();
+
+    expect(eligibleSweep).toMatchObject({ archived: 1, skippedCooldown: 0 });
+    expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+  }, 20_000);
 
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
@@ -1487,6 +1591,111 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       (workspace?.metadata as Record<string, unknown> | null)?.[EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY],
     ).toBe(4);
     // The rebuilt worktree is intact.
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("reports a reopen-pending workspace as blocked and keeps unmerged-work warnings separate", async () => {
+    // The close-readiness preflight omitted the reopen-pending blocker while the
+    // under-lock archive guard refused the same row with 409, so callers paid for
+    // a preservation upload before learning the archive was refused. The
+    // preflight reports the same blocker as the authoritative guard, in the same
+    // words, and keeps the unmerged-work warnings alongside it.
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({
+        metadata: setMetadataReopenPendingConsumption(
+          {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+          },
+          new Date("2026-10-18T03:30:36.158Z"),
+        ),
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+    expect(readiness?.state).toBe("blocked");
+    expect(readiness?.blockingReasons).toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(readiness?.isDestructiveCloseAllowed).toBe(false);
+    expect(readiness?.deliveryState).toBe("unmerged");
+    expect(readiness?.warnings).toContain(
+      "This workspace is 1 commit ahead of main and is not merged.",
+    );
+  });
+
+  it("treats consumed and unset reopen metadata as non-blocking", async () => {
+    // Only a set reopen-pending flag blocks the preflight. A workspace that never
+    // carried the flag, and one whose consumer already cleared it, both stay
+    // archivable through the preflight.
+    const seeded = await seedTerminalWorkspace();
+
+    const unsetReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(unsetReadiness?.blockingReasons).not.toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(unsetReadiness?.blockingReasons).toEqual([]);
+    expect(unsetReadiness?.isDestructiveCloseAllowed).toBe(true);
+
+    const pendingMetadata = setMetadataReopenPendingConsumption(
+      {
+        createdByRuntime: true,
+        [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+      },
+      new Date("2026-10-19T21:45:12.927Z"),
+    );
+    await db
+      .update(executionWorkspaces)
+      .set({ metadata: clearMetadataReopenPendingConsumption(pendingMetadata) })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const consumedReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(consumedReadiness?.blockingReasons).not.toContain(EXECUTION_WORKSPACE_REOPEN_PENDING_BLOCKING_REASON);
+    expect(consumedReadiness?.blockingReasons).toEqual([]);
+    expect(consumedReadiness?.isDestructiveCloseAllowed).toBe(true);
+  });
+
+  it("still refuses the archive when a reopen lands after a ready preflight", async () => {
+    // The preflight is a point-in-time read: a reopen can publish the
+    // reopen-pending flag after the readiness check and before the archive
+    // write. The under-lock guard stays authoritative for that race and refuses
+    // the stale ready preflight, so the rebuilt worktree survives.
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+
+    const staleReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(staleReadiness?.blockingReasons).toEqual([]);
+    expect(staleReadiness?.isDestructiveCloseAllowed).toBe(true);
+
+    // A concurrent reopen publishes the row active with the pending flag.
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "active",
+        metadata: setMetadataReopenPendingConsumption(
+          {
+            createdByRuntime: true,
+            [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2,
+          },
+          new Date(),
+        ),
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const result = await svc.archiveWorkspaceUnderLifecycleLock({
+      id: seeded.executionWorkspaceId,
+      patch: {},
+      closedAt: new Date(),
+    });
+    expect(result).toEqual({ outcome: "reopen_pending" });
+
+    const [workspace] = await db
+      .select({
+        status: executionWorkspaces.status,
+        metadata: executionWorkspaces.metadata,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("active");
+    expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 

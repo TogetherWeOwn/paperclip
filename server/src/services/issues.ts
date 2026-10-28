@@ -3,6 +3,7 @@ import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackCo
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
+import { holdsIssueAgainstAutoRelease } from "./issue-dependency-wakeups.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
@@ -138,7 +139,10 @@ import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import {
+  instanceSettingsService,
+  type InstanceSettingsWriteDb,
+} from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -7087,8 +7091,16 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(
+    companyId: string,
+    userId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    // Keep this read on the caller's transaction connection. The chat ingress
+    // task-mutation transaction calls create/update while holding the endpoint
+    // row lock; re-entering the outer pool here can deadlock when concurrent
+    // transactions fill the pool while waiting on the same endpoint row.
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -7736,6 +7748,7 @@ export function issueService(db: Db) {
         companyId: issues.companyId,
         assigneeAgentId: issues.assigneeAgentId,
         status: issues.status,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(
@@ -7751,6 +7764,7 @@ export function issueService(db: Db) {
             companyId: string;
             assigneeAgentId: string | null;
             status: string;
+            unblockDescriptor: typeof issues.$inferSelect.unblockDescriptor;
           }>,
         ) => rows[0] ?? null,
       );
@@ -9044,6 +9058,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           blockedTransitionAt: issues.blockedTransitionAt,
+          unblockDescriptor: issues.unblockDescriptor,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
@@ -9060,7 +9075,8 @@ export function issueService(db: Db) {
       const wakeableCandidates = candidates.filter(
         (candidate) =>
           candidate.assigneeAgentId &&
-          !["backlog", "done", "cancelled"].includes(candidate.status),
+          !["backlog", "done", "cancelled"].includes(candidate.status) &&
+          !holdsIssueAgainstAutoRelease(candidate.unblockDescriptor, candidate.status),
       );
       if (wakeableCandidates.length === 0) return [];
 
@@ -9105,6 +9121,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           companyId: issues.companyId,
+          unblockDescriptor: issues.unblockDescriptor,
         })
         .from(issues)
         .where(eq(issues.id, parentIssueId))
@@ -9112,6 +9129,7 @@ export function issueService(db: Db) {
       if (!parent || parent.conversationAgentId || !parent.assigneeAgentId || ["backlog", "done", "cancelled"].includes(parent.status)) {
         return null;
       }
+      if (holdsIssueAgainstAutoRelease(parent.unblockDescriptor, parent.status)) return null;
 
       const children = await db
         .select({
@@ -9721,8 +9739,12 @@ export function issueService(db: Db) {
         onDeduplicated,
         ...issueData
       } = data;
+      // All reads below stay on the caller's connection. Create is called
+      // from the chat ingress task-mutation transaction while it holds the
+      // endpoint row lock; acquiring a second pooled connection here can
+      // exhaust the pool under concurrent ingress and freeze the API.
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9733,12 +9755,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -10610,8 +10632,12 @@ export function issueService(db: Db) {
           );
         }
       }
+      // Keep this read on the caller's connection: update runs inside the
+      // chat ingress task-mutation transaction while it holds the endpoint
+      // row lock, so a pooled read here can exhaust the pool under ingress
+      // fanout and freeze the API (see create above).
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
@@ -10733,6 +10759,7 @@ export function issueService(db: Db) {
         await assertAssignableUser(
           existing.companyId,
           issueData.assigneeUserId,
+          dbOrTx,
         );
       }
       let nextProjectId =
@@ -10771,6 +10798,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextProjectWorkspaceId,
+          dbOrTx,
         );
         validatedProjectWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -10781,6 +10809,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextExecutionWorkspaceId,
+          dbOrTx,
         );
         validatedExecutionWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -10792,6 +10821,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextProjectWorkspaceId,
+            dbOrTx,
           );
         }
       }
@@ -10801,6 +10831,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextExecutionWorkspaceId,
+            dbOrTx,
           );
         }
       }
@@ -11391,6 +11422,9 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          unblockDescriptor: null,
+          blockedTransitionAt: null,
+          blockedOwnerNotifiedAt: null,
           startedAt: now,
           updatedAt: now,
         })
@@ -11506,6 +11540,11 @@ export function issueService(db: Db) {
           };
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
+          }
+          if (current.status === "blocked") {
+            adoptionSet.unblockDescriptor = null;
+            adoptionSet.blockedTransitionAt = null;
+            adoptionSet.blockedOwnerNotifiedAt = null;
           }
           const adopted = await db
             .update(issues)

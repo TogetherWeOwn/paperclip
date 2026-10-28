@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hashJsonValue } from "../services/audit-context.js";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -615,6 +616,52 @@ describe("agent instructions bundle routes", () => {
         }),
       }),
       expect.any(Object),
+    );
+  });
+
+  it("records content hashes when writing a bundle file", async () => {
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .put("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file?companyId=company-1")
+      .send({
+        path: "AGENTS.md",
+        content: "# Updated Agent\n",
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.instructions_file_updated",
+        details: expect.objectContaining({
+          contentHashBefore: hashJsonValue("# Agent\n"),
+          contentHashAfter: hashJsonValue("# Updated Agent\n"),
+        }),
+      }),
+    );
+  });
+
+  it("records runtimeConfig hashes when patching runtimeConfig", async () => {
+    const before = { heartbeat: { maxConcurrentRuns: 1 } };
+    const after = { heartbeat: { maxConcurrentRuns: 2 } };
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      runtimeConfig: before,
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({ runtimeConfig: after }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.updated",
+        details: expect.objectContaining({
+          runtimeConfigHashBefore: hashJsonValue(before),
+          runtimeConfigHashAfter: hashJsonValue(after),
+        }),
+      }),
     );
   });
 

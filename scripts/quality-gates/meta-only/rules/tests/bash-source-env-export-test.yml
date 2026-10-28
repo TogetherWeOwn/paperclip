@@ -1,0 +1,9 @@
+id: bash-source-env-export
+valid:
+- set -a; . ./service.env; exec ./push.sh
+- . ./functions.sh; helper
+invalid:
+- . ./service.env; exec ./push.sh
+- 'source ./service.env
+
+  ./push.sh'

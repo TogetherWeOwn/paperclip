@@ -233,7 +233,7 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- Use child issues for parallel or long delegated work instead of polling agents, sessions, or processes.",
   "- If woken by a human comment on a dependency-blocked issue, respond or triage the comment without treating the blocked deliverable work as unblocked.",
   "- Create child issues directly when you know what needs to be done; use issue-thread interactions when the board/user must choose suggested tasks, answer structured questions, or confirm a proposal.",
-  "- Use `PAPERCLIP_SCRATCH_DIR` / `PAPERCLIP_RUN_SCRATCH_DIR` for temporary scratch files instead of ad hoc `/tmp` paths; Paperclip removes that run-owned directory after the run ends.",
+  "- Use `PAPERCLIP_SCRATCH_DIR` / `PAPERCLIP_RUN_SCRATCH_DIR` for temporary scratch files instead of ad hoc `/tmp` paths; Paperclip removes that run-owned directory after the run ends. Never write fixed `/tmp` payload filenames (`/tmp` is shared across runs — stale bytes get POSTed); when the scratch vars are unset, `mktemp -d` first or use unique `/tmp/$PAPERCLIP_RUN_ID-*` names. Always POST the exact file just written (never `[ -f default ] || fallback` reselection) and verify the POST response echoes the intended bytes.",
   "- To ask for that input, create an interaction on the current issue with POST /api/issues/$PAPERCLIP_TASK_ID/interactions using kind suggest_tasks, ask_user_questions, or request_confirmation. Use continuationPolicy wake_assignee when you need to resume after a response (it wakes on acceptance and rejection alike; only expiry does not wake); use wake_assignee_on_accept when you want to resume only after acceptance.",
   "- Never create probe or throwaway issue-thread interactions to discover the interactions API shape or your permissions; schema discovery goes through the OpenAPI spec and explicit validation errors, not placeholder cards. Every ask_user_questions, suggest_tasks, or request_confirmation you post must carry a real, answerable prompt; withdraw one you no longer need instead of leaving it pending.",
   "- When you intentionally restart follow-up work on a completed assigned issue, include structured `resume: true` with the POST /api/issues/$PAPERCLIP_TASK_ID/comments or PATCH /api/issues/$PAPERCLIP_TASK_ID comment payload (substitute that issue's real id when it is not the current task). Generic agent comments on closed issues are inert by default.",
@@ -250,7 +250,7 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
 export const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip conversation using the supplied chat mode directive.",
   "Use available tools and assigned skills as needed; respect budget, pause/cancel, approval gates, and company boundaries.",
-  "Prefer the smallest verification that proves the action. Use PAPERCLIP_SCRATCH_DIR / PAPERCLIP_RUN_SCRATCH_DIR for temporary scratch files.",
+  "Prefer the smallest verification that proves the action. Use PAPERCLIP_SCRATCH_DIR / PAPERCLIP_RUN_SCRATCH_DIR for temporary scratch files; never fixed /tmp payload filenames (/tmp is shared across runs — mktemp -d when unset). Always POST the exact file just written and verify the POST echo.",
   "After 2 consecutive failures of the same control-plane write, stop retrying that write for the rest of the turn. Report the failure honestly; never claim an unconfirmed mutation succeeded.",
   "Never create probe or throwaway issue-thread interactions. Every interaction must carry a real, answerable prompt; withdraw one you no longer need.",
   "",
@@ -2591,7 +2591,8 @@ function renderPaperclipWakePromptBody(
   }
   if (!resumedSession && normalized.executionWorkspace?.branchName) {
     lines.push(
-      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it.`,
+      // paperclip:allow-git-push: prompt prose shows the agent the publish command to type; adapter code itself never pushes.
+      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it. On a public repository never publish a branch name that carries a tracker id: push HEAD to a card-free ref (${markdownInlineCode("git push origin HEAD:refs/heads/<type>/<short-slug>")}) and open the PR from that ref.`,
     );
   }
   if (normalized.simplifiedEnglishInteractions) {

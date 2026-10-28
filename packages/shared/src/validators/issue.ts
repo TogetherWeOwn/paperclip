@@ -24,6 +24,7 @@ import {
   ISSUE_WORK_MODES,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
+  ISSUE_UNBLOCK_DESCRIPTOR_KINDS,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_THREAD_INTERACTION_CANONICAL_RESOLVER_POLICIES,
   ISSUE_THREAD_INTERACTION_EFFECTIVE_RESOLVER_POLICY_SOURCES,
@@ -569,7 +570,7 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked", "cancelled"]),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
@@ -605,12 +606,13 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }
@@ -692,6 +694,7 @@ const createIssueBaseSchema = z.object({
         z.literal("board"),
       ]),
       action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+      kind: z.enum(ISSUE_UNBLOCK_DESCRIPTOR_KINDS).optional(),
     })
     .strict()
     .optional()
@@ -2130,7 +2133,10 @@ export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);
 export const upsertIssueDocumentSchema = z.object({
   title: z.string().trim().max(200).nullable().optional(),
   format: issueDocumentFormatSchema,
-  body: multilineTextSchema.pipe(z.string().max(524288)),
+  // Documents preserve exact bytes: no multilineTextSchema normalization.
+  // Escape-shaped source sequences (e.g. Python "\n", regex "\d") must
+  // round-trip untouched; normalizing them silently corrupts stored code.
+  body: z.string().max(524288),
   changeSummary: z.string().trim().max(500).nullable().optional(),
   baseRevisionId: z.string().guid().nullable().optional(),
 });

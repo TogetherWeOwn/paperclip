@@ -1,0 +1,66 @@
+id: gha-artifact-always-unscrubbed
+snapshots:
+  ? |-
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        path: test-results/
+  : labels:
+    - source: |-
+        uses: actions/upload-artifact@v4
+          if: ${{ always() }}
+          with:
+            path: test-results/
+      style: primary
+      start: 2
+      end: 88
+    - source: 'uses: actions/upload-artifact@v4'
+      style: secondary
+      start: 2
+      end: 34
+    - source: 'if: ${{ always() }}'
+      style: secondary
+      start: 37
+      end: 56
+  ? |-
+    jobs:
+      test:
+        steps:
+          - uses: actions/upload-artifact@v4
+            if: always()
+            with:
+              path: test-results/
+  : labels:
+    - source: |-
+        jobs:
+          test:
+            steps:
+              - uses: actions/upload-artifact@v4
+                if: always()
+                with:
+                  path: test-results/
+      style: primary
+      start: 0
+      end: 130
+    - source: |-
+        jobs:
+          test:
+            steps:
+              - uses: actions/upload-artifact@v4
+                if: always()
+                with:
+                  path: test-results/
+      style: secondary
+      start: 0
+      end: 130
+    - source: |-
+        jobs:
+          test:
+            steps:
+              - uses: actions/upload-artifact@v4
+                if: always()
+                with:
+                  path: test-results/
+      style: secondary
+      start: 0
+      end: 130

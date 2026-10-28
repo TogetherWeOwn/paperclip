@@ -12,6 +12,7 @@ import {
   notExists,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
@@ -47,6 +48,59 @@ const OWNERSHIP_ATTENTION_CODES = [
   "native_execution_ownership_unverified",
   "native_adopted_runner_authentication_timeout",
 ] as const;
+
+const CANONICAL_UUID_PATTERN =
+  "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/**
+ * Compare context ids as uuid, never `column::text = context ->> 'x'`: the
+ * text cast hides the column from its index, so the milestone sweep would
+ * scan every interaction/conversation row of the company for each candidate
+ * run. The lowercase-only guard keeps the old text-equality semantics
+ * exactly (`uuid::text` is lowercase canonical form) and makes a malformed
+ * context value match nothing (NULL) instead of raising.
+ */
+export function contextUuid(value: SQL) {
+  return sql`(case when ${value} ~ ${CANONICAL_UUID_PATTERN} then (${value})::uuid end)`;
+}
+
+/**
+ * Guarded uuid array for a jsonb array of ids (e.g. `wakeCommentIds`).
+ * Elements without canonical uuid shape become NULL and never match, which
+ * preserves the old `(json) ? column::text` result for arrays while letting
+ * the comparison stay uuid-typed. Non-array values yield an empty array;
+ * callers that must preserve `?` semantics for objects keep that check.
+ */
+export function contextUuidArray(value: SQL) {
+  return sql`(array(
+    select (case when wake_comment_id ~ ${CANONICAL_UUID_PATTERN} then wake_comment_id::uuid end)
+    from jsonb_array_elements_text(
+      case when jsonb_typeof(${value}) = 'array' then ${value} else '[]'::jsonb end
+    ) as wake_comment_ids(wake_comment_id)
+  ))`;
+}
+
+/**
+ * True when a `chat_message_links` row is the run's wake comment. Equivalent
+ * to the previous `comment_id::text = ... or (wakeCommentIds) ? comment_id::text`
+ * predicate, but uuid-typed so the conversation/comment index can serve it.
+ * The `?` fallback only runs for non-array `wakeCommentIds` values (object
+ * keys / scalar), which the array form intentionally does not reinterpret.
+ */
+export function wakeCommentLinkMatch(
+  commentId: SQL,
+  contextSnapshot: SQL,
+) {
+  return sql<boolean>`(
+    ${commentId} = ${contextUuid(sql`${contextSnapshot} ->> 'wakeCommentId'`)}
+    or ${commentId} = ${contextUuid(sql`${contextSnapshot} ->> 'commentId'`)}
+    or ${commentId} = any(${contextUuidArray(sql`${contextSnapshot} -> 'wakeCommentIds'`)})
+    or (
+      jsonb_typeof(${contextSnapshot} -> 'wakeCommentIds') <> 'array'
+      and (${contextSnapshot} -> 'wakeCommentIds') ? ${commentId}::text
+    )
+  )`;
+}
 
 export { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON };
 
@@ -241,7 +295,7 @@ async function enqueueSafeNativeChatProgress(
         chatConversations,
         and(
           eq(chatConversations.companyId, heartbeatRuns.companyId),
-          sql`${issueIdFromContext} = ${chatConversations.issueId}::text`,
+          sql`${chatConversations.issueId} = ${contextUuid(issueIdFromContext)}`,
           inArray(chatConversations.state, ["active", "waiting"]),
         ),
       )
@@ -602,7 +656,7 @@ export async function enqueueChatRunMilestones(
       and question_prompt.idempotency_key = 'interaction:' || question_delivery.interaction_id::text || ':' || question_prompt.endpoint_id::text
       and question_prompt.state = 'published'
     where question_delivery.company_id = ${heartbeatRuns.companyId}
-      and question_delivery.issue_id::text = ${issueIdFromContext}
+      and question_delivery.issue_id = ${contextUuid(issueIdFromContext)}
       and question_delivery.target_run_id = ${heartbeatRuns.id}
       and question_delivery.status in ('delivered', 'fallback_queued')
       and question_interaction.kind = 'ask_user_questions'
@@ -629,9 +683,9 @@ export async function enqueueChatRunMilestones(
         else 'interaction:' || interaction.id::text || ':' || interaction.status
       end
     where interaction.company_id = ${heartbeatRuns.companyId}
-      and interaction.issue_id::text = ${issueIdFromContext}
-      and interaction.id::text = ${heartbeatRuns.contextSnapshot} ->> 'interactionId'
-      and interaction.source_run_id::text = ${heartbeatRuns.contextSnapshot} ->> 'sourceRunId'
+      and interaction.issue_id = ${contextUuid(issueIdFromContext)}
+      and interaction.id = ${contextUuid(sql`${heartbeatRuns.contextSnapshot} ->> 'interactionId'`)}
+      and interaction.source_run_id = ${contextUuid(sql`${heartbeatRuns.contextSnapshot} ->> 'sourceRunId'`)}
       and (
         (
           interaction.kind = 'ask_user_questions'
@@ -675,7 +729,7 @@ export async function enqueueChatRunMilestones(
         chatConversations,
         and(
           eq(chatConversations.companyId, heartbeatRuns.companyId),
-          sql`${issueIdFromContext} = ${chatConversations.issueId}::text`,
+          sql`${chatConversations.issueId} = ${contextUuid(issueIdFromContext)}`,
           inArray(chatConversations.state, ["active", "waiting"]),
         ),
       )
@@ -777,11 +831,7 @@ export async function enqueueChatRunMilestones(
               where ${chatMessageLinks.companyId} = ${heartbeatRuns.companyId}
                 and ${chatMessageLinks.conversationId} = ${chatConversations.id}
                 and ${chatMessageLinks.direction} = 'inbound'
-                and (
-                  ${chatMessageLinks.commentId}::text = (${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId')
-                  or ${chatMessageLinks.commentId}::text = (${heartbeatRuns.contextSnapshot} ->> 'commentId')
-                  or (${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds') ? ${chatMessageLinks.commentId}::text
-                )
+                and ${wakeCommentLinkMatch(sql`${chatMessageLinks.commentId}`, sql`${heartbeatRuns.contextSnapshot}`)}
             )`,
             sql`exists (
               select 1

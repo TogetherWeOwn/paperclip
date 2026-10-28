@@ -9,6 +9,7 @@
  * module is pure so the §9.2 cases run as unit tests.
  */
 
+import { createHash } from "node:crypto";
 import type {
   ResolveRunModelParams,
   ResolveRunModelResult,
@@ -28,6 +29,21 @@ export const RUN_MODEL_DECISION_DEFAULT_MAX_ATTEMPTS = 12;
 
 /** Default delay before the first `model_decision_pending` retry. */
 export const RUN_MODEL_DECISION_DEFAULT_DELAY_MS = 5_000;
+
+/**
+ * Backoff ceiling for `model_decision_pending` retries. The
+ * router's own hint stays a floor on top of this: when the holder knows an
+ * account reset time, that time wins no matter how large.
+ */
+export const RUN_MODEL_DECISION_BACKOFF_MAX_MS = 30 * 60_000;
+
+/**
+ * Maximum `model_decision_pending` scheduled retries per card per rolling
+ * 24h. Matches one full lineage budget: a card that burns this
+ * many retries in a day gets surfaced instead of requeued, while
+ * human/board wakes keep working.
+ */
+export const RUN_MODEL_DECISION_DAILY_CAP_PER_ISSUE = 12;
 
 /** Max accepted length for a decided model id. */
 export const RUN_MODEL_DECISION_MAX_MODEL_LENGTH = 200;
@@ -311,6 +327,34 @@ export type RunModelDecisionNoDecision =
  * `scheduleBoundedRetryForRun` (`model_decision_pending`). Once attempts are
  * exhausted the issue is surfaced — the run never falls back to the default.
  */
+/**
+ * Exponential backoff for `model_decision_pending` retries:
+ * 5s, 10s, 20s, ... capped at 30m. The router's hint is a floor on top —
+ * a known account reset time is never shortened — and a missing hint falls
+ * back to the grown delay instead of looping hot on a flat 5s.
+ */
+export function resolveRunModelDecisionRetryDelayMs(
+  consumedAttempts: number,
+  retryAfterMsHint?: number,
+): number {
+  const safeAttempts = Number.isInteger(consumedAttempts)
+    ? Math.max(0, consumedAttempts)
+    : 0;
+  const grown = Math.min(
+    RUN_MODEL_DECISION_BACKOFF_MAX_MS,
+    RUN_MODEL_DECISION_DEFAULT_DELAY_MS * 2 ** Math.min(safeAttempts, 20),
+  );
+  const hint =
+    typeof retryAfterMsHint === "number" && Number.isFinite(retryAfterMsHint)
+      ? Math.max(0, Math.floor(retryAfterMsHint))
+      : 0;
+  return Math.max(grown, hint);
+}
+
+export function isRunModelDecisionBackoffExhausted(consumedAttempts: number): boolean {
+  return resolveRunModelDecisionRetryDelayMs(consumedAttempts) >= RUN_MODEL_DECISION_BACKOFF_MAX_MS;
+}
+
 export function resolveRunModelDecisionNoDecision(input: {
   consumedAttempts: number;
   maxAttempts?: number;
@@ -326,12 +370,103 @@ export function resolveRunModelDecisionNoDecision(input: {
   }
   return {
     action: "retry",
-    retryAfterMs: Math.max(
-      0,
-      Math.floor(input.retryAfterMs ?? RUN_MODEL_DECISION_DEFAULT_DELAY_MS),
+    retryAfterMs: resolveRunModelDecisionRetryDelayMs(
+      input.consumedAttempts,
+      input.retryAfterMs,
     ),
     reason: input.reason,
   };
+}
+
+export interface ModelDecisionCardContent {
+  title: string;
+  description: string | null;
+  priority: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  projectId: string | null;
+  goalId: string | null;
+  parentId: string | null;
+}
+
+/**
+ * Digest of the card's content and ownership. Execution-lock, checkout and
+ * monitor writes leave it unchanged, so retry scheduling cannot reset the
+ * repeat guard by touching the row.
+ */
+export function modelDecisionCardRevision(card: ModelDecisionCardContent): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        card.title,
+        card.description,
+        card.priority,
+        card.assigneeAgentId,
+        card.assigneeUserId,
+        card.projectId,
+        card.goalId,
+        card.parentId,
+      ]),
+    )
+    .digest("hex");
+}
+
+/**
+ * Card-state fingerprint stamped when a `model_decision_pending` retry is
+ * scheduled. A retry whose fingerprint matches the previous
+ * attempt's re-runs the same decision against the same card: drop it
+ * (surface) instead of requeueing.
+ */
+export interface RunModelDecisionDeferralFingerprint {
+  /** Deferral reason (e.g. which headroom/account signal parked the run). */
+  reason: string;
+  issueStatus: string | null;
+  cardRevision: string | null;
+  lastCommentAt: string | null;
+}
+
+function readFingerprintString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Reads a stamped deferral fingerprint back from a run snapshot. Anything
+ * malformed reads as unknown (null) so the scheduler retries instead of
+ * dropping on unreadable state.
+ */
+export function parseModelDecisionDeferralFingerprint(
+  value: unknown,
+): RunModelDecisionDeferralFingerprint | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.reason !== "string") return null;
+  return {
+    reason: record.reason,
+    issueStatus: readFingerprintString(record.issueStatus),
+    cardRevision: readFingerprintString(record.cardRevision),
+    lastCommentAt: readFingerprintString(record.lastCommentAt),
+  };
+}
+
+/**
+ * True when the current deferral repeats the previous attempt against an
+ * unchanged card: same signal, same status, same update and comment
+ * watermarks. Unknown previous state never counts as a repeat — the safe
+ * direction is to retry.
+ */
+export function isRepeatModelDecisionDeferral(
+  previous: RunModelDecisionDeferralFingerprint | null | undefined,
+  current: RunModelDecisionDeferralFingerprint,
+): boolean {
+  if (!previous) return false;
+  return (
+    previous.reason === current.reason &&
+    previous.issueStatus === current.issueStatus &&
+    previous.cardRevision === current.cardRevision &&
+    previous.lastCommentAt === current.lastCommentAt
+  );
 }
 
 
