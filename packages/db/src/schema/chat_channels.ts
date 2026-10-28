@@ -478,6 +478,9 @@ export const chatDeliveries = pgTable(
       sql`${table.state} in ('received', 'filtered', 'processing', 'processed', 'retry', 'failed')`,
     ),
     index("chat_deliveries_work_idx").on(table.state, table.nextAttemptAt),
+    index("chat_deliveries_endpoint_github_delivery_idx")
+      .on(table.endpointId, sql`(${table.normalizedEvent} -> 'githubAutomatic' -> 'context' ->> 'deliveryId')`)
+      .concurrently(),
     unique("chat_deliveries_company_id_uq").on(table.companyId, table.id),
     uniqueIndex("chat_deliveries_event_uq").on(
       table.endpointId,
@@ -636,6 +639,9 @@ export const chatMessageLinks = pgTable(
       table.conversationId,
       table.providerMessageId,
     ),
+    index("chat_message_links_delivery_comment_idx")
+      .on(table.deliveryId, table.commentId)
+      .concurrently(),
     foreignKey({
       columns: [table.companyId, table.conversationId],
       foreignColumns: [chatConversations.companyId, chatConversations.id],

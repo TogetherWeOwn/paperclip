@@ -144,6 +144,9 @@ export const heartbeatRuns = pgTable(
       table.id,
       table.completionContractId,
     ),
+    companyAgentWakeCommentCreatedIdx: index("heartbeat_runs_company_agent_wake_comment_created_idx")
+      .on(table.companyId, table.agentId, sql`(${table.contextSnapshot} ->> 'wakeCommentId')`, table.createdAt.desc())
+      .concurrently(),
     companyAgentStartedIdx: index("heartbeat_runs_company_agent_started_idx").on(
       table.companyId,
       table.agentId,
