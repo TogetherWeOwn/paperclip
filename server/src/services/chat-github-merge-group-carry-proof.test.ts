@@ -93,6 +93,9 @@ function fixture() {
     postMode: "ok",
     listingLag: false,
     onLastTree: undefined as (() => void) | undefined,
+    // Fires inside the final group-check listing, before the response is
+    // served, so a test can revoke configuration mid-listing (R1).
+    onGroupListing: undefined as (() => void) | undefined,
   };
   const chain = (execute: () => unknown): any => {
     const q: any = {};
@@ -198,8 +201,13 @@ function fixture() {
       });
     if (path === `/compare/${B}...${G}`)
       return response({
-        total_commits: 1,
+        total_commits: 2,
         commits: [
+          {
+            sha: H,
+            parents: [{ sha: B }],
+            commit: { message: "Add the reviewed feature" },
+          },
           {
             sha: G,
             parents: [{ sha: B }, { sha: H }],
@@ -248,6 +256,11 @@ function fixture() {
         ],
       });
     if (path.startsWith(`/commits/${G}/check-runs`)) {
+      if (state.onGroupListing) {
+        const hook = state.onGroupListing;
+        state.onGroupListing = undefined;
+        hook();
+      }
       const visible = state.listingLag ? [] : state.runs;
       return response({ total_count: visible.length, check_runs: visible });
     }
@@ -256,13 +269,15 @@ function fixture() {
       state.runs.push(run);
       if (state.postMode === "lose_response")
         throw new TypeError("Fixture: provider accepted POST, response was lost");
-      return response({ id: run.id });
+      // A positive receipt names the created check; the service settles
+      // `processed` only on such a receipt (R4).
+      return response(run);
     }
     if (method === "PATCH" && path.startsWith("/check-runs/")) {
       const run = state.runs.find((r) => r.id === Number(path.split("/").pop()));
       if (!run) throw new Error("Unknown check id");
       Object.assign(run, body);
-      return response({ id: run.id });
+      return response(run);
     }
     throw new Error(`Unexpected fixture request: ${method} ${path}`);
   }) as typeof fetch;
@@ -342,6 +357,41 @@ describe("required freshness at the publication boundary (F2)", () => {
       ).toHaveLength(0);
     },
   );
+});
+
+describe("required write-boundary authorization at intent commit (R1)", () => {
+  // Each mutable identity is revoked inside the final group-check listing —
+  // after evaluation and the first boundary check, before intent commit.
+  // None of them may authorize a success POST.
+  const revocations = [
+    "policy revision",
+    "native flag",
+    "endpoint generation",
+    "review app",
+    "enabled repository",
+    "queue ref",
+    "PR head",
+  ] as const;
+  it.each(revocations)("does not POST success after %s is revoked mid-listing", async (change) => {
+    const f = fixture();
+    await f.enqueue();
+    f.state.onGroupListing = () => {
+      if (change === "policy revision") f.state.config.revision = 4;
+      if (change === "native flag")
+        f.state.config.configuration.mergeGroupCarryEnabled = false;
+      if (change === "endpoint generation")
+        f.state.endpoint.setup.runtimeGeneration = 1;
+      if (change === "review app") f.state.endpoint.botExternalId = "other-app";
+      if (change === "enabled repository") f.state.resource.enabled = false;
+      if (change === "queue ref") f.state.refSha = NEXT;
+      if (change === "PR head") f.state.headSha = NEXT;
+    };
+    await f.service.processPending();
+    expect(
+      f.state.calls.filter((c) => c.method !== "GET" && c.body?.conclusion === "success"),
+    ).toHaveLength(0);
+    expect(f.state.action?.status).not.toBe("processed");
+  });
 });
 
 describe("required repository isolation (F4)", () => {

@@ -198,9 +198,14 @@ export function defaultGitHubReviewPolicy(): GitHubReviewPolicy {
  * queued head, policy revision, endpoint/credential epoch, and the review
  * evidence — so redelivery replays only validate this fingerprint instead of
  * trusting (group SHA, policy revision) alone. Heads entries are sorted by
- * pull number for stable comparison. */
+ * pull number for stable comparison.
+ *
+ * Version 2 records the review outcome (completion, score, conclusion) per
+ * head alongside its identity: a mutable or negative review recorded under
+ * the same head must force re-judgment, never a replay. Version 1 proofs
+ * predate outcome binding and are never replayed. */
 export interface MergeGroupCarryProofFingerprint {
-  version: 1;
+  version: 2;
   endpointId: string;
   appId: string;
   repositoryId: string;
@@ -213,6 +218,9 @@ export interface MergeGroupCarryProofFingerprint {
     pullNumber: number;
     headSha: string;
     configurationRevision: number;
+    complete: boolean;
+    score: number;
+    conclusion: string | null;
   }>;
   configurationRevision: number;
   runtimeGeneration: number;

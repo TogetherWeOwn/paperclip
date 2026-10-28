@@ -260,7 +260,8 @@ const byPullNumber = (
 
 /** Snapshot the exact identities observed at the write boundary. Heads and
  * reviews are normalized (lowercase SHAs, sorted by pull number) so a stored
- * fingerprint compares stably. */
+ * fingerprint compares stably. Review outcomes ride along so a later review
+ * change under the same head forces re-judgment instead of replay. */
 export function buildMergeGroupProofFingerprint(args: {
   endpointId: string;
   appId: string;
@@ -271,7 +272,7 @@ export function buildMergeGroupProofFingerprint(args: {
   runtimeGeneration: number;
 }): MergeGroupCarryProofFingerprint {
   return {
-    version: 1,
+    version: 2,
     endpointId: args.endpointId,
     appId: args.appId,
     repositoryId: args.ctx.repositoryId,
@@ -290,6 +291,9 @@ export function buildMergeGroupProofFingerprint(args: {
         pullNumber: review.pullNumber,
         headSha: review.headSha.toLowerCase(),
         configurationRevision: review.configurationRevision,
+        complete: review.complete,
+        score: review.score,
+        conclusion: review.conclusion,
       }))
       .sort(byPullNumber),
     configurationRevision: args.configurationRevision,
@@ -297,11 +301,84 @@ export function buildMergeGroupProofFingerprint(args: {
   };
 }
 
+/** Current local review evidence for one exact head, used to revalidate a
+ * stored proof without provider calls. */
+export type MergeGroupReplayReview = {
+  pullNumber: number;
+  headSha: string;
+  complete: boolean;
+  score: number;
+  conclusion: string | null;
+  configurationRevision: number;
+};
+
+const FULL_SHA_LOWER = /^[0-9a-f]{40}$/;
+
+function isValidProofHead(entry: unknown): entry is {
+  pullNumber: number;
+  headSha: string;
+} {
+  if (!entry || typeof entry !== "object") return false;
+  const { pullNumber, headSha } = entry as {
+    pullNumber?: unknown;
+    headSha?: unknown;
+  };
+  return (
+    typeof pullNumber === "number" &&
+    Number.isInteger(pullNumber) &&
+    pullNumber > 0 &&
+    typeof headSha === "string" &&
+    FULL_SHA_LOWER.test(headSha)
+  );
+}
+
+export type MergeGroupProofReview = {
+  pullNumber: number;
+  headSha: string;
+  configurationRevision: number;
+  complete: boolean;
+  score: number;
+  conclusion: string | null;
+};
+
+function isValidProofReview(entry: unknown): entry is MergeGroupProofReview {
+  if (!entry || typeof entry !== "object") return false;
+  const review = entry as {
+    pullNumber?: unknown;
+    headSha?: unknown;
+    configurationRevision?: unknown;
+    complete?: unknown;
+    score?: unknown;
+    conclusion?: unknown;
+  };
+  return (
+    typeof review.pullNumber === "number" &&
+    Number.isInteger(review.pullNumber) &&
+    review.pullNumber > 0 &&
+    typeof review.headSha === "string" &&
+    FULL_SHA_LOWER.test(review.headSha) &&
+    typeof review.configurationRevision === "number" &&
+    Number.isInteger(review.configurationRevision) &&
+    typeof review.complete === "boolean" &&
+    typeof review.score === "number" &&
+    (review.conclusion === null || typeof review.conclusion === "string")
+  );
+}
+
 /** Redelivery replay predicate. A stored proof replays only when every
  * database-observable field still matches the current delivery and source —
  * endpoint, review app, repository, group, base, queue ref, policy revision,
  * and endpoint/credential epoch — plus intact write-time head/review
- * evidence. Anything else is re-judged, never replayed.
+ * evidence that still matches current local review state. Anything else is
+ * re-judged, never replayed.
+ *
+ * Only a stored successful carry (`verdictOk`) may replay: mutable or
+ * negative outcomes (missing/weak/stale reviews, fail-closed verdicts) are
+ * always re-evaluated, because the underlying review may have completed since
+ * (a 4/5 recorded under the same group must recompute at 5/5, not replay
+ * `weak_review`). The stored review outcomes are compared element-wise
+ * against the current review rows; any completion, score, conclusion, or
+ * revision change forces re-judgment.
  *
  * Residual: provider-fresh heads are not re-read on replay (replay performs
  * no provider calls). The write-time proof was boundary-validated at
@@ -309,27 +386,72 @@ export function buildMergeGroupProofFingerprint(args: {
  * new group key; post-publish head drift cannot retroactively falsify the
  * published content binding. */
 export function mergeGroupProofReplayMatches(args: {
-  stored: MergeGroupCarryProofFingerprint | null | undefined;
+  /** Durable proof; legacy or malformed shapes never replay. */
+  stored: unknown;
   endpointId: string;
   appId: string;
   ctx: MergeGroupContext;
   configurationRevision: number;
   runtimeGeneration: number;
+  /** The stored row settled a successful carry (not a fail-closed verdict). */
+  verdictOk: boolean;
+  /** Current local review rows for the queued heads, newest first. */
+  currentReviews: MergeGroupReplayReview[];
 }): boolean {
-  const proof = args.stored;
-  if (!proof || proof.version !== 1) return false;
+  const proof = args.stored as Partial<MergeGroupCarryProofFingerprint> | null | undefined;
+  // Version 1 proofs predate review-outcome binding and never replay: the
+  // first redelivery re-judges once and stores version 2.
+  if (!proof || proof.version !== 2) return false;
+  if (!args.verdictOk) return false;
   if (!Array.isArray(proof.heads) || !Array.isArray(proof.reviews)) return false;
-  return (
-    proof.endpointId === args.endpointId &&
-    proof.appId === args.appId &&
-    proof.repositoryId === args.ctx.repositoryId &&
-    proof.repository === args.ctx.repository &&
-    proof.groupSha === args.ctx.groupSha.toLowerCase() &&
-    proof.groupRef === args.ctx.groupRef &&
-    proof.baseSha === args.ctx.baseSha.toLowerCase() &&
-    proof.configurationRevision === args.configurationRevision &&
-    proof.runtimeGeneration === args.runtimeGeneration
-  );
+  if (proof.heads.length === 0 || !proof.heads.every(isValidProofHead))
+    return false;
+  if (!proof.reviews.every(isValidProofReview)) return false;
+  if (
+    proof.endpointId !== args.endpointId ||
+    proof.appId !== args.appId ||
+    proof.repositoryId !== args.ctx.repositoryId ||
+    proof.repository !== args.ctx.repository ||
+    proof.groupSha !== args.ctx.groupSha.toLowerCase() ||
+    proof.groupRef !== args.ctx.groupRef ||
+    proof.baseSha !== args.ctx.baseSha.toLowerCase() ||
+    proof.configurationRevision !== args.configurationRevision ||
+    proof.runtimeGeneration !== args.runtimeGeneration
+  )
+    return false;
+  // Every stored head must still carry the identical stored review outcome in
+  // the current local evidence. A completed, rescored, reconcluded, or
+  // repolicied review under the same head forces a fresh judgment.
+  // Rows are newest first, as in fresh evaluation; never let older
+  // duplicate assessments overwrite the latest evidence for the same head.
+  const currentByHead = new Map<string, MergeGroupReplayReview>();
+  for (const review of args.currentReviews) {
+    const key = `${review.pullNumber}:${review.headSha.toLowerCase()}`;
+    if (!currentByHead.has(key)) currentByHead.set(key, review);
+  }
+  // Validated above: stored heads and reviews are well-formed.
+  const heads = proof.heads as Array<{ pullNumber: number; headSha: string }>;
+  const storedReviews = proof.reviews as MergeGroupProofReview[];
+  for (const head of heads) {
+    const match = storedReviews.find(
+      (review) =>
+        review.pullNumber === head.pullNumber &&
+        review.headSha === head.headSha,
+    );
+    if (!match) return false;
+    const current = currentByHead.get(
+      `${head.pullNumber}:${head.headSha}`,
+    );
+    if (
+      !current ||
+      current.configurationRevision !== match.configurationRevision ||
+      current.complete !== match.complete ||
+      current.score !== match.score ||
+      (current.conclusion ?? null) !== (match.conclusion ?? null)
+    )
+      return false;
+  }
+  return true;
 }
 
 const MERGE_SUBJECT = /^Merge pull request #(\d{1,9}) from \S+/;
@@ -543,36 +665,114 @@ export async function decideMergeGroupCarry(
         refPr.pullNumber,
       );
   }
-  // Immutable membership proof. Every group commit must be a merge-method
-  // entry whose second parent names the exact queued PR head; anything else
-  // — a squash/rebase shape, an unrecognized message, a malformed parent, or
-  // conflicting bindings for one PR — proves nothing about which head the
-  // group was cut from and fails closed. Title hints never become identity.
+  // Immutable membership proof. GitHub's compare commits are
+  // `git log BASE..HEAD`: the reviewed branch commits appear alongside the
+  // queue merge commit(s). Queue merge entries must bind their exact queued
+  // PR head through an immutable second parent; every remaining comparison
+  // commit must attribute through a pinned head's ancestry; and the
+  // first-parent spine from the group must reach the base without gaps.
+  // Anything else — a squash/rebase shape, an unrecognized message, a
+  // malformed parent, conflicting bindings for one PR, an unattributed
+  // commit, or a broken spine — proves nothing about which heads the group
+  // was cut from and fails closed. Title hints never become identity, and
+  // unknown commits are never discarded.
+  const bySha = new Map<string, MergeGroupCompareCommit>();
+  for (const commit of compare.commits) {
+    const sha = commit.sha.toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(sha) || bySha.has(sha))
+      return fail(
+        "ambiguous_group",
+        `the group comparison contains a malformed or repeated commit identity, so its membership cannot be proven`,
+      );
+    bySha.set(sha, commit);
+  }
   const boundHeads = new Map<number, string>();
+  const branchCommits: MergeGroupCompareCommit[] = [];
   for (const commit of compare.commits) {
     const firstLine = commit.message.split("\n", 1)[0] ?? "";
     const merge = MERGE_SUBJECT.exec(firstLine);
     const secondParent = commit.parents[1]?.toLowerCase() ?? null;
     if (
-      !merge ||
-      commit.parents.length !== 2 ||
-      !secondParent ||
-      !/^[0-9a-f]{40}$/.test(secondParent) ||
-      !/^[0-9a-f]{40}$/i.test(commit.sha)
-    )
-      return fail(
-        "ambiguous_group",
-        `the group contains commit ${commit.sha} with no immutable binding to a queued pull request head, so the group membership cannot be proven`,
-      );
-    const pullNumber = Number(merge[1]);
-    const prior = boundHeads.get(pullNumber);
-    if (prior !== undefined && prior !== secondParent)
-      return fail(
-        "ambiguous_group",
-        `pull request #${pullNumber} is bound to conflicting heads inside one group, so the queued head cannot be determined`,
-        pullNumber,
-      );
-    boundHeads.set(pullNumber, secondParent);
+      merge &&
+      commit.parents.length === 2 &&
+      secondParent &&
+      /^[0-9a-f]{40}$/.test(secondParent)
+    ) {
+      const pullNumber = Number(merge[1]);
+      const prior = boundHeads.get(pullNumber);
+      if (prior !== undefined && prior !== secondParent)
+        return fail(
+          "ambiguous_group",
+          `pull request #${pullNumber} is bound to conflicting heads inside one group, so the queued head cannot be determined`,
+          pullNumber,
+        );
+      boundHeads.set(pullNumber, secondParent);
+      continue;
+    }
+    branchCommits.push(commit);
+  }
+  // The queue spine: walking first parents from the group must reach the
+  // base through commits present in this comparison. A gap means the
+  // inventory does not span base..group and proves nothing.
+  {
+    let cursor = groupCommit.sha.toLowerCase();
+    const target = ctx.baseSha.toLowerCase();
+    for (let steps = 0; steps <= compare.commits.length; steps++) {
+      if (cursor === target) break;
+      const current = bySha.get(cursor);
+      const firstParent = current?.parents[0]?.toLowerCase() ?? null;
+      if (!current || !firstParent || !/^[0-9a-f]{40}$/.test(firstParent))
+        return fail(
+          "ambiguous_group",
+          `the group comparison does not connect ${cursor} back to the base, so its membership cannot be proven`,
+        );
+      cursor = firstParent;
+      if (steps === compare.commits.length && cursor !== target)
+        return fail(
+          "ambiguous_group",
+          "the group comparison does not reach the base through its first parents, so its membership cannot be proven",
+        );
+    }
+  }
+  // Branch-commit attribution: every non-merge commit must be a pinned head
+  // itself or a single-parent ancestor of one, linked through parent SHAs
+  // recorded in this same comparison. Only pinned heads anchor attribution;
+  // exotic shapes (root, octopus, or otherwise non-single-parent entries)
+  // cannot attribute and fail closed.
+  {
+    const attributed = new Set(boundHeads.values());
+    // Children index: parent SHA -> commits listing it as a parent.
+    const children = new Map<string, MergeGroupCompareCommit[]>();
+    for (const commit of compare.commits)
+      for (const parent of commit.parents) {
+        const key = parent.toLowerCase();
+        const list = children.get(key) ?? [];
+        list.push(commit);
+        children.set(key, list);
+      }
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const commit of branchCommits) {
+        const sha = commit.sha.toLowerCase();
+        if (attributed.has(sha)) continue;
+        if (commit.parents.length !== 1) continue;
+        const anchored = (children.get(sha) ?? []).some((child) =>
+          attributed.has(child.sha.toLowerCase()),
+        );
+        if (anchored) {
+          attributed.add(sha);
+          grew = true;
+        }
+      }
+    }
+    for (const commit of branchCommits) {
+      if (!attributed.has(commit.sha.toLowerCase()))
+        return fail(
+          "ambiguous_group",
+          `the group contains commit ${commit.sha} with no immutable binding to a queued pull request head, so the group membership cannot be proven`,
+        );
+    }
   }
   for (const refPr of refPrs) {
     if (!boundHeads.has(refPr.pullNumber))
