@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -111,6 +111,23 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .returning();
 
     return event!;
+  }
+
+  // Port of #17966's settleWhileCompanyRowLocked. 1023 computes spend inside
+  // budgets.ts, so a module mock cannot observe the scan; instead the spend
+  // tables are locked so any ledger/pending-run scan would wait.
+  async function settleWhileLocked<T>(locks: { companyId?: string; spendTables?: boolean }, start: () => Promise<T>) {
+    let admission!: Promise<T>;
+    const settled = await db.transaction(async (tx) => {
+      if (locks.companyId) await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, locks.companyId)).for("update");
+      if (locks.spendTables) await tx.execute(sql`lock table cost_events, heartbeat_runs in access exclusive mode`);
+      admission = start();
+      return Promise.race([
+        admission.then((value) => ({ value })),
+        new Promise<"waiting">((resolve) => setTimeout(resolve, 1_000, "waiting")),
+      ]);
+    });
+    return { settled, admission };
   }
 
   it("raises one soft incident per window before hard-stopping and safely logging agent telemetry", async () => {
@@ -354,5 +371,106 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       pauseReason: null,
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
+  });
+
+  it("admits concurrent runs without the company lock when no policy can block", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const service = budgetService(db);
+    const policyBase = { companyId, metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100 };
+    await db.insert(budgetPolicies).values([
+      { ...policyBase, scopeType: "company", scopeId: companyId, hardStopEnabled: true, isActive: false },
+      { ...policyBase, scopeType: "agent", scopeId: agentId, hardStopEnabled: false, isActive: true },
+      { ...policyBase, scopeType: "project", scopeId: projectId, hardStopEnabled: true, amount: 0, isActive: true },
+    ]);
+    await insertCostEvent({ companyId, agentId, projectId, costCents: 500 });
+
+    const { settled } = await settleWhileLocked({ companyId, spendTables: true }, () => Promise.all([
+      service.getInvocationBlock(companyId, agentId, { projectId }),
+      service.getInvocationBlock(companyId, agentId),
+    ]));
+
+    expect(settled).toEqual({ value: [null, null] });
+    await expect(service.getInvocationBlock(companyId, randomUUID())).rejects.toThrow("Agent not found");
+  });
+
+  it("keeps active hard-stop admission behind the company lock and blocks at the limit", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const service = budgetService(db);
+    await db.insert(budgetPolicies).values({ companyId, scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: true });
+
+    const underLimit = await settleWhileLocked({ companyId }, () => service.getInvocationBlock(companyId, agentId));
+    expect(underLimit.settled).toBe("waiting");
+    expect(await underLimit.admission).toBeNull();
+
+    await insertCostEvent({ companyId, agentId, costCents: 100 });
+    const atLimit = await settleWhileLocked({ companyId }, () => service.getInvocationBlock(companyId, agentId));
+    expect(atLimit.settled).toBe("waiting");
+    expect(await atLimit.admission).toMatchObject({
+      scopeType: "company",
+      scopeId: companyId,
+      reason: "Company is paused because its budget hard-stop was reached.",
+    });
+  });
+
+  it("resolves inactive policy incidents and budget holds without scanning their spend", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const service = budgetService(db);
+    const policyBase = { companyId, metric: "billed_cents", amount: 100, hardStopEnabled: true, isActive: false };
+    const [agentPolicy] = await db.insert(budgetPolicies).values({ ...policyBase, scopeType: "agent", scopeId: agentId,
+      windowKind: "calendar_month_utc" }).returning();
+    const [projectPolicy] = await db.insert(budgetPolicies).values({ ...policyBase, scopeType: "project", scopeId: projectId,
+      windowKind: "lifetime" }).returning();
+    const incidentBase = { companyId, metric: "billed_cents", windowStart: new Date(0), windowEnd: new Date(Date.UTC(9999, 0, 1)),
+      amountLimit: 100, amountObserved: 125, status: "open" };
+    await db.insert(budgetIncidents).values([
+      { ...incidentBase, policyId: agentPolicy!.id, scopeType: "agent", scopeId: agentId, windowKind: "calendar_month_utc", thresholdType: "soft" },
+      { ...incidentBase, policyId: projectPolicy!.id, scopeType: "project", scopeId: projectId, windowKind: "lifetime", thresholdType: "hard" },
+    ]);
+    await db.update(projects).set({ pauseReason: "budget", pausedAt: new Date() }).where(eq(projects.id, projectId));
+    const incidentStatus = async (policyId: string) =>
+      (await db.select().from(budgetIncidents).where(eq(budgetIncidents.policyId, policyId)))[0]?.status;
+
+    expect((await settleWhileLocked({ spendTables: true }, () => service.getInvocationBlock(companyId, agentId))).settled)
+      .toEqual({ value: null });
+    expect(await incidentStatus(agentPolicy!.id)).toBe("resolved");
+    expect(await incidentStatus(projectPolicy!.id)).toBe("open");
+
+    expect((await settleWhileLocked({ spendTables: true }, () => service.getInvocationBlock(companyId, agentId, { projectId }))).settled)
+      .toEqual({ value: null });
+    expect(await incidentStatus(projectPolicy!.id)).toBe("resolved");
+    expect((await db.select().from(projects).where(eq(projects.id, projectId)))[0]).toMatchObject({ pauseReason: null, pausedAt: null });
+  });
+
+  it("keeps a manual project pause blocking when no policy exists", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    await db.update(projects).set({ pauseReason: "manual", pausedAt: new Date() }).where(eq(projects.id, projectId));
+    expect(await budgetService(db).getInvocationBlock(companyId, agentId, { projectId })).toMatchObject({
+      scopeType: "project",
+      scopeId: projectId,
+      reason: "Project is paused and cannot start new work.",
+    });
+  });
+
+  // 1023-only: budgetService.getInvocationBlock also reconciles agent policy
+  // holds under the lock. The fast path is taken only when that is a no-op.
+  it("keeps agent hold reconciliation behind the company lock when holds are unsettled", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    await db.update(agents).set({ lifecycleHolds: ["company_paused"], pauseReason: "company_paused" }).where(eq(agents.id, agentId));
+    const { settled, admission } = await settleWhileLocked({ companyId }, () => budgetService(db).getInvocationBlock(companyId, agentId));
+    expect(settled).toBe("waiting");
+    expect(await admission).toBeNull();
+    expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]).toMatchObject({ lifecycleHolds: [], pauseReason: null });
+  });
+
+  it("still retries pending budget cancellation delivery on the lock-free path", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const [policy] = await db.insert(budgetPolicies).values({ companyId, scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: false,
+      enforcementVersion: 1, enforcementDeliveredVersion: 0 }).returning();
+    expect(await budgetService(db, { cancelWorkForScope }).getInvocationBlock(companyId, agentId)).toBeNull();
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
+    expect((await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy!.id)))[0]?.enforcementDeliveredVersion).toBe(1);
   });
 });
