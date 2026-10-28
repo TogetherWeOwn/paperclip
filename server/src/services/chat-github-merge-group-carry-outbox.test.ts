@@ -707,6 +707,7 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
     expect(await carryRun()).toMatchObject({
       status: "failed",
       code: "carry_superseded",
+      publicationAttempt: null,
     });
   });
 
@@ -774,7 +775,7 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
   });
 
   it.each(["disabled", "generation", "resource", "endpoint", "configuration_missing"] as const)(
-    "cleans up the ambiguous intent before cancelling after %s changes",
+    "preserves the ambiguous intent while cancelling after %s changes",
     async (change) => {
       const github = fakeGitHub(ids.endpointId);
       github.state.post = "lose_response";
@@ -808,12 +809,82 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
 
       const code = change === "disabled" ? "carry_disabled" : "connection_changed";
       expect(await action(queued.id)).toMatchObject({ status: "cancelled", result: { code } });
-      expect(await carryRun()).toMatchObject({ status: "failed", code, publicationAttempt: null });
+      expect(await carryRun()).toMatchObject({ status: "failed", code });
+      expect((await carryRun())?.publicationAttempt).not.toBeNull();
       expect(github.state.calls).toHaveLength(callsBeforeRetry);
       expect(github.posts()).toBe(1);
       expect(github.patches()).toBe(0);
       await service.processPending();
       expect(github.state.calls).toHaveLength(callsBeforeRetry);
+    },
+  );
+
+  it.each(["disabled", "generation"] as const)(
+    "reconciles a redelivery without a second POST after %s changes with a lagging listing",
+    async (change) => {
+      const github = fakeGitHub(ids.endpointId);
+      github.state.post = "lose_response";
+      github.state.listingLag = true;
+      const service = githubMergeGroupCarryService(db, github.fetchImpl);
+      const queued = await enqueue(service);
+      await service.processPending();
+      expect(github.posts()).toBe(1);
+      expect(github.state.runs).toHaveLength(1);
+      const pendingAttempt = (await carryRun())?.publicationAttempt;
+      expect(pendingAttempt).toMatchObject({ method: "POST", ambiguous: true });
+
+      if (change === "disabled") {
+        await db.update(chatGitHubConfigurations)
+          .set({ configuration: { mergeGroupCarryEnabled: false } as never })
+          .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+      } else {
+        const setup = { ...(await endpoint()).setup, runtimeGeneration: 1 };
+        await db.update(chatEndpoints).set({ setup })
+          .where(eq(chatEndpoints.id, ids.endpointId));
+      }
+      await retryNow(queued.id);
+      await service.processPending();
+      expect(await action(queued.id)).toMatchObject({ status: "cancelled" });
+
+      if (change === "disabled") {
+        await db.update(chatGitHubConfigurations)
+          .set({ configuration: { mergeGroupCarryEnabled: true } as never })
+          .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+      }
+      // A new delivery uses the live generation. An empty, lagging listing
+      // still cannot prove the earlier POST did not land, even after revoke.
+      github.state.post = "ok";
+      const redelivery = await enqueue(service);
+      await service.processPending();
+      expect(github.posts()).toBe(1);
+      expect(github.state.runs).toHaveLength(1);
+      expect(await action(redelivery.id)).toMatchObject({
+        status: "failed",
+        result: expect.objectContaining({ code: "carry_ambiguous_write", retryable: true }),
+      });
+      expect((await carryRun())?.publicationAttempt).toEqual(pendingAttempt);
+
+      // A failed listing also leaves the intent retryable, not permission to
+      // POST. Once the provider catches up, reconcile the original check.
+      github.state.listing = "error";
+      await retryNow(redelivery.id);
+      await service.processPending();
+      expect(await action(redelivery.id)).toMatchObject({
+        status: "failed",
+        result: expect.objectContaining({ retryable: true }),
+      });
+      expect((await carryRun())?.publicationAttempt).toEqual(pendingAttempt);
+      expect(github.posts()).toBe(1);
+
+      github.state.listing = "ok";
+      github.state.listingLag = false;
+      await retryNow(redelivery.id);
+      await service.processPending();
+      expect(await action(redelivery.id)).toMatchObject({ status: "processed" });
+      expect(await carryRun()).toMatchObject({ status: "processed", publicationAttempt: null });
+      expect(github.posts()).toBe(1);
+      expect(github.patches()).toBe(1);
+      expect(github.state.runs).toHaveLength(1);
     },
   );
 

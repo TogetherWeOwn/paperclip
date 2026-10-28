@@ -849,7 +849,7 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       .limit(1);
     if (!action || ["processed", "cancelled"].includes(action.status)) return;
     // Recover the existing intent before admission checks or provider reads.
-    // Revocation and expiry must retire it even when GitHub is unavailable.
+    // Revocation and expiry must settle its owner even when GitHub is unavailable.
     const [existing] = await db
       .select()
       .from(chatGithubCarryRuns)
@@ -880,9 +880,13 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       (action.result as { reconcileOnly?: unknown } | null)?.reconcileOnly ===
       true;
 
-    // Retire the intent and its retry owner atomically under the lease. A
-    // failed cleanup must leave the action retryable, never strand the row.
-    const finish = (code: string) =>
+    // Settle the row and its retry owner atomically under the lease. A failed
+    // cleanup must leave the action retryable. Only expiry/supersession retire
+    // the intent: revocation cannot prove an ambiguous write did not land, so
+    // a later delivery must inherit it and reconcile without a second POST.
+    const finish = (
+      code: "carry_expired" | "carry_superseded" | "carry_disabled" | "connection_changed",
+    ) =>
       lease.commit(async (tx) => {
         if (carryRowId) {
           await tx
@@ -890,7 +894,9 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
             .set({
               status: "failed",
               code,
-              publicationAttempt: null,
+              ...(code === "carry_expired" || code === "carry_superseded"
+                ? { publicationAttempt: null }
+                : {}),
               updatedAt: new Date(),
             })
             .where(
