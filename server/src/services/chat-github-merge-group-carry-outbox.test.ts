@@ -25,7 +25,7 @@ vi.mock("./chat-github-client.js", async (importOriginal) => ({
   githubBotRepositoryToken: async () => "installation-token",
 }));
 
-const { githubMergeGroupCarryService } = await import(
+const { githubMergeGroupCarryService, MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS } = await import(
   "./chat-github-merge-group-carry.js"
 );
 
@@ -708,6 +708,129 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
       status: "failed",
       code: "carry_superseded",
     });
+  });
+
+  it.each(["malformed", "truncated", "missing_total", "error"] as const)(
+    "expires an ambiguous intent even when the check listing stays %s",
+    async (listing) => {
+      const github = fakeGitHub(ids.endpointId);
+      github.state.post = "lose_response";
+      const service = githubMergeGroupCarryService(db, github.fetchImpl);
+      const queued = await enqueue(service);
+      await service.processPending();
+      expect((await carryRun())?.publicationAttempt).not.toBeNull();
+      const callsBeforeExpiry = github.state.calls.length;
+
+      github.state.listing = listing;
+      await db.update(chatActions).set({
+        createdAt: new Date(Date.now() - MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS - 1000),
+        result: { attempts: 8, retryable: true, reconcileOnly: true, retryAt: new Date(0).toISOString() },
+      }).where(eq(chatActions.id, queued.id));
+      await service.processPending();
+
+      expect(await action(queued.id)).toMatchObject({
+        status: "cancelled",
+        result: { code: "carry_expired" },
+      });
+      expect(await carryRun()).toMatchObject({
+        status: "failed",
+        code: "carry_expired",
+        publicationAttempt: null,
+      });
+      expect(github.posts()).toBe(1);
+      expect(github.patches()).toBe(0);
+      expect(github.state.calls).toHaveLength(callsBeforeExpiry);
+      const callsAfterExpiry = github.state.calls.length;
+      await service.processPending();
+      expect(github.state.calls).toHaveLength(callsAfterExpiry);
+    },
+  );
+
+  it("keeps an unexpired intent retryable through a listing failure and later adopts it", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    github.state.post = "lose_response";
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    const queued = await enqueue(service);
+    await service.processPending();
+    github.state.listing = "error";
+    await db.update(chatActions).set({
+      result: { attempts: 8, retryable: true, reconcileOnly: true, retryAt: new Date(0).toISOString() },
+    }).where(eq(chatActions.id, queued.id));
+    await service.processPending();
+    expect(await action(queued.id)).toMatchObject({
+      status: "failed",
+      result: expect.objectContaining({ attempts: 9, retryable: true, reconcileOnly: true }),
+    });
+    expect(await carryRun()).toMatchObject({ status: "processing" });
+    expect((await carryRun())?.publicationAttempt).not.toBeNull();
+
+    github.state.listing = "ok";
+    await retryNow(queued.id);
+    await service.processPending();
+    expect(await action(queued.id)).toMatchObject({ status: "processed" });
+    expect(await carryRun()).toMatchObject({ status: "processed", publicationAttempt: null });
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(1);
+  });
+
+  it.each(["disabled", "generation", "resource", "endpoint", "configuration_missing"] as const)(
+    "cleans up the ambiguous intent before cancelling after %s changes",
+    async (change) => {
+      const github = fakeGitHub(ids.endpointId);
+      github.state.post = "lose_response";
+      const service = githubMergeGroupCarryService(db, github.fetchImpl);
+      const queued = await enqueue(service);
+      await service.processPending();
+      expect(await carryRun()).toMatchObject({ status: "processing" });
+      expect((await carryRun())?.publicationAttempt).not.toBeNull();
+      const callsBeforeRetry = github.state.calls.length;
+
+      if (change === "disabled") {
+        await db.update(chatGitHubConfigurations)
+          .set({ configuration: { mergeGroupCarryEnabled: false } as never })
+          .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+      } else if (change === "generation") {
+        await db.update(chatEndpoints).set({ setup: { runtimeGeneration: 1 } })
+          .where(eq(chatEndpoints.id, ids.endpointId));
+      } else if (change === "resource") {
+        await db.update(chatEndpointResources).set({ enabled: false })
+          .where(eq(chatEndpointResources.endpointId, ids.endpointId));
+      } else if (change === "endpoint") {
+        await db.update(chatEndpoints).set({ status: "paused" })
+          .where(eq(chatEndpoints.id, ids.endpointId));
+      } else {
+        await db.delete(chatGitHubConfigurations)
+          .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+      }
+      await retryNow(queued.id);
+      await service.processPending();
+
+      const code = change === "disabled" ? "carry_disabled" : "connection_changed";
+      expect(await action(queued.id)).toMatchObject({ status: "cancelled", result: { code } });
+      expect(await carryRun()).toMatchObject({ status: "failed", code, publicationAttempt: null });
+      expect(github.state.calls).toHaveLength(callsBeforeRetry);
+      expect(github.posts()).toBe(1);
+      expect(github.patches()).toBe(0);
+      await service.processPending();
+      expect(github.state.calls).toHaveLength(callsBeforeRetry);
+    },
+  );
+
+  it("does not regress a processed carry when a redelivery is cancelled after disabling", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    await enqueue(service);
+    await service.processPending();
+    const completed = await carryRun();
+    const again = await enqueue(service);
+    await db.update(chatGitHubConfigurations)
+      .set({ configuration: { mergeGroupCarryEnabled: false } as never })
+      .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
+    const callsBeforeRetry = github.state.calls.length;
+    await service.processPending();
+    expect(await action(again.id)).toMatchObject({ status: "cancelled", result: { code: "carry_disabled" } });
+    expect(await carryRun()).toEqual(completed);
+    expect(github.state.calls).toHaveLength(callsBeforeRetry);
   });
 
   it("re-judges a redelivery after the review completes instead of replaying weak_review (R2)", async () => {

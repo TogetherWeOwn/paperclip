@@ -848,6 +848,22 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       .where(eq(chatActions.id, id))
       .limit(1);
     if (!action || ["processed", "cancelled"].includes(action.status)) return;
+    // Recover the existing intent before admission checks or provider reads.
+    // Revocation and expiry must retire it even when GitHub is unavailable.
+    const [existing] = await db
+      .select()
+      .from(chatGithubCarryRuns)
+      .where(
+        and(
+          eq(chatGithubCarryRuns.endpointId, action.endpointId),
+          eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
+          eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
+        ),
+      )
+      .limit(1);
+    let carryRowId: string | null = existing?.id ?? null;
+    const pendingAttempt: MergeGroupCarryPublicationAttempt | null =
+      existing?.publicationAttempt ?? null;
     const settle = (
       status: "processed" | "cancelled",
       result: Record<string, unknown>,
@@ -864,31 +880,49 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       (action.result as { reconcileOnly?: unknown } | null)?.reconcileOnly ===
       true;
 
+    // Retire the intent and its retry owner atomically under the lease. A
+    // failed cleanup must leave the action retryable, never strand the row.
+    const finish = (code: string) =>
+      lease.commit(async (tx) => {
+        if (carryRowId) {
+          await tx
+            .update(chatGithubCarryRuns)
+            .set({
+              status: "failed",
+              code,
+              publicationAttempt: null,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatGithubCarryRuns.id, carryRowId),
+                ne(chatGithubCarryRuns.status, "processed"),
+              ),
+            );
+        }
+        await tx
+          .update(chatActions)
+          .set({ status: "cancelled", result: { code }, updatedAt: new Date() })
+          .where(eq(chatActions.id, id));
+      });
+
+    // Apply the local expiry bound before any fallible provider operation.
+    // The catch path can otherwise reschedule an expired intent forever.
+    if (
+      (pendingAttempt || isReconcileOnly()) &&
+      Date.now() - new Date(action.createdAt).getTime() >
+        MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS
+    ) {
+      await finish("carry_expired");
+      return;
+    }
+
     /** Bounded terminal settlement for reconcile-only recovery. Ambiguous
      * work retires only through an explicit bound: the delivery window
      * expired (the group is superseded by definition), or the live queue ref
      * moved past this group (another group owns the queue now). Anything
      * else keeps reconciling. True when settled terminally. */
     const settleReconcileTerminal = async (): Promise<boolean> => {
-      const finish = async (code: "carry_expired" | "carry_superseded") => {
-        const rowId = carryRowId;
-        if (rowId) {
-          await lease
-            .commit(async (tx) => {
-              await tx
-                .update(chatGithubCarryRuns)
-                .set({
-                  status: "failed",
-                  code,
-                  publicationAttempt: null,
-                  updatedAt: new Date(),
-                })
-                .where(eq(chatGithubCarryRuns.id, rowId));
-            })
-            .catch(() => {});
-        }
-        await settle("cancelled", { code });
-      };
       const ageMs = Date.now() - new Date(action.createdAt).getTime();
       if (ageMs > MERGE_GROUP_CARRY_MAX_EVENT_AGE_MS) {
         await finish("carry_expired");
@@ -992,11 +1026,11 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       ((source.endpoint.setup as { runtimeGeneration?: number })
         .runtimeGeneration ?? 0) !== payload.runtimeGeneration
     ) {
-      await settle("cancelled", { code: "connection_changed" });
+      await finish("connection_changed");
       return;
     }
     if (!mergeGroupCarryEnabled(source.configuration)) {
-      await settle("cancelled", { code: "carry_disabled" });
+      await finish("carry_disabled");
       return;
     }
     if (payload.admitted === false) {
@@ -1034,20 +1068,8 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       .returning({ id: chatGithubCarryRuns.id });
     // A prior attempt's write intent survives takeover: an ambiguous write
     // reconciles only and never authorizes a second POST.
-    let carryRowId: string | null = claimed?.id ?? null;
-    let pendingAttempt: MergeGroupCarryPublicationAttempt | null = null;
+    carryRowId = claimed?.id ?? carryRowId;
     if (!claimed) {
-      const [existing] = await db
-        .select()
-        .from(chatGithubCarryRuns)
-        .where(
-          and(
-            eq(chatGithubCarryRuns.endpointId, action.endpointId),
-            eq(chatGithubCarryRuns.repositoryId, ctx.repositoryId),
-            eq(chatGithubCarryRuns.groupSha, ctx.groupSha),
-          ),
-        )
-        .limit(1);
       if (existing?.status === "processed") {
         // Replay compares the stored proof (heads plus review outcomes)
         // against current local review evidence. Only a stored successful
@@ -1090,8 +1112,6 @@ export function githubMergeGroupCarryService(db: Db, fetchImpl = fetch) {
       // longer matches is re-judged. Take it over, preserving any unconfirmed
       // write intent for reconciliation.
       if (existing) {
-        carryRowId = existing.id;
-        pendingAttempt = existing.publicationAttempt ?? null;
         await lease.commit(async (tx) => {
           await tx
             .update(chatGithubCarryRuns)
