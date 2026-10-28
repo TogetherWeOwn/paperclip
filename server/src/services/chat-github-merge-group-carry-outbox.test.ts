@@ -790,7 +790,8 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
           .set({ configuration: { mergeGroupCarryEnabled: false } as never })
           .where(eq(chatGitHubConfigurations.endpointId, ids.endpointId));
       } else if (change === "generation") {
-        await db.update(chatEndpoints).set({ setup: { runtimeGeneration: 1 } })
+        const setup = { ...(await endpoint()).setup, runtimeGeneration: 1 };
+        await db.update(chatEndpoints).set({ setup })
           .where(eq(chatEndpoints.id, ids.endpointId));
       } else if (change === "resource") {
         await db.update(chatEndpointResources).set({ enabled: false })
