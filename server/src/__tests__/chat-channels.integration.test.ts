@@ -6457,6 +6457,78 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, late.id)))[0].state).toBe("superseded");
       expect((await db.select().from(chatGitHubReviews).where(eq(chatGitHubReviews.id, unrelated.id)))[0].state).toBe("queued");
     });
+    it("keeps publishing other pull request checks while one run lookup is blocked", async () => {
+      const f = await reviewBotFixture();
+      const head = "b".repeat(40);
+      const automaticEvent = (number: number) => githubAutomaticReviewEvent({
+        action: "opened", installation: { id: 2468 },
+        repository: { id: 97531, full_name: "paperclipai/paperclip", name: "paperclip", owner: { id: 1357, login: "paperclipai" } },
+        sender: { id: 42, login: "octocat" },
+        pull_request: {
+          number, title: "Blocked lookup", body: "", draft: false,
+          base: { sha: "a".repeat(40), ref: "master" }, head: { sha: head },
+          user: { id: 42, login: "octocat", type: "User" }, labels: [],
+        },
+      }, randomUUID())!;
+      const blocked = automaticEvent(84);
+      const unrelated = automaticEvent(85);
+      const writes: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (/\/pulls\/8[45]$/.test(url)) return Response.json({ head: { sha: head } });
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.endsWith("/check-runs") && init?.method === "POST") {
+          writes.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 85, html_url: "https://github.com/checks/85" });
+        }
+        return undefined;
+      });
+      const checks = githubReviewCheckService(db, f.providerFetch);
+      const [activeEndpoint] = await readChatEndpointsById(f.endpoint.id);
+      await checks.enqueue(activeEndpoint, blocked, true, "authorized");
+      await checks.enqueue(activeEndpoint, unrelated, true, "authorized");
+      await db.update(chatActions).set({ updatedAt: new Date("2000-01-01T00:00:00Z") })
+        .where(eq(chatActions.providerActionId, `github-check:${blocked.deliveryId}`));
+      const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Review PR 84", status: "todo" }).returning();
+      const [config] = await db.select().from(chatGitHubConfigurations).where(eq(chatGitHubConfigurations.endpointId, f.endpoint.id));
+      await db.insert(chatGitHubReviews).values({
+        companyId: f.companyId, endpointId: f.endpoint.id, issueId: issue.id,
+        repositoryId: blocked.repositoryId, repository: blocked.repository, pullNumber: blocked.pullNumber,
+        headSha: blocked.headSha, deliveryId: randomUUID(), configurationRevision: config.revision,
+        policySnapshot: config.configuration.defaults, event: blocked, state: "queued",
+      });
+      const holder = createDb(externalTestDatabaseUrl ?? tempDb!.connectionString, { maxConnections: 1 });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockHeld = new Promise<void>((resolve) => { locked = resolve; });
+      const holding = holder.$client.begin(async (tx) => {
+        await tx`lock table chat_message_links in access exclusive mode`;
+        locked();
+        await released;
+      });
+      try {
+        await lockHeld;
+        const outcome = await Promise.race([
+          checks.processPending().then(() => "settled"),
+          new Promise((resolve) => setTimeout(() => resolve("blocked"), 15_000)),
+        ]);
+        expect(outcome).toBe("settled");
+      } finally {
+        release();
+        await holding;
+        await holder.$client.end();
+      }
+      const actions = await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_check"),
+      ));
+      const byDelivery = new Map(actions.map((action) => [action.providerActionId, action]));
+      expect(byDelivery.get(`github-check:${blocked.deliveryId}`)).toMatchObject({
+        status: "failed", result: { attempts: 1, retryable: true, code: "check_publication_failed" },
+      });
+      expect(byDelivery.get(`github-check:${unrelated.deliveryId}`)).toMatchObject({ result: { state: "queued" } });
+      expect(writes).toEqual([expect.objectContaining({ head_sha: head, status: "queued" })]);
+    }, 60_000);
     it("links a gated GitHub check to the current vanity review page before a task exists", async () => {
       const publicOrigin = vi.spyOn(cloudRuntimeIdentity, "runtimePublicOrigin").mockReturnValue("https://current-vanity.example");
       onTestFinished(() => publicOrigin.mockRestore());

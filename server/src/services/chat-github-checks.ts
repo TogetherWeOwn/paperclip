@@ -22,6 +22,10 @@ import {
   githubBotRequest,
 } from "./chat-github-client.js";
 
+const CHECK_DISPATCH_CONCURRENCY = 4;
+const CHECK_LOOKUP_STATEMENT_TIMEOUT_MS = 5_000;
+const CHECK_LOOKUP_LOCK_TIMEOUT_MS = 1_000;
+
 /** Check status follows the ordinary chat delivery/task/run. This outbox never
  * schedules an agent. Assessments are published by the governed review tool. */
 export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
@@ -176,8 +180,11 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   .where(eq(heartbeatRuns.id, review.runId))
               )[0]
             : undefined;
-          if (review && !run) {
-            const [sourceRun] = await db
+          const { sourceRun, delivery } = await db.transaction(async (tx) => {
+            await tx.execute(
+              sql`select set_config('statement_timeout', ${`${CHECK_LOOKUP_STATEMENT_TIMEOUT_MS}`}, true), set_config('lock_timeout', ${`${CHECK_LOOKUP_LOCK_TIMEOUT_MS}`}, true)`,
+            );
+            const [sourceRun] = review && !run ? await tx
               .select({ run: { id: heartbeatRuns.id, status: heartbeatRuns.status } })
               .from(chatDeliveries)
               .innerJoin(
@@ -199,10 +206,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                 ),
               )
               .orderBy(desc(heartbeatRuns.createdAt))
-              .limit(1);
-            run = sourceRun?.run;
-          }
-          const [delivery] = await db
+              .limit(1) : [];
+            const [delivery] = await tx
             .select({ state: chatDeliveries.state })
             .from(chatDeliveries)
             .where(
@@ -212,6 +217,9 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               ),
             )
             .limit(1);
+            return { sourceRun, delivery };
+          });
+          run ??= sourceRun?.run;
           const admissionEnded =
             !review &&
             (delivery?.state === "filtered" || delivery?.state === "failed");
@@ -448,7 +456,12 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
         ),
       );
     const rows = await db
-      .select({ id: chatActions.id })
+      .select({
+        id: chatActions.id,
+        endpointId: chatActions.endpointId,
+        repositoryId: sql<string | null>`${chatActions.payload}->'event'->>'repositoryId'`,
+        pullNumber: sql<string | null>`${chatActions.payload}->'event'->>'pullNumber'`,
+      })
       .from(chatActions)
       .where(
         and(
@@ -468,7 +481,27 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
       )
       .orderBy(chatActions.updatedAt)
       .limit(limit);
-    for (const row of rows) await dispatch(row.id);
+    const scopes = new Set<string>();
+    const queue = rows.filter((row) => {
+      const scope = `${row.endpointId}:${row.repositoryId}:${row.pullNumber}`;
+      if (scopes.has(scope)) return false;
+      scopes.add(scope);
+      return true;
+    });
+    const failures: unknown[] = [];
+    await Promise.all(
+      Array.from(
+        { length: Math.min(CHECK_DISPATCH_CONCURRENCY, queue.length) },
+        async () => {
+          for (let row = queue.shift(); row; row = queue.shift()) {
+            await dispatch(row.id).catch((error: unknown) => {
+              failures.push(error);
+            });
+          }
+        },
+      ),
+    );
+    if (failures.length) throw failures[0];
   }
   return { enqueue, processPending };
 }
