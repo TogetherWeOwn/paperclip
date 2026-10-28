@@ -4,11 +4,14 @@ import {
   mergeGroupCarryEnabled,
   readMergeGroupCheckRuns,
   planMergeGroupCheckPublication,
+  parseMergeGroupCheckReceipt,
+  isDefinitiveProviderRejection,
   type MergeGroupCheckRunRef,
   type MergeGroupGitHubRequest,
 } from "./chat-github-merge-group-carry.js";
 import {
   decideMergeGroupCarry,
+  mergeGroupCarryExternalId,
   type MergeGroupContext,
 } from "./chat-github-merge-group.js";
 
@@ -36,6 +39,44 @@ function context(): MergeGroupContext {
 
 const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), { status });
+
+describe("check publication receipt validation", () => {
+  const receipt = () => ({
+    id: 123, head_sha: GROUP, external_id: mergeGroupCarryExternalId(ENDPOINT, GROUP),
+    app: { id: Number(APP_ID) }, status: "completed", conclusion: "success",
+  });
+  const parse = (response: unknown) => parseMergeGroupCheckReceipt({
+    response, ctx: context(), endpointId: ENDPOINT, appId: APP_ID, expectedConclusion: "success",
+  });
+
+  it("accepts a complete matching receipt", () => {
+    expect(parse(receipt())).toEqual({ checkId: "123" });
+    expect(parse({ ...receipt(), head_sha: GROUP.toUpperCase(), id: "123" })).toEqual({ checkId: "123" });
+  });
+
+  it.each([
+    ["wrong head", { head_sha: HEAD_A }],
+    ["missing head", { head_sha: undefined }],
+    ["wrong external id", { external_id: "other" }],
+    ["wrong app", { app: { id: 42 } }],
+    ["unfinished status", { status: "in_progress" }],
+    ["wrong conclusion", { conclusion: "action_required" }],
+    ["zero id", { id: 0 }],
+    ["unsafe numeric id", { id: Number.MAX_SAFE_INTEGER + 1 }],
+    ["invalid string id", { id: "01" }],
+  ])("rejects %s", (_name, change) => {
+    expect(parse({ ...receipt(), ...change })).toBeNull();
+  });
+
+  it.each([400, 401, 403, 404, 422])("treats HTTP %i as definitive", (providerStatus) => {
+    expect(isDefinitiveProviderRejection({ details: { providerStatus } })).toBe(true);
+  });
+
+  it.each([429, 500, 502, 503, 504, 418, "400", undefined])("treats status %s as ambiguous", (providerStatus) => {
+    expect(isDefinitiveProviderRejection({ details: { providerStatus } })).toBe(false);
+    expect(isDefinitiveProviderRejection(new Error("network failure"))).toBe(false);
+  });
+});
 
 describe("mergeGroupCarryEnabled", () => {
   it("is inert unless explicitly enabled", () => {

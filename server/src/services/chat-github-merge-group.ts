@@ -395,7 +395,7 @@ export function mergeGroupProofReplayMatches(args: {
   runtimeGeneration: number;
   /** The stored row settled a successful carry (not a fail-closed verdict). */
   verdictOk: boolean;
-  /** Current local review rows for the queued heads. */
+  /** Current local review rows for the queued heads, newest first. */
   currentReviews: MergeGroupReplayReview[];
 }): boolean {
   const proof = args.stored as Partial<MergeGroupCarryProofFingerprint> | null | undefined;
@@ -422,12 +422,13 @@ export function mergeGroupProofReplayMatches(args: {
   // Every stored head must still carry the identical stored review outcome in
   // the current local evidence. A completed, rescored, reconcluded, or
   // repolicied review under the same head forces a fresh judgment.
-  const currentByHead = new Map(
-    args.currentReviews.map((review) => [
-      `${review.pullNumber}:${review.headSha.toLowerCase()}`,
-      review,
-    ]),
-  );
+  // Rows are newest first, as in fresh evaluation; never let older
+  // duplicate assessments overwrite the latest evidence for the same head.
+  const currentByHead = new Map<string, MergeGroupReplayReview>();
+  for (const review of args.currentReviews) {
+    const key = `${review.pullNumber}:${review.headSha.toLowerCase()}`;
+    if (!currentByHead.has(key)) currentByHead.set(key, review);
+  }
   // Validated above: stored heads and reviews are well-formed.
   const heads = proof.heads as Array<{ pullNumber: number; headSha: string }>;
   const storedReviews = proof.reviews as MergeGroupProofReview[];

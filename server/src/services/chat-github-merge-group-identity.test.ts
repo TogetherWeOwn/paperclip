@@ -560,6 +560,17 @@ describe("proof fingerprint and replay predicate (R2)", () => {
     ).toBe(false);
   });
 
+  it("uses the newest review when duplicate head rows are replayed", () => {
+    const olderSuccess = currentReviews()[0]!;
+    const newerRejection = { ...olderSuccess, headSha: H.toUpperCase(), score: 4, conclusion: "action_required" };
+    expect(mergeGroupProofReplayMatches({
+      ...replayArgs(), currentReviews: [newerRejection, olderSuccess],
+    })).toBe(false);
+    expect(mergeGroupProofReplayMatches({
+      ...replayArgs(), currentReviews: [olderSuccess, newerRejection],
+    })).toBe(true);
+  });
+
   it("rejects malformed stored heads and reviews", async () => {
     const malformed = [
       { ...proof(), heads: [] as never },

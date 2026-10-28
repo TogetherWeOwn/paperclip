@@ -522,6 +522,37 @@ suite("merge-group carry outbox (real PostgreSQL, fake GitHub)", () => {
     });
   });
 
+  it("re-judges redelivery when a newer same-head review rejects an earlier success", async () => {
+    const github = fakeGitHub(ids.endpointId);
+    const service = githubMergeGroupCarryService(db, github.fetchImpl);
+    await enqueue(service);
+    await service.processPending();
+    expect(github.state.runs[0]).toMatchObject({ conclusion: "success" });
+
+    const [original] = await db.select().from(chatGitHubReviews)
+      .where(eq(chatGitHubReviews.endpointId, ids.endpointId));
+    await db.update(chatGitHubReviews).set({ createdAt: new Date("2020-01-01T00:00:00Z") })
+      .where(eq(chatGitHubReviews.id, original!.id));
+    await db.insert(chatGitHubReviews).values({
+      companyId: original!.companyId, endpointId: original!.endpointId,
+      issueId: original!.issueId, repositoryId: REPO_ID, repository: REPO,
+      pullNumber: 12, headSha: HEAD, deliveryId: randomUUID(),
+      configurationRevision: 3, policySnapshot: {} as never, event: {} as never,
+      state: "completed", assessment: { complete: true, score: 4 } as never,
+      conclusion: "action_required", createdAt: new Date("2021-01-01T00:00:00Z"),
+    });
+
+    const callsBefore = github.state.calls.length;
+    const again = await enqueue(service);
+    await service.processPending();
+    expect((await action(again.id)).result).not.toMatchObject({ replayed: true });
+    expect(github.state.calls.length).toBeGreaterThan(callsBefore);
+    expect(github.posts()).toBe(1);
+    expect(github.patches()).toBe(1);
+    expect(github.state.runs[0]).toMatchObject({ conclusion: "action_required" });
+    expect(await carryRun()).toMatchObject({ verdictOk: false, code: "weak_review" });
+  });
+
   it("does not carry when the live queue ref no longer points at the group", async () => {
     const github = fakeGitHub(ids.endpointId);
     github.state.refSha = "1".repeat(40);
