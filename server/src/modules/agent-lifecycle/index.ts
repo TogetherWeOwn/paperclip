@@ -10,8 +10,9 @@ import { purgeAgent } from "./adapters/deletion.js";
 import { agentRecords } from "./adapters/records.js";
 import { assertRootDatabase, createLifecycleStore } from "./adapters/postgres.js";
 import { createLifecycleWorker } from "./application/worker.js";
-import { AgentLifecycleConflict } from "./domain/policy.js";
 import type { LifecycleDriver } from "./application/ports.js";
+
+export { applyAgentPolicyHoldsInTransaction } from "./adapters/postgres.js";
 
 export { AgentLifecycleConflict, canConfigureAgentConnection, isAgentAwaitingSetup } from "./domain/policy.js";
 
@@ -27,13 +28,6 @@ export function configureAgentLifecycle(db: Db, effects: LifecycleEffects, drive
   const worker = createLifecycleWorker(createLifecycleStore(db, effects), driver, effects.reportFailure, canRun);
   workers.set(db, worker);
   return worker;
-}
-
-/** Reconcile one agent's policy holds inside the caller's accounting
- * transaction (a savepoint; the company row is already locked). */
-export function reconcileAgentPolicyHoldsInTransaction(tx: Db, effects: LifecycleEffects, agentId: string) {
-  if (!("nestedIndex" in tx)) throw new AgentLifecycleConflict("Policy holds require the caller's accounting transaction");
-  return createLifecycleStore(tx, effects).change(agentId, "reconcile");
 }
 
 export function scheduleAgentLifecycle(db: Db, id: string) {

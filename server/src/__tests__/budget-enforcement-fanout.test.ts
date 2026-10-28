@@ -10,6 +10,7 @@ import {
 vi.mock("../telemetry.js", () => ({ getTelemetryClient: () => ({ track: vi.fn() }) }));
 
 import { budgetService } from "../services/budgets.ts";
+import { applyAgentBudgetHoldInTransaction } from "../services/agent-lifecycle.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { createCostAccountingReconciler } from "../services/run-cost-accounting.ts";
 
@@ -105,6 +106,78 @@ describeEmbeddedPostgres("budget enforcement company-lock fan-out", () => {
 
     await service.upsertPolicy(companyId, { scopeType: "agent", scopeId: agent!.id, amount: 200 }, null);
     expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]?.lifecycleHolds).not.toContain("budget");
+  });
+
+  it("waits for a contended agent row and applies the budget hold after release", async () => {
+    const companyId = await companyWithIdleAgents(1);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agent!.id,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: true });
+    const [event] = await db.insert(costEvents).values({ companyId, agentId: agent!.id, provider: "openai", biller: "openai",
+      billingType: "metered_api", model: "contention", inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, costCents: 150,
+      occurredAt: new Date() }).returning();
+    let pending!: Promise<void>;
+    const settled = await db.transaction(async (tx) => {
+      await tx.select().from(agents).where(eq(agents.id, agent!.id)).for("update");
+      pending = budgetService(db).evaluateCostEvent(event!);
+      return Promise.race([
+        pending.then(() => "completed" as const),
+        new Promise<"waiting">((resolve) => setTimeout(resolve, 1_000, "waiting")),
+      ]);
+    });
+    // Always release the lock and drain the evaluation before asserting, including on failure.
+    await pending;
+    expect(settled).toBe("waiting");
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]).toMatchObject({
+      lifecycleHolds: ["budget"], lifecycleState: "pausing", pauseReason: "budget",
+    });
+  });
+
+  it.each(["stop", "resume"] as const)("preserves an inherited company_paused hold on budget %s", async (action) => {
+    const companyId = await companyWithIdleAgents(1);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    // The company is active but its inherited hold has not yet been projected away.
+    // Budget enforcement must change only the budget hold, not reconcile the company.
+    await db.update(agents).set({ lifecycleHolds: action === "stop" ? ["company_paused"] : ["company_paused", "budget"],
+      lifecycleState: "paused", status: "paused", pauseReason: "company_paused" }).where(eq(agents.id, agent!.id));
+    await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agent!.id,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: true });
+    const [event] = await db.insert(costEvents).values({ companyId, agentId: agent!.id, provider: "openai", biller: "openai",
+      billingType: "metered_api", model: "hold-preservation", inputTokens: 1, cachedInputTokens: 0, outputTokens: 1,
+      costCents: action === "stop" ? 150 : 50, occurredAt: new Date() }).returning();
+
+    const service = budgetService(db);
+    if (action === "stop") await service.evaluateCostEvent(event!);
+    else await service.upsertPolicy(companyId, { scopeType: "agent", scopeId: agent!.id, amount: 200 }, null);
+
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]).toMatchObject({
+      lifecycleHolds: action === "stop" ? ["company_paused", "budget"] : ["company_paused"],
+      lifecycleState: "paused", pauseReason: "company_paused",
+    });
+  });
+
+  it("applies the computed budget decision without resolving policies again", async () => {
+    const companyId = await companyWithIdleAgents(1);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    // No budget policy exists: this integration boundary must consume its caller's decision.
+    await db.transaction(tx => applyAgentBudgetHoldInTransaction(tx as unknown as typeof db, companyId, agent!.id, true));
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]?.lifecycleHolds).toEqual(["budget"]);
+    await db.transaction(tx => applyAgentBudgetHoldInTransaction(tx as unknown as typeof db, companyId, agent!.id, false));
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]?.lifecycleHolds).toEqual([]);
+  });
+
+  it("does not apply a budget decision to an agent from another company", async () => {
+    const companyId = await companyWithIdleAgents(1);
+    const otherCompanyId = await companyWithIdleAgents(1);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    // A real blocking policy makes ignoring companyId observable even in the old shim.
+    await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agent!.id,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 100, hardStopEnabled: true, isActive: true });
+    await db.insert(costEvents).values({ companyId, agentId: agent!.id, provider: "openai", biller: "openai",
+      billingType: "metered_api", model: "company-scope", inputTokens: 1, cachedInputTokens: 0, outputTokens: 1,
+      costCents: 150, occurredAt: new Date() });
+    await db.transaction(tx => applyAgentBudgetHoldInTransaction(tx as unknown as typeof db, otherCompanyId, agent!.id, true));
+    expect((await db.select().from(agents).where(eq(agents.id, agent!.id)))[0]?.lifecycleHolds).toEqual([]);
   });
 
   it("shares one recovery sweep, including service recovery, across overlapping ticks", async () => {

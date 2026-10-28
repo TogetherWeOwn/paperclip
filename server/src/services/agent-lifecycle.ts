@@ -1,6 +1,7 @@
 import { logger } from "../middleware/logger.js";
 import type { Db } from "@paperclipai/db";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
+import { applyAgentPolicyHoldsInTransaction } from "../modules/agent-lifecycle/index.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { budgetServiceInTransaction, deliverBudgetEnforcement, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
@@ -47,12 +48,9 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
   return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
 }
 
-/** Budget evaluation owns the transaction and supplies the aggregate agent decision.
- * 1023 port of upstream 30b753f61: the 1023 lifecycle store re-derives the hold
- * from the agent's policies inside the same transaction, so `blocked` is advisory. */
-export function applyAgentBudgetHoldInTransaction(tx: Db, companyId: string, agentId: string, _blocked: boolean) {
-  void companyId;
-  return lifecycle.reconcileAgentPolicyHoldsInTransaction(tx, createAgentLifecycleEffects(), agentId);
+/** Budget evaluation owns the transaction and supplies the aggregate agent decision. */
+export function applyAgentBudgetHoldInTransaction(tx: Db, companyId: string, agentId: string, blocked: boolean) {
+  return applyAgentPolicyHoldsInTransaction(tx, createAgentLifecycleEffects(), companyId, agentId, { budget: blocked });
 }
 
 function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDriver {
