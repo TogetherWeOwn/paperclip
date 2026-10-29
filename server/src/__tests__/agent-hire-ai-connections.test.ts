@@ -105,6 +105,22 @@ async function poolFixture(f: Awaited<ReturnType<typeof fixture>>, extraMembers:
 }
 
 describe("agent-created hires use managed AI connections", () => {
+  it("hires a native agent using a chat gateway pool", async () => {
+    const f = await fixture("openai");
+    const routing = { kind: "gateway", protocol: "chat", auth: "bearer", baseUrl: "https://gateway.example/v1", models: [{ id: "model" }, { id: "other" }] } as const;
+    const account = await aiConnectionService(db).save(f.companyId, f.userId, { provider: "openai", method: "api_key", name: "Gateway", ownership: "personal", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "fixture");
+    const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...account }, profile: { provider: "opencode", model: "paperclip/model" } };
+    const p = await poolFixture(f, [member]);
+    const pool = await aiConnectionRouterService(db).save(p.pool.pluginKey, { companyId: f.companyId, id: p.pool.id, expectedRevision: p.pool.revision, config: { name: p.pool.name, enabled: true, mode: "round_robin", thresholdPercent: 90, members: [member] } }, f.userId);
+    const models = await request(f.app).get(`/api/companies/${f.companyId}/adapters/paperclip_runner/models`).query({ poolId: pool.id });
+    expect(models.status).toBe(200);
+    expect(models.body).toContainEqual({ id: "paperclip/model", label: "paperclip/model" });
+    expect(models.body).toContainEqual({ id: "paperclip/other", label: "paperclip/other" });
+    expect(models.body.some((model: { id: string }) => model.id === "gpt-5.6-sol")).toBe(false);
+    const response = await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({ name: "Gateway teammate", role: "engineer", adapterType: "paperclip_runner", adapterConfig: { provider: "opencode", model: "paperclip/model" }, runtimeConfig: { aiConnection: { mode: "router", connectionId: pool.id } } });
+    const agent = hired(response);
+    expect(agent.runtimeConfig.aiConnection).toEqual({ mode: "router", connectionId: pool.id });
+  });
   it.each(["agent-hires", "agents"])("%s inherits a manager's pool without copying legacy credentials", async (endpoint) => {
     const f = await fixture("openai");
     const p = await poolFixture(f);

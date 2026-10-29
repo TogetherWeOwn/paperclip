@@ -12,6 +12,7 @@ import { aiConnectionRouterService, AiConnectionPoolExhausted, poolMemberRuntime
 import { aiConnectionSessionCompatibilityInputs } from "../services/ai-connection-session.js";
 import { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } from "../services/native-runtime/provider-profile.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import * as aiConnections from "../services/ai-connections.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { secretService } from "../services/secrets.js";
@@ -87,6 +88,65 @@ describe("durable, authorized connection routing", () => {
     await expect(makePool()).rejects.toThrow("instance operator");
     expect(await service().selectable(companyId, "alice")).toEqual([]);
     await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+  });
+  it("saves and selects a chat gateway with the OpenCode harness", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+    const routing = { kind: "gateway", protocol: "chat", auth: "bearer", baseUrl: "https://gateway.example/v1", models: [{ id: "custom/model" }] } as const;
+    const account = await aiConnectionService(db).save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "Chat gateway", apiKey: "fixture", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "fixture-gateway");
+    const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...account }, profile: { provider: "opencode", model: "custom/model" } };
+    const pool = await makePool({ members: [member] });
+    const originalService = aiConnectionService;
+    let selects = 0;
+    const spy = vi.spyOn(aiConnections, "aiConnectionService").mockImplementation((client) => {
+      const service = originalService(client);
+      const originalSelect = service.select;
+      return { ...service, select: async (...args: Parameters<typeof originalSelect>) => { selects++; return originalSelect(...args); } };
+    });
+    try {
+      const selected = await resolve(pool.id, "chat-gateway");
+      // Bound selection calls without requiring an exact implementation count.
+      expect(selects).toBeGreaterThan(0);
+      expect(selects).toBeLessThanOrEqual(2);
+      selects = 0;
+      await resolve(pool.id, "chat-gateway");
+      expect(selects).toBeLessThanOrEqual(1);
+      expect(selected.binding).toEqual(member.binding);
+      expect(selected.runtimeConfig).toMatchObject({ provider: "opencode", model: "custom/model" });
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(makePool({ members: [{ ...member, profile: { provider: "codex", model: "model" } }] })).rejects.toThrow();
+    await expect(makePool({ members: [{ ...member, binding: { ...member.binding, provider: "anthropic" } }] })).rejects.toThrow();
+    await expect(makePool({ members: [{ ...member, binding: { ...member.binding, method: "subscription" } }] })).rejects.toThrow();
+    await expect(makePool({ members: [{ ...members[0]!, profile: { provider: "opencode", model: "custom/model" } }] })).rejects.toThrow();
+  });
+  it.each(["gateway", "local"] as const)("validates %s pool profiles by routing protocol", (kind) => {
+    const route = { kind, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1", auth: "bearer" as const, models: [] };
+    for (const [protocol, profile, compatibleAdapter, incompatibleAdapter] of [
+      ["responses", { provider: "codex", model: "custom" }, "codex_local", "claude_local"],
+      ["messages", { provider: "acpx", acpxAgent: "claude", model: "custom" }, "claude_local", "codex_local"],
+      ["chat", { provider: "opencode", model: "paperclip/custom" }, "opencode_local", "codex_local"],
+    ] as const) {
+      const member = { ...members[0]!, profile };
+      // Unit-level protocol matrix: openai + messages is not saveable via the public schema.
+      const metadata = { provider: "openai" as const, method: "api_key" as const, routing: { ...route, protocol } };
+      expect(poolMemberRuntimeConfig(member, "paperclip_runner", {}, metadata).config).toMatchObject(profile);
+      expect(() => poolMemberRuntimeConfig(member, "paperclip_runner", {}, { ...metadata, routing: { ...metadata.routing, protocol: protocol === "chat" ? "responses" : "chat" } })).toThrow();
+      // The target-harness guard uses the routed metadata, not the binding alone.
+      expect(poolMemberRuntimeConfig(member, compatibleAdapter, {}, metadata).config).toMatchObject(profile);
+      expect(() => poolMemberRuntimeConfig(member, incompatibleAdapter, {}, metadata)).toThrow("Pool member is incompatible with this harness");
+    }
+  });
+  it("qualifies routed model overrides against the connection's routing models", () => {
+    const route = { kind: "gateway" as const, baseUrl: "https://gateway.example/v1", auth: "bearer" as const, models: [{ id: "a" }, { id: "b" }] };
+    const chatMember = { ...members[0]!, profile: { provider: "opencode" as const, model: "paperclip/a" } };
+    const chatMeta = { provider: "openai" as const, method: "api_key" as const, routing: { ...route, protocol: "chat" as const } };
+    expect(poolMemberRuntimeConfig(chatMember, "paperclip_runner", { model: "paperclip/b" }, chatMeta)).toMatchObject({ config: { model: "paperclip/b" }, notes: [] });
+    expect(poolMemberRuntimeConfig(chatMember, "paperclip_runner", { model: "paperclip/c" }, chatMeta)).toMatchObject({ config: { model: "paperclip/a" }, notes: ["Model override is unavailable for this member; using its default."] });
+    const responsesMember = { ...members[0]!, profile: { provider: "codex" as const, model: "a" } };
+    const responsesMeta = { provider: "openai" as const, method: "api_key" as const, routing: { ...route, protocol: "responses" as const } };
+    expect(poolMemberRuntimeConfig(responsesMember, "paperclip_runner", { model: "b" }, responsesMeta)).toMatchObject({ config: { model: "b" }, notes: [] });
+    expect(poolMemberRuntimeConfig(responsesMember, "paperclip_runner", { model: "c" }, responsesMeta)).toMatchObject({ config: { model: "a" }, notes: ["Model override is unavailable for this member; using its default."] });
   });
   it("registers native connectors only for declared installed routers", async () => {
     const entry = (await service().catalog())[0]!;

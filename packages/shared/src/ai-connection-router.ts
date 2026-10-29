@@ -15,7 +15,9 @@ export const aiConnectionPoolMemberSchema = z.object({
   profile: z.object({
     provider: z.enum(["codex", "acpx", "opencode"]),
     acpxAgent: z.enum(["claude", "grok"]).optional(),
-    model: z.string().trim().min(1).max(256),
+    // A raw routing model ID may be 256 chars; aiRoutingModel adds at most
+    // an 11-char "openrouter/" prefix, so a normalized ID needs 267.
+    model: z.string().trim().min(1).max(267),
     effort: z.string().trim().min(1).max(32).optional(),
   }).strict(),
 }).strict();

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, ExternalLink, Loader2, MoreHorizontal, Plus, Search, Trash2, X } from "lucide-react";
-import { aiConnectionRouterAppDefinition, type AiConnectionPool, type AiConnectionPoolConfig, type AiConnectionPoolMember, type AiManagedConnectionSummary, type ToolConnection } from "@paperclipai/shared";
+import { aiConnectionRouterAppDefinition, aiRoutingModel, type AiConnectionPool, type AiConnectionPoolConfig, type AiConnectionPoolMember, type AiManagedConnectionSummary, type ToolConnection } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { aiConnectionPoolsApi, type PoolInspection } from "@/api/ai-connection-pools";
 import { toolsApi } from "@/api/tools";
@@ -26,8 +26,13 @@ import { AI_PROVIDERS, aiMethodLabel } from "./model";
 
 const configOf = ({ name, enabled, members, mode, thresholdPercent }: AiConnectionPoolConfig): AiConnectionPoolConfig => ({ name, enabled, members, mode, thresholdPercent });
 const emptyConfig = (): AiConnectionPoolConfig => ({ name: "AI connection pool", enabled: false, members: [], mode: "round_robin", thresholdPercent: 90 });
-function memberOf(account: AiManagedConnectionSummary): AiConnectionPoolMember {
-  const profile: AiConnectionPoolMember["profile"] = account.provider === "openai" ? { provider: "codex", model: "gpt-5.6-sol" }
+export function memberOf(account: AiManagedConnectionSummary): AiConnectionPoolMember {
+  const routing = account.routing?.kind === "gateway" || account.routing?.kind === "local" ? account.routing : undefined;
+  const model = routing?.models[0]?.id;
+  const profile: AiConnectionPoolMember["profile"] = routing?.protocol === "chat" ? { provider: "opencode", model: aiRoutingModel(routing, "opencode_local", model ?? "model") }
+    : routing?.protocol === "responses" ? { provider: "codex", model: model ?? "gpt-5.6-sol" }
+    : routing?.protocol === "messages" ? { provider: "acpx", acpxAgent: "claude", model: model ?? "claude-sonnet-5" }
+    : account.provider === "openai" ? { provider: "codex", model: "gpt-5.6-sol" }
     : account.provider === "anthropic" ? { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5" }
     : account.provider === "xai" ? { provider: "acpx", acpxAgent: "grok", model: "grok-4.7" }
     : { provider: "opencode", model: "openrouter/anthropic/claude-sonnet-4.6" };
