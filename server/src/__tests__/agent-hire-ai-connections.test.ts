@@ -139,7 +139,8 @@ describe("agent-created hires use managed AI connections", () => {
       for (const raw of ["custom/b", "custom model"]) {
         for (const model of new Set([raw, `${prefix}${raw}`])) {
           const effective = poolMemberRuntimeConfig(member, adapterType, { model }, metadata);
-          expect(effective).toEqual({ config: { provider: "opencode", model: `${prefix}${raw}` }, notes: [] });
+          if (model !== `${prefix}${raw}`) { expect(effective).toEqual({ config: { provider: "opencode", model: `${prefix}custom/a` }, notes: ["Model override is unavailable for this member; using its default."] }); continue; }
+          expect(effective).toEqual({ config: { provider: "opencode", model }, notes: [] });
           const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId, adapterType, binding: member.binding, config: effective.config });
           try {
             expect(runtime.config.model).toBe(`${prefix}${raw}`);
