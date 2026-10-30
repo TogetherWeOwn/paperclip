@@ -197,17 +197,25 @@ describe("agent-created hires use managed AI connections", () => {
     const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...account }, profile: { provider: "opencode", model: "custom/model" } };
     const p = await poolFixture(f, [member]);
     const pool = await aiConnectionRouterService(db).save(p.pool.pluginKey, { companyId: f.companyId, id: p.pool.id, expectedRevision: p.pool.revision, config: { name: p.pool.name, enabled: true, mode: "round_robin", thresholdPercent: 90, members: [member] } }, f.userId);
-    const environment = { id: randomUUID(), companyId: f.companyId, driver: "plugin", config: { pluginKey: "fixture.environment", driverKey: "runner" } };
-    const target = vi.spyOn(agentRunnerSelection, "resolveAgentRunnerEnvironmentForCompany").mockResolvedValue({ environment, driver: "plugin" } as Awaited<ReturnType<typeof agentRunnerSelection.resolveAgentRunnerEnvironmentForCompany>>);
+    const [environment] = await db.insert(environments).values({ name: `Plugin target ${f.companyId}`, driver: "plugin", config: { pluginKey: "fixture.environment", driverKey: "runner" } }).returning();
+    const target = vi.spyOn(agentRunnerSelection, "resolveAgentRunnerEnvironmentForCompany").mockImplementation(async (_db, _companyId, environmentId) => environmentId === environment.id
+      ? { environment, driver: "plugin" }
+      : { environment: null, driver: "local" });
     const driver = vi.spyOn(agentRunnerSelection, "pluginEnvironmentRunnerTaskDriver").mockResolvedValue({ driverKey: "runner", supportsTasks: true } as NonNullable<Awaited<ReturnType<typeof agentRunnerSelection.pluginEnvironmentRunnerTaskDriver>>>);
     try {
-      const response = await request(f.app).post(`/api/companies/${f.companyId}/${endpoint}`).send({ name: "Unsupported plugin teammate", role: "engineer", adapterType: "paperclip_runner", adapterConfig: { provider: "opencode", model: "paperclip/custom/model" }, runtimeConfig: { aiConnection: { mode: "router", connectionId: pool.id } } });
+      const [manager] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(manager.defaultEnvironmentId).toBeNull();
+      const input = { role: "engineer", adapterType: "paperclip_runner", adapterConfig: { provider: "opencode", model: "paperclip/custom/model" }, runtimeConfig: { aiConnection: { mode: "router", connectionId: pool.id } } };
+      const response = await request(f.app).post(`/api/companies/${f.companyId}/${endpoint}`).send({ ...input, name: "Unsupported plugin teammate", defaultEnvironmentId: environment.id });
       expect(response.status, JSON.stringify(response.body)).toBe(422);
       expect(response.body.error).toContain("no compatible harness");
-      expect(target).toHaveBeenCalledWith(db, f.companyId, undefined);
+      expect(target).toHaveBeenCalledWith(db, f.companyId, environment.id);
       expect(driver).toHaveBeenCalledWith(db, environment);
       expect(await db.select().from(agents).where(eq(agents.companyId, f.companyId))).toHaveLength(1);
       expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, pool.id))).toHaveLength(1);
+      const localAgent = hired(await request(f.app).post(`/api/companies/${f.companyId}/${endpoint}`).send({ ...input, name: "Local teammate" }));
+      expect(target).toHaveBeenCalledWith(db, f.companyId, undefined);
+      expect(localAgent.runtimeConfig.aiConnection).toEqual({ mode: "router", connectionId: pool.id });
     } finally { target.mockRestore(); driver.mockRestore(); }
   });
   it.each(["agent-hires", "agents"])("%s inherits a manager's pool without copying legacy credentials", async (endpoint) => {

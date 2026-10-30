@@ -106,7 +106,9 @@ the resolved child harness and the account's authoritative routing protocol.
 A nonempty model inventory does not invalidate a saved raw manual member default.
 The resolved environment also constrains eligibility: plugin Runner task targets
 accept managed non-routed Codex/Claude credentials, not routed OpenCode members.
-Unsupported target/member pairs are rejected before creation or pool allocation.
+Unsupported target/member pairs are rejected before creation or pool allocation,
+including lifecycle harness verification. Explicit hire environments and low-trust
+task environment overrides retain their selection precedence.
 Pool eligibility, member installation, responsible-user, hiring and approval
 checks still apply. [Hire and model-catalog fixtures](../../server/src/__tests__/agent-hire-ai-connections.test.ts)
 do not establish live-provider acceptance or qualify the full agent-access journey.

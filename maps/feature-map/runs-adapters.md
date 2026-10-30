@@ -192,7 +192,10 @@ and the account's routing protocol, not its provider label alone. Verify OpenCod
 from the raw alias `paperclip/custom/a` by projecting the latter as
 `paperclip/paperclip/custom/a`; Hermes preserves both raw IDs. Empty chat inventories
 require explicit model entry before saving or enabling a pool. Verify the selected
-execution target supports the member's managed credentials before allocation.
+execution target supports the member's managed credentials before allocation,
+including mixed-pool lifecycle verification. Global environment failures must retain
+their actionable diagnosis. Legacy OpenCode discovery preserves complete spaced
+model IDs on both local and remote targets.
 Model inventories are hints: retain saved manual member defaults absent from a nonempty inventory;
 qualify task overrides against declared hints when present and allow manual
 overrides when hints are empty. Saving or listing models does not prove provider

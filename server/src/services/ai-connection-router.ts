@@ -226,11 +226,11 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  async function resolve(input: { companyId: string; poolId: string; agentId: string; userId: string | null; adapterType: string; taskKey: string; overrides?: Record<string, unknown>; existingGrantId?: string; requireExisting?: boolean; persisted?: AiConnectionRouterSelection; validateRuntime?: (config: Record<string, unknown>, metadata: AiConnectionMetadata, phase: "candidate" | "commit" | "persisted") => Promise<void> }) {
+  async function resolve(input: { companyId: string; poolId: string; agentId: string; userId: string | null; adapterType: string; taskKey: string; overrides?: Record<string, unknown>; existingGrantId?: string; requireExisting?: boolean; persisted?: AiConnectionRouterSelection; validateRuntime?: (config: Record<string, unknown>, metadata: AiConnectionMetadata, phase: "candidate" | "commit" | "persisted", client: Db) => Promise<void> }) {
     const pinWhere = and(eq(aiConnectionTaskPins.companyId, input.companyId), eq(aiConnectionTaskPins.poolId, input.poolId), eq(aiConnectionTaskPins.agentId, input.agentId), eq(aiConnectionTaskPins.taskKey, input.taskKey));
     const validateSelection = async (selection: AiConnectionRouterSelection, client = db) => {
       const account = await aiConnectionService(client).select({ companyId: input.companyId, agentId: input.agentId, userId: input.userId, adapterType: input.adapterType, binding: selection.binding, model: selection.runtimeConfig.model, runnerProvider: selection.runtimeConfig.provider, acpxAgent: selection.runtimeConfig.acpxAgent });
-      await input.validateRuntime?.(selection.runtimeConfig, aiConnectionMetadataSchema.parse(account.connection.config.ai), input.persisted ? "persisted" : "commit");
+      await input.validateRuntime?.(selection.runtimeConfig, aiConnectionMetadataSchema.parse(account.connection.config.ai), input.persisted ? "persisted" : "commit", client);
       return account;
     };
     if (input.persisted) {
@@ -264,7 +264,7 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
           const metadata = aiConnectionMetadataSchema.parse(account.connection.config.ai);
           const effective = poolMemberRuntimeConfig(member, input.adapterType, input.overrides, metadata);
           if (!isAiConnectionCompatible(metadata, input.adapterType, effective.config.model, effective.config.provider, effective.config.acpxAgent)) throw unprocessable("Pool member is incompatible with this harness");
-          await input.validateRuntime?.(effective.config, metadata, "candidate");
+          await input.validateRuntime?.(effective.config, metadata, "candidate", db);
           candidates.push({ member, runtimeConfig: effective.config, notes: effective.notes });
         } catch (error) { if (pin) throw error; }
       }

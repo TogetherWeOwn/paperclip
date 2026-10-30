@@ -14,6 +14,8 @@ import { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderI
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as aiConnections from "../services/ai-connections.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { environmentService } from "../services/environments.js";
+import { createHeartbeatPoolRuntimeValidator } from "../services/heartbeat/environment-selection.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { secretService } from "../services/secrets.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -235,6 +237,13 @@ describe("durable, authorized connection routing", () => {
     expect(poolMemberRuntimeConfig(member, "opencode_local", {}, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "high" }, notes: [] });
     expect(poolMemberRuntimeConfig(member, "opencode_local", { variant: "medium" }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "medium" }, notes: [] });
     expect(poolMemberRuntimeConfig(member, "opencode_local", { variant: "provider-specific" }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "provider-specific" }, notes: [] });
+    for (const adapterType of ["opencode_local"]) {
+      expect(poolMemberRuntimeConfig(member, adapterType, { variant: "v".repeat(32) }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "v".repeat(32) }, notes: [] });
+      for (const variant of ["v".repeat(33), " ", "\t"]) {
+        expect(poolMemberRuntimeConfig(member, adapterType, { variant }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "high" }, notes: ["Effort override is unavailable for this member; using its default."] });
+      }
+      expect(poolMemberRuntimeConfig(member, adapterType, { variant: "" }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model", variant: "high" }, notes: [] });
+    }
     expect(poolMemberRuntimeConfig(member, "paperclip_runner", { variant: "medium" }, metadata)).toEqual({ config: { provider: "opencode", model: "paperclip/custom/model" }, notes: ["Effort override is unavailable for this member; using its default."] });
   });
   it("rejects unsupported supplied execution targets before pinning and rechecks at commit", async () => {
@@ -264,6 +273,31 @@ describe("durable, authorized connection routing", () => {
       await expect(resolve(pool.id, "supported-target", { persisted: selection, validateRuntime })).rejects.toThrow("Unsupported supplied target");
     } finally { proposal.mockReset(); proposal.mockImplementation(defaultProposal); }
   });
+  it("commits concurrent allocations with the real environment validator on one database connection", async () => {
+    const single = createDb(externalTestDatabaseUrl ?? database.connectionString, { maxConnections: 1 });
+    const pool = await makePool();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const validateRuntime = await createHeartbeatPoolRuntimeValidator(single, {
+        run: { id: randomUUID() }, agent: { id: agentId, companyId, defaultEnvironmentId: null }, adapterType: "paperclip_runner",
+        issueId: null, issueContext: null, trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
+        environmentsSvc: environmentService(single), instanceSettings: instanceSettingsService(single),
+      });
+      const allocations = ["one", "two", "three"].map(taskKey => aiConnectionRouterService(single, worker).resolve({
+        companyId, poolId: pool.id, agentId, userId: "alice", adapterType: "paperclip_runner", taskKey, validateRuntime,
+      }));
+      const selected = await Promise.race([
+        Promise.all(allocations),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Allocation stalled with one database connection")), 4000); }),
+      ]);
+      expect(selected).toHaveLength(3);
+      expect(await db.select().from(aiConnectionTaskPins).where(eq(aiConnectionTaskPins.poolId, pool.id))).toHaveLength(3);
+      expect((await db.select().from(aiConnectionRouterCursors).where(eq(aiConnectionRouterCursors.poolId, pool.id)))[0]?.version).toBe(3);
+    } finally {
+      if (timer) clearTimeout(timer);
+      await single.$client.end({ timeout: 1 });
+    }
+  }, 10_000);
   it("registers native connectors only for declared installed routers", async () => {
     const entry = (await service().catalog())[0]!;
     expect(entry.name).toBe("AI connection pool");

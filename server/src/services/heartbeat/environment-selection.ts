@@ -29,9 +29,9 @@ import {
   nativeChatWorkspaceMatches,
 } from "../native-runtime/native-chat-workspace.js";
 import { NativeRunnerOwnershipUnverifiedError } from "../native-runtime/native-runner-ownership.js";
-import type { environmentService } from "../environments.js";
+import { environmentService } from "../environments.js";
 import type { executionWorkspaceService } from "../execution-workspaces.js";
-import type { instanceSettingsService } from "../instance-settings.js";
+import { instanceSettingsService } from "../instance-settings.js";
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 import { WORKSPACE_BUSY_RETRY_REASON } from "../../modules/run-dispatch/index.js";
 import { WorkspaceBusyDeferral, type createHeartbeatRetries } from "./retries.js";
@@ -435,17 +435,20 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   };
 }
 
-export function createHeartbeatPoolRuntimeValidator(db: Db, input: Parameters<typeof resolveHeartbeatEnvironmentChoice>[0] & { adapterType: string }) {
-  const resolvePluginRunnerTasks = async () => {
-    const choice = await resolveHeartbeatEnvironmentChoice(input);
+export async function createHeartbeatPoolRuntimeValidator(db: Db, input: Parameters<typeof resolveHeartbeatEnvironmentChoice>[0] & { adapterType: string; persisted?: boolean }) {
+  const resolvePluginRunnerTasks = async (client: Db) => {
+    const choice = await resolveHeartbeatEnvironmentChoice(client === db ? input : {
+      ...input, environmentsSvc: environmentService(client), instanceSettings: instanceSettingsService(client),
+    });
     const environment = choice.selectedEnvironmentForConfig;
     if (!environment) throw unprocessable("The selected environment is unavailable");
-    return environment.driver === "plugin" && Boolean(await pluginEnvironmentRunnerTaskDriver(db, environment));
+    return environment.driver === "plugin" && Boolean(await pluginEnvironmentRunnerTaskDriver(client, environment));
   };
-  let candidatePluginRunnerTasks: Promise<boolean> | undefined;
-  return async (runtimeConfig: Record<string, unknown>, metadata: AiConnectionMetadata, phase: "candidate" | "commit" | "persisted") => {
+  const candidatePluginRunnerTasks = input.adapterType === "paperclip_runner" && !input.persisted
+    ? await resolvePluginRunnerTasks(db) : false;
+  return async (runtimeConfig: Record<string, unknown>, metadata: AiConnectionMetadata, phase: "candidate" | "commit" | "persisted", client: Db = db) => {
     if (input.adapterType !== "paperclip_runner" || phase === "persisted") return;
-    const runnerTasks = await (phase === "candidate" ? (candidatePluginRunnerTasks ??= resolvePluginRunnerTasks()) : resolvePluginRunnerTasks());
+    const runnerTasks = phase === "candidate" ? candidatePluginRunnerTasks : await resolvePluginRunnerTasks(client);
     if (!runnerTasks) return;
     const provider = runtimeConfig.provider === "acpx" ? runtimeConfig.acpxAgent : runtimeConfig.provider;
     if (!supportsPluginRunnerManagedCredentials(provider, metadata.routing)) throw unprocessable("Plugin Runner does not support this managed credential provider or routing");

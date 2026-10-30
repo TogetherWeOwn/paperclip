@@ -258,15 +258,17 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     const ensure = vi.spyOn(input.services.environmentsSvc, "ensureLocalEnvironment");
     const settings = vi.spyOn(input.services.instanceSettings, "get");
     const driver = vi.spyOn(agentRunnerSelection, "pluginEnvironmentRunnerTaskDriver").mockResolvedValue({ driverKey: "runner", supportsTasks: true } as NonNullable<Awaited<ReturnType<typeof agentRunnerSelection.pluginEnvironmentRunnerTaskDriver>>>);
-    const validate = createHeartbeatPoolRuntimeValidator(db, { run: input.run, agent: input.agent, adapterType: input.agent.adapterType,
-      issueId: input.task.issueId, issueContext: input.task.issueContext, trustPreset: input.policy.trustPreset, ...input.services });
+    const validatorInput = { run: input.run, agent: input.agent, adapterType: input.agent.adapterType,
+      issueId: input.task.issueId, issueContext: input.task.issueContext, trustPreset: input.policy.trustPreset, ...input.services };
+    const validatePersisted = await createHeartbeatPoolRuntimeValidator(db, { ...validatorInput, persisted: true });
     const config = { provider: "opencode", model: "paperclip/qwen" };
     const metadata = { provider: "openai" as const, method: "api_key" as const, routing: { kind: "gateway" as const, protocol: "chat" as const, auth: "bearer" as const, baseUrl: "https://gateway.example/v1", models: [] } };
     try {
-      await expect(validate(config, metadata, "persisted")).resolves.toBeUndefined();
+      await expect(validatePersisted(config, metadata, "persisted")).resolves.toBeUndefined();
       expect(ensure).not.toHaveBeenCalled();
       expect(settings).not.toHaveBeenCalled();
       expect(driver).not.toHaveBeenCalled();
+      const validate = await createHeartbeatPoolRuntimeValidator(db, validatorInput);
       await expect(validate(config, metadata, "candidate")).rejects.toThrow("Plugin Runner does not support");
       await expect(validate(config, metadata, "candidate")).rejects.toThrow("Plugin Runner does not support");
       expect(ensure).toHaveBeenCalledTimes(1);

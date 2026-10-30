@@ -236,9 +236,13 @@ it("requires an explicit model for a chat pool member with no model hints", asyn
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   flushSync(() => { setter.call(input, "custom/a"); input.dispatchEvent(new Event("input", { bubbles: true })); });
   expect(button("Create pool").disabled).toBe(false);
+  const boundaryModel = "x".repeat(256);
+  flushSync(() => { setter.call(input, boundaryModel); input.dispatchEvent(new Event("input", { bubbles: true })); });
+  expect(input.value).toBe(boundaryModel);
+  expect(button("Create pool").disabled).toBe(false);
   flushSync(() => button("Create pool").click());
   expect(mocks.savePool).toHaveBeenCalledOnce();
-  expect(mocks.savePool.mock.calls[0]![1].config.members[0].profile.model).toBe("custom/a");
+  expect(mocks.savePool.mock.calls[0]![1].config.members[0].profile.model).toBe(boundaryModel);
 });
 
 it("prevents enabling or saving an edited pool until the chat model is valid", async () => {
@@ -249,6 +253,7 @@ it("prevents enabling or saving an edited pool until the chat model is valid", a
   mocks.listGallery.mockResolvedValue({ apps: [{ name: "Pool", slug: "pool", branding: {}, aiConnectionRouter: { pluginKey: "pool" } }] });
   mocks.listAgents.mockResolvedValue([]);
   mocks.inspectPool.mockResolvedValue({});
+  mocks.savePool.mockReturnValue(new Promise(() => {}));
   flushSync(() => root.render(<QueryClientProvider client={client}><AiConnectionPoolConnector pluginKey="pool" connection={{ id: pool.id } as ToolConnection} /></QueryClientProvider>));
   await settle();
   const input = container.querySelector<HTMLInputElement>('[aria-label="Model for connection 1"]')!;
@@ -266,4 +271,12 @@ it("prevents enabling or saving an edited pool until the chat model is valid", a
   expect(save.disabled).toBe(false);
   expect(enable.disabled).toBe(false);
   expect(mocks.savePool).not.toHaveBeenCalled();
+  const boundaryModel = "x".repeat(256);
+  flushSync(() => { setter.call(input, boundaryModel); input.dispatchEvent(new Event("input", { bubbles: true })); });
+  expect(input.value).toBe(boundaryModel);
+  expect(save.disabled).toBe(false);
+  expect(enable.disabled).toBe(false);
+  flushSync(() => save.click());
+  expect(mocks.savePool).toHaveBeenCalledOnce();
+  expect(mocks.savePool.mock.calls[0]![1]).toMatchObject({ id: pool.id, expectedRevision: pool.revision, config: { members: [{ profile: { model: boundaryModel } }] } });
 });

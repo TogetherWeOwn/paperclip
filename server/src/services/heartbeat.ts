@@ -2492,6 +2492,10 @@ export function heartbeatService(
       let aiBinding = requestedAiBinding?.mode === "router" ? undefined : requestedAiBinding;
       const originalAiIssueOverrides = issueAssigneeOverrides;
       if (requestedAiBinding?.mode === "router") {
+        const validateRuntime = await createHeartbeatPoolRuntimeValidator(db, {
+          run, agent, adapterType: agent.adapterType, issueId, issueContext, trustPreset, environmentsSvc, instanceSettings,
+          persisted: routerHasPersistedInput,
+        });
         try {
           const routerTaskKey = readNonEmptyString(context.aiRouterTaskKey) ?? taskKey ?? run.id;
           // A retry must retain the original run-key affinity even if the host
@@ -2505,7 +2509,7 @@ export function heartbeatService(
             companyId: agent.companyId, poolId: requestedAiBinding.connectionId, agentId: agent.id,
             userId: responsibleUserId, adapterType: agent.adapterType, taskKey: String(context.aiRouterTaskKey),
             overrides: issueAssigneeOverrides?.adapterConfig ?? {},
-            validateRuntime: createHeartbeatPoolRuntimeValidator(db, { run, agent, adapterType: agent.adapterType, issueId, issueContext, trustPreset, environmentsSvc, instanceSettings }),
+            validateRuntime,
             existingGrantId: typeof savedIdentity === "string" ? savedIdentity.split(":")[0] : undefined,
             requireExisting: Boolean(taskSession?.sessionDisplayId) && !shouldResetTaskSessionForWake(context),
             persisted: routerHasPersistedInput ? context.aiRouterSelection as AiConnectionRouterSelection | undefined : undefined,
