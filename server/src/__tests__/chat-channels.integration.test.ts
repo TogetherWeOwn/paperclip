@@ -2945,8 +2945,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(endpoint.setup).toEqual(value);
     });
 
-    async function publicationRetryFixture() {
-      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+    async function publicationRetryFixture(reportOnly = true) {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", reportOnly);
       const head = "b".repeat(40);
       const inline: Array<{ id: number; body: string; html_url: string; user: { login: string } }> = [];
       const checks: Array<{ id: number; external_id: string; app: { id: number }; html_url: string }> = [];
@@ -3144,6 +3144,133 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(f.responseComments.get(originalId)?.body).toContain("Second assessment");
       expect(f.responseWrites.filter(write => write.method === "POST")).toHaveLength(1);
     });
+    async function assessmentCheckFixture() {
+      const f = await publicationRetryFixture(false);
+      const remoteChecks: Array<Record<string, unknown> & { id: number }> = [];
+      const checkWrites: Array<{ method: string; body: Record<string, unknown> }> = [];
+      const provider = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input)), method = init?.method ?? "GET";
+        if (url.pathname.endsWith("/check-runs") && method === "GET") {
+          return Response.json({ check_runs: remoteChecks });
+        }
+        if (/\/check-runs(?:\/[0-9]+)?$/.test(url.pathname) && (method === "POST" || method === "PATCH")) {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          const existing = method === "PATCH" ? remoteChecks.find(check => String(check.id) === url.pathname.split("/").at(-1)) : undefined;
+          if (method === "PATCH" && !existing) throw new Error("Unknown synthetic GitHub check");
+          const check = existing ?? { id: 900 + remoteChecks.length,
+            html_url: `https://github.com/checks/${900 + remoteChecks.length}`, app: { id: Number(f.endpoint.botExternalId) } };
+          Object.assign(check, body);
+          if (!existing) remoteChecks.push(check);
+          checkWrites.push({ method, body });
+          return Response.json(check);
+        }
+        return f.provider(input, init);
+      };
+      f.setSupplementalProviderFetch(provider);
+      const checks = githubReviewCheckService(db, f.providerFetch);
+      return { ...f, provider, remoteChecks, checkWrites, checkWorker: checks };
+    }
+
+    async function authorizedSameHeadReviewFixture() {
+      const f = await assessmentCheckFixture();
+      await f.service.execute(f.session, "submit_review", { ...f.assessment, score: 5 }, "published-first-assessment");
+      const [assessed] = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
+      expect(assessed).toMatchObject({ state: "completed", conclusion: "success", assessment: { score: 5 } });
+      expect(f.remoteChecks.at(-1)).toMatchObject({ status: "completed", conclusion: "success" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review this head again", userId: "42", userName: "octocat", mentioned: true }) });
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({ endpointId: f.endpoint.id,
+          issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802" }) }).returning();
+      const session = { ...f.session, runId: run.id };
+      await f.service.execute(session, "begin_review", { reviewedCommit: f.head });
+      const review = (await readChatGitHubReviewsByEndpointId(f.endpoint.id)).find(row => row.runId === run.id)!;
+      expect(review).toMatchObject({ state: "running", assessment: null, headSha: f.head });
+      expect(review.deliveryId).not.toBe(assessed.deliveryId);
+      const writeCount = f.checkWrites.length;
+      return { ...f, assessed, review, nextRun: run, nextSession: session, writeCount };
+    }
+
+    it("publishes a pending check for an authorized second same-head begin_review before submission", async () => {
+      const f = await authorizedSameHeadReviewFixture();
+      await f.checkWorker.processPending();
+      const writes = f.checkWrites.slice(f.writeCount);
+      expect.soft(writes.length, "a new authorized assessment attempt must replace the prior success with pending").toBeGreaterThan(0);
+      expect.soft(writes.at(-1)?.body).toMatchObject({ head_sha: f.head, status: "in_progress" });
+      expect.soft(writes.at(-1)?.body.conclusion).toBeUndefined();
+      expect.soft(f.remoteChecks.at(-1)).toMatchObject({ status: "in_progress" });
+      const reviews = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
+      expect.soft(reviews.find(row => row.id === f.review.id)).toMatchObject({ state: "running", assessment: null });
+      expect.soft(reviews.find(row => row.id === f.assessed.id)).toMatchObject({ state: "completed", conclusion: "success",
+        assessment: f.assessed.assessment });
+      await f.service.execute(f.nextSession, "submit_review", { ...f.assessment, score: 5, summary: "Second same-head assessment" }, "second-same-head-assessment");
+      expect.soft(f.remoteChecks.at(-1)).toMatchObject({ status: "completed", conclusion: "success" });
+    });
+
+    it("publishes a nonpassing terminal check when an authorized second same-head review fails without an assessment", async () => {
+      const f = await authorizedSameHeadReviewFixture();
+      await db.update(heartbeatRuns).set({ status: "failed", error: "Synthetic authorized review failure" })
+        .where(eq(heartbeatRuns.id, f.nextRun.id));
+      await f.checkWorker.processPending();
+      expect.soft(f.checkWrites.slice(f.writeCount).at(-1)?.body,
+        "the previous success must not mask the authorized review's terminal failure")
+        .toMatchObject({ head_sha: f.head, status: "completed", conclusion: "action_required" });
+      expect.soft(f.remoteChecks.at(-1)).toMatchObject({ status: "completed", conclusion: "action_required" });
+      const reviews = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
+      expect.soft(reviews.find(row => row.id === f.review.id)).toMatchObject({ runId: f.nextRun.id,
+        state: "error", assessment: null, conclusion: "action_required" });
+      expect.soft(reviews.find(row => row.id === f.assessed.id)).toMatchObject({ state: "completed", conclusion: "success",
+        assessment: f.assessed.assessment });
+    });
+
+    it.each([403, 422, 503])("distinguishes abandoned from recoverable unpublished assessments after HTTP %s", async status => {
+      const f = await assessmentCheckFixture();
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          return new Response("Synthetic publication rejection", {
+            status, headers: status === 503 ? { "retry-after": "120" } : undefined,
+          });
+        }
+        return f.provider(input, init);
+      });
+      const submitted = await f.service.execute(f.session, "submit_review", { ...f.assessment, score: 5 }, "unpublished-assessment");
+      expect(submitted).toMatchObject({ status: "failed", receipt: { retryable: status === 503, providerStatus: status } });
+      const publication = await f.action();
+      expect(publication).toMatchObject({ status: "failed", result: { retryable: status === 503 } });
+      const [historical] = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
+      expect(historical).toMatchObject({ assessment: { score: 5 }, checkId: null, checkUrl: null });
+      expect(f.remoteChecks).toEqual([]);
+      expect(f.checkWrites).toEqual([]);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "failed", runtimeMode: "native", contextSnapshot: {}, error: "Synthetic duplicate failure" }).returning();
+      const event = { ...historical.event, deliveryId: randomUUID() };
+      const [replacement] = await db.insert(chatGitHubReviews).values({ companyId: f.companyId, endpointId: f.endpoint.id,
+        issueId: f.conversation.issueId!, runId: run.id, repositoryId: historical.repositoryId, repository: historical.repository,
+        pullNumber: historical.pullNumber, headSha: historical.headSha, deliveryId: event.deliveryId,
+        configurationRevision: historical.configurationRevision, policySnapshot: historical.policySnapshot, event,
+        state: "running", createdAt: new Date(Date.now() + 1000) }).returning();
+      const [endpoint] = await readChatEndpointsById(f.endpoint.id);
+      await f.checkWorker.enqueue(endpoint, event, true, "synthetic admitted receipt");
+      await f.checkWorker.processPending();
+      const reviews = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
+      expect.soft(reviews.find(row => row.id === historical.id)).toEqual(historical);
+      expect.soft(await f.action()).toEqual(publication);
+      if (status === 503) {
+        expect(f.checkWrites, "a recoverable assessment publication must retain check ownership").toEqual([]);
+        expect(f.remoteChecks).toEqual([]);
+      } else {
+        expect.soft(f.checkWrites.length, "an unrecoverable unpublished assessment cannot consume the replacement check")
+          .toBeGreaterThan(0);
+        expect.soft(f.checkWrites.at(-1)?.body).toMatchObject({ status: "completed", conclusion: "action_required" });
+        expect.soft(f.remoteChecks.at(-1)).toMatchObject({ status: "completed", conclusion: "action_required" });
+        expect.soft(reviews.find(row => row.id === replacement.id)).toMatchObject({ runId: run.id,
+          state: "error", assessment: null, conclusion: "action_required" });
+      }
+    });
+
     it("ignores a review request addressed to an external GitHub bot", async () => {
       const f = await subscribedGitHubFixture("github:paperclipai/paperclip:419");
       const wakeCount = f.wakeup.mock.calls.length;

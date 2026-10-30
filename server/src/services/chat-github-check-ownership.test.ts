@@ -46,6 +46,7 @@ async function fixture(db: Db, options: {
   existingCheck?: boolean;
   conclusion?: string;
   ratingThreshold?: GitHubReviewPolicy["ratingThreshold"];
+  liveHeadSha?: string;
 } = {}) {
   const companyId = randomUUID(), agentId = randomUUID(), applicationId = randomUUID(), issueId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Synthetic check ownership",
@@ -85,7 +86,9 @@ async function fixture(db: Db, options: {
     const url = new URL(String(input)), method = init?.method ?? "GET";
     const prefix = "/repos/acme/widget";
     if (url.origin === "https://api.github.com") {
-      if (method === "GET" && url.pathname === `${prefix}/pulls/42`) return Response.json({ head: { sha: event.headSha } });
+      if (method === "GET" && url.pathname === `${prefix}/pulls/42`) {
+        return Response.json({ head: { sha: options.liveHeadSha ?? event.headSha } });
+      }
       if (method === "GET" && url.pathname === `${prefix}/commits/${event.headSha}/check-runs`) {
         return Response.json({ check_runs: remote });
       }
@@ -286,6 +289,66 @@ describe.skipIf(!support.supported)("GitHub assessed check ownership PostgreSQL 
       expect((await f.reviews())[0]).toMatchObject({ runId: newest.id, state: "running", assessment: null, conclusion: null });
       expect(await f.action()).toMatchObject({ status: "received", result: { state: "running" } });
     });
+  });
+
+  it.each([
+    { status: "running", state: "running", checkStatus: "in_progress", actionStatus: "received" },
+    { status: "failed", state: "error", checkStatus: "completed", actionStatus: "processed" },
+  ])("publishes the $state lifecycle instead of an abandoned unpublished assessment", async expected => {
+    await withFixture(async f => {
+      const abandoned = await f.review({ createdAt: at(10), state: "superseded", assessment: assessment(5),
+        conclusion: "success", checkId: null, checkUrl: null });
+      const run = await f.run(expected.status);
+      const replacement = await f.review({ runId: run.id, createdAt: at(30) });
+      await f.enqueue();
+      await f.service.processPending();
+      expect.soft(f.unexpectedRequests).toEqual([]);
+      expect.soft(f.writes, "an unpublished superseded assessment cannot leave the current head without a check")
+        .toEqual([{ method: "POST", body: expect.objectContaining({ name: "Paperclip Review",
+          head_sha: f.event.headSha, status: expected.checkStatus }) }]);
+      expect.soft(f.writes[0]?.body.conclusion).toBe(expected.checkStatus === "completed" ? "action_required" : undefined);
+      expect.soft(f.remote).toHaveLength(1);
+      expect.soft(await f.action()).toMatchObject({ status: expected.actionStatus, result: { state: expected.state } });
+      const retained = await f.reviews();
+      expect.soft(retained.find(row => row.id === replacement.id)).toMatchObject({ runId: run.id,
+        state: expected.state, assessment: null, conclusion: expected.checkStatus === "completed" ? "action_required" : null });
+      expect.soft(retained.find(row => row.id === abandoned.id)).toEqual(abandoned);
+    }, { existingCheck: false });
+  });
+
+  it("settles an obsolete running duplicate after its run fails without changing the published assessment", async () => {
+    await withFixture(async f => {
+      const assessed = await f.review({ createdAt: at(10), state: "completed", conclusion: "success",
+        assessment: assessment(5), checkId: "101", checkUrl: "https://github.com/acme/widget/checks/101" });
+      const run = await f.run("failed", { error: "Synthetic review run failed" });
+      const duplicate = await f.review({ runId: run.id, createdAt: at(30), state: "running" });
+      await expectOwnership(f, assessed.id);
+      expect((await f.reviews()).find(row => row.id === duplicate.id),
+        "provider ownership must not keep a failed duplicate displayed as running")
+        .toMatchObject({ runId: run.id, state: "error", assessment: null, conclusion: "action_required" });
+    });
+  });
+
+  it("supersedes a queued automatic receipt for a stale head without changing its published assessment", async () => {
+    await withFixture(async f => {
+      const assessed = await f.review({ createdAt: at(10), state: "completed", conclusion: "success",
+        assessment: assessment(5), checkId: "101", checkUrl: "https://github.com/acme/widget/checks/101" });
+      const delivery = await f.delivery();
+      const receipt = await f.review({ deliveryId: delivery.id, createdAt: at(30), state: "queued" });
+      const checks = structuredClone(f.remote);
+      await f.enqueue();
+      await f.service.processPending();
+      await f.service.processPending();
+      expect.soft(f.unexpectedRequests).toEqual([]);
+      expect.soft(f.writes, "stale work must not write over the assessed check").toEqual([]);
+      expect.soft(f.remote).toEqual(checks);
+      expect.soft(await f.action()).toMatchObject({ status: "cancelled", result: { code: "stale_head" } });
+      const retained = await f.reviews();
+      expect.soft(retained.find(row => row.id === receipt.id),
+        "stale-head cancellation and repair must settle the queued automatic receipt")
+        .toMatchObject({ state: "superseded", assessment: null, runId: null });
+      expect.soft(retained.find(row => row.id === assessed.id)).toEqual(assessed);
+    }, { liveHeadSha: "c".repeat(40) });
   });
 
   const coordinates = ["head", "endpoint", "repository ID", "pull number"] as const;
