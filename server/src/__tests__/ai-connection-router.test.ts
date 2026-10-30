@@ -182,6 +182,33 @@ describe("durable, authorized connection routing", () => {
     const pool = await makePool({ members: [member] });
     expect((await resolve(pool.id, `manual-${kind}`)).runtimeConfig).toEqual({ provider: "opencode", model: "paperclip/custom/manual" });
   });
+  it.each([
+    ["gateway", "fresh"], ["gateway", "pinned"], ["local", "fresh"], ["local", "pinned"],
+  ] as const)("prioritizes the projected %s default over a raw hint alias for %s selections", async (kind, phase) => {
+    await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+    const routing = { kind, protocol: "chat" as const, auth: "bearer" as const, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1", models: [{ id: "paperclip/custom/a" }] };
+    const account = await aiConnectionService(db).save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "Default alias collision", apiKey: "fixture", allAgents: true, agentIds: [], routing }, "fixture");
+    const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...account }, profile: { provider: "opencode", model: "custom/a" } };
+    const pool = await makePool({ members: [member] });
+    for (const adapterType of ["paperclip_runner", "opencode_local"]) {
+      const taskKey = `default-alias-${kind}-${phase}-${adapterType}`;
+      if (phase === "pinned") await resolve(pool.id, taskKey, { adapterType });
+      const pinsBefore = await db.select().from(aiConnectionTaskPins).where(eq(aiConnectionTaskPins.poolId, pool.id));
+      const [cursorBefore] = await db.select().from(aiConnectionRouterCursors).where(eq(aiConnectionRouterCursors.poolId, pool.id));
+      for (const model of ["paperclip/custom/a", "paperclip/paperclip/custom/a", "paperclip/custom/a"]) {
+        const selection = await resolve(pool.id, taskKey, { adapterType, overrides: { model } });
+        expect(selection).toMatchObject({ memberId: member.id, binding: member.binding, runtimeConfig: { provider: "opencode", model }, notes: [] });
+      }
+      const pinsAfter = await db.select().from(aiConnectionTaskPins).where(eq(aiConnectionTaskPins.poolId, pool.id));
+      const [cursorAfter] = await db.select().from(aiConnectionRouterCursors).where(eq(aiConnectionRouterCursors.poolId, pool.id));
+      expect(pinsAfter).toHaveLength(pinsBefore.length + (phase === "fresh" ? 1 : 0));
+      expect(cursorAfter?.version).toBe(cursorBefore!.version + (phase === "fresh" ? 1 : 0));
+      if (phase === "pinned") {
+        expect(pinsAfter).toEqual(pinsBefore);
+        expect(cursorAfter).toEqual(cursorBefore);
+      }
+    }
+  });
   it("authorizes direct OpenRouter members before evaluating fresh and pinned model overrides", async () => {
     const account = await aiConnectionService(db).save(companyId, "alice", { provider: "openrouter", method: "api_key", ownership: "personal", name: "OpenRouter", apiKey: "fixture", allAgents: true, agentIds: [] }, "fixture");
     const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openrouter", method: "api_key", ...account }, profile: { provider: "opencode", model: "anthropic/claude-sonnet-4.5" } };

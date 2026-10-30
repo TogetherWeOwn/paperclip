@@ -20,6 +20,7 @@ import { getServerAdapter, registerServerAdapter, unregisterServerAdapter } from
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionRouterService, poolMemberRuntimeConfig } from "../services/ai-connection-router.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
@@ -150,6 +151,31 @@ describe("agent-created hires use managed AI connections", () => {
             }
           } finally { await runtime.cleanup(); }
         }
+      }
+    }
+  });
+  it.each(["gateway", "local"] as const)("preserves the manual %s default through catalog, router selection, and managed runtime", async (kind) => {
+    const f = await fixture("openai");
+    const routing = { kind, protocol: "chat" as const, auth: "bearer" as const, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1", models: [{ id: "paperclip/custom/a" }] };
+    const account = await aiConnectionService(db).save(f.companyId, f.userId, { provider: "openai", method: "api_key", name: "Default alias collision", ownership: "personal", allAgents: true, agentIds: [], routing }, "fixture");
+    const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...account }, profile: { provider: "opencode", model: "custom/a" } };
+    const p = await poolFixture(f, [member]);
+    const pool = await aiConnectionRouterService(db).save(p.pool.pluginKey, { companyId: f.companyId, id: p.pool.id, expectedRevision: p.pool.revision, config: { name: p.pool.name, enabled: true, mode: "round_robin", thresholdPercent: 90, members: [member] } }, f.userId);
+    const router = aiConnectionRouterService(db, { isRunning: () => true, call: async () => ({ kind: "selected", memberId: member.id }) } as unknown as PluginWorkerManager);
+    for (const adapterType of ["paperclip_runner", "opencode_local"]) {
+      const catalog = await request(f.app).get(`/api/companies/${f.companyId}/adapters/${adapterType}/models`).query({ poolId: pool.id });
+      expect(catalog.status, JSON.stringify(catalog.body)).toBe(200);
+      expect(catalog.body).toEqual([{ id: "paperclip/custom/a", label: "paperclip/custom/a" }, { id: "paperclip/paperclip/custom/a", label: "paperclip/paperclip/custom/a" }]);
+      for (const [index, raw] of ["custom/a", "paperclip/custom/a"].entries()) {
+        const model = catalog.body[index].id;
+        const selection = await router.resolve({ companyId: f.companyId, poolId: pool.id, agentId: f.agentId, userId: f.userId, adapterType, taskKey: `${adapterType}-${index}`, overrides: { model } });
+        expect(selection).toMatchObject({ binding: member.binding, runtimeConfig: { provider: "opencode", model }, notes: [] });
+        const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId, adapterType, binding: selection.binding, config: selection.runtimeConfig });
+        try {
+          expect(runtime.config.model).toBe(model);
+          const config = JSON.parse(String(runtime.config.env.OPENCODE_CONFIG_CONTENT));
+          expect(config.provider.paperclip.models).toEqual({ [raw]: { name: raw } });
+        } finally { await runtime.cleanup(); }
       }
     }
   });

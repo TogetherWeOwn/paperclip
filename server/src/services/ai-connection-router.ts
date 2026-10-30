@@ -46,6 +46,7 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
   const normalizeOverride = (value: string) => {
     if (!routed) return value;
     const requested = value.trim();
+    if (requested === defaultModel) return defaultModel;
     const declared = routedModels.find((m) => projectModel(m.id) === requested) ?? routedModels.find((m) => m.id === requested);
     return declared ? projectModel(declared.id) : aiRoutingModel(metadata!.routing!, harness, requested);
   };
