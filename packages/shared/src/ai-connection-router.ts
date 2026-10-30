@@ -15,7 +15,7 @@ export const aiConnectionPoolMemberSchema = z.object({
   profile: z.object({
     provider: z.enum(["codex", "acpx", "opencode"]),
     acpxAgent: z.enum(["claude", "grok"]).optional(),
-    model: z.string().trim().min(1).max(256),
+    model: z.string().trim().min(1).max(267),
     effort: z.string().trim().min(1).max(32).optional(),
   }).strict(),
 }).strict();
