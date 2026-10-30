@@ -1,7 +1,7 @@
 import { notifyGitHubReviewProjection, repairSupersededGitHubReviews } from "./chat-channels/github/review-projection-work.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { notifyGitHubReviewChecks, registerGitHubReviewCheckWork } from "./chat-channels/github/review-check-work.js";
-import { githubReviewCheckState } from "./chat-channels/github/review-check-state.js";
+import { githubReviewCheckState, githubReviewCheckTarget } from "./chat-channels/github/review-check-state.js";
 import {
   GitHubPublicationLeaseLost,
   withGitHubPublicationLease,
@@ -114,7 +114,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          const { source, review, run, terminal, state, status, assessmentOwner, authorizedAttempt, awaitingRun } = currentState;
+          const { source, review, run, terminal, state, status, assessmentOwner, authorizedAttempt, awaitingRun, newerAttempt } = currentState;
           const policy = review?.policySnapshot ?? {
             ...source.configuration.defaults,
             ...source.configuration.repositories[event.repositoryId],
@@ -177,15 +177,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          // A viable assessed check still owns this head: the newest unassessed
-          // row never writes to the provider, but it must still reconcile
-          // locally instead of stranding as queued/running. Only a distinct
-          // authorized attempt (its own begin_review receipt, not an admission
-          // receipt) publishes a replacement lifecycle over the prior result.
-          if (assessmentOwner?.viable && !authorizedAttempt) {
-            // Processing the suppression receipt does not finish reconciliation
-            // while its run or the owner's publication can still change.
-            const reconcilePending = awaitingRun || assessmentOwner.publicationPending;
+          if (newerAttempt || (assessmentOwner?.viable && !authorizedAttempt)) {
+            const reconcilePending = awaitingRun || (!newerAttempt && assessmentOwner?.publicationPending === true);
             await lease.commit(async (tx) => {
               await notifyGitHubReviewProjection(tx, { companyId: action.companyId, endpointId: action.endpointId });
               if (review && ["queued", "running"].includes(review.state) && terminal)
@@ -207,7 +200,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                 .update(chatActions)
                 .set({
                   status: "processed",
-                  result: { code: "assessment_owns_check", reviewId: assessmentOwner.id, state,
+                  result: { code: newerAttempt ? "newer_attempt_owns_check" : "assessment_owns_check",
+                    reviewId: newerAttempt?.id ?? assessmentOwner!.id, state,
                     ...(reconcilePending ? { reconcilePending: true,
                       retryAt: new Date(Date.now() + 5000).toISOString() } : {}) },
                   updatedAt: new Date(),
@@ -235,17 +229,21 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             }>(
               `/commits/${event.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
             );
-            const check = checks.check_runs.filter(
-              (check) =>
-                check.external_id === externalId &&
-                String(check.app?.id) === source.endpoint.botExternalId,
-            ).at(-1);
+            const check = await githubReviewCheckTarget(db, checks.check_runs, review,
+              externalId, source.endpoint.botExternalId, fresh.result, authorizedAttempt);
+            const checkIntent = { reviewId: review?.id,
+              beforeIds: checks.check_runs.filter(item => item.external_id === externalId &&
+                String(item.app?.id) === source.endpoint.botExternalId).map(item => item.id) };
             // GitHub retains a completed check's conclusion when PATCHed back to
             // queued/in_progress. A fresh attempt needs a new check run with the
             // same stable name; otherwise a prior success still looks passing.
             const updateCheck =
               check &&
               !(check.status === "completed" && status !== "completed");
+            if (!updateCheck) await lease.commit(async tx => {
+              await tx.update(chatActions).set({ result: sql`coalesce(${chatActions.result}, '{}'::jsonb) ||
+                ${JSON.stringify({ checkIntent })}::jsonb`, updatedAt: new Date() }).where(eq(chatActions.id, id));
+            });
             const posted = await request<{ id: number; html_url: string }>(
               updateCheck ? `/check-runs/${check.id}` : "/check-runs",
               {
@@ -266,10 +264,12 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                 },
               },
             );
-            if (review)
-              await lease.commit(async (tx) => {
+            await lease.commit(async (tx) => {
+                await tx.update(chatActions).set({ result: sql`coalesce(${chatActions.result}, '{}'::jsonb) ||
+                  ${JSON.stringify({ checkId: String(posted.id), checkReviewId: review?.id })}::jsonb`,
+                  updatedAt: new Date() }).where(eq(chatActions.id, id));
                 await notifyGitHubReviewProjection(tx, { companyId: action.companyId, endpointId: action.endpointId });
-                await tx
+                if (review) await tx
                   .update(chatGitHubReviews)
                   .set({
                     state,
@@ -294,12 +294,12 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               .update(chatActions)
               .set({
                 status: status === "completed" ? "processed" : "received",
-                result: {
+                result: sql`(coalesce(${chatActions.result}, '{}'::jsonb) - 'reconcilePending' - 'code' - 'reviewId') || ${JSON.stringify({
                   state,
                   attempts: 0,
                   retryable: true,
                   retryAt: new Date(Date.now() + 5000).toISOString(),
-                },
+                })}::jsonb`,
                 updatedAt: new Date(),
               })
               .where(eq(chatActions.id, id));
@@ -312,14 +312,14 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               .update(chatActions)
               .set({
                 status: "failed",
-                result: {
+                result: sql`coalesce(${chatActions.result}, '{}'::jsonb) || ${JSON.stringify({
                   attempts,
                   retryable: attempts < 8,
                   retryAt: new Date(
                     Date.now() + Math.min(300000, 1000 * 2 ** attempts),
                   ).toISOString(),
                   code: "check_publication_failed",
-                },
+                })}::jsonb`,
                 updatedAt: new Date(),
               })
               .where(eq(chatActions.id, id));

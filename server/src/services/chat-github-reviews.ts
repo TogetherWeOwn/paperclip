@@ -1,5 +1,6 @@
 import { notifyGitHubReviewProjection } from "./chat-channels/github/review-projection-work.js";
 import { notifyGitHubReviewChecks } from "./chat-channels/github/review-check-work.js";
+import { githubAssessmentCheckDigest, githubNewerReviewAttempt, githubReviewCheckTarget } from "./chat-channels/github/review-check-state.js";
 import { notifyChatResponseAvailability } from "./chat-response-availability.js";
 import { githubRunReplyState } from "./chat-run-publications.js";
 import { stageReceiptReactionRemovals } from "./chat-receipt-reactions.js";
@@ -1131,6 +1132,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               "GitHub history is too large to safely resolve a publication retry",
             );
           };
+          let assessmentReview: typeof chatGitHubReviews.$inferSelect | undefined;
           const currentHead = async (expected: string) => {
             const currentSource = await scope(session, true);
             await assertPublicationAuthority(currentSource, action);
@@ -1153,7 +1155,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 ),
               )
               .limit(1);
-            if (newer) throw conflict("github_review_superseded");
+            if (newer || (assessmentReview && await githubNewerReviewAttempt(db, assessmentReview, source.agent.id)))
+              throw conflict("github_review_superseded");
             const current = await api.request<Pull>(`/pulls/${source.number}`);
             if (current.head.sha !== expected)
               throw conflict("github_review_superseded");
@@ -1209,6 +1212,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
               .limit(1);
             if (!review?.assessment)
               throw conflict("Review assessment is unavailable");
+            assessmentReview = review;
             await currentHead(review.headSha);
             const assessment = validateGitHubReviewAssessment(
               review.assessment,
@@ -1373,15 +1377,16 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             }>(
               `/commits/${review.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
             );
-            // A fresh review attempt posts its own check run with the same
-            // stable name; the assessment completes the newest matching run,
-            // never a superseded earlier result.
-            const check = checks.check_runs.filter(
-              (item) =>
-                item.external_id ===
-                  `${source.endpoint.id}:${source.number}:${review.headSha}` &&
-                String(item.app?.id) === source.endpoint.botExternalId,
-            ).at(-1);
+            const externalId = `${source.endpoint.id}:${source.number}:${review.headSha}`;
+            const check = await githubReviewCheckTarget(db, checks.check_runs, review,
+              externalId, source.endpoint.botExternalId, fresh.result, true);
+            if (!check) await lease.commit(async tx => {
+              await tx.update(chatActions).set({ result: sql`coalesce(${chatActions.result}, '{}'::jsonb) ||
+                ${JSON.stringify({ checkIntent: { reviewId: review.id,
+                  beforeIds: checks.check_runs.filter(item => item.external_id === externalId &&
+                    String(item.app?.id) === source.endpoint.botExternalId).map(item => item.id) } })}::jsonb`,
+                updatedAt: new Date() }).where(eq(chatActions.id, action.id));
+            });
             await currentHead(review.headSha);
             const postedCheck = await api.request<{
               id: number;
@@ -1403,6 +1408,8 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 },
               },
             });
+            receipts.check = { id: String(postedCheck.id), url: postedCheck.html_url,
+              digest: githubAssessmentCheckDigest(review) };
             await lease.commit(async (tx) => {
               await tx
                 .update(chatGitHubReviews)

@@ -44,8 +44,9 @@ export function registerGitHubReviewCheckWork(
       const current = await githubReviewCheckState(db, action);
       if (current.disposition !== "publish" || current.state !== action.result?.state ||
         (action.result?.reconcilePending === true &&
-          (current.authorizedAttempt || !current.assessmentOwner?.viable ||
-            (!current.awaitingRun && !current.assessmentOwner.publicationPending)))) dueAt = 0;
+          (current.newerAttempt ? !current.awaitingRun :
+            (current.authorizedAttempt || !current.assessmentOwner?.viable ||
+              (!current.awaitingRun && !current.assessmentOwner.publicationPending))))) dueAt = 0;
     }
     if (row.leaseExpiresAt) dueAt = Math.max(dueAt, Date.parse(row.leaseExpiresAt));
     return { id: action.id, companyId: action.companyId, endpointId: action.endpointId,
