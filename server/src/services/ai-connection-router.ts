@@ -1,6 +1,6 @@
 import type { ConnectionManagementContext } from "./connection-management.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { aiConnectionPools, aiConnectionRouterCursors, aiConnectionTaskPins, companySecrets, connectionGrants, instanceSettings, plugins, toolApplications, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
 import { AI_PROVIDER_MODEL_ID_MAX_LENGTH, AI_ROUTING_MODEL_ID_MAX_LENGTH, aiConnectionRouterAppDefinition, aiConnectionRouterSlug, aiConnectionPoolConfigSchema, aiConnectionMetadataSchema, aiRoutingHarness, aiRoutingModel, aiRoutingModelFromRaw, isAiConnectionCompatible, type AiConnectionMetadata, type AiConnectionPool, type AiConnectionPoolMember, type AiConnectionRouterRequest, type AiConnectionRouterSelection, type AiConnectionPoolSaveInput, type AiConnectionUsage } from "@paperclipai/shared";
 import { isCodexLocalKnownModel, codexLocalReasoningEffortsForModel } from "@paperclipai/adapter-codex-local";
@@ -24,9 +24,12 @@ export class AiConnectionPoolExhausted extends Error {
   readonly code = "ai_connection_pool_exhausted";
   constructor(readonly retryAt: string, readonly poolId: string) { super("All eligible pool accounts are over their usage limit. Waiting for usage to reset."); }
 }
+const nativeCatalogModel = (provider: string, value: string) => provider === "openai" ? isCodexLocalKnownModel(value)
+  : provider === "anthropic" ? claudeModels.some((m) => m.id === value)
+  : provider === "xai" ? grokModels.some((m) => m.id === value) : value.startsWith("openrouter/");
 
 /** Routing can override provider/model only, never environment, permissions, or instructions. */
-export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterType: string, overrides: Record<string, unknown> = {}, metadata?: AiConnectionMetadata) {
+export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterType: string, overrides: Record<string, unknown> = {}, metadata?: AiConnectionMetadata, isCanonicalModel?: (requested: string) => boolean) {
   const notes: string[] = [];
   const provider = member.binding.provider;
   const profile = member.profile;
@@ -47,15 +50,13 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
     if (!routed) return value;
     const requested = value.trim();
     if (requested === defaultModel) return defaultModel;
-    const declared = routedModels.find((m) => projectModel(m.id) === requested) ?? routedModels.find((m) => m.id === requested);
+    const declared = routedModels.find((m) => projectModel(m.id) === requested) ?? (isCanonicalModel?.(requested) ? undefined : routedModels.find((m) => m.id === requested));
     return declared ? projectModel(declared.id) : aiRoutingModel(metadata!.routing!, harness, requested);
   };
   const supportsModel = (value: string) => routed
     ? validModel(harness === "opencode_local" ? value.slice("paperclip/".length) : value, AI_PROVIDER_MODEL_ID_MAX_LENGTH)
       && (routedModels.length === 0 || routedModels.some((m) => projectModel(m.id) === value))
-    : validModel(value, AI_ROUTING_MODEL_ID_MAX_LENGTH) && (provider === "openai" ? isCodexLocalKnownModel(value)
-    : provider === "anthropic" ? claudeModels.some((m) => m.id === value)
-    : provider === "xai" ? grokModels.some((m) => m.id === value) : value.startsWith("openrouter/"));
+    : validModel(value, AI_ROUTING_MODEL_ID_MAX_LENGTH) && nativeCatalogModel(provider, value);
   const config: Record<string, unknown> = { provider: profile.provider, ...(profile.acpxAgent ? { acpxAgent: profile.acpxAgent } : {}), model: defaultModel };
   const validate = () => {
     if (!isAiConnectionCompatible(routed ? metadata : member.binding, adapterType, config.model, config.provider, config.acpxAgent)) throw unprocessable("Pool member is incompatible with this harness");
@@ -257,13 +258,32 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
       const [cursor] = await db.select().from(aiConnectionRouterCursors).where(and(eq(aiConnectionRouterCursors.poolId, row.id), eq(aiConnectionRouterCursors.companyId, input.companyId)));
       if (!cursor) throw unprocessable("The connection pool cursor is unavailable");
       const pool: AiConnectionPool = { ...row.config, id: row.id, companyId: row.companyId, pluginKey: row.pluginKey, revision: row.revision };
+      const memberMetadata = new Map<string, AiConnectionMetadata>();
+      const memberConnectionIds = [...new Set(pool.members.map((member) => member.binding.connectionId))];
+      if (memberConnectionIds.length) {
+        const connections = await db.select({ id: toolConnections.id, config: toolConnections.config }).from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), inArray(toolConnections.id, memberConnectionIds)));
+        const configs = new Map(connections.map((connection) => [connection.id, connection.config]));
+        for (const member of pool.members) {
+          const parsed = aiConnectionMetadataSchema.safeParse(configs.get(member.binding.connectionId)?.ai);
+          if (parsed.success) memberMetadata.set(member.id, parsed.data);
+        }
+      }
+      const canonicalModel = (requested: string) => pool.members.some((member) => {
+        const routing = memberMetadata.get(member.id)?.routing;
+        if (routing?.kind === "gateway" || routing?.kind === "local") {
+          const memberHarness = aiRoutingHarness(input.adapterType, member.profile.provider, member.profile.acpxAgent);
+          return aiRoutingModelFromRaw(routing, memberHarness, member.profile.model) === requested
+            || routing.models.some((model) => aiRoutingModelFromRaw(routing, memberHarness, model.id) === requested);
+        }
+        return member.profile.model === requested || nativeCatalogModel(member.binding.provider, requested);
+      });
       const deadline = Date.now() + 15_000;
       const candidates: AiConnectionRouterRequest["candidates"] = [];
       for (const member of pin ? [pin.member] : pool.members) {
         try {
           const account = await aiConnectionService(db).authorize({ companyId: input.companyId, agentId: input.agentId, userId: input.userId, binding: member.binding });
           const metadata = aiConnectionMetadataSchema.parse(account.connection.config.ai);
-          const effective = poolMemberRuntimeConfig(member, input.adapterType, input.overrides, metadata);
+          const effective = poolMemberRuntimeConfig(member, input.adapterType, input.overrides, metadata, canonicalModel);
           if (!isAiConnectionCompatible(metadata, input.adapterType, effective.config.model, effective.config.provider, effective.config.acpxAgent)) throw unprocessable("Pool member is incompatible with this harness");
           await input.validateRuntime?.(effective.config, metadata, "candidate", db);
           candidates.push({ member, runtimeConfig: effective.config, notes: effective.notes });

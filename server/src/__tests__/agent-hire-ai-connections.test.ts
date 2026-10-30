@@ -179,6 +179,24 @@ describe("agent-created hires use managed AI connections", () => {
       }
     }
   });
+  it.each(["gateway", "local"] as const)("keeps a projected %s catalog identity canonical across pool members", async (kind) => {
+    const f = await fixture("openai");
+    const route = { kind, protocol: "chat" as const, auth: "bearer" as const, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1" };
+    const accountA = await aiConnectionService(db).save(f.companyId, f.userId, { provider: "openai", method: "api_key", name: "Member A", ownership: "personal", allAgents: true, agentIds: [], routing: { ...route, models: [{ id: "custom/a" }] } }, "fixture");
+    const accountB = await aiConnectionService(db).save(f.companyId, f.userId, { provider: "openai", method: "api_key", name: "Member B", ownership: "personal", allAgents: true, agentIds: [], routing: { ...route, models: [{ id: "paperclip/custom/a" }] } }, "fixture");
+    const memberA: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...accountA }, profile: { provider: "opencode", model: "custom/a" } };
+    const memberB: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...accountB }, profile: { provider: "opencode", model: "other" } };
+    const p = await poolFixture(f, [memberB, memberA]);
+    const pool = await aiConnectionRouterService(db).save(p.pool.pluginKey, { companyId: f.companyId, id: p.pool.id, expectedRevision: p.pool.revision, config: { name: p.pool.name, enabled: true, mode: "round_robin", thresholdPercent: 90, members: [memberB, memberA] } }, f.userId);
+    for (const adapterType of ["paperclip_runner", "opencode_local"]) {
+      const catalog = await request(f.app).get(`/api/companies/${f.companyId}/adapters/${adapterType}/models`).query({ poolId: pool.id });
+      expect(catalog.status, JSON.stringify(catalog.body)).toBe(200);
+      expect(catalog.body).toEqual([{ id: "paperclip/other", label: "paperclip/other" }, { id: "paperclip/paperclip/custom/a", label: "paperclip/paperclip/custom/a" }, { id: "paperclip/custom/a", label: "paperclip/custom/a" }]);
+      const router = aiConnectionRouterService(db, { isRunning: () => true, call: async () => ({ kind: "selected", memberId: memberB.id }) } as unknown as PluginWorkerManager);
+      const selection = await router.resolve({ companyId: f.companyId, poolId: pool.id, agentId: f.agentId, userId: f.userId, adapterType, taskKey: `cross-member-${adapterType}`, overrides: { model: "paperclip/custom/a" } });
+      expect(selection).toMatchObject({ memberId: memberB.id, runtimeConfig: { provider: "opencode", model: "paperclip/other" }, notes: ["Model override is unavailable for this member; using its default."] });
+    }
+  });
   it.each(["gateway", "local"] as const)("preserves literal %s Hermes model IDs through catalog and runtime projection", async (kind) => {
     const f = await fixture("openai");
     const routing = { kind, protocol: "chat" as const, auth: "bearer" as const, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1", models: [{ id: "custom/b" }, { id: "paperclip/custom/b", label: "Literal alias" }] };

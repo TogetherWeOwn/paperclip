@@ -209,6 +209,29 @@ describe("durable, authorized connection routing", () => {
       }
     }
   });
+  it.each([
+    ["gateway", "fresh"], ["gateway", "pinned"], ["local", "fresh"], ["local", "pinned"],
+  ] as const)("keeps a projected %s catalog identity canonical across members for %s selections", async (kind, phase) => {
+    await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+    const route = { kind, protocol: "chat" as const, auth: "bearer" as const, baseUrl: kind === "local" ? "http://127.0.0.1:1234" : "https://gateway.example/v1" };
+    const accountA = await aiConnectionService(db).save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "Canonical member A", apiKey: "fixture", allAgents: true, agentIds: [], routing: { ...route, models: [{ id: "custom/a" }] } }, "fixture");
+    const accountB = await aiConnectionService(db).save(companyId, "alice", { provider: "openai", method: "api_key", ownership: "personal", name: "Canonical member B", apiKey: "fixture", allAgents: true, agentIds: [], routing: { ...route, models: [{ id: "paperclip/custom/a" }, { id: "paperclip/custom/c" }] } }, "fixture");
+    const memberA: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...accountA }, profile: { provider: "opencode", model: "custom/a" } };
+    const memberB: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openai", method: "api_key", ...accountB }, profile: { provider: "opencode", model: "other" } };
+    const pool = await makePool({ members: [memberB, memberA] });
+    for (const adapterType of ["paperclip_runner", "opencode_local"]) {
+      const taskKey = `cross-member-${kind}-${phase}-${adapterType}`;
+      if (phase === "pinned") await resolve(pool.id, taskKey, { adapterType });
+      const fallback = await resolve(pool.id, taskKey, { adapterType, overrides: { model: "paperclip/custom/a" } });
+      expect(fallback).toMatchObject({ memberId: memberB.id, binding: memberB.binding, runtimeConfig: { provider: "opencode", model: "paperclip/other" }, notes: ["Model override is unavailable for this member; using its default."] });
+      const alias = await resolve(pool.id, taskKey, { adapterType, overrides: { model: "paperclip/paperclip/custom/a" } });
+      expect(alias).toMatchObject({ memberId: memberB.id, runtimeConfig: { provider: "opencode", model: "paperclip/paperclip/custom/a" }, notes: [] });
+      const raw = await resolve(pool.id, taskKey, { adapterType, overrides: { model: "paperclip/custom/c" } });
+      expect(raw).toMatchObject({ memberId: memberB.id, runtimeConfig: { provider: "opencode", model: "paperclip/paperclip/custom/c" }, notes: [] });
+      const canonical = await resolve(pool.id, `${taskKey}-a`, { adapterType, overrides: { model: "paperclip/custom/a" } });
+      expect(canonical).toMatchObject({ memberId: memberA.id, runtimeConfig: { provider: "opencode", model: "paperclip/custom/a" }, notes: [] });
+    }
+  });
   it("authorizes direct OpenRouter members before evaluating fresh and pinned model overrides", async () => {
     const account = await aiConnectionService(db).save(companyId, "alice", { provider: "openrouter", method: "api_key", ownership: "personal", name: "OpenRouter", apiKey: "fixture", allAgents: true, agentIds: [] }, "fixture");
     const member: AiConnectionPoolMember = { id: randomUUID(), binding: { mode: "delegated", provider: "openrouter", method: "api_key", ...account }, profile: { provider: "opencode", model: "anthropic/claude-sonnet-4.5" } };
