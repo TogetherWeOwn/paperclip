@@ -36,15 +36,18 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
     : provider === "xai" ? profile.provider === "acpx" && profile.acpxAgent === "grok"
     : profile.provider === "opencode";
   if (!expected) throw unprocessable("Pool member harness does not match its account");
+  const harness = aiRoutingHarness(adapterType, profile.provider, profile.acpxAgent);
+  const normalizeModel = (value: string) => routed ? aiRoutingModel(metadata!.routing!, harness, value) : value;
   const routedModels = routed ? metadata!.routing!.models : [];
-  // Routed overrides qualify against the connection's declared models (in
-  // normalized form); with none declared, manually supplied aliases stand.
+  const defaultModel = routed && harness === "hermes_local" && !routedModels.some((m) => m.id === profile.model)
+    ? routedModels.find((m) => aiRoutingModel(metadata!.routing!, "opencode_local", m.id) === profile.model)?.id ?? profile.model
+    : profile.model;
   const supportsModel = (value: string) => routed
-    ? routedModels.length === 0 || routedModels.some((m) => aiRoutingModel(metadata!.routing!, aiRoutingHarness("paperclip_runner", profile.provider, profile.acpxAgent), m.id) === value)
+    ? routedModels.length === 0 || routedModels.some((m) => normalizeModel(m.id) === value)
     : provider === "openai" ? isCodexLocalKnownModel(value)
     : provider === "anthropic" ? claudeModels.some((m) => m.id === value)
     : provider === "xai" ? grokModels.some((m) => m.id === value) : value.startsWith("openrouter/");
-  const config: Record<string, unknown> = { provider: profile.provider, ...(profile.acpxAgent ? { acpxAgent: profile.acpxAgent } : {}), model: profile.model };
+  const config: Record<string, unknown> = { provider: profile.provider, ...(profile.acpxAgent ? { acpxAgent: profile.acpxAgent } : {}), model: defaultModel };
   const validate = () => {
     if (!isAiConnectionCompatible(routed ? metadata : member.binding, adapterType, config.model, config.provider, config.acpxAgent)) throw unprocessable("Pool member is incompatible with this harness");
     if (adapterType === "paperclip_runner") {
@@ -53,10 +56,11 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
     }
   };
   validate();
-  if (typeof overrides.model === "string" && overrides.model !== profile.model) {
-    if (supportsModel(overrides.model)) {
-      config.model = overrides.model;
-      try { validate(); } catch { config.model = profile.model; notes.push("Model override is unavailable for this member; using its default."); }
+  const overrideModel = typeof overrides.model === "string" ? normalizeModel(overrides.model) : undefined;
+  if (overrideModel !== undefined && overrideModel !== normalizeModel(defaultModel)) {
+    if (supportsModel(overrideModel)) {
+      config.model = overrideModel;
+      try { validate(); } catch { config.model = defaultModel; notes.push("Model override is unavailable for this member; using its default."); }
     } else notes.push("Model override is unavailable for this member; using its default.");
   }
   const model = String(config.model);
@@ -247,8 +251,6 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
           const metadata = aiConnectionMetadataSchema.parse(account.connection.config.ai);
           const effective = poolMemberRuntimeConfig(member, input.adapterType, input.overrides, metadata);
           const selection: AiConnectionRouterSelection = { poolId: row.id, memberId: member.id, binding: member.binding, runtimeConfig: effective.config, notes: effective.notes };
-          // The first select validates these same inputs and supplies trusted metadata.
-          // Recheck only if the effective model or harness differs from the profile.
           if (selection.runtimeConfig.model !== member.profile.model || selection.runtimeConfig.provider !== member.profile.provider || selection.runtimeConfig.acpxAgent !== member.profile.acpxAgent) {
             await validateSelection(selection);
           }

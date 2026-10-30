@@ -3071,11 +3071,16 @@ export function agentRoutes(
         if (!account) continue;
         const memberAdapter = member.binding.provider === "openai" ? "codex_local" : member.binding.provider === "anthropic" ? "claude_local" : member.binding.provider === "xai" ? "grok_local" : "opencode_local";
         const routing = account.routing?.kind === "gateway" || account.routing?.kind === "local" ? account.routing : undefined;
-        const models = routing
-          ? [{ id: member.profile.model, label: member.profile.model }, ...routing.models.map((m) => { const id = aiRoutingModel(routing, agentHarnessType("paperclip_runner", { provider: member.profile.provider, acpxAgent: member.profile.acpxAgent }), m.id); return { id, label: m.label ?? id }; })]
+        const models: Array<{ id: string; label?: string }> = routing
+          ? [{ id: member.profile.model }, ...routing.models]
           : [{ id: member.profile.model, label: member.profile.model }, ...await listAdapterModels(memberAdapter)];
         for (const model of models) {
-          try { poolMemberRuntimeConfig({ ...member, profile: { ...member.profile, model: model.id } }, type, {}, account); catalog.set(model.id, model); } catch { /* Only qualified profiles belong in the pool catalog. */ }
+          try {
+            const modelId = routing ? aiRoutingModel(routing, agentHarnessType(type, member.profile), model.id) : model.id;
+            const runtime = poolMemberRuntimeConfig({ ...member, profile: { ...member.profile, model: modelId } }, type, {}, account);
+            const id = String(runtime.config.model);
+            catalog.set(id, { id, label: model.label?.trim() || id });
+          } catch {}
         }
       }
       res.json([...catalog.values()]);

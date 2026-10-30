@@ -101,6 +101,13 @@ caller's runtime and remains subject to permission and credential restrictions;
 it is not an arbitrary host-configuration or login tool. REST/CLI creation and
 hire runner options use the [shared request contract](../../packages/shared/src/validators/agent.ts).
 
+Explicit or inherited pool bindings accept gateway/local members compatible with
+the resolved child harness and the account's authoritative routing protocol.
+A nonempty model inventory does not invalidate a saved manual member default.
+Pool eligibility, member installation, responsible-user, hiring and approval
+checks still apply. [Hire and model-catalog fixtures](../../server/src/__tests__/agent-hire-ai-connections.test.ts)
+do not establish live-provider acceptance or qualify the full agent-access journey.
+
 Evidence: `source-only` — [implementation](../../server/src/routes/agents.ts#L1395) at
 the reviewed commit above.
 
