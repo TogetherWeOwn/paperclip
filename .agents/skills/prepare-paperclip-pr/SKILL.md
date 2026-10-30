@@ -31,8 +31,15 @@ each one).
 
 ## 2. Get changes cleanly on top of master
 
-* Fetch the target remote and rebase (or otherwise replay) your branch on top
-  of the target master so the PR has no merge conflicts.
+* **Merge-queue repos (e.g. AvoroGlobal/keystone): skip this step.** Where the
+  target repo lands PRs through a merge queue, never rebase, restack, or merge
+  the base branch into your PR branch just because it is "behind" — the queue
+  tests the combined tree, and every extra push re-runs the full review gate
+  and invalidates SHA-bound approvals. Only rebase or merge the base branch
+  when GitHub reports a real merge conflict or a gate explicitly requires
+  newer base code.
+* Otherwise: fetch the target remote and rebase (or otherwise replay) your
+  branch on top of the target master so the PR has no merge conflicts.
 * Re-verify after rebase: build/tests relevant to the change still pass at
   whatever depth the task warrants.
 
