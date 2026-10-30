@@ -26,7 +26,8 @@ export function registerGitHubReviewCheckWork(
           and l.lease_key = 'github-publication:' || (${chatActions.payload}->'event'->>'repositoryId')
             || ':' || (${chatActions.payload}->'event'->>'pullNumber'))`,
     }).from(chatActions).where(and(eq(chatActions.kind, "github_review_check"),
-      or(eq(chatActions.status, "received"), and(eq(chatActions.status, "failed"), sql`${chatActions.result}->>'retryable' = 'true'`)),
+      or(eq(chatActions.status, "received"), and(eq(chatActions.status, "failed"), sql`${chatActions.result}->>'retryable' = 'true'`),
+        and(eq(chatActions.status, "processed"), sql`${chatActions.result}->>'reconcilePending' = 'true'`)),
       scope ? eq(chatActions.companyId, scope.companyId) : undefined,
       scope?.endpointId ? eq(chatActions.endpointId, scope.endpointId) : undefined,
       scope?.repositoryId ? sql`${chatActions.payload}->'event'->>'repositoryId' = ${scope.repositoryId}` : undefined,
@@ -39,9 +40,12 @@ export function registerGitHubReviewCheckWork(
     const event = action.payload.event as GitHubReviewEventContext;
     let dueAt = action.result?.retryAt ? Date.parse(String(action.result.retryAt)) : 0;
     if (!Number.isFinite(dueAt)) throw new Error("GitHub review check has an invalid retry deadline");
-    if (action.status === "received") {
+    if (action.status === "received" || action.result?.reconcilePending === true) {
       const current = await githubReviewCheckState(db, action);
-      if (current.disposition !== "publish" || current.state !== action.result?.state) dueAt = 0;
+      if (current.disposition !== "publish" || current.state !== action.result?.state ||
+        (action.result?.reconcilePending === true &&
+          (current.authorizedAttempt || !current.assessmentOwner?.viable ||
+            (!current.awaitingRun && !current.assessmentOwner.publicationPending)))) dueAt = 0;
     }
     if (row.leaseExpiresAt) dueAt = Math.max(dueAt, Date.parse(row.leaseExpiresAt));
     return { id: action.id, companyId: action.companyId, endpointId: action.endpointId,

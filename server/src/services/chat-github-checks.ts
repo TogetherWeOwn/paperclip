@@ -76,7 +76,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
         ),
       )
       .limit(1);
-    if (!action || ["processed", "cancelled"].includes(action.status)) return;
+    if (!action || action.status === "cancelled" ||
+      (action.status === "processed" && action.result?.reconcilePending !== true)) return;
     const event = action.payload.event as GitHubReviewEventContext;
     const guardedFetch: typeof fetch = (input, init) => {
       if (!canContinue()) throw new GitHubPublicationLeaseLost();
@@ -97,7 +98,8 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
           .select()
           .from(chatActions)
           .where(eq(chatActions.id, id));
-        if (!fresh || ["processed", "cancelled"].includes(fresh.status)) return;
+        if (!fresh || fresh.status === "cancelled" ||
+          (fresh.status === "processed" && fresh.result?.reconcilePending !== true)) return;
         let attempts = Number(fresh.result?.attempts ?? 0);
         try {
           const currentState = await githubReviewCheckState(db, fresh);
@@ -112,7 +114,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          const { source, review, run, terminal, state, status, assessmentOwner } = currentState;
+          const { source, review, run, terminal, state, status, assessmentOwner, authorizedAttempt, awaitingRun } = currentState;
           const policy = review?.policySnapshot ?? {
             ...source.configuration.defaults,
             ...source.configuration.repositories[event.repositoryId],
@@ -180,10 +182,10 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
           // locally instead of stranding as queued/running. Only a distinct
           // authorized attempt (its own begin_review receipt, not an admission
           // receipt) publishes a replacement lifecycle over the prior result.
-          const authorizedAttempt =
-            !!review?.runId &&
-            review.deliveryId === `run:${review.runId}:${review.headSha}`;
           if (assessmentOwner?.viable && !authorizedAttempt) {
+            // Processing the suppression receipt does not finish reconciliation
+            // while its run or the owner's publication can still change.
+            const reconcilePending = awaitingRun || assessmentOwner.publicationPending;
             await lease.commit(async (tx) => {
               await notifyGitHubReviewProjection(tx, { companyId: action.companyId, endpointId: action.endpointId });
               if (review && ["queued", "running"].includes(review.state) && terminal)
@@ -205,14 +207,16 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                 .update(chatActions)
                 .set({
                   status: "processed",
-                  result: { code: "assessment_owns_check", reviewId: assessmentOwner.id },
+                  result: { code: "assessment_owns_check", reviewId: assessmentOwner.id, state,
+                    ...(reconcilePending ? { reconcilePending: true,
+                      retryAt: new Date(Date.now() + 5000).toISOString() } : {}) },
                   updatedAt: new Date(),
                 })
                 .where(eq(chatActions.id, id));
             });
             return;
           }
-          if (fresh.result?.state !== state) {
+          if (fresh.result?.state !== state || fresh.result?.code === "assessment_owns_check") {
             const origin = runtimePublicOrigin();
             const detailsPath = review
               ? `issues/${review.issueId}`
@@ -341,6 +345,11 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             and(
               eq(chatActions.status, "failed"),
               sql`${chatActions.result}->>'retryable' = 'true'`,
+              sql`(${chatActions.result}->>'retryAt')::timestamptz <= now()`,
+            ),
+            and(
+              eq(chatActions.status, "processed"),
+              sql`${chatActions.result}->>'reconcilePending' = 'true'`,
               sql`(${chatActions.result}->>'retryAt')::timestamptz <= now()`,
             ),
           ),

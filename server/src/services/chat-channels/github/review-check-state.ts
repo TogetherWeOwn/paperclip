@@ -57,13 +57,11 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
     .orderBy(desc(chatGitHubReviews.createdAt))
     .limit(1);
   if (review?.assessment) return { disposition: "assessment_owns_check" as const, reviewId: review.id };
-  // An assessed sibling may still own this head's provider check even when a
-  // newer unassessed row exists. Ownership is only viable while the assessment
-  // actually has a remote check (checkId) or a publication attempt that is
-  // still pending or retryable; a permanently unpublished assessment owns
-  // nothing and must not suppress the replacement lifecycle.
+  // A pending lifecycle also stores checkId, so that ID alone cannot prove
+  // assessment publication. Keep recoverable publications in charge, but let a
+  // replacement lifecycle proceed after permanent publication failure.
   let assessmentOwner:
-    | { id: string; viable: boolean }
+    | { id: string; viable: boolean; publicationPending: boolean }
     | undefined;
   if (review) {
     const [owner] = await db
@@ -81,36 +79,25 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
       .orderBy(desc(chatGitHubReviews.createdAt))
       .limit(1);
     if (owner) {
-      // The assessment owns while it has a remote check or while its terminal
-      // review state has no proof that publication is dead: a publication
-      // action that is still received or retryable may yet produce the check,
-      // and the absence of any publication record means the stored result is
-      // the standing lifecycle. Only an assessment whose publication failed
-      // permanently (or a non-terminal assessed row, such as a superseded or
-      // abandoned one) cannot consume the replacement check.
-      let viable = owner.checkId != null;
-      if (!viable && ["completed", "incomplete"].includes(owner.state)) {
-        const publications = await db
-          .select({ status: chatActions.status, result: chatActions.result })
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.companyId, action.companyId),
-              eq(chatActions.endpointId, action.endpointId),
-              eq(chatActions.kind, "github_review_publication"),
-              sql`${chatActions.payload}->>'reviewId' = ${owner.id}`,
-            ),
-          );
-        viable =
-          publications.length === 0 ||
-          publications.some(
-            (publication) =>
-              publication.status === "received" ||
-              (publication.status === "failed" &&
-                publication.result?.retryable === true),
-          );
-      }
-      assessmentOwner = { id: owner.id, viable };
+      const publications = await db
+        .select({ status: chatActions.status, result: chatActions.result })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.companyId, action.companyId),
+            eq(chatActions.endpointId, action.endpointId),
+            eq(chatActions.kind, "github_review_publication"),
+            sql`${chatActions.payload}->>'reviewId' = ${owner.id}`,
+          ),
+        );
+      const publicationPending = publications.some(
+        (publication) => publication.status === "received" ||
+          (publication.status === "failed" && publication.result?.retryable === true),
+      );
+      const viable = publications.some((publication) => publication.status === "processed") ||
+        (["completed", "incomplete"].includes(owner.state) &&
+          (publications.length === 0 || publicationPending));
+      assessmentOwner = { id: owner.id, viable, publicationPending };
     }
   }
   let run = review?.runId
@@ -121,9 +108,12 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
           .where(eq(heartbeatRuns.id, review.runId))
       )[0]
     : undefined;
-  if (review && !run) {
+  const manualAttempt = !!review?.runId && review.deliveryId === `run:${review.runId}:${review.headSha}`;
+  let automaticAttempt = false;
+  if (review && (!run || !manualAttempt)) {
     const [sourceRun] = await db
-      .select({ run: { id: heartbeatRuns.id, status: heartbeatRuns.status } })
+      .select({ run: { id: heartbeatRuns.id, status: heartbeatRuns.status },
+        deliveryId: chatDeliveries.id, deliveryState: chatDeliveries.state })
       .from(chatDeliveries)
       .innerJoin(
         chatMessageLinks,
@@ -139,13 +129,18 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
       )
       .where(
         and(
+          eq(chatDeliveries.companyId, action.companyId),
           eq(chatDeliveries.endpointId, action.endpointId),
           sql`${chatDeliveries.normalizedEvent}->'githubAutomatic'->'context'->>'deliveryId' = ${event.deliveryId}`,
+          review.runId ? eq(heartbeatRuns.id, review.runId) : undefined,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt))
       .limit(1);
-    run = sourceRun?.run;
+    run ??= sourceRun?.run;
+    automaticAttempt = !!review.runId && action.payload.admitted === true &&
+      sourceRun?.run.id === review.runId && sourceRun.deliveryId === review.deliveryId &&
+      sourceRun.deliveryState === "processed";
   }
   const [delivery] = await db
     .select({ state: chatDeliveries.state })
@@ -185,5 +180,8 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
       : state === "queued"
         ? "queued"
         : "completed";
-  return { disposition: "publish" as const, source, review, run, terminal, state, status, assessmentOwner };
+  const awaitingRun = !!review && !terminal && ["queued", "running"].includes(review.state) &&
+    delivery?.state !== "filtered" && delivery?.state !== "failed";
+  return { disposition: "publish" as const, source, review, run, terminal, state, status, assessmentOwner,
+    authorizedAttempt: manualAttempt || automaticAttempt, awaitingRun };
 }
