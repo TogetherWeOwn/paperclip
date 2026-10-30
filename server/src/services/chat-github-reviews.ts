@@ -1373,12 +1373,15 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
             }>(
               `/commits/${review.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
             );
-            const check = checks.check_runs.find(
+            // A fresh review attempt posts its own check run with the same
+            // stable name; the assessment completes the newest matching run,
+            // never a superseded earlier result.
+            const check = checks.check_runs.filter(
               (item) =>
                 item.external_id ===
                   `${source.endpoint.id}:${source.number}:${review.headSha}` &&
                 String(item.app?.id) === source.endpoint.botExternalId,
-            );
+            ).at(-1);
             await currentHead(review.headSha);
             const postedCheck = await api.request<{
               id: number;

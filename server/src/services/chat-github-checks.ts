@@ -112,7 +112,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
-          const { source, review, run, terminal, state, status } = currentState;
+          const { source, review, run, terminal, state, status, assessmentOwner } = currentState;
           const policy = review?.policySnapshot ?? {
             ...source.configuration.defaults,
             ...source.configuration.repositories[event.repositoryId],
@@ -175,6 +175,43 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             });
             return;
           }
+          // A viable assessed check still owns this head: the newest unassessed
+          // row never writes to the provider, but it must still reconcile
+          // locally instead of stranding as queued/running. Only a distinct
+          // authorized attempt (its own begin_review receipt, not an admission
+          // receipt) publishes a replacement lifecycle over the prior result.
+          const authorizedAttempt =
+            !!review?.runId &&
+            review.deliveryId === `run:${review.runId}:${review.headSha}`;
+          if (assessmentOwner?.viable && !authorizedAttempt) {
+            await lease.commit(async (tx) => {
+              await notifyGitHubReviewProjection(tx, { companyId: action.companyId, endpointId: action.endpointId });
+              if (review && ["queued", "running"].includes(review.state) && terminal)
+                await tx
+                  .update(chatGitHubReviews)
+                  .set({
+                    state,
+                    runId: run?.id ?? review.runId,
+                    conclusion,
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(chatGitHubReviews.id, review.id),
+                      isNull(chatGitHubReviews.assessment),
+                    ),
+                  );
+              await tx
+                .update(chatActions)
+                .set({
+                  status: "processed",
+                  result: { code: "assessment_owns_check", reviewId: assessmentOwner.id },
+                  updatedAt: new Date(),
+                })
+                .where(eq(chatActions.id, id));
+            });
+            return;
+          }
           if (fresh.result?.state !== state) {
             const origin = runtimePublicOrigin();
             const detailsPath = review
@@ -194,11 +231,11 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
             }>(
               `/commits/${event.headSha}/check-runs?check_name=Paperclip%20Review&per_page=100`,
             );
-            const check = checks.check_runs.find(
+            const check = checks.check_runs.filter(
               (check) =>
                 check.external_id === externalId &&
                 String(check.app?.id) === source.endpoint.botExternalId,
-            );
+            ).at(-1);
             // GitHub retains a completed check's conclusion when PATCHed back to
             // queued/in_progress. A fresh attempt needs a new check run with the
             // same stable name; otherwise a prior success still looks passing.
