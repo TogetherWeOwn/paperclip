@@ -8,7 +8,8 @@ import { connectionManagementService, continuingConnectionManagement } from "../
 import { connectionManagementGuard, connectionRequestContext, connectionRequestUserId, aiLoginUserAction } from "./connection-management-authz.js";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClaudeRunnerOptions, type AgentConfigurationWarning, type AgentRunnerChoice } from "@paperclipai/shared";
-import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
+import { pluginEnvironmentRunnerTaskDriver, resolveAgentRunnerEnvironmentForCompany, resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
+import { supportsPluginRunnerManagedCredentials } from "../services/native-runtime/plugin-runner-credentials.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -3076,8 +3077,7 @@ export function agentRoutes(
           : [{ id: member.profile.model, label: member.profile.model }, ...await listAdapterModels(memberAdapter)];
         for (const model of models) {
           try {
-            const modelId = routing ? aiRoutingModel(routing, agentHarnessType(type, member.profile), model.id) : model.id;
-            const runtime = poolMemberRuntimeConfig({ ...member, profile: { ...member.profile, model: modelId } }, type, {}, account);
+            const runtime = poolMemberRuntimeConfig({ ...member, profile: { ...member.profile, model: model.id } }, type, {}, account);
             const id = String(runtime.config.model);
             catalog.set(id, { id, label: model.label?.trim() || id });
           } catch {}
@@ -3191,6 +3191,8 @@ export function agentRoutes(
       const userId = responsibleUserForAiRequest(req);
       const memberConnectionIds = new Set<string>();
       const accounts = await aiConnectionService(db).list(companyId, userId ?? "");
+      const runnerEnvironment = adapterType === "paperclip_runner" ? await resolveAgentRunnerEnvironmentForCompany(db, companyId, environmentId) : null;
+      const runnerTasks = runnerEnvironment?.environment?.driver === "plugin" && await pluginEnvironmentRunnerTaskDriver(db, runnerEnvironment.environment);
       let compatible = false;
       let hasAccessibleMember = false;
       for (const member of pool.members) {
@@ -3199,6 +3201,7 @@ export function agentRoutes(
         hasAccessibleMember = true;
         let runtime: ReturnType<typeof poolMemberRuntimeConfig>;
         try { runtime = poolMemberRuntimeConfig(member, adapterType, {}, account); } catch { continue; }
+        if (runnerTasks && !supportsPluginRunnerManagedCredentials(runtime.config.provider === "acpx" ? runtime.config.acpxAgent : runtime.config.provider, account.routing)) continue;
         compatible = true;
         const allowUninstalledShared = newAgent && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, member.binding);
         try {

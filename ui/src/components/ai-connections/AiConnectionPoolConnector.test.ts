@@ -10,8 +10,19 @@ function accountOf(kind: "gateway" | "local", protocol: "chat" | "responses" | "
 }
 
 describe("connection pool member defaults", () => {
-  it.each(["gateway", "local"] as const)("uses OpenCode and the routed model for a chat %s connection", (kind) => {
-    expect(memberOf(accountOf(kind, "chat", `${kind}-chat-model`)).profile).toEqual({ provider: "opencode", model: `paperclip/${kind}-chat-model` });
+  it.each(["gateway", "local"] as const)("uses OpenCode and the raw model for a chat %s connection", (kind) => {
+    expect(memberOf(accountOf(kind, "chat", `${kind}-chat-model`)).profile).toEqual({ provider: "opencode", model: `${kind}-chat-model` });
+  });
+  it.each(["gateway", "local"] as const)("requires a model when a chat %s inventory is empty", (kind) => {
+    const account = accountOf(kind, "chat", "model");
+    const member = memberOf({ ...account, routing: { ...account.routing!, models: [] } });
+    expect(member.profile).toEqual({ provider: "opencode", model: "" });
+    expect(aiConnectionPoolMemberSchema.shape.profile.shape.model.safeParse(member.profile.model).success).toBe(false);
+  });
+  it.each(["gateway", "local"] as const)("preserves the first raw model when chat %s hints include colliding routed names", (kind) => {
+    const account = accountOf(kind, "chat", "custom/a");
+    expect(memberOf({ ...account, routing: { ...account.routing!, models: [{ id: "custom/a" }, { id: "paperclip/custom/a" }] } }).profile.model).toBe("custom/a");
+    expect(memberOf({ ...account, routing: { ...account.routing!, models: [{ id: "paperclip/custom/a" }, { id: "custom/a" }] } }).profile.model).toBe("paperclip/custom/a");
   });
   it.each([
     ["gateway", "responses", { provider: "codex", model: "gateway-responses-model" }],
@@ -27,11 +38,11 @@ describe("connection pool member defaults", () => {
     expect(aiConnectionPoolMemberSchema.parse({ ...member, profile: { ...member.profile, model: "m".repeat(267) } }).profile.model).toHaveLength(267);
     expect(aiConnectionPoolMemberSchema.safeParse({ ...member, profile: { ...member.profile, model: "m".repeat(268) } }).success).toBe(false);
   });
-  it("keeps a maximum-length chat model ID serializable after normalization", () => {
+  it("keeps a maximum-length raw chat model ID serializable", () => {
     const raw = "m".repeat(256);
     const account = { ...accountOf("gateway", "chat", raw), id: "00000000-0000-4000-8000-000000000001", grantId: "00000000-0000-4000-8000-000000000002" };
     const member = memberOf(account);
-    expect(member.profile.model).toBe(`paperclip/${raw}`);
-    expect(aiConnectionPoolMemberSchema.parse(member).profile.model).toHaveLength(266);
+    expect(member.profile.model).toBe(raw);
+    expect(aiConnectionPoolMemberSchema.parse(member).profile.model).toHaveLength(256);
   });
 });

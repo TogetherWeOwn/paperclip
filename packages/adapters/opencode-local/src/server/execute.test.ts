@@ -82,6 +82,25 @@ describe("OpenCode local skill injection", () => {
     expect(prompt).not.toContain("Create child issues");
   });
 
+  it.each(["high", "medium"])("passes a routed OpenCode variant %s to the CLI", async (variant) => {
+    const commandPath = path.join(configHome, "fake-opencode-variant");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "session", part: { text: "done" } }) }));
+    const result = await execute({
+      runId: "variant-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "paperclip/example-model", variant, env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {},
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    const args = runProcessMock.mock.calls[0]![3];
+    expect(args).toContain("--variant");
+    expect(args[args.indexOf("--variant") + 1]).toBe(variant);
+  });
+
   it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
     const commandPath = path.join(configHome, "fake-opencode-context");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });

@@ -188,8 +188,11 @@ Manual: Select the intended adapter and account, refresh model choices, and run 
 For gateway/local connection pools, model choices follow the requesting harness
 and the account's routing protocol, not its provider label alone. Verify OpenCode's
 `paperclip/` model namespace and Hermes's raw model IDs, including literal
-`paperclip/` aliases. Translate an OpenCode-namespaced saved default for Hermes
-only when the hints identify its raw counterpart and do not declare the exact ID.
+`paperclip/` aliases. Pool defaults remain raw: OpenCode must distinguish `custom/a`
+from the raw alias `paperclip/custom/a` by projecting the latter as
+`paperclip/paperclip/custom/a`; Hermes preserves both raw IDs. Empty chat inventories
+require explicit model entry before saving or enabling a pool. Verify the selected
+execution target supports the member's managed credentials before allocation.
 Model inventories are hints: retain saved manual member defaults absent from a nonempty inventory;
 qualify task overrides against declared hints when present and allow manual
 overrides when hints are empty. Saving or listing models does not prove provider

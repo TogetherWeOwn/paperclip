@@ -28,7 +28,8 @@ import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration } f
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
-import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
+import { createHeartbeatPoolRuntimeValidator, selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
+import { isPluginRunnerManagedCredentialSupported } from "./native-runtime/plugin-runner-credentials.js";
 import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
@@ -2504,6 +2505,7 @@ export function heartbeatService(
             companyId: agent.companyId, poolId: requestedAiBinding.connectionId, agentId: agent.id,
             userId: responsibleUserId, adapterType: agent.adapterType, taskKey: String(context.aiRouterTaskKey),
             overrides: issueAssigneeOverrides?.adapterConfig ?? {},
+            validateRuntime: createHeartbeatPoolRuntimeValidator(db, { run, agent, adapterType: agent.adapterType, issueId, issueContext, trustPreset, environmentsSvc, instanceSettings }),
             existingGrantId: typeof savedIdentity === "string" ? savedIdentity.split(":")[0] : undefined,
             requireExisting: Boolean(taskSession?.sessionDisplayId) && !shouldResetTaskSessionForWake(context),
             persisted: routerHasPersistedInput ? context.aiRouterSelection as AiConnectionRouterSelection | undefined : undefined,
@@ -2771,6 +2773,11 @@ export function heartbeatService(
           appendRunEvent,
         },
       }));
+      if (requestedAiBinding?.mode === "router" && managedAiRuntime && !isPluginRunnerManagedCredentialSupported({
+        executionTarget, adapterType: agent.adapterType, config: managedAiRuntime.config, routing: managedAiRuntime.config.managedAiRouting,
+      })) throw new ConfigurationIncompleteFailure("Plugin Runner does not support this managed credential provider or routing", {
+        configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` },
+      });
       const preparedInstructions = instructionWorkingCopy = createHeartbeatInstructionWorkingCopy({
         observabilityCompatibilityKey: observability?.compatibilityKey,
         db, instructionCopies, readRun: () => run!, agent, context,

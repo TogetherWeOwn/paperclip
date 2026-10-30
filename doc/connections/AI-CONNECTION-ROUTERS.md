@@ -35,6 +35,31 @@ Pins snapshot the concrete binding and member profile. Removing or editing a
 member affects future allocations. Composer changes can change a supported
 model or effort, with a note on fallback, but never the account or harness.
 Session reset and compaction retain the pin. Revocation requires operator repair.
+
+Gateway/local pool profiles store raw model IDs, up to 256 characters. OpenCode
+adds one `paperclip/` namespace at execution and catalog projection, including
+when a raw alias itself starts with `paperclip/`; Hermes uses the raw ID unchanged.
+This raw-storage rule does not change direct/OpenRouter profiles: their existing
+qualified model semantics remain, and compatibility checks use the effective task
+model after overrides rather than rejecting an unevaluated member default.
+Model inventories are hints and do not invalidate a saved manual default. Task
+overrides select a projected catalog ID or a matching raw hint; with no hints,
+manual model IDs remain available. Empty, whitespace-only or oversized overrides
+retain the default and produce a fallback note. Projected OpenCode models also
+retain the harness's provider/model format requirements. Raw aliases otherwise
+follow the connection schema, including aliases with internal spaces. A chat connection with
+no model hints requires explicit model entry before its pool can be saved or enabled.
+Qualified model identities remain lossless through usage receipts and accounting,
+with a 267-character maximum covering the OpenRouter namespace. Legacy OpenCode
+projects saved effort and task variants into `variant`; native OpenCode does not
+support that setting and reports a fallback note.
+
+Pool adoption and allocation also validate the selected execution environment.
+Plugin Runner task targets currently accept managed non-routed Codex and Claude
+credentials only. Unsupported members are excluded before a pin is committed;
+commit-time authorization and final execution-target validation remain required.
+Persisted-selection validation does not reinterpret current environment preferences;
+existing native recovery/lease rules and the actual-target credential guard still apply.
 Authentication repair uses the failed run’s durable concrete allocation and
 current member permissions; reconnect-and-continue preserves the agent’s pool
 binding. Changing the agent’s pool invalidates the old repair card.
