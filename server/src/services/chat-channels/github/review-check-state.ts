@@ -54,7 +54,10 @@ export async function githubReviewCheckState(db: Db, action: typeof chatActions.
         eq(chatGitHubReviews.headSha, event.headSha),
       ),
     )
-    .orderBy(desc(chatGitHubReviews.createdAt))
+    .orderBy(
+      desc(sql`${chatGitHubReviews.assessment} is not null`),
+      desc(chatGitHubReviews.createdAt),
+    )
     .limit(1);
   if (review?.assessment) return { disposition: "assessment_owns_check" as const, reviewId: review.id };
   let run = review?.runId
