@@ -178,6 +178,33 @@ describe("plugin http.fetch response byte cap", () => {
     }
   });
 
+  it("does not refuse bodiless HEAD and 304 responses by their content-length", async () => {
+    const port = await httpServer((req, res) => {
+      res.writeHead(req.url === "/not-modified" ? 304 : 200, {
+        "content-length": String(300 * 1024 * 1024),
+      });
+      res.end();
+    });
+
+    const head = await executePinnedHttpRequest(
+      loopbackTarget(port, "/file"),
+      { method: "HEAD" },
+      new AbortController().signal,
+      1024,
+    );
+    expect(head.status).toBe(200);
+    expect(head.headers["content-length"]).toBe(String(300 * 1024 * 1024));
+    expect(head.body).toBe("");
+
+    const notModified = await executePinnedHttpRequest(
+      loopbackTarget(port, "/not-modified"),
+      undefined,
+      new AbortController().signal,
+      1024,
+    );
+    expect(notModified.status).toBe(304);
+  });
+
   it("validates maxResponseBytes and clamps it to the host-wide cap", () => {
     expect(resolvePluginFetchByteLimit(undefined)).toBe(200 * 1024 * 1024);
     expect(resolvePluginFetchByteLimit(4096)).toBe(4096);
@@ -218,6 +245,7 @@ describe("plugin http.fetch redirect mode", () => {
       url: string;
       method: string;
       authorization?: string;
+      headers: IncomingMessage["headers"];
       body: string;
     }> = [];
     const port = await httpServer((req, res) => {
@@ -230,6 +258,7 @@ describe("plugin http.fetch redirect mode", () => {
           url: req.url ?? "",
           method: req.method ?? "",
           authorization: req.headers.authorization,
+          headers: req.headers,
           body,
         });
         if (req.url === "/start") {
@@ -332,6 +361,88 @@ describe("plugin http.fetch redirect mode", () => {
     );
     expect(final.seen).toHaveLength(1);
     expect(final.seen[0]?.authorization).toBeUndefined();
+  });
+
+  it("keeps only safe headers when a followed redirect changes origin", async () => {
+    const final = await redirectServer();
+    const hop = await httpServer((_req, res) => {
+      res.writeHead(307, { location: `http://127.0.0.1:${final.port}/final` });
+      res.end();
+    });
+    await runPluginHttpFetch(
+      `http://127.0.0.1:${hop}/`,
+      {
+        redirect: "follow",
+        headers: {
+          "x-api-key": "secret",
+          "x-amz-security-token": "secret",
+          accept: "application/json",
+          "user-agent": "plugin",
+        },
+      },
+      new AbortController().signal,
+      1024,
+      loopbackResolver,
+    );
+    const headers = final.seen[0]?.headers ?? {};
+    expect(headers["x-api-key"]).toBeUndefined();
+    expect(headers["x-amz-security-token"]).toBeUndefined();
+    expect(headers.accept).toBe("application/json");
+    expect(headers["user-agent"]).toBe("plugin");
+  });
+
+  it("keeps custom headers when a followed redirect stays on the same origin", async () => {
+    const { port, seen } = await redirectServer();
+    await runPluginHttpFetch(
+      `http://127.0.0.1:${port}/start`,
+      { redirect: "follow", headers: { "x-api-key": "secret" } },
+      new AbortController().signal,
+      1024,
+      loopbackResolver,
+    );
+    expect(seen.map((r) => r.headers["x-api-key"])).toEqual([
+      "secret",
+      "secret",
+    ]);
+  });
+
+  it("refuses a cross-origin redirect to a URL with credentials", async () => {
+    const final = await redirectServer();
+    const hop = await httpServer((_req, res) => {
+      res.writeHead(302, {
+        location: `http://user:pass@127.0.0.1:${final.port}/final`,
+      });
+      res.end();
+    });
+    await expect(
+      runPluginHttpFetch(
+        `http://127.0.0.1:${hop}/`,
+        { redirect: "follow" },
+        new AbortController().signal,
+        1024,
+        loopbackResolver,
+      ),
+    ).rejects.toThrow(/credentials/);
+    expect(final.seen).toHaveLength(0);
+  });
+
+  it("does not apply the byte cap to a redirect body it follows past", async () => {
+    const final = await redirectServer();
+    const hop = await httpServer((_req, res) => {
+      res.writeHead(302, {
+        location: `http://127.0.0.1:${final.port}/final`,
+        "content-length": String(64 * 1024),
+      });
+      res.end("r".repeat(64 * 1024));
+    });
+    const result = await runPluginHttpFetch(
+      `http://127.0.0.1:${hop}/`,
+      { redirect: "follow" },
+      new AbortController().signal,
+      1024,
+      loopbackResolver,
+    );
+    expect(result.body).toBe("final");
   });
 
   it("stops after too many redirects", async () => {

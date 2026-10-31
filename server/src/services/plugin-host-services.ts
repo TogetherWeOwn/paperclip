@@ -100,8 +100,19 @@ const MAX_PLUGIN_FETCH_REDIRECTS = 20;
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-/** Headers dropped when a followed redirect leaves the original origin. */
-const CROSS_ORIGIN_REDIRECT_STRIPPED_HEADERS = ["authorization", "cookie", "proxy-authorization"];
+/**
+ * The only caller headers kept when a followed redirect leaves the original
+ * origin. Plugins authenticate with many custom headers (`x-api-key` and
+ * similar), so every other header is dropped rather than a named few.
+ */
+const CROSS_ORIGIN_REDIRECT_SAFE_HEADERS = new Set([
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  "content-language",
+  "content-type",
+  "user-agent",
+]);
 
 /**
  * A plugin fetch response body crossed the per-call or host-wide byte cap. The
@@ -303,6 +314,7 @@ export async function executePinnedHttpRequest(
   init: RequestInit | undefined,
   signal: AbortSignal,
   maxResponseBytes: number = MAX_RESPONSE_BODY_BYTES,
+  discardBody?: (status: number, headers: IncomingMessage["headers"]) => boolean,
 ): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
@@ -318,10 +330,21 @@ export async function executePinnedHttpRequest(
     req.end();
   });
 
+  const status = response.statusCode ?? 500;
+  // A body the caller never sees (an intermediate redirect) is not read, so
+  // the cap applies only to the body that is returned.
+  const discard = discardBody?.(status, response.headers) === true;
+  if (discard) response.destroy();
+
   // Refuse a declared length over the cap before reading any of the body. A
-  // smaller (false) declared length is still bounded by the count below.
+  // smaller (false) declared length is still bounded by the count below. HEAD,
+  // 204 and 304 responses carry a content-length but no body.
   const declaredLength = Number(response.headers["content-length"]);
-  if (Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
+  const bodiless = discard
+    || options.method?.toUpperCase() === "HEAD"
+    || status === 204
+    || status === 304;
+  if (!bodiless && Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
     response.destroy();
     throw new PluginHttpResponseTooLargeError(
       maxResponseBytes,
@@ -331,7 +354,7 @@ export async function executePinnedHttpRequest(
 
   const chunks: Buffer[] = [];
   let totalBytes = 0;
-  await new Promise<void>((resolve, reject) => {
+  if (!discard) await new Promise<void>((resolve, reject) => {
     response.on("data", (chunk: Buffer | string) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBytes += buf.length;
@@ -356,7 +379,7 @@ export async function executePinnedHttpRequest(
   }
 
   return {
-    status: response.statusCode ?? 500,
+    status,
     statusText: response.statusMessage ?? "",
     headers,
     body: Buffer.concat(chunks).toString("utf8"),
@@ -387,7 +410,9 @@ function redirectRequestInit(
     }
   }
   if (crossOrigin) {
-    for (const name of CROSS_ORIGIN_REDIRECT_STRIPPED_HEADERS) headers.delete(name);
+    for (const name of Array.from(headers.keys())) {
+      if (!CROSS_ORIGIN_REDIRECT_SAFE_HEADERS.has(name)) headers.delete(name);
+    }
   }
   return {
     ...init,
@@ -415,7 +440,15 @@ export async function runPluginHttpFetch(
     // Resolve once, then connect directly to that IP to prevent DNS
     // rebinding. Every redirect hop is validated again.
     const target = await resolveTarget(url);
-    const response = await executePinnedHttpRequest(target, init, signal, maxResponseBytes);
+    const response = await executePinnedHttpRequest(
+      target,
+      init,
+      signal,
+      maxResponseBytes,
+      redirectMode === "follow"
+        ? (status, headers) => REDIRECT_STATUSES.has(status) && Boolean(headers.location)
+        : undefined,
+    );
     // Any mode other than "follow" or "error" keeps the manual behavior.
     if (!REDIRECT_STATUSES.has(response.status) || (redirectMode !== "follow" && redirectMode !== "error")) {
       return response;
@@ -430,6 +463,11 @@ export async function runPluginHttpFetch(
     }
     const from = new URL(url);
     const to = new URL(location, from);
+    // As in the fetch standard: never send credentials embedded in a
+    // redirect target on another origin.
+    if (from.origin !== to.origin && (to.username || to.password)) {
+      throw new Error("Refused redirect to another origin with credentials in the URL");
+    }
     init = redirectRequestInit(init, response.status, from, to);
     url = to.toString();
   }
@@ -874,8 +912,10 @@ export function buildHostServices(
   const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
   // Abort controllers for in-flight `http.fetch` calls the worker can cancel,
-  // keyed by the worker-chosen fetch id.
+  // keyed by the worker-chosen fetch id. `activeFetches` holds every in-flight
+  // call, with or without an id, so dispose() can abort them all.
   const inFlightFetches = new Map<string, AbortController>();
+  const activeFetches = new Set<AbortController>();
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -1702,6 +1742,7 @@ export function buildHostServices(
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
         const fetchId = typeof params.fetchId === "string" && params.fetchId ? params.fetchId : undefined;
+        activeFetches.add(controller);
         if (fetchId) inFlightFetches.set(fetchId, controller);
 
         try {
@@ -1713,6 +1754,7 @@ export function buildHostServices(
           );
         } finally {
           clearTimeout(timeout);
+          activeFetches.delete(controller);
           if (fetchId && inFlightFetches.get(fetchId) === controller) inFlightFetches.delete(fetchId);
         }
       },
@@ -3576,7 +3618,8 @@ export function buildHostServices(
     dispose() {
       disposed = true;
 
-      for (const controller of inFlightFetches.values()) controller.abort();
+      for (const controller of activeFetches) controller.abort();
+      activeFetches.clear();
       inFlightFetches.clear();
 
       // Clear event bus subscriptions to prevent accumulation on worker restart.
