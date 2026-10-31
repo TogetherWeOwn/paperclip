@@ -35,6 +35,7 @@ import { environmentCreationCleanupErrorData } from "./environment-creation-clea
  * @see PLUGIN_SPEC.md §14 — SDK Surface
  */
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
@@ -59,6 +60,7 @@ import type {
 import type {
   PluginContext,
   PluginEvent,
+  PluginHttpFetchInit,
   PluginJobContext,
   PluginLauncherRegistration,
   ScopeKey,
@@ -581,7 +583,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       http: {
-        async fetch(url: string, init?: RequestInit): Promise<Response> {
+        async fetch(url: string, init?: PluginHttpFetchInit): Promise<Response> {
           const serializedInit: Record<string, unknown> = {};
           if (init) {
             if (init.method) serializedInit.method = init.method;
@@ -604,12 +606,41 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
                 ? init.body
                 : String(init.body);
             }
+            if (init.redirect) serializedInit.redirect = init.redirect;
           }
 
-          const result = await callHost("http.fetch", {
+          const signal = init?.signal ?? undefined;
+          signal?.throwIfAborted();
+          const fetchId = signal ? randomUUID() : undefined;
+
+          // Reject as soon as the plugin aborts, and ask the host to abort the
+          // outbound request. The listener goes on before the request is sent
+          // so an abort can't slip in between. An older host without
+          // `http.fetch.cancel` answers METHOD_NOT_FOUND, which is ignored.
+          let onAbort: (() => void) | undefined;
+          const aborted = signal && fetchId
+            ? new Promise<never>((_, reject) => {
+              onAbort = () => {
+                callHost("http.fetch.cancel", { fetchId }).catch(() => {});
+                reject(signal.reason);
+              };
+              signal.addEventListener("abort", onAbort, { once: true });
+            })
+            : undefined;
+
+          const call = callHost("http.fetch", {
             url,
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            ...(init?.maxResponseBytes !== undefined ? { maxResponseBytes: init.maxResponseBytes } : {}),
+            ...(fetchId ? { fetchId } : {}),
           });
+
+          let result: Awaited<typeof call>;
+          try {
+            result = await (aborted ? Promise.race([call, aborted]) : call);
+          } finally {
+            if (onAbort) signal?.removeEventListener("abort", onAbort);
+          }
 
           // Reconstruct a Response-like object from the serialized result
           return new Response(result.body, {

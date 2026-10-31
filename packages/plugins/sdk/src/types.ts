@@ -634,6 +634,21 @@ export interface PluginDatabaseClient {
 }
 
 /**
+ * Options for `ctx.http.fetch`: standard `RequestInit` plus host-enforced
+ * limits.
+ */
+export interface PluginHttpFetchInit extends RequestInit {
+  /**
+   * Maximum response body size in bytes. The host stops reading as soon as the
+   * body crosses this limit (or when a declared `content-length` is already
+   * larger) and the call rejects with a `JsonRpcCallError` whose code is
+   * `PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE`. The host-wide cap
+   * (200 MB) still applies when this is unset or larger.
+   */
+  maxResponseBytes?: number;
+}
+
+/**
  * `ctx.http` — make outbound HTTP requests.
  *
  * Requires `http.outbound` capability.
@@ -648,11 +663,16 @@ export interface PluginHttpClient {
    * Plugins may also use standard Node `fetch` or other libraries directly —
    * this client exists for host-managed tracing and audit logging.
    *
+   * `method`, `headers`, `body`, `redirect` and `signal` are forwarded to the
+   * host. The host never follows redirects unless `redirect: "follow"` is set;
+   * `redirect: "error"` rejects on a 3xx response. Aborting `signal` rejects
+   * the call and aborts the host request.
+   *
    * @param url - Target URL
-   * @param init - Standard `RequestInit` options
+   * @param init - Standard `RequestInit` options plus `maxResponseBytes`
    * @returns The response
    */
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  fetch(url: string, init?: PluginHttpFetchInit): Promise<Response>;
 }
 
 /**
