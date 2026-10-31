@@ -10,11 +10,11 @@ import {
   createSuccessResponse,
   isJsonRpcRequest,
   isJsonRpcResponse,
-  parseMessage,
-  PLUGIN_RPC_ERROR_CODES,
-  serializeMessage,
   type JsonRpcRequest,
   type JsonRpcResponse,
+  PLUGIN_RPC_ERROR_CODES,
+  parseMessage,
+  serializeMessage,
 } from "../src/protocol.js";
 import type { PluginHttpFetchInit } from "../src/types.js";
 import { startWorkerRpcHost } from "../src/worker-rpc-host.js";
@@ -24,7 +24,10 @@ import { startWorkerRpcHost } from "../src/worker-rpc-host.js";
  * `maxResponseBytes` and `signal` to the host instead of dropping them.
  */
 
-type HostFetchHandler = (request: JsonRpcRequest, reply: (response: JsonRpcResponse) => void) => void;
+type HostFetchHandler = (
+  request: JsonRpcRequest,
+  reply: (response: JsonRpcResponse) => void,
+) => void;
 
 async function withFetchWorker(
   makeInit: () => PluginHttpFetchInit,
@@ -41,7 +44,10 @@ async function withFetchWorker(
     async setup(ctx) {
       ctx.actions.register("fetch", async () => {
         try {
-          const res = await ctx.http.fetch("https://example.test/data", makeInit());
+          const res = await ctx.http.fetch(
+            "https://example.test/data",
+            makeInit(),
+          );
           return { status: res.status, body: await res.text() };
         } catch (err) {
           return {
@@ -52,9 +58,14 @@ async function withFetchWorker(
       });
     },
   });
-  const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+  const worker = startWorkerRpcHost({
+    plugin,
+    stdin: hostToWorker,
+    stdout: workerToHost,
+  });
 
-  const reply = (response: JsonRpcResponse) => hostToWorker.write(serializeMessage(response));
+  const reply = (response: JsonRpcResponse) =>
+    hostToWorker.write(serializeMessage(response));
 
   function callWorker(method: string, params: unknown) {
     const id = `host-${nextRequestId++}`;
@@ -112,7 +123,12 @@ describe("worker ctx.http.fetch bridge", () => {
   it("forwards redirect and maxResponseBytes, with no fetch id when there is no signal", async () => {
     const seen: unknown[] = [];
     await withFetchWorker(
-      () => ({ method: "POST", body: "x", redirect: "manual", maxResponseBytes: 4096 }),
+      () => ({
+        method: "POST",
+        body: "x",
+        redirect: "manual",
+        maxResponseBytes: 4096,
+      }),
       (request, reply) => {
         seen.push(request.params);
         reply(createSuccessResponse(request.id, okResult));
@@ -121,22 +137,26 @@ describe("worker ctx.http.fetch bridge", () => {
         await expect(callFetch()).resolves.toEqual({ status: 200, body: "ok" });
       },
     );
-    expect(seen).toEqual([{
-      url: "https://example.test/data",
-      init: { method: "POST", body: "x", redirect: "manual" },
-      maxResponseBytes: 4096,
-    }]);
+    expect(seen).toEqual([
+      {
+        url: "https://example.test/data",
+        init: { method: "POST", body: "x", redirect: "manual" },
+        maxResponseBytes: 4096,
+      },
+    ]);
   });
 
   it("passes the host's typed too-large error through to the plugin", async () => {
     await withFetchWorker(
       () => ({ maxResponseBytes: 10 }),
       (request, reply) => {
-        reply(createErrorResponse(
-          request.id,
-          PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE,
-          "Response body exceeded 10 bytes (while streaming)",
-        ));
+        reply(
+          createErrorResponse(
+            request.id,
+            PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE,
+            "Response body exceeded 10 bytes (while streaming)",
+          ),
+        );
       },
       async (callFetch) => {
         await expect(callFetch()).resolves.toEqual({
@@ -151,7 +171,9 @@ describe("worker ctx.http.fetch bridge", () => {
     const controller = new AbortController();
     const requests: JsonRpcRequest[] = [];
     let cancelled!: () => void;
-    const cancelSeen = new Promise<void>((resolve) => { cancelled = resolve; });
+    const cancelSeen = new Promise<void>((resolve) => {
+      cancelled = resolve;
+    });
 
     await withFetchWorker(
       () => ({ signal: controller.signal }),
@@ -166,26 +188,34 @@ describe("worker ctx.http.fetch bridge", () => {
         }
       },
       async (callFetch) => {
-        await expect(callFetch()).resolves.toEqual({ error: "AbortError", code: 20 });
+        await expect(callFetch()).resolves.toEqual({
+          error: "AbortError",
+          code: 20,
+        });
         await cancelSeen;
       },
     );
 
     const [fetchRequest, cancelRequest] = requests;
-    expect(fetchRequest!.method).toBe("http.fetch");
-    const fetchId = (fetchRequest!.params as { fetchId?: string }).fetchId;
+    expect(fetchRequest?.method).toBe("http.fetch");
+    const fetchId = (fetchRequest?.params as { fetchId?: string } | undefined)
+      ?.fetchId;
     expect(fetchId).toEqual(expect.any(String));
-    expect(cancelRequest!.method).toBe("http.fetch.cancel");
-    expect(cancelRequest!.params).toEqual({ fetchId });
+    expect(cancelRequest?.method).toBe("http.fetch.cancel");
+    expect(cancelRequest?.params).toEqual({ fetchId });
   });
 
   it("does not call the host when the signal is already aborted", async () => {
     const requests: JsonRpcRequest[] = [];
     await withFetchWorker(
       () => ({ signal: AbortSignal.abort() }),
-      (request) => { requests.push(request); },
+      (request) => {
+        requests.push(request);
+      },
       async (callFetch) => {
-        await expect(callFetch()).resolves.toMatchObject({ error: "AbortError" });
+        await expect(callFetch()).resolves.toMatchObject({
+          error: "AbortError",
+        });
       },
     );
     expect(requests).toEqual([]);
@@ -199,11 +229,19 @@ describe("worker ctx.http.fetch bridge", () => {
         if (request.method === "http.fetch") {
           controller.abort();
         } else {
-          reply(createErrorResponse(request.id, -32601, `Host does not handle method "${request.method}"`));
+          reply(
+            createErrorResponse(
+              request.id,
+              -32601,
+              `Host does not handle method "${request.method}"`,
+            ),
+          );
         }
       },
       async (callFetch) => {
-        await expect(callFetch()).resolves.toMatchObject({ error: "AbortError" });
+        await expect(callFetch()).resolves.toMatchObject({
+          error: "AbortError",
+        });
         // Let the cancel's METHOD_NOT_FOUND arrive; it must not surface anywhere.
         await new Promise((resolve) => setTimeout(resolve, 20));
       },

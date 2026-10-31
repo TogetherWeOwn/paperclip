@@ -1,11 +1,21 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { createServer as netCreateServer, type AddressInfo, type Server as NetServer, type Socket } from "node:net";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import {
+  type AddressInfo,
+  type Server as NetServer,
+  createServer as netCreateServer,
+  type Socket,
+} from "node:net";
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  PluginHttpResponseTooLargeError,
   executePinnedHttpRequest,
+  PluginHttpResponseTooLargeError,
   resolvePluginFetchByteLimit,
   runPluginHttpFetch,
   type ValidatedFetchTarget,
@@ -25,17 +35,28 @@ const openSockets: Socket[] = [];
 
 afterEach(async () => {
   for (const socket of openSockets.splice(0)) socket.destroy();
-  await Promise.all(openServers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  await Promise.all(
+    openServers
+      .splice(0)
+      .map(
+        (server) =>
+          new Promise<void>((resolve) => server.close(() => resolve())),
+      ),
+  );
 });
 
 async function listen(server: Server | NetServer): Promise<number> {
   openServers.push(server);
   server.on("connection", (socket: Socket) => openSockets.push(socket));
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) =>
+    server.listen(0, "127.0.0.1", () => resolve()),
+  );
   return (server.address() as AddressInfo).port;
 }
 
-async function httpServer(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<number> {
+async function httpServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<number> {
   return listen(createServer(handler));
 }
 
@@ -50,14 +71,23 @@ function loopbackTarget(port: number, path = "/"): ValidatedFetchTarget {
 
 const loopbackResolver = async (url: string) => {
   const parsed = new URL(url);
-  return { ...loopbackTarget(Number(parsed.port)), parsedUrl: parsed, hostHeader: parsed.host };
+  return {
+    ...loopbackTarget(Number(parsed.port)),
+    parsedUrl: parsed,
+    hostHeader: parsed.host,
+  };
 };
 
 describe("plugin http.fetch response byte cap", () => {
   it("returns a body that fits under maxResponseBytes", async () => {
     const port = await httpServer((_req, res) => res.end("x".repeat(1000)));
 
-    const result = await executePinnedHttpRequest(loopbackTarget(port), undefined, new AbortController().signal, 1000);
+    const result = await executePinnedHttpRequest(
+      loopbackTarget(port),
+      undefined,
+      new AbortController().signal,
+      1000,
+    );
 
     expect(result.status).toBe(200);
     expect(result.body).toHaveLength(1000);
@@ -66,7 +96,9 @@ describe("plugin http.fetch response byte cap", () => {
   it("aborts an endless chunked body as soon as it crosses the cap", async () => {
     let bytesSent = 0;
     let closed!: () => void;
-    const socketClosed = new Promise<void>((resolve) => { closed = resolve; });
+    const socketClosed = new Promise<void>((resolve) => {
+      closed = resolve;
+    });
     const port = await httpServer((_req, res) => {
       res.writeHead(200, { "content-type": "text/plain" }); // no content-length: chunked
       const chunk = Buffer.alloc(16 * 1024, 0x61);
@@ -88,7 +120,9 @@ describe("plugin http.fetch response byte cap", () => {
     ).catch((err: unknown) => err);
 
     expect(error).toBeInstanceOf(PluginHttpResponseTooLargeError);
-    expect((error as PluginHttpResponseTooLargeError).code).toBe(PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE);
+    expect((error as PluginHttpResponseTooLargeError).code).toBe(
+      PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE,
+    );
     expect((error as Error).message).toContain("while streaming");
     // The host hung up; the server did not keep streaming into it.
     await socketClosed;
@@ -119,7 +153,9 @@ describe("plugin http.fetch response byte cap", () => {
     const server = netCreateServer((socket) => {
       socket.on("error", () => {});
       socket.once("data", () => {
-        socket.write("HTTP/1.1 200 OK\r\ncontent-length: 16\r\nconnection: close\r\n\r\n");
+        socket.write(
+          "HTTP/1.1 200 OK\r\ncontent-length: 16\r\nconnection: close\r\n\r\n",
+        );
         socket.end(Buffer.alloc(1024 * 1024, 0x62));
       });
     });
@@ -130,7 +166,10 @@ describe("plugin http.fetch response byte cap", () => {
       undefined,
       new AbortController().signal,
       1024,
-    ).then((result) => ({ body: result.body }), (err: unknown) => ({ err }));
+    ).then(
+      (result) => ({ body: result.body }),
+      (err: unknown) => ({ err }),
+    );
 
     if ("body" in outcome) {
       expect(outcome.body.length).toBeLessThanOrEqual(16);
@@ -143,9 +182,13 @@ describe("plugin http.fetch response byte cap", () => {
     expect(resolvePluginFetchByteLimit(undefined)).toBe(200 * 1024 * 1024);
     expect(resolvePluginFetchByteLimit(4096)).toBe(4096);
     expect(resolvePluginFetchByteLimit(0)).toBe(0);
-    expect(resolvePluginFetchByteLimit(Number.MAX_SAFE_INTEGER)).toBe(200 * 1024 * 1024);
+    expect(resolvePluginFetchByteLimit(Number.MAX_SAFE_INTEGER)).toBe(
+      200 * 1024 * 1024,
+    );
     for (const bad of [-1, 1.5, Number.NaN, "1024", Infinity]) {
-      expect(() => resolvePluginFetchByteLimit(bad)).toThrow(/maxResponseBytes/);
+      expect(() => resolvePluginFetchByteLimit(bad)).toThrow(
+        /maxResponseBytes/,
+      );
     }
   });
 });
@@ -158,7 +201,11 @@ describe("plugin http.fetch abort", () => {
     });
     const controller = new AbortController();
 
-    const pending = executePinnedHttpRequest(loopbackTarget(port), undefined, controller.signal);
+    const pending = executePinnedHttpRequest(
+      loopbackTarget(port),
+      undefined,
+      controller.signal,
+    );
     setTimeout(() => controller.abort(), 50);
 
     await expect(pending).rejects.toThrow();
@@ -167,12 +214,24 @@ describe("plugin http.fetch abort", () => {
 
 describe("plugin http.fetch redirect mode", () => {
   async function redirectServer() {
-    const seen: Array<{ url: string; method: string; authorization?: string; body: string }> = [];
+    const seen: Array<{
+      url: string;
+      method: string;
+      authorization?: string;
+      body: string;
+    }> = [];
     const port = await httpServer((req, res) => {
       let body = "";
-      req.on("data", (chunk) => { body += chunk; });
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
       req.on("end", () => {
-        seen.push({ url: req.url ?? "", method: req.method ?? "", authorization: req.headers.authorization, body });
+        seen.push({
+          url: req.url ?? "",
+          method: req.method ?? "",
+          authorization: req.headers.authorization,
+          body,
+        });
         if (req.url === "/start") {
           res.writeHead(302, { location: "/final" });
           res.end();
@@ -194,7 +253,11 @@ describe("plugin http.fetch redirect mode", () => {
     const { port, seen } = await redirectServer();
     for (const init of [undefined, { redirect: "manual" } as RequestInit]) {
       const result = await runPluginHttpFetch(
-        `http://127.0.0.1:${port}/start`, init, new AbortController().signal, 1024, loopbackResolver,
+        `http://127.0.0.1:${port}/start`,
+        init,
+        new AbortController().signal,
+        1024,
+        loopbackResolver,
       );
       expect(result.status).toBe(302);
       expect(result.headers.location).toBe("/final");
@@ -204,9 +267,15 @@ describe("plugin http.fetch redirect mode", () => {
 
   it("rejects on a 3xx when redirect is error", async () => {
     const { port } = await redirectServer();
-    await expect(runPluginHttpFetch(
-      `http://127.0.0.1:${port}/start`, { redirect: "error" }, new AbortController().signal, 1024, loopbackResolver,
-    )).rejects.toThrow(/redirect mode is "error"/);
+    await expect(
+      runPluginHttpFetch(
+        `http://127.0.0.1:${port}/start`,
+        { redirect: "error" },
+        new AbortController().signal,
+        1024,
+        loopbackResolver,
+      ),
+    ).rejects.toThrow(/redirect mode is "error"/);
   });
 
   it("follows and re-resolves each hop when redirect is follow", async () => {
@@ -217,7 +286,10 @@ describe("plugin http.fetch redirect mode", () => {
       { redirect: "follow" },
       new AbortController().signal,
       1024,
-      async (url) => { resolved.push(new URL(url).pathname); return loopbackResolver(url); },
+      async (url) => {
+        resolved.push(new URL(url).pathname);
+        return loopbackResolver(url);
+      },
     );
     expect(result.status).toBe(200);
     expect(result.body).toBe("final");
@@ -229,7 +301,12 @@ describe("plugin http.fetch redirect mode", () => {
     const { port, seen } = await redirectServer();
     await runPluginHttpFetch(
       `http://127.0.0.1:${port}/see-other`,
-      { redirect: "follow", method: "POST", body: "payload", headers: { "content-type": "text/plain" } },
+      {
+        redirect: "follow",
+        method: "POST",
+        body: "payload",
+        headers: { "content-type": "text/plain" },
+      },
       new AbortController().signal,
       1024,
       loopbackResolver,
@@ -254,13 +331,19 @@ describe("plugin http.fetch redirect mode", () => {
       loopbackResolver,
     );
     expect(final.seen).toHaveLength(1);
-    expect(final.seen[0]!.authorization).toBeUndefined();
+    expect(final.seen[0]?.authorization).toBeUndefined();
   });
 
   it("stops after too many redirects", async () => {
     const { port } = await redirectServer();
-    await expect(runPluginHttpFetch(
-      `http://127.0.0.1:${port}/loop`, { redirect: "follow" }, new AbortController().signal, 1024, loopbackResolver,
-    )).rejects.toThrow(/Too many redirects/);
+    await expect(
+      runPluginHttpFetch(
+        `http://127.0.0.1:${port}/loop`,
+        { redirect: "follow" },
+        new AbortController().signal,
+        1024,
+        loopbackResolver,
+      ),
+    ).rejects.toThrow(/Too many redirects/);
   });
 });
