@@ -146,6 +146,8 @@ export interface HostServices {
   /** Provides `http.fetch`. */
   http: {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
+    /** Abort an in-flight `http.fetch` started with the same `fetchId`. */
+    cancel(params: WorkerToHostMethods["http.fetch.cancel"][0]): Promise<void>;
   };
 
   /** Provides `secrets.resolve`. */
@@ -409,6 +411,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // HTTP
   "http.fetch": "http.outbound",
+  "http.fetch.cancel": "http.outbound",
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
@@ -774,6 +777,9 @@ export function createHostClientHandlers(
     // HTTP
     "http.fetch": gated("http.fetch", async (params) => {
       return services.http.fetch(params);
+    }),
+    "http.fetch.cancel": gated("http.fetch.cancel", async (params) => {
+      return services.http.cancel(params);
     }),
 
     // Secrets

@@ -78,7 +78,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
-import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
+import { PLUGIN_RPC_ERROR_CODES, type WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
   SANDBOX_STARTUP_SPAN_ATTRS,
@@ -91,6 +91,50 @@ import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumenta
 
 /** Maximum time (ms) a plugin fetch request may take before being aborted. */
 const PLUGIN_FETCH_TIMEOUT_MS = 30_000;
+
+/** Host-wide cap on a plugin fetch response body; `maxResponseBytes` may only lower it. */
+const MAX_RESPONSE_BODY_BYTES = 200 * 1024 * 1024; // 200 MB
+
+/** Maximum redirects followed for `redirect: "follow"` (the fetch standard's limit). */
+const MAX_PLUGIN_FETCH_REDIRECTS = 20;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * The only caller headers kept when a followed redirect leaves the original
+ * origin. Plugins authenticate with many custom headers (`x-api-key` and
+ * similar), so every other header is dropped rather than a named few.
+ */
+const CROSS_ORIGIN_REDIRECT_SAFE_HEADERS = new Set([
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  "content-language",
+  "content-type",
+  "user-agent",
+]);
+
+/**
+ * A plugin fetch response body crossed the per-call or host-wide byte cap. The
+ * code travels to the worker as the JSON-RPC error code.
+ */
+export class PluginHttpResponseTooLargeError extends Error {
+  readonly code = PLUGIN_RPC_ERROR_CODES.HTTP_RESPONSE_TOO_LARGE;
+
+  constructor(readonly limitBytes: number, detail: string) {
+    super(`Response body exceeded ${limitBytes} bytes (${detail})`);
+    this.name = "PluginHttpResponseTooLargeError";
+  }
+}
+
+/** Resolve a caller's `maxResponseBytes` against the host-wide cap. */
+export function resolvePluginFetchByteLimit(maxResponseBytes: unknown): number {
+  if (maxResponseBytes === undefined || maxResponseBytes === null) return MAX_RESPONSE_BODY_BYTES;
+  if (typeof maxResponseBytes !== "number" || !Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 0) {
+    throw new Error("maxResponseBytes must be a non-negative integer");
+  }
+  return Math.min(maxResponseBytes, MAX_RESPONSE_BODY_BYTES);
+}
 
 /** Maximum time (ms) to wait for a DNS lookup before aborting. */
 const DNS_LOOKUP_TIMEOUT_MS = 5_000;
@@ -149,7 +193,7 @@ function isPrivateIP(ip: string): boolean {
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-interface ValidatedFetchTarget {
+export interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -265,10 +309,12 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: RequestInit | undefined,
   signal: AbortSignal,
+  maxResponseBytes: number = MAX_RESPONSE_BODY_BYTES,
+  discardBody?: (status: number, headers: IncomingMessage["headers"]) => boolean,
 ): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
@@ -284,16 +330,37 @@ async function executePinnedHttpRequest(
     req.end();
   });
 
-  const MAX_RESPONSE_BODY_BYTES = 200 * 1024 * 1024; // 200 MB
+  const status = response.statusCode ?? 500;
+  // A body the caller never sees (an intermediate redirect) is not read, so
+  // the cap applies only to the body that is returned.
+  const discard = discardBody?.(status, response.headers) === true;
+  if (discard) response.destroy();
+
+  // Refuse a declared length over the cap before reading any of the body. A
+  // smaller (false) declared length is still bounded by the count below. HEAD,
+  // 204 and 304 responses carry a content-length but no body.
+  const declaredLength = Number(response.headers["content-length"]);
+  const bodiless = discard
+    || options.method?.toUpperCase() === "HEAD"
+    || status === 204
+    || status === 304;
+  if (!bodiless && Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
+    response.destroy();
+    throw new PluginHttpResponseTooLargeError(
+      maxResponseBytes,
+      `content-length ${declaredLength}`,
+    );
+  }
+
   const chunks: Buffer[] = [];
   let totalBytes = 0;
-  await new Promise<void>((resolve, reject) => {
+  if (!discard) await new Promise<void>((resolve, reject) => {
     response.on("data", (chunk: Buffer | string) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBytes += buf.length;
-      if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
+      if (totalBytes > maxResponseBytes) {
         chunks.length = 0;
-        response.destroy(new Error(`Response body exceeded ${MAX_RESPONSE_BODY_BYTES} bytes`));
+        response.destroy(new PluginHttpResponseTooLargeError(maxResponseBytes, "while streaming"));
         return;
       }
       chunks.push(buf);
@@ -312,11 +379,98 @@ async function executePinnedHttpRequest(
   }
 
   return {
-    status: response.statusCode ?? 500,
+    status,
     statusText: response.statusMessage ?? "",
     headers,
     body: Buffer.concat(chunks).toString("utf8"),
   };
+}
+
+/**
+ * Build the request for the next hop of a followed redirect, as the fetch
+ * standard does: 303 (and 301/302 after POST) become a bodiless GET, and
+ * credentials are dropped when the redirect leaves the original origin.
+ */
+function redirectRequestInit(
+  init: RequestInit | undefined,
+  status: number,
+  from: URL,
+  to: URL,
+): RequestInit | undefined {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const toGet = (status === 303 && method !== "GET" && method !== "HEAD")
+    || ((status === 301 || status === 302) && method === "POST");
+  const crossOrigin = from.origin !== to.origin;
+  if (!toGet && !crossOrigin) return init;
+
+  const headers = new Headers(init?.headers);
+  if (toGet) {
+    for (const name of ["content-type", "content-length", "content-encoding", "content-language", "content-location"]) {
+      headers.delete(name);
+    }
+  }
+  if (crossOrigin) {
+    for (const name of Array.from(headers.keys())) {
+      if (!CROSS_ORIGIN_REDIRECT_SAFE_HEADERS.has(name)) headers.delete(name);
+    }
+  }
+  return {
+    ...init,
+    method: toGet ? "GET" : init?.method,
+    body: toGet ? undefined : init?.body,
+    headers: Object.fromEntries(headers.entries()),
+  };
+}
+
+/**
+ * Run one plugin fetch, applying the caller's redirect mode. The host has
+ * always returned 3xx responses as-is, so an unset mode stays "manual" for
+ * existing plugins. `resolveTarget` is injectable for tests only.
+ */
+export async function runPluginHttpFetch(
+  url: string,
+  init: RequestInit | undefined,
+  signal: AbortSignal,
+  maxResponseBytes: number,
+  resolveTarget: (url: string) => Promise<ValidatedFetchTarget> = validateAndResolveFetchUrl,
+): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+  const redirectMode = init?.redirect ?? "manual";
+  for (let redirects = 0; ; redirects++) {
+    // SSRF protection: validate protocol whitelist + block private IPs.
+    // Resolve once, then connect directly to that IP to prevent DNS
+    // rebinding. Every redirect hop is validated again.
+    const target = await resolveTarget(url);
+    const response = await executePinnedHttpRequest(
+      target,
+      init,
+      signal,
+      maxResponseBytes,
+      redirectMode === "follow"
+        ? (status, headers) => REDIRECT_STATUSES.has(status) && Boolean(headers.location)
+        : undefined,
+    );
+    // Any mode other than "follow" or "error" keeps the manual behavior.
+    if (!REDIRECT_STATUSES.has(response.status) || (redirectMode !== "follow" && redirectMode !== "error")) {
+      return response;
+    }
+    if (redirectMode === "error") {
+      throw new Error(`Refused redirect (status ${response.status}): redirect mode is "error"`);
+    }
+    const location = response.headers.location;
+    if (!location) return response;
+    if (redirects >= MAX_PLUGIN_FETCH_REDIRECTS) {
+      throw new Error(`Too many redirects (more than ${MAX_PLUGIN_FETCH_REDIRECTS})`);
+    }
+    const from = new URL(url);
+    const to = new URL(location, from);
+    // As in the fetch standard: never send credentials embedded in a
+    // redirect target on another origin.
+    if (from.origin !== to.origin && (to.username || to.password)) {
+      throw new Error("Refused redirect to another origin with credentials in the URL");
+    }
+    init = redirectRequestInit(init, response.status, from, to);
+    url = to.toString();
+  }
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -757,6 +911,11 @@ export function buildHostServices(
   const approvalSvc = approvalService(db);
   const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
+  // Abort controllers for in-flight `http.fetch` calls the worker can cancel,
+  // keyed by the worker-chosen fetch id. `activeFetches` holds every in-flight
+  // call, with or without an id, so dispose() can abort them all.
+  const inFlightFetches = new Map<string, AbortController>();
+  const activeFetches = new Set<AbortController>();
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -1579,19 +1738,29 @@ export function buildHostServices(
 
     http: {
       async fetch(params) {
-        // SSRF protection: validate protocol whitelist + block private IPs.
-        // Resolve once, then connect directly to that IP to prevent DNS rebinding.
-        const target = await validateAndResolveFetchUrl(params.url);
-
+        const maxResponseBytes = resolvePluginFetchByteLimit(params.maxResponseBytes);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
+        const fetchId = typeof params.fetchId === "string" && params.fetchId ? params.fetchId : undefined;
+        activeFetches.add(controller);
+        if (fetchId) inFlightFetches.set(fetchId, controller);
 
         try {
-          const init = params.init as RequestInit | undefined;
-          return await executePinnedHttpRequest(target, init, controller.signal);
+          return await runPluginHttpFetch(
+            params.url,
+            params.init as RequestInit | undefined,
+            controller.signal,
+            maxResponseBytes,
+          );
         } finally {
           clearTimeout(timeout);
+          activeFetches.delete(controller);
+          if (fetchId && inFlightFetches.get(fetchId) === controller) inFlightFetches.delete(fetchId);
         }
+      },
+
+      async cancel(params) {
+        inFlightFetches.get(params.fetchId)?.abort();
       },
     },
 
@@ -3448,6 +3617,10 @@ export function buildHostServices(
      */
     dispose() {
       disposed = true;
+
+      for (const controller of activeFetches) controller.abort();
+      activeFetches.clear();
+      inFlightFetches.clear();
 
       // Clear event bus subscriptions to prevent accumulation on worker restart.
       // Without this, each crash/restart cycle adds duplicate subscriptions.

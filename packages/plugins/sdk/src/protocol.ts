@@ -265,6 +265,12 @@ export const PLUGIN_RPC_ERROR_CODES = {
    * `multiCompanyConfig: true` on its definition.
    */
   CROSS_TENANT_CONFIG: -32006,
+  /**
+   * An `http.fetch` response body exceeded the caller's `maxResponseBytes`
+   * (or the host-wide cap). The host stops reading as soon as the limit is
+   * crossed, so the body never reaches the worker.
+   */
+  HTTP_RESPONSE_TOO_LARGE: -32007,
   /** A catch-all for errors that do not fit other categories. */
   UNKNOWN: -32099,
 } as const;
@@ -1698,8 +1704,19 @@ export interface WorkerToHostMethods {
 
   // HTTP
   "http.fetch": [
-    params: { url: string; init?: Record<string, unknown> },
+    params: {
+      url: string;
+      init?: Record<string, unknown>;
+      /** Per-call body cap in bytes; the host enforces it while reading. */
+      maxResponseBytes?: number;
+      /** Worker-chosen id that `http.fetch.cancel` uses to abort this call. */
+      fetchId?: string;
+    },
     result: { status: number; statusText: string; headers: Record<string, string>; body: string },
+  ];
+  "http.fetch.cancel": [
+    params: { fetchId: string },
+    result: void,
   ];
 
   // Secrets
