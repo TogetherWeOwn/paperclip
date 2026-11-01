@@ -1,4 +1,4 @@
-import { subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "@paperclipai/db";
+import { subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "@paperclipai/db/work-signals";
 import { createWorkScheduler } from "./work-scheduler.js";
 import { type DeliveryQueue } from "./delivery-work-notifications.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
@@ -125,7 +125,7 @@ export function createDeliveryWorkCoordinator(input: {
       } };
       workers.set(queue, worker);
       const ready = Promise.resolve().then(() => { start(); return running; });
-      return { ready, wake };
+      return { ready, ...worker };
     },
     async stop() {
       stopped = true;
