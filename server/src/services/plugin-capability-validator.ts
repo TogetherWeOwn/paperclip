@@ -119,6 +119,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "plugin.state.get": ["plugin.state.read"],
   "plugin.state.list": ["plugin.state.read"],
   "plugin.state.set": ["plugin.state.write"],
+  "plugin.state.create": ["plugin.state.write"],
   "plugin.state.delete": ["plugin.state.write"],
 
   // Runtime / Integration operations

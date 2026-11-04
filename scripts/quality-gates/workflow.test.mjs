@@ -139,10 +139,7 @@ test("policy decides gate availability from the merge base parent and fails clos
   );
   assert.match(detectScript, /git rev-parse HEAD\^1/);
   assert.match(detectScript, /rev-list --parents/);
-  assert.match(
-    qualityGates,
-    /^ {4}needs: \[gate, policy, changes\]$/m,
-  );
+  assert.match(qualityGates, /^ {4}needs: \[gate, policy, changes\]$/m);
   assert.match(
     qualityGates,
     /^ {4}if: \$\{\{ needs\.changes\.outputs\.affected == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
@@ -151,6 +148,13 @@ test("policy decides gate availability from the merge base parent and fails clos
   assert.match(
     verify,
     /QUALITY_GATE_TOOLING: \$\{\{ needs\.policy\.outputs\.quality_gate_tooling \}\}/,
+  );
+});
+
+test("changed-test coverage runs the checked-out preparation-aware runner", () => {
+  assert.match(
+    qualityGates,
+    /run: node scripts\/quality-gates\/coverage-changed\.mjs/,
   );
 });
 

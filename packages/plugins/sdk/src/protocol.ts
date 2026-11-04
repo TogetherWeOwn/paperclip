@@ -53,6 +53,7 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
+  ScopeKey,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -347,6 +348,11 @@ export interface InitializeParams {
   apiVersion: number;
   /** Host-derived plugin database namespace, when the manifest declares database access. */
   databaseNamespace?: string | null;
+  /**
+   * Methods implemented by this host's service adapters. Missing or unknown
+   * entries confer no support. This is separate from the plugin's permissions.
+   */
+  supportedHostMethods?: string[];
 }
 
 /**
@@ -1625,6 +1631,10 @@ export interface WorkerToHostMethods {
   "state.set": [
     params: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string; value: unknown },
     result: void,
+  ];
+  "state.create": [
+    params: ScopeKey & { value: unknown },
+    result: boolean,
   ];
   "state.delete": [
     params: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string },

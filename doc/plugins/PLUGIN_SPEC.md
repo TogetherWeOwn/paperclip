@@ -542,6 +542,12 @@ Input includes:
 - resolved plugin config
 - instance info
 - host API version
+- optional `supportedHostMethods: string[]`, listing implemented host service handlers
+
+The worker exposes optional `ctx.state.create` only when the host advertises
+`state.create` and the plugin declares `plugin.state.write`. Missing or unknown
+support leaves it unavailable; no get/set emulation is permitted. This additive
+negotiation keeps API v1 and legacy workers compatible.
 
 ### 13.2 `health`
 
@@ -767,6 +773,7 @@ export interface PluginContext {
     register(key: string, input: { cron: string }, fn: (job: PluginJobContext) => Promise<void>): void;
   };
   state: {
+    create?(input: ScopeKey, value: unknown): Promise<boolean>;
     get(input: ScopeKey): Promise<unknown | null>;
     set(input: ScopeKey, value: unknown): Promise<void>;
     delete(input: ScopeKey): Promise<void>;
@@ -1334,7 +1341,17 @@ Constraints:
 
 Constraints:
 
-- unique `(plugin_id, scope_kind, scope_id, namespace, state_key)`
+- unique NULLS NOT DISTINCT `(plugin_id, scope_kind, scope_id, namespace, state_key)` (PostgreSQL 15+)
+
+Optional `ctx.state.create` uses this existing constraint for database-atomic
+insert-if-absent. `true` means this invocation inserted the full value and committed;
+`false` leaves an existing row unchanged, including JSON null and timestamps.
+Storage, authorization, transport, and unsupported-method failures throw; an
+ambiguous response must not authorize fresh work. Company scope uses the authorized
+invocation company, and plugin identity is supplied by the host. Availability is
+read-only and host-negotiated; no get/set fallback is allowed. Generic state is not
+append-only. See [Atomic plugin state creation](ATOMIC_STATE.md) for the complete
+consumer contract and uninstall/reset hazards.
 
 Examples:
 

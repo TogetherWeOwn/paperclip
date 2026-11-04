@@ -791,11 +791,24 @@ export interface PluginActivityClient {
  * ```
  *
  * `plugin.state.read` capability required for `get()`.
- * `plugin.state.write` capability required for `set()` and `delete()`.
+ * `plugin.state.write` capability required for `create()`, `set()`, and `delete()`.
  *
  * @see PLUGIN_SPEC.md §21.3 `plugin_state`
  */
 export interface PluginStateClient {
+  /**
+   * Atomically insert the entire value if the scope key is absent. True means
+   * this call inserted and committed; false leaves the existing row unchanged,
+   * including a stored JSON null. Storage, authorization and transport errors
+   * throw. A lost response is ambiguous and must never authorize fresh work.
+   *
+   * Requires `plugin.state.write`. Optional: check `typeof ctx.state.create ===
+   * "function"` READ-ONLY before real admission or dry-run. An older host or
+   * unsupported adapter leaves it undefined; never emulate with get/set.
+   * Generic state can still be deleted on uninstall/reset; it is not append-only.
+   */
+  create?(input: ScopeKey, value: unknown): Promise<boolean>;
+
   /**
    * Read a state value.
    *

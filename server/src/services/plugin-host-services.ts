@@ -1677,6 +1677,9 @@ export function buildHostServices(
           namespace: params.namespace,
         });
       },
+      async create(params) {
+        return stateStore.create(pluginId, params);
+      },
       async set(params) {
         await stateStore.set(pluginId, {
           scopeKind: params.scopeKind as any,

@@ -77,7 +77,12 @@ Actions minutes):
   findings remain after the first pass).
 - Changed-test coverage report (`pnpm coverage:changed`): WARN. It runs coverage
   for changed tests handled by the configured Vitest projects, else lists changed
-  source files without a colocated test. It does not compute changed-line coverage.
+  source files without a colocated test. Before running selected tests, the report
+  prepares shared and plugin SDK build outputs through the existing build helper.
+  Preparation lives in the checked-out script, not a new trusted-workflow step, so
+  it also applies to PRs validated by the previous master workflow. Preparation
+  failures are reported without attempting coverage. The report does not compute
+  changed-line coverage.
 - Supply chain (`pnpm audit`, Trivy `fs`, gitleaks `detect`): WARN. It reports
   vulnerable dependencies and leaked secrets.
 - Gate tooling self-test (`pnpm test:quality-gates`): HARD. It fails when the
