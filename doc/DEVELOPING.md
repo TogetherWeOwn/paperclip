@@ -1496,8 +1496,19 @@ Environment overrides:
   workspace is terminal before it archives the workspace and deletes the worktree.
   A person can reopen the work inside this window. The default is `1` day. A value
   of `0` disables the cooldown and restores immediate reaping. A negative or
-  non-numeric value falls back to the default. Dirty, untracked, or undelivered
-  work is not deleted.
+  non-numeric value falls back to the default. The cooldown is not preservation
+  authorization: the mandatory preservation preflight currently refuses every generic
+  workspace close/cleanup, even after delivery and cooldown pass. The sweep reports
+  `skippedPreservation` without archiving or recording a cleanup failure. Close-readiness
+  reports `blocked` with `isDestructiveCloseAllowed: false`; direct archive, closed-row
+  retry and physical-cleanup service calls return a preservation conflict before effects.
+  Complete ignored/nested/detached inventory, fresh remote retention of original commit
+  graphs (including squash-delivered work), and fenced queued/retry/session/service/lease
+  and external-consumer absence are not established by the existing contracts. There is
+  no allowlist, override, rescue push or new proof API. Source-bound unrealized allocation
+  rollback remains a separate no-resource transaction. Positive cleanup admission needs
+  a separately reviewed protocol; this refusal-first source change does not enable live
+  cleanup or change any installed controller.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

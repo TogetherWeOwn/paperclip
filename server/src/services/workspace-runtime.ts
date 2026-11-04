@@ -35,6 +35,7 @@ import {
 import { and, desc, eq, gte, inArray, isNull, like, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
+import { assertExecutionWorkspacePreservation } from "./execution-workspace-preservation.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
 import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
@@ -4519,6 +4520,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   runCleanupCommands?: boolean;
   forceWorktreeRemoval?: boolean;
 }) {
+  assertExecutionWorkspacePreservation();
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
