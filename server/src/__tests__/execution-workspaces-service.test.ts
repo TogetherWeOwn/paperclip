@@ -35,6 +35,7 @@ import {
   clearMetadataReopenPendingConsumption,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
+  terminalWorkspaceSweepHasSkips,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
@@ -61,6 +62,20 @@ describe("execution workspace delivery state", () => {
     [{ sourceIssueTerminal: true, mergedPullRequest: false, pullRequestStateUnknown: true, isMergedIntoBase: false }, "unknown"],
   ] as const)("derives %s as %s", (input, expected) => {
     expect(deriveExecutionWorkspaceDeliveryState(input)).toBe(expected);
+  });
+});
+
+describe("terminal workspace reaper skip signals", () => {
+  it.each([
+    "skippedActiveRun", "skippedNonTerminalTree", "skippedUndelivered",
+    "skippedRace", "skippedReopened", "skippedCooldown", "skippedPreservation",
+  ])("reports a sweep with only %s", (counter) => {
+    expect(terminalWorkspaceSweepHasSkips({ checked: 1, archived: 0, [counter]: 1 })).toBe(true);
+  });
+
+  it("does not report empty sweeps or non-skip counters", () => {
+    expect(terminalWorkspaceSweepHasSkips({ checked: 0, skippedPreservation: 0 })).toBe(false);
+    expect(terminalWorkspaceSweepHasSkips({ checked: 1, clearedStaleReopenPending: 1 })).toBe(false);
   });
 });
 
@@ -548,6 +563,29 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .where(eq(executionWorkspaces.id, workspace.id)).then((rows) => rows[0]);
     expect(after).toEqual(workspace);
     await expect(svc.update(workspace.id, { status: "archived" })).rejects.toMatchObject({ status: 409 });
+  }, 20_000);
+
+  it.each(["archived", "cleanup_failed"])("retains legacy %s workspace identifiers across generic updates", async (status) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await db.update(executionWorkspaces).set({ status })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const before = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId)).then((rows) => rows[0]!);
+
+    for (const patch of [
+      { cwd: "/unproved-new-target" },
+      { providerRef: "/unproved-new-target" },
+      { branchName: "unproved-new-branch" },
+      { status: "active", cwd: "/unproved-new-target" },
+    ]) {
+      await expect(svc.update(before.id, patch)).rejects.toMatchObject({ status: 409 });
+      const after = await db.select().from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, before.id)).then((rows) => rows[0]);
+      expect(after).toEqual(before);
+    }
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    await expect(svc.update(before.id, { cwd: before.cwd, name: "Retained workspace" }))
+      .resolves.toMatchObject({ cwd: before.cwd, name: "Retained workspace", status });
   }, 20_000);
 
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {

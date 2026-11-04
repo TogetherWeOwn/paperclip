@@ -281,6 +281,10 @@ export function deriveExecutionWorkspaceDeliveryState(input: {
   return "unknown";
 }
 
+export function terminalWorkspaceSweepHasSkips(result: Record<string, number>): boolean {
+  return Object.entries(result).some(([key, count]) => key.startsWith("skipped") && count > 0);
+}
+
 export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore" | "restore";
 
 export type RecordedBranchRestoreSkipReason =
@@ -3217,13 +3221,26 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (patch.status && isClosedExecutionWorkspaceStatus(patch.status)) {
         assertExecutionWorkspacePreservation();
       }
-      const row = await db
-        .update(executionWorkspaces)
-        .set({ ...patch, updatedAt: new Date() })
-        .where(eq(executionWorkspaces.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return row ? toExecutionWorkspace(row) : null;
+      return db.transaction(async (tx) => {
+        await acquireExecutionWorkspaceLifecycleLock(tx, id);
+        const existing = await tx.select().from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, id)).then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        // Retained artifacts must stay linked to a closed row. Identifier changes
+        // on reopen belong to the explicit lifecycle operation, not a generic patch.
+        if (isClosedExecutionWorkspaceStatus(existing.status) && (["cwd", "providerRef", "branchName"] as const).some(
+          (field) => patch[field] !== undefined && patch[field] !== existing[field],
+        )) {
+          assertExecutionWorkspacePreservation();
+        }
+        const row = await tx
+          .update(executionWorkspaces)
+          .set({ ...patch, updatedAt: new Date() })
+          .where(eq(executionWorkspaces.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        return row ? toExecutionWorkspace(row) : null;
+      });
     },
 
     // Reopen one closed isolated execution workspace so an authorized issue can

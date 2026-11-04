@@ -527,6 +527,9 @@ describe.sequential("execution workspace routes", () => {
     expect(mockWorkspaceOperationService.createRecorder).not.toHaveBeenCalled();
   });
 
+  // Hypothetical service admission tests keep the route's generation-fence wiring
+  // covered. They do not assert real cleanup admission; the refusal cases above
+  // and the service suite exercise the mandatory preservation guard.
   it("destroys the reusable sandbox leases inside the destruction fence when the archive wins", async () => {
     // The archive wins the lifecycle race. The fence runs the destroy callback,
     // so the reusable sandbox lease teardown runs with the worktree teardown.

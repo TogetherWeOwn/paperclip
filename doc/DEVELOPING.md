@@ -1505,8 +1505,12 @@ Environment overrides:
   Complete ignored/nested/detached inventory, fresh remote retention of original commit
   graphs (including squash-delivered work), and fenced queued/retry/session/service/lease
   and external-consumer absence are not established by the existing contracts. There is
-  no allowlist, override, rescue push or new proof API. Source-bound unrealized allocation
-  rollback remains a separate no-resource transaction. Positive cleanup admission needs
+  no allowlist, override, rescue push or new proof API. If persistence of a newly realized
+  worktree fails, generic cleanup also refuses: the worktree and branch remain in place,
+  and the heartbeat warning records `runId`, `issueId` and `executionWorkspaceCwd` for
+  recovery. There may be no workspace row; this is deliberate retention, not successful
+  rollback or automatic reclamation. Source-bound unrealized allocation rollback remains
+  a separate no-resource transaction. Positive cleanup admission needs
   a separately reviewed protocol; this refusal-first source change does not enable live
   cleanup or change any installed controller.
 

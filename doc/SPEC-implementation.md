@@ -1188,7 +1188,10 @@ The current app also exposes V1-supporting surfaces for:
   are unproved. The current refusal-first implementation admits no generic workspace close/cleanup, including
   shared sessions and retries of legacy archived/cleanup-failed rows. It retains bytes, refs, bindings, services,
   leases and lifecycle state; there is no caller override or metadata proof. Terminal-tree, cooldown, reopen,
-  generation and Git fences remain necessary but insufficient. Source-bound unrealized-allocation rollback has
+  generation and Git fences remain necessary but insufficient. Generic updates cannot change a legacy closed
+  row's checkout path, provider ref or branch name; unchanged identifiers and descriptive updates remain allowed.
+  Realized-worktree persistence failures retain files/refs even without a workspace row and log their recovery
+  location on the failed heartbeat. Source-bound unrealized-allocation rollback has
   its separate transactional no-resource contract. A future positive admission protocol requires separate review.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
