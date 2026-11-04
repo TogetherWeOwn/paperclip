@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -143,6 +143,35 @@ async function runGit(cwd: string, args: string[]) {
 
 async function readGit(cwd: string, args: string[]) {
   return (await execFileAsync("git", args, { cwd })).stdout.trim();
+}
+
+async function expectCleanupPreservesWorkspace(
+  input: Parameters<typeof cleanupExecutionWorkspaceArtifacts>[0],
+  workspace: RealizedExecutionWorkspace,
+  repoRoot: string,
+) {
+  const readmeBytes = await fs.readFile(path.join(workspace.cwd, "README.md"));
+  const gitPointerBytes = await fs.readFile(path.join(workspace.cwd, ".git"));
+  const branchTip = await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`]);
+  const worktreeInventory = await readGit(repoRoot, ["worktree", "list", "--porcelain"]);
+
+  await expect(cleanupExecutionWorkspaceArtifacts(input)).rejects.toMatchObject({
+    status: 409,
+    message: "Execution workspace preservation preflight blocked close/cleanup",
+    details: {
+      code: "execution_workspace_preservation_unproved",
+      blockingReasons: [
+        expect.stringContaining("Workspace preservation is unproved"),
+        expect.stringContaining("Remote commit preservation is unproved"),
+        expect.stringContaining("Workspace consumer safety is unproved"),
+      ],
+    },
+  });
+
+  expect(await fs.readFile(path.join(workspace.cwd, "README.md"))).toEqual(readmeBytes);
+  expect(await fs.readFile(path.join(workspace.cwd, ".git"))).toEqual(gitPointerBytes);
+  expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(branchTip);
+  expect(await readGit(repoRoot, ["worktree", "list", "--porcelain"])).toBe(worktreeInventory);
 }
 
 async function runPnpm(cwd: string, args: string[]) {
@@ -3934,7 +3963,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
-  it("removes a created git worktree and branch during cleanup", async () => {
+  it("blocks cleanup and preserves a created git worktree, branch and uncommitted files", async () => {
     const repoRoot = await createTempRepo();
 
     const workspace = await realizeExecutionWorkspace({
@@ -3965,8 +3994,17 @@ describe("realizeExecutionWorkspace", () => {
     });
 
     expect(workspace.branchCreatedByRuntime).toBe(true);
+    await fs.appendFile(path.join(workspace.cwd, "README.md"), "uncommitted work\n");
+    await fs.writeFile(path.join(workspace.cwd, ".gitignore"), "ignored.bin\n");
+    const ignoredBytes = Buffer.from([0, 255, 17, 128]);
+    await fs.writeFile(path.join(workspace.cwd, "ignored.bin"), ignoredBytes);
+    await fs.writeFile(path.join(workspace.cwd, "untracked.txt"), "retain untracked work\n");
+    const statusBefore = await readGit(workspace.cwd, ["status", "--porcelain", "--ignored"]);
+    expect(statusBefore).toContain("M README.md");
+    expect(statusBefore).toContain("?? untracked.txt");
+    expect(statusBefore).toContain("!! ignored.bin");
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expectCleanupPreservesWorkspace({
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -3987,19 +4025,15 @@ describe("realizeExecutionWorkspace", () => {
         cwd: repoRoot,
         cleanupCommand: null,
       },
-    });
+    }, workspace, repoRoot);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
-    await expect(
-      execFileAsync("git", ["branch", "--list", workspace.branchName!], { cwd: repoRoot }),
-    ).resolves.toMatchObject({
-      stdout: "",
-    });
+    expect(await fs.readFile(path.join(workspace.cwd, "README.md"), "utf8")).toBe("hello\nuncommitted work\n");
+    expect(await fs.readFile(path.join(workspace.cwd, "ignored.bin"))).toEqual(ignoredBytes);
+    expect(await fs.readFile(path.join(workspace.cwd, "untracked.txt"), "utf8")).toBe("retain untracked work\n");
+    expect(await readGit(workspace.cwd, ["status", "--porcelain", "--ignored"])).toBe(statusBefore);
   });
 
-  it("deletes a runtime-created branch at its verified tip after a reuse realization", async () => {
+  it("blocks cleanup and preserves a runtime-created branch at its verified tip after reuse", async () => {
     const repoRoot = await createTempRepo();
     const realizationInput = {
       base: {
@@ -4042,7 +4076,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(reused.branchCreatedByRuntime).toBe(true);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expectCleanupPreservesWorkspace({
       workspace: {
         id: "execution-workspace-reused-cleanup",
         cwd: reused.cwd,
@@ -4064,19 +4098,13 @@ describe("realizeExecutionWorkspace", () => {
         cleanupCommand: null,
       },
       expectedBranchHeadSha: verifiedBranchTip,
-    });
+    }, reused, repoRoot);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(reused.cwd)).rejects.toThrow();
-    await expect(
-      execFileAsync("git", ["rev-parse", "--verify", `refs/heads/${reused.branchName}`], {
-        cwd: repoRoot,
-      }),
-    ).rejects.toThrow();
+    expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(verifiedBranchTip);
+    expect(await readGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${reused.branchName}`])).toBe(verifiedBranchTip);
   });
 
-  it("keeps a runtime-created branch when its tip changes after guarded worktree removal", async () => {
+  it("blocks cleanup before the branch-deletion callback and preserves the original branch tip", async () => {
     const repoRoot = await createTempRepo();
     const workspace = await realizeExecutionWorkspace({
       base: {
@@ -4109,8 +4137,12 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "raced.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Raced branch update"]);
     const racedHeadSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    expect(racedHeadSha).not.toBe(expectedHeadSha);
+    const beforeBranchDelete = vi.fn(async () => {
+      await runGit(repoRoot, ["update-ref", `refs/heads/${workspace.branchName}`, racedHeadSha]);
+    });
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expectCleanupPreservesWorkspace({
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4129,18 +4161,16 @@ describe("realizeExecutionWorkspace", () => {
         cleanupCommand: null,
       },
       expectedBranchHeadSha: expectedHeadSha,
-      beforeBranchDelete: async () => {
-        await runGit(repoRoot, ["update-ref", `refs/heads/${workspace.branchName}`, racedHeadSha]);
-      },
-    });
+      beforeBranchDelete,
+    }, workspace, repoRoot);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toHaveLength(1);
-    expect(cleanup.warnings[0]).toContain(`Skipped deleting branch "${workspace.branchName}"`);
-    expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(racedHeadSha);
+    expect(beforeBranchDelete).not.toHaveBeenCalled();
+    expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(expectedHeadSha);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(expectedHeadSha);
+    expect(await fs.readFile(path.join(repoRoot, "raced.txt"), "utf8")).toBe("new work\n");
   });
 
-  it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
+  it("blocks cleanup and preserves an unmerged runtime-created branch and committed files", async () => {
     const repoRoot = await createTempRepo();
 
     const workspace = await realizeExecutionWorkspace({
@@ -4173,8 +4203,10 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(workspace.cwd, "unmerged.txt"), "still here\n", "utf8");
     await runGit(workspace.cwd, ["add", "unmerged.txt"]);
     await runGit(workspace.cwd, ["commit", "-m", "Keep unmerged work"]);
+    const unmergedHeadSha = await readGit(workspace.cwd, ["rev-parse", "HEAD"]);
+    expect(await readGit(repoRoot, ["rev-list", "--count", `main..${workspace.branchName}`])).toBe("1");
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expectCleanupPreservesWorkspace({
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4194,19 +4226,14 @@ describe("realizeExecutionWorkspace", () => {
         cwd: repoRoot,
         cleanupCommand: null,
       },
-    });
+    }, workspace, repoRoot);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toHaveLength(1);
-    expect(cleanup.warnings[0]).toContain(`Skipped deleting branch "${workspace.branchName}"`);
-    await expect(
-      execFileAsync("git", ["branch", "--list", workspace.branchName!], { cwd: repoRoot }),
-    ).resolves.toMatchObject({
-      stdout: expect.stringContaining(workspace.branchName!),
-    });
+    expect(await fs.readFile(path.join(workspace.cwd, "unmerged.txt"), "utf8")).toBe("still here\n");
+    expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(unmergedHeadSha);
+    expect(await readGit(repoRoot, ["rev-list", "--count", `main..${workspace.branchName}`])).toBe("1");
   }, 10_000);
 
-  it("records teardown and cleanup operations when a recorder is provided", async () => {
+  it("blocks cleanup before commands, safety callbacks and recorder operations while preserving instance bytes", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
 
@@ -4240,58 +4267,67 @@ describe("realizeExecutionWorkspace", () => {
     const worktreesDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-instances-"));
     const instanceId = deriveWorktreeInstanceId(workspace.cwd);
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
-    await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
-    await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
-    await fs.writeFile(
-      path.join(workspace.cwd, ".paperclip", ".env"),
-      `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`,
-      "utf8",
-    );
-    process.env.PAPERCLIP_WORKTREES_DIR = worktreesDir;
+    try {
+      await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
+      const instanceBytes = Buffer.from([0, 128, 255, 17, 10]);
+      const instanceFile = path.join(instanceRoot, "db", "preserve.bin");
+      await fs.writeFile(instanceFile, instanceBytes);
+      await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
+      const envPath = path.join(workspace.cwd, ".paperclip", ".env");
+      const envBytes = Buffer.from(
+        `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`,
+      );
+      await fs.writeFile(envPath, envBytes);
+      process.env.PAPERCLIP_WORKTREES_DIR = worktreesDir;
+      const commandMarkers = ["cleanup", "project-cleanup", "teardown"]
+        .map((name) => path.join(workspace.cwd, ".paperclip", `${name}.txt`));
+      for (const marker of commandMarkers) {
+        await fs.writeFile(marker, "command not run\n");
+      }
+      const commands = commandMarkers.map((marker) => `printf 'unexpected command effect' > ${JSON.stringify(marker)}`);
+      const assertSafeToCleanup = vi.fn(async () => {
+        throw new Error("Caller safety callback must not run before preservation refusal");
+      });
+      const recordOperation = vi.spyOn(recorder, "recordOperation");
 
-    await cleanupExecutionWorkspaceArtifacts({
-      workspace: {
-        id: "execution-workspace-1",
-        cwd: workspace.cwd,
-        providerType: "git_worktree",
-        providerRef: workspace.worktreePath,
-        branchName: workspace.branchName,
-        repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
-        projectId: workspace.projectId,
-        projectWorkspaceId: workspace.workspaceId,
-        sourceIssueId: "issue-1",
-        metadata: {
-          ...RUNTIME_OWNED_GIT_BRANCH_METADATA,
-          worktreeInstanceRoot: instanceRoot,
+      await expectCleanupPreservesWorkspace({
+        workspace: {
+          id: "execution-workspace-1",
+          cwd: workspace.cwd,
+          providerType: "git_worktree",
+          providerRef: workspace.worktreePath,
+          branchName: workspace.branchName,
+          repoUrl: workspace.repoUrl,
+          baseRef: workspace.repoRef,
+          projectId: workspace.projectId,
+          projectWorkspaceId: workspace.workspaceId,
+          sourceIssueId: "issue-1",
+          metadata: {
+            ...RUNTIME_OWNED_GIT_BRANCH_METADATA,
+            worktreeInstanceRoot: instanceRoot,
+          },
         },
-      },
-      projectWorkspace: {
-        cwd: repoRoot,
-        cleanupCommand: "printf 'cleanup ok\\n'",
-      },
-      recorder,
-    });
+        projectWorkspace: {
+          cwd: repoRoot,
+          cleanupCommand: commands[1],
+        },
+        cleanupCommand: commands[0],
+        teardownCommand: commands[2],
+        assertSafeToCleanup,
+        recorder,
+      }, workspace, repoRoot);
 
-    expect(operations.map((operation) => operation.phase)).toEqual([
-      "workspace_teardown",
-      "workspace_teardown",
-      "worktree_cleanup",
-      "worktree_cleanup",
-    ]);
-    expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
-    expect(operations[1]?.metadata).toMatchObject({
-      cleanupAction: "remove_worktree_instance",
-      instanceRoot,
-    });
-    expect(operations[2]?.metadata).toMatchObject({
-      cleanupAction: "worktree_remove",
-    });
-    expect(operations[3]?.metadata).toMatchObject({
-      cleanupAction: "branch_delete",
-    });
-    await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    await fs.rm(worktreesDir, { recursive: true, force: true });
+      expect(assertSafeToCleanup).not.toHaveBeenCalled();
+      expect(recordOperation).not.toHaveBeenCalled();
+      expect(operations).toEqual([]);
+      expect(await fs.readFile(instanceFile)).toEqual(instanceBytes);
+      expect(await fs.readFile(envPath)).toEqual(envBytes);
+      for (const marker of commandMarkers) {
+        expect(await fs.readFile(marker, "utf8")).toBe("command not run\n");
+      }
+    } finally {
+      await fs.rm(worktreesDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -10034,7 +10070,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     };
   }
 
-  it("terminal cleanup removes the worktree but preserves the attached pre-existing branch at its tip", async () => {
+  it("blocks terminal cleanup and preserves the worktree and attached pre-existing branch at its tip", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/operator-owned", "operator.txt");
 
@@ -10042,37 +10078,35 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(workspace.created).toBe(true);
     expect(workspace.branchCreatedByRuntime).toBe(false);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+    await expectCleanupPreservesWorkspace(
       cleanupWorkspaceInput(workspace, repoRoot, branchTip),
+      workspace,
+      repoRoot,
     );
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect(await fs.readFile(path.join(workspace.cwd, "operator.txt"), "utf8")).toBe("operator.txt\n");
     expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/operator-owned"])).toBe(branchTip);
   });
 
-  it("treats unversioned legacy ownership as operator-owned during cleanup", async () => {
+  it("blocks cleanup and preserves the worktree and branch with unversioned legacy ownership", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/legacy-owned", "legacy-owned.txt");
     const workspace = await realizeExistingBranch(repoRoot, "feature/legacy-owned");
     const cleanupInput = cleanupWorkspaceInput(workspace, repoRoot, branchTip);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expectCleanupPreservesWorkspace({
       ...cleanupInput,
       workspace: {
         ...cleanupInput.workspace,
         metadata: { createdByRuntime: true },
       },
-    });
+    }, workspace, repoRoot);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect(await fs.readFile(path.join(workspace.cwd, "legacy-owned.txt"), "utf8")).toBe("legacy-owned.txt\n");
     expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/legacy-owned"])).toBe(branchTip);
   });
 
-  it("terminal cleanup preserves a pre-existing branch pinned via a literal branchTemplate", async () => {
+  it("blocks terminal cleanup and preserves the worktree and pre-existing literal branchTemplate branch", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/literal-pin", "literal.txt");
 
@@ -10108,13 +10142,13 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(workspace.branchCreatedByRuntime).toBe(false);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+    await expectCleanupPreservesWorkspace(
       cleanupWorkspaceInput(workspace, repoRoot, branchTip),
+      workspace,
+      repoRoot,
     );
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect(await fs.readFile(path.join(workspace.cwd, "literal.txt"), "utf8")).toBe("literal.txt\n");
     expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/literal-pin"])).toBe(branchTip);
   });
 

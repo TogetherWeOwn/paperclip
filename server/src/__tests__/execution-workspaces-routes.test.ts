@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
+import { executionWorkspacePreservationBlockingReasons } from "../services/execution-workspace-preservation.js";
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -488,6 +489,42 @@ describe.sequential("execution workspace routes", () => {
     expect(res.body.closeReadiness).toEqual(readiness);
     expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).not.toHaveBeenCalled();
     expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {},
+    { cwd: "/unproved-new-target", providerRef: "/unproved-new-target" },
+    { branchName: "unproved-new-branch" },
+    { config: { cleanupCommand: "exit 0" } },
+  ])("refuses preservation-uncertain archive without any lifecycle or teardown effects: %j", async (patch) => {
+    const readiness = {
+      state: "blocked",
+      blockingReasons: executionWorkspacePreservationBlockingReasons(),
+      isDestructiveCloseAllowed: false,
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      status: "active",
+      mode: "shared_workspace",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue(readiness);
+
+    const res = await request(createApp())
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ ...patch, status: "archived" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.closeReadiness).toEqual(readiness);
+    expect(mockExecutionWorkspaceService.archiveWorkspaceUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.fenceClosedWorkspaceDestruction).not.toHaveBeenCalled();
+    expect(mockWorkspaceRuntimeLeaseService.release).not.toHaveBeenCalled();
+    expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
+    expect(mockWorkspaceRuntimeTeardown.stopRuntimeServicesForExecutionWorkspace).not.toHaveBeenCalled();
+    expect(mockWorkspaceRuntimeTeardown.cleanupExecutionWorkspaceArtifacts).not.toHaveBeenCalled();
+    expect(mockWorkspaceOperationService.createRecorder).not.toHaveBeenCalled();
   });
 
   it("destroys the reusable sandbox leases inside the destruction fence when the archive wins", async () => {

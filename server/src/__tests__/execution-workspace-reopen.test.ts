@@ -445,22 +445,27 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
     expect(readExecutionWorkspaceLifecycleGeneration(row?.metadata as Record<string, unknown> | null)).toBe(5);
   });
 
-  it("runs the destroy under the fence when the generation matches, and skips it after a reopen", async () => {
+  it("refuses destruction without preservation when the generation matches, and skips it after a reopen", async () => {
     const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
     const cwd = await makeExistingDir();
     const workspaceId = await seedClosedWorkspace({ companyId, projectId, projectWorkspaceId, cwd, generation: 7 });
 
     const svc = executionWorkspaceService(db);
 
-    // The captured generation matches, so the destroy callback runs.
+    // A matching generation is necessary but cannot prove preservation.
+    const before = await readWorkspace(workspaceId);
     const destroyMatches = vi.fn(async () => "destroyed");
-    const matched = await svc.fenceClosedWorkspaceDestruction({
+    await expect(svc.fenceClosedWorkspaceDestruction({
       workspaceId,
       capturedGeneration: 7,
       destroy: destroyMatches,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "execution_workspace_preservation_unproved" },
     });
-    expect(matched.skippedReopened).toBe(false);
-    expect(destroyMatches).toHaveBeenCalledTimes(1);
+    expect(destroyMatches).not.toHaveBeenCalled();
+    expect(await readWorkspace(workspaceId)).toEqual(before);
+    expect((await stat(cwd)).isDirectory()).toBe(true);
 
     // Simulate a reopen: raise the generation and mark the row active.
     await db

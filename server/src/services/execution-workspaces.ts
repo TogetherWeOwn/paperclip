@@ -38,6 +38,10 @@ import type {
 } from "@paperclipai/shared";
 import { deriveProjectUrlKey, WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import {
+  assertExecutionWorkspacePreservation,
+  executionWorkspacePreservationBlockingReasons,
+} from "./execution-workspace-preservation.js";
 import { logger } from "../middleware/logger.js";
 import {
   applyIssueExecutionPolicyTransition,
@@ -1891,7 +1895,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: () => {
+        assertExecutionWorkspacePreservation();
+        return runTerminalWorkspaceCleanup(workspace, expectedHeadSha);
+      },
     });
   }
 
@@ -2625,7 +2632,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       } = await inspectGitCloseReadiness(executionWorkspace);
       const { deliveryState } = await assessDelivery(workspace, git);
       const warnings = [...gitWarnings];
-      const blockingReasons: string[] = [];
+      const blockingReasons = executionWorkspacePreservationBlockingReasons();
       if (!statusInspectionSucceeded) {
         blockingReasons.push("Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
       }
@@ -2841,6 +2848,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedRace: 0,
           skippedReopened: 0,
           skippedCooldown: 0,
+          skippedPreservation: 0,
           clearedStaleReopenPending: 0,
         };
       }
@@ -2905,6 +2913,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedRace: 0,
         skippedReopened: 0,
         skippedCooldown: 0,
+        skippedPreservation: 0,
         clearedStaleReopenPending: 0,
       };
 
@@ -3022,6 +3031,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedActiveRun += 1;
           continue;
         }
+        if (executionWorkspacePreservationBlockingReasons().length > 0) {
+          result.skippedPreservation += 1;
+          continue;
+        }
         result.eligible += 1;
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
@@ -3037,6 +3050,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          assertExecutionWorkspacePreservation();
           return tx
             .update(executionWorkspaces)
             .set({
@@ -3200,6 +3214,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
+      if (patch.status && isClosedExecutionWorkspaceStatus(patch.status)) {
+        assertExecutionWorkspacePreservation();
+      }
       const row = await db
         .update(executionWorkspaces)
         .set({ ...patch, updatedAt: new Date() })
@@ -3582,6 +3599,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // rebuilt worktree. The route maps this to HTTP 409.
           return { outcome: "reopen_pending" };
         }
+        assertExecutionWorkspacePreservation();
         const baseMetadata =
           (input.patch.metadata as Record<string, unknown> | null | undefined)
           ?? (fresh.metadata as Record<string, unknown> | null);
@@ -3642,6 +3660,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         isWriteTarget: (fresh) => isClosedExecutionWorkspaceStatus(fresh.status),
         onSkip: () => null,
         write: async ({ tx }) => {
+          assertExecutionWorkspacePreservation();
           const row = await tx
             .update(executionWorkspaces)
             .set({
@@ -3690,7 +3709,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           message: "execution workspace cleanup skipped because it was reopened",
         },
         onSkip: () => ({ skippedReopened: true as const }),
-        write: async () => ({ skippedReopened: false as const, result: await input.destroy() }),
+        write: async () => {
+          assertExecutionWorkspacePreservation();
+          return { skippedReopened: false as const, result: await input.destroy() };
+        },
       });
     },
 
