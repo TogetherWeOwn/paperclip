@@ -170,6 +170,21 @@ handler. The worker receives sanitized headers, route params, query, parsed JSON
 body, actor context, and company id. Do not use plugin routes to claim core
 paths; they always remain under `/api/plugins/:pluginId/api/*`.
 
+For run provenance, use the readonly
+`PluginApiRequestInput.actor.authenticatedRunId?: string | null` field. Only a
+host-verified agent JWT yields its signed run identity. All other authentication
+paths yield `null`; older hosts omit the property, yielding `undefined`. The
+legacy `actor.runId` is unchanged and remains untrusted as provenance: do not
+fall back to it. Do not parse or forward bearer credentials in plugin code;
+authentication and provenance verification belong to the host.
+
+Treat this as identity, not proof of run liveness, workspace authority, or command
+admission. Apply independent admission checks and fail closed for **new command
+admission and dry-run** on missing or `null` provenance. Keep that gate separate
+from existing receipt reads, heartbeats, cancellation, and reconciliation: those
+must remain available when ownership and company access authorize them, even
+without verified run provenance.
+
 ## Managed Paperclip resources
 
 Plugins that provide durable Paperclip business objects should declare them in

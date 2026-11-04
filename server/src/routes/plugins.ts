@@ -64,7 +64,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PluginStreamBus } from "../services/plugin-stream-bus.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
-import type { PluginPerformActionActorContext, ToolRunContext } from "@paperclipai/plugin-sdk";
+import type { PluginApiRequestInput, PluginApiResponse, PluginPerformActionActorContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
   assertAuthenticated,
@@ -447,30 +447,6 @@ export interface PluginRouteBridgeDeps {
 
 export interface PluginRouteToolGatewayDeps {
   toolGateway: ToolGatewayService;
-}
-
-interface PluginScopedApiRequest {
-  routeKey: string;
-  method: string;
-  path: string;
-  params: Record<string, string>;
-  query: Record<string, string | string[]>;
-  body: unknown;
-  actor: {
-    actorType: "user" | "agent";
-    actorId: string;
-    agentId?: string | null;
-    userId?: string | null;
-    runId?: string | null;
-  };
-  companyId: string;
-  headers: Record<string, string>;
-}
-
-interface PluginScopedApiResponse {
-  status?: number;
-  headers?: Record<string, string>;
-  body?: unknown;
 }
 
 /** Request body for POST /api/plugins/tools/execute */
@@ -1917,7 +1893,7 @@ export function pluginRoutes(
       }
 
       const actor = getActorInfo(req);
-      const input: PluginScopedApiRequest = {
+      const input: PluginApiRequestInput = {
         routeKey: match.route.routeKey,
         method: req.method,
         path: requestPath,
@@ -1930,6 +1906,13 @@ export function pluginRoutes(
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
           runId: actor.runId,
+          // Only middleware-verified JWT state proves run identity; runId remains legacy context.
+          authenticatedRunId: req.actor.type === "agent"
+            && req.actor.source === "agent_jwt"
+            && typeof req.actor.runId === "string"
+            && req.actor.runId.trim().length > 0
+            ? req.actor.runId
+            : null,
         },
         companyId,
         headers: sanitizePluginRequestHeaders(req),
@@ -1939,7 +1922,7 @@ export function pluginRoutes(
         plugin.id,
         "handleApiRequest",
         input,
-      ) as PluginScopedApiResponse;
+      ) as PluginApiResponse;
       const status = Number.isInteger(result.status) && Number(result.status) >= 200 && Number(result.status) <= 599
         ? Number(result.status)
         : 200;

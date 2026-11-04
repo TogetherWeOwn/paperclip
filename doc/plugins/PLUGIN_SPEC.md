@@ -727,6 +727,19 @@ Scoped API routes:
   `{ status?, headers?, body? }`.
 - Only safe request headers are forwarded; auth/cookie headers are never passed
   to the worker.
+- `PluginApiRequestInput.actor.authenticatedRunId` is a readonly, optional
+  `string | null` field. The host supplies the signed run identity only from a
+  host-verified agent JWT. All other authentication paths supply `null`; older
+  hosts omit the property (`undefined` to consumers).
+- Legacy `actor.runId` semantics remain unchanged. It is not trusted run
+  provenance and must never substitute for `authenticatedRunId`. Plugins must
+  neither parse nor forward bearer credentials to derive provenance.
+- Verified run provenance establishes identity only, not current run liveness,
+  workspace authority, or command admission. Consumers must apply independent
+  admission checks and fail closed for new command admission and dry-run when
+  `authenticatedRunId` is missing or `null`. This gate must preserve existing
+  receipt reads, heartbeats, cancellation, and reconciliation authorized by
+  ownership and company access.
 
 ## 14.2 Example SDK Shape
 

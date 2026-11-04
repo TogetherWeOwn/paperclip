@@ -491,6 +491,19 @@ before dispatch. The worker receives route params, query, parsed JSON body,
 sanitized headers, actor context, and `companyId`; responses are JSON `{ status?,
 headers?, body? }`.
 
+`PluginApiRequestInput.actor.authenticatedRunId` is a readonly, optional
+`string | null` field. Only a host-verified agent JWT supplies its signed run
+identity; all other authentication paths produce `null`. Older hosts omit the
+field, so consumers must also handle `undefined`. The legacy `actor.runId` is
+unchanged and is not trusted run provenance; never use it as a fallback.
+Plugins must not parse or forward bearer credentials to reconstruct provenance.
+
+This field proves identity only, not run liveness, workspace authority, or command
+admission. Consumers must still apply their admission checks, and fail closed for
+**new command admission and dry-run** when it is missing or `null`. That gate must
+not block existing receipt reads, heartbeats, cancellation, or reconciliation
+that are authorized by ownership and company access.
+
 ## Issue Orchestration APIs
 
 Workflow plugins can use `ctx.issues` for orchestration-grade issue operations without importing host server internals.

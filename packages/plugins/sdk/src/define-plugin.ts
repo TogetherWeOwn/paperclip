@@ -172,6 +172,12 @@ export interface PluginApiRequestInput {
     agentId?: string | null;
     userId?: string | null;
     runId?: string | null;
+    /**
+     * Run identity authenticated by the host's verified agent JWT, otherwise null.
+     * Older hosts omit this field. This proves identity only, not current liveness,
+     * workspace authority, or command admission. Never substitute runId for it.
+     */
+    readonly authenticatedRunId?: string | null;
   };
   companyId: string;
   headers: Record<string, string>;
