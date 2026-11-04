@@ -139,10 +139,7 @@ test("policy decides gate availability from the merge base parent and fails clos
   );
   assert.match(detectScript, /git rev-parse HEAD\^1/);
   assert.match(detectScript, /rev-list --parents/);
-  assert.match(
-    qualityGates,
-    /^ {4}needs: \[gate, policy, changes\]$/m,
-  );
+  assert.match(qualityGates, /^ {4}needs: \[gate, policy, changes\]$/m);
   assert.match(
     qualityGates,
     /^ {4}if: \$\{\{ needs\.changes\.outputs\.affected == 'true' && needs\.policy\.outputs\.quality_gate_tooling == 'true' \}\}$/m,
@@ -154,23 +151,11 @@ test("policy decides gate availability from the merge base parent and fails clos
   );
 });
 
-test("changed-test coverage prepares the plugin SDK entrypoint first", () => {
-  const build = qualityGates.indexOf(
-    "      - name: Build plugin SDK for changed-test coverage",
-  );
-  const coverage = qualityGates.indexOf(
-    "      - name: Coverage changed lines (WARN, report only)",
-  );
-  assert.ok(
-    build >= 0 && coverage > build,
-    "SDK preparation must precede coverage",
-  );
-  const preparation = qualityGates.slice(build, coverage);
+test("changed-test coverage runs the checked-out preparation-aware runner", () => {
   assert.match(
-    preparation,
-    /run: pnpm --filter @paperclipai\/plugin-sdk ensure-build-deps/,
+    qualityGates,
+    /run: node scripts\/quality-gates\/coverage-changed\.mjs/,
   );
-  assert.doesNotMatch(preparation, /continue-on-error: true/);
 });
 
 test("base parent controls the decision even when the PR head changes the tooling", () => {

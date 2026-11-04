@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import {
   getChangedFiles,
   isSourceFile,
@@ -57,6 +58,28 @@ const testFiles = changed.filter(isVitestTestFile);
 const sourceFiles = changed.filter(isSourceFile);
 
 if (testFiles.length > 0) {
+  // The trusted workflow comes from master, but this script comes from the PR
+  // checkout. Keep preparation here so it applies before the workflow is merged.
+  summarize([
+    "Preparing shared and plugin SDK outputs for changed-test coverage.",
+  ]);
+  const preparation = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(
+        new URL("../ensure-plugin-build-deps.mjs", import.meta.url),
+      ),
+    ],
+    { encoding: "utf8", timeout: 600000 },
+  );
+  process.stdout.write(preparation.stdout ?? "");
+  process.stderr.write(preparation.stderr ?? "");
+  if (preparation.error || preparation.status !== 0) {
+    summarize([
+      `WARN: SDK preparation failed (${preparation.error?.message ?? preparation.signal ?? preparation.status}); coverage was not run.`,
+    ]);
+    process.exit(0);
+  }
   summarize([
     `Changed test files: ${testFiles.length}. Running vitest with coverage (WARN only).`,
     ...testFiles.map((file) => `- ${file}`),
