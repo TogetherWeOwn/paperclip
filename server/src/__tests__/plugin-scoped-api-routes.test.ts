@@ -1,7 +1,15 @@
-import express from "express";
+import express, { type RequestHandler } from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { agentApiKeys, agents, authUsers, companyMemberships, type Db } from "@paperclipai/db";
 import { pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { actorMiddleware } from "../middleware/auth.js";
+
+const mockVerifyAgentJwt = vi.hoisted(() => vi.fn());
+
+vi.mock("../agent-auth-jwt.js", () => ({
+  verifyLocalAgentJwt: mockVerifyAgentJwt,
+}));
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -54,7 +62,8 @@ function manifest(apiRoutes: NonNullable<PaperclipPluginManifestV1["apiRoutes"]>
 }
 
 async function createApp(input: {
-  actor: Record<string, unknown>;
+  actor?: Record<string, unknown>;
+  authenticate?: RequestHandler;
   plugin?: Record<string, unknown> | null;
   workerRunning?: boolean;
   workerResult?: unknown;
@@ -74,10 +83,10 @@ async function createApp(input: {
 
   const app = express();
   app.use(express.json());
-  app.use((req, _res, next) => {
+  app.use(input.authenticate ?? ((req, _res, next) => {
     req.actor = input.actor as typeof req.actor;
     next();
-  });
+  }));
   app.use(
     "/api",
     pluginRoutes(
@@ -248,7 +257,7 @@ describe.sequential("plugin scoped API routes", () => {
       routeKey: "issue.advance",
       params: { issueId },
       body: { step: "next" },
-      actor: expect.objectContaining({ actorType: "agent", agentId, runId }),
+      actor: expect.objectContaining({ actorType: "agent", agentId, runId, authenticatedRunId: null }),
       companyId,
     }));
   });
@@ -455,6 +464,166 @@ describe.sequential("plugin scoped API routes", () => {
     expect(res.status).toBe(503);
     expect(res.body.error).toContain("worker is not running");
     expect(workerManager.call).not.toHaveBeenCalled();
+  });
+
+  describe("authenticated run provenance", () => {
+    const secondRunId = "44444444-4444-4444-8444-444444444445";
+    const apiRoutes = manifest([{
+      routeKey: "receipt.inspect",
+      method: "POST",
+      path: "/receipts/inspect",
+      auth: "board-or-agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    }]);
+    const plugin = { id: pluginId, pluginKey: apiRoutes.id, status: "ready", manifestJson: apiRoutes };
+    const path = `/api/plugins/${pluginId}/api/receipts/inspect?companyId=${companyId}`;
+
+    function fakeAuthDb(agentKey = false) {
+      // No run ownership rows: provenance must come from the verified claim, not a lookup.
+      return {
+        select: () => ({
+          from: (table: unknown) => ({
+            where: async () => {
+              if (table === agents) return [{ id: agentId, companyId, status: "active" }];
+              if (table === authUsers) return [{ id: "user-1" }];
+              if (table === companyMemberships) return [{ companyId, membershipRole: "member", status: "active" }];
+              if (table === agentApiKeys && agentKey) {
+                return [{ id: "key-1", agentId, companyId, responsibleUserId: "user-1", scopeConfig: null }];
+              }
+              return [];
+            },
+          }),
+        }),
+        update: () => ({ set: () => ({ where: async () => [] }) }),
+        insert: () => ({ values: async () => [] }),
+      } as unknown as Db;
+    }
+
+    function authenticate(agentKey = false) {
+      return actorMiddleware(fakeAuthDb(agentKey), {
+        deploymentMode: "authenticated",
+        resolveSession: async () => null,
+      });
+    }
+
+    beforeEach(() => {
+      mockVerifyAgentJwt.mockReset();
+      // The signature verifier is the fake auth boundary; middleware and routing are real.
+      mockVerifyAgentJwt.mockImplementation((token: string) => ({
+        sub: agentId,
+        company_id: companyId,
+        adapter_type: "codex_local",
+        run_id: token === "synthetic-run-b" ? secondRunId : runId,
+        responsible_user_id: "user-1",
+      }));
+    });
+
+    it.each([
+      ["synthetic-run-a", runId, false],
+      ["synthetic-run-a", runId, true],
+      ["synthetic-run-b", secondRunId, false],
+      ["synthetic-run-b", secondRunId, true],
+    ])("forwards only the signed run for %s (claim %s, matching header %s)", async (token, signedRunId, withHeader) => {
+      const { app, workerManager } = await createApp({ authenticate: authenticate(), plugin });
+      const req = request(app).post(path).set("Authorization", `Bearer ${token}`);
+      if (withHeader) req.set("X-Paperclip-Run-Id", signedRunId);
+      const res = await req.send({});
+
+      expect(res.status).toBe(200);
+      expect(workerManager.call.mock.calls[0]?.[2].actor).toEqual({
+        actorType: "agent", actorId: agentId, agentId, userId: null,
+        runId: signedRunId, authenticatedRunId: signedRunId,
+      });
+      expect(workerManager.call.mock.calls[0]?.[2].headers.authorization).toBeUndefined();
+    });
+
+    it("rejects a different run of the same agent before dispatch", async () => {
+      const { app, workerManager } = await createApp({ authenticate: authenticate(), plugin });
+      const res = await request(app).post(path)
+        .set("Authorization", "Bearer synthetic-run-a")
+        .set("X-Paperclip-Run-Id", secondRunId)
+        .send({});
+
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe("agent_jwt_run_id_mismatch");
+      expect(workerManager.call).not.toHaveBeenCalled();
+    });
+
+    it("preserves agent-key route access and legacy run headers without authenticating the run", async () => {
+      const { app, workerManager } = await createApp({ authenticate: authenticate(true), plugin });
+      const res = await request(app).post(path)
+        .set("Authorization", "Bearer synthetic-agent-key")
+        .set("X-Paperclip-Run-Id", runId)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(mockVerifyAgentJwt).not.toHaveBeenCalled();
+      expect(workerManager.call.mock.calls[0]?.[2].actor).toMatchObject({
+        actorType: "agent", agentId, runId, authenticatedRunId: null,
+      });
+    });
+
+    it.each([
+      ["agent_key", "agent", runId],
+      ["cloud_tenant", "agent", runId],
+      ["cloud_control", "agent", runId],
+      [undefined, "agent", runId],
+      ["agent_jwt", "agent", undefined],
+      ["agent_jwt", "agent", ""],
+      ["agent_jwt", "agent", "   "],
+      ["session", "board", runId],
+      ["local_implicit", "board", runId],
+      ["board_key", "board", runId],
+      ["cloud_tenant", "board", runId],
+      ["agent_jwt", "board", runId],
+    ])("emits null for source=%s, type=%s, run=%s", async (source, type, actorRunId) => {
+      const { app, workerManager } = await createApp({
+        actor: {
+          type, source, agentId, companyId, companyIds: [companyId], userId: "user-1", isInstanceAdmin: true,
+          runId: actorRunId, authenticatedRunId: secondRunId,
+        },
+        plugin,
+      });
+      const res = await request(app).post(path).set("X-Paperclip-Run-Id", runId).send({});
+
+      expect(res.status).toBe(200);
+      expect(workerManager.call.mock.calls[0]?.[2].actor.authenticatedRunId).toBeNull();
+      expect(workerManager.call.mock.calls[0]?.[2].actor.runId).toBe(actorRunId ?? null);
+    });
+
+    it.each([false, true])("ignores provenance-shaped client fields (JWT: %s)", async (jwt) => {
+      const { app, workerManager } = await createApp({ authenticate: authenticate(!jwt), plugin });
+      const spoofedActor = { type: "agent", source: "agent_jwt", runId: secondRunId, authenticatedRunId: secondRunId };
+      const res = await request(app).post(`${path}&authenticatedRunId=${secondRunId}&actor=${JSON.stringify(spoofedActor)}`)
+        .set("Authorization", "Bearer synthetic-run-a")
+        .set("X-Paperclip-Run-Id", runId)
+        .set("X-Paperclip-Authenticated-Run-Id", secondRunId)
+        .send({ actor: spoofedActor, authenticatedRunId: secondRunId });
+
+      expect(res.status).toBe(200);
+      const input = workerManager.call.mock.calls[0]?.[2];
+      expect(input.actor.authenticatedRunId).toBe(jwt ? runId : null);
+      expect(input.actor.runId).toBe(runId);
+      expect(input.headers["x-paperclip-authenticated-run-id"]).toBeUndefined();
+    });
+
+    it("still rejects another company's agent before dispatch", async () => {
+      const { app, workerManager } = await createApp({
+        actor: { type: "agent", source: "agent_jwt", agentId, companyId: "other-company", runId },
+        plugin,
+      });
+      const res = await request(app).post(path).send({});
+      expect(res.status).toBe(403);
+      expect(workerManager.call).not.toHaveBeenCalled();
+    });
+
+    it("still rejects unauthenticated callers before dispatch", async () => {
+      const { app, workerManager } = await createApp({ actor: { type: "none", source: "none" }, plugin });
+      const res = await request(app).post(path).send({});
+      expect(res.status).toBe(401);
+      expect(workerManager.call).not.toHaveBeenCalled();
+    });
   });
 
   it("rejects manifest routes that try to claim core API paths", () => {

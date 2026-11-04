@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { definePlugin } from "../src/define-plugin.js";
+import { definePlugin, type PluginApiRequestInput } from "../src/define-plugin.js";
 import {
   createRequest,
   createErrorResponse,
@@ -243,6 +243,110 @@ describe("worker performAction context", () => {
           },
         }) as { actor: { budgetSpentFraction?: unknown } };
         expect(result.actor.budgetSpentFraction).toBeUndefined();
+      }
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});
+
+describe("worker API request run provenance", () => {
+  it.each<{
+    name: string;
+    provenance: Array<Pick<PluginApiRequestInput["actor"], "authenticatedRunId">>;
+  }>([
+    {
+      name: "distinct authenticated runs for the same agent",
+      provenance: [
+        { authenticatedRunId: "synthetic-signed-run-A" },
+        { authenticatedRunId: "synthetic-signed-run-B" },
+      ],
+    },
+    { name: "explicit null", provenance: [{ authenticatedRunId: null }] },
+    { name: "older-host omission", provenance: [{}] },
+  ])("preserves $name through JSON-RPC to onApiRequest", async ({ provenance }) => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const received: PluginApiRequestInput[] = [];
+    let nextRequestId = 1;
+    const plugin = definePlugin({
+      async setup() {},
+      async onApiRequest(input) {
+        received.push(input);
+        return { body: { ok: true } };
+      },
+    });
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      await expect(callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-worker-api-provenance",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Worker API Provenance Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })).resolves.toMatchObject({ ok: true });
+
+      for (const [index, fields] of provenance.entries()) {
+        const input: PluginApiRequestInput = {
+          routeKey: "inspect",
+          method: "POST",
+          path: "/inspect",
+          params: {},
+          query: {},
+          body: {},
+          actor: {
+            actorType: "agent",
+            actorId: "agent-1",
+            agentId: "agent-1",
+            userId: null,
+            runId: "legacy-untrusted-run",
+            ...fields,
+          },
+          companyId: "company-1",
+          headers: {},
+        };
+        await expect(callWorker("handleApiRequest", input)).resolves.toEqual({ body: { ok: true } });
+        expect(received).toHaveLength(index + 1);
+        expect(received[index]).toStrictEqual(input);
+        expect(received[index].actor.authenticatedRunId).toBe(fields.authenticatedRunId);
+        expect(Object.prototype.hasOwnProperty.call(received[index].actor, "authenticatedRunId"))
+          .toBe(Object.prototype.hasOwnProperty.call(fields, "authenticatedRunId"));
       }
     } finally {
       worker.stop();
