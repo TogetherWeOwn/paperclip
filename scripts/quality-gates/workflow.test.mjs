@@ -154,6 +154,25 @@ test("policy decides gate availability from the merge base parent and fails clos
   );
 });
 
+test("changed-test coverage prepares the plugin SDK entrypoint first", () => {
+  const build = qualityGates.indexOf(
+    "      - name: Build plugin SDK for changed-test coverage",
+  );
+  const coverage = qualityGates.indexOf(
+    "      - name: Coverage changed lines (WARN, report only)",
+  );
+  assert.ok(
+    build >= 0 && coverage > build,
+    "SDK preparation must precede coverage",
+  );
+  const preparation = qualityGates.slice(build, coverage);
+  assert.match(
+    preparation,
+    /run: pnpm --filter @paperclipai\/plugin-sdk ensure-build-deps/,
+  );
+  assert.doesNotMatch(preparation, /continue-on-error: true/);
+});
+
 test("base parent controls the decision even when the PR head changes the tooling", () => {
   const { scratch, repo } = makeRepo();
   try {

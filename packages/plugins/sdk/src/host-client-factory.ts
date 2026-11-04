@@ -590,6 +590,15 @@ export function createHostClientHandlers(
 
     if (params.scopeKind === "company") {
       const scopeId = readNonEmptyString(params.scopeId);
+      // Storage retains the raw scopeId, so atomic create must not authorize
+      // a trimmed key while inserting a different one.
+      if (method === "state.create" && scopeId && scopeId !== params.scopeId) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          "company scopeId must not contain surrounding whitespace",
+        );
+      }
       return scopeId ? { kind: "single", companyId: scopeId } : { kind: "all" };
     }
 

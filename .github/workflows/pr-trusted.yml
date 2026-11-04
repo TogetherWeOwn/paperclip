@@ -808,6 +808,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node scripts/quality-gates/ast-grep-changed.mjs
 
+      - name: Build plugin SDK for changed-test coverage
+        run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
       - name: Coverage changed lines (WARN, report only)
         continue-on-error: true
         env:

@@ -47,6 +47,39 @@ describe("atomic state host adapter compatibility", () => {
     },
   );
 
+  it.each([" %s", "%s ", "\t%s\n"])(
+    "rejects a padded company scope %j before calling the adapter",
+    async (padding) => {
+      const companyId = "4b940f0f-5cc4-46ea-8ab8-a278bccf8c88";
+      const create = vi.fn(async () => true);
+      const handlers = makeHost({ create });
+      await expect(
+        requireCreate(handlers["state.create"])(
+          { ...input, scopeId: padding.replace("%s", companyId) },
+          { invocationScope: { companyId } },
+        ),
+      ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves legacy set company-scope handling", async () => {
+    const set = vi.fn(async () => {});
+    const handlers = makeHost({ set });
+    const padded = { ...input, scopeId: " company-a " };
+    await handlers["state.set"](padded, context);
+    expect(set).toHaveBeenCalledExactlyOnceWith(padded);
+  });
+
+  it("passes an exactly authorized company key to the adapter unchanged", async () => {
+    const create = vi.fn(async () => true);
+    const handlers = makeHost({ create });
+    await expect(
+      requireCreate(handlers["state.create"])(input, context),
+    ).resolves.toBe(true);
+    expect(create).toHaveBeenCalledExactlyOnceWith(input);
+  });
+
   it("cannot authorize another company's key using an extraneous companyId", async () => {
     const create = vi.fn(async () => true);
     const handlers = makeHost({ create });
