@@ -121,6 +121,7 @@ export interface HostServices {
   state: {
     get(params: WorkerToHostMethods["state.get"][0]): Promise<WorkerToHostMethods["state.get"][1]>;
     set(params: WorkerToHostMethods["state.set"][0]): Promise<void>;
+    create?(params: WorkerToHostMethods["state.create"][0]): Promise<boolean>;
     delete(params: WorkerToHostMethods["state.delete"][0]): Promise<void>;
   };
 
@@ -362,11 +363,12 @@ type HostHandler<M extends WorkerToHostMethodName> = (
  * A complete map of all worker→host method handlers.
  *
  * This type matches `WorkerToHostHandlers` from `plugin-worker-manager.ts`
- * but makes every handler required (the factory always provides all handlers).
+ * but requires the baseline handlers. Additive, negotiated methods are optional
+ * so an older service adapter cannot accidentally advertise support.
  */
 export type HostClientHandlers = {
-  [M in WorkerToHostMethodName]: HostHandler<M>;
-};
+  [M in Exclude<WorkerToHostMethodName, "state.create">]: HostHandler<M>;
+} & { "state.create"?: HostHandler<"state.create"> };
 
 // ---------------------------------------------------------------------------
 // Capability → method mapping
@@ -395,6 +397,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // State
   "state.get": "plugin.state.read",
   "state.set": "plugin.state.write",
+  "state.create": "plugin.state.write",
   "state.delete": "plugin.state.write",
 
   "db.namespace": "database.namespace.read",
@@ -580,7 +583,9 @@ export function createHostClientHandlers(
     if (method === "companies.list") return { kind: "all" };
     if (!isRecord(params)) return noCompanyScope;
 
-    const companyId = readNonEmptyString(params.companyId);
+    // Atomic state keys have no companyId field. An extra worker-supplied
+    // field must not override the scopeId used by storage and authorization.
+    const companyId = method === "state.create" ? null : readNonEmptyString(params.companyId);
     if (companyId) return { kind: "single", companyId };
 
     if (params.scopeKind === "company") {
@@ -741,6 +746,15 @@ export function createHostClientHandlers(
     "state.get": gated("state.get", async (params) => {
       return services.state.get(params);
     }),
+    "state.create": typeof services.state?.create === "function"
+      ? gated("state.create", async (params) => {
+        const result = await services.state.create!(params);
+        if (typeof result !== "boolean") {
+          throw new Error("state.create returned a non-boolean result");
+        }
+        return result;
+      })
+      : undefined,
     "state.set": gated("state.set", async (params) => {
       return services.state.set(params);
     }),

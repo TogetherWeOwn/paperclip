@@ -3127,6 +3127,9 @@ export function createPluginWorkerHandle(
       instanceInfo: options.instanceInfo,
       apiVersion: options.apiVersion,
       databaseNamespace: options.databaseNamespace ?? null,
+      supportedHostMethods: Object.entries(options.hostHandlers ?? {})
+        .filter(([, handler]) => typeof handler === "function")
+        .map(([method]) => method),
     };
 
     try {

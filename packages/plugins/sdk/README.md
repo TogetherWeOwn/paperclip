@@ -106,6 +106,8 @@ runWorker(plugin, import.meta.url);
 
 **Jobs:** Declare in `manifest.jobs` with `jobKey`, `displayName`, `schedule` (cron). Register handler with `ctx.jobs.register(jobKey, fn)`. **Webhooks:** Declare in `manifest.webhooks` with `endpointKey`; handle in `onWebhook(input)`. **State:** `ctx.state.get/set/delete(scopeKey)`; scope kinds: `instance`, `company`, `project`, `project_workspace`, `agent`, `issue`, `goal`, `run`.
 
+**Atomic state:** Optional `ctx.state.create(scopeKey, value)` requires `plugin.state.write` and host-negotiated `state.create` support. Check `typeof ctx.state.create === "function"` without writes before real admission or dry-run. `true` means this call inserted and committed; `false` preserves an existing row (including JSON null). Errors and ambiguous responses reject; never emulate with get/set. Dry-run must not call create. See [Atomic plugin state creation](../../../doc/plugins/ATOMIC_STATE.md) for compatibility, consumer invariants, and reset hazards.
+
 **Trusted local folders:** Declare `manifest.localFolders[]` and the `local.folders` capability when a plugin needs an operator-configured company-scoped folder. Use `ctx.localFolders.configure()`, `status()`, `readText()`, and `writeTextAtomic()` instead of resolving arbitrary filesystem paths yourself. The host validates absolute roots, read/write access, required relative folders/files, traversal attempts, symlink escapes, and writes through temp-file-plus-rename atomic replacement.
 
 ## Events

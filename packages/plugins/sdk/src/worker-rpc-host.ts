@@ -1758,6 +1758,28 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     currentConfig = params.config;
     databaseNamespace = params.databaseNamespace ?? null;
 
+    // Availability is host-negotiated, never inferred from this SDK's version.
+    if (
+      Array.isArray(params.supportedHostMethods)
+      && params.supportedHostMethods.every((method) => typeof method === "string")
+      && params.supportedHostMethods.includes("state.create")
+      && manifest.capabilities.includes("plugin.state.write")
+    ) {
+      ctx.state.create = async (input: ScopeKey, value: unknown): Promise<boolean> => {
+        const result = await callHost("state.create", {
+          scopeKind: input.scopeKind,
+          scopeId: input.scopeId,
+          namespace: input.namespace,
+          stateKey: input.stateKey,
+          value,
+        });
+        if (typeof result !== "boolean") {
+          throw new Error("state.create returned a non-boolean result");
+        }
+        return result;
+      };
+    }
+
     // Call the plugin's setup function
     await plugin.definition.setup(ctx);
 

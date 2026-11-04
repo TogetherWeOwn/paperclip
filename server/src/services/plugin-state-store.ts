@@ -1,4 +1,5 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { setPluginStateSchema } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import { plugins, pluginState } from "@paperclipai/db";
 import type {
@@ -53,14 +54,14 @@ function scopeConditions(
 /**
  * Plugin State Store — scoped key-value persistence for plugin workers.
  *
- * Provides `get`, `set`, `delete`, and `list` operations over the
+ * Provides `get`, `create`, `set`, `delete`, and `list` operations over the
  * `plugin_state` table. Each plugin's data is strictly namespaced by
  * `pluginId` so plugins cannot read or write each other's state.
  *
  * This service implements the server-side backing for the `ctx.state` SDK
  * client exposed to plugin workers. The host is responsible for:
  * - enforcing `plugin.state.read` capability before calling `get` / `list`
- * - enforcing `plugin.state.write` capability before calling `set` / `delete`
+ * - enforcing `plugin.state.write` capability before calling `create` / `set` / `delete`
  *
  * @see PLUGIN_SPEC.md §14 — SDK Surface (`ctx.state`)
  * @see PLUGIN_SPEC.md §15.1 — Capabilities: Plugin State
@@ -159,6 +160,54 @@ export function pluginStateStore(db: Db) {
             updatedAt: new Date(),
           },
         });
+    },
+
+    /**
+     * Insert once at the existing NULLS NOT DISTINCT composite key. The
+     * transaction promise resolves only after commit; a conflict never updates
+     * the winner. Plugin identity is host supplied, not part of the input.
+     */
+    create: async (
+      pluginId: string,
+      input: {
+        scopeKind: string;
+        scopeId?: string | null;
+        namespace?: string | null;
+        stateKey: string;
+        value: unknown;
+      },
+    ): Promise<boolean> => {
+      const parsed = setPluginStateSchema.parse({
+        ...input,
+        scopeId: input.scopeId ?? undefined,
+        namespace: input.namespace ?? undefined,
+      });
+      await assertPluginExists(pluginId);
+
+      return db.transaction(async (tx) => {
+        const inserted = await tx
+          .insert(pluginState)
+          .values({
+            pluginId,
+            scopeKind: parsed.scopeKind,
+            scopeId: parsed.scopeId ?? null,
+            namespace: parsed.namespace ?? DEFAULT_NAMESPACE,
+            stateKey: parsed.stateKey,
+            // Explicit encoding preserves JSON null rather than inserting SQL NULL.
+            valueJson: sql`${JSON.stringify(parsed.value)}::jsonb`,
+          })
+          .onConflictDoNothing({
+            target: [
+              pluginState.pluginId,
+              pluginState.scopeKind,
+              pluginState.scopeId,
+              pluginState.namespace,
+              pluginState.stateKey,
+            ],
+          })
+          .returning({ id: pluginState.id });
+        return inserted.length === 1;
+      });
     },
 
     /**
