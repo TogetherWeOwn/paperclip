@@ -5,6 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import express from "express";
+import request from "supertest";
+import { errorHandler } from "../middleware/index.js";
+import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, inArray, sql } from "drizzle-orm";
 import {
@@ -586,6 +590,55 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     await expect(svc.update(before.id, { cwd: before.cwd, name: "Retained workspace" }))
       .resolves.toMatchObject({ cwd: before.cwd, name: "Retained workspace", status });
+  }, 20_000);
+
+  it.each(["archived", "cleanup_failed"])("rejects status-only generic reopen of retained %s workspaces through service and HTTP", async (status) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await db.update(executionWorkspaces).set({
+      status,
+      closedAt: new Date(),
+      metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 7 },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const before = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId)).then((rows) => rows[0]!);
+    const head = await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId: "local-board", source: "local_implicit", isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", executionWorkspaceRoutes(db));
+    app.use(errorHandler);
+    const endpoint = `/api/execution-workspaces/${before.id}`;
+    const replacement = { cwd: "/unproved-new-target", providerRef: "/unproved-new-target", branchName: "unproved-new-branch" };
+
+    for (const openStatus of ["active", "idle", "in_review"]) {
+      await expect(svc.update(before.id, { status: openStatus })).rejects.toMatchObject({ status: 409 });
+      await expect(svc.update(before.id, replacement)).rejects.toMatchObject({ status: 409 });
+      const transition = await request(app).patch(endpoint).send({ status: openStatus });
+      expect(transition.status).toBe(409);
+      const rebind = await request(app).patch(endpoint).send(replacement);
+      expect(rebind.status).toBe(409);
+      const after = await db.select().from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, before.id)).then((rows) => rows[0]);
+      expect(after).toEqual(before);
+    }
+    const issue = await db.select().from(issues)
+      .where(eq(issues.id, seeded.sourceIssueId)).then((rows) => rows[0]!);
+    expect(issue.executionWorkspaceId).toBe(before.id);
+    expect(await readGit(seeded.worktreePath, ["rev-parse", "HEAD"])).toBe(head);
+    expect(await readGit(seeded.worktreePath, ["rev-parse", `refs/heads/${before.branchName}`])).toBe(head);
+    await expect(fs.readFile(path.join(seeded.worktreePath, "README.md"), "utf8")).resolves.toBe("# Test repo\n");
+
+    const descriptive = await request(app).patch(endpoint).send({
+      cwd: before.cwd, providerRef: before.providerRef, branchName: before.branchName, name: "Retained workspace",
+    });
+    expect(descriptive.status).toBe(200);
+    expect(descriptive.body).toMatchObject({
+      id: before.id, status, cwd: before.cwd, providerRef: before.providerRef, branchName: before.branchName,
+      name: "Retained workspace", metadata: before.metadata, closedAt: before.closedAt!.toISOString(),
+    });
   }, 20_000);
 
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {

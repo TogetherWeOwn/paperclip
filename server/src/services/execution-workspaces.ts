@@ -3226,10 +3226,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const existing = await tx.select().from(executionWorkspaces)
           .where(eq(executionWorkspaces.id, id)).then((rows) => rows[0] ?? null);
         if (!existing) return null;
-        // Retained artifacts must stay linked to a closed row. Identifier changes
-        // on reopen belong to the explicit lifecycle operation, not a generic patch.
-        if (isClosedExecutionWorkspaceStatus(existing.status) && (["cwd", "providerRef", "branchName"] as const).some(
-          (field) => patch[field] !== undefined && patch[field] !== existing[field],
+        // Retained artifacts must stay linked to a closed row. Status transitions
+        // and identifier changes on reopen belong to the explicit lifecycle operation.
+        if (isClosedExecutionWorkspaceStatus(existing.status) && (
+          (patch.status !== undefined && patch.status !== existing.status)
+          || (["cwd", "providerRef", "branchName"] as const).some(
+            (field) => patch[field] !== undefined && patch[field] !== existing[field],
+          )
         )) {
           assertExecutionWorkspacePreservation();
         }

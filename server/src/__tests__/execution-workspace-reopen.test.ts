@@ -250,10 +250,10 @@ describeEmbeddedPostgres("reopen archived isolated execution workspace", () => {
       .then((rows) => rows[0] ?? null);
   }
 
-  it("reopens the archived row in place, keeps the issue link, and raises the generation", async () => {
+  it.each(["archived", "cleanup_failed"] as const)("reopens the %s row in place, keeps the issue link, and raises the generation", async (status) => {
     const { companyId, projectId, projectWorkspaceId } = await seedCompanyProject();
     const cwd = await makeExistingDir();
-    const workspaceId = await seedClosedWorkspace({ companyId, projectId, projectWorkspaceId, cwd, generation: 3 });
+    const workspaceId = await seedClosedWorkspace({ companyId, projectId, projectWorkspaceId, cwd, status, generation: 3 });
     const issueId = await seedIssue({ companyId, projectId, workspaceId, issueNumber: 4100 });
 
     const svc = executionWorkspaceService(db);
