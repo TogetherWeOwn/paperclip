@@ -6090,7 +6090,9 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
+      // Retained closed rows require an explicit lifecycle reopen before reuse.
       input.existingExecutionWorkspaceStatus !== "archived" &&
+      input.existingExecutionWorkspaceStatus !== "cleanup_failed" &&
       // An unrealized source-bound allocation has no worktree to restore:
       // presence of the binding is not proof of realization. Dispatch
       // realizes fresh and adopts the record at persistence instead.
@@ -6138,8 +6140,8 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
         : null;
   const remediation =
     input.reason === "inherited_workspace_reuse_failed"
-      ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
-      : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
+      ? "Inspect the referenced execution workspace restore/provision logs, then repair or explicitly reopen the workspace before retrying."
+      : "Repair or explicitly reopen the referenced execution workspace before retrying.";
   const message = causeMessage
     ? `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored because ${causeMessage}.`
     : `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored.`;

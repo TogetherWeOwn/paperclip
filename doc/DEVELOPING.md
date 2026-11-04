@@ -1512,7 +1512,10 @@ Environment overrides:
   rollback or automatic reclamation. Source-bound unrealized allocation rollback remains
   a separate no-resource transaction. Positive cleanup admission needs
   a separately reviewed protocol; this refusal-first source change does not enable live
-  cleanup or change any installed controller.
+  cleanup or change any installed controller. Heartbeat reuse treats both `archived` and
+  `cleanup_failed` rows as unavailable until explicitly reopened through the lifecycle
+  operation. It fails before restore/provisioning rather than silently reopening or
+  replacing the retained workspace binding.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
