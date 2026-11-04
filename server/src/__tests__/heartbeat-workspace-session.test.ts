@@ -1714,6 +1714,7 @@ describe("effective run execution workspace config freshness", () => {
   it.each([
     { name: "missing", status: null },
     { name: "archived", status: "archived" },
+    { name: "cleanup_failed", status: "cleanup_failed" },
   ])("fails loudly when the inherited workspace row is $name", async ({ status }) => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-old",
@@ -1735,6 +1736,7 @@ describe("effective run execution workspace config freshness", () => {
       nextMetadata: metadata,
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
+    const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
 
     await expect(provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
@@ -1743,10 +1745,50 @@ describe("effective run execution workspace config freshness", () => {
       runId: "run-1",
       workspaceConfigFreshness: decision,
       restoreExistingWorkspace: reuseRequest.existingExecutionWorkspaceAvailable
-        ? async () => ({ id: "workspace-old", warnings: [] })
+        ? restoreExistingWorkspace
         : null,
       realizeWorkspace,
-    })).rejects.toThrow(/could not be restored/);
+    })).rejects.toThrow(/workspace-old.*could not be restored.*explicitly reopen/);
+    expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it.each(["active", "idle", "in_review"])("restores an open %s workspace without replacing its binding", async (status) => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: status,
+    });
+    expect(reuseRequest).toEqual({
+      requestedExecutionWorkspaceId: "workspace-old",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: reuseRequest.existingExecutionWorkspaceAvailable,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const workspace = { id: "workspace-old", warnings: [] };
+    const restoreExistingWorkspace = vi.fn(async () => workspace);
+    const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+      existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+      issueRef: { id: "issue-1" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: reuseRequest.existingExecutionWorkspaceAvailable
+        ? restoreExistingWorkspace
+        : null,
+      realizeWorkspace,
+    });
+
+    expect(result.executionWorkspace).toBe(workspace);
+    expect(result.reusedExecutionWorkspace).toBe(workspace);
+    expect(restoreExistingWorkspace).toHaveBeenCalledOnce();
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 

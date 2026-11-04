@@ -118,13 +118,15 @@ export function ExecutionWorkspaceCloseDialog({
                     : "Close is ready"}
               </div>
               <div className="mt-1 text-xs opacity-80">
-                {readiness.isSharedWorkspace
-                  ? "This is a shared workspace session. Archiving it removes this session record but keeps the underlying project workspace."
-                  : readiness.git?.workspacePath && readiness.git.repoRoot && readiness.git.workspacePath !== readiness.git.repoRoot
-                    ? "This execution workspace has its own checkout path and can be archived independently."
-                    : readiness.isProjectPrimaryWorkspace
-                      ? "This execution workspace currently points at the project's primary workspace path."
-                      : "This workspace is disposable and can be archived."}
+                {readiness.state === "blocked"
+                  ? "The workspace and its resources will remain in place while close is blocked."
+                  : readiness.isSharedWorkspace
+                    ? "This is a shared workspace session. Archiving it removes this session record but keeps the underlying project workspace."
+                    : readiness.git?.workspacePath && readiness.git.repoRoot && readiness.git.workspacePath !== readiness.git.repoRoot
+                      ? "This execution workspace has its own checkout path and can be archived independently."
+                      : readiness.isProjectPrimaryWorkspace
+                        ? "This execution workspace currently points at the project's primary workspace path."
+                        : "Review the cleanup actions and warnings before archiving this workspace."}
               </div>
             </div>
 

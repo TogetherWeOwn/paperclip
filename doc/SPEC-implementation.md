@@ -1182,9 +1182,19 @@ The current app also exposes V1-supporting surfaces for:
   server-owned URL expansion, issue/comment/document scopes, status/date filters, issue-level pagination, a
   bounded `matchesPerIssue` override for machine consumers, and explicit issue/match truncation flags
 - execution workspaces, project workspaces, workspace runtime services, and workspace operations. Workspace reads
-  derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`; terminal issue trees with a
-  merged delivery and no active checkout run become cleanup-eligible with reason `issue_terminal` and are archived
-  through the workspace cleanup path. Reopening the source issue records activity but does not restore that workspace.
+  derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`. Delivery classification is not
+  preservation authorization. Close-readiness and mandatory lifecycle/physical-cleanup guards fail closed while
+  complete removal-scope inventory, fresh authoritative remote commit retention, and fenced consumer/lease absence
+  are unproved. The current refusal-first implementation admits no generic workspace close/cleanup, including
+  shared sessions and retries of legacy archived/cleanup-failed rows. It retains bytes, refs, bindings, services,
+  leases and lifecycle state; there is no caller override or metadata proof. Terminal-tree, cooldown, reopen,
+  generation and Git fences remain necessary but insufficient. Under the lifecycle lock, generic updates cannot
+  reopen a legacy closed row or change its checkout path, provider ref or branch name; unchanged identifiers and
+  descriptive updates remain allowed. Reopening requires the explicit, authorized lifecycle operation, which
+  raises the generation and preserves the issue binding.
+  Realized-worktree persistence failures retain files/refs even without a workspace row and log their recovery
+  location on the failed heartbeat. Source-bound unrealized-allocation rollback has
+  its separate transactional no-resource contract. A future positive admission protocol requires separate review.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration
