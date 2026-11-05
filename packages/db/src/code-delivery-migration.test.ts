@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 
 const migration = await readFile(new URL("./migrations/0432_dear_jane_foster.sql", import.meta.url), "utf8");
+const decisionMigration = await readFile(new URL("./migrations/0433_last_proudstar.sql", import.meta.url), "utf8");
 const support = await getEmbeddedPostgresTestSupport();
 const head = "a".repeat(40);
 
@@ -43,7 +44,10 @@ const head = "a".repeat(40);
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-code-delivery-");
     sql = postgres(database.connectionString, { max: 5, onnotice: () => {} });
-    await sql.unsafe(`DROP TRIGGER code_delivery_capture_work_product ON issue_work_products;
+    await sql.unsafe(`DROP TRIGGER code_delivery_transferred_ownership ON code_delivery_obligations;
+      DROP TABLE code_delivery_decisions, code_delivery_authorities;
+      DROP FUNCTION code_delivery_transferred_ownership(), code_delivery_decision_mutation();
+      DROP TRIGGER code_delivery_capture_work_product ON issue_work_products;
       DROP TRIGGER code_delivery_issue_revision ON issues;
       DROP TRIGGER code_delivery_initialize_intent ON issues;
       DROP TABLE code_delivery_ownership_events, code_delivery_obligations, code_delivery_discoveries, issue_code_delivery_intents;
@@ -61,7 +65,7 @@ const head = "a".repeat(40);
     legacyTask = await issue(legacy);
     legacyProducts = Array.from(await sql<Record<string, unknown>[]>`SELECT * FROM issue_work_products WHERE issue_id = ${legacy.issueId} ORDER BY id`);
     await sql.begin(async tx => {
-      for (const statement of migration.split("--> statement-breakpoint").map(s => s.trim()).filter(Boolean)) await tx.unsafe(statement);
+      for (const statement of `${migration}\n--> statement-breakpoint\n${decisionMigration}`.split("--> statement-breakpoint").map(s => s.trim()).filter(Boolean)) await tx.unsafe(statement);
     });
   }, 90_000);
   afterAll(async () => { await sql?.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);

@@ -47,6 +47,8 @@ export const codeDeliveryObligations = pgTable("code_delivery_obligations", {
   baseRef: text("base_ref").notNull(),
   proposedHeadSha: text("proposed_head_sha").notNull(),
   reviewedHeadSha: text("reviewed_head_sha"),
+  headDecisionId: uuid("head_decision_id"),
+  transferDecisionId: uuid("transfer_decision_id"),
   revision: bigint("revision", { mode: "number" }).notNull().default(1),
   provenance: jsonb("provenance").$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

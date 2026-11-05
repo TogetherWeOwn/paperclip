@@ -2857,6 +2857,7 @@ export type { AgentLifecycleRequest, AgentLifecycleResult } from "./types/agent-
 
 export * from "./types/task-workspace.js";
 export * from "./validators/task-workspace.js";
+export * from "./validators/code-delivery.js";
 
 export { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository } from "./validators/workspace-repository.js";
 
