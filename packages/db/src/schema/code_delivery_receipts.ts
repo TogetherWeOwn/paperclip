@@ -20,6 +20,7 @@ export const codeDeliveryReadinessReceipts = pgTable("code_delivery_readiness_re
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, table => ({
   issue: foreignKey({ columns: [table.companyId, table.issueId], foreignColumns: [issues.companyId, issues.id] }),
+  identity: unique("code_delivery_readiness_receipts_identity_uq").on(table.companyId, table.issueId, table.id),
   revision: unique("code_delivery_readiness_receipts_revision_uq").on(table.companyId, table.issueId, table.issueRevision),
   issueIndex: index("code_delivery_readiness_receipts_issue_idx").on(table.companyId, table.issueId),
   status: check("code_delivery_readiness_receipts_status_ck", sql`${table.terminalStatus} in ('done', 'cancelled')`),
@@ -27,4 +28,21 @@ export const codeDeliveryReadinessReceipts = pgTable("code_delivery_readiness_re
   validSnapshot: check("code_delivery_readiness_receipts_snapshot_ck", sql`${table.snapshotHash} ~ '^[a-f0-9]{64}$' and ${table.transactionId} ~ '^[0-9]+$'`),
   validTime: check("code_delivery_readiness_receipts_time_ck", sql`${table.expiresAt} > ${table.preparedAt} and ${table.expiresAt} <= ${table.preparedAt} + interval '30 seconds'`),
   validActor: check("code_delivery_readiness_receipts_actor_ck", sql`${table.actorType} in ('agent', 'user') and length(${table.actorId}) > 0 and (${table.actorType} <> 'agent' or ${table.runId} is not null)`),
+}));
+
+export const codeDeliveryReceiptConsumptions = pgTable("code_delivery_receipt_consumptions", {
+  receiptId: uuid("receipt_id").primaryKey(),
+  companyId: uuid("company_id").notNull(),
+  issueId: uuid("issue_id").notNull(),
+  issueRevision: bigint("issue_revision", { mode: "number" }).notNull(),
+  terminalStatus: text("terminal_status").$type<"done" | "cancelled">().notNull(),
+  transactionId: text("transaction_id").notNull().default(sql`pg_current_xact_id()::text`),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, table => ({
+  receipt: foreignKey({ columns: [table.companyId, table.issueId, table.receiptId],
+    foreignColumns: [codeDeliveryReadinessReceipts.companyId, codeDeliveryReadinessReceipts.issueId, codeDeliveryReadinessReceipts.id] }),
+  revision: unique("code_delivery_receipt_consumptions_revision_uq").on(table.companyId, table.issueId, table.issueRevision),
+  status: check("code_delivery_receipt_consumptions_status_ck", sql`${table.terminalStatus} in ('done', 'cancelled')`),
+  validRevision: check("code_delivery_receipt_consumptions_revision_ck", sql`${table.issueRevision} > 0`),
+  validTransaction: check("code_delivery_receipt_consumptions_transaction_ck", sql`${table.transactionId} ~ '^[0-9]+$'`),
 }));

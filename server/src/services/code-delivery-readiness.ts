@@ -1,6 +1,6 @@
 import { and, eq, inArray, or } from "drizzle-orm";
 import { activityLog, codeDeliveryDecisions, codeDeliveryDiscoveries, codeDeliveryObligations, codeDeliveryOwnershipEvents,
-  codeDeliveryReadinessReceipts, issueCodeDeliveryIntents, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
+  codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, issueCodeDeliveryIntents, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import { conflict, HttpError } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { assertDeliveryAdjudicator, deliveryActor, lockDeliveryIssues, readDeliveryIssue } from "./code-delivery-authority.js";
@@ -116,36 +116,49 @@ export function codeDeliveryReadinessService(db: Db) {
       return token;
     },
 
-    commit: async (transaction: DeliveryTransaction, companyId: string, issueId: string, effectiveStatus: string,
-      actor: AuthorizationActor, token: PreparedCodeDeliveryReadiness | null) => {
-      if (!terminal(effectiveStatus)) return null;
+    apply: async <T>(transaction: DeliveryTransaction, companyId: string, issueId: string, effectiveStatus: string,
+      actor: AuthorizationActor, token: PreparedCodeDeliveryReadiness | null, mutate: (tx: DeliveryTransaction) => Promise<T>) => {
+      if (!terminal(effectiveStatus)) return { receipt: null, result: await mutate(transaction) };
       const proof = token && typeof token === "object" ? prepared.get(token) : null;
       if (!proof || proof.companyId !== companyId || proof.issueId !== issueId || proof.status !== effectiveStatus
         || proof.actorHash !== deliveryFingerprint(actor)) throw deliveryReadinessConflict("preparation_required");
+      prepared.delete(token!);
       if (Date.now() >= proof.expiresAt.getTime()) throw stale();
-      const tx = transaction as unknown as Db;
-      const locked = await lockDeliveryIssues(tx, actor, companyId, proof.lockIds);
-      const current = await snapshot(tx, companyId, issueId, actor);
-      const sources = await sourceBindings(tx, current, true);
-      if (deliveryFingerprint({ snapshot: current, sources }) !== proof.snapshotHash) throw stale();
-      const plan = planDeliveryReadiness(current);
-      for (const obligation of current.obligations.filter(row => row.ownerIssueId !== issueId)) {
-        const destination = locked.find(row => row.id === obligation.ownerIssueId);
-        if (!destination) throw stale();
-        await assertDeliveryTransferDestination(tx, destination);
-      }
-      const evidence = evaluateDeliveryReadiness(current, plan, proof.evidence.pullRequests.map(row => row.observation));
-      await adjudication(tx, current, usedDecisions(plan, evidence));
-      const principal = deliveryActor(actor);
-      if (Date.now() >= proof.expiresAt.getTime()) throw stale();
-      const [receipt] = await tx.insert(codeDeliveryReadinessReceipts).values({ companyId, issueId,
-        issueRevision: current.issue.codeDeliveryRevision, terminalStatus: effectiveStatus, snapshotHash: proof.snapshotHash,
-        actorType: principal.type, actorId: principal.id, runId: principal.runId, evidence: { version: 1, ...evidence },
-        preparedAt: proof.preparedAt, expiresAt: proof.expiresAt }).returning();
-      await tx.insert(activityLog).values({ companyId, actorType: principal.type, actorId: principal.id, runId: principal.runId,
-        action: "code_delivery.readiness_certified", entityType: "issue", entityId: issueId,
-        details: { receiptId: receipt!.id, terminalStatus: effectiveStatus, issueRevision: current.issue.codeDeliveryRevision } });
-      return receipt!;
+      return transaction.transaction(async savepoint => {
+        const tx = savepoint as unknown as Db;
+        const locked = await lockDeliveryIssues(tx, actor, companyId, proof.lockIds);
+        const current = await snapshot(tx, companyId, issueId, actor);
+        const sources = await sourceBindings(tx, current, true);
+        if (deliveryFingerprint({ snapshot: current, sources }) !== proof.snapshotHash) throw stale();
+        const plan = planDeliveryReadiness(current);
+        for (const obligation of current.obligations.filter(row => row.ownerIssueId !== issueId)) {
+          const destination = locked.find(row => row.id === obligation.ownerIssueId);
+          if (!destination) throw stale();
+          await assertDeliveryTransferDestination(tx, destination);
+        }
+        const evidence = evaluateDeliveryReadiness(current, plan, proof.evidence.pullRequests.map(row => row.observation));
+        await adjudication(tx, current, usedDecisions(plan, evidence));
+        const principal = deliveryActor(actor);
+        if (Date.now() >= proof.expiresAt.getTime()) throw stale();
+        const [receipt] = await tx.insert(codeDeliveryReadinessReceipts).values({ companyId, issueId,
+          issueRevision: current.issue.codeDeliveryRevision, terminalStatus: effectiveStatus, snapshotHash: proof.snapshotHash,
+          actorType: principal.type, actorId: principal.id, runId: principal.runId, evidence: { version: 1, ...evidence },
+          preparedAt: proof.preparedAt, expiresAt: proof.expiresAt }).returning();
+        if (!receipt) throw deliveryReadinessConflict("receipt_missing");
+        const result = await mutate(savepoint);
+        const [consumption] = await tx.select().from(codeDeliveryReceiptConsumptions)
+          .where(and(eq(codeDeliveryReceiptConsumptions.companyId, companyId), eq(codeDeliveryReceiptConsumptions.issueId, issueId),
+            eq(codeDeliveryReceiptConsumptions.receiptId, receipt.id)));
+        const [updated] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+        if (!consumption || consumption.issueRevision !== receipt.issueRevision + 1 || consumption.terminalStatus !== effectiveStatus
+          || consumption.transactionId !== receipt.transactionId || !updated || updated.status !== effectiveStatus
+          || updated.codeDeliveryRevision !== consumption.issueRevision) throw deliveryReadinessConflict("receipt_not_consumed");
+        await tx.insert(activityLog).values({ companyId, actorType: principal.type, actorId: principal.id, runId: principal.runId,
+          action: "code_delivery.readiness_certified", entityType: "issue", entityId: issueId,
+          details: { receiptId: receipt.id, terminalStatus: effectiveStatus, issueRevision: current.issue.codeDeliveryRevision,
+            terminalRevision: consumption.issueRevision } });
+        return { receipt, result };
+      });
     },
   };
 }

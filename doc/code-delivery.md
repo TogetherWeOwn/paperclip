@@ -22,7 +22,8 @@ presentation and discovery data, never proof of delivery.
 | `code_delivery_ownership_events` | Append-only ownership provenance. Initial registration and independently adjudicated transfers retain every owner. |
 | `code_delivery_decisions` | Immutable independent classification, head acceptance, no-PR, closed-unmerged, withdrawal, and transfer decisions. These are not terminal readiness receipts. |
 | `code_delivery_authorities` | Explicit company-scoped technical agent for no-stage decisions, configured by an authorized human administrator. No agent name or job title grants this authority. |
-| `code_delivery_readiness_receipts` (schema draft) | Server-prepared terminal evidence bound to one company, task revision, effective terminal status, snapshot hash, transaction and expiry. Its migration and database consumption guards are not generated or active yet. |
+| `code_delivery_readiness_receipts` (schema draft) | Server-prepared terminal evidence bound to one company, task revision, effective terminal status, snapshot hash, transaction and expiry. Its migration is not generated or active yet. |
+| `code_delivery_receipt_consumptions` (schema draft) | Immutable one-to-one consumption of a receipt by the exact next task revision and terminal status in the same transaction. Only the terminal-update trigger creates consumption. Not installed yet. |
 | `issues.code_delivery_revision` | Server-owned monotonic invalidation version. Every task update and supported delivery-association mutation advances it, including A-to-B-to-A policy changes. It grants no authority. |
 
 The database enforces company/task/project/workspace foreign keys and canonical
@@ -141,28 +142,53 @@ issue, policy/state, retained associations, decisions, ownership and source
 bindings. Nonterminal effective results, including earlier review approvals,
 return no token and perform no provider or delivery database work.
 
-The candidate commit method re-locks the task and related owners, checks current
-run authority, compares the complete snapshot and rechecks the independent
-adjudication context. Outbound transfers recheck the current destination's live
-wake path under its lock. Receipt data retains exact head, repository identity,
+The candidate `apply` method synchronously claims a matching preparation token,
+then opens a savepoint on the caller's transaction. It re-locks the task and
+related owners, checks current run authority, compares the complete snapshot and
+rechecks independent adjudication. Outbound transfers recheck the destination's
+current wake path under its lock. There is no receipt-only commit method.
+The mutation callback must use the supplied savepoint for the terminal task write,
+native decision and every transactional effect. It must not perform remote reads,
+stop a process, publish notifications, or perform other irreversible effects.
+Those operations belong after a confirmed outer commit or in a transactionally
+accepted durable delivery path.
+
+After the callback, `apply` requires the database-created consumption record and
+exact terminal task revision/status before recording the audit. A callback that
+does nothing, writes a different status/revision, or fails cannot return a receipt.
+The savepoint rolls back local writes even if the enclosing caller catches the
+error. The token cannot be retried or replayed, including after rollback; a new
+attempt must prepare again. Receipt data retains exact head, repository identity,
 merge timestamp, merge SHA, observation time, obligation revision and selected
-decision IDs. Receipt insertion and its audit use the caller's transaction. The
-preparation and every observation expire within 30 seconds. Validation does not
-refresh evidence or call GitHub while holding locks.
+decision IDs. Preparation and every observation expire within 30 seconds.
+Validation never refreshes evidence or calls GitHub while holding locks.
 
-**This is not yet an atomic terminal guard.** The receipt schema is authored but
-its generated migration, immutable-history trigger, terminal-write receipt guard
-and deferred receipt-consumption constraint are pending. No existing terminal
-writer calls this service. It must not be activated until the receipt and native
-terminal transition are guaranteed to commit together, including rejection of
-unprepared direct writes, terminal creation/import and receipt replay. Current
-transfer validation also conservatively refuses an already-terminal destination;
-verified completed replacement/owner evidence still needs lifecycle integration.
+`packages/db/src/migration-fragments/code-delivery-terminal-guards.sql` is
+**uninstalled migration source, not an executable journal entry**. After generating
+the receipt/consumption schema migration through the supported route, that
+migration must include this fragment before activation. The fragment authors
+immutable receipt/consumption guards, transaction/revision/deadline validation,
+unprepared terminal-write and terminal-insert rejection, automatic exact-revision
+consumption, and deferred settlement checks. Settlement rejects an unused receipt
+or an outer-transaction change after consumption. A later transaction may update
+terminal bookkeeping, but cannot rewrite a terminal timestamp without a new receipt.
+Only the trigger may insert consumption; its row is not caller-supplied evidence.
 
-The new policy and preparation-boundary regression sources are authored but not
-executed. The boundary tests mock persistence/authorization and do not prove
-PostgreSQL locking, transaction rollback, native review decisions or terminal
-side-effect preservation. Real database/API/concurrency acceptance is required.
+**This is not yet an active terminal guard.** The generated migration/snapshots
+and every native writer integration remain pending. No existing terminal writer
+calls `apply`. Do not install this checkpoint. The service intentionally requires
+the uninstalled database protocol, rather than falling back to a JSON receipt or
+an unguarded write. Current transfer validation conservatively refuses an
+already-terminal destination; verified completed replacement/owner evidence still
+needs lifecycle integration.
+
+The policy, preparation/consumption boundary, and new SQL-fragment regression
+sources are authored but not executed at this checkpoint. Server boundary tests
+mock persistence/authorization. The SQL test uses real PostgreSQL with an isolated
+minimal trigger fixture and the actual guard source; it is not generated-schema
+migration acceptance. Neither establishes native review decisions, full API
+rollback or terminal-side-effect preservation. Full database/API/concurrency
+acceptance is still required.
 In particular, route-level pre-terminal run cancellation must be moved behind the
 accepted transactional boundary; a denied attempt must not have stopped a run
 before its stale-state conflict is detected. Native and other transaction-owning
@@ -183,12 +209,13 @@ constraints, canonical deduplication, immutable history, revision invalidation,
 late registration, display moves, deletion, and a concurrent close/association
 attempt. It is not full terminal-writer or live-provider acceptance.
 
-Run the focused persistence check from the repository root:
-
-```sh
-pnpm exec vitest run --project @paperclipai/db src/code-delivery-migration.test.ts
-pnpm --filter @paperclipai/db typecheck
-```
+The CI verification route must generate the receipt schema migration and include
+the guard fragment, retain the five newest snapshots, and exercise both the full
+schema upgrade and the standalone SQL-fragment fixture. The relevant source tests
+are `packages/db/src/code-delivery-migration.test.ts`,
+`packages/db/src/code-delivery-terminal-guards.test.ts`, and the server
+`code-delivery-readiness` policy/boundary tests. Exact-candidate typecheck and
+full required checks remain necessary; authored regression sources are not results.
 
 No migration has been applied to a running instance by this work. For an
 operational rollback, retain a pre-upgrade database backup and its matching
