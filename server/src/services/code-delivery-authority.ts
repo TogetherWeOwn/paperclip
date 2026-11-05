@@ -52,7 +52,7 @@ export async function lockDeliveryIssues(tx: Db, actor: AuthorizationActor, comp
   }
   const ids = [...new Set([...issueIds, ...(sourceIssueId ? [sourceIssueId] : [])])].sort();
   const rows = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, ids)))
-    .orderBy(issues.id).for("update", { noWait });
+    .orderBy(issues.id).for("update", noWait ? { noWait: true } : undefined);
   if (ids.some(id => !rows.some(row => row.id === id))) throw notFound("Task not found");
   if (principal.type === "agent") {
     const run = await assertAgentRunWriteAllowed(tx, companyId, { agentId: principal.id, runId: principal.runId });

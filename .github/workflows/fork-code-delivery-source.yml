@@ -205,6 +205,7 @@ jobs:
             printf '%s\n' "${codes[1]}" > "$evidence/$name.log-exit-code"
             test "${codes[0]}" = 0 && test "${codes[1]}" = 0
           }
+          record candidate-sdk-links node scripts/link-plugin-dev-sdk.mjs
           record candidate-dependencies pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           checks_failed=0
           record candidate-tests pnpm exec vitest run --maxWorkers=1 --no-file-parallelism \

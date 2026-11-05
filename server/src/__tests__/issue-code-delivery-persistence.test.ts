@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, authUsers, codeDeliveryDecisions, codeDeliveryDiscoveries, codeDeliveryObligations,
   codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, companies, companyMemberships,
@@ -9,6 +9,7 @@ import { issueService, type IssuePostCommitAction } from "../services/issues.js"
 import type { ActivityPublication } from "../services/activity-log.js";
 import { codeDeliveryReadinessService, type PreparedCodeDeliveryReadiness } from "../services/code-delivery-readiness.js";
 import { codeDeliveryDecisionService } from "../services/code-delivery-decisions.js";
+import { lockDeliveryIssues } from "../services/code-delivery-authority.js";
 import type { AuthorizationActor } from "../services/authorization.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -125,6 +126,33 @@ describePostgres("common issue-service code-delivery persistence", () => {
       outcome: "merged", observation: { headSha: head, mergeCommitSha: merge, mergedAt: expect.any(String) } }] });
     expect(provider.read).not.toHaveBeenCalled();
   });
+
+  it("keeps ordinary delivery locks blocking and readiness locks NOWAIT under real contention", async () => {
+    const f = await seed(), before = await snapshot(f.companyId);
+    const locked = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const holder = db.transaction(async tx => {
+      const rows = await lockDeliveryIssues(tx as unknown as Db, actor, f.companyId, [f.issueId]);
+      expect(rows.map(row => row.id)).toEqual([f.issueId]);
+      locked.resolve();
+      await release.promise;
+    });
+    void holder.catch(error => locked.reject(error));
+    try {
+      await locked.promise;
+      await expect(db.transaction(async tx => {
+        await tx.execute(sql`SET LOCAL lock_timeout = '1s'`);
+        return lockDeliveryIssues(tx as unknown as Db, actor, f.companyId, [f.issueId], true);
+      })).rejects.toMatchObject({ cause: { code: "55P03" } });
+    } finally {
+      release.resolve();
+      await holder;
+    }
+    await db.transaction(async tx => {
+      const rows = await lockDeliveryIssues(tx as unknown as Db, actor, f.companyId, [f.issueId], false);
+      expect(rows.map(row => row.id)).toEqual([f.issueId]);
+    });
+    expect(await snapshot(f.companyId)).toEqual(before);
+  }, 10_000);
 
   it("serializes competing prepared common-service completions into one consumed receipt", async () => {
     const f = await seed();

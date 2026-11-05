@@ -6,12 +6,17 @@ type Discovery = typeof codeDeliveryDiscoveries.$inferSelect;
 type Obligation = typeof codeDeliveryObligations.$inferSelect;
 type Decision = typeof codeDeliveryDecisions.$inferSelect;
 
-const discovery = { id: "discovery", companyId: "company", issueId: "issue", sourceRevision: "revision",
-  snapshot: { type: "pull_request", url: "https://github.com/fixture/source/pull/12" } } as Discovery;
-const obligation = { id: "obligation", provider: "github", companyId: "company", ownerIssueId: "issue",
-  sourceIssueId: "issue", repository: "fixture/source", pullRequestNumber: 12 } as Obligation;
-const decision = { id: "decision", companyId: "company", issueId: "issue", obligationId: "obligation", kind: "accept_head",
-  payload: { reconciliations: [{ discoveryId: "discovery", sourceRevision: "revision", obligationId: "obligation" }] } } as Decision;
+const createdAt = new Date("2026-11-05T01:00:00.000Z");
+const discovery: Discovery = { id: "discovery", companyId: "company", issueId: "issue", sourceRevision: "revision",
+  sourceWorkProductId: "product", createdAt, snapshot: { type: "pull_request", url: "https://github.com/fixture/source/pull/12" } };
+const obligation: Obligation = { id: "obligation", provider: "github", companyId: "company", ownerIssueId: "issue",
+  sourceIssueId: "issue", repository: "fixture/source", pullRequestNumber: 12, repositoryId: "1", baseRef: "main",
+  sourceProjectId: "project", sourceWorkspaceId: "workspace", proposedHeadSha: "a".repeat(40), reviewedHeadSha: "a".repeat(40),
+  headDecisionId: "decision", transferDecisionId: null, revision: 2, provenance: {}, createdAt };
+const decision: Decision = { id: "decision", companyId: "company", issueId: "issue", obligationId: "obligation", kind: "accept_head",
+  issueRevision: 1, obligationRevision: 1, actorType: "agent", actorId: "reviewer", runId: "run", idempotencyKey: "accept-head",
+  requestHash: "0".repeat(64), reason: "Fixture decision", authority: {}, createdAt,
+  payload: { reconciliations: [{ discoveryId: "discovery", sourceRevision: "revision", obligationId: "obligation" }] } };
 
 describe("retained code-delivery discovery identity", () => {
   it.each(["https://github.com/Fixture/Source/pull/12", "https://github.com/fixture/source/pull/12/files",

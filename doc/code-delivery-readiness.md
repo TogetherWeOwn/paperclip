@@ -162,8 +162,14 @@ journal/pruning changes, commands, exit codes, hook inventories, full failure
 logs and SHA-256 checksums. Changes outside migration source fail the result.
 Generation never applies migrations, commits, pushes, publishes or deploys.
 After generation, the subsystem-check step requires an unchanged migration tree
-and the integrated terminal guard before building the existing SDK test
-prerequisites and running the thirteen selected delivery/provider/interaction
+and the integrated terminal guard. It explicitly runs the reviewed first-party
+`node scripts/link-plugin-dev-sdk.mjs` command to link the in-repository SDK into
+workspace-excluded provider packages before building the existing SDK test
+prerequisites. The link command creates development symlinks only; it does not
+install packages or enable lifecycle scripts. It is the sole root postinstall
+command, invoked by name rather than enabling root or dependency hooks. Its
+source is bound to the verified source SHA, and its command, result and full log
+are retained. The job then runs the thirteen selected delivery/provider/interaction
 suites. It retains the complete test JSON and fails if any test is skipped,
 pending or todo, if an expected suite is missing, or if any assertion fails.
 Database/server focused typechecks and module boundaries still run after a test

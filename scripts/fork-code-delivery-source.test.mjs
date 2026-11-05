@@ -76,6 +76,8 @@ test("subsystem checks use integrated bytes and cannot pass with skipped Postgre
   assert.match(candidate.run, /result\['numPendingTests'\] == 0/);
   assert.match(candidate.run, /len\(files\) == 13/);
   assert.match(candidate.run, /server\/src\/services\/issue-thread-interactions\.test\.ts/);
+  assert.match(candidate.run, /candidate-sdk-links node scripts\/link-plugin-dev-sdk\.mjs/);
+  assert.ok(candidate.run.indexOf("record candidate-sdk-links") < candidate.run.indexOf("record candidate-dependencies"));
   assert.match(candidate.run, /candidate-db-typecheck pnpm --filter @paperclipai\/db typecheck/);
   assert.match(candidate.run, /candidate-server-typecheck pnpm --filter @paperclipai\/server typecheck/);
   assert.match(candidate.run, /PIPESTATUS/);

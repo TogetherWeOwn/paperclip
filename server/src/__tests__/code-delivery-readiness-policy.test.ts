@@ -14,14 +14,20 @@ function fixture(intent: "code" | "non_code" | "ambiguous" = "code"): DeliverySn
     completedStageIds: ["security"], changesRequestedCount: 1, returnAssignee: { type: "agent", agentId: "author" } } },
   intent: { issueId, companyId, intent, revision: 2 }, obligations: [], discoveries: [], decisions: [], ownership: [] } as unknown as DeliverySnapshot;
 }
+function decision(snapshot: DeliverySnapshot, input: Pick<DeliverySnapshot["decisions"][number], "kind" | "payload"> & Partial<DeliverySnapshot["decisions"][number]>): DeliverySnapshot["decisions"][number] {
+  return { id: randomUUID(), companyId: snapshot.issue.companyId, issueId: snapshot.issue.id,
+    issueRevision: snapshot.issue.codeDeliveryRevision, obligationId: null, obligationRevision: null,
+    actorType: "agent", actorId: "reviewer", runId: randomUUID(), idempotencyKey: randomUUID(),
+    requestHash: "0".repeat(64), reason: "Fixture decision", authority: {}, createdAt: new Date(now), ...input };
+}
 function obligation(snapshot: DeliverySnapshot, number = 1, repository = "fixture/source") {
   const id = randomUUID(), decisionId = randomUUID();
   snapshot.obligations.push({ id, companyId: snapshot.issue.companyId, ownerIssueId: snapshot.issue.id, sourceIssueId: snapshot.issue.id,
     sourceProjectId: randomUUID(), sourceWorkspaceId: randomUUID(), provider: "github", repositoryId: String(number), repository,
     pullRequestNumber: number, baseRef: "main", proposedHeadSha: head, reviewedHeadSha: head, headDecisionId: decisionId,
     transferDecisionId: null, revision: 2, provenance: {} } as DeliverySnapshot["obligations"][number]);
-  snapshot.decisions.push({ id: decisionId, companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, obligationId: id,
-    obligationRevision: 1, kind: "accept_head", payload: { headSha: head } } as DeliverySnapshot["decisions"][number]);
+  snapshot.decisions.push(decision(snapshot, { id: decisionId, obligationId: id,
+    obligationRevision: 1, kind: "accept_head", payload: { headSha: head } }));
   return snapshot.obligations.at(-1)!;
 }
 function observation(row: DeliverySnapshot["obligations"][number], patch: Partial<CodeDeliveryPullRequestObservation> = {}): CodeDeliveryPullRequestObservation {
@@ -34,21 +40,22 @@ function evaluate(snapshot: DeliverySnapshot, observations: CodeDeliveryPullRequ
 }
 function disposition(snapshot: DeliverySnapshot, row: DeliverySnapshot["obligations"][number], kind: "closed_unmerged" | "withdrawn") {
   const id = randomUUID();
-  snapshot.decisions.push({ id, companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, obligationId: row.id,
-    obligationRevision: row.revision, kind, payload: { observation: observation(row, { state: "closed", mergedAt: null, mergeCommitSha: null }) } } as DeliverySnapshot["decisions"][number]);
+  snapshot.decisions.push(decision(snapshot, { id, obligationId: row.id,
+    obligationRevision: row.revision, kind, payload: { observation: observation(row, { state: "closed", mergedAt: null, mergeCommitSha: null }) } }));
   return snapshot.decisions.at(-1)!;
 }
 function discovery(snapshot: DeliverySnapshot, url?: string) {
-  const row = { id: randomUUID(), companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, sourceRevision: "revision-1",
-    snapshot: { type: url ? "pull_request" : "branch", url: url ?? null, status: "merged" } } as DeliverySnapshot["discoveries"][number];
+  const row: DeliverySnapshot["discoveries"][number] = { id: randomUUID(), companyId: snapshot.issue.companyId,
+    issueId: snapshot.issue.id, sourceWorkProductId: randomUUID(), sourceRevision: "revision-1", createdAt: new Date(now),
+    snapshot: { type: url ? "pull_request" : "branch", url: url ?? null, status: "merged" } };
   snapshot.discoveries.push(row);
   return row;
 }
 function noPr(snapshot: DeliverySnapshot) {
-  const decision = { id: randomUUID(), companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, kind: "no_pr",
-    obligationId: null, payload: { reconciliations: snapshot.discoveries.map(row => ({ discoveryId: row.id, sourceRevision: row.sourceRevision, obligationId: null })) } } as DeliverySnapshot["decisions"][number];
-  snapshot.decisions.push(decision);
-  return decision;
+  const noPrDecision = decision(snapshot, { kind: "no_pr", payload: { reconciliations: snapshot.discoveries.map(row => ({
+    discoveryId: row.id, sourceRevision: row.sourceRevision, obligationId: null })) } });
+  snapshot.decisions.push(noPrDecision);
+  return noPrDecision;
 }
 
 describe("effective terminal code-delivery readiness policy", () => {
@@ -158,10 +165,11 @@ describe("effective terminal code-delivery readiness policy", () => {
     row.transferDecisionId = transferId;
     row.reviewedHeadSha = null;
     row.headDecisionId = null;
-    snapshot.ownership.push({ companyId: snapshot.issue.companyId, obligationId: row.id, fromIssueId: snapshot.issue.id,
-      toIssueId: destination, obligationRevision: 2, provenance: { decisionId: transferId } } as DeliverySnapshot["ownership"][number]);
-    snapshot.decisions.push({ id: transferId, companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, obligationId: row.id,
-      kind: "transfer", obligationRevision: 1, payload: { destinationIssueId: destination } } as DeliverySnapshot["decisions"][number]);
+    snapshot.ownership.push({ id: randomUUID(), createdAt: new Date(now), companyId: snapshot.issue.companyId,
+      obligationId: row.id, fromIssueId: snapshot.issue.id, toIssueId: destination, obligationRevision: 2,
+      provenance: { decisionId: transferId } });
+    snapshot.decisions.push(decision(snapshot, { id: transferId, obligationId: row.id,
+      kind: "transfer", obligationRevision: 1, payload: { destinationIssueId: destination } }));
     expect(evaluate(snapshot, [])).toMatchObject({ noPrDecisionId: null, transfers: [{ obligationId: row.id, decisionId: transferId }], pullRequests: [] });
     snapshot.ownership = [];
     expect(() => evaluate(snapshot, [])).toThrow();
@@ -171,10 +179,11 @@ describe("effective terminal code-delivery readiness policy", () => {
     row.sourceIssueId = randomUUID();
     row.ownerIssueId = destination;
     discovery(snapshot, `https://github.com/${row.repository}/pull/${row.pullRequestNumber}`);
-    snapshot.ownership.push({ companyId: snapshot.issue.companyId, obligationId: row.id, fromIssueId: snapshot.issue.id,
-      toIssueId: destination, obligationRevision: 2, provenance: { decisionId: transferId } } as DeliverySnapshot["ownership"][number]);
-    snapshot.decisions.push({ id: transferId, companyId: snapshot.issue.companyId, issueId: snapshot.issue.id, obligationId: row.id,
-      kind: "transfer", obligationRevision: 1, payload: { destinationIssueId: destination } } as DeliverySnapshot["decisions"][number]);
+    snapshot.ownership.push({ id: randomUUID(), createdAt: new Date(now), companyId: snapshot.issue.companyId,
+      obligationId: row.id, fromIssueId: snapshot.issue.id, toIssueId: destination, obligationRevision: 2,
+      provenance: { decisionId: transferId } });
+    snapshot.decisions.push(decision(snapshot, { id: transferId, obligationId: row.id,
+      kind: "transfer", obligationRevision: 1, payload: { destinationIssueId: destination } }));
     expect(planDeliveryReadiness(snapshot).identities).toEqual([]);
   });
   it("does not conflate canonical JSON key ordering but binds all issue/stage/participant/round fields", () => {
