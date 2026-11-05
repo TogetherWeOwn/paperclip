@@ -5,8 +5,9 @@ import type { DeliveryTransaction, PreparedCodeDeliveryReadiness } from "../serv
 import { applyIssueCodeDelivery, assertIssueMutationDoesNotTerminalize } from "../services/issue-code-delivery.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
-const boundary = vi.hoisted(() => ({ apply: vi.fn() }));
+const boundary = vi.hoisted(() => ({ apply: vi.fn(), stops: vi.fn() }));
 vi.mock("../services/code-delivery-readiness.js", () => ({ codeDeliveryReadinessService: () => ({ apply: boundary.apply }) }));
+vi.mock("../services/heartbeat/issue-terminal-stops.js", () => ({ acceptIssueTerminalRunStops: boundary.stops }));
 
 const actor: AuthorizationActor = { type: "board", userId: "reviewer", source: "session" };
 const token = Object.freeze({}) as PreparedCodeDeliveryReadiness;
@@ -14,7 +15,7 @@ const tx = Object.freeze({}) as DeliveryTransaction;
 const issue = { id: "issue", companyId: "company" };
 const attribution = { userId: "reviewer" };
 
-beforeEach(() => { boundary.apply.mockReset(); });
+beforeEach(() => { boundary.apply.mockReset(); boundary.stops.mockReset(); });
 
 describe("unprepared terminal-effects preflight", () => {
   function staged(index: number) {
@@ -98,20 +99,21 @@ describe("common issue delivery mutation boundary", () => {
   it.each(["done", "cancelled"])("runs effective %s only on the receipt savepoint", async status => {
     const savepoint = Object.freeze({ nested: true }) as unknown as DeliveryTransaction;
     boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, mutate) => ({
-      receipt: { id: "receipt" }, result: await mutate(savepoint),
+      receipt: { id: "receipt" }, result: await mutate(savepoint, { id: "receipt" }, issue),
     }));
     const mutate = vi.fn().mockResolvedValue("updated");
     await expect(applyIssueCodeDelivery({ transaction: tx, issue, patch: { status }, attribution,
       preparation: { actor, prepared: token }, postCommitBuffers: [], mutate })).resolves.toBe("updated");
-    expect(boundary.apply).toHaveBeenCalledExactlyOnceWith(tx, "company", "issue", status, actor, token, mutate);
+    expect(boundary.apply).toHaveBeenCalledExactlyOnceWith(tx, "company", "issue", status, actor, token, expect.any(Function));
     expect(mutate).toHaveBeenCalledExactlyOnceWith(savepoint);
+    expect(boundary.stops).toHaveBeenCalledExactlyOnceWith(savepoint, issue, { id: "receipt" });
   });
 
   it("drops only this attempt's post-commit effects if the receipt savepoint rolls back", async () => {
     const publications = ["earlier publication"], actions = ["earlier action"];
     const mutate = vi.fn(async () => { publications.push("terminal publication"); actions.push("stop run"); return "updated"; });
     boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, callback) => {
-      await callback(tx);
+      await callback(tx, { id: "receipt" }, issue);
       throw new Error("receipt not consumed");
     });
     await expect(applyIssueCodeDelivery({ transaction: tx, issue, patch: { status: "done" }, attribution,
@@ -120,9 +122,31 @@ describe("common issue delivery mutation boundary", () => {
     expect(actions).toEqual(["earlier action"]);
   });
 
+  it("clears this attempt's effects when durable stop acceptance fails", async () => {
+    const actions = ["earlier action"];
+    boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, callback) => ({
+      result: await callback(tx, { id: "receipt" }, issue),
+    }));
+    boundary.stops.mockRejectedValue(new Error("stop target changed"));
+    const mutate = vi.fn(async () => { actions.push("terminal action"); return "updated"; });
+    await expect(applyIssueCodeDelivery({ transaction: tx, issue, patch: { status: "done" }, attribution,
+      preparation: { actor, prepared: token }, postCommitBuffers: [actions], mutate })).rejects.toThrow("stop target changed");
+    expect(actions).toEqual(["earlier action"]);
+  });
+
+  it("does not mutate when the readiness boundary omits its server receipt binding", async () => {
+    boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, callback) => ({ result: await callback(tx) }));
+    const mutate = vi.fn();
+    await expect(applyIssueCodeDelivery({ transaction: tx, issue, patch: { status: "done" }, attribution,
+      preparation: { actor, prepared: token }, postCommitBuffers: [], mutate }))
+      .rejects.toMatchObject({ details: { reason: "terminal_effect_receipt_missing" } });
+    expect(mutate).not.toHaveBeenCalled();
+    expect(boundary.stops).not.toHaveBeenCalled();
+  });
+
   it("keeps effects available to the outer transaction owner after successful consumption", async () => {
     const actions: string[] = [];
-    boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, callback) => ({ result: await callback(tx) }));
+    boundary.apply.mockImplementation(async (_tx, _companyId, _issueId, _status, _actor, _token, callback) => ({ result: await callback(tx, { id: "receipt" }, issue) }));
     const mutate = vi.fn(async () => { actions.push("cancel after outer commit"); return { status: "done" }; });
     await expect(applyIssueCodeDelivery({ transaction: tx, issue, patch: { status: "done" }, attribution,
       preparation: { actor, prepared: token }, postCommitBuffers: [actions], mutate })).resolves.toEqual({ status: "done" });

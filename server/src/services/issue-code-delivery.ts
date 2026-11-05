@@ -3,6 +3,7 @@ import type { AuthorizationActor } from "./authorization.js";
 import { codeDeliveryReadinessService, type DeliveryTransaction, type PreparedCodeDeliveryReadiness } from "./code-delivery-readiness.js";
 import { deliveryReadinessConflict } from "./code-delivery-readiness-policy.js";
 import { applyIssueExecutionPolicyTransition } from "./issue-execution-policy.js";
+import { acceptIssueTerminalRunStops } from "./heartbeat/issue-terminal-stops.js";
 
 export function assertIssueMutationDoesNotTerminalize(input: Parameters<typeof applyIssueExecutionPolicyTransition>[0]) {
   const transition = applyIssueExecutionPolicyTransition(input);
@@ -43,7 +44,12 @@ export async function applyIssueCodeDelivery<T>(input: {
   const bufferLengths = input.postCommitBuffers.map(buffer => buffer.length);
   try {
     const applied = await codeDeliveryReadinessService(input.transaction as unknown as Db).apply(
-      input.transaction, input.issue.companyId, input.issue.id, status, actor, preparation.prepared, input.mutate,
+      input.transaction, input.issue.companyId, input.issue.id, status, actor, preparation.prepared, async (tx, receipt, issue) => {
+        if (!receipt || !issue) throw deliveryReadinessConflict("terminal_effect_receipt_missing");
+        const result = await input.mutate(tx);
+        await acceptIssueTerminalRunStops(tx, issue, receipt);
+        return result;
+      },
     );
     return applied.result;
   } catch (error) {

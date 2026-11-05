@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, authUsers, codeDeliveryDecisions, codeDeliveryDiscoveries, codeDeliveryObligations,
-  codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, companies, companyMemberships,
+  codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, codeDeliveryTerminalEffects, companies, companyMemberships,
   createDb, executionWorkspaces, heartbeatRuns, issueCodeDeliveryIntents, issueComments, issueExecutionDecisions,
   issueThreadInteractions, issues, projects, projectWorkspaces, statusDecisions, type Db } from "@paperclipai/db";
 import { issueService, type IssuePostCommitAction } from "../services/issues.js";
@@ -59,7 +59,8 @@ describePostgres("common issue-service code-delivery persistence", () => {
   async function snapshot(companyId: string) {
     return Promise.all([issues, heartbeatRuns, issueThreadInteractions, issueExecutionDecisions, statusDecisions,
       issueComments, activityLog, executionWorkspaces, issueCodeDeliveryIntents, codeDeliveryDecisions, codeDeliveryDiscoveries,
-      codeDeliveryObligations, codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions].map(async table => {
+      codeDeliveryObligations, codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions,
+      codeDeliveryTerminalEffects].map(async table => {
       const rows = await db.select().from(table).where(eq(table.companyId, companyId));
       return rows.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     }));
@@ -107,6 +108,9 @@ describePostgres("common issue-service code-delivery persistence", () => {
     const [saved] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(saved?.codeDeliveryRevision).toBe(consumption!.issueRevision);
     expect(updated?.codeDeliveryRevision).toBe(consumption!.issueRevision);
+    expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId)))
+      .toMatchObject([{ companyId: f.companyId, receiptId: receipt!.id, runId: f.runId, effectKind: "stop_run",
+        state: "pending", attemptCount: 0, settledAt: null }]);
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId)))
       .toMatchObject([{ status: "expired", result: { outcome: "issue_closed" } }]);
     expect(provider.read).not.toHaveBeenCalled();
@@ -177,6 +181,46 @@ describePostgres("common issue-service code-delivery persistence", () => {
       await issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [], { codeDelivery: { actor, prepared } });
       throw new Error("outer transaction rejected");
     })).rejects.toThrow("outer transaction rejected");
+    expect(await snapshot(f.companyId)).toEqual(before);
+  });
+
+  it("keeps accepted stop intents invisible until the caller's outer commit", async () => {
+    const f = await seed();
+    await classify(f, "classify_non_code");
+    const prepared = await codeDeliveryReadinessService(db).prepare(f.companyId, f.issueId, "done", actor);
+    await db.transaction(async tx => {
+      await issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [], { codeDelivery: { actor, prepared } });
+      expect(await tx.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(1);
+      expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(0);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]?.status).toBe("running");
+    });
+    expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(1);
+  });
+
+  it("does not accept stop intents for another task or company, or for a settled run", async () => {
+    const f = await seed(), foreign = await seed();
+    const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Other task", status: "todo" }).returning();
+    await db.insert(heartbeatRuns).values([
+      { companyId: f.companyId, agentId: f.agentId, issueId: other!.id, status: "running" },
+      { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, status: "succeeded" },
+    ]);
+    await classify(f, "classify_non_code");
+    const prepared = await codeDeliveryReadinessService(db).prepare(f.companyId, f.issueId, "done", actor);
+    await db.transaction(tx => issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [],
+      { codeDelivery: { actor, prepared } }));
+    expect((await db.select().from(codeDeliveryTerminalEffects)).filter(row => row.companyId === f.companyId || row.companyId === foreign.companyId)
+      .map(row => row.runId)).toEqual([f.runId]);
+  });
+
+  it("rolls back a consumed receipt if a pointed run belongs to another task", async () => {
+    const f = await seed();
+    const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Other task", status: "todo" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: other!.id, status: "running" }).returning();
+    await db.update(issues).set({ executionRunId: run!.id }).where(eq(issues.id, f.issueId));
+    await classify(f, "classify_non_code");
+    const prepared = await codeDeliveryReadinessService(db).prepare(f.companyId, f.issueId, "done", actor), before = await snapshot(f.companyId);
+    await expect(db.transaction(tx => issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [],
+      { codeDelivery: { actor, prepared } }))).rejects.toMatchObject({ details: { reason: "terminal_effect_run_binding_mismatch" } });
     expect(await snapshot(f.companyId)).toEqual(before);
   });
 

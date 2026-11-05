@@ -119,7 +119,8 @@ export function codeDeliveryReadinessService(db: Db) {
     },
 
     apply: async <T>(transaction: DeliveryTransaction, companyId: string, issueId: string, effectiveStatus: string,
-      actor: AuthorizationActor, token: PreparedCodeDeliveryReadiness | null, mutate: (tx: DeliveryTransaction) => Promise<T>) => {
+      actor: AuthorizationActor, token: PreparedCodeDeliveryReadiness | null,
+      mutate: (tx: DeliveryTransaction, receipt?: typeof codeDeliveryReadinessReceipts.$inferSelect, issue?: DeliverySnapshot["issue"]) => Promise<T>) => {
       if (!terminal(effectiveStatus)) return { receipt: null, result: await mutate(transaction) };
       const proof = token && typeof token === "object" ? prepared.get(token) : null;
       if (!proof || proof.companyId !== companyId || proof.issueId !== issueId || proof.status !== effectiveStatus
@@ -147,7 +148,7 @@ export function codeDeliveryReadinessService(db: Db) {
           actorType: principal.type, actorId: principal.id, runId: principal.runId, evidence: { version: 1, ...evidence },
           preparedAt: proof.preparedAt, expiresAt: proof.expiresAt }).returning();
         if (!receipt) throw deliveryReadinessConflict("receipt_missing");
-        const result = await mutate(savepoint);
+        const result = await mutate(savepoint, receipt, current.issue);
         const [consumption] = await tx.select().from(codeDeliveryReceiptConsumptions)
           .where(and(eq(codeDeliveryReceiptConsumptions.companyId, companyId), eq(codeDeliveryReceiptConsumptions.issueId, issueId),
             eq(codeDeliveryReceiptConsumptions.receiptId, receipt.id)));

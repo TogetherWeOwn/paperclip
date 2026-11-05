@@ -67,10 +67,22 @@ interrupt handling or run/goal stops. It permits an earlier review approval that
 still advances to `in_review`. This is a temporary fail-closed boundary, not a
 finished positive completion path or an exemption for agent-owned tasks.
 
-The REST path must next accept a durable, transactionally fenced stop/effect
-intent, then dispatch physical effects only after accepted outer commit. Merely
-moving the provider read before the existing physical stop is insufficient: a
-later revision conflict must leave the run and goal untouched.
+The common terminal mutation now authors run-stop intents in the receipt's own
+savepoint, after the terminal SQL write consumes that receipt. The heartbeat-owned
+`issue-terminal-stops.ts` acceptance boundary checks company/task/run binding,
+current transaction and terminal revision, locks a bounded set of exact run targets
+with NOWAIT, and writes one `stop_run` effect per receipt/run. It makes no process,
+provider or goal-control calls. Rollback removes the intent with the status and
+receipt; another connection cannot read it until outer commit.
+
+**This new effect schema is awaiting supported Actions migration generation and
+integration. No effect dispatcher or scheduler registration exists yet.** The
+candidate remains uninstalled and REST still fails closed. Accepting an intent
+is not stopping a run, proving physical termination, or authorizing successor
+execution. Goal-stop acceptance and fenced delivery/retry/settlement remain
+required before enabling REST completion. Merely moving the provider read before
+the existing physical stop is insufficient: a later revision conflict must leave
+the run and goal untouched.
 
 Native finalization and other common-service callers without preparation also
 fail closed. A completed-run/system preparation authority has not been
@@ -90,6 +102,17 @@ not install this candidate or claim universal usable completion from the SQL
 backstop alone.
 
 ## Verification limits
+
+Exact-source Actions run `41992896333` at
+`50308eee54dc4507f726f199131b271b88b35660` passed all thirteen selected
+suites: **450 tests, zero failed/skipped/pending/todo**, database/server
+typechecks and module boundaries. Migration regeneration changed no source.
+That qualification precedes the terminal-effect acceptance changes. Their new
+schema, custom SQL guard fragment and persistence regressions are unverified;
+the fragment must be reviewed and integrated with the Actions-generated migration.
+No new local tests, typecheck, build, generation or installation ran. Prior failures
+below remain part of the retained qualification history. This targeted successful
+run is not full-repository or REST/native/all-writer acceptance.
 
 The first integrated direct-source Actions run at
 `51e6b0194169c0414ebde07b8bf2d60d7a9d7171` executed 428 tests: 418 passed and
