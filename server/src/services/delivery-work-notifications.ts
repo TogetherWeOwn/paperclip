@@ -149,6 +149,7 @@ export const DELIVERY_QUEUES = {
   issueMonitors: "issue-monitors",
   agentTimers: "agent-timers",
   caseHandoffs: "case-handoffs",
+  issueTerminalStops: "issue-terminal-stops",
   nativeHarnessBackupExpiration: "native-harness-backup-expiration",
   nativeCheckpointExpiration: "native-checkpoint-expiration",
 } as const;

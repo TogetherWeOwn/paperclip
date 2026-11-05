@@ -3032,6 +3032,13 @@
       "when": 1793860400244,
       "tag": "0434_brainy_franklin_richards",
       "breakpoints": true
+    },
+    {
+      "idx": 435,
+      "version": "7",
+      "when": 1793868475354,
+      "tag": "0435_puzzling_synch",
+      "breakpoints": true
     }
   ]
 }

@@ -5,6 +5,8 @@ import { activityLog, agents, authUsers, codeDeliveryDecisions, codeDeliveryDisc
   codeDeliveryOwnershipEvents, codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, codeDeliveryTerminalEffects, companies, companyMemberships,
   createDb, executionWorkspaces, heartbeatRuns, issueCodeDeliveryIntents, issueComments, issueExecutionDecisions,
   issueThreadInteractions, issues, projects, projectWorkspaces, statusDecisions, type Db } from "@paperclipai/db";
+import { databaseWorkPending, reconcileDatabaseWork, subscribeDatabaseWork } from "@paperclipai/db/work-signals";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { issueService, type IssuePostCommitAction } from "../services/issues.js";
 import type { ActivityPublication } from "../services/activity-log.js";
 import { codeDeliveryReadinessService, type PreparedCodeDeliveryReadiness } from "../services/code-delivery-readiness.js";
@@ -30,7 +32,10 @@ describePostgres("common issue-service code-delivery persistence", () => {
       createdAt: new Date(), updatedAt: new Date() });
   }, 30_000);
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
-  beforeEach(() => { provider.read.mockReset(); });
+  beforeEach(async () => {
+    provider.read.mockReset();
+    await reconcileDatabaseWork(db, DELIVERY_QUEUES.issueTerminalStops);
+  });
 
   async function seed() {
     const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
@@ -195,6 +200,57 @@ describePostgres("common issue-service code-delivery persistence", () => {
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]?.status).toBe("running");
     });
     expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(1);
+  });
+
+  it.each([false, true])("registers stop work before insertion and settles only with the outer transaction (rollback=%s)", async rollback => {
+    const f = await seed();
+    await classify(f, "classify_non_code");
+    const prepared = await codeDeliveryReadinessService(db).prepare(f.companyId, f.issueId, "done", actor);
+    const signals: string[] = [], intentHints: boolean[] = [], atIntent: Promise<unknown[]>[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.issueTerminalStops, (event, hints) => {
+      signals.push(event);
+      if (event === "intent") {
+        intentHints.push(hints?.has(f.companyId) ?? false);
+        atIntent.push(Promise.resolve(db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))));
+      }
+    });
+    try {
+      const transaction = db.transaction(async tx => {
+        await issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [],
+          { codeDelivery: { actor, prepared } });
+        expect(signals).toEqual(["intent"]);
+        expect(intentHints).toEqual([true]);
+        expect(databaseWorkPending(db, DELIVERY_QUEUES.issueTerminalStops)).toBe(true);
+        expect(await Promise.all(atIntent)).toEqual([[]]);
+        expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(0);
+        if (rollback) throw new Error("outer rollback");
+      });
+      if (rollback) await expect(transaction).rejects.toThrow("outer rollback");
+      else await transaction;
+      expect(signals).toEqual(["intent", "settled"]);
+      await reconcileDatabaseWork(db, DELIVERY_QUEUES.issueTerminalStops);
+      expect(databaseWorkPending(db, DELIVERY_QUEUES.issueTerminalStops)).toBe(false);
+      expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId)))
+        .toHaveLength(rollback ? 0 : 1);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]?.status).toBe("running");
+    } finally { unsubscribe(); }
+  });
+
+  it("does not announce stop work for a settled run or a rejected preparation", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    const signals: string[] = [], unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.issueTerminalStops, event => signals.push(event));
+    try {
+      await expect(issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }))
+        .rejects.toMatchObject({ details: { reason: "preparation_required" } });
+      await classify(f, "classify_non_code");
+      const prepared = await codeDeliveryReadinessService(db).prepare(f.companyId, f.issueId, "done", actor);
+      await db.transaction(tx => issueService(db).update(f.issueId, { status: "done", actorUserId: "reviewer" }, tx, [], [],
+        { codeDelivery: { actor, prepared } }));
+      expect(signals).toEqual([]);
+      expect(databaseWorkPending(db, DELIVERY_QUEUES.issueTerminalStops)).toBe(false);
+      expect(await db.select().from(codeDeliveryTerminalEffects).where(eq(codeDeliveryTerminalEffects.issueId, f.issueId))).toHaveLength(0);
+    } finally { unsubscribe(); }
   });
 
   it("does not accept stop intents for another task or company, or for a settled run", async () => {

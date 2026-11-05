@@ -33,6 +33,27 @@ const support = await getEmbeddedPostgresTestSupport();
     await tx`UPDATE issues SET status = ${status}, completed_at = CASE WHEN ${status} = 'done' THEN clock_timestamp() ELSE NULL END,
       cancelled_at = CASE WHEN ${status} = 'cancelled' THEN clock_timestamp() ELSE NULL END, execution_state = '{"status":"completed"}' WHERE id = ${id}`;
   }
+  async function runFor(row: Record<string, unknown>) {
+    const [agent] = await sql`INSERT INTO agents (company_id, name, role, adapter_type)
+      VALUES (${String(row.company_id)}, 'Delivery executor', 'engineer', 'process') RETURNING id`;
+    const [run] = await sql`INSERT INTO heartbeat_runs (company_id, agent_id, issue_id, status, invocation_source)
+      VALUES (${String(row.company_id)}, ${agent.id}, ${String(row.id)}, 'running', 'manual') RETURNING *`;
+    return run;
+  }
+  async function effect(tx: Transaction, certified: Record<string, unknown>, runId: string) {
+    const [result] = await tx`INSERT INTO code_delivery_terminal_effects (company_id, issue_id, receipt_id, run_id, effect_kind)
+      VALUES (${String(certified.company_id)}, ${String(certified.issue_id)}, ${String(certified.id)}, ${runId}, 'stop_run') RETURNING *`;
+    return result;
+  }
+  async function acceptedEffect() {
+    const row = await fixture(), run = await runFor(row);
+    const accepted = await sql.begin(async tx => {
+      const certified = await receipt(tx, row);
+      await close(tx, row.id);
+      return effect(tx, certified, run.id);
+    });
+    return { row, run, accepted };
+  }
   async function assertNoReceipt(id: string) {
     expect(await sql`SELECT * FROM code_delivery_readiness_receipts WHERE issue_id = ${id}`).toHaveLength(0);
     expect(await sql`SELECT * FROM code_delivery_receipt_consumptions WHERE issue_id = ${id}`).toHaveLength(0);
@@ -42,8 +63,8 @@ const support = await getEmbeddedPostgresTestSupport();
     sql = postgres(database.connectionString, { max: 4, onnotice: () => {} });
     await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}, 'Delivery guards', 'GUARD')`;
     const [installed] = await sql`SELECT count(*)::int AS count FROM pg_trigger
-      WHERE tgname IN ('code_delivery_terminal_guard', 'code_delivery_receipt_settled', 'code_delivery_terminal_settled')`;
-    expect(installed.count).toBe(3);
+      WHERE tgname IN ('code_delivery_terminal_guard', 'code_delivery_receipt_settled', 'code_delivery_terminal_settled', 'code_delivery_terminal_effect_guard')`;
+    expect(installed.count).toBe(4);
   }, 90_000);
   afterAll(async () => { await sql?.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
 
@@ -180,6 +201,78 @@ const support = await getEmbeddedPostgresTestSupport();
     })).rejects.toThrow("code_delivery_receipt_not_settled");
     expect(await issue(before.id)).toEqual(before);
     await assertNoReceipt(before.id);
+  });
+  it.each(["done", "cancelled"])("accepts a %s-bound stop intent without changing the physical run", async status => {
+    const row = await fixture(), run = await runFor(row);
+    const accepted = await sql.begin(async tx => {
+      const certified = await receipt(tx, row, status);
+      await close(tx, row.id, status);
+      const accepted = await effect(tx, certified, run.id);
+      expect(await sql`SELECT id FROM code_delivery_terminal_effects WHERE issue_id = ${row.id}`).toHaveLength(0);
+      return accepted;
+    });
+    expect(accepted).toMatchObject({ company_id: companyId, issue_id: row.id, run_id: run.id,
+      effect_kind: "stop_run", state: "pending", attempt_count: 0, settled_at: null });
+    expect((await sql`SELECT * FROM heartbeat_runs WHERE id = ${run.id}`)[0]).toEqual(run);
+  });
+  it.each(["unconsumed", "other_task", "other_company", "native_binding"])("refuses a stop intent with %s evidence", async fault => {
+    const row = await fixture(), other = await fixture();
+    if (fault === "other_company") {
+      const [company] = await sql`INSERT INTO companies (name, issue_prefix) VALUES ('Other tenant', ${`X${randomUUID().slice(0, 6)}`}) RETURNING id`;
+      other.company_id = company.id;
+      const [foreign] = await sql`INSERT INTO issues (company_id, title, status) VALUES (${company.id}, 'Foreign task', 'todo') RETURNING id`;
+      other.id = foreign.id;
+    }
+    const run = await runFor(fault === "other_task" || fault === "other_company" ? other : row);
+    if (fault === "native_binding") await sql`UPDATE heartbeat_runs SET native_issue_id = ${other.id} WHERE id = ${run.id}`;
+    await expect(sql.begin(async tx => {
+      const certified = await receipt(tx, row);
+      if (fault !== "unconsumed") await close(tx, row.id);
+      await effect(tx, certified, run.id);
+    })).rejects.toThrow("code_delivery_terminal_effect_receipt_mismatch");
+    expect(await issue(row.id)).toEqual(row);
+    await assertNoReceipt(row.id);
+    expect(await sql`SELECT id FROM code_delivery_terminal_effects WHERE issue_id = ${row.id}`).toHaveLength(0);
+  });
+  it("refuses a fresh effect on a receipt from an earlier committed transaction", async () => {
+    const row = await fixture(), run = await runFor(row);
+    const certified = await sql.begin(async tx => { const r = await receipt(tx, row); await close(tx, row.id); return r; });
+    await expect(sql.begin(tx => effect(tx, certified, run.id))).rejects.toThrow("code_delivery_terminal_effect_receipt_mismatch");
+    expect(await sql`SELECT id FROM code_delivery_terminal_effects WHERE issue_id = ${row.id}`).toHaveLength(0);
+  });
+  it("rolls back effect history with the outer terminal mutation", async () => {
+    const row = await fixture(), run = await runFor(row);
+    await expect(sql.begin(async tx => {
+      const certified = await receipt(tx, row);
+      await close(tx, row.id);
+      await effect(tx, certified, run.id);
+      throw new Error("outer rollback");
+    })).rejects.toThrow("outer rollback");
+    expect(await issue(row.id)).toEqual(row);
+    await assertNoReceipt(row.id);
+    expect(await sql`SELECT id FROM code_delivery_terminal_effects WHERE issue_id = ${row.id}`).toHaveLength(0);
+  });
+  it.each(["receipt_id", "run_id", "issue_id", "company_id", "effect_kind", "created_at"])("retains immutable effect %s", async field => {
+    const { accepted } = await acceptedEffect();
+    const value = field === "effect_kind" ? "stop_other" : field === "created_at" ? new Date(0) : randomUUID();
+    await expect(sql`UPDATE code_delivery_terminal_effects SET ${sql(field)} = ${value} WHERE id = ${accepted.id}`)
+      .rejects.toThrow("code_delivery_terminal_effect_binding_immutable");
+    expect((await sql`SELECT * FROM code_delivery_terminal_effects WHERE id = ${accepted.id}`)[0]).toEqual(accepted);
+  });
+  it("permits monotonic retry and settlement, but never rewrites settled history", async () => {
+    const { accepted } = await acceptedEffect();
+    await expect(sql`UPDATE code_delivery_terminal_effects SET attempt_count = 2 WHERE id = ${accepted.id}`)
+      .rejects.toThrow("code_delivery_terminal_effect_binding_immutable");
+    await sql`UPDATE code_delivery_terminal_effects SET attempt_count = 1, next_attempt_at = now() + interval '1 minute' WHERE id = ${accepted.id}`;
+    await expect(sql`UPDATE code_delivery_terminal_effects SET attempt_count = 0 WHERE id = ${accepted.id}`)
+      .rejects.toThrow("code_delivery_terminal_effect_binding_immutable");
+    await sql`UPDATE code_delivery_terminal_effects SET state = 'settled', settled_at = now() WHERE id = ${accepted.id}`;
+    const [settled] = await sql`SELECT * FROM code_delivery_terminal_effects WHERE id = ${accepted.id}`;
+    await expect(sql`UPDATE code_delivery_terminal_effects SET state = 'pending', settled_at = NULL WHERE id = ${accepted.id}`)
+      .rejects.toThrow("code_delivery_terminal_effect_binding_immutable");
+    await expect(sql`DELETE FROM code_delivery_terminal_effects WHERE id = ${accepted.id}`)
+      .rejects.toThrow("code_delivery_terminal_effect_history_immutable");
+    expect((await sql`SELECT * FROM code_delivery_terminal_effects WHERE id = ${accepted.id}`)[0]).toEqual(settled);
   });
   it("retains immutable evidence while allowing later terminal bookkeeping without a new verdict", async () => {
     const before = await fixture();

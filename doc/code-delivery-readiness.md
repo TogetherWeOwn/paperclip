@@ -75,14 +75,24 @@ with NOWAIT, and writes one `stop_run` effect per receipt/run. It makes no proce
 provider or goal-control calls. Rollback removes the intent with the status and
 receipt; another connection cannot read it until outer commit.
 
-**This new effect schema is awaiting supported Actions migration generation and
-integration. No effect dispatcher or scheduler registration exists yet.** The
-candidate remains uninstalled and REST still fails closed. Accepting an intent
-is not stopping a run, proving physical termination, or authorizing successor
-execution. Goal-stop acceptance and fenced delivery/retry/settlement remain
-required before enabling REST completion. Merely moving the provider read before
-the existing physical stop is insufficient: a later revision conflict must leave
-the run and goal untouched.
+Migration `0435_puzzling_synch.sql` integrates the supported Actions-generated
+effect schema and an immutable target/receipt-binding guard. Its snapshot and
+journal are unchanged generator output, with the prescribed old-snapshot pruning.
+An effect requires a consumed receipt for this exact company/task/run, transaction
+and terminal revision. Target identity cannot be changed; attempts are monotonic
+and settled history cannot be rewritten or removed.
+
+Acceptance registers `issue-terminal-stops` work on the producing transaction
+before inserting effects. It uses the shared transaction-aware notification
+protocol: an intent is not a commit, nested savepoint release is not outer
+settlement, and rollback leaves no durable effects. No new polling is added.
+**No effect dispatcher or scheduler registration exists yet.** The candidate
+remains uninstalled and REST still fails closed. Accepting an intent is not
+stopping a run, proving physical termination, or authorizing successor execution.
+Goal-stop acceptance and fenced delivery/retry/settlement remain required before
+enabling REST completion. Merely moving the provider read before the existing
+physical stop is insufficient: a later revision conflict must leave the run and
+goal untouched.
 
 Native finalization and other common-service callers without preparation also
 fail closed. A completed-run/system preparation authority has not been
@@ -107,12 +117,16 @@ Exact-source Actions run `41992896333` at
 `50308eee54dc4507f726f199131b271b88b35660` passed all thirteen selected
 suites: **450 tests, zero failed/skipped/pending/todo**, database/server
 typechecks and module boundaries. Migration regeneration changed no source.
-That qualification precedes the terminal-effect acceptance changes. Their new
-schema, custom SQL guard fragment and persistence regressions are unverified;
-the fragment must be reviewed and integrated with the Actions-generated migration.
-No new local tests, typecheck, build, generation or installation ran. Prior failures
-below remain part of the retained qualification history. This targeted successful
-run is not full-repository or REST/native/all-writer acceptance.
+That qualification precedes the terminal-effect acceptance changes. Their next
+Actions run `41997124076` at `6a5ca7eda382cfc2d66edb9779b79fdc30f1f46f`
+successfully generated the effect migration, but failed its qualification step
+because regeneration changed source. Candidate tests and typechecks did not run;
+that failure is retained. Its verified output is now integrated with the SQL
+guard. New complete-schema effect and transaction-notification regressions remain
+unverified until the resulting new SHA runs in Actions. No new local tests,
+typecheck, build, generation or installation ran. Prior failures below remain
+part of the retained qualification history. This targeted successful run is not
+full-repository or REST/native/all-writer acceptance.
 
 The first integrated direct-source Actions run at
 `51e6b0194169c0414ebde07b8bf2d60d7a9d7171` executed 428 tests: 418 passed and

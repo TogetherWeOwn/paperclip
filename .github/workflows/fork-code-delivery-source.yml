@@ -192,6 +192,7 @@ jobs:
           git diff --exit-code HEAD -- packages/db/src/migrations
           test -z "$(git ls-files --others --exclude-standard packages/db/src/migrations)"
           grep -q 'CREATE FUNCTION code_delivery_terminal_guard()' packages/db/src/migrations/0434_brainy_franklin_richards.sql
+          grep -q 'CREATE FUNCTION code_delivery_terminal_effect_guard()' packages/db/src/migrations/0435_puzzling_synch.sql
           record() {
             local name="$1"
             shift

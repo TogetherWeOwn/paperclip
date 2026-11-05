@@ -7,6 +7,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 const migration = await readFile(new URL("./migrations/0432_dear_jane_foster.sql", import.meta.url), "utf8");
 const decisionMigration = await readFile(new URL("./migrations/0433_last_proudstar.sql", import.meta.url), "utf8");
 const receiptMigration = await readFile(new URL("./migrations/0434_brainy_franklin_richards.sql", import.meta.url), "utf8");
+const effectMigration = await readFile(new URL("./migrations/0435_puzzling_synch.sql", import.meta.url), "utf8");
 const support = await getEmbeddedPostgresTestSupport();
 const head = "a".repeat(40);
 
@@ -45,7 +46,9 @@ const head = "a".repeat(40);
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-code-delivery-");
     sql = postgres(database.connectionString, { max: 5, onnotice: () => {} });
-    await sql.unsafe(`DROP TRIGGER code_delivery_terminal_guard ON issues;
+    await sql.unsafe(`DROP TABLE code_delivery_terminal_effects;
+      DROP FUNCTION code_delivery_terminal_effect_guard();
+      DROP TRIGGER code_delivery_terminal_guard ON issues;
       DROP TRIGGER code_delivery_consume_terminal_receipt ON issues;
       DROP TRIGGER code_delivery_terminal_settled ON issues;
       DROP TABLE code_delivery_receipt_consumptions, code_delivery_readiness_receipts;
@@ -93,13 +96,16 @@ const head = "a".repeat(40);
       VALUES (${legacy.companyId}, 'Pending review', 'in_review', ${sql.json(before.execution_policy)}, ${sql.json(before.execution_state)}) RETURNING *`;
     const rollback = new Error("rollback isolated upgrade");
     await expect(sql.begin(async tx => {
-      for (const statement of receiptMigration.split("--> statement-breakpoint").map(value => value.trim()).filter(Boolean)) await tx.unsafe(statement);
+      for (const statement of `${receiptMigration}\n--> statement-breakpoint\n${effectMigration}`.split("--> statement-breakpoint").map(value => value.trim()).filter(Boolean)) await tx.unsafe(statement);
       const [terminal] = await tx`SELECT to_jsonb(i) AS row FROM issues i WHERE id = ${legacy.issueId}`;
       const [pending] = await tx`SELECT * FROM issues WHERE id = ${review.id}`;
       expect(terminal.row).toEqual(before);
       expect(pending).toEqual(review);
       expect(await tx`SELECT * FROM code_delivery_readiness_receipts`).toHaveLength(0);
       expect(await tx`SELECT * FROM code_delivery_receipt_consumptions`).toHaveLength(0);
+      expect(await tx`SELECT * FROM code_delivery_terminal_effects`).toHaveLength(0);
+      const [guard] = await tx`SELECT count(*)::int AS count FROM pg_trigger WHERE tgname = 'code_delivery_terminal_effect_guard'`;
+      expect(guard.count).toBe(1);
       await expect(tx.savepoint(nested => nested`UPDATE issues SET status = 'done', completed_at = now() WHERE id = ${review.id}`))
         .rejects.toMatchObject({ message: "code_delivery_preparation_required" });
       throw rollback;

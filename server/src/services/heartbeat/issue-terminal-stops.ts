@@ -1,6 +1,7 @@
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { codeDeliveryReadinessReceipts, codeDeliveryReceiptConsumptions, codeDeliveryTerminalEffects, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { deliveryReadinessConflict } from "../code-delivery-readiness-policy.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -36,6 +37,7 @@ export async function acceptIssueTerminalRunStops(tx: Transaction, issue: IssueB
     if (source !== issue.id) throw deliveryReadinessConflict("terminal_effect_run_binding_mismatch");
   }
   if (!targets.length) return [];
+  await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueTerminalStops, issue.companyId);
   return tx.insert(codeDeliveryTerminalEffects).values(targets.map(run => ({
     companyId: issue.companyId, issueId: issue.id, receiptId: receipt.id, runId: run.id, effectKind: "stop_run" as const,
   }))).onConflictDoNothing().returning();

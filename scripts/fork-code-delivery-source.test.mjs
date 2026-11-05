@@ -69,6 +69,7 @@ test("subsystem checks use integrated bytes and cannot pass with skipped Postgre
   assert.match(candidate.run, /git diff --exit-code HEAD -- packages\/db\/src\/migrations/);
   assert.match(candidate.run, /git ls-files --others --exclude-standard packages\/db\/src\/migrations/);
   assert.match(candidate.run, /CREATE FUNCTION code_delivery_terminal_guard/);
+  assert.match(candidate.run, /CREATE FUNCTION code_delivery_terminal_effect_guard/);
   assert.match(candidate.run, /pnpm exec vitest run --maxWorkers=1 --no-file-parallelism/);
   for (const name of ["code-delivery-migration.test.ts", "code-delivery-terminal-guards.test.ts", "issue-code-delivery-persistence.test.ts"]) {
     assert.ok(candidate.run.includes(name));
