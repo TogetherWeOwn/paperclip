@@ -85,11 +85,24 @@ backstop alone.
 
 ## Verification limits
 
-New common-boundary unit and PostgreSQL regression sources cover missing/forged
-preparation, principal mismatch, timestamp writes, review-state preservation,
-post-commit buffer rollback, stale transition preparation and lock conflicts.
-These sources have not yet been executed. They do not establish positive native
-API completion, full generated-schema acceptance or live provider behavior.
+The first integrated direct-source Actions run at
+`51e6b0194169c0414ebde07b8bf2d60d7a9d7171` executed 428 tests: 418 passed and
+10 failed, with none skipped. Migration regeneration produced no source changes.
+Ten suites passed, including the complete-schema migration, executable SQL guard,
+readiness policy and common-service denial suites. Six registration tests failed
+on fixtures missing the required work-product provider; four boundary tests failed
+because a reset hook returned a mock that Vitest then invoked as teardown.
+These failures remain part of the evidence, not a successful qualification.
+
+The follow-up fixes those fixtures and the reset hook. New common-service
+PostgreSQL regression sources exercise independently classified non-code
+completion/cancellation, exact merged-head receipt consumption, competing
+preparations, outer-transaction rollback and changed review rounds. Denial snapshots now include delivery
+intents, obligations, decisions, discoveries, ownership, receipts and consumption
+rows alongside task/run/interaction state. The provider is controlled in these
+tests; this is not live GitHub or REST/native-finalizer acceptance. Only the
+previously failing single boundary test was reproduced locally and passed after
+the hook fix. The new persistence cases await exact-source Actions execution.
 
 Required verification, including full typecheck/test/build and exact-head check
 links, belongs on GitHub Actions. Local diagnostic execution is limited to an

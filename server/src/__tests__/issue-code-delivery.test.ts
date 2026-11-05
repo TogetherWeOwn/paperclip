@@ -14,7 +14,7 @@ const tx = Object.freeze({}) as DeliveryTransaction;
 const issue = { id: "issue", companyId: "company" };
 const attribution = { userId: "reviewer" };
 
-beforeEach(() => boundary.apply.mockReset());
+beforeEach(() => { boundary.apply.mockReset(); });
 
 describe("unprepared terminal-effects preflight", () => {
   function staged(index: number) {

@@ -167,11 +167,11 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
   });
   it("retains and matches deleted/reclassified discoveries, but not unrelated branch evidence", async () => {
     const f = await fixture(), service = codeDeliveryRegistrationService(db);
-    const [product] = await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, type: "pull_request",
+    const [product] = await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, provider: "github", type: "pull_request",
       title: "Display", status: "merged", url: "https://github.com/fixture/source/pull/1#issuecomment-12" }).returning();
     await db.update(issueWorkProducts).set({ type: "artifact", url: null }).where(eq(issueWorkProducts.id, product.id));
     await db.delete(issueWorkProducts).where(eq(issueWorkProducts.id, product.id));
-    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, type: "branch", title: "Branch", status: "active" });
+    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, provider: "github", type: "branch", title: "Branch", status: "active" });
     observe();
     const registered = await service.register(f.company.id, f.issue.id, author, await input(f));
     const read = await service.read(f.company.id, f.issue.id, reviewer);
@@ -182,7 +182,7 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
   });
   it("binds branch discoveries to independently accepted delivery and retains exact source revisions", async () => {
     const f = await fixture(), service = codeDeliveryRegistrationService(db);
-    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, type: "branch", title: "Local branch", status: "active" });
+    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, provider: "github", type: "branch", title: "Local branch", status: "active" });
     observe();
     const registered = await service.register(f.company.id, f.issue.id, author, await input(f));
     const read = await service.read(f.company.id, f.issue.id, reviewer);
@@ -206,7 +206,7 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
   });
   it.each(["https://github.com/fixture/source/pull/1", "https://github.com/fixture/other/pull/2", "https://github.com/fixture/source/pull/%31"])("does not waive PR discovery with no-PR disposition: %s", async url => {
     const f = await fixture(), service = codeDeliveryRegistrationService(db);
-    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, type: "branch", title: "Retained PR", status: "closed", url });
+    await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, provider: "github", type: "branch", title: "Retained PR", status: "closed", url });
     await codeDeliveryDecisionService(db).decide(f.company.id, f.issue.id, reviewer, { kind: "classify_code",
       expectedIssueRevision: (await current(f)).codeDeliveryRevision, reason: "Code association exists", idempotencyKey: randomUUID() });
     const read = await service.read(f.company.id, f.issue.id, reviewer);
@@ -217,7 +217,7 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
   });
   it("keeps late discoveries unresolved after an earlier independent reconciliation", async () => {
     const f = await fixture(), service = codeDeliveryRegistrationService(db);
-    const [product] = await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, type: "branch", title: "No PR", status: "active" }).returning();
+    const [product] = await db.insert(issueWorkProducts).values({ companyId: f.company.id, issueId: f.issue.id, provider: "github", type: "branch", title: "No PR", status: "active" }).returning();
     await codeDeliveryDecisionService(db).decide(f.company.id, f.issue.id, reviewer, { kind: "classify_code",
       expectedIssueRevision: (await current(f)).codeDeliveryRevision, reason: "Local-only implementation", idempotencyKey: randomUUID() });
     const read = await service.read(f.company.id, f.issue.id, reviewer);
