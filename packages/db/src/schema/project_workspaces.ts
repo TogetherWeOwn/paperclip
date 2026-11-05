@@ -35,6 +35,7 @@ export const projectWorkspaces = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    companyProjectIdUq: uniqueIndex("project_workspaces_company_project_id_uq").on(table.companyId, table.projectId, table.id),
     companyProjectIdx: index("project_workspaces_company_project_idx").on(table.companyId, table.projectId),
     projectPrimaryIdx: index("project_workspaces_project_primary_idx").on(table.projectId, table.isPrimary),
     projectSourceTypeIdx: index("project_workspaces_project_source_type_idx").on(table.projectId, table.sourceType),

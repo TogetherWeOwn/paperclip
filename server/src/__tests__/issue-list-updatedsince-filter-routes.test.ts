@@ -151,6 +151,7 @@ describeEmbeddedPostgres("issue list routes updatedSince filter", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.map((issue: { id: string }) => issue.id)).toEqual([freshIssueId]);
+    expect(res.body[0].codeDeliveryRevision).toBe(0);
   });
 
   it("returns 400 for a malformed updatedSince timestamp", async () => {

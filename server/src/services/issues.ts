@@ -5078,6 +5078,7 @@ const issueListSelect = {
   status: issues.status,
   displayStatus: issueDisplayStatusSql(),
   statusVersion: issues.statusVersion,
+  codeDeliveryRevision: issues.codeDeliveryRevision,
   lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,

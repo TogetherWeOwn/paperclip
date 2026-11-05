@@ -863,6 +863,7 @@ export interface Issue {
   /** Collection projections omit task bodies and cannot seed the detail cache. */
   listProjection?: "index" | "rows";
   statusVersion?: number;
+  codeDeliveryRevision?: number;
   /** True only while the title is the provisional slice of the initial prompt. */
   titleNeedsGeneration?: boolean;
   conversationAgentId?: string | null;
