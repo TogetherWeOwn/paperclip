@@ -115,6 +115,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  noCodeWorkspaceSelectionConflict,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
@@ -481,7 +482,8 @@ function buildPreRealizationExecutionWorkspaceSettings(
   const mode =
     settings.mode &&
     settings.mode !== "inherit" &&
-    settings.mode !== "reuse_existing"
+    settings.mode !== "reuse_existing" &&
+    settings.mode !== "no_code"
       ? settings.mode
       : null;
   const next: Record<string, unknown> = {};
@@ -9746,7 +9748,10 @@ export function issueService(db: Db) {
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental({ db: dbOrTx as InstanceSettingsWriteDb })
       ).enableIsolatedWorkspaces;
-      if (!isolatedWorkspacesEnabled) {
+      const noCodeWorkspaceRequested = parseObject(issueData.executionWorkspaceSettings).mode === "no_code";
+      const noCodeConflict = noCodeWorkspaceSelectionConflict(issueData);
+      if (noCodeConflict) throw unprocessable(noCodeConflict);
+      if (!isolatedWorkspacesEnabled && !noCodeWorkspaceRequested) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
@@ -9910,6 +9915,7 @@ export function issueService(db: Db) {
             issueData.projectId === workspaceSource.projectId;
           if (
             inheritsSourceProject &&
+            !noCodeWorkspaceRequested &&
             projectWorkspaceId == null &&
             workspaceSource.projectWorkspaceId
           ) {
@@ -10011,7 +10017,7 @@ export function issueService(db: Db) {
               ),
             ) as Record<string, unknown> | null;
         }
-        if (!projectWorkspaceId && issueData.projectId) {
+        if (!noCodeWorkspaceRequested && !projectWorkspaceId && issueData.projectId) {
           const project = await tx
             .select({
               executionWorkspacePolicy: projects.executionWorkspacePolicy,
@@ -10289,8 +10295,9 @@ export function issueService(db: Db) {
               ),
             )
             .then((r) => r[0] ?? null);
+          if (!projectRow) throw unprocessable("Imported project must belong to the target company");
           const policy = parseProjectExecutionWorkspacePolicy(
-            projectRow?.executionWorkspacePolicy,
+            projectRow.executionWorkspacePolicy,
           );
           let defaultProjectWorkspaceId =
             policy?.defaultProjectWorkspaceId ?? null;
@@ -10360,16 +10367,19 @@ export function issueService(db: Db) {
 
           const projectId = row.projectId ?? null;
           let projectWorkspaceId = row.projectWorkspaceId ?? null;
-          // Isolated-workspace fields are gated the same way create() gates them:
-          // when the experiment is off the imported settings are dropped.
-          let executionWorkspaceSettings = isolatedWorkspacesEnabled
+          const noCodeWorkspaceRequested = parseObject(row.executionWorkspaceSettings).mode === "no_code";
+          const noCodeConflict = noCodeWorkspaceSelectionConflict(row);
+          if (noCodeConflict) throw unprocessable(noCodeConflict);
+          // Match create(): task-local no-code survives the experiment gate and
+          // never acquires an implicit project code-workspace binding.
+          let executionWorkspaceSettings = isolatedWorkspacesEnabled || noCodeWorkspaceRequested
             ? (row.executionWorkspaceSettings ?? null)
             : null;
           let projectGoalId: string | null = null;
           if (projectId) {
             const derived = await loadProjectDerived(projectId);
             projectGoalId = derived.goalId;
-            if (!projectWorkspaceId)
+            if (!noCodeWorkspaceRequested && !projectWorkspaceId)
               projectWorkspaceId = derived.defaultProjectWorkspaceId;
             if (executionWorkspaceSettings == null) {
               executionWorkspaceSettings =
@@ -10662,10 +10672,34 @@ export function issueService(db: Db) {
       // Warm sandbox continuity is runtime bookkeeping, independent of the
       // opt-in UI for creating isolated worktrees. Public updates still obey
       // the feature gate; only the internal shared-workspace binding bypasses it.
-      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace) {
+      const effectiveNoCodeSelection = {
+        executionWorkspaceSettings: existing.executionWorkspaceSettings,
+        projectWorkspaceId: existing.projectWorkspaceId,
+        executionWorkspaceId: existing.executionWorkspaceId,
+        executionWorkspacePreference: existing.executionWorkspacePreference,
+        assigneeAdapterOverrides: existing.assigneeAdapterOverrides,
+        ...issueData,
+      };
+      const workspaceSelectionChanged =
+        issueData.executionWorkspaceSettings !== undefined ||
+        issueData.projectWorkspaceId !== undefined ||
+        issueData.executionWorkspaceId !== undefined ||
+        issueData.executionWorkspacePreference !== undefined ||
+        issueData.assigneeAdapterOverrides !== undefined;
+      // Legacy conflicting rows must still permit status/disposition recovery.
+      // Dispatch validates the full row before any workspace or provider work.
+      const noCodeConflict = workspaceSelectionChanged
+        ? noCodeWorkspaceSelectionConflict(effectiveNoCodeSelection)
+        : null;
+      if (noCodeConflict) throw unprocessable(noCodeConflict);
+      const noCodeWorkspaceRequested = parseObject(effectiveNoCodeSelection.executionWorkspaceSettings).mode === "no_code";
+      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace && !noCodeWorkspaceRequested) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
-        delete issueData.executionWorkspaceSettings;
+        // Clearing a no-code opt-in remains possible when isolated worktrees are off.
+        if (!(parseObject(existing.executionWorkspaceSettings).mode === "no_code" && issueData.executionWorkspaceSettings === null)) {
+          delete issueData.executionWorkspaceSettings;
+        }
       }
 
       if (issueData.status) {
