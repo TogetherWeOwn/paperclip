@@ -1,0 +1,232 @@
+name: Fork Code Delivery Source
+run-name: Generate delivery schema for ${{ github.event.pull_request.head.sha }}
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    if: >-
+      github.repository == 'TogetherWeOwn/paperclip' &&
+      github.event.pull_request.head.repo.full_name == 'TogetherWeOwn/paperclip' &&
+      github.event.pull_request.head.ref == 'verify/native-pr-completion-guard'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "true"
+      NO_COLOR: "1"
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Bind workflow and direct source identities
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          evidence="$RUNNER_TEMP/code-delivery-generation"
+          mkdir -p "$evidence"
+          python3 -I - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          pr = event['pull_request']
+          repo = 'TogetherWeOwn/paperclip'
+          assert os.environ['GITHUB_REPOSITORY'] == repo
+          assert pr['head']['repo']['full_name'] == repo
+          assert pr['base']['repo']['full_name'] == repo
+          assert pr['head']['ref'] == 'verify/native-pr-completion-guard'
+          assert pr['base']['ref'] == 'master'
+          source = pr['head']['sha']
+          assert re.fullmatch(r'[0-9a-f]{40}', source)
+          commit = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/commits/{source}']))
+          assert commit['sha'] == source
+          tree = commit['tree']['sha']
+          assert re.fullmatch(r'[0-9a-f]{40}', tree)
+          data = {
+              'schema_version': 1, 'purpose': 'migration source generation, not qualification',
+              'repository': repo, 'source_sha': source, 'source_tree': tree,
+              'workflow_sha': os.environ['WORKFLOW_SHA'], 'workflow_ref': os.environ['WORKFLOW_REF'],
+              'workflow_url': f"https://github.com/{repo}/blob/{os.environ['WORKFLOW_SHA']}/.github/workflows/fork-code-delivery-source.yml",
+              'pr_number': pr['number'], 'pr_head_sha': source, 'pr_base_sha': pr['base']['sha'],
+              'pr_merge_sha': pr.get('merge_commit_sha'), 'event_sha': os.environ['GITHUB_SHA'],
+              'run_url': f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'stock_base_sha': '6fa54d55779295d90c455389cebdd3da96607d20',
+          }
+          root = Path(os.environ['RUNNER_TEMP']) / 'code-delivery-generation'
+          (root / 'provenance.json').write_text(json.dumps(data, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'source_sha={source}\nsource_tree={tree}\n')
+          PY
+
+      - name: Checkout the exact same-fork source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: TogetherWeOwn/paperclip
+          ref: ${{ steps.identity.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify checked-out bytes before source execution
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          SOURCE_TREE: ${{ steps.identity.outputs.source_tree }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test "$(git remote get-url origin)" = https://github.com/TogetherWeOwn/paperclip
+          test -z "$(git status --porcelain)"
+          test -z "$(git ls-files '*pnpmfile*')"
+          python3 -I - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          names = subprocess.check_output(['git', 'ls-files', '-z', '*package.json']).decode().split('\0')
+          inventory = []
+          for name in filter(None, names):
+              data = json.loads(Path(name).read_text())
+              hooks = {key: value for key, value in data.get('scripts', {}).items() if key in {'preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublish', 'prepublishOnly'}}
+              if hooks:
+                  inventory.append({'path': name, 'hooks': hooks, 'execution': 'disabled'})
+          root = Path(os.environ['RUNNER_TEMP']) / 'code-delivery-generation'
+          (root / 'workspace-hooks.json').write_text(json.dumps(inventory, indent=2) + '\n')
+          PY
+          git show HEAD:package.json > "$RUNNER_TEMP/code-delivery-generation/package.json"
+          git show HEAD:pnpm-workspace.yaml > "$RUNNER_TEMP/code-delivery-generation/pnpm-workspace.yaml"
+          git show HEAD:.npmrc > "$RUNNER_TEMP/code-delivery-generation/npmrc.txt"
+          sha256sum pnpm-lock.yaml > "$RUNNER_TEMP/code-delivery-generation/lockfile.sha256"
+
+      - name: Set up source-pinned Node without caches
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: source/.nvmrc
+          package-manager-cache: false
+
+      - name: Set up source-pinned pnpm without caches or install
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          package_json_file: source/package.json
+          run_install: false
+          cache: false
+
+      - name: Frozen install with every lifecycle script disabled
+        id: install
+        working-directory: source
+        timeout-minutes: 20
+        run: |
+          evidence="$RUNNER_TEMP/code-delivery-generation"
+          { node --version; pnpm --version; } > "$evidence/tool-versions.txt"
+          printf '%s\n' 'pnpm 9.15.4 lacks native minimumReleaseAge; frozen lock is not retrospective age proof.' 'All lifecycle scripts disabled; no build-script exceptions. No pnpm hook files.' > "$evidence/supply-chain-limits.txt"
+          printf '%s\n' 'pnpm install --frozen-lockfile --ignore-scripts' > "$evidence/install.command"
+          set +e
+          timeout --signal=TERM --kill-after=30s 18m pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tee "$evidence/install.log"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${codes[0]}" > "$evidence/install.exit-code"
+          printf '%s\n' "${codes[1]}" > "$evidence/install.log-exit-code"
+          test "${codes[0]}" = 0 && test "${codes[1]}" = 0
+
+      - name: Check generation workflow contracts
+        id: controls
+        working-directory: source
+        timeout-minutes: 3
+        run: |
+          evidence="$RUNNER_TEMP/code-delivery-generation"
+          printf '%s\n' 'node --test scripts/fork-code-delivery-source.test.mjs' > "$evidence/controls.command"
+          set +e
+          timeout --signal=TERM --kill-after=10s 2m node --test scripts/fork-code-delivery-source.test.mjs 2>&1 | tee "$evidence/controls.log"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${codes[0]}" > "$evidence/controls.exit-code"
+          printf '%s\n' "${codes[1]}" > "$evidence/controls.log-exit-code"
+          test "${codes[0]}" = 0 && test "${codes[1]}" = 0
+
+      - name: Generate migration source without database access
+        id: generate
+        working-directory: source
+        timeout-minutes: 15
+        run: |
+          evidence="$RUNNER_TEMP/code-delivery-generation"
+          test -z "${DATABASE_URL:-}"
+          printf '%s\n' 'pnpm db:generate' > "$evidence/generate.command"
+          set +e
+          timeout --signal=TERM --kill-after=30s 12m pnpm db:generate 2>&1 | tee "$evidence/generate.log"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${codes[0]}" > "$evidence/generate.exit-code"
+          printf '%s\n' "${codes[1]}" > "$evidence/generate.log-exit-code"
+          test "${codes[0]}" = 0 && test "${codes[1]}" = 0
+
+      - name: Retain all generation changes and failure evidence
+        if: always()
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CONTROLS_OUTCOME: ${{ steps.controls.outcome }}
+          GENERATE_OUTCOME: ${{ steps.generate.outcome }}
+        run: |
+          python3 -I - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'code-delivery-generation'
+          root.mkdir(parents=True, exist_ok=True)
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+          result = {'install_outcome': os.environ['INSTALL_OUTCOME'], 'controls_outcome': os.environ['CONTROLS_OUTCOME'], 'generate_outcome': os.environ['GENERATE_OUTCOME'], 'qualified': False}
+          if (source / '.git').exists():
+              def git(*args):
+                  return subprocess.check_output(['git', '-C', str(source), *args])
+              git('add', '--intent-to-add', '--', 'packages/db/src/migrations')
+              patch = git('diff', '--binary', '--full-index', 'HEAD', '--')
+              (root / 'generation.patch').write_bytes(patch)
+              (root / 'generation-status.txt').write_bytes(git('status', '--porcelain=v1', '--untracked-files=all'))
+              changed = git('diff', '--name-only', 'HEAD', '--').decode().splitlines()
+              changed = sorted(set(changed + git('ls-files', '--others', '--exclude-standard').decode().splitlines()))
+              result['changed_files'] = changed
+              hooks = []
+              store = source / 'node_modules' / '.pnpm'
+              manifests = list(store.glob('*/node_modules/*/package.json')) + list(store.glob('*/node_modules/@*/*/package.json'))
+              for path in sorted(manifests):
+                  data = json.loads(path.read_text())
+                  scripts = {key: value for key, value in data.get('scripts', {}).items() if key in {'preinstall', 'install', 'postinstall', 'prepare'}}
+                  if scripts:
+                      hooks.append({'name': data.get('name'), 'version': data.get('version'), 'hooks': scripts, 'execution': 'disabled'})
+              (root / 'dependency-hooks.json').write_text(json.dumps(hooks, indent=2) + '\n')
+              result['unexpected_changes'] = [name for name in changed if not name.startswith('packages/db/src/migrations/')]
+              for name in changed:
+                  path = source / name
+                  if name.startswith('packages/db/src/migrations/') and path.is_file():
+                      assert not path.is_symlink()
+                      target = root / 'generated' / name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(path.read_bytes())
+          else:
+              result['unexpected_changes'] = ['source checkout unavailable']
+          result['generation_succeeded'] = result['install_outcome'] == 'success' and result['controls_outcome'] == 'success' and result['generate_outcome'] == 'success' and not result['unexpected_changes']
+          result['next_action'] = 'Review generated data and integrate it in a new source commit. Then qualify that new SHA; this is not acceptance or migration permission.'
+          (root / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          (root / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root)}\n' for p in files))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('# Migration source generation only\n\n' + json.dumps(result, indent=2) + '\n')
+          if not result['generation_succeeded']:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload generated source and logs even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: code-delivery-generation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/code-delivery-generation/
+          if-no-files-found: error
+          retention-days: 14

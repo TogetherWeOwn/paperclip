@@ -89,6 +89,43 @@ API completion, full generated-schema acceptance or live provider behavior.
 
 Required verification, including full typecheck/test/build and exact-head check
 links, belongs on GitHub Actions. Local diagnostic execution is limited to an
-authorized focused failing-test reproduction. Until a permitted verification and
-migration-generation route exists, this candidate is not ready for review or
-publication.
+authorized focused failing-test reproduction. This candidate is not ready for
+implementation review, upstream publication or installation.
+
+## Fork-only migration generation
+
+`.github/workflows/fork-code-delivery-source.yml` is supporting verification
+infrastructure for the public source-transport fork only. It runs for the
+same-fork `verify/native-pr-completion-guard` draft PR targeting `master` in
+`TogetherWeOwn/paperclip`. It does not run for upstream or other PR heads. This
+workflow is not part of the proposed upstream subsystem.
+
+The job checks out the event's complete source SHA, not the synthetic PR merge.
+It compares the checkout's SHA and tree with GitHub's canonical commit response
+before executing source. Its artifact records source SHA/tree, workflow/control
+SHA, PR head/base/merge, event SHA, stock base, run URL and tool versions. These
+identities are distinct even when some values happen to match.
+
+Generation runs on a disposable GitHub-hosted runner with read-only repository
+permissions, no persisted checkout credentials, no production environment, no
+shared caches and bounded install/generation timeouts. It uses the source's
+Node version file and package-manager pin, frozen dependencies and
+`--ignore-scripts`. Root, workspace and dependency install hooks are disabled;
+there are no native-build exceptions. A pnpm hook file fails preflight. The
+pinned pnpm 9.15.4 does not support the native three-day release-age filter;
+frozen installation does not retrospectively prove dependency age or safety.
+No package-manager upgrade or lockfile change is included.
+
+The job calls the supported `pnpm db:generate` command without a database URL.
+It uploads complete generation diff data, new/changed SQL and snapshots,
+journal/pruning changes, commands, exit codes, hook inventories, full failure
+logs and SHA-256 checksums. Changes outside migration source fail the result.
+It never applies migrations, commits, pushes, publishes or deploys.
+
+The author must inspect generation artifacts as data and integrate only reviewed
+migration changes, including the separate custom guard fragment through the
+migration path. This produces a new source SHA. Generation success is not
+qualification: the new SHA still needs complete exact-source typecheck, tests,
+build, migration synchronization and native API/PostgreSQL/all-writer/race/
+denial acceptance, plus all ordinary PR and independent review gates. No such
+final exact-source verification has been established by adding this workflow.
