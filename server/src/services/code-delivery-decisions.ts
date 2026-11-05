@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agents, codeDeliveryAuthorities, codeDeliveryDecisions, codeDeliveryDiscoveries,
-  codeDeliveryObligations, codeDeliveryOwnershipEvents, heartbeatRuns, issueCodeDeliveryIntents, issues, type Db } from "@paperclipai/db";
+import { activityLog, codeDeliveryAuthorities, codeDeliveryDecisions, codeDeliveryDiscoveries,
+  codeDeliveryObligations, codeDeliveryOwnershipEvents, issueCodeDeliveryIntents, issues, type Db } from "@paperclipai/db";
 import { codeDeliveryAuthoritySchema, codeDeliveryDecisionSchema, type CodeDeliveryAuthorityInput,
   type CodeDeliveryDecisionInput } from "@paperclipai/shared";
 import { conflict, forbidden } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { assertDeliveryTransferDestination } from "./code-delivery-transfer.js";
 import { assertDeliveryAdjudicator, deliveryActor, lockDeliveryIssues, readDeliveryIssue, type DeliveryIssue } from "./code-delivery-authority.js";
 import { createCodeDeliveryGitHubReader, type CodeDeliveryPullRequestObservation } from "./code-delivery-github.js";
 import { reconcileDeliveryDiscoveries } from "./code-delivery-discovery.js";
@@ -31,25 +31,6 @@ export function codeDeliveryDecisionService(db: Db) {
     const principal = deliveryActor(actor);
     if (existing.requestHash !== digest(input) || existing.actorType !== principal.type || existing.actorId !== principal.id) throw denied("idempotency_key_reused");
     return existing;
-  }
-
-  async function destinationReady(tx: Db, destination: DeliveryIssue) {
-    if (!open(destination) || !["todo", "in_progress", "in_review"].includes(destination.status)
-      || !destination.assigneeAgentId || destination.assigneeUserId) throw denied("destination_not_runnable");
-    await assertAssignableAgent(tx, destination.companyId, destination.assigneeAgentId, { kind: "work" });
-    const [agent] = await tx.select({ status: agents.status }).from(agents).where(and(eq(agents.companyId, destination.companyId),
-      eq(agents.id, destination.assigneeAgentId))).for("share");
-    if (!agent || ["paused", "error", "terminated", "pending_approval"].includes(agent.status)) throw denied("destination_not_runnable");
-    const monitor = parseIssueExecutionState(destination.executionState)?.monitor;
-    const now = Date.now();
-    const monitorLive = monitor?.status === "scheduled" && monitor.nextCheckAt && Date.parse(monitor.nextCheckAt) > now
-      && destination.monitorNextCheckAt?.getTime() === Date.parse(monitor.nextCheckAt)
-      && monitor.timeoutAt && Date.parse(monitor.timeoutAt) > Date.parse(monitor.nextCheckAt)
-      && monitor.maxAttempts != null && monitor.attemptCount < monitor.maxAttempts;
-    const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, destination.companyId),
-      eq(heartbeatRuns.agentId, destination.assigneeAgentId), sql`${heartbeatRuns.status} in ('queued', 'running')`,
-      sql`(${heartbeatRuns.issueId} = ${destination.id} or ${heartbeatRuns.nativeIssueId} = ${destination.id})`)).limit(1).for("share");
-    if (!monitorLive && !run) throw denied("destination_has_no_wake_path");
   }
 
   return {
@@ -134,7 +115,7 @@ export function codeDeliveryDecisionService(db: Db) {
           if (input.destinationIssueId === issueId) throw denied("self_transfer");
           const destination = locked.find(row => row.id === input.destinationIssueId)!;
           checkRevision(destination, input.expectedDestinationRevision);
-          await destinationReady(tx, destination);
+          await assertDeliveryTransferDestination(tx, destination);
           const [visited] = await tx.select({ id: codeDeliveryOwnershipEvents.id }).from(codeDeliveryOwnershipEvents).where(and(
             eq(codeDeliveryOwnershipEvents.companyId, companyId), eq(codeDeliveryOwnershipEvents.obligationId, obligation!.id),
             eq(codeDeliveryOwnershipEvents.toIssueId, destination.id))).limit(1);

@@ -36,10 +36,11 @@ export async function reconcileDeliveryDiscoveries(tx: Db, companyId: string, is
   return selected.map(row => ({ discoveryId: row.id, sourceRevision: row.sourceRevision, obligationId: obligation?.id ?? null }));
 }
 
-export function matchDeliveryDiscovery(discovery: Discovery, obligations: Obligation[], decisions: Array<typeof codeDeliveryDecisions.$inferSelect> = []) {
+export function matchDeliveryDiscovery(discovery: Discovery, obligations: Obligation[], decisions: Array<typeof codeDeliveryDecisions.$inferSelect> = [],
+  transferredObligationIds: ReadonlySet<string> = new Set()) {
   const identity = discoverGitHubPullRequest(discovery.snapshot.url);
   const obligation = identity ? obligations.find(row => row.companyId === discovery.companyId
-    && (row.ownerIssueId === discovery.issueId || row.sourceIssueId === discovery.issueId)
+    && (row.ownerIssueId === discovery.issueId || row.sourceIssueId === discovery.issueId || transferredObligationIds.has(row.id))
     && row.provider === "github" && row.repository === identity.repository && row.pullRequestNumber === identity.number) : null;
   if (obligation) return { discoveryId: discovery.id, obligationId: obligation.id, decisionId: null };
   for (const decision of decisions) {
@@ -48,7 +49,7 @@ export function matchDeliveryDiscovery(discovery: Discovery, obligations: Obliga
     for (const entry of decision.payload.reconciliations) {
       if (!entry || typeof entry !== "object" || entry.discoveryId !== discovery.id || entry.sourceRevision !== discovery.sourceRevision) continue;
       const accepted = decision.kind === "accept_head" && obligations.find(row => row.id === entry.obligationId
-        && row.id === decision.obligationId && (row.ownerIssueId === discovery.issueId || row.sourceIssueId === discovery.issueId));
+        && row.id === decision.obligationId && (row.ownerIssueId === discovery.issueId || row.sourceIssueId === discovery.issueId || transferredObligationIds.has(row.id)));
       if (accepted || (decision.kind === "no_pr" && entry.obligationId === null)) {
         return { discoveryId: discovery.id, obligationId: accepted ? accepted.id : null, decisionId: decision.id };
       }

@@ -98,6 +98,7 @@ export { pipelineCaseEvents } from "./pipeline_case_events.js";
 export { issueWorkProducts } from "./issue_work_products.js";
 export { issueCodeDeliveryIntents, codeDeliveryDiscoveries, codeDeliveryObligations, codeDeliveryOwnershipEvents } from "./code_delivery.js";
 export { codeDeliveryAuthorities, codeDeliveryDecisions } from "./code_delivery_decisions.js";
+export { codeDeliveryReadinessReceipts } from "./code_delivery_receipts.js";
 export { labels } from "./labels.js";
 export { issueLabels } from "./issue_labels.js";
 export { issueApprovals } from "./issue_approvals.js";

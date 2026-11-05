@@ -22,6 +22,7 @@ presentation and discovery data, never proof of delivery.
 | `code_delivery_ownership_events` | Append-only ownership provenance. Initial registration and independently adjudicated transfers retain every owner. |
 | `code_delivery_decisions` | Immutable independent classification, head acceptance, no-PR, closed-unmerged, withdrawal, and transfer decisions. These are not terminal readiness receipts. |
 | `code_delivery_authorities` | Explicit company-scoped technical agent for no-stage decisions, configured by an authorized human administrator. No agent name or job title grants this authority. |
+| `code_delivery_readiness_receipts` (schema draft) | Server-prepared terminal evidence bound to one company, task revision, effective terminal status, snapshot hash, transaction and expiry. Its migration and database consumption guards are not generated or active yet. |
 | `issues.code_delivery_revision` | Server-owned monotonic invalidation version. Every task update and supported delivery-association mutation advances it, including A-to-B-to-A policy changes. It grants no authority. |
 
 The database enforces company/task/project/workspace foreign keys and canonical
@@ -119,6 +120,53 @@ Common terminal enforcement and its receipts are still required. Superseded-deli
 proof, public API authorization, company portability/deletion and complete
 terminal-surface acceptance remain unfinished. The registration/reconciliation
 increment has not yet been exercised by CI. Do not interpret these internal services as a finished prevention gate.
+
+## Prepared readiness candidate (not activated)
+
+`code-delivery-readiness-policy.ts` plans all owned obligations, retained discovery
+reconciliations and outbound transfers. Genuine non-code tasks produce no provider
+requests. Code without an owned or transferred PR needs an independent typed
+no-PR decision. Each owned PR must have an independently accepted exact live head
+and authenticated merged evidence, or an exact independent closed-unmerged or
+withdrawal decision plus a fresh live closed observation. Work-product labels do
+not participate in the delivery predicate. Unknown intent, partial observations,
+head/identity mismatches, oversized attempts and stale evidence fail closed.
+Superseded delivery is not implemented in this candidate.
+
+`code-delivery-readiness.ts` separates preparation from transactional validation.
+Preparation performs bounded authenticated provider reads without task row locks.
+It returns an opaque in-process token, not serializable receipt JSON or caller
+claims. The token binds actor context, effective terminal status and a hash of
+issue, policy/state, retained associations, decisions, ownership and source
+bindings. Nonterminal effective results, including earlier review approvals,
+return no token and perform no provider or delivery database work.
+
+The candidate commit method re-locks the task and related owners, checks current
+run authority, compares the complete snapshot and rechecks the independent
+adjudication context. Outbound transfers recheck the current destination's live
+wake path under its lock. Receipt data retains exact head, repository identity,
+merge timestamp, merge SHA, observation time, obligation revision and selected
+decision IDs. Receipt insertion and its audit use the caller's transaction. The
+preparation and every observation expire within 30 seconds. Validation does not
+refresh evidence or call GitHub while holding locks.
+
+**This is not yet an atomic terminal guard.** The receipt schema is authored but
+its generated migration, immutable-history trigger, terminal-write receipt guard
+and deferred receipt-consumption constraint are pending. No existing terminal
+writer calls this service. It must not be activated until the receipt and native
+terminal transition are guaranteed to commit together, including rejection of
+unprepared direct writes, terminal creation/import and receipt replay. Current
+transfer validation also conservatively refuses an already-terminal destination;
+verified completed replacement/owner evidence still needs lifecycle integration.
+
+The new policy and preparation-boundary regression sources are authored but not
+executed. The boundary tests mock persistence/authorization and do not prove
+PostgreSQL locking, transaction rollback, native review decisions or terminal
+side-effect preservation. Real database/API/concurrency acceptance is required.
+In particular, route-level pre-terminal run cancellation must be moved behind the
+accepted transactional boundary; a denied attempt must not have stopped a run
+before its stale-state conflict is detected. Native and other transaction-owning
+callers must prepare before taking their enclosing locks.
 
 ## Migration and verification
 
