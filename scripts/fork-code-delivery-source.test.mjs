@@ -12,9 +12,16 @@ const step = (name) => {
   return found;
 };
 
-test("generation is limited to the selected same-fork pull request", () => {
+test("generation is limited to the selected same-fork draft source", () => {
   assert.deepEqual(document.errors, []);
-  assert.deepEqual(Object.keys(workflow.on), ["pull_request"]);
+  assert.deepEqual(Object.keys(workflow.on), ["push", "pull_request"]);
+  assert.deepEqual(workflow.on.push.branches, ["verify/native-pr-completion-guard"]);
+  assert.match(job.if, /github\.event_name == 'push'/);
+  assert.match(job.if, /github\.ref == 'refs\/heads\/verify\/native-pr-completion-guard'/);
+  const identity = step("Bind workflow and direct source identities");
+  assert.match(identity.run, /len\(prs\) == 1/);
+  assert.match(identity.run, /pr\['head'\]\['sha'\] == event\['after'\] == os\.environ\['GITHUB_SHA'\]/);
+  assert.match(identity.run, /pr\['state'\] == 'open' and pr\['draft'\] is True/);
   assert.deepEqual(workflow.on.pull_request.branches, ["master"]);
   assert.match(job.if, /github\.repository == 'TogetherWeOwn\/paperclip'/);
   assert.match(job.if, /head\.repo\.full_name == 'TogetherWeOwn\/paperclip'/);

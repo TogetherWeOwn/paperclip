@@ -1,7 +1,9 @@
 name: Fork Code Delivery Source
-run-name: Generate delivery schema for ${{ github.event.pull_request.head.sha }}
+run-name: Generate delivery schema for ${{ github.event.pull_request.head.sha || github.sha }}
 
 on:
+  push:
+    branches: [verify/native-pr-completion-guard]
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened]
@@ -13,8 +15,10 @@ jobs:
   generate:
     if: >-
       github.repository == 'TogetherWeOwn/paperclip' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/verify/native-pr-completion-guard') ||
+      (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == 'TogetherWeOwn/paperclip' &&
-      github.event.pull_request.head.ref == 'verify/native-pr-completion-guard'
+      github.event.pull_request.head.ref == 'verify/native-pr-completion-guard'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     defaults:
@@ -38,16 +42,26 @@ jobs:
           import json, os, re, subprocess
           from pathlib import Path
           event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
-          pr = event['pull_request']
           repo = 'TogetherWeOwn/paperclip'
           assert os.environ['GITHUB_REPOSITORY'] == repo
+          if os.environ['GITHUB_EVENT_NAME'] == 'push':
+              assert os.environ['GITHUB_REF'] == 'refs/heads/verify/native-pr-completion-guard'
+              assert event['repository']['full_name'] == repo
+              prs = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/pulls?state=open&head=TogetherWeOwn:verify/native-pr-completion-guard&base=master&per_page=100'], timeout=30))
+              assert len(prs) == 1
+              pr = prs[0]
+              assert pr['head']['sha'] == event['after'] == os.environ['GITHUB_SHA']
+          else:
+              assert os.environ['GITHUB_EVENT_NAME'] == 'pull_request'
+              pr = event['pull_request']
+          assert pr['state'] == 'open' and pr['draft'] is True
           assert pr['head']['repo']['full_name'] == repo
           assert pr['base']['repo']['full_name'] == repo
           assert pr['head']['ref'] == 'verify/native-pr-completion-guard'
           assert pr['base']['ref'] == 'master'
           source = pr['head']['sha']
           assert re.fullmatch(r'[0-9a-f]{40}', source)
-          commit = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/commits/{source}']))
+          commit = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/commits/{source}'], timeout=30))
           assert commit['sha'] == source
           tree = commit['tree']['sha']
           assert re.fullmatch(r'[0-9a-f]{40}', tree)

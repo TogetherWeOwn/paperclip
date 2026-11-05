@@ -97,8 +97,14 @@ implementation review, upstream publication or installation.
 `.github/workflows/fork-code-delivery-source.yml` is supporting verification
 infrastructure for the public source-transport fork only. It runs for the
 same-fork `verify/native-pr-completion-guard` draft PR targeting `master` in
-`TogetherWeOwn/paperclip`. It does not run for upstream or other PR heads. This
-workflow is not part of the proposed upstream subsystem.
+`TogetherWeOwn/paperclip`. It also accepts pushes to that exact fork ref, but
+requires a single open draft PR with the same repository, base and exact push
+SHA before execution. This permits direct-source generation when a conflicting
+fork base prevents GitHub from scheduling `pull_request` workflows, without
+merging the fork base into the stock-based candidate. The conflict and missing
+ordinary PR checks remain gates; a push run does not satisfy them. It does not
+run for upstream or other PR heads. This workflow is not part of the proposed
+upstream subsystem.
 
 The job checks out the event's complete source SHA, not the synthetic PR merge.
 It compares the checkout's SHA and tree with GitHub's canonical commit response
