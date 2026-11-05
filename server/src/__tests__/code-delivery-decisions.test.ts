@@ -238,12 +238,12 @@ const head = "a".repeat(40);
     expect(await snapshot(f)).toEqual(before);
     expect(provider.read).not.toHaveBeenCalled();
   });
-  it.each(["expired", "future", "obligation_changed"])("rejects %s prepared evidence", async fault => {
+  it.each(["expired", "future", "invalid_date", "obligation_changed"])("rejects %s prepared evidence", async fault => {
     const f = await fixture(), o = await register(f);
     provider.read.mockImplementation(async () => {
       if (fault === "obligation_changed") await db.update(codeDeliveryObligations).set({ proposedHeadSha: "b".repeat(40), revision: 2 }).where(eq(codeDeliveryObligations.id, o.id));
       return { status: "observed", pullRequests: [{ state: "closed", headSha: head,
-        observedAt: new Date(Date.now() + (fault === "future" ? 60_000 : fault === "expired" ? -60_000 : 0)).toISOString() }] };
+        observedAt: fault === "invalid_date" ? "invalid" : new Date(Date.now() + (fault === "future" ? 60_000 : fault === "expired" ? -60_000 : 0)).toISOString() }] };
     });
     await expect(codeDeliveryDecisionService(db).decide(f.company.id, f.issue.id, actor, await obligationInput(f, o, "closed_unmerged")))
       .rejects.toMatchObject({ details: { code: "code_delivery_revision_conflict" } });

@@ -4,12 +4,13 @@ import { activityLog, agents, codeDeliveryAuthorities, codeDeliveryDecisions, co
   codeDeliveryObligations, codeDeliveryOwnershipEvents, heartbeatRuns, issueCodeDeliveryIntents, issues, type Db } from "@paperclipai/db";
 import { codeDeliveryAuthoritySchema, codeDeliveryDecisionSchema, type CodeDeliveryAuthorityInput,
   type CodeDeliveryDecisionInput } from "@paperclipai/shared";
-import { conflict, forbidden, notFound } from "../errors.js";
+import { conflict, forbidden } from "../errors.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
-import { assertDeliveryAdjudicator, deliveryActor, lockDeliveryIssues, type DeliveryIssue } from "./code-delivery-authority.js";
+import { assertDeliveryAdjudicator, deliveryActor, lockDeliveryIssues, readDeliveryIssue, type DeliveryIssue } from "./code-delivery-authority.js";
 import { createCodeDeliveryGitHubReader, type CodeDeliveryPullRequestObservation } from "./code-delivery-github.js";
+import { reconcileDeliveryDiscoveries } from "./code-delivery-discovery.js";
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const open = (issue: DeliveryIssue) => !["done", "cancelled"].includes(issue.status);
@@ -22,18 +23,6 @@ function checkRevision(issue: DeliveryIssue, expected: number) {
 
 export function codeDeliveryDecisionService(db: Db) {
   const observe = createCodeDeliveryGitHubReader(db);
-
-  async function readIssue(companyId: string, issueId: string, actor: AuthorizationActor) {
-    const [issue] = await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-    if (!issue) throw notFound("Task not found");
-    const resource = { type: "issue" as const, companyId, issueId, projectId: issue.projectId,
-      parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status };
-    const access = authorizationService(db);
-    if (!(await access.decide({ actor, action: "issue:read", resource })).allowed) throw notFound("Task not found");
-    const mutation = await access.decide({ actor, action: "issue:mutate", resource });
-    if (!mutation.allowed) throw forbidden(mutation.explanation);
-    return issue;
-  }
 
   async function existingDecision(tx: Db, companyId: string, issueId: string, actor: AuthorizationActor, input: CodeDeliveryDecisionInput) {
     const [existing] = await tx.select().from(codeDeliveryDecisions).where(and(eq(codeDeliveryDecisions.companyId, companyId),
@@ -90,7 +79,7 @@ export function codeDeliveryDecisionService(db: Db) {
     decide: async (companyId: string, issueId: string, actor: AuthorizationActor, rawInput: CodeDeliveryDecisionInput) => {
       const input = codeDeliveryDecisionSchema.parse(rawInput);
       const principal = deliveryActor(actor);
-      const initial = await readIssue(companyId, issueId, actor);
+      const initial = await readDeliveryIssue(db, companyId, issueId, actor);
       const authority = await assertDeliveryAdjudicator(db, initial, actor);
       const replay = await existingDecision(db, companyId, issueId, actor, input);
       if (replay) return replay;
@@ -122,7 +111,8 @@ export function codeDeliveryDecisionService(db: Db) {
         const [currentObligation] = obligation ? await tx.select().from(codeDeliveryObligations).where(and(
           eq(codeDeliveryObligations.companyId, companyId), eq(codeDeliveryObligations.id, obligation.id))).for("update") : [];
         if (obligation && (!currentObligation || currentObligation.ownerIssueId !== issueId || currentObligation.revision !== obligation.revision)) throw stale();
-        if (observation && (Date.now() - Date.parse(observation.observedAt) > 30_000 || Date.parse(observation.observedAt) > Date.now())) throw stale();
+        const observedAt = observation ? Date.parse(observation.observedAt) : null;
+        if (observedAt !== null && (!Number.isFinite(observedAt) || Date.now() - observedAt > 30_000 || observedAt > Date.now())) throw stale();
         const [intent] = await tx.select().from(issueCodeDeliveryIntents).where(and(eq(issueCodeDeliveryIntents.companyId, companyId),
           eq(issueCodeDeliveryIntents.issueId, issueId))).for("update");
         if (!intent) throw denied("missing_intent");
@@ -133,10 +123,13 @@ export function codeDeliveryDecisionService(db: Db) {
         if (input.kind === "classify_non_code" || input.kind === "no_pr") {
           const [owned] = await tx.select({ id: codeDeliveryObligations.id }).from(codeDeliveryObligations).where(and(
             eq(codeDeliveryObligations.companyId, companyId), eq(codeDeliveryObligations.ownerIssueId, issueId))).limit(1);
-          const [discovered] = await tx.select({ id: codeDeliveryDiscoveries.id }).from(codeDeliveryDiscoveries).where(and(
-            eq(codeDeliveryDiscoveries.companyId, companyId), eq(codeDeliveryDiscoveries.issueId, issueId))).limit(1);
+          const [discovered] = input.kind === "classify_non_code" ? await tx.select({ id: codeDeliveryDiscoveries.id }).from(codeDeliveryDiscoveries).where(and(
+            eq(codeDeliveryDiscoveries.companyId, companyId), eq(codeDeliveryDiscoveries.issueId, issueId))).limit(1) : [];
           if (owned || discovered) throw denied("unreconciled_associations");
         }
+        const reconciliations = input.kind === "no_pr" || input.kind === "accept_head"
+          ? await reconcileDeliveryDiscoveries(tx, companyId, issueId, input.discoveryIds ?? [], input.kind === "accept_head" ? currentObligation : undefined)
+          : null;
         if (input.kind === "transfer") {
           if (input.destinationIssueId === issueId) throw denied("self_transfer");
           const destination = locked.find(row => row.id === input.destinationIssueId)!;
@@ -148,6 +141,7 @@ export function codeDeliveryDecisionService(db: Db) {
           if (visited) throw denied("cyclic_transfer");
         }
         const payload: Record<string, unknown> = { version: 1, ...(observation ? { observation } : {}),
+          ...(reconciliations ? { reconciliations } : {}),
           ...(input.kind === "accept_head" ? { headSha: input.headSha } : {}),
           ...(input.kind === "transfer" ? { destinationIssueId: input.destinationIssueId, destinationRevision: input.expectedDestinationRevision } : {}) };
         const [decision] = await tx.insert(codeDeliveryDecisions).values({ companyId, issueId, obligationId: obligation?.id ?? null,

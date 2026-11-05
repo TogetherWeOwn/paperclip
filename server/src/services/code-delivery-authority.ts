@@ -18,6 +18,26 @@ export function deliveryActor(actor: AuthorizationActor): DeliveryActor {
   throw forbidden("An authenticated delivery decision actor is required", { code: "code_delivery_authority_denied" });
 }
 
+export async function readDeliveryIssue(db: Db, companyId: string, issueId: string, actor: AuthorizationActor, mutate = true) {
+  if (actor.type === "agent" && actor.companyId !== companyId) throw notFound("Task not found");
+  const [issue] = await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  if (!issue) throw notFound("Task not found");
+  const resource = { type: "issue" as const, companyId, issueId, projectId: issue.projectId,
+    parentIssueId: issue.parentId, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status };
+  const access = authorizationService(db);
+  if (!(await access.decide({ actor, action: "issue:read", resource })).allowed) throw notFound("Task not found");
+  if (mutate) {
+    const mutation = await access.decide({ actor, action: "issue:mutate", resource });
+    if (!mutation.allowed) throw forbidden(mutation.explanation);
+    if (actor.type === "agent") {
+      const principal = deliveryActor(actor);
+      const run = await assertAgentRunWriteAllowed(db, companyId, { agentId: principal.id, runId: principal.runId });
+      if (!run || run.status !== "running") throw forbidden("An active task run is required");
+    }
+  }
+  return issue;
+}
+
 export async function lockDeliveryIssues(tx: Db, actor: AuthorizationActor, companyId: string, issueIds: string[]) {
   const principal = deliveryActor(actor);
   if (actor.type === "agent" && actor.companyId !== companyId) throw notFound("Task not found");
@@ -69,6 +89,13 @@ export async function assertDeliveryAdjudicator(tx: Db, issue: DeliveryIssue, ac
   exclude("user", issue.createdByUserId);
   exclude(executor.type, executor.type === "agent" ? executor.agentId : executor.userId);
   if (requester) exclude(requester.type, requester.id);
+  const registrations = await tx.select({ provenance: codeDeliveryObligations.provenance }).from(codeDeliveryObligations)
+    .where(and(eq(codeDeliveryObligations.companyId, issue.companyId), eq(codeDeliveryObligations.ownerIssueId, issue.id)));
+  for (const { provenance } of registrations) {
+    const actor = provenance.actor;
+    if (actor && typeof actor === "object" && "type" in actor && "id" in actor
+      && (actor.type === "agent" || actor.type === "user")) exclude(actor.type, actor.id);
+  }
   const inherited = await tx.select({ authority: codeDeliveryDecisions.authority }).from(codeDeliveryObligations)
     .innerJoin(codeDeliveryDecisions, and(eq(codeDeliveryDecisions.companyId, codeDeliveryObligations.companyId),
       eq(codeDeliveryDecisions.id, codeDeliveryObligations.transferDecisionId)))

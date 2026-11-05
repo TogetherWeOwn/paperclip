@@ -26,10 +26,38 @@ presentation and discovery data, never proof of delivery.
 
 The database enforces company/task/project/workspace foreign keys and canonical
 PR uniqueness. Registration starts without an accepted head. An observation is
-not evidence that an independent reviewer accepted that head. The authorized
-registration and discovery reconciliation services are still required before a
-public mutation surface can use these tables. Independent acceptance is available
-only as an internal service at this checkpoint.
+not evidence that an independent reviewer accepted that head. Registration,
+reconciliation and independent acceptance are internal services only at this
+checkpoint; none is a public mutation endpoint or terminal completion gate.
+
+## Canonical registration and discovery reconciliation
+
+`code-delivery-registration.ts` validates the task's explicit repository workspace
+and project, then uses the authenticated GitHub reader before taking task locks.
+Caller-supplied repository ID, PR number, base and proposed head must all match
+that server observation. Inside the transaction it rechecks the acting run,
+authorization, task revision and source binding. Registration records observation
+provenance, initial ownership and audit together. It never accepts the head or
+records a native review decision. The registrant cannot independently adjudicate
+that delivery later, even after an assignment change.
+
+Canonical repository-ID/PR-number identity is company-scoped. Identical retries
+return the retained obligation without duplicate audit; a different owner,
+source workspace, base or proposed head cannot reuse registration to overwrite
+it. A new registration on a terminal or explicit non-code task is refused.
+An ambiguous task can register code evidence, but remains unclassified until an
+independent classification decision. Source selection never defaults to the
+project's primary repository.
+
+`code-delivery-discovery.ts` matches retained GitHub PR links to validated
+obligations; URL parsing alone does not validate provider identity or delivery.
+Branch and commit snapshots remain unresolved until an independent head-acceptance
+decision explicitly binds their discovery IDs and retained source revisions.
+An independent no-PR decision must name every retained discovery and cannot waive
+a PR association. New snapshots are not covered by an earlier decision. No
+work-product deletion, conversion, display label or project move removes retained
+evidence. The read service returns unresolved associations explicitly; it does
+not repair them from a label or a caller-provided receipt.
 
 ## Discovery retention
 
@@ -43,9 +71,10 @@ New code associations on terminal tasks are refused; display-only updates to
 already-discovered legacy associations remain possible. Explicit non-code tasks
 cannot acquire new code associations. An existing ambiguous task with code
 associations cannot become non-code just because someone deletes its work
-products. Independent reconciliation remains to be implemented; deleting a link
-is not a substitute for it. The internal transfer service retains the original
-obligation and adds history rather than moving or deleting display data.
+products. The internal reconciliation service retains independent decisions;
+deleting a link is not a substitute for one. The internal transfer service retains
+the original obligation and adds history rather than moving or deleting display
+data.
 
 Ordinary task deletion remains possible without retained code associations.
 Tasks referenced by discoveries or obligations cannot be physically deleted.
@@ -86,10 +115,10 @@ acceptance. Database triggers refuse direct ownership moves and head certificati
 without the corresponding current decision.
 
 The internal service alone cannot prevent the destination from later closing.
-Common terminal enforcement and its receipts are still required. Registration,
-discovery reconciliation, superseded-delivery proof, public API authorization,
-company portability/deletion and complete terminal-surface acceptance remain
-unfinished. Do not interpret these internal services as a finished prevention gate.
+Common terminal enforcement and its receipts are still required. Superseded-delivery
+proof, public API authorization, company portability/deletion and complete
+terminal-surface acceptance remain unfinished. The registration/reconciliation
+increment has not yet been exercised by CI. Do not interpret these internal services as a finished prevention gate.
 
 ## Migration and verification
 
