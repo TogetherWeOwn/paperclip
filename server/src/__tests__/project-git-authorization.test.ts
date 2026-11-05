@@ -9,6 +9,7 @@ import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { ghFetch } from "../services/github-fetch.js";
 import { projectRoutes } from "../routes/projects.js";
 import { createGitHubWorkspaceDeliveryResolver } from "../services/github-workspace-delivery.js";
+import { createCodeDeliveryGitHubReader } from "../services/code-delivery-github.js";
 import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
 import { errorHandler } from "../middleware/index.js";
 import { githubCredentialsFixture } from "./helpers/github-credentials-fixture.js";
@@ -212,6 +213,66 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       vi.mocked(ghFetch).mockClear(); vault.resolveUserSecretValue.mockClear();
       expect(await f.service.resolve(f.request, f.scope)).toBeNull();
       expect(ghFetch).not.toHaveBeenCalled(); expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+    });
+    it("requires and rechecks explicit consent for authenticated public-repository observations", async () => {
+      const f = await projectAuthorizationFixture();
+      await db.update(projectWorkspaces).set({ metadata: { githubRepositoryUrl: "https://github.com/fixture/project", githubRepositoryPrivate: false } })
+        .where(eq(projectWorkspaces.id, f.workspace.id));
+      const identity = { projectId: f.project.id, workspaceId: f.workspace.id, repository: "fixture/project", repositoryId: "1",
+        number: 17, baseRef: "main", reviewedHeadSha: "a".repeat(40) };
+      const fetch = vi.fn<typeof globalThis.fetch>(async (_url, init) => {
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer test-token-A");
+        return Response.json({ number: 17, url: "https://api.github.com/repos/fixture/project/pulls/17",
+          html_url: "https://github.com/fixture/project/pull/17", base: { ref: "main", repo: {
+            id: 1, full_name: "fixture/project", url: "https://api.github.com/repos/fixture/project",
+          } }, head: { sha: identity.reviewedHeadSha }, merged: true, draft: false, state: "closed",
+          merged_at: "2026-01-02T03:04:05Z", merge_commit_sha: "b".repeat(40) });
+      });
+      const read = createCodeDeliveryGitHubReader(db, { fetch });
+      vault.resolveUserSecretValue.mockClear(); vi.mocked(ghFetch).mockClear();
+      expect(await read(f.input.companyId, [identity])).toEqual({ status: "unavailable", reason: "authorization_unavailable" });
+      expect(fetch).not.toHaveBeenCalled(); expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+      await f.service.set(f.input.companyId, f.project.id, "A", f.selected.id);
+      expect(await read(f.input.companyId, [identity])).toMatchObject({ status: "observed", pullRequests: [{ state: "merged", repositoryId: "1" }] });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(ghFetch).not.toHaveBeenCalled();
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, f.selected.id));
+      vault.resolveUserSecretValue.mockClear();
+      expect(await read(f.input.companyId, [identity])).toEqual({ status: "unavailable", reason: "authorization_unavailable" });
+      expect(fetch).toHaveBeenCalledTimes(1); expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+    });
+    it.each(["company", "project", "repository", "membership", "private access", "low-trust", "connection"])("denies authenticated observations after %s changes without reading provider data", async change => {
+      const f = await projectAuthorizationFixture();
+      await f.service.set(f.input.companyId, f.project.id, "A", f.selected.id);
+      await db.update(projectWorkspaces).set({ metadata: { githubRepositoryUrl: "https://github.com/fixture/project", githubRepositoryPrivate: false } })
+        .where(eq(projectWorkspaces.id, f.workspace.id));
+      if (change === "membership") await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.input.companyId));
+      if (change === "private access") await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, f.project.id));
+      if (change === "low-trust") await db.update(projects).set({ executionWorkspacePolicy: { authorizationPolicy: { trustBoundary: {
+        mode: LOW_TRUST_REVIEW_PRESET, companyId: f.input.companyId, projectIds: [f.project.id],
+      } } } }).where(eq(projects.id, f.project.id));
+      if (change === "connection") await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, f.selected.connectionId));
+      const fetch = vi.fn<typeof globalThis.fetch>();
+      const read = createCodeDeliveryGitHubReader(db, { fetch });
+      vault.resolveUserSecretValue.mockClear();
+      expect(await read(change === "company" ? randomUUID() : f.input.companyId, [{
+        projectId: change === "project" ? randomUUID() : f.project.id, workspaceId: f.workspace.id,
+        repository: change === "repository" ? "fixture/other" : "fixture/project", repositoryId: "1",
+        number: 17, baseRef: "main", reviewedHeadSha: "a".repeat(40),
+      }])).toEqual({ status: "unavailable", reason: "authorization_unavailable" });
+      expect(fetch).not.toHaveBeenCalled(); expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+    });
+    it("uses foreground run authority for authenticated public reads without borrowing saved project consent", async () => {
+      const f = await projectAuthorizationFixture();
+      await db.update(projectWorkspaces).set({ metadata: { githubRepositoryUrl: "https://github.com/fixture/project", githubRepositoryPrivate: false } })
+        .where(eq(projectWorkspaces.id, f.workspace.id));
+      const input = { ...f.request, requireAuthentication: true };
+      const scope = { ...f.scope, runId: f.input.runId, agentId: f.input.agentId };
+      expect(await f.service.resolve(input, scope)).toBe("test-token-A");
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.input.runId));
+      vault.resolveUserSecretValue.mockClear();
+      await expect(f.service.resolve(input, scope)).rejects.toThrow("Active task run");
+      expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
     });
     it.each(["inspect", "remove"] as const)("allows authorized %s after archive while denying provisioning and revoked consent", async operation => {
       const f = await projectAuthorizationFixture();

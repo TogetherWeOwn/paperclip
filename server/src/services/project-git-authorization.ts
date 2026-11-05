@@ -136,7 +136,7 @@ export function projectGitAuthorizationService(db: Db) {
       return read(companyId, projectId, userId);
     },
     async resolve(
-      input: { companyId: string; projectId: string; workspaceId: string; expectedRepository?: string },
+      input: { companyId: string; projectId: string; workspaceId: string; expectedRepository?: string; requireAuthentication?: boolean },
       scope?: {
         projectId: string;
         workspaceId?: string;
@@ -168,7 +168,7 @@ export function projectGitAuthorizationService(db: Db) {
       const repo = normalizeProjectRepositoryUrl(workspace.repoUrl);
       if (input.expectedRepository && repo.fullName.toLowerCase() !== input.expectedRepository.toLowerCase())
         throw forbidden("Project repository changed before GitHub authorization");
-      const isPrivate = await projectRepositoryIsPrivate(db, input.companyId, workspace);
+      const requiresCredential = input.requireAuthentication || await projectRepositoryIsPrivate(db, input.companyId, workspace);
       if (scope.runId || scope.agentId) {
         if (!scope.runId || !scope.agentId) throw forbidden("Incomplete foreground Git identity");
         const [run] = await db
@@ -205,7 +205,7 @@ export function projectGitAuthorizationService(db: Db) {
         }, input.companyId, {
           issueId, workspaceId: issue.executionWorkspaceId, projectWorkspaceId: workspace.id,
         });
-        if (!isPrivate) return null;
+        if (!requiresCredential) return null;
         const result = await resolveGitHubOperationCredentials(db, {
           companyId: input.companyId,
           runId: scope.runId,
@@ -214,7 +214,7 @@ export function projectGitAuthorizationService(db: Db) {
         if (result.status !== "available") throw forbidden(result.reason ?? "Run GitHub authorization unavailable");
         return transientGitToken(result.env.PAPERCLIP_GIT_TOKEN);
       }
-      if (!isPrivate) return null;
+      if (!requiresCredential) return null;
       if (!row.gitAuthorizationGrantId)
         throw forbidden("Authorize this project's GitHub connection before provisioning private repositories");
       const selected =
