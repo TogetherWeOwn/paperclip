@@ -52,6 +52,12 @@ attempt while preserving the caller's earlier entries. The outer transaction
 owner still owns delivery after successful outer commit; releasing a savepoint
 is not permission to publish or stop a process.
 
+The common terminal write owns the task's update timestamp and certified revision.
+Its interaction-expiry call skips the redundant task touch, while retaining
+interaction expiry, linked-action revocation and their normal publications.
+Other expiry callers retain the default touch. Receipt settlement still rejects
+any subsequent task revision within the certifying transaction.
+
 ## Explicitly incomplete integration
 
 **REST terminal updates currently return `409 code_delivery_not_ready` with
@@ -104,6 +110,17 @@ tests; this is not live GitHub or REST/native-finalizer acceptance. Only the
 previously failing single boundary test was reproduced locally and passed after
 the hook fix. The new persistence cases await exact-source Actions execution.
 
+The next Actions run at `c7c59dc2a15dea9f4808a25d0cdc20d56d5cedfe` executed
+434 tests: **423 passed, 11 failed, none skipped**. The failures exposed an
+additional post-consumption task touch in interaction expiry, incomplete native
+review-state fixtures and an exact-window SQL fixture using two different clock
+reads. The current changes remove only that redundant touch, complete the review
+fixtures and use a stable statement timestamp for the receipt window; they do not
+relax receipt or independent-adjudicator validation. A single merged-proof
+common-service test failed before and passed after the touch repair. Its ten
+unselected tests were skipped by the explicit name filter, not verified locally.
+The revised suites and typechecks await new exact-source Actions results.
+
 Required verification, including full typecheck/test/build and exact-head check
 links, belongs on GitHub Actions. Local diagnostic execution is limited to an
 authorized focused failing-test reproduction. This candidate is not ready for
@@ -146,10 +163,11 @@ logs and SHA-256 checksums. Changes outside migration source fail the result.
 Generation never applies migrations, commits, pushes, publishes or deploys.
 After generation, the subsystem-check step requires an unchanged migration tree
 and the integrated terminal guard before building the existing SDK test
-prerequisites and running the twelve selected delivery/provider suites. It
-retains the complete test JSON and fails if any test is skipped, pending or todo,
-if an expected suite is missing, or if any assertion fails. Database/server
-focused typechecks and module boundaries follow successful tests. Commands,
+prerequisites and running the thirteen selected delivery/provider/interaction
+suites. It retains the complete test JSON and fails if any test is skipped,
+pending or todo, if an expected suite is missing, or if any assertion fails.
+Database/server focused typechecks and module boundaries still run after a test
+failure, and the final status preserves every failed check. Commands,
 exit codes and complete logs survive failure. PostgreSQL tests use disposable
 runner-local databases, never an installed runtime database. These targeted
 checks are not the full repository or native API/all-writer acceptance suite.

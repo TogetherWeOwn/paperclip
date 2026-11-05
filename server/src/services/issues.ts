@@ -11813,7 +11813,7 @@ export function issueService(db: Db) {
             ).expirePendingInteractionsForTerminalIssue(updated, {
               agentId: actorAgentId ?? null,
               userId: actorUserId ?? null,
-            });
+            }, { touchIssue: false });
             const {
               nativeQuestionCancellationIdentity,
               requestNativeQuestionRunCancellation,

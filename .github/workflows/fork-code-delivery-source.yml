@@ -206,6 +206,7 @@ jobs:
             test "${codes[0]}" = 0 && test "${codes[1]}" = 0
           }
           record candidate-dependencies pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          checks_failed=0
           record candidate-tests pnpm exec vitest run --maxWorkers=1 --no-file-parallelism \
             packages/db/src/code-delivery-migration.test.ts \
             packages/db/src/code-delivery-terminal-guards.test.ts \
@@ -217,22 +218,24 @@ jobs:
             server/src/__tests__/code-delivery-registration.test.ts \
             server/src/__tests__/issue-code-delivery-persistence.test.ts \
             server/src/__tests__/issue-code-delivery.test.ts \
+            server/src/services/issue-thread-interactions.test.ts \
             server/src/__tests__/project-git-authorization.test.ts \
             server/src/__tests__/github-workspace-delivery.test.ts \
-            --reporter=default --reporter=json --outputFile.json="$evidence/candidate-tests.json"
-          python3 -I - <<'PY'
+            --reporter=default --reporter=json --outputFile.json="$evidence/candidate-tests.json" || checks_failed=1
+          python3 -I - <<'PY' || checks_failed=1
           import json, os
           from pathlib import Path
           result = json.loads((Path(os.environ['RUNNER_TEMP']) / 'code-delivery-generation/candidate-tests.json').read_text())
           assert result['success'] is True and result['numTotalTests'] > 0
           assert result['numFailedTests'] == 0 and result['numPendingTests'] == 0 and result['numTodoTests'] == 0
           files = {Path(suite['name']).name for suite in result['testResults']}
-          assert len(files) == 12, files
+          assert len(files) == 13, files
           assert all(suite['status'] == 'passed' and suite['assertionResults'] for suite in result['testResults'])
           PY
-          record candidate-db-typecheck pnpm --filter @paperclipai/db typecheck
-          record candidate-server-typecheck pnpm --filter @paperclipai/server typecheck
-          record candidate-boundaries node scripts/check-module-boundaries.mjs
+          record candidate-db-typecheck pnpm --filter @paperclipai/db typecheck || checks_failed=1
+          record candidate-server-typecheck pnpm --filter @paperclipai/server typecheck || checks_failed=1
+          record candidate-boundaries node scripts/check-module-boundaries.mjs || checks_failed=1
+          test "$checks_failed" = 0
 
       - name: Retain all generation changes and failure evidence
         if: always()

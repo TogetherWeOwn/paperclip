@@ -26,7 +26,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const [result] = await tx`INSERT INTO code_delivery_readiness_receipts
       (company_id, issue_id, issue_revision, terminal_status, evidence, snapshot_hash, actor_type, actor_id, prepared_at, expires_at)
       VALUES (${String(row.company_id)}, ${String(row.id)}, ${Number(row.code_delivery_revision)}, ${status}, ${tx.json(evidence)},
-        ${"a".repeat(64)}, 'user', 'reviewer', clock_timestamp(), clock_timestamp() + interval '30 seconds') RETURNING *`;
+        ${"a".repeat(64)}, 'user', 'reviewer', statement_timestamp(), statement_timestamp() + interval '30 seconds') RETURNING *`;
     return result;
   }
   async function close(tx: Transaction, id: string, status = "done") {

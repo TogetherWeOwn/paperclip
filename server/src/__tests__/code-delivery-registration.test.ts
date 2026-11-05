@@ -44,7 +44,8 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
       title: "Delivery", status: "in_review", createdByUserId: authorUser, assigneeUserId: reviewerUser,
       executionPolicy: { mode: "normal", stages: [stage] }, executionState: { status: "pending", currentStageId: stage.id,
         currentStageIndex: 0, currentStageType: "review", currentParticipant: { type: "user", userId: reviewerUser },
-        returnAssignee: { type: "agent", agentId: agent.id }, completedStageIds: [], changesRequestedCount: 0 } }).returning();
+        returnAssignee: { type: "agent", agentId: agent.id }, completedStageIds: [], changesRequestedCount: 0,
+        lastDecisionId: null, lastDecisionOutcome: null } }).returning();
     return { company, project, primary, workspace, issue, agent };
   }
   async function current(f: Awaited<ReturnType<typeof fixture>>) {

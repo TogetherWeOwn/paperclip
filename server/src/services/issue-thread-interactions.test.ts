@@ -378,7 +378,7 @@ describe("issueThreadInteractionService", () => {
     expect(state.toolActionRequestUpdates).toHaveLength(0);
   });
 
-  it("expires the linked tool action request when a terminal issue closes a confirmation card", async () => {
+  it.each([undefined, true, false])("expires linked tool actions with terminal issue touch %s", async touchIssue => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
     const interactionRow = {
       id: "interaction-tool", companyId: "company-1", issueId: "11111111-1111-4111-8111-111111111111",
@@ -413,9 +413,11 @@ describe("issueThreadInteractionService", () => {
     const expired = await svc.expirePendingInteractionsForTerminalIssue(
       { id: interactionRow.issueId, companyId: "company-1", status: "cancelled" },
       { userId: "local-board" },
+      { touchIssue },
     );
     expect(expired).toHaveLength(1);
     expect(expired[0]?.result).toMatchObject({ version: 1, outcome: "issue_closed" });
+    expect(state.issueTouches).toHaveLength(touchIssue === false ? 0 : 1);
     expect(state.toolActionRequestUpdates).toHaveLength(1);
     expect(state.toolActionRequestUpdates[0]).toMatchObject({ status: "expired", resolvedByUserId: "local-board" });
   });

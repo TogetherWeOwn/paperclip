@@ -5139,6 +5139,7 @@ export function issueThreadInteractionService(
     expirePendingInteractionsForTerminalIssue: async (
       issue: { id: string; companyId: string; status: string },
       actor: InteractionActor = {},
+      options: { touchIssue?: boolean } = {},
     ) => {
       if (!isTerminalIssueStatus(issue.status)) return [];
       const rows = await db
@@ -5221,7 +5222,7 @@ export function issueThreadInteractionService(
         if (updated) expired.push(hydrateInteraction(updated));
       }
       if (expired.length > 0) {
-        await touchIssue(db, issue.id, issue.companyId);
+        if (options.touchIssue !== false) await touchIssue(db, issue.id, issue.companyId);
         await emitResolvedInteractionsTelemetry(db, expired);
       }
       return expired;

@@ -74,11 +74,15 @@ test("subsystem checks use integrated bytes and cannot pass with skipped Postgre
     assert.ok(candidate.run.includes(name));
   }
   assert.match(candidate.run, /result\['numPendingTests'\] == 0/);
-  assert.match(candidate.run, /len\(files\) == 12/);
+  assert.match(candidate.run, /len\(files\) == 13/);
+  assert.match(candidate.run, /server\/src\/services\/issue-thread-interactions\.test\.ts/);
   assert.match(candidate.run, /candidate-db-typecheck pnpm --filter @paperclipai\/db typecheck/);
   assert.match(candidate.run, /candidate-server-typecheck pnpm --filter @paperclipai\/server typecheck/);
   assert.match(candidate.run, /PIPESTATUS/);
   assert.match(candidate.run, /candidate-tests\.json/);
+  assert.match(candidate.run, /checks_failed=0/);
+  assert.match(candidate.run, /candidate-server-typecheck.*\|\| checks_failed=1/);
+  assert.match(candidate.run, /test "\$checks_failed" = 0/);
 });
 
 test("generation is bounded and failures still retain diff and logs", () => {

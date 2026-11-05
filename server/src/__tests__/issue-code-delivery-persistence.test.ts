@@ -103,6 +103,11 @@ describePostgres("common issue-service code-delivery persistence", () => {
     expect(receipt).toMatchObject({ terminalStatus: status, actorType: "user", actorId: "reviewer", evidence: { intent: { kind: "non_code" } } });
     expect(consumption).toMatchObject({ receiptId: receipt!.id, terminalStatus: status,
       issueRevision: receipt!.issueRevision + 1, transactionId: receipt!.transactionId });
+    const [saved] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(saved?.codeDeliveryRevision).toBe(consumption!.issueRevision);
+    expect(updated?.codeDeliveryRevision).toBe(consumption!.issueRevision);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId)))
+      .toMatchObject([{ status: "expired", result: { outcome: "issue_closed" } }]);
     expect(provider.read).not.toHaveBeenCalled();
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]?.status).toBe("running");
   });
