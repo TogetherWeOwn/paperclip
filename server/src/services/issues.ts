@@ -254,6 +254,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { applyIssueCodeDelivery, type IssueCodeDeliveryPreparation } from "./issue-code-delivery.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -11144,7 +11145,7 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: { bindRuntimeSharedWorkspace?: boolean; codeDelivery?: IssueCodeDeliveryPreparation } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -12034,9 +12035,18 @@ export function issueService(db: Db) {
         };
       };
 
+      const guardedUpdate = (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => applyIssueCodeDelivery({
+        transaction: tx,
+        issue: existing,
+        patch,
+        attribution: { agentId: actorAgentId, userId: actorUserId, runId: actorRunId },
+        preparation: options.codeDelivery,
+        postCommitBuffers: [activityPublications, queuedPostCommitActions],
+        mutate: runUpdate,
+      });
       const result = await (dbOrTx === db
-        ? db.transaction(runUpdate)
-        : runUpdate(dbOrTx));
+        ? db.transaction(guardedUpdate)
+        : guardedUpdate(dbOrTx));
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);

@@ -95,11 +95,13 @@ async function adjudication(db: Db, value: DeliverySnapshot, decisions: Delivery
 export function codeDeliveryReadinessService(db: Db) {
   const observe = createCodeDeliveryGitHubReader(db);
   return {
-    prepare: async (companyId: string, issueId: string, effectiveStatus: string, actor: AuthorizationActor): Promise<PreparedCodeDeliveryReadiness | null> => {
+    prepare: async (companyId: string, issueId: string, effectiveStatus: string, actor: AuthorizationActor,
+      expectedIssueRevision?: number): Promise<PreparedCodeDeliveryReadiness | null> => {
       if (!terminal(effectiveStatus)) return null;
       deliveryActor(actor);
       const preparedAt = new Date();
       const initial = await snapshot(db, companyId, issueId, actor);
+      if (expectedIssueRevision !== undefined && initial.issue.codeDeliveryRevision !== expectedIssueRevision) throw stale();
       const plan = planDeliveryReadiness(initial);
       const sources = await sourceBindings(db, initial);
       const result = plan.identities.length ? await observe(companyId, plan.identities) : { status: "observed" as const, pullRequests: [] };
@@ -126,7 +128,7 @@ export function codeDeliveryReadinessService(db: Db) {
       if (Date.now() >= proof.expiresAt.getTime()) throw stale();
       return transaction.transaction(async savepoint => {
         const tx = savepoint as unknown as Db;
-        const locked = await lockDeliveryIssues(tx, actor, companyId, proof.lockIds);
+        const locked = await lockDeliveryIssues(tx, actor, companyId, proof.lockIds, true);
         const current = await snapshot(tx, companyId, issueId, actor);
         const sources = await sourceBindings(tx, current, true);
         if (deliveryFingerprint({ snapshot: current, sources }) !== proof.snapshotHash) throw stale();
@@ -158,6 +160,14 @@ export function codeDeliveryReadinessService(db: Db) {
           details: { receiptId: receipt.id, terminalStatus: effectiveStatus, issueRevision: current.issue.codeDeliveryRevision,
             terminalRevision: consumption.issueRevision } });
         return { receipt, result };
+      }).catch((error: unknown) => {
+        let current = error;
+        for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+          const value = current as { code?: unknown; cause?: unknown };
+          if (value.code === "55P03" || value.code === "40P01") throw stale();
+          current = value.cause;
+        }
+        throw error;
       });
     },
   };

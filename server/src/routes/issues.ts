@@ -331,6 +331,7 @@ import {
   projectReadSqlCondition,
 } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { assertIssueMutationDoesNotTerminalize } from "../services/issue-code-delivery.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { ensurePersonalPrivateProject } from "../services/projects.js";
@@ -14132,6 +14133,24 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      if (updateFields.status === "done" || updateFields.status === "cancelled") {
+        const previousPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+        const policy = req.body.executionPolicy === undefined ? previousPolicy : applyActorMonitorScheduledBy(
+          normalizeIssueExecutionPolicy(req.body.executionPolicy), actor.actorType,
+        );
+        assertIssueMutationDoesNotTerminalize({
+          issue: existing,
+          policy,
+          previousPolicy,
+          requestedStatus: updateFields.status,
+          requestedAssigneePatch: { assigneeAgentId: normalizedAssigneeAgentId, assigneeUserId: req.body.assigneeUserId },
+          actor: { agentId: actor.agentId ?? null, userId: actor.actorType === "user" ? actor.actorId : null },
+          allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+          commentBody,
+          reviewRequest,
+          monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && !monitorPoliciesEqual(previousPolicy, policy),
+        });
+      }
     if (req.body.visibility === "private" && !existing.projectId && updateFields.projectId === undefined) {
       const responsibleUserId = existing.responsibleUserId ?? (req.actor.type === "board"
         ? req.actor.userId ?? null

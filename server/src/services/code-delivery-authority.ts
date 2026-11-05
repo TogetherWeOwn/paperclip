@@ -38,7 +38,7 @@ export async function readDeliveryIssue(db: Db, companyId: string, issueId: stri
   return issue;
 }
 
-export async function lockDeliveryIssues(tx: Db, actor: AuthorizationActor, companyId: string, issueIds: string[]) {
+export async function lockDeliveryIssues(tx: Db, actor: AuthorizationActor, companyId: string, issueIds: string[], noWait = false) {
   const principal = deliveryActor(actor);
   if (actor.type === "agent" && actor.companyId !== companyId) throw notFound("Task not found");
   let sourceIssueId: string | null = null;
@@ -52,7 +52,7 @@ export async function lockDeliveryIssues(tx: Db, actor: AuthorizationActor, comp
   }
   const ids = [...new Set([...issueIds, ...(sourceIssueId ? [sourceIssueId] : [])])].sort();
   const rows = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, ids)))
-    .orderBy(issues.id).for("update");
+    .orderBy(issues.id).for("update", { noWait });
   if (ids.some(id => !rows.some(row => row.id === id))) throw notFound("Task not found");
   if (principal.type === "agent") {
     const run = await assertAgentRunWriteAllowed(tx, companyId, { agentId: principal.id, runId: principal.runId });

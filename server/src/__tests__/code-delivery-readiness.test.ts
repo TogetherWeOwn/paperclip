@@ -162,6 +162,25 @@ describe("prepared code-delivery readiness boundary", () => {
     expect(boundaries.lock).not.toHaveBeenCalled();
     expect(f.issue).toEqual(before);
   });
+  it("refuses an already-stale effective transition before provider reads", async () => {
+    const f = harness(), before = structuredClone(f.issue);
+    await expect(f.service.prepare("company", "issue", "done", actor, 3))
+      .rejects.toMatchObject({ status: 409, details: { code: "code_delivery_revision_conflict" } });
+    expect(boundaries.read).not.toHaveBeenCalled();
+    expect(boundaries.lock).not.toHaveBeenCalled();
+    expect(f.writes).toEqual([]);
+    expect(f.issue).toEqual(before);
+  });
+  it.each(["55P03", "40P01"])("returns a typed conflict after savepoint rollback on %s", async code => {
+    const f = harness(), before = structuredClone(f.issue), token = await f.service.prepare("company", "issue", "done", actor);
+    boundaries.lock.mockRejectedValue({ cause: { code } });
+    await expect(f.apply(token)).rejects.toMatchObject({ status: 409, details: { code: "code_delivery_revision_conflict" } });
+    expect(boundaries.lock).toHaveBeenCalledWith(f.db, actor, "company", ["issue"], true);
+    expect(f.issue).toEqual(before);
+    expect(f.mutate).not.toHaveBeenCalled();
+    expect(f.writes).toEqual([]);
+    await expect(f.apply(token)).rejects.toMatchObject({ details: { reason: "preparation_required" } });
+  });
   it("expires preparation rather than refreshing cached observations inside the transaction", async () => {
     vi.useFakeTimers();
     const f = harness(), token = await f.service.prepare("company", "issue", "done", actor);
