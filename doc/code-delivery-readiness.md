@@ -73,11 +73,15 @@ consent without borrowing ambient human credentials. Direct SQL writers, termina
 creation/import, lifecycle deletion/export, supersession and all-writer/race
 acceptance remain incomplete.
 
-Receipt/consumption schema sources and SQL guard fragments are **not included in
-a generated executable migration yet**. Existing migrations therefore do not
-activate the database terminal backstop. Do not install this candidate or claim
-universal terminal prevention from common-service integration alone. Generate
-snapshots through the supported database generator; never hand-edit snapshots.
+Migration `0434_brainy_franklin_richards.sql` includes the generated receipt and
+consumption tables plus the terminal guard, immutable history and deferred
+settlement checks. Its schema snapshot and journal came from the supported
+Actions generator; only SQL received custom trigger definitions. Applying the
+migration would activate a fail-closed database backstop, including for terminal
+creation/import and direct SQL updates. No running instance has applied it.
+Writer preparation, durable effects and full acceptance remain incomplete: do
+not install this candidate or claim universal usable completion from the SQL
+backstop alone.
 
 ## Verification limits
 
@@ -126,7 +130,16 @@ The job calls the supported `pnpm db:generate` command without a database URL.
 It uploads complete generation diff data, new/changed SQL and snapshots,
 journal/pruning changes, commands, exit codes, hook inventories, full failure
 logs and SHA-256 checksums. Changes outside migration source fail the result.
-It never applies migrations, commits, pushes, publishes or deploys.
+Generation never applies migrations, commits, pushes, publishes or deploys.
+After generation, the subsystem-check step requires an unchanged migration tree
+and the integrated terminal guard before building the existing SDK test
+prerequisites and running the twelve selected delivery/provider suites. It
+retains the complete test JSON and fails if any test is skipped, pending or todo,
+if an expected suite is missing, or if any assertion fails. Database/server
+focused typechecks and module boundaries follow successful tests. Commands,
+exit codes and complete logs survive failure. PostgreSQL tests use disposable
+runner-local databases, never an installed runtime database. These targeted
+checks are not the full repository or native API/all-writer acceptance suite.
 
 The author must inspect generation artifacts as data and integrate only reviewed
 migration changes, including the separate custom guard fragment through the

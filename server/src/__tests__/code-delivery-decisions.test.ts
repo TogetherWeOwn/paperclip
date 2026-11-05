@@ -8,6 +8,7 @@ import type { CodeDeliveryDecisionInput } from "@paperclipai/shared";
 import { codeDeliveryDecisionService } from "../services/code-delivery-decisions.js";
 import type { AuthorizationActor } from "../services/authorization.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { insertTerminalDeliveryFixture } from "./helpers/code-delivery.js";
 
 const provider = vi.hoisted(() => ({ read: vi.fn() }));
 vi.mock("../services/code-delivery-github.js", () => ({ createCodeDeliveryGitHubReader: () => provider.read }));
@@ -202,7 +203,7 @@ const head = "a".repeat(40);
     if (fault === "self") destinationId = f.issue.id;
     if (fault === "missing") destinationId = randomUUID();
     if (fault === "foreign") destinationId = (await fixture()).issue.id;
-    if (fault === "terminal") await db.update(issues).set({ status: "done" }).where(eq(issues.id, dest.id));
+    if (fault === "terminal") await insertTerminalDeliveryFixture(db, dest.id);
     if (fault === "unassigned") await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, dest.id));
     if (fault === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.author.id));
     if (fault === "no_wake") await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.issueId, dest.id));

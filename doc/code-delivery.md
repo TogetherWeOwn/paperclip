@@ -1,9 +1,9 @@
 # Code-delivery persistence
 
-This subsystem is under implementation. The current persistence and authenticated
-GitHub observation layers do **not** enforce terminal task readiness. Do not use
-this intermediate implementation as a completion gate or install it as a finished
-feature. No public registration, adjudication, disposition, transfer, or receipt
+This subsystem is under implementation. Common-service rejection and an
+executable fail-closed SQL backstop are present, but usable terminal writer and
+durable-effect integration remain incomplete. Do not install this intermediate
+implementation as a finished feature. No public registration, adjudication, disposition, transfer, or receipt
 API is implemented yet.
 
 ## Ownership of evidence
@@ -22,8 +22,8 @@ presentation and discovery data, never proof of delivery.
 | `code_delivery_ownership_events` | Append-only ownership provenance. Initial registration and independently adjudicated transfers retain every owner. |
 | `code_delivery_decisions` | Immutable independent classification, head acceptance, no-PR, closed-unmerged, withdrawal, and transfer decisions. These are not terminal readiness receipts. |
 | `code_delivery_authorities` | Explicit company-scoped technical agent for no-stage decisions, configured by an authorized human administrator. No agent name or job title grants this authority. |
-| `code_delivery_readiness_receipts` (schema draft) | Server-prepared terminal evidence bound to one company, task revision, effective terminal status, snapshot hash, transaction and expiry. Its migration is not generated or active yet. |
-| `code_delivery_receipt_consumptions` (schema draft) | Immutable one-to-one consumption of a receipt by the exact next task revision and terminal status in the same transaction. Only the terminal-update trigger creates consumption. Not installed yet. |
+| `code_delivery_readiness_receipts` | Server-prepared terminal evidence bound to one company, task revision, effective terminal status, snapshot hash, transaction and expiry. Defined in executable migration `0434`; not installed in a running instance. |
+| `code_delivery_receipt_consumptions` | Immutable one-to-one consumption of a receipt by the exact next task revision and terminal status in the same transaction. Only the terminal-update trigger creates consumption. Not installed yet. |
 | `issues.code_delivery_revision` | Server-owned monotonic invalidation version. Every task update and supported delivery-association mutation advances it, including A-to-B-to-A policy changes. It grants no authority. |
 
 The database enforces company/task/project/workspace foreign keys and canonical
@@ -163,32 +163,29 @@ merge timestamp, merge SHA, observation time, obligation revision and selected
 decision IDs. Preparation and every observation expire within 30 seconds.
 Validation never refreshes evidence or calls GitHub while holding locks.
 
-`packages/db/src/migration-fragments/code-delivery-terminal-guards.sql` is
-**uninstalled migration source, not an executable journal entry**. After generating
-the receipt/consumption schema migration through the supported route, that
-migration must include this fragment before activation. The fragment authors
-immutable receipt/consumption guards, transaction/revision/deadline validation,
-unprepared terminal-write and terminal-insert rejection, automatic exact-revision
-consumption, and deferred settlement checks. Settlement rejects an unused receipt
-or an outer-transaction change after consumption. A later transaction may update
-terminal bookkeeping, but cannot rewrite a terminal timestamp without a new receipt.
-Only the trigger may insert consumption; its row is not caller-supplied evidence.
+Migration `0434_brainy_franklin_richards.sql` contains the Actions-generated
+receipt/consumption tables and custom immutable history, transaction/revision/
+deadline validation, unprepared terminal-write and terminal-insert rejection,
+automatic exact-revision consumption, and deferred settlement checks. The former
+uninstalled fragment is now part of this executable journal entry, not a separate
+source of truth. Settlement rejects an unused receipt or an outer-transaction
+change after consumption. A later transaction may update terminal bookkeeping,
+but cannot rewrite a terminal timestamp without a new receipt. Only the trigger
+may insert consumption; its row is not caller-supplied evidence.
 
-**This is not yet an active terminal guard.** The generated migration/snapshots
-and every native writer integration remain pending. No existing terminal writer
-calls `apply`. Do not install this checkpoint. The service intentionally requires
-the uninstalled database protocol, rather than falling back to a JSON receipt or
-an unguarded write. Current transfer validation conservatively refuses an
-already-terminal destination; verified completed replacement/owner evidence still
-needs lifecycle integration.
+**This is not an installed or usable end-to-end completion guard.** SQL source
+integration does not complete native writer preparation, durable effects,
+superseded outcomes or lifecycle integration. Do not install this checkpoint.
+Current transfer validation conservatively refuses an already-terminal destination;
+verified completed replacement/owner evidence still needs lifecycle integration.
 
-The policy, preparation/consumption boundary, and new SQL-fragment regression
-sources are authored but not executed at this checkpoint. Server boundary tests
-mock persistence/authorization. The SQL test uses real PostgreSQL with an isolated
-minimal trigger fixture and the actual guard source; it is not generated-schema
-migration acceptance. Neither establishes native review decisions, full API
-rollback or terminal-side-effect preservation. Full database/API/concurrency
-acceptance is still required.
+The SQL regression now uses the complete migrated PostgreSQL schema rather than
+a minimal trigger fixture. Persistence tests also replay the receipt upgrade over
+retained legacy terminal/review rows. Test fixture receipts are explicitly
+synthetic, not live-provider evidence. These authored sources need exact-source
+Actions execution; neither SQL coverage nor mocked service boundaries establish
+native review decisions, full API rollback or terminal-side-effect preservation.
+Full database/API/concurrency acceptance is still required.
 In particular, route-level pre-terminal run cancellation must be moved behind the
 accepted transactional boundary; a denied attempt must not have stopped a run
 before its stale-state conflict is detected. Native and other transaction-owning
@@ -209,13 +206,15 @@ constraints, canonical deduplication, immutable history, revision invalidation,
 late registration, display moves, deletion, and a concurrent close/association
 attempt. It is not full terminal-writer or live-provider acceptance.
 
-The CI verification route must generate the receipt schema migration and include
-the guard fragment, retain the five newest snapshots, and exercise both the full
-schema upgrade and the standalone SQL-fragment fixture. The relevant source tests
-are `packages/db/src/code-delivery-migration.test.ts`,
-`packages/db/src/code-delivery-terminal-guards.test.ts`, and the server
-`code-delivery-readiness` policy/boundary tests. Exact-candidate typecheck and
-full required checks remain necessary; authored regression sources are not results.
+The fork-only Actions route generated the receipt schema, snapshot, journal and
+pruning deletion. The integrated tree retains the five newest snapshots and all
+historical SQL and journal entries. It now requires zero generation drift before
+selected subsystem tests, database/server typechecks and module-boundary checks.
+The relevant sources include `packages/db/src/code-delivery-migration.test.ts`,
+`packages/db/src/code-delivery-terminal-guards.test.ts`, and the server delivery
+policy, preparation, registration, authority and common-mutation tests.
+Exact-candidate full required checks remain necessary; authored regression
+sources and a successful generator are not acceptance results.
 
 No migration has been applied to a running instance by this work. For an
 operational rollback, retain a pre-upgrade database backup and its matching

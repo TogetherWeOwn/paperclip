@@ -1,3 +1,46 @@
+CREATE TABLE "code_delivery_readiness_receipts" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"company_id" uuid NOT NULL,
+	"issue_id" uuid NOT NULL,
+	"issue_revision" bigint NOT NULL,
+	"terminal_status" text NOT NULL,
+	"snapshot_hash" text NOT NULL,
+	"transaction_id" text DEFAULT pg_current_xact_id()::text NOT NULL,
+	"actor_type" text NOT NULL,
+	"actor_id" text NOT NULL,
+	"run_id" uuid,
+	"evidence" jsonb NOT NULL,
+	"prepared_at" timestamp with time zone NOT NULL,
+	"expires_at" timestamp with time zone NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "code_delivery_readiness_receipts_identity_uq" UNIQUE("company_id","issue_id","id"),
+	CONSTRAINT "code_delivery_readiness_receipts_revision_uq" UNIQUE("company_id","issue_id","issue_revision"),
+	CONSTRAINT "code_delivery_readiness_receipts_status_ck" CHECK ("code_delivery_readiness_receipts"."terminal_status" in ('done', 'cancelled')),
+	CONSTRAINT "code_delivery_readiness_receipts_revision_ck" CHECK ("code_delivery_readiness_receipts"."issue_revision" >= 0),
+	CONSTRAINT "code_delivery_readiness_receipts_snapshot_ck" CHECK ("code_delivery_readiness_receipts"."snapshot_hash" ~ '^[a-f0-9]{64}$' and "code_delivery_readiness_receipts"."transaction_id" ~ '^[0-9]+$'),
+	CONSTRAINT "code_delivery_readiness_receipts_time_ck" CHECK ("code_delivery_readiness_receipts"."expires_at" > "code_delivery_readiness_receipts"."prepared_at" and "code_delivery_readiness_receipts"."expires_at" <= "code_delivery_readiness_receipts"."prepared_at" + interval '30 seconds'),
+	CONSTRAINT "code_delivery_readiness_receipts_actor_ck" CHECK ("code_delivery_readiness_receipts"."actor_type" in ('agent', 'user') and length("code_delivery_readiness_receipts"."actor_id") > 0 and ("code_delivery_readiness_receipts"."actor_type" <> 'agent' or "code_delivery_readiness_receipts"."run_id" is not null))
+);
+--> statement-breakpoint
+CREATE TABLE "code_delivery_receipt_consumptions" (
+	"receipt_id" uuid PRIMARY KEY NOT NULL,
+	"company_id" uuid NOT NULL,
+	"issue_id" uuid NOT NULL,
+	"issue_revision" bigint NOT NULL,
+	"terminal_status" text NOT NULL,
+	"transaction_id" text DEFAULT pg_current_xact_id()::text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "code_delivery_receipt_consumptions_revision_uq" UNIQUE("company_id","issue_id","issue_revision"),
+	CONSTRAINT "code_delivery_receipt_consumptions_status_ck" CHECK ("code_delivery_receipt_consumptions"."terminal_status" in ('done', 'cancelled')),
+	CONSTRAINT "code_delivery_receipt_consumptions_revision_ck" CHECK ("code_delivery_receipt_consumptions"."issue_revision" > 0),
+	CONSTRAINT "code_delivery_receipt_consumptions_transaction_ck" CHECK ("code_delivery_receipt_consumptions"."transaction_id" ~ '^[0-9]+$')
+);
+--> statement-breakpoint
+ALTER TABLE "code_delivery_readiness_receipts" ADD CONSTRAINT "code_delivery_readiness_receipts_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "code_delivery_readiness_receipts" ADD CONSTRAINT "code_delivery_readiness_receipts_company_id_issue_id_issues_company_id_id_fk" FOREIGN KEY ("company_id","issue_id") REFERENCES "public"."issues"("company_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "code_delivery_receipt_consumptions" ADD CONSTRAINT "code_delivery_receipt_consumptions_company_id_issue_id_receipt_id_code_delivery_readiness_receipts_company_id_issue_id_id_fk" FOREIGN KEY ("company_id","issue_id","receipt_id") REFERENCES "public"."code_delivery_readiness_receipts"("company_id","issue_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "code_delivery_readiness_receipts_issue_idx" ON "code_delivery_readiness_receipts" USING btree ("company_id","issue_id");
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_receipt_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   current_revision bigint;
@@ -12,13 +55,17 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_receipt_insert BEFORE INSERT ON code_delivery_readiness_receipts
   FOR EACH ROW EXECUTE FUNCTION code_delivery_receipt_insert();
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_preserve_receipts BEFORE UPDATE OR DELETE ON code_delivery_readiness_receipts
   FOR EACH ROW EXECUTE FUNCTION code_delivery_preserve_history();
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_preserve_consumptions BEFORE UPDATE OR DELETE ON code_delivery_receipt_consumptions
   FOR EACH ROW EXECUTE FUNCTION code_delivery_preserve_history();
 
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_terminal_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   receipt_id uuid;
@@ -52,9 +99,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_terminal_guard BEFORE INSERT OR UPDATE ON issues
   FOR EACH ROW EXECUTE FUNCTION code_delivery_terminal_guard();
 
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_consume_terminal_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
   receipt_id uuid;
@@ -74,9 +123,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_consume_terminal_receipt AFTER UPDATE ON issues
   FOR EACH ROW EXECUTE FUNCTION code_delivery_consume_terminal_receipt();
 
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_validate_consumption() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF pg_trigger_depth() < 2 OR NEW.transaction_id <> pg_current_xact_id()::text OR NOT EXISTS (
@@ -91,9 +142,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER code_delivery_validate_consumption BEFORE INSERT ON code_delivery_receipt_consumptions
   FOR EACH ROW EXECUTE FUNCTION code_delivery_validate_consumption();
 
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_receipt_settled() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NOT EXISTS (
@@ -108,9 +161,11 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE CONSTRAINT TRIGGER code_delivery_receipt_settled AFTER INSERT ON code_delivery_readiness_receipts
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION code_delivery_receipt_settled();
 
+--> statement-breakpoint
 CREATE FUNCTION code_delivery_terminal_settled() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF EXISTS (
@@ -125,5 +180,6 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE CONSTRAINT TRIGGER code_delivery_terminal_settled AFTER UPDATE ON issues
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION code_delivery_terminal_settled();

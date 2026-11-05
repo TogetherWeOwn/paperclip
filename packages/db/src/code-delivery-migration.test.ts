@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const migration = await readFile(new URL("./migrations/0432_dear_jane_foster.sql", import.meta.url), "utf8");
 const decisionMigration = await readFile(new URL("./migrations/0433_last_proudstar.sql", import.meta.url), "utf8");
+const receiptMigration = await readFile(new URL("./migrations/0434_brainy_franklin_richards.sql", import.meta.url), "utf8");
 const support = await getEmbeddedPostgresTestSupport();
 const head = "a".repeat(40);
 
@@ -44,7 +45,13 @@ const head = "a".repeat(40);
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-code-delivery-");
     sql = postgres(database.connectionString, { max: 5, onnotice: () => {} });
-    await sql.unsafe(`DROP TRIGGER code_delivery_transferred_ownership ON code_delivery_obligations;
+    await sql.unsafe(`DROP TRIGGER code_delivery_terminal_guard ON issues;
+      DROP TRIGGER code_delivery_consume_terminal_receipt ON issues;
+      DROP TRIGGER code_delivery_terminal_settled ON issues;
+      DROP TABLE code_delivery_receipt_consumptions, code_delivery_readiness_receipts;
+      DROP FUNCTION code_delivery_receipt_insert(), code_delivery_terminal_guard(), code_delivery_consume_terminal_receipt(),
+        code_delivery_validate_consumption(), code_delivery_receipt_settled(), code_delivery_terminal_settled();
+      DROP TRIGGER code_delivery_transferred_ownership ON code_delivery_obligations;
       DROP TABLE code_delivery_decisions, code_delivery_authorities;
       DROP FUNCTION code_delivery_transferred_ownership(), code_delivery_decision_mutation();
       DROP TRIGGER code_delivery_capture_work_product ON issue_work_products;
@@ -79,6 +86,25 @@ const head = "a".repeat(40);
     expect(new Set(discoveries.map(row => row.snapshot.type))).toEqual(new Set(["pull_request", "branch"]));
     expect(await sql`SELECT * FROM code_delivery_obligations WHERE owner_issue_id = ${legacy.issueId}`).toHaveLength(0);
     expect(Array.from(await sql<Record<string, unknown>[]>`SELECT * FROM issue_work_products WHERE issue_id = ${legacy.issueId} ORDER BY id`)).toEqual(legacyProducts);
+  });
+  it("upgrades receipt enforcement without rewriting legacy terminal or review state", async () => {
+    const before = await issue(legacy);
+    const [review] = await sql`INSERT INTO issues (company_id, title, status, execution_policy, execution_state)
+      VALUES (${legacy.companyId}, 'Pending review', 'in_review', ${sql.json(before.execution_policy)}, ${sql.json(before.execution_state)}) RETURNING *`;
+    const rollback = new Error("rollback isolated upgrade");
+    await expect(sql.begin(async tx => {
+      for (const statement of receiptMigration.split("--> statement-breakpoint").map(value => value.trim()).filter(Boolean)) await tx.unsafe(statement);
+      const [terminal] = await tx`SELECT to_jsonb(i) AS row FROM issues i WHERE id = ${legacy.issueId}`;
+      const [pending] = await tx`SELECT * FROM issues WHERE id = ${review.id}`;
+      expect(terminal.row).toEqual(before);
+      expect(pending).toEqual(review);
+      expect(await tx`SELECT * FROM code_delivery_readiness_receipts`).toHaveLength(0);
+      expect(await tx`SELECT * FROM code_delivery_receipt_consumptions`).toHaveLength(0);
+      await expect(tx.savepoint(nested => nested`UPDATE issues SET status = 'done', completed_at = now() WHERE id = ${review.id}`))
+        .rejects.toMatchObject({ message: "code_delivery_preparation_required" });
+      throw rollback;
+    })).rejects.toBe(rollback);
+    expect(await issue(legacy)).toEqual(before);
   });
   it("allows ordinary task deletion only when no durable code associations need preservation", async () => {
     const nonCode = await fixture();

@@ -1,14 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
 
-const guards = await readFile(new URL("./migration-fragments/code-delivery-terminal-guards.sql", import.meta.url), "utf8");
-const persistence = await readFile(new URL("./migrations/0432_dear_jane_foster.sql", import.meta.url), "utf8");
 const support = await getEmbeddedPostgresTestSupport();
 
-(support.supported ? describe : describe.skip)("terminal receipt SQL guards in an isolated trigger fixture", () => {
+(support.supported ? describe : describe.skip)("terminal receipt guards in the complete migrated schema", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let sql: ReturnType<typeof postgres>;
   type Transaction = postgres.TransactionSql;
@@ -16,8 +13,8 @@ const support = await getEmbeddedPostgresTestSupport();
   const evidence = { version: 1, pullRequests: [{ headSha: "a".repeat(40), mergeCommitSha: "b".repeat(40) }] };
 
   async function fixture() {
-    const [issue] = await sql`INSERT INTO issues (company_id, status, execution_state)
-      VALUES (${companyId}, 'in_review', ${sql.json({ currentStageId: "qa", completedStageIds: ["security"], changesRequestedCount: 1,
+    const [issue] = await sql`INSERT INTO issues (company_id, title, status, execution_state)
+      VALUES (${companyId}, 'Delivery', 'in_review', ${sql.json({ currentStageId: "qa", completedStageIds: ["security"], changesRequestedCount: 1,
         currentParticipant: "reviewer", returnAssignee: "author", monitor: { nextCheckAt: "2099-01-01T00:00:00Z" } })}) RETURNING *`;
     return issue;
   }
@@ -26,8 +23,10 @@ const support = await getEmbeddedPostgresTestSupport();
     return row;
   }
   async function receipt(tx: Transaction, row: Record<string, unknown>, status = "done") {
-    const [result] = await tx`INSERT INTO code_delivery_readiness_receipts (company_id, issue_id, issue_revision, terminal_status, evidence)
-      VALUES (${String(row.company_id)}, ${String(row.id)}, ${Number(row.code_delivery_revision)}, ${status}, ${tx.json(evidence)}) RETURNING *`;
+    const [result] = await tx`INSERT INTO code_delivery_readiness_receipts
+      (company_id, issue_id, issue_revision, terminal_status, evidence, snapshot_hash, actor_type, actor_id, prepared_at, expires_at)
+      VALUES (${String(row.company_id)}, ${String(row.id)}, ${Number(row.code_delivery_revision)}, ${status}, ${tx.json(evidence)},
+        ${"a".repeat(64)}, 'user', 'reviewer', clock_timestamp(), clock_timestamp() + interval '30 seconds') RETURNING *`;
     return result;
   }
   async function close(tx: Transaction, id: string, status = "done") {
@@ -40,33 +39,11 @@ const support = await getEmbeddedPostgresTestSupport();
   }
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-delivery-terminal-guards-");
-    const admin = postgres(database.connectionString, { max: 1, onnotice: () => {} });
-    try { await admin`CREATE SCHEMA delivery_terminal_fixture`; }
-    finally { await admin.end({ timeout: 1 }); }
-    sql = postgres(database.connectionString, { max: 4, onnotice: () => {}, connection: { search_path: "delivery_terminal_fixture,public" } });
-    await sql.unsafe(`CREATE TABLE issues (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(), company_id uuid NOT NULL, status text NOT NULL, title text DEFAULT 'Delivery',
-      code_delivery_revision bigint DEFAULT 0 NOT NULL, execution_state jsonb, completed_at timestamptz, cancelled_at timestamptz,
-      UNIQUE(company_id, id)
-    );
-    CREATE TABLE code_delivery_readiness_receipts (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(), company_id uuid NOT NULL, issue_id uuid NOT NULL, issue_revision bigint NOT NULL,
-      terminal_status text NOT NULL, transaction_id text NOT NULL DEFAULT pg_current_xact_id()::text, evidence jsonb NOT NULL,
-      prepared_at timestamptz NOT NULL DEFAULT clock_timestamp(), expires_at timestamptz NOT NULL DEFAULT clock_timestamp() + interval '30 seconds',
-      UNIQUE(company_id, issue_id, issue_revision), UNIQUE(company_id, issue_id, id), FOREIGN KEY(company_id, issue_id) REFERENCES issues(company_id, id)
-    );
-    CREATE TABLE code_delivery_receipt_consumptions (
-      receipt_id uuid PRIMARY KEY, company_id uuid NOT NULL, issue_id uuid NOT NULL, issue_revision bigint NOT NULL,
-      terminal_status text NOT NULL, transaction_id text NOT NULL DEFAULT pg_current_xact_id()::text, created_at timestamptz DEFAULT now(),
-      UNIQUE(company_id, issue_id, issue_revision),
-      FOREIGN KEY(company_id, issue_id, receipt_id) REFERENCES code_delivery_readiness_receipts(company_id, issue_id, id)
-    );`);
-    for (const statement of persistence.split("--> statement-breakpoint").map(value => value.trim())) {
-      if (/^CREATE (FUNCTION code_delivery_(issue_revision|preserve_history)\(\)|TRIGGER code_delivery_issue_revision\b)/.test(statement)) {
-        await sql.unsafe(statement);
-      }
-    }
-    await sql.unsafe(guards);
+    sql = postgres(database.connectionString, { max: 4, onnotice: () => {} });
+    await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}, 'Delivery guards', 'GUARD')`;
+    const [installed] = await sql`SELECT count(*)::int AS count FROM pg_trigger
+      WHERE tgname IN ('code_delivery_terminal_guard', 'code_delivery_receipt_settled', 'code_delivery_terminal_settled')`;
+    expect(installed.count).toBe(3);
   }, 90_000);
   afterAll(async () => { await sql?.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
 
@@ -78,12 +55,12 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   it.each(["done", "cancelled"])("rejects terminal creation/import as %s", async status => {
     const id = randomUUID();
-    await expect(sql`INSERT INTO issues (id, company_id, status) VALUES (${id}, ${companyId}, ${status})`)
+    await expect(sql`INSERT INTO issues (id, company_id, title, status) VALUES (${id}, ${companyId}, 'Import', ${status})`)
       .rejects.toThrow("code_delivery_terminal_creation_requires_open_task");
     expect(await issue(id)).toBeUndefined();
   });
   it("rejects terminal timestamps on an otherwise nonterminal create or update", async () => {
-    await expect(sql`INSERT INTO issues (company_id, status, completed_at) VALUES (${companyId}, 'in_review', now())`)
+    await expect(sql`INSERT INTO issues (company_id, title, status, completed_at) VALUES (${companyId}, 'Import', 'in_review', now())`)
       .rejects.toThrow("code_delivery_terminal_creation_requires_open_task");
     const before = await fixture();
     await expect(sql`UPDATE issues SET completed_at = now() WHERE id = ${before.id}`)
@@ -114,11 +91,11 @@ const support = await getEmbeddedPostgresTestSupport();
     const before = await fixture();
     await expect(sql.begin(async tx => {
       await tx`INSERT INTO code_delivery_readiness_receipts (company_id, issue_id, issue_revision, terminal_status, evidence,
-        transaction_id, prepared_at, expires_at) VALUES (
+        transaction_id, prepared_at, expires_at, snapshot_hash, actor_type, actor_id) VALUES (
         ${fault === "company" ? randomUUID() : companyId}, ${before.id}, ${fault === "revision" ? 77 : Number(before.code_delivery_revision)},
         'done', '{}', ${fault === "transaction" ? "0" : tx`pg_current_xact_id()::text`},
         ${fault === "future" ? tx`clock_timestamp() + interval '1 hour'` : tx`clock_timestamp()`},
-        ${fault === "expired" ? tx`clock_timestamp() - interval '1 second'` : tx`clock_timestamp() + interval '30 seconds'`})`;
+        ${fault === "expired" ? tx`clock_timestamp() - interval '1 second'` : tx`clock_timestamp() + interval '30 seconds'`}, ${'a'.repeat(64)}, 'user', 'reviewer')`;
     })).rejects.toThrow("code_delivery_invalid_receipt");
     expect(await issue(before.id)).toEqual(before);
     await assertNoReceipt(before.id);
@@ -195,8 +172,9 @@ const support = await getEmbeddedPostgresTestSupport();
   it("rejects expiry at outer commit, not only at observation or statement time", async () => {
     const before = await fixture();
     await expect(sql.begin(async tx => {
-      await tx`INSERT INTO code_delivery_readiness_receipts (company_id, issue_id, issue_revision, terminal_status, evidence, expires_at)
-        VALUES (${companyId}, ${before.id}, ${Number(before.code_delivery_revision)}, 'done', '{}', clock_timestamp() + interval '0.5 seconds')`;
+      await tx`INSERT INTO code_delivery_readiness_receipts (company_id, issue_id, issue_revision, terminal_status, evidence, prepared_at, expires_at, snapshot_hash, actor_type, actor_id)
+        VALUES (${companyId}, ${before.id}, ${Number(before.code_delivery_revision)}, 'done', '{}', clock_timestamp(),
+          clock_timestamp() + interval '0.5 seconds', ${'a'.repeat(64)}, 'user', 'reviewer')`;
       await close(tx, before.id);
       await tx`SELECT pg_sleep(0.6)`;
     })).rejects.toThrow("code_delivery_receipt_not_settled");

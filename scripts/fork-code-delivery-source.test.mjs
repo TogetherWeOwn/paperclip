@@ -63,6 +63,24 @@ test("generation has read-only permissions, pinned actions and no script excepti
   for (const value of Object.values(job.env)) assert.doesNotMatch(String(value), /secrets\./);
 });
 
+test("subsystem checks use integrated bytes and cannot pass with skipped PostgreSQL tests", () => {
+  const candidate = step("Verify the integrated direct-source delivery subsystem");
+  assert.ok(candidate["timeout-minutes"] <= 20);
+  assert.match(candidate.run, /git diff --exit-code HEAD -- packages\/db\/src\/migrations/);
+  assert.match(candidate.run, /git ls-files --others --exclude-standard packages\/db\/src\/migrations/);
+  assert.match(candidate.run, /CREATE FUNCTION code_delivery_terminal_guard/);
+  assert.match(candidate.run, /pnpm exec vitest run --maxWorkers=1 --no-file-parallelism/);
+  for (const name of ["code-delivery-migration.test.ts", "code-delivery-terminal-guards.test.ts", "issue-code-delivery-persistence.test.ts"]) {
+    assert.ok(candidate.run.includes(name));
+  }
+  assert.match(candidate.run, /result\['numPendingTests'\] == 0/);
+  assert.match(candidate.run, /len\(files\) == 12/);
+  assert.match(candidate.run, /candidate-db-typecheck pnpm --filter @paperclipai\/db typecheck/);
+  assert.match(candidate.run, /candidate-server-typecheck pnpm --filter @paperclipai\/server typecheck/);
+  assert.match(candidate.run, /PIPESTATUS/);
+  assert.match(candidate.run, /candidate-tests\.json/);
+});
+
 test("generation is bounded and failures still retain diff and logs", () => {
   assert.ok(job["timeout-minutes"] <= 40);
   const generate = step("Generate migration source without database access");
@@ -75,6 +93,8 @@ test("generation is bounded and failures still retain diff and logs", () => {
     assert.ok(report.run.includes(evidence), `Missing artifact data ${evidence}`);
   }
   assert.match(report.run, /'qualified': False/);
+  assert.match(report.run, /'candidate_outcome': os\.environ\['CANDIDATE_OUTCOME'\]/);
+  assert.match(report.run, /if not result\['subsystem_checks_succeeded'\]/);
   assert.match(report.run, /raise SystemExit\(1\)/);
   const upload = step("Upload generated source and logs even on failure");
   assert.equal(upload.if, "always()");

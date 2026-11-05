@@ -8,6 +8,7 @@ import type { AuthorizationActor } from "../services/authorization.js";
 import { codeDeliveryRegistrationService } from "../services/code-delivery-registration.js";
 import { codeDeliveryDecisionService } from "../services/code-delivery-decisions.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { insertTerminalDeliveryFixture } from "./helpers/code-delivery.js";
 
 const provider = vi.hoisted(() => ({ read: vi.fn() }));
 vi.mock("../services/code-delivery-github.js", () => ({ createCodeDeliveryGitHubReader: () => provider.read }));
@@ -102,7 +103,7 @@ const reviewer: AuthorizationActor = { type: "board", source: "local_implicit", 
   });
   it.each(["terminal", "non_code", "stale", "wrong_workspace", "foreign_workspace", "forged_receipt"])("refuses %s before provider access", async fault => {
     const f = await fixture();
-    if (fault === "terminal") await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issue.id));
+    if (fault === "terminal") await insertTerminalDeliveryFixture(db, f.issue.id);
     if (fault === "non_code") await db.update(issueCodeDeliveryIntents).set({ intent: "non_code", revision: 2 }).where(eq(issueCodeDeliveryIntents.issueId, f.issue.id));
     const request = await input(f);
     if (fault === "stale") request.expectedIssueRevision++;
