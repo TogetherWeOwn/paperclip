@@ -1,0 +1,130 @@
+name: Fork recovery characterization
+run-name: Recovery characterization at ${{ github.sha }}
+
+on:
+  push:
+    branches: [work/e4326d60-303e-4f82-84d2-89cdcbcf038a]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  characterize:
+    if: github.repository == 'TogetherWeOwn/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "true"
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+      EVIDENCE: ${{ runner.temp }}/recovery-characterization
+    steps:
+      - name: Checkout exact push source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: false
+
+      - name: Bind source, comparison baseline and open draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          mkdir -p "$EVIDENCE"
+          python3 -I - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          repo = 'TogetherWeOwn/paperclip'
+          branch = 'work/e4326d60-303e-4f82-84d2-89cdcbcf038a'
+          baseline = '4638e5ea30dc08a9dbd18e9aba50b5a32c0c5e3f'
+          source = os.environ['GITHUB_SHA']
+          assert os.environ['GITHUB_REPOSITORY'] == repo
+          assert os.environ['GITHUB_EVENT_NAME'] == 'push'
+          assert os.environ['GITHUB_REF'] == f'refs/heads/{branch}'
+          assert git('rev-parse', 'HEAD') == source == os.environ['WORKFLOW_SHA']
+          assert git('remote', 'get-url', 'origin') == f'https://github.com/{repo}'
+          assert not git('status', '--porcelain')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', baseline, source], check=True)
+          prs = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/pulls?state=open&head=TogetherWeOwn:{branch}&per_page=100'], timeout=30))
+          assert len(prs) == 1
+          pr = prs[0]
+          assert pr['draft'] and pr['head']['sha'] == source
+          assert pr['head']['repo']['full_name'] == pr['base']['repo']['full_name'] == repo
+          assert pr['base']['ref'] in {'baseline/native-monitor-20261108-4638e5ea30dc', 'contrib/recovery-attribution-4638e5ea30dc'}
+          assert not git('ls-files', '*pnpmfile*')
+          evidence = Path(os.environ['EVIDENCE'])
+          hooks = []
+          for name in git('ls-files', '*package.json').splitlines():
+              data = json.loads(Path(name).read_text())
+              scripts = {k: v for k, v in data.get('scripts', {}).items() if k in {'preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublish', 'prepublishOnly'}}
+              if scripts:
+                  hooks.append({'path': name, 'hooks': scripts, 'execution': 'disabled'})
+          (evidence / 'workspace-hooks.json').write_text(json.dumps(hooks, indent=2) + '\n')
+          data = {'repository': repo, 'source_sha': source, 'source_tree': git('rev-parse', 'HEAD^{tree}'),
+                  'baseline': baseline, 'pr': pr['html_url'], 'pr_base_sha': pr['base']['sha'],
+                  'workflow_sha': os.environ['WORKFLOW_SHA'], 'workflow_ref': os.environ['WORKFLOW_REF'],
+                  'event': 'push', 'run_url': f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                  'lockfile_sha256': hashlib.sha256(Path('pnpm-lock.yaml').read_bytes()).hexdigest(),
+                  'scope': 'Characterization only; not full CI, merge qualification or runtime efficacy'}
+          (evidence / 'provenance.json').write_text(json.dumps(data, indent=2) + '\n')
+          PY
+
+      - name: Setup source-pinned Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Setup source-pinned pnpm without install
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          run_install: false
+          cache: false
+
+      - name: Frozen install without lifecycle scripts
+        run: |
+          { node --version; pnpm --version; } | tee "$EVIDENCE/tool-versions.txt"
+          printf '%s\n' 'pnpm 9.15.4 has no native release-age control. Frozen lock is not age/provenance proof.' 'All lifecycle scripts disabled; no hook-file or build-script exemptions.' > "$EVIDENCE/supply-chain-limits.txt"
+          pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tee "$EVIDENCE/install.log"
+
+      - name: Build existing test prerequisites explicitly
+        run: |
+          node scripts/link-plugin-dev-sdk.mjs
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
+      - name: Run database-backed characterization
+        id: tests
+        run: |
+          pnpm exec vitest run --project @paperclipai/server server/src/__tests__/recovery-neutral-sibling.test.ts --maxWorkers=1 --no-file-parallelism --reporter=default --reporter=json --outputFile.json="$EVIDENCE/tests.json" 2>&1 | tee "$EVIDENCE/tests.log"
+
+      - name: Require both cases to execute, including on assertion failure
+        if: always()
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads((Path(os.environ['EVIDENCE']) / 'tests.json').read_text())
+          assertions = [a for suite in data['testResults'] for a in suite['assertionResults']]
+          assert len(assertions) == 2, assertions
+          assert all(a['status'] in {'passed', 'failed'} for a in assertions), assertions
+          for trigger in ['issue_children_completed', 'issue_commented']:
+              assert sum(trigger in a['fullName'] for a in assertions) == 1
+          print(json.dumps({'executed': len(assertions), 'statuses': [a['status'] for a in assertions]}, indent=2))
+          PY
+
+      - name: Preserve provenance, assertions and failure logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: recovery-characterization-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 14
