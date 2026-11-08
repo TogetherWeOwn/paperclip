@@ -10,8 +10,37 @@ permissions:
   pull-requests: read
 
 jobs:
-  characterize:
+  changes:
     if: github.repository == 'TogetherWeOwn/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full_run: ${{ steps.diff.outputs.full_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: false
+      - name: Compare exact source against the fixed baseline
+        id: diff
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import os, subprocess
+          baseline = '4638e5ea30dc08a9dbd18e9aba50b5a32c0c5e3f'
+          base = subprocess.check_output(['git', 'merge-base', baseline, os.environ['GITHUB_SHA']], text=True).strip()
+          assert base == baseline
+          paths = subprocess.check_output(['git', 'diff', '--name-only', '--no-renames', '-z', base, os.environ['GITHUB_SHA']])
+          # Every changed path selects this bounded diagnostic, including unknown paths.
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"full_run={'true' if paths else 'false'}\n")
+          PY
+
+  characterize:
+    needs: changes
+    if: needs.changes.outputs.full_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     defaults:
