@@ -1,10 +1,10 @@
 import { Readable } from "node:stream";
-import express from "express";
-import request from "supertest";
+import type { issueRecoveryActions } from "@paperclipai/db";
 import { getTableName, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
+import express from "express";
+import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { issueRecoveryActions } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
