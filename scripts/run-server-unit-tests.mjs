@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 
@@ -56,10 +56,7 @@ export async function runServerTests(files) {
   await context.exit();
 }
 
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
-) {
+if (import.meta.main) {
   runServerTests(process.argv.slice(2)).catch((error) => {
     console.error(`[test:server:unit] ${error.message}`);
     process.exitCode = 1;

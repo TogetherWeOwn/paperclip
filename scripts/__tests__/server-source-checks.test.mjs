@@ -73,6 +73,42 @@ test("CLI refuses absent or invalid selection before starting Vitest", () => {
   }
 });
 
+for (const [script, label] of [
+  ["run-server-unit-tests.mjs", "test:server:unit"],
+  ["typecheck-server-changed.mjs", "typecheck:server:changed"],
+]) {
+  test(`${script} rejects absent or invalid selection through a symlink`, (t) => {
+    const fixture = mkdtempSync(path.join(os.tmpdir(), "server-cli-link-"));
+    t.after(() => rmSync(fixture, { recursive: true, force: true }));
+    const link = path.join(fixture, script);
+    symlinkSync(path.join(root, "scripts", script), link);
+    for (const files of [[], ["--watch"], ["server/src/missing.test.ts"]]) {
+      const result = spawnSync(process.execPath, [link, ...files], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.ok(result.stderr.includes(`[${label}]`));
+      assert.doesNotMatch(
+        result.stdout,
+        /RUN|Test Files|Effective project roots/,
+      );
+    }
+  });
+
+  test(`${script} does not run when imported`, () => {
+    const result = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", `await import("./scripts/${script}")`],
+      { cwd: root, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
+  });
+}
+
 test("normal server tests resolve both runner entry points from source", async () => {
   const { default: config } = await import("../../server/vitest.config.ts");
   const sourceConfig = JSON.parse(

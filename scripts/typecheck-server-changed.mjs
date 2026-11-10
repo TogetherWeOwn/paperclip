@@ -2,7 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { selectServerTests } from "./run-server-unit-tests.mjs";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -57,10 +57,7 @@ export function typecheckServerChanged(files) {
   }
 }
 
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
-) {
+if (import.meta.main) {
   try {
     process.exitCode = typecheckServerChanged(process.argv.slice(2));
   } catch (error) {
