@@ -98,6 +98,82 @@ git push origin --delete <old-name>
 
 Every PR must include a **Model Used** section specifying which AI model produced or assisted with the change. Include the provider, exact model ID/version, context window size, and any relevant capability details (e.g., reasoning mode, tool use). If no AI was used, write "None — human-authored". This applies to all contributors — human and AI alike.
 
+### Bounded server checks without a build
+
+Use Node.js 24.11+ and the pinned pnpm 9.15.4 from `packageManager`.
+Run these commands from the repository root. Do not use the production server
+`typecheck` script for a bounded pre-push check: it prepares runner and SDK build
+outputs, including a Rust binary.
+
+Reuse an existing frozen-lockfile install unless the lockfile changes. For a new
+install, first check the one-minute load (`/proc/loadavg`) against `nproc`,
+`MemAvailable` against `MemTotal` in `/proc/meminfo`, and disk use with `df /home`.
+Do not install when load exceeds the CPU count, available memory is below 10%, or
+`/home` is at least 85% full. Use a task-owned scratch directory and disable
+lifecycle scripts:
+
+```sh
+scratch="$(mktemp -d)"
+nice timeout -k 10 300 pnpm install --frozen-lockfile --ignore-scripts --store-dir "$scratch/pnpm-store"
+```
+
+Inventory install scripts and native dependencies before installing. pnpm 9 has no
+native minimum-release-age control; the frozen lockfile pins this install and
+`--ignore-scripts` disables all lifecycle scripts. Do not enable scripts, update
+the lockfile, or build workspace packages to make these checks run. A failed
+frozen install is missing verification, not a passing check.
+
+Run the package/project type-check and covering tests as **separate commands**:
+
+```sh
+nice timeout -k 10 120 pnpm typecheck:server:source
+nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/source-resolution.test.ts
+
+# Select exact covering files for an issue-route or execution-policy change:
+nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts server/src/__tests__/issue-execution-policy.test.ts
+
+# Cover the selection/config tooling itself:
+nice timeout -k 10 300 node --test scripts/__tests__/server-source-checks.test.mjs
+```
+
+`typecheck:server:source` checks `server/tsconfig.source.json`, not individual
+files. It includes all server source and tests (including `src/__tests__`), and
+follows their real source dependency graph. Its development-only paths resolve
+the plugin SDK, runner and eval kernel from source. Most other workspace packages
+already export source. It emits no JavaScript, declarations, or build cache and
+does not run code generation. The runner's generated protocol source and catalog
+manifests are checked in; missing or stale generated files must be repaired through
+their owning generator, not replaced with stubs or partial `dist` trees. The normal
+build configs, package exports and published package behavior are unchanged.
+
+This check can expose existing test type errors that the production config excludes.
+A nonzero result or timeout is not a pass. Report the diagnostics and their source
+SHA; do not exclude failing tests or weaken strictness to hide a baseline problem.
+
+`test:server:unit` uses the normal server test settings plus the same source entry
+points as the compiler. Pass one or more existing repository-relative `.test.ts`
+files under `server/src/`, or `.test.mjs` files under `server/scripts/`. An absent,
+invalid, missing, directory, glob, flag, or symlink selection fails before Vitest
+starts. Selection is exact, not a substring filter. It never defaults to the full
+suite and does not accept Vitest flags. Pick database-free unit files for a local
+check; this entry point does not make integration tests safe to run locally.
+Do not select tests that require a database, browser, Docker, network service,
+runner binary or workspace build output on the shared host.
+
+Before every push, also run the changed-file formatter and linter under separate
+120-second bounds, for example `nice timeout -k 10 120 pnpm exec biome format
+<changed-files>` and `nice timeout -k 10 120 pnpm exec biome lint <changed-files>`.
+Record the input SHA (and dirty diff when applicable), selected files, command,
+elapsed time, exit result, test counts and legitimate skips. Full suites,
+repo-wide type-checks, production builds, browser/integration checks and historical
+mutation verification remain GitHub Actions-only; link the runs at the exact PR
+head. Never substitute these bounded checks for required CI.
+
+After verification, remove only the scratch cache and `node_modules` directories
+you created in your own worktree. Do not remove a pre-existing install or a shared
+cache. These commands create no package `dist`, generated source, or build cache
+that needs cleanup.
+
 ### Tests Must Pass
 
 All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
