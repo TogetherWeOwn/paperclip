@@ -43,6 +43,7 @@ export function selectServerTests(files, root = repoRoot) {
 
 export async function runServerTests(files) {
   const include = selectServerTests(files);
+  console.log("[test:server:unit] Exact selection:", include.join(", "));
   const { startVitest } = await import("vitest/node");
   const context = await startVitest("test", [], {
     root: path.join(repoRoot, "server"),

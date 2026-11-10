@@ -126,8 +126,8 @@ frozen install is missing verification, not a passing check.
 Run the package/project type-check and covering tests as **separate commands**:
 
 ```sh
-nice timeout -k 10 120 pnpm typecheck:server:source
-nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/source-resolution.test.ts
+nice timeout -k 10 120 pnpm typecheck:server:changed server/src/__tests__/source-resolution.test.ts server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
+nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/source-resolution.test.ts server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
 
 # Select exact covering files for an issue-route or execution-policy change:
 nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts server/src/__tests__/issue-execution-policy.test.ts
@@ -136,9 +136,30 @@ nice timeout -k 10 300 pnpm test:server:unit server/src/__tests__/issue-agent-mu
 nice timeout -k 10 300 node --test scripts/__tests__/server-source-checks.test.mjs
 ```
 
-`typecheck:server:source` checks `server/tsconfig.source.json`, not individual
-files. It includes all server source and tests (including `src/__tests__`), and
-follows their real source dependency graph. Its development-only paths resolve
+`typecheck:server:changed` asks the installed compiler to expand the normal
+`server/tsconfig.json` production roots. It unions those roots with the explicit
+TypeScript test selection in a temporary no-emit project extending
+`server/tsconfig.source.json`. It prints every effective root and checks the full
+transitive import graph, including unselected tests reached by imports. It preserves
+strictness, module resolution and the existing library-check policy. All diagnostics
+fail the check; there is no baseline filter or selected-file waiver. The temporary
+project is removed when the command exits normally. After a forced kill, remove only
+this invocation's `server/.typecheck-*` directory, not another running check's files.
+
+Select every applicable changed TypeScript test and the precise covering tests for
+each changed behavior. The example above covers SDK/runner source resolution and
+ownership-route fixture typing. The selector/project negative controls are in
+`scripts/__tests__/server-source-checks.test.mjs`; JavaScript runtime tests do not
+substitute for selected TypeScript tests. The compiler command shares runtime
+selection validation but accepts only `.test.ts`, never `.test.mjs`. Both commands
+reject missing/empty/invalid selections before running a compiler or test runner.
+
+Keep `pnpm typecheck:server:source` as the separate all-server-tests view. It checks
+all `src/__tests__` roots plus production sources and exposes the existing test
+backlog; it is not the bounded affected-test command and its known failing baseline
+is not a pass. It remains a separate diagnostic, not a replacement for any required
+CI gate or authorization for a broad cleanup. Both compiler commands follow the
+real source dependency graph. Their development-only paths resolve
 the plugin SDK, runner and eval kernel from source. Most other workspace packages
 already export source. It emits no JavaScript, declarations, or build cache and
 does not run code generation. The runner's generated protocol source and catalog
@@ -168,6 +189,18 @@ elapsed time, exit result, test counts and legitimate skips. Full suites,
 repo-wide type-checks, production builds, browser/integration checks and historical
 mutation verification remain GitHub Actions-only; link the runs at the exact PR
 head. Never substitute these bounded checks for required CI.
+
+On the fork, `server-source-checks.yml` checks the exact PR head after a fresh
+frozen, ignore-scripts install with no restored store. It checks for workspace
+`dist` before and after these bounded commands. It includes the ownership-route
+acceptance file and the pool-target compatibility file whenever that file exists
+at the tested head. The latter is absent at the initial tooling base; absence is
+reported, never counted as coverage. The negative controls include the historical
+`Boolean(details)` nullable-narrowing expression that caused TS18047, selected and
+transitively imported test errors, a production-root error, and missing source.
+These are mechanism regressions, not a claim that the entire historical revisions
+or the absent pool-target test were checked. Historical-revision verification
+requires separate source-only Actions evidence when feasible.
 
 After verification, remove only the scratch cache and `node_modules` directories
 you created in your own worktree. Do not remove a pre-existing install or a shared
