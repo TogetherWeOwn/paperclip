@@ -2494,14 +2494,13 @@ describe("agent issue mutation checkout ownership", () => {
           sourceIssueStatus: "todo",
         });
 
+      const errorCode = res.body.details?.code;
+      const resolveRecovery =
+        mockIssueRecoveryActionService.resolveActiveForIssue;
       expect.soft(res.status).toBe(409);
-      expect
-        .soft(res.body.details?.code)
-        .toBe("chat_recovery_requires_authorized_context");
+      expect.soft(errorCode).toBe("chat_recovery_requires_authorized_context");
       expect.soft(mockIssueService.update).not.toHaveBeenCalled();
-      expect
-        .soft(mockIssueRecoveryActionService.resolveActiveForIssue)
-        .not.toHaveBeenCalled();
+      expect.soft(resolveRecovery).not.toHaveBeenCalled();
       expect.soft(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
       expect.soft(mockLogActivity).not.toHaveBeenCalled();
       // This is a route-boundary test, not a fake SQL engine: inspect the
