@@ -11,6 +11,15 @@ export default defineConfig({
           new URL("../packages/paperclip-runner/src/index.ts", import.meta.url),
         ),
       },
+      {
+        find: /^@paperclipai\/paperclip-runner\/live$/,
+        replacement: fileURLToPath(
+          new URL(
+            "../packages/paperclip-runner/src/live/index.ts",
+            import.meta.url,
+          ),
+        ),
+      },
     ],
   },
   test: {

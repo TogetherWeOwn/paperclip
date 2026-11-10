@@ -8,7 +8,7 @@ const sourceConfig = JSON.parse(
 ) as { compilerOptions: { paths: Record<string, [string]> } };
 
 // Use the same development-only entry points as the compiler. Production
-// package exports and the normal server test/build configuration stay unchanged.
+// package exports and the production build configuration stay unchanged.
 export default mergeConfig(
   serverConfig,
   defineConfig({

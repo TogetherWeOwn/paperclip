@@ -73,6 +73,27 @@ test("CLI refuses absent or invalid selection before starting Vitest", () => {
   }
 });
 
+test("normal server tests resolve both runner entry points from source", async () => {
+  const { default: config } = await import("../../server/vitest.config.ts");
+  const sourceConfig = JSON.parse(
+    readFileSync(
+      new URL("../../server/tsconfig.source.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  for (const name of [
+    "@paperclipai/paperclip-runner",
+    "@paperclipai/paperclip-runner/live",
+  ]) {
+    const alias = config.resolve.alias.find(({ find }) => find.test(name));
+    assert.equal(
+      alias?.replacement,
+      path.resolve(root, "server", sourceConfig.compilerOptions.paths[name][0]),
+      `${name} must also load in the normal server suite`,
+    );
+  }
+});
+
 test("source project checks all server tests without changing the build config", () => {
   const result = spawnSync(
     path.join(root, "node_modules/.bin/tsc"),

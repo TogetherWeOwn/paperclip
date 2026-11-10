@@ -167,6 +167,11 @@ manifests are checked in; missing or stale generated files must be repaired thro
 their owning generator, not replaced with stubs or partial `dist` trees. The normal
 build configs, package exports and published package behavior are unchanged.
 
+The normal server test resolver maps both the runner root and its `live` subpath
+from source. This keeps the resolution regression runnable in the normal suite.
+The SDK source aliases remain specific to the bounded source configuration; the
+normal suite still uses its existing SDK preparation.
+
 This check can expose existing test type errors that the production config excludes.
 A nonzero result or timeout is not a pass. Report the diagnostics and their source
 SHA; do not exclude failing tests or weaken strictness to hide a baseline problem.
