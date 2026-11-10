@@ -1,0 +1,55 @@
+name: Server source checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    if: github.repository == 'TogetherWeOwn/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+          cache: false
+      - name: Install from the frozen lockfile without scripts or a restored store
+        run: timeout -k 10 300 pnpm install --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/pnpm-store"
+      - name: Verify no workspace build output exists
+        run: |
+          git rev-parse HEAD
+          test -z "$(find server packages -type d -name node_modules -prune -o -type d -name dist -print)"
+      - name: Type-check the production project and explicit acceptance tests
+        shell: bash
+        run: |
+          files=(server/src/__tests__/source-resolution.test.ts server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts)
+          pool=server/src/__tests__/heartbeat-pool-target-compatibility.test.ts
+          if test -f "$pool"; then
+            files+=("$pool")
+          else
+            printf '%s is absent at this head; no pool-target coverage is claimed.\n' "$pool"
+          fi
+          timeout -k 10 120 pnpm typecheck:server:changed "${files[@]}"
+      - name: Cover selector, project graph and strict negative controls
+        run: timeout -k 10 300 node --test scripts/__tests__/server-source-checks.test.mjs
+      - name: Run exact database-free covering files
+        run: timeout -k 10 300 pnpm test:server:unit server/src/__tests__/source-resolution.test.ts server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts
+      - name: Verify source-only checks left no workspace build output
+        run: test -z "$(find server packages -type d -name node_modules -prune -o -type d -name dist -print)"
+      - name: Remove the job-owned dependency store
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/pnpm-store"

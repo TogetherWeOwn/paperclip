@@ -1,0 +1,34 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "allowImportingTsExtensions": true,
+    "rootDir": "..",
+    "paths": {
+      "@paperclipai/plugin-sdk": ["../packages/plugins/sdk/src/index.ts"],
+      "@paperclipai/plugin-sdk/testing": [
+        "../packages/plugins/sdk/src/testing.ts"
+      ],
+      "@paperclipai/plugin-sdk/ui": ["../packages/plugins/sdk/src/ui/index.ts"],
+      "@paperclipai/plugin-sdk/ui/hooks": [
+        "../packages/plugins/sdk/src/ui/hooks.ts"
+      ],
+      "@paperclipai/paperclip-runner": [
+        "../packages/paperclip-runner/src/index.ts"
+      ],
+      "@paperclipai/paperclip-runner/testing": [
+        "../packages/paperclip-runner/src/testing.ts"
+      ],
+      "@paperclipai/paperclip-runner/live": [
+        "../packages/paperclip-runner/src/live/index.ts"
+      ],
+      "@paperclipai/paperclip-eval-kernel": [
+        "../packages/paperclip-eval-kernel/src/index.ts"
+      ]
+    }
+  },
+  "include": ["src"],
+  "exclude": []
+}
