@@ -1,7 +1,9 @@
 name: Per-case evidence
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - ci/per-case-evidence-pr18005
 
 permissions:
   contents: read
@@ -38,7 +40,9 @@ jobs:
           echo "tree $(git rev-parse HEAD^{tree})" >> evidence-meta.txt
           echo "scope server-5-of-12+server-9-of-12 four-files" >> evidence-meta.txt
           echo "cache none-direct-vitest-no-turbo" >> evidence-meta.txt
-          sha256sum pnpm-lock.yaml >> evidence-meta.txt
+          echo "ref $GITHUB_REF branch ${GITHUB_REF#refs/heads/}" >> evidence-meta.txt
+          echo "event $GITHUB_EVENT_NAME" >> evidence-meta.txt
+          sha256sum pnpm-lock.yaml .github/workflows/per-case-evidence.yml server/src/__tests__/per-case-probe-setup.mjs scripts/ci/vitest.per-case.config.ts >> evidence-meta.txt
           cat evidence-meta.txt
       - name: Run spool per-case suite with JSON reporter and probes
         env:
@@ -47,11 +51,11 @@ jobs:
           pnpm run preflight:workspace-links
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           pnpm exec vitest run \
-            server/src/services/usage-receipts-read.test.ts \
-            server/src/services/run-cost-accounting.test.ts \
-            server/src/services/native-runtime/runner-bridge-tools.test.ts \
-            server/src/services/attention-retention-work.test.ts \
-            --setupFiles=./scripts/ci/per-case-probe-setup.mjs \
+            --config scripts/ci/vitest.per-case.config.ts \
+            src/services/usage-receipts-read.test.ts \
+            src/services/run-cost-accounting.test.ts \
+            src/services/native-runtime/runner-bridge-tools.test.ts \
+            src/__tests__/attention-retention-work.test.ts \
             --reporter=json --outputFile=vitest-per-case.json
       - name: Upload per-case evidence
         if: always()
@@ -59,7 +63,8 @@ jobs:
         with:
           name: vitest-per-case-${{ github.run_attempt }}
           path: |
-            vitest-per-case.json
+            server/vitest-per-case.json
             probe.json
             evidence-meta.txt
+          if-no-files-found: error
           retention-days: 30
