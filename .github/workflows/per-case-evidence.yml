@@ -1,0 +1,65 @@
+name: Per-case evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  per-case:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Record toolchain and head
+        run: |
+          echo "node $(node --version)" > evidence-meta.txt
+          echo "pnpm $(pnpm --version)" >> evidence-meta.txt
+          echo "vitest $(pnpm exec vitest --version)" >> evidence-meta.txt
+          echo "head $(git rev-parse HEAD)" >> evidence-meta.txt
+          echo "parents $(git log -1 --format=%P)" >> evidence-meta.txt
+          echo "tree $(git rev-parse HEAD^{tree})" >> evidence-meta.txt
+          echo "scope server-5-of-12+server-9-of-12 four-files" >> evidence-meta.txt
+          echo "cache none-direct-vitest-no-turbo" >> evidence-meta.txt
+          sha256sum pnpm-lock.yaml >> evidence-meta.txt
+          cat evidence-meta.txt
+      - name: Run spool per-case suite with JSON reporter and probes
+        env:
+          PER_CASE_PROBE_OUT: probe.json
+        run: |
+          pnpm run preflight:workspace-links
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          pnpm exec vitest run \
+            server/src/services/usage-receipts-read.test.ts \
+            server/src/services/run-cost-accounting.test.ts \
+            server/src/services/native-runtime/runner-bridge-tools.test.ts \
+            server/src/services/attention-retention-work.test.ts \
+            --setupFiles=./scripts/ci/per-case-probe-setup.mjs \
+            --reporter=json --outputFile=vitest-per-case.json
+      - name: Upload per-case evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vitest-per-case-${{ github.run_attempt }}
+          path: |
+            vitest-per-case.json
+            probe.json
+            evidence-meta.txt
+          retention-days: 30
