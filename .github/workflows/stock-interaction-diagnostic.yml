@@ -14,6 +14,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+      - name: Test failure diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import textwrap
+
+          workflow = pathlib.Path('.github/workflows/stock-interaction-diagnostic.yml').read_text()
+          script = workflow.split('      - name: Exercise stock board-origin interaction\n', 1)[1]
+          script = script.split('        run: |\n', 1)[1].split('      - name: Upload diagnostic evidence\n', 1)[0]
+          setup = textwrap.dedent(script).split('trap capture_failure EXIT\n', 1)[0] + 'trap capture_failure EXIT\n'
+          cases = [
+              ('setup', None, '', 'not_started', 'unclassified', 17),
+              ('startup', 'EADDRINUSE', 'server_pid=99999999', 'exited', 'address_in_use', 18),
+              ('fixture', 'ECONNREFUSED', 'sleep 60 & server_pid=$!', 'alive', 'connection_refused', 19),
+              ('fixture', 'unknown', 'server_pid=99999999', 'exited', 'unclassified', 20),
+              ('startup', 'EADDRINUSE ECONNREFUSED', 'server_pid=99999999', 'exited', 'address_in_use', 21),
+          ]
+          for stage, log, process, state, category, code in cases:
+              with tempfile.TemporaryDirectory() as tmp:
+                  commands = [f'stage={stage}', process]
+                  if log is not None:
+                      commands.append(f"printf '%s\\n' 'private-canary {log}' > \"$start_log\"")
+                  commands.append(f'exit {code}')
+                  result = subprocess.run(['bash', '-c', setup + '\n'.join(commands)],
+                                          env={**os.environ, 'RUNNER_TEMP': tmp}, capture_output=True, text=True)
+                  evidence = pathlib.Path(tmp, 'interaction-evidence', 'failure-diagnostic.txt').read_text()
+                  expected = f'stage={stage}\nexit_code={code}\nserver_process={state}\nlog_category={category}\n'
+                  assert result.returncode == code, (stage, result.returncode)
+                  assert evidence == expected, (stage, evidence)
+                  assert 'private-canary' not in evidence + result.stdout + result.stderr
+          print('Failure diagnostic cases passed')
+          PY
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -24,6 +61,35 @@ jobs:
           evidence="$RUNNER_TEMP/interaction-evidence"
           data="$RUNNER_TEMP/paperclip-stock"
           mkdir -p "$evidence"
+          start_log="$RUNNER_TEMP/paperclip-start.log"
+          stage=setup
+          server_pid=
+          capture_failure() {
+            result=$?
+            if (( result != 0 )); then
+              {
+                printf 'stage=%s\nexit_code=%s\n' "$stage" "$result"
+                if [[ -z "$server_pid" ]]; then
+                  printf '%s\n' 'server_process=not_started'
+                elif kill -0 "$server_pid" 2>/dev/null; then
+                  printf '%s\n' 'server_process=alive'
+                else
+                  printf '%s\n' 'server_process=exited'
+                fi
+                # Never copy log lines: they may contain generated credentials or errors.
+                if [[ -f "$start_log" ]] && grep -Fq 'EADDRINUSE' "$start_log"; then
+                  printf '%s\n' 'log_category=address_in_use'
+                elif [[ -f "$start_log" ]] && grep -Fq 'ECONNREFUSED' "$start_log"; then
+                  printf '%s\n' 'log_category=connection_refused'
+                else
+                  printf '%s\n' 'log_category=unclassified'
+                fi
+              } > "$evidence/failure-diagnostic.txt"
+            fi
+            if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi
+            return "$result"
+          }
+          trap capture_failure EXIT
           cli=(npx --yes paperclipai@2026.1106.0)
           "${cli[@]}" --version | tee "$evidence/version.txt"
           printf '%s\n' 'Release source: d69631b01b9c658f80bf8bed389863dce82643e1' \
@@ -31,15 +97,16 @@ jobs:
             'No plugins, skills, host scripts, direct database writes or provider credentials.' \
             'A wake after the interaction is temporal association, not direct correlation.' \
             'Missing, coalesced, truncated or ambiguous evidence is inconclusive.' > "$evidence/scope.txt"
-          "${cli[@]}" onboard --yes --data-dir "$data" --no-install-service > "$RUNNER_TEMP/paperclip-start.log" 2>&1 &
+          stage=startup
+          "${cli[@]}" onboard --yes --data-dir "$data" --no-install-service > "$start_log" 2>&1 &
           server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           for attempt in {1..90}; do
             if curl --fail --silent http://127.0.0.1:3100/api/health > "$evidence/health.json"; then break; fi
             if ! kill -0 "$server_pid" 2>/dev/null; then printf '%s\n' 'Stock startup exited before health check.'; exit 1; fi
             sleep 2
           done
           test -s "$evidence/health.json"
+          stage=fixture
           "${cli[@]}" company create --payload-json '{"name":"Disposable diagnostic"}' --json > "$evidence/company.json"
           company=$(jq -er '.id' "$evidence/company.json")
           "${cli[@]}" agent create --company-id "$company" --payload-json '{"name":"Assignee","adapterType":"process","adapterConfig":{"command":"/usr/bin/true"}}' --json > "$evidence/assignee.json"
