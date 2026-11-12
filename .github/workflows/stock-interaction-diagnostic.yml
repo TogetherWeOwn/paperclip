@@ -1,0 +1,74 @@
+name: Stock interaction diagnostic
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/stock-interaction-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Exercise stock board-origin interaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/interaction-evidence"
+          data="$RUNNER_TEMP/paperclip-stock"
+          mkdir -p "$evidence"
+          cli=(npx --yes paperclipai@2026.1106.0)
+          "${cli[@]}" --version | tee "$evidence/version.txt"
+          printf '%s\n' 'Release source: d69631b01b9c658f80bf8bed389863dce82643e1' \
+            'Actor: local-trusted board. Adapter: process /usr/bin/true, not a model provider.' \
+            'No plugins, skills, host scripts, direct database writes or provider credentials.' \
+            'A wake after the interaction is temporal association, not direct correlation.' \
+            'Missing, coalesced, truncated or ambiguous evidence is inconclusive.' > "$evidence/scope.txt"
+          "${cli[@]}" onboard --yes --data-dir "$data" --no-install-service > "$RUNNER_TEMP/paperclip-start.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..90}; do
+            if curl --fail --silent http://127.0.0.1:3100/api/health > "$evidence/health.json"; then break; fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then printf '%s\n' 'Stock startup exited before health check.'; exit 1; fi
+            sleep 2
+          done
+          test -s "$evidence/health.json"
+          "${cli[@]}" company create --payload-json '{"name":"Disposable diagnostic"}' --json > "$evidence/company.json"
+          company=$(jq -er '.id' "$evidence/company.json")
+          "${cli[@]}" agent create --company-id "$company" --payload-json '{"name":"Assignee","adapterType":"process","adapterConfig":{"command":"/usr/bin/true"}}' --json > "$evidence/assignee.json"
+          "${cli[@]}" agent create --company-id "$company" --payload-json '{"name":"Addressee","adapterType":"process","adapterConfig":{"command":"/usr/bin/true"}}' --json > "$evidence/addressee.json"
+          assignee=$(jq -er '.id' "$evidence/assignee.json")
+          addressee=$(jq -er '.id' "$evidence/addressee.json")
+          test "$assignee" != "$addressee"
+          "${cli[@]}" issue create --company-id "$company" --title 'Disposable interaction diagnostic' --assignee-agent-id "$assignee" --standalone --json > "$evidence/issue.json"
+          issue=$(jq -er '.id' "$evidence/issue.json")
+          curl --fail --silent --show-error "http://127.0.0.1:3100/api/issues/$issue/diagnostics/wakes" > "$evidence/baseline.json"
+          payload=$(jq -nc --arg agent "$addressee" '{kind:"request_confirmation",addresseeAgentId:$agent,payload:{version:1,prompt:"Diagnostic confirmation"}}')
+          "${cli[@]}" issue interaction:create "$issue" --payload-json "$payload" --json > "$evidence/interaction.json"
+          for attempt in {1..10}; do
+            sleep 3
+            curl --fail --silent --show-error "http://127.0.0.1:3100/api/issues/$issue/diagnostics/wakes" > "$evidence/post-$attempt.json"
+          done
+          "${cli[@]}" issue interactions "$issue" --json > "$evidence/interactions-final.json"
+          "${cli[@]}" issue runs "$issue" --json > "$evidence/issue-runs.json"
+          jq -r '.. | objects | .runId? // empty' "$evidence/post-"*.json | sort -u | while IFS= read -r run_id; do
+            if [[ "$run_id" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+              curl --fail --silent --show-error "http://127.0.0.1:3100/api/heartbeat-runs/$run_id" > "$evidence/run-$run_id.json" || rm -f "$evidence/run-$run_id.json"
+            fi
+          done
+          printf '%s\n' 'Snapshots captured. Inspect the baseline, final interaction, truncation, coalescing and any linked run before drawing conclusions.'
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-interaction-diagnostic
+          path: ${{ runner.temp }}/interaction-evidence/
+          if-no-files-found: warn
+          retention-days: 7
