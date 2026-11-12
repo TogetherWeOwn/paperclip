@@ -94,7 +94,10 @@ jobs:
           "${cli[@]}" --version | tee "$evidence/version.txt"
           printf '%s\n' 'Release source: d69631b01b9c658f80bf8bed389863dce82643e1' \
             'Actor: local-trusted board. Adapter: process /usr/bin/true, not a model provider.' \
-            'No plugins, skills, host scripts, direct database writes or provider credentials.' \
+            'No custom plugins or skills, host scripts, direct database writes or provider credentials were added.' \
+            'Stock skills may be materialized; skill use is not established and strict no-skills qualification is not proven.' \
+            'Board-origin synthetic process evidence does not establish agent-origin or model-provider behavior.' \
+            'CI telemetry suppression is source-based, not verified by network measurement.' \
             'A wake after the interaction is temporal association, not direct correlation.' \
             'Missing, coalesced, truncated or ambiguous evidence is inconclusive.' > "$evidence/scope.txt"
           stage=startup
