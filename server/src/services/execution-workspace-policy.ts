@@ -8,7 +8,32 @@ import type {
 } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
-export type ParsedExecutionWorkspaceMode = Exclude<ExecutionWorkspaceMode, "inherit" | "reuse_existing">;
+export type ParsedExecutionWorkspaceMode = Exclude<ExecutionWorkspaceMode, "inherit" | "reuse_existing"> | "no_code";
+
+// No-code is a task-local opt-in, not a project default or an alias for agent_default.
+// Validate the effective row on writes and again at dispatch (including legacy rows).
+export function noCodeWorkspaceSelectionConflict(input: {
+  executionWorkspaceSettings?: unknown;
+  projectWorkspaceId?: string | null;
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  assigneeAdapterOverrides?: unknown;
+}): string | null {
+  const settings = parseObject(input.executionWorkspaceSettings);
+  if (settings.mode !== "no_code") return null;
+  const overrides = parseObject(input.assigneeAdapterOverrides);
+  const adapterConfig = parseObject(overrides.adapterConfig);
+  if (
+    input.projectWorkspaceId || input.executionWorkspaceId ||
+    (input.executionWorkspacePreference && input.executionWorkspacePreference !== "inherit") ||
+    settings.workspaceStrategy || settings.workspaceRuntime ||
+    overrides.useProjectWorkspace === true ||
+    adapterConfig.cwd || adapterConfig.workspaceStrategy || adapterConfig.workspaceRuntime
+  ) {
+    return "No-code workspace selection conflicts with an explicit code workspace choice. Remove the conflicting choice explicitly before selecting no_code; existing workspaces are never detached automatically.";
+  }
+  return null;
+}
 
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE = "workspace_worktree_requires_project";
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
@@ -63,7 +88,7 @@ export function resolveEffectiveWorkspaceStrategyType(
   }
   // Default mirrors workspace-runtime.ts realizeExecutionWorkspace: missing type -> "project_primary".
   // agent_default is a metadata-only mode that never creates a worktree, so it keeps "adapter_managed".
-  return mode === "agent_default" ? "adapter_managed" : "project_primary";
+  return (mode === "agent_default" || mode === "no_code") ? "adapter_managed" : "project_primary";
 }
 
 export function resolvePinnedIssueWorkspaceStrategyType(input: {
@@ -81,7 +106,7 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
   }
   // When no explicit strategy type is set, mirror the runtime default (project_primary for most
   // modes; adapter_managed for agent_default). Mode alone never implies git_worktree.
-  return input.mode === "agent_default" ? "adapter_managed" : "project_primary";
+  return (input.mode === "agent_default" || input.mode === "no_code") ? "adapter_managed" : "project_primary";
 }
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
@@ -223,7 +248,8 @@ export function parseIssueExecutionWorkspaceSettings(
       mode === "isolated_workspace" ||
       mode === "operator_branch" ||
       mode === "reuse_existing" ||
-      mode === "agent_default"
+      mode === "agent_default" ||
+      mode === "no_code"
     ) {
       return mode;
     }
@@ -265,7 +291,7 @@ export function selectEnvironmentExecutionWorkspaceSettings(
   isolatedWorkspacesEnabled: boolean,
 ): IssueExecutionWorkspaceSettings | null {
   if (!parsedSettings) return null;
-  if (isolatedWorkspacesEnabled) return parsedSettings;
+  if (isolatedWorkspacesEnabled || parsedSettings.mode === "no_code") return parsedSettings;
   return parsedSettings.networkEgress
     ? { networkEgress: parsedSettings.networkEgress }
     : null;
@@ -456,7 +482,7 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
       delete nextConfig.workspaceStrategy;
     }
 
-    if (input.mode === "agent_default") {
+    if (input.mode === "agent_default" || input.mode === "no_code") {
       delete nextConfig.workspaceRuntime;
     } else if (input.issueSettings?.workspaceRuntime) {
       nextConfig.workspaceRuntime = cloneRecord(input.issueSettings.workspaceRuntime) ?? undefined;

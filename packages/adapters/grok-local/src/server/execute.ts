@@ -368,6 +368,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId,
         target: executionTarget,
         adapterKey: "grok",
+        noCodeWorkspace: workspaceContext.mode === "no_code",
         workspaceLocalDir: cwd,
         timeoutSec,
         installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
