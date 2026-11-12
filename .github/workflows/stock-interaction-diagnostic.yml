@@ -1,0 +1,147 @@
+name: Stock interaction diagnostic
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/stock-interaction-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test failure diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import textwrap
+
+          workflow = pathlib.Path('.github/workflows/stock-interaction-diagnostic.yml').read_text()
+          script = workflow.split('      - name: Exercise stock board-origin interaction\n', 1)[1]
+          script = script.split('        run: |\n', 1)[1].split('      - name: Upload diagnostic evidence\n', 1)[0]
+          setup = textwrap.dedent(script).split('trap capture_failure EXIT\n', 1)[0] + 'trap capture_failure EXIT\n'
+          requests = [line.strip() for line in script.splitlines() if 'curl --fail' in line]
+          assert len(requests) == 4, requests
+          assert all('--connect-timeout 2 --max-time 5' in line for line in requests), requests
+          cases = [
+              ('setup', None, '', 'not_started', 'unclassified', 17),
+              ('startup', 'EADDRINUSE', 'server_pid=99999999', 'exited', 'address_in_use', 18),
+              ('fixture', 'ECONNREFUSED', 'sleep 60 & server_pid=$!', 'alive', 'connection_refused', 19),
+              ('fixture', 'unknown', 'server_pid=99999999', 'exited', 'unclassified', 20),
+              ('startup', 'EADDRINUSE ECONNREFUSED', 'server_pid=99999999', 'exited', 'address_in_use', 21),
+          ]
+          for stage, log, process, state, category, code in cases:
+              with tempfile.TemporaryDirectory() as tmp:
+                  commands = [f'stage={stage}', process]
+                  if log is not None:
+                      commands.append(f"printf '%s\\n' 'private-canary {log}' > \"$start_log\"")
+                  commands.append(f'exit {code}')
+                  result = subprocess.run(['bash', '-c', setup + '\n'.join(commands)],
+                                          env={**os.environ, 'RUNNER_TEMP': tmp}, capture_output=True, text=True)
+                  evidence = pathlib.Path(tmp, 'interaction-evidence', 'failure-diagnostic.txt').read_text()
+                  expected = f'stage={stage}\nexit_code={code}\nserver_process={state}\nlog_category={category}\n'
+                  assert result.returncode == code, (stage, result.returncode)
+                  assert evidence == expected, (stage, evidence)
+                  assert 'private-canary' not in evidence + result.stdout + result.stderr
+          print('Failure diagnostic cases passed')
+          PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Exercise stock board-origin interaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/interaction-evidence"
+          data="$RUNNER_TEMP/paperclip-stock"
+          mkdir -p "$evidence"
+          start_log="$RUNNER_TEMP/paperclip-start.log"
+          stage=setup
+          server_pid=
+          capture_failure() {
+            result=$?
+            if (( result != 0 )); then
+              {
+                printf 'stage=%s\nexit_code=%s\n' "$stage" "$result"
+                if [[ -z "$server_pid" ]]; then
+                  printf '%s\n' 'server_process=not_started'
+                elif kill -0 "$server_pid" 2>/dev/null; then
+                  printf '%s\n' 'server_process=alive'
+                else
+                  printf '%s\n' 'server_process=exited'
+                fi
+                # Never copy log lines: they may contain generated credentials or errors.
+                if [[ -f "$start_log" ]] && grep -Fq 'EADDRINUSE' "$start_log"; then
+                  printf '%s\n' 'log_category=address_in_use'
+                elif [[ -f "$start_log" ]] && grep -Fq 'ECONNREFUSED' "$start_log"; then
+                  printf '%s\n' 'log_category=connection_refused'
+                else
+                  printf '%s\n' 'log_category=unclassified'
+                fi
+              } > "$evidence/failure-diagnostic.txt"
+            fi
+            if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi
+            return "$result"
+          }
+          trap capture_failure EXIT
+          cli=(npx --yes paperclipai@2026.1106.0)
+          "${cli[@]}" --version | tee "$evidence/version.txt"
+          printf '%s\n' 'Release source: d69631b01b9c658f80bf8bed389863dce82643e1' \
+            'Actor: local-trusted board. Adapter: process /usr/bin/true, not a model provider.' \
+            'No custom plugins or skills, host scripts, direct database writes or provider credentials were added.' \
+            'Stock skills may be materialized; skill use is not established and strict no-skills qualification is not proven.' \
+            'Board-origin synthetic process evidence does not establish agent-origin or model-provider behavior.' \
+            'CI telemetry suppression is source-based, not verified by network measurement.' \
+            'A wake after the interaction is temporal association, not direct correlation.' \
+            'Missing, coalesced, truncated or ambiguous evidence is inconclusive.' > "$evidence/scope.txt"
+          stage=startup
+          "${cli[@]}" onboard --yes --data-dir "$data" --no-install-service > "$start_log" 2>&1 &
+          server_pid=$!
+          for attempt in {1..90}; do
+            if curl --fail --connect-timeout 2 --max-time 5 --silent http://127.0.0.1:3100/api/health > "$evidence/health.json"; then break; fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then printf '%s\n' 'Stock startup exited before health check.'; exit 1; fi
+            sleep 2
+          done
+          test -s "$evidence/health.json"
+          stage=fixture
+          "${cli[@]}" company create --payload-json '{"name":"Disposable diagnostic"}' --json > "$evidence/company.json"
+          company=$(jq -er '.id' "$evidence/company.json")
+          "${cli[@]}" agent create --company-id "$company" --payload-json '{"name":"Assignee","adapterType":"process","adapterConfig":{"command":"/usr/bin/true"}}' --json > "$evidence/assignee.json"
+          "${cli[@]}" agent create --company-id "$company" --payload-json '{"name":"Addressee","adapterType":"process","adapterConfig":{"command":"/usr/bin/true"}}' --json > "$evidence/addressee.json"
+          assignee=$(jq -er '.id' "$evidence/assignee.json")
+          addressee=$(jq -er '.id' "$evidence/addressee.json")
+          test "$assignee" != "$addressee"
+          "${cli[@]}" issue create --company-id "$company" --title 'Disposable interaction diagnostic' --assignee-agent-id "$assignee" --standalone --json > "$evidence/issue.json"
+          issue=$(jq -er '.id' "$evidence/issue.json")
+          curl --fail --connect-timeout 2 --max-time 5 --silent --show-error "http://127.0.0.1:3100/api/issues/$issue/diagnostics/wakes" > "$evidence/baseline.json"
+          payload=$(jq -nc --arg agent "$addressee" '{kind:"request_confirmation",addresseeAgentId:$agent,payload:{version:1,prompt:"Diagnostic confirmation"}}')
+          "${cli[@]}" issue interaction:create "$issue" --payload-json "$payload" --json > "$evidence/interaction.json"
+          for attempt in {1..10}; do
+            sleep 3
+            curl --fail --connect-timeout 2 --max-time 5 --silent --show-error "http://127.0.0.1:3100/api/issues/$issue/diagnostics/wakes" > "$evidence/post-$attempt.json"
+          done
+          "${cli[@]}" issue interactions "$issue" --json > "$evidence/interactions-final.json"
+          "${cli[@]}" issue runs "$issue" --json > "$evidence/issue-runs.json"
+          jq -r '.. | objects | .runId? // empty' "$evidence/post-"*.json | sort -u | while IFS= read -r run_id; do
+            if [[ "$run_id" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+              curl --fail --connect-timeout 2 --max-time 5 --silent --show-error "http://127.0.0.1:3100/api/heartbeat-runs/$run_id" > "$evidence/run-$run_id.json" || rm -f "$evidence/run-$run_id.json"
+            fi
+          done
+          printf '%s\n' 'Snapshots captured. Inspect the baseline, final interaction, truncation, coalescing and any linked run before drawing conclusions.'
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-interaction-diagnostic
+          path: ${{ runner.temp }}/interaction-evidence/
+          if-no-files-found: warn
+          retention-days: 7
