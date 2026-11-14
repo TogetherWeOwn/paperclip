@@ -1,0 +1,55 @@
+# Review policy data, not an automated enforcement mechanism.
+# The highest matching tier wins: sensitive > ordinary > low. Unmatched paths
+# are sensitive. QA reviews every change; Security reviews sensitive changes
+# before QA. The author records risk_tier, and QA checks paths and contents.
+#
+# Content always escalates to sensitive, regardless of a path match: new or
+# changed public endpoints or input parsing; authentication, authorization,
+# sessions, cryptography, keys, secrets, credentials, permissions, tenant
+# isolation, personal data, SQL, schemas or migrations; dependencies or
+# lockfiles (including development dependencies); CI or workflows; weakened
+# assertions, deleted tests or snapshots, or lowered gates. Test paths below
+# are low only for additive unit-test changes; other changes are sensitive.
+# Moving a sensitive-floor path to a lower tier requires Security approval.
+version: 1
+default_tier: sensitive
+tiers:
+  low:
+    # Existing static artwork only; no executable or security documentation.
+    - doc/assets/header.png
+    - doc/assets/four-pillars-dark.png
+    - doc/assets/four-pillars-light.png
+    # Additive unit tests only; content triggers still take precedence.
+    - ui/src/lib/utils.date-time.test.ts
+    - ui/src/lib/task-date-groups.test.ts
+  # No module has an audited justification for ordinary classification.
+  ordinary: []
+  sensitive:
+    # Review controls, workflows, configuration and dependency inputs.
+    - .github/**
+    - '**/CODEOWNERS'
+    - '**/package.json'
+    - '**/pnpm-lock.yaml'
+    - '**/package-lock.json'
+    - '**/yarn.lock'
+    - '**/pnpm-workspace.yaml'
+    - '**/Dockerfile*'
+    - '**/Makefile'
+    - '**/AGENTS.md'
+    - '**/CLAUDE.md'
+    - .claude/**
+    - .agents/**
+    - skills/**
+    - packages/skills-catalog/**
+    - packages/teams-catalog/**
+    # Trust boundaries, storage, execution, network, install and release.
+    - server/**
+    - cli/**
+    - packages/db/**
+    - packages/adapters/**
+    - packages/adapter-utils/**
+    - packages/plugins/**
+    - scripts/**
+    - docker/**
+    - SECURITY.md
+    - CONSTRAINTS.md
