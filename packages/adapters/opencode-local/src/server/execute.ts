@@ -390,6 +390,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId,
         target: executionTarget,
         adapterKey: "opencode",
+        noCodeWorkspace: workspaceContext.mode === "no_code",
         timeoutSec,
         workspaceLocalDir: cwd,
         installCommand: SANDBOX_INSTALL_COMMAND,

@@ -523,8 +523,11 @@ export function environmentRunOrchestrator(
         duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       });
       const realizationMode = workspaceRealization.mode === "in_place" ? "in_place" : "copy";
-      const authoritativeRoot =
-        typeof workspaceRealization.authoritativeRoot === "string" && workspaceRealization.authoritativeRoot.trim().length > 0
+      // Copy-mode realization metadata describes the host sync source, not
+      // authority on the remote. No-code directories use the transport's root.
+      const authoritativeRoot = effectiveExecutionWorkspaceMode === "no_code" && executionTarget?.kind === "remote"
+        ? (executionTarget.transport === "ssh" ? executionTarget.spec.remoteWorkspacePath : executionTarget.remoteCwd)
+        : typeof workspaceRealization.authoritativeRoot === "string" && workspaceRealization.authoritativeRoot.trim().length > 0
           ? workspaceRealization.authoritativeRoot.trim()
           : realizedCwd;
       const workspaceTargetMetadata: AdapterWorkspaceRealization = {

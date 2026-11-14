@@ -261,6 +261,7 @@ See `doc/project-repositories.md` for the API and UI contract.
 - `execution_policy` jsonb null
 - `execution_state` jsonb null
 - execution workspace fields: `execution_workspace_id`, `execution_workspace_preference`, `execution_workspace_settings`
+- Explicit task-local `executionWorkspaceSettings.mode = "no_code"` selects an ordinary non-repository execution directory without provisioning or transferring a code workspace. It is independent of the isolated-worktree feature flag and is not a project default, an inheritable selection, or an `executionWorkspacePreference` value. Unspecified tasks, `agent_default`, work modes, role names and missing repositories retain their normal behavior. Conflicting explicit code-workspace bindings, preferences or task-level workspace overrides are rejected without detaching or deleting existing workspaces. Project identity and company, environment, sandbox, credential and authorization gates remain effective. Runtime instruction, skill and authentication assets are not working-tree transfers.
 - `started_at` timestamptz null
 - `completed_at` timestamptz null
 - `cancelled_at` timestamptz null
