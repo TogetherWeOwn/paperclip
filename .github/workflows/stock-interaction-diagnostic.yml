@@ -10,7 +10,40 @@ permissions:
   contents: read
 
 jobs:
+  stock-install-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Resolve stock package without lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/stock-install"
+          evidence="$RUNNER_TEMP/stock-install-evidence"
+          mkdir -p "$dir" "$evidence"
+          cd "$dir"
+          node --version | tee "$evidence/node-version.txt"
+          npm --version | tee "$evidence/npm-version.txt"
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); if (a<11 || (a===11 && (b<19 || (b===19 && c<0)))) process.exit(1)' "$(npm --version)"
+          printf '%s\n' '{"private":true,"dependencies":{"paperclipai":"2026.1106.0"}}' > package.json
+          printf '%s\n' 'min-release-age=3' 'ignore-scripts=true' 'audit=false' 'fund=false' > .npmrc
+          npm install --package-lock-only --ignore-scripts
+          cp package-lock.json "$evidence/package-lock.json"
+          node -e 'const l=require(process.argv[1]); const p=l.packages; console.log(JSON.stringify(Object.entries(p).filter(([,v])=>v.hasInstallScript).map(([path,v])=>({path,version:v.version,resolved:v.resolved,integrity:v.integrity})),null,2))' "$dir/package-lock.json" > "$evidence/install-hook-candidates.json"
+          printf '%s\n' 'Resolution only: no dependencies installed and no hooks approved or executed.' > "$evidence/scope.txt"
+      - name: Upload stock install evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-install-preflight
+          path: ${{ runner.temp }}/stock-install-evidence/
+          if-no-files-found: warn
+          retention-days: 7
   diagnostic:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
